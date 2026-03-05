@@ -142,6 +142,31 @@ Prompts for all credentials, role URL, skills, model selection, and domain.
 ./deploy.sh --stop
 ```
 
+## CI/CD: Auto Push To Docker Hub
+
+This repository includes a GitHub Actions workflow at `.github/workflows/docker-publish.yml`.
+
+It automatically builds and pushes Docker images when:
+- code is pushed to `main`
+- a tag matching `v*` is pushed
+- manually triggered from GitHub Actions (`workflow_dispatch`)
+
+### Required GitHub Secrets
+
+In your GitHub repo, add these secrets:
+- `DOCKERHUB_USERNAME`: your Docker Hub username
+- `DOCKERHUB_TOKEN`: Docker Hub access token (not password)
+
+### Published Image
+
+The workflow publishes to:
+- `docker.io/<DOCKERHUB_USERNAME>/gta-claw`
+
+Generated tags include:
+- `latest` (default branch)
+- branch/tag based tags
+- `sha-<commit>`
+
 ## Endpoints
 
 | Endpoint | Method | Description |
