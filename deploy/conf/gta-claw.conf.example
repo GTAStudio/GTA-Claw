@@ -1,0 +1,62 @@
+# ==============================================================================
+# GTA-Claw 部署配置文件
+# 复制本文件为 gta-claw.conf 并填写实际值
+# 用法: ./run.sh --config conf/gta-claw.conf
+# ==============================================================================
+
+# ---- 必填项 ----
+
+# GitHub Personal Access Token (需要 Copilot Requests 权限)
+GITHUB_TOKEN=
+
+# Azure Bot Service 凭据 (Azure Portal → Bot 注册)
+MicrosoftAppId=
+MicrosoftAppPassword=
+
+# Role 配置 JSON 的 URL
+# 格式: { "content": "You are a...", "model": "gpt-4o" }
+AGENT_ROLE_URL=
+
+# Skill 模块 URL (多个用逗号分隔)
+ENABLED_SKILLS=
+
+# ---- 可选项 (有默认值) ----
+
+# Docker 镜像名称 (Docker Hub)
+DOCKER_IMAGE=gtastudio/gta-claw:latest
+
+# AI 模型 (会被 role config 中的 model 字段覆盖)
+COPILOT_MODEL=gpt-4o
+
+# 域名 (Caddy 自动 HTTPS, 本地测试用 localhost)
+DOMAIN=localhost
+
+# 日志级别: trace, debug, info, warn, error, fatal
+LOG_LEVEL=info
+
+# 最大会话数
+MAX_SESSIONS=100
+
+# 会话过期时间 (毫秒)
+SESSION_TTL_MS=3600000
+
+# Skill 执行超时 (毫秒)
+SKILL_EXEC_TIMEOUT_MS=30000
+
+# SDK 请求超时 (毫秒)
+SDK_REQUEST_TIMEOUT_MS=120000
+
+# 速率限制 (每 IP 每分钟请求数, 仅 /api/messages)
+RATE_LIMIT_PER_MIN=30
+
+# Skill HTTP 请求域名白名单 (逗号分隔, 留空=不限制)
+ALLOWED_SKILL_DOMAINS=
+
+# 信任上游代理的 x-forwarded-for 头 (仅在受信代理后面设 true)
+TRUST_PROXY=false
+
+# 自动更新 SDK/CLI
+AUTO_UPDATE=false
+
+# Admin API 令牌 (留空则禁用 /admin/reload 端点)
+ADMIN_TOKEN=

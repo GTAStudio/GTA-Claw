@@ -1,0 +1,55 @@
+services:
+  gta-claw:
+    image: ${DOCKER_IMAGE:-gtastudio/gta-claw:latest}
+    restart: unless-stopped
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - MicrosoftAppId=${MicrosoftAppId}
+      - MicrosoftAppPassword=${MicrosoftAppPassword}
+      - AGENT_ROLE_URL=${AGENT_ROLE_URL}
+      - ENABLED_SKILLS=${ENABLED_SKILLS}
+      - COPILOT_MODEL=${COPILOT_MODEL:-gpt-4o}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - MAX_SESSIONS=${MAX_SESSIONS:-100}
+      - SESSION_TTL_MS=${SESSION_TTL_MS:-3600000}
+      - SKILL_EXEC_TIMEOUT_MS=${SKILL_EXEC_TIMEOUT_MS:-30000}
+      - SDK_REQUEST_TIMEOUT_MS=${SDK_REQUEST_TIMEOUT_MS:-120000}
+      - RATE_LIMIT_PER_MIN=${RATE_LIMIT_PER_MIN:-30}
+      - ALLOWED_SKILL_DOMAINS=${ALLOWED_SKILL_DOMAINS:-}
+      - TRUST_PROXY=${TRUST_PROXY:-true}
+      - DOMAIN=${DOMAIN:-localhost}
+      - AUTO_UPDATE=${AUTO_UPDATE:-false}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+    networks:
+      - gta-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3978/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      gta-claw:
+        condition: service_healthy
+    networks:
+      - gta-net
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  gta-net:
+    driver: bridge
