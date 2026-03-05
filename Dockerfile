@@ -14,7 +14,12 @@ ENV npm_config_python=/usr/bin/python3
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm install --no-audit --no-fund --unsafe-perm
+RUN node -v && npm -v && \
+  npm install --no-audit --no-fund --unsafe-perm --loglevel=verbose || \
+  (echo "=== npm install failed, dumping npm logs ===" && \
+   ls -la /root/.npm/_logs || true && \
+   cat /root/.npm/_logs/* || true && \
+   exit 1)
 
 COPY tsconfig.json ./
 COPY src/ ./src/
