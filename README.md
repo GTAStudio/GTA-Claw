@@ -162,6 +162,8 @@ In your GitHub repo, add these secrets:
 The workflow publishes to:
 - `docker.io/<DOCKERHUB_USERNAME>/gta-claw`
 
+Note: the workflow normalizes the namespace to lowercase to match Docker Hub naming rules.
+
 Generated tags include:
 - `latest` (default branch)
 - branch/tag based tags
