@@ -3,14 +3,18 @@ FROM node:20-bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
+  git \
   python3 \
+  python-is-python3 \
   ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+
+ENV npm_config_python=/usr/bin/python3
 
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm ci --no-audit --no-fund --unsafe-perm || npm install --no-audit --no-fund --unsafe-perm
 
 COPY tsconfig.json ./
 COPY src/ ./src/
