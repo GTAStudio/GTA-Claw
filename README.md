@@ -156,13 +156,14 @@ It automatically builds and pushes Docker images when:
 In your GitHub repo, add these secrets:
 - `DOCKERHUB_USERNAME`: your Docker Hub username
 - `DOCKERHUB_TOKEN`: Docker Hub access token (not password)
+- `DOCKERHUB_IMAGE` (optional): full image name, e.g. `docker.io/gtastudio/gta-claw`
 
 ### Published Image
 
 The workflow publishes to:
 - `docker.io/<DOCKERHUB_USERNAME>/gta-claw`
 
-Note: the workflow normalizes the namespace to lowercase to match Docker Hub naming rules.
+If `DOCKERHUB_IMAGE` is not set, the workflow defaults to `docker.io/<DOCKERHUB_USERNAME>/gta-claw` and normalizes the namespace to lowercase.
 
 Generated tags include:
 - `latest` (default branch)
