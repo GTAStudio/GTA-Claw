@@ -1,7 +1,11 @@
 # ---- Build Stage ----
-FROM node:20-alpine AS builder
+FROM node:20-bookworm-slim AS builder
 
-RUN apk add --no-cache build-base python3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  build-essential \
+  python3 \
+  ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -14,9 +18,13 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ---- Production Stage ----
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
-RUN apk add --no-cache curl bash
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  curl \
+  bash \
+  ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install Copilot CLI via official install script
 ARG COPILOT_CLI_VERSION=""
