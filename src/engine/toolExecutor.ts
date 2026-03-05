@@ -5,11 +5,12 @@ import { logger } from "../utils/logger.js";
 const ISOLATE_MEMORY_MB = 128;
 const require = createRequire(import.meta.url);
 
-type IvmModule = typeof import("isolated-vm");
-
-let ivm: IvmModule | null = null;
+/* eslint-disable @typescript-eslint/no-explicit-any */
+// isolated-vm is optional — types are referenced as `any` to avoid
+// compile-time dependency on the package's type declarations.
+let ivm: any = null;
 try {
-  ivm = require("isolated-vm") as IvmModule;
+  ivm = require("isolated-vm");
 } catch {
   ivm = null;
 }
@@ -20,7 +21,7 @@ interface RegisteredSkill {
 }
 
 export class ToolExecutor {
-  private isolate: InstanceType<IvmModule["Isolate"]> | null = null;
+  private isolate: any = null;
   private registeredSkills: RegisteredSkill[] = [];
   private disposed = false;
   private readonly timeoutMs: number;
@@ -43,14 +44,14 @@ export class ToolExecutor {
     }
   }
 
-  private createIsolate(): InstanceType<IvmModule["Isolate"]> {
+  private createIsolate(): any {
     if (!ivm) {
       throw new Error("isolated-vm backend is not available");
     }
 
     return new ivm.Isolate({
       memoryLimit: ISOLATE_MEMORY_MB,
-      onCatastrophicError: (err) => {
+      onCatastrophicError: (err: Error) => {
         logger.fatal({ err }, "Isolate catastrophic error — recreating");
         this.recoverIsolate();
       },

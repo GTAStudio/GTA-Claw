@@ -23,7 +23,10 @@ RUN node -v && npm -v && \
 
 COPY tsconfig.json ./
 COPY src/ ./src/
-RUN npm run build
+RUN npm run build 2>&1 || \
+  (echo "=== tsc build failed ===" && \
+   npx tsc --noEmit --pretty 2>&1 || true && \
+   exit 1)
 RUN npm prune --omit=dev
 
 # ---- Production Stage ----
