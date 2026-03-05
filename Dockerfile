@@ -14,7 +14,7 @@ ENV npm_config_python=/usr/bin/python3
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci --no-audit --no-fund --unsafe-perm || npm install --no-audit --no-fund --unsafe-perm
+RUN npm install --no-audit --no-fund --unsafe-perm
 
 COPY tsconfig.json ./
 COPY src/ ./src/
