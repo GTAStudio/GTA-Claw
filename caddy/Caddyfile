@@ -1,0 +1,9 @@
+{$DOMAIN} {
+    reverse_proxy gta-claw:3978
+    encode gzip
+
+    log {
+        output stdout
+        format json
+    }
+}
