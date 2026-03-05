@@ -24,6 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate Docker Hub secrets
+        shell: bash
         run: |
           if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
             echo "Missing required secrets: DOCKERHUB_USERNAME and/or DOCKERHUB_TOKEN"
@@ -46,12 +47,23 @@ jobs:
         id: image
         shell: bash
         run: |
+          image_regex='^docker\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$'
+
           if [ -n "${{ secrets.DOCKERHUB_IMAGE }}" ]; then
-            image="${{ secrets.DOCKERHUB_IMAGE }}"
+            image=$(echo "${{ secrets.DOCKERHUB_IMAGE }}" | tr '[:upper:]' '[:lower:]')
           else
             namespace=$(echo "${{ secrets.DOCKERHUB_USERNAME }}" | tr '[:upper:]' '[:lower:]')
             image="docker.io/${namespace}/gta-claw"
           fi
+
+          if ! [[ "$image" =~ $image_regex ]]; then
+            echo "Invalid Docker image name: '$image'"
+            echo "Expected format: docker.io/<namespace>/<repo> (lowercase only)"
+            echo "Tip: set DOCKERHUB_IMAGE to something like docker.io/gtastudio/gta-claw"
+            exit 1
+          fi
+
+          echo "Using image: $image"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
 
       - name: Extract Docker metadata
