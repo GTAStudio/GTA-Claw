@@ -12,9 +12,11 @@
   "dependencies": {
     "@github/copilot-sdk": "^0.1.30",
     "botbuilder": "^4.23.1",
-    "isolated-vm": "^6.0.2",
     "pino": "^9.6.0",
     "restify": "^11.1.0"
+  },
+  "optionalDependencies": {
+    "isolated-vm": "^6.0.2"
   },
   "devDependencies": {
     "@types/bunyan": "^1.8.11",

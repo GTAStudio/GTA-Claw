@@ -186,7 +186,8 @@ Generated tags include:
 
 ## Security
 
-- Skills run in V8 isolate sandbox (isolated-vm) with memory limits
+- Skills run in V8 isolate sandbox (`isolated-vm`) with memory limits when available
+- If `isolated-vm` is unavailable, engine falls back to Node `vm` sandbox mode (reduced isolation)
 - Domain whitelist for skill HTTP calls
 - Rate limiting on bot endpoint (30 req/min per IP)
 - Non-root Docker user

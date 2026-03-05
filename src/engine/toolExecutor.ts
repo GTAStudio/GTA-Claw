@@ -1,7 +1,18 @@
-import ivm from "isolated-vm";
+import { Script, createContext } from "node:vm";
+import { createRequire } from "node:module";
 import { logger } from "../utils/logger.js";
 
 const ISOLATE_MEMORY_MB = 128;
+const require = createRequire(import.meta.url);
+
+type IvmModule = typeof import("isolated-vm");
+
+let ivm: IvmModule | null = null;
+try {
+  ivm = require("isolated-vm") as IvmModule;
+} catch {
+  ivm = null;
+}
 
 interface RegisteredSkill {
   name: string;
@@ -9,19 +20,34 @@ interface RegisteredSkill {
 }
 
 export class ToolExecutor {
-  private isolate: ivm.Isolate;
+  private isolate: InstanceType<IvmModule["Isolate"]> | null = null;
   private registeredSkills: RegisteredSkill[] = [];
   private disposed = false;
   private readonly timeoutMs: number;
   private readonly allowedDomains: string[];
+  private readonly mode: "isolated-vm" | "node-vm";
 
   constructor(timeoutMs: number, allowedDomains: string[]) {
     this.timeoutMs = timeoutMs;
     this.allowedDomains = allowedDomains;
-    this.isolate = this.createIsolate();
+
+    if (ivm) {
+      this.mode = "isolated-vm";
+      this.isolate = this.createIsolate();
+      logger.info("ToolExecutor using isolated-vm backend");
+    } else {
+      this.mode = "node-vm";
+      logger.warn(
+        "isolated-vm not available; falling back to node:vm sandbox (reduced isolation)",
+      );
+    }
   }
 
-  private createIsolate(): ivm.Isolate {
+  private createIsolate(): InstanceType<IvmModule["Isolate"]> {
+    if (!ivm) {
+      throw new Error("isolated-vm backend is not available");
+    }
+
     return new ivm.Isolate({
       memoryLimit: ISOLATE_MEMORY_MB,
       onCatastrophicError: (err) => {
@@ -32,6 +58,8 @@ export class ToolExecutor {
   }
 
   private recoverIsolate(): void {
+    if (!this.isolate) return;
+
     try {
       this.isolate.dispose();
     } catch {
@@ -69,6 +97,79 @@ export class ToolExecutor {
     const skill = this.registeredSkills.find((s) => s.name === name);
     if (!skill) {
       throw new Error(`Unknown skill: ${name}`);
+    }
+
+    if (this.mode === "node-vm") {
+      return this.executeWithNodeVm(skill.code, name, params);
+    }
+
+    return this.executeWithIsolate(skill.code, name, params);
+  }
+
+  private async executeWithNodeVm(
+    skillCode: string,
+    skillName: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const api = {
+      httpGet: async (url: string): Promise<string> => {
+        if (typeof url !== "string") throw new Error("url must be a string");
+        if (!this.isDomainAllowed(url)) {
+          throw new Error(`Domain not allowed: ${url}`);
+        }
+        const resp = await fetch(url, {
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        return resp.text();
+      },
+      httpPost: async (
+        url: string,
+        body: string,
+        headers: Record<string, string> = {},
+      ): Promise<string> => {
+        if (typeof url !== "string") throw new Error("url must be a string");
+        if (!this.isDomainAllowed(url)) {
+          throw new Error(`Domain not allowed: ${url}`);
+        }
+        const resp = await fetch(url, {
+          method: "POST",
+          body,
+          headers,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        return resp.text();
+      },
+      log: (msg: unknown): void => {
+        const sanitized = String(msg).slice(0, 2000);
+        logger.info({ skill: skillName }, `[skill] ${sanitized}`);
+      },
+    };
+
+    const sandbox: {
+      params: Record<string, unknown>;
+      api: typeof api;
+      result?: unknown;
+    } = { params, api, result: undefined };
+
+    const context = createContext(sandbox);
+    const script = new Script(
+      `
+      const fn = ${skillCode};
+      result = fn(params, api);
+      `,
+    );
+
+    script.runInContext(context, { timeout: this.timeoutMs });
+    return Promise.resolve(sandbox.result);
+  }
+
+  private async executeWithIsolate(
+    skillCode: string,
+    skillName: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (!ivm || !this.isolate) {
+      throw new Error("isolated-vm backend is not available");
     }
 
     const context = await this.isolate.createContext();
@@ -119,7 +220,7 @@ export class ToolExecutor {
         "$log",
         new ivm.Callback((msg: string) => {
           const sanitized = String(msg).slice(0, 2000);
-          logger.info({ skill: name }, `[skill] ${sanitized}`);
+          logger.info({ skill: skillName }, `[skill] ${sanitized}`);
         }),
       );
 
@@ -131,7 +232,7 @@ export class ToolExecutor {
           httpPost: async (url, body, headers) => $httpPost.apply(undefined, [url, body, JSON.stringify(headers || {})], { result: { promise: true } }),
           log: (msg) => $log.apply(undefined, [String(msg)])
         };
-        const fn = ${skill.code};
+        const fn = ${skillCode};
         return fn($0, api);
         `,
         [new ivm.ExternalCopy(params).copyInto()],
@@ -147,6 +248,11 @@ export class ToolExecutor {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (!this.isolate) {
+      logger.info("ToolExecutor disposed");
+      return;
+    }
+
     try {
       this.isolate.dispose();
     } catch {

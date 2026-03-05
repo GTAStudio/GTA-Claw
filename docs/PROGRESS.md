@@ -115,6 +115,7 @@
 | 2026-03-05 | Switched Docker base image from Alpine to Debian slim for reliable native-module CI builds | Dockerfile |
 | 2026-03-05 | Hardened Docker builder npm install path (python toolchain + `npm ci` fallback) | Dockerfile |
 | 2026-03-05 | Switched Docker builder to `npm install` to avoid CI-only `npm ci` strict failure path | Dockerfile |
+| 2026-03-05 | Made `isolated-vm` optional with automatic Node `vm` fallback to unblock environments without native build support | src/engine/toolExecutor.ts, package.json, package-lock.json, README.md |
 | 2026-03-05 | Made rate limiting configurable via `RATE_LIMIT_PER_MIN` across app/deploy/compose | src/config.ts, src/server.ts, deploy.sh, docker-compose.yml, .env.example, README.md |
 | 2026-03-05 | Made updater cross-platform and tied auto-update to loaded config | src/updater/sdkUpdater.ts, src/index.ts |
 | 2026-03-05 | Optimized Docker image by pruning dev dependencies | Dockerfile |
