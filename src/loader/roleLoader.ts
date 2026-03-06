@@ -1,4 +1,5 @@
 import { logger } from "../utils/logger.js";
+import { fetch } from "../utils/proxy.js";
 
 const MAX_ROLE_SIZE = 1_048_576; // 1 MB
 const FETCH_TIMEOUT_MS = 10_000;

@@ -1,6 +1,7 @@
 import { Script, createContext } from "node:vm";
 import { createRequire } from "node:module";
 import { logger } from "../utils/logger.js";
+import { fetch } from "../utils/proxy.js";
 
 const ISOLATE_MEMORY_MB = 128;
 const require = createRequire(import.meta.url);

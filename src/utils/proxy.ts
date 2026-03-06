@@ -1,5 +1,9 @@
-import { ProxyAgent, setGlobalDispatcher } from "undici";
+import { ProxyAgent, setGlobalDispatcher, fetch as undiciFetch } from "undici";
 import { logger } from "./logger.js";
+
+// Re-export undici's fetch so all modules use the proxy-aware version.
+// Node.js's built-in global fetch does NOT respect setGlobalDispatcher.
+export { undiciFetch as fetch };
 
 /**
  * If HTTP_PROXY / HTTPS_PROXY / ALL_PROXY is set, configure undici's global

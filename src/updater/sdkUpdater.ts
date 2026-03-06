@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { logger } from "../utils/logger.js";
+import { fetch } from "../utils/proxy.js";
 
 const execFileAsync = promisify(execFile);
 

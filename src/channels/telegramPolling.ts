@@ -1,4 +1,5 @@
 import { logger } from "../utils/logger.js";
+import { fetch } from "../utils/proxy.js";
 import { splitMessage } from "../utils/splitMessage.js";
 
 interface TelegramUser {
