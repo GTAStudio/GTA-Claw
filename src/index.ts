@@ -156,6 +156,8 @@ async function main(): Promise<void> {
     bot,
     config,
     getEngine: () => engine,
+    deviceFlow,
+    processChannelMessage,
     whatsappHandler,
     getRuntimeStatus: () => ({
       skillCount: skills.length,
@@ -237,6 +239,15 @@ async function main(): Promise<void> {
       `GTA-Claw engine ready. Skills: ${skills.length} loaded.`,
     );
   });
+
+  // 6b. Auto-trigger Device Flow so auth code appears in logs at startup
+  if (deviceFlow && !engine) {
+    deviceFlow.getAuthMessage().then((msg) => {
+      logger.info({ authInstructions: msg }, "Device Flow — authorize now");
+    }).catch((err) => {
+      logger.error({ err }, "Failed to auto-start Device Flow");
+    });
+  }
 
   if (telegramClient) {
     await telegramClient.start();

@@ -201,6 +201,7 @@ Generated tags include:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/messages` | POST | Bot Framework messages (Teams) |
+| `/chat` | POST | Simple HTTP chat (no channel needed) |
 | `/health` | GET | Health check + status |
 | `/admin/reload` | POST | Hot-reload role+skills and reset active sessions (requires `ADMIN_TOKEN`) |
 

@@ -73,6 +73,13 @@ interface ServerDeps {
   config: AppConfig;
   getEngine: () => CopilotEngine | null;
   getRuntimeStatus: () => RuntimeStatus;
+  deviceFlow?: import("./auth/deviceFlow.js").GitHubDeviceFlow;
+  processChannelMessage?: (input: {
+    channel: "telegram" | "discord" | "whatsapp";
+    conversationId: string;
+    userName: string;
+    text: string;
+  }) => Promise<string>;
   whatsappHandler?: WhatsAppWebhookHandler;
   reloadFn?: () => Promise<ReloadResult>;
 }
@@ -150,6 +157,40 @@ export function createServer(deps: ServerDeps): restify.Server {
       authenticated: Boolean(engine),
       deviceFlowEnabled: config.DEVICE_FLOW_ENABLED,
     });
+    next();
+  });
+
+  // POST /chat — simple HTTP chat endpoint (no channel setup needed)
+  server.post("/chat", async (req: Request, res: Response, next: Next) => {
+    const body = req.body as Record<string, unknown> | undefined;
+    const message = typeof body?.message === "string" ? body.message.trim() : "";
+    const conversationId = typeof body?.conversation_id === "string" ? body.conversation_id : `http-${req.socket.remoteAddress ?? "anon"}`;
+
+    if (!message) {
+      res.send(400, { error: "Missing 'message' field" });
+      next();
+      return;
+    }
+
+    const engine = getEngine();
+    if (!engine) {
+      if (deps.deviceFlow) {
+        const authMsg = await deps.deviceFlow.getAuthMessage();
+        res.send(401, { error: "Not authenticated", auth_instructions: authMsg });
+      } else {
+        res.send(401, { error: "Not authenticated. Set GITHUB_TOKEN or enable Device Flow." });
+      }
+      next();
+      return;
+    }
+
+    try {
+      const reply = await engine.chat(conversationId, message);
+      res.send(200, { reply });
+    } catch (err) {
+      logger.error({ err }, "Chat endpoint error");
+      res.send(500, { error: "Internal error" });
+    }
     next();
   });
 

@@ -341,10 +341,32 @@ docker rm -f gta-claw
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check + status info |
+| `/chat` | POST | HTTP chat interface (no channel needed) |
 | `/api/messages` | POST | Bot Framework messages (Teams) |
 | `/admin/reload` | POST | Hot-reload role and skills (requires `ADMIN_TOKEN`) |
 | `/admin/system` | GET | System info (Node.js process + OS) |
 | `/admin/exec` | POST | Execute whitelisted system commands |
+
+### HTTP Chat Interface
+
+No channel setup needed — talk to Claw directly via HTTP:
+
+```bash
+# Send a message
+curl -X POST http://localhost:3978/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello, show me server status"}'
+
+# Specify a conversation ID (for multi-turn context)
+curl -X POST http://localhost:3978/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "continue", "conversation_id": "my-session-1"}'
+```
+
+Response format:
+```json
+{"reply": "Claw's response..."}
+```
 
 ### HTTP Proxy Configuration
 

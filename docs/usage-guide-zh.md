@@ -341,10 +341,32 @@ docker rm -f gta-claw
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查 + 状态信息 |
+| `/chat` | POST | HTTP 直聊接口（无需聊天频道） |
 | `/api/messages` | POST | Bot Framework 消息（Teams） |
 | `/admin/reload` | POST | 热重载角色和技能（需 `ADMIN_TOKEN`） |
 | `/admin/system` | GET | 系统信息（Node.js 进程 + OS） |
 | `/admin/exec` | POST | 执行白名单系统命令 |
+
+### HTTP 直聊接口
+
+不需要配置任何聊天频道，直接通过 HTTP 和 Claw 对话：
+
+```bash
+# 发送消息
+curl -X POST http://localhost:3978/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "你好，帮我看一下服务器状态"}'
+
+# 指定会话 ID（保持上下文连续对话）
+curl -X POST http://localhost:3978/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "继续", "conversation_id": "my-session-1"}'
+```
+
+返回格式：
+```json
+{"reply": "Claw 的回复内容..."}
+```
 
 ### HTTP 代理配置
 
