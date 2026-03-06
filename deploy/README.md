@@ -17,6 +17,8 @@ vim conf/gta-claw.conf    # 填写实际值
 ./run.sh --config conf/gta-claw.conf
 ```
 
+默认采用 Docker 单容器模式（`docker pull` + `docker run`），不依赖 compose。
+
 ## 鉴权模式
 
 支持两种方式（二选一）：
@@ -76,15 +78,11 @@ ENABLE_WHATSAPP=false
 ```
 deploy/
 ├── run.sh                      部署脚本
-├── docker-compose.yml          容器编排 (从 Docker Hub 拉取镜像)
-├── caddy/
-│   └── Caddyfile               Caddy 反向代理 (自动 HTTPS)
 └── conf/
     └── gta-claw.conf.example   配置模板
 ```
 
 ## 要求
 
-- Docker + Docker Compose 插件
-- 80/443 端口开放 (Caddy HTTPS)
-- 有效的域名指向服务器 (Caddy 自动申请 Let's Encrypt 证书)
+- Docker
+- 若需 HTTPS，请在宿主机已有反向代理（Nginx/Caddy/Traefik）上转发到 `127.0.0.1:3978`

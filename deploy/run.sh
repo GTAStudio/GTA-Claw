@@ -60,7 +60,7 @@ msg() {
     oauth_url_hint) if is_en; then echo "OAuth base URL (e.g. https://bot.example.com)"; else echo "OAuth 回调基础 URL (如 https://bot.example.com)"; fi ;;
     role_hint) if is_en; then echo "Hint: URL to JSON, e.g. {\"content\":\"You are...\",\"model\":\"gpt-4o\"}"; else echo "提示: 指向一个 JSON 文件, 格式: {\"content\": \"You are...\", \"model\": \"gpt-4o\"}"; fi ;;
     skills_hint) if is_en; then echo "Hint: Separate multiple skill URLs with commas"; else echo "提示: 多个 Skill URL 用逗号分隔"; fi ;;
-    domain_hint) if is_en; then echo "Hint: Caddy can auto-issue HTTPS certs; use localhost for local testing"; else echo "提示: Caddy 会自动申请 HTTPS 证书, 本地测试用 localhost"; fi ;;
+    domain_hint) if is_en; then echo "Hint: use your reverse-proxy domain; use localhost for local testing"; else echo "提示: 使用反向代理的域名, 本地测试用 localhost"; fi ;;
     selected_model) if is_en; then echo "Selected model:"; else echo "已选择模型:"; fi ;;
     ask_domain) if is_en; then echo "Domain"; else echo "域名"; fi ;;
     ask_image) if is_en; then echo "Docker image"; else echo "Docker 镜像"; fi ;;
@@ -111,11 +111,6 @@ check_prerequisites() {
     missing=1
   fi
 
-  if ! docker compose version &>/dev/null 2>&1; then
-    log_error "未检测到 docker compose 插件，请先安装"
-    missing=1
-  fi
-
   if [ "$missing" -ne 0 ]; then
     exit 1
   fi
@@ -124,6 +119,18 @@ check_prerequisites() {
   if ! docker info &>/dev/null 2>&1; then
     log_error "Docker daemon 未运行，请先启动 Docker"
     exit 1
+  fi
+}
+
+get_env_value() {
+  local key="$1"
+  local fallback="$2"
+  local value
+  value="$(grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -n1 | cut -d'=' -f2-)"
+  if [ -z "$value" ]; then
+    echo "$fallback"
+  else
+    echo "$value"
   fi
 }
 
@@ -309,14 +316,6 @@ validate_channel_mode() {
 set_env_file_permissions() {
   if command -v chmod &>/dev/null; then
     chmod 600 "$ENV_FILE" 2>/dev/null || true
-  fi
-}
-
-compose() {
-  if [ -f "$ENV_FILE" ]; then
-    docker compose --env-file "$ENV_FILE" "$@"
-  else
-    docker compose "$@"
   fi
 }
 
@@ -592,11 +591,17 @@ do_deploy() {
   log_step "拉取最新镜像..."
   # 从 .env 读取镜像名 (如果有的话)
   local image
-  image=$(grep "^DOCKER_IMAGE=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo "gtastudio/gta-claw:latest")
+  image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
   docker pull "$image" || log_warn "镜像拉取失败，将使用本地缓存 (如有)"
 
   log_step "启动服务..."
-  compose up -d --remove-orphans
+  docker rm -f gta-claw >/dev/null 2>&1 || true
+  docker run -d \
+    --name gta-claw \
+    --restart unless-stopped \
+    --env-file "$ENV_FILE" \
+    -p 3978:3978 \
+    "$image" >/dev/null
 
   echo ""
   log_info "部署完成！"
@@ -605,7 +610,7 @@ do_deploy() {
   # 等待健康检查
   log_step "等待服务就绪..."
   local container_id
-  container_id="$(compose ps -q gta-claw 2>/dev/null || true)"
+  container_id="gta-claw"
   local retries=0
   while [ "$retries" -lt 30 ]; do
     if [ -n "$container_id" ]; then
@@ -620,14 +625,12 @@ do_deploy() {
   done
 
   echo ""
-  compose ps
+  docker ps --filter "name=^/gta-claw$"
   echo ""
 
-  local domain
-  domain=$(grep "^DOMAIN=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo "localhost")
   echo -e "${BOLD}═══════════════════════════════════════${NC}"
-  log_info "健康检查: https://${domain}/health"
-  log_info "Bot 端点:  https://${domain}/api/messages"
+  log_info "健康检查: http://localhost:3978/health"
+  log_info "Bot 端点:  http://localhost:3978/api/messages"
   echo -e "${BOLD}═══════════════════════════════════════${NC}"
   echo ""
   log_info "查看日志: ./run.sh --logs"
@@ -640,29 +643,37 @@ do_update() {
 
   if [ -f "$ENV_FILE" ]; then
     local image
-    image=$(grep "^DOCKER_IMAGE=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo "gtastudio/gta-claw:latest")
+    image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
     docker pull "$image"
   else
     docker pull gtastudio/gta-claw:latest
   fi
 
   log_step "重启服务..."
-  compose up -d --remove-orphans
+  local image
+  image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
+  docker rm -f gta-claw >/dev/null 2>&1 || true
+  docker run -d \
+    --name gta-claw \
+    --restart unless-stopped \
+    --env-file "$ENV_FILE" \
+    -p 3978:3978 \
+    "$image" >/dev/null
+  docker ps --filter "name=^/gta-claw$"
   log_info "更新完成"
-  compose ps
 }
 
 # ---- 停止 ----
 do_stop() {
   log_step "停止所有 GTA-Claw 服务..."
-  compose down
+  docker rm -f gta-claw >/dev/null 2>&1 || true
   log_info "所有服务已停止"
 }
 
 # ---- 状态 ----
 do_status() {
   log_step "服务状态:"
-  compose ps
+  docker ps --filter "name=^/gta-claw$"
 
   echo ""
   # 尝试获取健康检查
@@ -670,15 +681,15 @@ do_status() {
     log_info "健康检查:"
     curl -s "http://localhost:3978/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || \
       curl -s "http://localhost:3978/health" 2>/dev/null || true
-  elif compose exec -T gta-claw curl -sf "http://localhost:3978/health" &>/dev/null 2>&1; then
+  elif docker exec gta-claw curl -sf "http://localhost:3978/health" &>/dev/null 2>&1; then
     log_info "健康检查 (容器内):"
-    compose exec -T gta-claw curl -s "http://localhost:3978/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+    docker exec gta-claw curl -s "http://localhost:3978/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
   fi
 }
 
 # ---- 日志 ----
 do_logs() {
-  compose logs -f --tail=100
+  docker logs -f --tail 100 gta-claw
 }
 
 # ---- 帮助 ----
@@ -702,9 +713,6 @@ do_help() {
   echo "目录结构:"
   echo "  deploy/"
   echo "  ├── run.sh                 部署脚本"
-  echo "  ├── docker-compose.yml     容器编排"
-  echo "  ├── caddy/"
-  echo "  │   └── Caddyfile          反向代理配置"
   echo "  └── conf/"
   echo "      └── gta-claw.conf.example  配置模板"
   echo ""

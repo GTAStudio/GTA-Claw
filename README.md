@@ -136,6 +136,9 @@ Skills execute in an isolated V8 sandbox with these bridges:
 
 ## Deployment
 
+`deploy/run.sh` now uses docker-only mode (`docker pull` + `docker run`) by default,
+without requiring docker compose for server deployment.
+
 ### Interactive Mode
 ```bash
 ./deploy.sh

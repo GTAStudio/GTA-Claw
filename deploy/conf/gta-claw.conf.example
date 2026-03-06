@@ -38,7 +38,7 @@ DOCKER_IMAGE=gtastudio/gta-claw:latest
 # AI 模型 (会被 role config 中的 model 字段覆盖)
 COPILOT_MODEL=gpt-4o
 
-# 域名 (Caddy 自动 HTTPS, 本地测试用 localhost)
+# 域名 (反向代理对外域名, 本地测试用 localhost)
 DOMAIN=localhost
 
 # 日志级别: trace, debug, info, warn, error, fatal
