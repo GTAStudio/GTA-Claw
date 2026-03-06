@@ -8,6 +8,7 @@ dist/
 .env
 .env.*
 !.env.example
+deploy/conf/gta-claw.conf
 
 # Logs
 npm-debug.log*
