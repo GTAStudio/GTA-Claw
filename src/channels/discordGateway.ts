@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import { logger } from "../utils/logger.js";
+import { splitMessage } from "../utils/splitMessage.js";
 
 interface DiscordGatewayPacket {
   op: number;
@@ -207,7 +208,7 @@ export class DiscordGatewayClient {
   }
 
   private async sendChannelMessage(channelId: string, text: string): Promise<void> {
-    const chunks = splitForDiscord(text, 1900);
+    const chunks = splitMessage(text, 1900);
     for (const chunk of chunks) {
       const resp = await fetch(
         `https://discord.com/api/v10/channels/${channelId}/messages`,

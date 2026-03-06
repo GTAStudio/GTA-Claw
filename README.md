@@ -9,28 +9,35 @@
 cp .env.example .env
 # Edit .env with your credentials
 
-# 2. Deploy (interactive mode)
-chmod +x deploy.sh
-./deploy.sh
+# 2. Deploy (docker-only, no compose needed)
+cd deploy
+chmod +x run.sh
+./run.sh
 
 # Or deploy from config file
-./deploy.sh --config .env.production
+./run.sh --config conf/gta-claw.conf
 ```
 
 ## Architecture
 
 ```
-Internet → Caddy (:443 HTTPS) → GTA-Claw Engine (:3978)
-                                      │
-                                 ┌────┴─────┐
-                                 │ TeamsBot  │ ← Microsoft Teams
-                                 └────┬─────┘
-                                 ┌────┴──────────┐
-                                 │ CopilotEngine  │ ← @github/copilot-sdk
-                                 └────┬──────────┘
-                                 ┌────┴──────────┐
-                                 │ ToolExecutor   │ ← isolated-vm sandbox
-                                 └───────────────┘
+Internet → Reverse Proxy (:443 HTTPS) → GTA-Claw Engine (:3978)
+                                            │
+                                       ┌────┴───────────────────────┐
+                                       │  Multi-Channel Gateway      │
+                                       │  • Teams (Bot Framework)    │
+                                       │  • Telegram (Polling)       │
+                                       │  • Discord (Gateway/WS)     │
+                                       │  • WhatsApp (Webhook)       │
+                                       └───────────┬─────────────┘
+                                       ┌───────────┴─────────────┐
+                                       │ CopilotEngine             │
+                                       │ @github/copilot-sdk       │
+                                       └───────────┬─────────────┘
+                                       ┌───────────┴─────────────┐
+                                       │ ToolExecutor              │
+                                       │ isolated-vm sandbox       │
+                                       └─────────────────────────┘
 ```
 
 **Core Principle**: The engine is an empty shell. All intelligence comes from:
@@ -57,12 +64,8 @@ Authentication now supports two modes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GITHUB_TOKEN` | *(empty)* | PAT token for direct auth mode |
-| `OAUTH_ENABLED` | `false` | Enable GitHub OAuth web authorization flow |
-| `GITHUB_CLIENT_ID` | *(empty)* | GitHub OAuth App Client ID |
-| `GITHUB_CLIENT_SECRET` | *(empty)* | GitHub OAuth App Client Secret |
-| `AUTH_BASE_URL` | *(empty)* | Public base URL, e.g. `https://bot.example.com` |
-| `OAUTH_CALLBACK_PATH` | `/auth/callback` | OAuth callback path |
-| `OAUTH_SCOPE` | `copilot` | Requested GitHub OAuth scope |
+| `DEVICE_FLOW_ENABLED` | `false` | Enable GitHub Device Flow authorization |
+| `GITHUB_CLIENT_ID` | *(empty)* | GitHub OAuth App Client ID (for Device Flow) |
 
 ### Optional Environment Variables
 
@@ -136,28 +139,29 @@ Skills execute in an isolated V8 sandbox with these bridges:
 
 ## Deployment
 
-`deploy/run.sh` now uses docker-only mode (`docker pull` + `docker run`) by default,
-without requiring docker compose for server deployment.
+`deploy/run.sh` uses docker-only mode (`docker pull` + `docker run`),
+without requiring docker compose.
 
 ### Interactive Mode
 ```bash
-./deploy.sh
+cd deploy
+./run.sh
 ```
-Prompts for all credentials, role URL, skills, model selection, and domain.
+Prompts for credentials, role URL, skills, model, channels, and advanced options.
 
 ### Config File Mode
 ```bash
-./deploy.sh --config .env.production
+./run.sh --config conf/gta-claw.conf
 ```
 
-### Update SDK/CLI
+### Update Image
 ```bash
-./deploy.sh --update
+./run.sh --update
 ```
 
 ### Stop Services
 ```bash
-./deploy.sh --stop
+./run.sh --stop
 ```
 
 ## CI/CD: Auto Push To Docker Hub
@@ -194,10 +198,6 @@ Generated tags include:
 |----------|--------|-------------|
 | `/api/messages` | POST | Bot Framework messages (Teams) |
 | `/health` | GET | Health check + status |
-| `/auth/login` | GET | Start GitHub OAuth flow |
-| `/auth/callback` | GET | OAuth callback endpoint |
-| `/auth/status` | GET | OAuth session/authentication status |
-| `/auth/logout` | POST | Clear OAuth session cookie |
 | `/admin/reload` | POST | Hot-reload role+skills and reset active sessions (requires `ADMIN_TOKEN`) |
 
 ## Channel Compatibility
@@ -211,14 +211,14 @@ GTA-Claw supports four channel modes (can be enabled together):
 
 Recommended auth strategy:
 
-1. Enterprise/public deployment: OAuth (`OAUTH_ENABLED=true`)
-2. Internal-only deployment: PAT (`GITHUB_TOKEN`) to avoid OAuth callback exposure
+1. Enterprise/public deployment: Device Flow (`DEVICE_FLOW_ENABLED=true`) — no domain needed
+2. Internal-only deployment: PAT (`GITHUB_TOKEN`) for simplest setup
 
 ## Prerequisites
 
-- Docker & Docker Compose
+- Docker
 - GitHub account with Copilot access
-- Azure Bot Service registration (for Teams)
+- Azure Bot Service registration (only if using Teams channel)
 
 ## Security
 
@@ -227,7 +227,7 @@ Recommended auth strategy:
 - Domain whitelist for skill HTTP calls
 - Rate limiting on bot endpoint (30 req/min per IP)
 - Non-root Docker user
-- HTTPS via Caddy with automatic TLS
+- HTTPS via reverse proxy (Caddy/Nginx/Traefik)
 
 ## ⚠️ Notice
 

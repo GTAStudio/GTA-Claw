@@ -1,5 +1,6 @@
 import { logger } from "../utils/logger.js";
 import type { CopilotEngine } from "../engine/copilotEngine.js";
+import type { GitHubDeviceFlow } from "../auth/deviceFlow.js";
 
 export interface IncomingMessage {
   channel: "telegram" | "discord" | "whatsapp";
@@ -12,7 +13,7 @@ export type EngineGetter = () => CopilotEngine | null;
 
 export async function processIncomingMessage(
   getEngine: EngineGetter,
-  oauthLoginPath: string | undefined,
+  deviceFlow: GitHubDeviceFlow | undefined,
   input: IncomingMessage,
 ): Promise<string> {
   const text = input.text.trim();
@@ -22,9 +23,9 @@ export async function processIncomingMessage(
 
   const engine = getEngine();
   if (!engine) {
-    return oauthLoginPath
-      ? `GTA-Claw 尚未完成授权，请先访问: ${oauthLoginPath}`
-      : "GTA-Claw 尚未配置有效鉴权。";
+    return deviceFlow
+      ? deviceFlow.getAuthMessage()
+      : "GTA-Claw is not configured with authentication.";
   }
 
   logger.info(
@@ -44,6 +45,6 @@ export async function processIncomingMessage(
       { err, channel: input.channel, conversationId: input.conversationId },
       "Channel message processing failed",
     );
-    return "抱歉，处理消息时发生错误，请稍后再试。";
+    return "Sorry, an error occurred while processing your message. Please try again.";
   }
 }

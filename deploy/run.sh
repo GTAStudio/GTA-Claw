@@ -48,16 +48,14 @@ msg() {
     existing_env) if is_en; then echo "Detected existing .env file"; else echo "检测到已有配置文件 (.env)"; fi ;;
     reconfigure) if is_en; then echo "Reconfigure? (y/N):"; else echo "是否重新配置？(y/N):"; fi ;;
     use_existing) if is_en; then echo "Using existing configuration"; else echo "使用现有配置"; fi ;;
-    step_auth) if is_en; then echo "[1/8] GitHub auth mode"; else echo "[1/8] GitHub 认证方式"; fi ;;
-    step_bot) if is_en; then echo "[2/8] Azure Bot credentials"; else echo "[2/8] Azure Bot 凭据"; fi ;;
-    step_role) if is_en; then echo "[3/8] Role configuration"; else echo "[3/8] Role 配置"; fi ;;
-    step_skills) if is_en; then echo "[4/8] Skills configuration"; else echo "[4/8] Skills 配置"; fi ;;
-    step_model) if is_en; then echo "[5/8] AI model"; else echo "[5/8] AI 模型"; fi ;;
-    step_domain) if is_en; then echo "[6/8] Domain configuration"; else echo "[6/8] 域名配置"; fi ;;
-    step_advanced) if is_en; then echo "[7/8] Advanced options"; else echo "[7/8] 高级选项"; fi ;;
-    step_write) if is_en; then echo "[8/8] Writing configuration"; else echo "[8/8] 写入配置"; fi ;;
+    step_auth) if is_en; then echo "[1/7] GitHub auth mode"; else echo "[1/7] GitHub 认证方式"; fi ;;
+    step_role) if is_en; then echo "[2/7] Role configuration"; else echo "[2/7] Role 配置"; fi ;;
+    step_skills) if is_en; then echo "[3/7] Skills configuration"; else echo "[3/7] Skills 配置"; fi ;;
+    step_model) if is_en; then echo "[4/7] AI model"; else echo "[4/7] AI 模型"; fi ;;
+    step_channels) if is_en; then echo "[5/7] Channel configuration"; else echo "[5/7] 通道配置"; fi ;;
+    step_advanced) if is_en; then echo "[6/7] Advanced options"; else echo "[6/7] 高级选项"; fi ;;
+    step_write) if is_en; then echo "[7/7] Writing configuration"; else echo "[7/7] 写入配置"; fi ;;
     auth_choice) if is_en; then echo "Auth mode number"; else echo "认证方式编号"; fi ;;
-    oauth_url_hint) if is_en; then echo "OAuth base URL (e.g. https://bot.example.com)"; else echo "OAuth 回调基础 URL (如 https://bot.example.com)"; fi ;;
     role_hint) if is_en; then echo "Hint: URL to JSON, e.g. {\"content\":\"You are...\",\"model\":\"gpt-4o\"}"; else echo "提示: 指向一个 JSON 文件, 格式: {\"content\": \"You are...\", \"model\": \"gpt-4o\"}"; fi ;;
     skills_hint) if is_en; then echo "Hint: Separate multiple skill URLs with commas"; else echo "提示: 多个 Skill URL 用逗号分隔"; fi ;;
     domain_hint) if is_en; then echo "Hint: use your reverse-proxy domain; use localhost for local testing"; else echo "提示: 使用反向代理的域名, 本地测试用 localhost"; fi ;;
@@ -259,21 +257,18 @@ validate_skills_urls() {
 
 validate_auth_mode() {
   local github_token="$1"
-  local oauth_enabled="$2"
+  local device_flow_enabled="$2"
   local client_id="$3"
-  local client_secret="$4"
-  local auth_base_url="$5"
 
   if [ -n "$github_token" ]; then
     return 0
   fi
 
-  if [ -n "$client_id" ] && [ -n "$client_secret" ] && [ -n "$auth_base_url" ] && [ "$oauth_enabled" != "false" ]; then
-    validate_url "$auth_base_url" "AUTH_BASE_URL" || return 1
+  if [ "$device_flow_enabled" = "true" ] && [ -n "$client_id" ]; then
     return 0
   fi
 
-  log_error "鉴权配置无效：请提供 GITHUB_TOKEN，或启用 OAuth 并配置 GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET / AUTH_BASE_URL"
+  log_error "鉴权配置无效：请提供 GITHUB_TOKEN，或启用 Device Flow 并配置 GITHUB_CLIENT_ID"
   return 1
 }
 
@@ -374,15 +369,13 @@ do_config() {
   validate_positive_integer "$(grep '^RATE_LIMIT_PER_MIN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo '30')" "RATE_LIMIT_PER_MIN"
   validate_boolean "$(grep '^AUTO_UPDATE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "AUTO_UPDATE"
   validate_boolean "$(grep '^TRUST_PROXY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "TRUST_PROXY"
-  validate_boolean "$(grep '^OAUTH_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "OAUTH_ENABLED"
+  validate_boolean "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "DEVICE_FLOW_ENABLED"
   validate_url "$(grep '^AGENT_ROLE_URL=' "$ENV_FILE" | cut -d'=' -f2-)" "AGENT_ROLE_URL"
   validate_skills_urls "$(grep '^ENABLED_SKILLS=' "$ENV_FILE" | cut -d'=' -f2-)"
   validate_auth_mode \
     "$(grep '^GITHUB_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^OAUTH_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || true)" \
-    "$(grep '^GITHUB_CLIENT_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^GITHUB_CLIENT_SECRET=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^AUTH_BASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
+    "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
+    "$(grep '^GITHUB_CLIENT_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
   validate_channel_mode \
     "$(grep '^ENABLE_TEAMS=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'true')" \
     "$(grep '^ENABLE_TELEGRAM=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
@@ -422,32 +415,20 @@ do_interactive() {
 
   log_step "$(msg step_auth)"
   echo "  1) Personal Access Token"
-  echo "  2) OAuth 网页授权 (企业推荐)"
+  echo "  2) Device Flow 设备授权 (推荐, 无需域名)"
   local auth_mode
   auth_mode=$(prompt_optional "$(msg auth_choice)" "2")
 
   local github_token=""
-  local oauth_enabled="false"
+  local device_flow_enabled="false"
   local github_client_id=""
-  local github_client_secret=""
-  local auth_base_url=""
-  local oauth_callback_path="/auth/callback"
-  local oauth_scope="copilot"
 
   if [ "$auth_mode" = "1" ]; then
     github_token=$(prompt_secret "GITHUB_TOKEN" "GitHub PAT (需要 Copilot Requests 权限)")
   else
-    oauth_enabled="true"
-    github_client_id=$(prompt_required "GITHUB_CLIENT_ID" "GitHub OAuth Client ID")
-    github_client_secret=$(prompt_secret "GITHUB_CLIENT_SECRET" "GitHub OAuth Client Secret")
-    auth_base_url=$(prompt_required "AUTH_BASE_URL" "$(msg oauth_url_hint)")
-    validate_url "$auth_base_url" "AUTH_BASE_URL"
+    device_flow_enabled="true"
+    github_client_id=$(prompt_required "GITHUB_CLIENT_ID" "GitHub OAuth App Client ID")
   fi
-
-  log_step "$(msg step_bot)"
-  local app_id app_password
-  app_id=$(prompt_required "MicrosoftAppId" "Microsoft App ID")
-  app_password=$(prompt_secret "MicrosoftAppPassword" "Microsoft App Password")
 
   log_step "$(msg step_role)"
   echo -e "  ${CYAN}$(msg role_hint)${NC}"
@@ -466,33 +447,22 @@ do_interactive() {
   model=$(select_model)
   log_info "$(msg selected_model) $model"
 
-  log_step "$(msg step_domain)"
-  echo -e "  ${CYAN}$(msg domain_hint)${NC}"
-  local domain
-  domain=$(prompt_optional "$(msg ask_domain)" "localhost")
-
-  log_step "$(msg step_advanced)"
-  local docker_image rate_limit admin_token auto_update trust_proxy
-  docker_image=$(prompt_optional "$(msg ask_image)" "gtastudio/gta-claw:latest")
-  rate_limit=$(prompt_optional "$(msg ask_rate)" "30")
-  auto_update=$(prompt_optional "$(msg ask_auto_update)" "false")
-  trust_proxy=$(prompt_optional "$(msg ask_trust_proxy)" "false")
-  admin_token=$(prompt_optional "$(msg ask_admin_token)" "")
-
-  validate_image_ref "$docker_image"
-  validate_positive_integer "$rate_limit" "RATE_LIMIT_PER_MIN"
-  validate_boolean "$auto_update" "AUTO_UPDATE"
-  validate_boolean "$trust_proxy" "TRUST_PROXY"
-  validate_auth_mode "$github_token" "$oauth_enabled" "$github_client_id" "$github_client_secret" "$auth_base_url"
-
+  log_step "$(msg step_channels)"
   local enable_teams enable_telegram enable_discord enable_whatsapp
+  local app_id app_password
   local telegram_bot_token telegram_poll_interval_ms discord_bot_token discord_gateway_url discord_gateway_intents
   local whatsapp_verify_token whatsapp_access_token whatsapp_phone_number_id whatsapp_webhook_path
 
-  enable_teams=$(prompt_optional "$(msg ask_enable_teams)" "true")
+  enable_teams=$(prompt_optional "$(msg ask_enable_teams)" "false")
+
+  app_id=""
+  app_password=""
+  if [ "$enable_teams" = "true" ]; then
+    app_id=$(prompt_required "MicrosoftAppId" "Microsoft App ID")
+    app_password=$(prompt_secret "MicrosoftAppPassword" "Microsoft App Password")
+  fi
+
   enable_telegram=$(prompt_optional "$(msg ask_enable_telegram)" "false")
-  enable_discord=$(prompt_optional "$(msg ask_enable_discord)" "false")
-  enable_whatsapp=$(prompt_optional "$(msg ask_enable_whatsapp)" "false")
 
   telegram_bot_token=""
   telegram_poll_interval_ms="2000"
@@ -501,6 +471,8 @@ do_interactive() {
     telegram_poll_interval_ms=$(prompt_optional "$(msg ask_tg_interval)" "2000")
     validate_positive_integer "$telegram_poll_interval_ms" "TELEGRAM_POLL_INTERVAL_MS"
   fi
+
+  enable_discord=$(prompt_optional "$(msg ask_enable_discord)" "false")
 
   discord_bot_token=""
   discord_gateway_url="wss://gateway.discord.gg/?v=10&encoding=json"
@@ -511,6 +483,8 @@ do_interactive() {
     discord_gateway_intents=$(prompt_optional "$(msg ask_discord_intents)" "$discord_gateway_intents")
     validate_positive_integer "$discord_gateway_intents" "DISCORD_GATEWAY_INTENTS"
   fi
+
+  enable_whatsapp=$(prompt_optional "$(msg ask_enable_whatsapp)" "false")
 
   whatsapp_verify_token=""
   whatsapp_access_token=""
@@ -534,6 +508,22 @@ do_interactive() {
     "$whatsapp_access_token" \
     "$whatsapp_phone_number_id"
 
+  log_step "$(msg step_advanced)"
+  echo -e "  ${CYAN}$(msg domain_hint)${NC}"
+  local domain docker_image rate_limit admin_token auto_update trust_proxy
+  domain=$(prompt_optional "$(msg ask_domain)" "localhost")
+  docker_image=$(prompt_optional "$(msg ask_image)" "gtastudio/gta-claw:latest")
+  rate_limit=$(prompt_optional "$(msg ask_rate)" "30")
+  auto_update=$(prompt_optional "$(msg ask_auto_update)" "false")
+  trust_proxy=$(prompt_optional "$(msg ask_trust_proxy)" "false")
+  admin_token=$(prompt_optional "$(msg ask_admin_token)" "")
+
+  validate_image_ref "$docker_image"
+  validate_positive_integer "$rate_limit" "RATE_LIMIT_PER_MIN"
+  validate_boolean "$auto_update" "AUTO_UPDATE"
+  validate_boolean "$trust_proxy" "TRUST_PROXY"
+  validate_auth_mode "$github_token" "$device_flow_enabled" "$github_client_id"
+
   log_step "$(msg step_write)"
 
   # 写入 .env
@@ -543,12 +533,8 @@ do_interactive() {
 
 DOCKER_IMAGE=${docker_image}
 GITHUB_TOKEN=${github_token}
-OAUTH_ENABLED=${oauth_enabled}
+DEVICE_FLOW_ENABLED=${device_flow_enabled}
 GITHUB_CLIENT_ID=${github_client_id}
-GITHUB_CLIENT_SECRET=${github_client_secret}
-AUTH_BASE_URL=${auth_base_url}
-OAUTH_CALLBACK_PATH=${oauth_callback_path}
-OAUTH_SCOPE=${oauth_scope}
 MicrosoftAppId=${app_id}
 MicrosoftAppPassword=${app_password}
 AGENT_ROLE_URL=${role_url}

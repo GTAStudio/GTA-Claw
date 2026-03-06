@@ -9,13 +9,9 @@
 # 方案 A: Personal Access Token
 GITHUB_TOKEN=
 
-# 方案 B: OAuth 网页授权 (企业推荐)
-OAUTH_ENABLED=false
+# 方案 B: Device Flow 设备授权 (推荐, 无需域名/回调)
+DEVICE_FLOW_ENABLED=false
 GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
-AUTH_BASE_URL=
-OAUTH_CALLBACK_PATH=/auth/callback
-OAUTH_SCOPE=copilot
 
 # ---- 必填项 ----
 

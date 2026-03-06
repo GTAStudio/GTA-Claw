@@ -7,7 +7,6 @@ import { logger } from "./utils/logger.js";
 import type { AgentBot } from "./bot/teamsBot.js";
 import type { AppConfig } from "./config.js";
 import type { CopilotEngine } from "./engine/copilotEngine.js";
-import type { GitHubOAuthManager } from "./auth/githubOAuth.js";
 import type { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
 
 interface RuntimeStatus {
@@ -72,7 +71,6 @@ interface ServerDeps {
   config: AppConfig;
   getEngine: () => CopilotEngine | null;
   getRuntimeStatus: () => RuntimeStatus;
-  oauthManager?: GitHubOAuthManager;
   whatsappHandler?: WhatsAppWebhookHandler;
   reloadFn?: () => Promise<ReloadResult>;
 }
@@ -148,23 +146,10 @@ export function createServer(deps: ServerDeps): restify.Server {
       sessions: engine?.sessionCount ?? 0,
       model: status.activeModel,
       authenticated: Boolean(engine),
-      oauthEnabled: config.OAUTH_ENABLED,
+      deviceFlowEnabled: config.DEVICE_FLOW_ENABLED,
     });
     next();
   });
-
-  if (deps.oauthManager) {
-    const oauth = deps.oauthManager;
-
-    server.get("/auth/login", oauth.login);
-    server.get(config.OAUTH_CALLBACK_PATH, oauth.callback);
-    server.get("/auth/status", (req: Request, res: Response, next: Next) => {
-      const status = oauth.getStatus(req);
-      res.send(200, status);
-      next();
-    });
-    server.post("/auth/logout", oauth.logout);
-  }
 
   if (deps.whatsappHandler) {
     const whatsapp = deps.whatsappHandler;

@@ -3,21 +3,23 @@ import {
   type TurnContext,
 } from "botbuilder";
 import { logger } from "../utils/logger.js";
+import { splitMessage } from "../utils/splitMessage.js";
 import type { CopilotEngine } from "../engine/copilotEngine.js";
+import type { GitHubDeviceFlow } from "../auth/deviceFlow.js";
 
 const TEAMS_MAX_MESSAGE_LENGTH = 4000;
 
 export class AgentBot extends TeamsActivityHandler {
   private readonly getEngine: () => CopilotEngine | null;
-  private readonly oauthLoginPath: string | undefined;
+  private readonly deviceFlow: GitHubDeviceFlow | undefined;
 
   constructor(
     getEngine: () => CopilotEngine | null,
-    oauthLoginPath?: string,
+    deviceFlow?: GitHubDeviceFlow,
   ) {
     super();
     this.getEngine = getEngine;
-    this.oauthLoginPath = oauthLoginPath;
+    this.deviceFlow = deviceFlow;
   }
 
   protected async onMessageActivity(context: TurnContext): Promise<void> {
@@ -26,8 +28,8 @@ export class AgentBot extends TeamsActivityHandler {
 
     const engine = this.getEngine();
     if (!engine) {
-      const authHint = this.oauthLoginPath
-        ? `Please authorize first: ${this.oauthLoginPath}`
+      const authHint = this.deviceFlow
+        ? await this.deviceFlow.getAuthMessage()
         : "No active GitHub token is configured.";
       await context.sendActivity(
         `GTA-Claw is not authenticated yet. ${authHint}`,
@@ -78,32 +80,4 @@ export class AgentBot extends TeamsActivityHandler {
     // Treat edited messages as new messages
     await this.onMessageActivity(context);
   }
-}
-
-function splitMessage(text: string, maxLength: number): string[] {
-  if (text.length <= maxLength) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      chunks.push(remaining);
-      break;
-    }
-
-    // Try to split at a newline or space boundary
-    let splitAt = remaining.lastIndexOf("\n", maxLength);
-    if (splitAt < maxLength * 0.5) {
-      splitAt = remaining.lastIndexOf(" ", maxLength);
-    }
-    if (splitAt < maxLength * 0.3) {
-      splitAt = maxLength; // Hard split
-    }
-
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
-  }
-
-  return chunks;
 }

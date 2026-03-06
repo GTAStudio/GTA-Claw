@@ -1,4 +1,5 @@
 import { logger } from "../utils/logger.js";
+import { splitMessage } from "../utils/splitMessage.js";
 
 interface TelegramUser {
   id: number;
@@ -132,7 +133,7 @@ export class TelegramPollingClient {
   }
 
   private async sendMessage(chatId: number, text: string): Promise<void> {
-    const chunks = splitForTelegram(text, 4000);
+    const chunks = splitMessage(text, 4000);
     for (const chunk of chunks) {
       const resp = await fetch(`${this.baseUrl}/sendMessage`, {
         method: "POST",
@@ -150,24 +151,4 @@ export class TelegramPollingClient {
       }
     }
   }
-}
-
-function splitForTelegram(text: string, maxLength: number): string[] {
-  if (text.length <= maxLength) return [text];
-  const out: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      out.push(remaining);
-      break;
-    }
-
-    let splitAt = remaining.lastIndexOf("\n", maxLength);
-    if (splitAt < maxLength * 0.5) splitAt = remaining.lastIndexOf(" ", maxLength);
-    if (splitAt < maxLength * 0.3) splitAt = maxLength;
-
-    out.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
-  }
-  return out;
 }

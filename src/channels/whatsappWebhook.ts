@@ -1,5 +1,6 @@
 import type { Next, Request, Response } from "restify";
 import { logger } from "../utils/logger.js";
+import { splitMessage } from "../utils/splitMessage.js";
 
 interface WhatsAppTextMessage {
   from: string;
@@ -105,7 +106,7 @@ export class WhatsAppWebhookHandler {
   };
 
   private async sendText(to: string, text: string): Promise<void> {
-    for (const chunk of splitForWhatsApp(text, 3500)) {
+    for (const chunk of splitMessage(text, 3500)) {
       const resp = await fetch(
         `https://graph.facebook.com/v20.0/${this.phoneNumberId}/messages`,
         {
@@ -132,26 +133,4 @@ export class WhatsAppWebhookHandler {
       }
     }
   }
-}
-
-function splitForWhatsApp(text: string, maxLength: number): string[] {
-  if (text.length <= maxLength) return [text];
-
-  const out: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      out.push(remaining);
-      break;
-    }
-
-    let splitAt = remaining.lastIndexOf("\n", maxLength);
-    if (splitAt < maxLength * 0.5) splitAt = remaining.lastIndexOf(" ", maxLength);
-    if (splitAt < maxLength * 0.3) splitAt = maxLength;
-
-    out.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
-  }
-
-  return out;
 }

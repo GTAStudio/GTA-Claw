@@ -7,7 +7,7 @@ import { CopilotEngine } from "./engine/copilotEngine.js";
 import { AgentBot } from "./bot/teamsBot.js";
 import { createServer } from "./server.js";
 import { checkForUpdates } from "./updater/sdkUpdater.js";
-import { GitHubOAuthManager } from "./auth/githubOAuth.js";
+import { GitHubDeviceFlow } from "./auth/deviceFlow.js";
 import { processIncomingMessage } from "./channels/messageProcessor.js";
 import { TelegramPollingClient } from "./channels/telegramPolling.js";
 import { DiscordGatewayClient } from "./channels/discordGateway.js";
@@ -98,24 +98,14 @@ async function main(): Promise<void> {
     );
   }
 
-  const oauthManager = config.OAUTH_ENABLED
-    ? new GitHubOAuthManager({
+  const deviceFlow = config.DEVICE_FLOW_ENABLED
+    ? new GitHubDeviceFlow({
         clientId: config.GITHUB_CLIENT_ID!,
-        clientSecret: config.GITHUB_CLIENT_SECRET!,
-        baseUrl: config.AUTH_BASE_URL!,
-        callbackPath: config.OAUTH_CALLBACK_PATH,
-        scope: config.OAUTH_SCOPE,
-        sessionTtlMs: config.SESSION_TTL_MS,
-        onTokenAuthorized: async (token, login) => {
-          await activateEngineWithToken(token, `oauth:${login}`);
+        onTokenAcquired: async (token, login) => {
+          await activateEngineWithToken(token, `device-flow:${login}`);
         },
       })
     : undefined;
-
-  const oauthLoginPath =
-    config.OAUTH_ENABLED && config.AUTH_BASE_URL
-      ? `${config.AUTH_BASE_URL}/auth/login`
-      : undefined;
 
   const processChannelMessage = async (input: {
     channel: "telegram" | "discord" | "whatsapp";
@@ -123,7 +113,7 @@ async function main(): Promise<void> {
     userName: string;
     text: string;
   }): Promise<string> =>
-    processIncomingMessage(() => engine, oauthLoginPath, input);
+    processIncomingMessage(() => engine, deviceFlow, input);
 
   const telegramClient = config.ENABLE_TELEGRAM
     ? new TelegramPollingClient({
@@ -155,14 +145,13 @@ async function main(): Promise<void> {
     : undefined;
 
   // 5. Create Teams bot
-  const bot = new AgentBot(() => engine, oauthLoginPath);
+  const bot = new AgentBot(() => engine, deviceFlow);
 
   // 6. Create and start HTTP server
   const server = createServer({
     bot,
     config,
     getEngine: () => engine,
-    oauthManager,
     whatsappHandler,
     getRuntimeStatus: () => ({
       skillCount: skills.length,
@@ -269,6 +258,9 @@ async function main(): Promise<void> {
     logger.info({ signal }, "Shutdown signal received");
 
     server.close();
+    if (deviceFlow) {
+      deviceFlow.stop();
+    }
     if (telegramClient) {
       await telegramClient.stop();
     }

@@ -24,23 +24,18 @@ vim conf/gta-claw.conf    # 填写实际值
 支持两种方式（二选一）：
 
 1. `GITHUB_TOKEN` (PAT)
-2. OAuth 网页授权（企业推荐）
+2. Device Flow 设备授权（推荐，无需域名）
 
-OAuth 模式需要在 `conf/gta-claw.conf` 中配置：
+Device Flow 模式只需要在 `conf/gta-claw.conf` 中配置：
 
 ```ini
-OAUTH_ENABLED=true
-GITHUB_CLIENT_ID=...
-GITHUB_CLIENT_SECRET=...
-AUTH_BASE_URL=https://your-domain.com
-OAUTH_CALLBACK_PATH=/auth/callback
-OAUTH_SCOPE=copilot
+DEVICE_FLOW_ENABLED=true
+GITHUB_CLIENT_ID=你的 OAuth App Client ID
 ```
 
-部署后先访问：
+用户给机器人发消息时，机器人会回复一个验证码和链接（https://github.com/login/device），用户在浏览器中输入验证码即可完成授权。
 
-- `https://<你的域名>/auth/login` 完成授权
-- `https://<你的域名>/auth/status` 查看授权状态
+**不需要域名、回调 URL 或 Client Secret。**
 
 ## 四通道兼容
 

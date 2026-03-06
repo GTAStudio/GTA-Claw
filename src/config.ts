@@ -9,12 +9,8 @@ export interface AppConfig {
 
   // Auth
   GITHUB_TOKEN?: string;
-  OAUTH_ENABLED: boolean;
+  DEVICE_FLOW_ENABLED: boolean;
   GITHUB_CLIENT_ID?: string;
-  GITHUB_CLIENT_SECRET?: string;
-  AUTH_BASE_URL?: string;
-  OAUTH_CALLBACK_PATH: string;
-  OAUTH_SCOPE: string;
 
   // Channel switches
   ENABLE_TEAMS: boolean;
@@ -144,14 +140,6 @@ export function loadConfig(): AppConfig {
 
   const GITHUB_TOKEN = process.env["GITHUB_TOKEN"]?.trim();
   const GITHUB_CLIENT_ID = process.env["GITHUB_CLIENT_ID"]?.trim();
-  const GITHUB_CLIENT_SECRET = process.env["GITHUB_CLIENT_SECRET"]?.trim();
-  const AUTH_BASE_URL_RAW = process.env["AUTH_BASE_URL"]?.trim();
-  const AUTH_BASE_URL = AUTH_BASE_URL_RAW
-    ? validateUrl(AUTH_BASE_URL_RAW, "AUTH_BASE_URL")
-    : undefined;
-  const OAUTH_CALLBACK_PATH =
-    process.env["OAUTH_CALLBACK_PATH"]?.trim() || "/auth/callback";
-  const OAUTH_SCOPE = process.env["OAUTH_SCOPE"]?.trim() || "copilot";
 
   const ENABLE_TEAMS = parseBooleanEnv("ENABLE_TEAMS", true);
   const ENABLE_TELEGRAM = parseBooleanEnv("ENABLE_TELEGRAM", false);
@@ -187,26 +175,15 @@ export function loadConfig(): AppConfig {
   const WHATSAPP_WEBHOOK_PATH =
     process.env["WHATSAPP_WEBHOOK_PATH"]?.trim() || "/whatsapp/webhook";
 
-  const hasOAuthConfig = Boolean(
-    GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && AUTH_BASE_URL,
-  );
-  const OAUTH_ENABLED = parseBooleanEnv("OAUTH_ENABLED", hasOAuthConfig);
+  const DEVICE_FLOW_ENABLED = parseBooleanEnv("DEVICE_FLOW_ENABLED", Boolean(GITHUB_CLIENT_ID));
 
-  if (OAUTH_ENABLED && !hasOAuthConfig) {
-    throw new Error(
-      "OAUTH_ENABLED=true requires GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and AUTH_BASE_URL",
-    );
+  if (DEVICE_FLOW_ENABLED && !GITHUB_CLIENT_ID) {
+    throw new Error("DEVICE_FLOW_ENABLED=true requires GITHUB_CLIENT_ID");
   }
 
-  if (!GITHUB_TOKEN && !OAUTH_ENABLED) {
+  if (!GITHUB_TOKEN && !DEVICE_FLOW_ENABLED) {
     throw new Error(
-      "Either GITHUB_TOKEN must be set or OAuth must be enabled with OAUTH_ENABLED=true",
-    );
-  }
-
-  if (!OAUTH_CALLBACK_PATH.startsWith("/")) {
-    throw new Error(
-      `OAUTH_CALLBACK_PATH must start with '/': ${OAUTH_CALLBACK_PATH}`,
+      "Either GITHUB_TOKEN or DEVICE_FLOW_ENABLED=true (with GITHUB_CLIENT_ID) is required",
     );
   }
 
@@ -267,12 +244,8 @@ export function loadConfig(): AppConfig {
     AGENT_ROLE_URL,
     ENABLED_SKILLS,
     GITHUB_TOKEN,
-    OAUTH_ENABLED,
+    DEVICE_FLOW_ENABLED,
     GITHUB_CLIENT_ID,
-    GITHUB_CLIENT_SECRET,
-    AUTH_BASE_URL,
-    OAUTH_CALLBACK_PATH,
-    OAUTH_SCOPE,
     ENABLE_TEAMS,
     ENABLE_TELEGRAM,
     ENABLE_DISCORD,
@@ -313,10 +286,10 @@ export function loadConfig(): AppConfig {
       skillUrls: config.ENABLED_SKILLS.length,
       rateLimitPerMin: config.RATE_LIMIT_PER_MIN,
       domain: config.DOMAIN,
-      authMode: config.OAUTH_ENABLED
+      authMode: config.DEVICE_FLOW_ENABLED
         ? config.GITHUB_TOKEN
-          ? "oauth+token"
-          : "oauth"
+          ? "device-flow+token"
+          : "device-flow"
         : "token",
       channels: {
         teams: config.ENABLE_TEAMS,
