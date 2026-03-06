@@ -2,8 +2,8 @@ import { logger } from "./utils/logger.js";
 
 export interface AppConfig {
   // Required core
-  MICROSOFT_APP_ID: string;
-  MICROSOFT_APP_PASSWORD: string;
+  MICROSOFT_APP_ID?: string;
+  MICROSOFT_APP_PASSWORD?: string;
   AGENT_ROLE_URL: string;
   ENABLED_SKILLS: string[];
 
@@ -213,6 +213,15 @@ export function loadConfig(): AppConfig {
   if (ENABLE_TELEGRAM && !TELEGRAM_BOT_TOKEN) {
     throw new Error("ENABLE_TELEGRAM=true requires TELEGRAM_BOT_TOKEN");
   }
+  if (
+    ENABLE_TEAMS &&
+    (!process.env["MicrosoftAppId"]?.trim() ||
+      !process.env["MicrosoftAppPassword"]?.trim())
+  ) {
+    throw new Error(
+      "ENABLE_TEAMS=true requires MicrosoftAppId and MicrosoftAppPassword",
+    );
+  }
   if (ENABLE_DISCORD && !DISCORD_BOT_TOKEN) {
     throw new Error("ENABLE_DISCORD=true requires DISCORD_BOT_TOKEN");
   }
@@ -232,8 +241,8 @@ export function loadConfig(): AppConfig {
     );
   }
 
-  const MICROSOFT_APP_ID = requireEnv("MicrosoftAppId");
-  const MICROSOFT_APP_PASSWORD = requireEnv("MicrosoftAppPassword");
+  const MICROSOFT_APP_ID = process.env["MicrosoftAppId"]?.trim();
+  const MICROSOFT_APP_PASSWORD = process.env["MicrosoftAppPassword"]?.trim();
 
   const AGENT_ROLE_URL = validateUrl(
     requireEnv("AGENT_ROLE_URL"),

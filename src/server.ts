@@ -85,17 +85,21 @@ export function createServer(deps: ServerDeps): restify.Server {
   const server = restify.createServer({ name: "GTA-Claw" });
   server.use(restify.plugins.queryParser());
   server.use(restify.plugins.bodyParser());
-  const adapter = new BotFrameworkAdapter({
-    appId: config.MICROSOFT_APP_ID,
-    appPassword: config.MICROSOFT_APP_PASSWORD,
-  });
+  const adapter = config.ENABLE_TEAMS
+    ? new BotFrameworkAdapter({
+        appId: config.MICROSOFT_APP_ID,
+        appPassword: config.MICROSOFT_APP_PASSWORD,
+      })
+    : null;
   const rateLimiter = new RateLimiter(config.RATE_LIMIT_PER_MIN);
 
-  // Adapter error handler
-  adapter.onTurnError = async (context: TurnContext, error: Error) => {
-    logger.error({ err: error }, "Bot adapter turn error");
-    await context.sendActivity("An error occurred. Please try again later.");
-  };
+  if (adapter) {
+    // Adapter error handler
+    adapter.onTurnError = async (context: TurnContext, error: Error) => {
+      logger.error({ err: error }, "Bot adapter turn error");
+      await context.sendActivity("An error occurred. Please try again later.");
+    };
+  }
 
   // Rate limiting middleware
   server.use((req: Request, res: Response, next: Next) => {
@@ -123,6 +127,9 @@ export function createServer(deps: ServerDeps): restify.Server {
 
   // Bot Framework messages endpoint (Teams)
   if (config.ENABLE_TEAMS) {
+    if (!adapter) {
+      throw new Error("Teams is enabled but Bot Framework adapter is unavailable");
+    }
     server.post("/api/messages", async (req: Request, res: Response) => {
       await adapter.processActivity(req, res, async (context) => {
         await bot.run(context);

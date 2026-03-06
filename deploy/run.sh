@@ -26,11 +26,81 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 ENV_FILE=".env"
+LANG_CHOICE="${APP_LANG:-zh}"
 
 log_info()  { echo -e "${GREEN}[✓]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 log_error() { echo -e "${RED}[✗]${NC} $*"; }
 log_step()  { echo -e "${CYAN}[»]${NC} ${BOLD}$*${NC}"; }
+
+is_en() {
+  [ "$LANG_CHOICE" = "en" ]
+}
+
+msg() {
+  local key="$1"
+  case "$key" in
+    lang_prompt) if is_en; then echo "Choose language: 1) English  2) 中文"; else echo "请选择语言：1) English  2) 中文"; fi ;;
+    lang_input) if is_en; then echo "Enter choice [2]:"; else echo "输入选项 [2]："; fi ;;
+    banner_top) if is_en; then echo "╔══════════════════════════════════════════╗"; else echo "╔══════════════════════════════════════════╗"; fi ;;
+    banner_mid) if is_en; then echo "║      GTA-Claw — Interactive Setup       ║"; else echo "║     GTA-Claw — 交互式部署向导            ║"; fi ;;
+    banner_bot) if is_en; then echo "╚══════════════════════════════════════════╝"; else echo "╚══════════════════════════════════════════╝"; fi ;;
+    existing_env) if is_en; then echo "Detected existing .env file"; else echo "检测到已有配置文件 (.env)"; fi ;;
+    reconfigure) if is_en; then echo "Reconfigure? (y/N):"; else echo "是否重新配置？(y/N):"; fi ;;
+    use_existing) if is_en; then echo "Using existing configuration"; else echo "使用现有配置"; fi ;;
+    step_auth) if is_en; then echo "[1/8] GitHub auth mode"; else echo "[1/8] GitHub 认证方式"; fi ;;
+    step_bot) if is_en; then echo "[2/8] Azure Bot credentials"; else echo "[2/8] Azure Bot 凭据"; fi ;;
+    step_role) if is_en; then echo "[3/8] Role configuration"; else echo "[3/8] Role 配置"; fi ;;
+    step_skills) if is_en; then echo "[4/8] Skills configuration"; else echo "[4/8] Skills 配置"; fi ;;
+    step_model) if is_en; then echo "[5/8] AI model"; else echo "[5/8] AI 模型"; fi ;;
+    step_domain) if is_en; then echo "[6/8] Domain configuration"; else echo "[6/8] 域名配置"; fi ;;
+    step_advanced) if is_en; then echo "[7/8] Advanced options"; else echo "[7/8] 高级选项"; fi ;;
+    step_write) if is_en; then echo "[8/8] Writing configuration"; else echo "[8/8] 写入配置"; fi ;;
+    auth_choice) if is_en; then echo "Auth mode number"; else echo "认证方式编号"; fi ;;
+    oauth_url_hint) if is_en; then echo "OAuth base URL (e.g. https://bot.example.com)"; else echo "OAuth 回调基础 URL (如 https://bot.example.com)"; fi ;;
+    role_hint) if is_en; then echo "Hint: URL to JSON, e.g. {\"content\":\"You are...\",\"model\":\"gpt-4o\"}"; else echo "提示: 指向一个 JSON 文件, 格式: {\"content\": \"You are...\", \"model\": \"gpt-4o\"}"; fi ;;
+    skills_hint) if is_en; then echo "Hint: Separate multiple skill URLs with commas"; else echo "提示: 多个 Skill URL 用逗号分隔"; fi ;;
+    domain_hint) if is_en; then echo "Hint: Caddy can auto-issue HTTPS certs; use localhost for local testing"; else echo "提示: Caddy 会自动申请 HTTPS 证书, 本地测试用 localhost"; fi ;;
+    selected_model) if is_en; then echo "Selected model:"; else echo "已选择模型:"; fi ;;
+    ask_domain) if is_en; then echo "Domain"; else echo "域名"; fi ;;
+    ask_image) if is_en; then echo "Docker image"; else echo "Docker 镜像"; fi ;;
+    ask_rate) if is_en; then echo "Rate limit (requests/min per IP)"; else echo "速率限制 (每IP每分钟请求数)"; fi ;;
+    ask_auto_update) if is_en; then echo "Auto-update SDK/CLI (true/false)"; else echo "自动更新 SDK/CLI (true/false)"; fi ;;
+    ask_trust_proxy) if is_en; then echo "Trust proxy headers (true/false)"; else echo "信任反向代理头 (true/false)"; fi ;;
+    ask_admin_token) if is_en; then echo "Admin API token (empty to disable)"; else echo "Admin API 令牌 (留空禁用)"; fi ;;
+    ask_enable_teams) if is_en; then echo "Enable Teams channel (true/false)"; else echo "启用 Teams 通道 (true/false)"; fi ;;
+    ask_enable_telegram) if is_en; then echo "Enable Telegram polling channel (true/false)"; else echo "启用 Telegram Polling 通道 (true/false)"; fi ;;
+    ask_enable_discord) if is_en; then echo "Enable Discord gateway channel (true/false)"; else echo "启用 Discord Gateway 通道 (true/false)"; fi ;;
+    ask_enable_whatsapp) if is_en; then echo "Enable WhatsApp webhook channel (true/false)"; else echo "启用 WhatsApp Webhook 通道 (true/false)"; fi ;;
+    ask_tg_interval) if is_en; then echo "Telegram polling interval (ms)"; else echo "Telegram 轮询间隔毫秒"; fi ;;
+    ask_discord_gateway_url) if is_en; then echo "Discord gateway URL"; else echo "Discord Gateway URL"; fi ;;
+    ask_discord_intents) if is_en; then echo "Discord gateway intents"; else echo "Discord Gateway Intents"; fi ;;
+    ask_wa_webhook_path) if is_en; then echo "WhatsApp webhook path"; else echo "WhatsApp Webhook 路径"; fi ;;
+    config_saved) if is_en; then echo "Configuration saved to .env"; else echo "配置已保存到 .env"; fi ;;
+    *) echo "$key" ;;
+  esac
+}
+
+select_language() {
+  if [ -n "${APP_LANG:-}" ]; then
+    case "${APP_LANG}" in
+      en|EN|english|English) LANG_CHOICE="en" ;;
+      *) LANG_CHOICE="zh" ;;
+    esac
+    return
+  fi
+
+  echo ""
+  echo "$(msg lang_prompt)"
+  local lang_input
+  read -rp "$(msg lang_input) " lang_input
+  lang_input="${lang_input:-2}"
+  if [ "$lang_input" = "1" ]; then
+    LANG_CHOICE="en"
+  else
+    LANG_CHOICE="zh"
+  fi
+}
 
 # ---- 前置检查 ----
 check_prerequisites() {
@@ -277,12 +347,23 @@ do_config() {
 
   # 验证基础必填项
   local has_error=0
-  for var in MicrosoftAppId MicrosoftAppPassword AGENT_ROLE_URL ENABLED_SKILLS; do
+  for var in AGENT_ROLE_URL ENABLED_SKILLS; do
     if ! grep -Eq "^${var}=.+" "$ENV_FILE"; then
       log_error "缺少必填配置: $var"
       has_error=1
     fi
   done
+
+  local enable_teams
+  enable_teams="$(grep '^ENABLE_TEAMS=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'true')"
+  if [ "$enable_teams" = "true" ]; then
+    for var in MicrosoftAppId MicrosoftAppPassword; do
+      if ! grep -Eq "^${var}=.+" "$ENV_FILE"; then
+        log_error "ENABLE_TEAMS=true 时缺少必填配置: $var"
+        has_error=1
+      fi
+    done
+  fi
 
   if [ "$has_error" -ne 0 ]; then
     log_error "请检查配置文件并补充必填项"
@@ -320,29 +401,31 @@ do_config() {
 
 # ---- 交互式部署 ----
 do_interactive() {
+  select_language
+
   echo ""
-  echo -e "${BOLD}╔══════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}║     GTA-Claw — 交互式部署向导            ║${NC}"
-  echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
+  echo -e "${BOLD}$(msg banner_top)${NC}"
+  echo -e "${BOLD}$(msg banner_mid)${NC}"
+  echo -e "${BOLD}$(msg banner_bot)${NC}"
   echo ""
 
   # 如果已存在 .env，询问是否覆盖
   if [ -f "$ENV_FILE" ]; then
-    echo -e "  ${YELLOW}检测到已有配置文件 (.env)${NC}"
+    echo -e "  ${YELLOW}$(msg existing_env)${NC}"
     local overwrite
-    read -rp "  是否重新配置？(y/N): " overwrite
+    read -rp "  $(msg reconfigure) " overwrite
     if [[ ! "$overwrite" =~ ^[yY] ]]; then
-      log_info "使用现有配置"
+      log_info "$(msg use_existing)"
       do_deploy
       return
     fi
   fi
 
-  log_step "[1/8] GitHub 认证方式"
+  log_step "$(msg step_auth)"
   echo "  1) Personal Access Token"
   echo "  2) OAuth 网页授权 (企业推荐)"
   local auth_mode
-  auth_mode=$(prompt_optional "认证方式编号" "2")
+  auth_mode=$(prompt_optional "$(msg auth_choice)" "2")
 
   local github_token=""
   local oauth_enabled="false"
@@ -358,44 +441,44 @@ do_interactive() {
     oauth_enabled="true"
     github_client_id=$(prompt_required "GITHUB_CLIENT_ID" "GitHub OAuth Client ID")
     github_client_secret=$(prompt_secret "GITHUB_CLIENT_SECRET" "GitHub OAuth Client Secret")
-    auth_base_url=$(prompt_required "AUTH_BASE_URL" "OAuth 回调基础 URL (如 https://bot.example.com)")
+    auth_base_url=$(prompt_required "AUTH_BASE_URL" "$(msg oauth_url_hint)")
     validate_url "$auth_base_url" "AUTH_BASE_URL"
   fi
 
-  log_step "[2/8] Azure Bot 凭据"
+  log_step "$(msg step_bot)"
   local app_id app_password
   app_id=$(prompt_required "MicrosoftAppId" "Microsoft App ID")
   app_password=$(prompt_secret "MicrosoftAppPassword" "Microsoft App Password")
 
-  log_step "[3/8] Role 配置"
-  echo -e "  ${CYAN}提示: 指向一个 JSON 文件, 格式: {\"content\": \"You are...\", \"model\": \"gpt-4o\"}${NC}"
+  log_step "$(msg step_role)"
+  echo -e "  ${CYAN}$(msg role_hint)${NC}"
   local role_url
   role_url=$(prompt_required "AGENT_ROLE_URL" "Role 配置 URL")
   validate_url "$role_url" "AGENT_ROLE_URL"
 
-  log_step "[4/8] Skills 配置"
-  echo -e "  ${CYAN}提示: 多个 Skill URL 用逗号分隔${NC}"
+  log_step "$(msg step_skills)"
+  echo -e "  ${CYAN}$(msg skills_hint)${NC}"
   local skills_urls
   skills_urls=$(prompt_required "ENABLED_SKILLS" "Skill URLs")
   validate_skills_urls "$skills_urls"
 
-  log_step "[5/8] AI 模型"
+  log_step "$(msg step_model)"
   local model
   model=$(select_model)
-  log_info "已选择模型: $model"
+  log_info "$(msg selected_model) $model"
 
-  log_step "[6/8] 域名配置"
-  echo -e "  ${CYAN}提示: Caddy 会自动申请 HTTPS 证书, 本地测试用 localhost${NC}"
+  log_step "$(msg step_domain)"
+  echo -e "  ${CYAN}$(msg domain_hint)${NC}"
   local domain
-  domain=$(prompt_optional "域名" "localhost")
+  domain=$(prompt_optional "$(msg ask_domain)" "localhost")
 
-  log_step "[7/8] 高级选项"
+  log_step "$(msg step_advanced)"
   local docker_image rate_limit admin_token auto_update trust_proxy
-  docker_image=$(prompt_optional "Docker 镜像" "gtastudio/gta-claw:latest")
-  rate_limit=$(prompt_optional "速率限制 (每IP每分钟请求数)" "30")
-  auto_update=$(prompt_optional "自动更新 SDK/CLI (true/false)" "false")
-  trust_proxy=$(prompt_optional "信任反向代理头 (true/false)" "false")
-  admin_token=$(prompt_optional "Admin API 令牌 (留空禁用)" "")
+  docker_image=$(prompt_optional "$(msg ask_image)" "gtastudio/gta-claw:latest")
+  rate_limit=$(prompt_optional "$(msg ask_rate)" "30")
+  auto_update=$(prompt_optional "$(msg ask_auto_update)" "false")
+  trust_proxy=$(prompt_optional "$(msg ask_trust_proxy)" "false")
+  admin_token=$(prompt_optional "$(msg ask_admin_token)" "")
 
   validate_image_ref "$docker_image"
   validate_positive_integer "$rate_limit" "RATE_LIMIT_PER_MIN"
@@ -407,16 +490,16 @@ do_interactive() {
   local telegram_bot_token telegram_poll_interval_ms discord_bot_token discord_gateway_url discord_gateway_intents
   local whatsapp_verify_token whatsapp_access_token whatsapp_phone_number_id whatsapp_webhook_path
 
-  enable_teams=$(prompt_optional "启用 Teams 通道 (true/false)" "true")
-  enable_telegram=$(prompt_optional "启用 Telegram Polling 通道 (true/false)" "false")
-  enable_discord=$(prompt_optional "启用 Discord Gateway 通道 (true/false)" "false")
-  enable_whatsapp=$(prompt_optional "启用 WhatsApp Webhook 通道 (true/false)" "false")
+  enable_teams=$(prompt_optional "$(msg ask_enable_teams)" "true")
+  enable_telegram=$(prompt_optional "$(msg ask_enable_telegram)" "false")
+  enable_discord=$(prompt_optional "$(msg ask_enable_discord)" "false")
+  enable_whatsapp=$(prompt_optional "$(msg ask_enable_whatsapp)" "false")
 
   telegram_bot_token=""
   telegram_poll_interval_ms="2000"
   if [ "$enable_telegram" = "true" ]; then
     telegram_bot_token=$(prompt_secret "TELEGRAM_BOT_TOKEN" "Telegram Bot Token")
-    telegram_poll_interval_ms=$(prompt_optional "Telegram 轮询间隔毫秒" "2000")
+    telegram_poll_interval_ms=$(prompt_optional "$(msg ask_tg_interval)" "2000")
     validate_positive_integer "$telegram_poll_interval_ms" "TELEGRAM_POLL_INTERVAL_MS"
   fi
 
@@ -425,8 +508,8 @@ do_interactive() {
   discord_gateway_intents="33281"
   if [ "$enable_discord" = "true" ]; then
     discord_bot_token=$(prompt_secret "DISCORD_BOT_TOKEN" "Discord Bot Token")
-    discord_gateway_url=$(prompt_optional "Discord Gateway URL" "$discord_gateway_url")
-    discord_gateway_intents=$(prompt_optional "Discord Gateway Intents" "$discord_gateway_intents")
+    discord_gateway_url=$(prompt_optional "$(msg ask_discord_gateway_url)" "$discord_gateway_url")
+    discord_gateway_intents=$(prompt_optional "$(msg ask_discord_intents)" "$discord_gateway_intents")
     validate_positive_integer "$discord_gateway_intents" "DISCORD_GATEWAY_INTENTS"
   fi
 
@@ -438,7 +521,7 @@ do_interactive() {
     whatsapp_verify_token=$(prompt_secret "WHATSAPP_VERIFY_TOKEN" "WhatsApp Verify Token")
     whatsapp_access_token=$(prompt_secret "WHATSAPP_ACCESS_TOKEN" "WhatsApp Access Token")
     whatsapp_phone_number_id=$(prompt_required "WHATSAPP_PHONE_NUMBER_ID" "WhatsApp Phone Number ID")
-    whatsapp_webhook_path=$(prompt_optional "WhatsApp Webhook 路径" "$whatsapp_webhook_path")
+    whatsapp_webhook_path=$(prompt_optional "$(msg ask_wa_webhook_path)" "$whatsapp_webhook_path")
   fi
 
   validate_channel_mode \
@@ -452,7 +535,7 @@ do_interactive() {
     "$whatsapp_access_token" \
     "$whatsapp_phone_number_id"
 
-  log_step "[8/8] 写入配置"
+  log_step "$(msg step_write)"
 
   # 写入 .env
   cat > "$ENV_FILE" <<EOF
@@ -499,7 +582,7 @@ EOF
 
   set_env_file_permissions
 
-  log_info "配置已保存到 .env"
+  log_info "$(msg config_saved)"
   echo ""
   do_deploy
 }
