@@ -201,14 +201,13 @@ export function createServer(deps: ServerDeps): restify.Server {
   });
 
   // Device Flow instructions endpoint for easier authorization UX.
-  server.get("/auth/device", async (req: Request, res: Response, next: Next) => {
+  server.get("/auth/device", async (req: Request, res: Response) => {
     const engine = getEngine();
     if (engine) {
       res.send(200, {
         authenticated: true,
         message: "Already authenticated.",
       });
-      next();
       return;
     }
 
@@ -217,7 +216,6 @@ export function createServer(deps: ServerDeps): restify.Server {
         authenticated: false,
         error: "Device Flow is disabled. Set DEVICE_FLOW_ENABLED=true and GITHUB_CLIENT_ID.",
       });
-      next();
       return;
     }
 
@@ -231,11 +229,10 @@ export function createServer(deps: ServerDeps): restify.Server {
       logger.error({ err }, "Failed to get Device Flow auth instructions");
       res.send(500, { error: "Failed to get Device Flow instructions" });
     }
-    next();
   });
 
   // POST /chat — simple HTTP chat endpoint (no channel setup needed)
-  server.post("/chat", async (req: Request, res: Response, next: Next) => {
+  server.post("/chat", async (req: Request, res: Response) => {
     const body = req.body as Record<string, unknown> | undefined;
     const messageRaw =
       typeof body?.message === "string"
@@ -255,7 +252,6 @@ export function createServer(deps: ServerDeps): restify.Server {
 
     if (!message) {
       res.send(400, { error: "Missing 'message' field" });
-      next();
       return;
     }
 
@@ -275,7 +271,6 @@ export function createServer(deps: ServerDeps): restify.Server {
         "- If not authenticated, call GET /auth/device and complete GitHub Device Flow.",
       ].join("\n");
       res.send(200, { reply: help });
-      next();
       return;
     }
 
@@ -287,7 +282,6 @@ export function createServer(deps: ServerDeps): restify.Server {
       } else {
         res.send(401, { error: "Not authenticated. Set GITHUB_TOKEN or enable Device Flow." });
       }
-      next();
       return;
     }
 
@@ -298,7 +292,6 @@ export function createServer(deps: ServerDeps): restify.Server {
       logger.error({ err }, "Chat endpoint error");
       res.send(500, { error: "Internal error" });
     }
-    next();
   });
 
   if (deps.whatsappHandler) {
