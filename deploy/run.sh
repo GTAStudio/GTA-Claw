@@ -583,11 +583,35 @@ EOF
 
 # ---- 部署 ----
 do_deploy() {
-  log_step "拉取最新镜像..."
-  # 从 .env 读取镜像名 (如果有的话)
   local image
   image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
-  docker pull "$image" || log_warn "镜像拉取失败，将使用本地缓存 (如有)"
+
+  # Try pull first; if fails, check local; if no local image, build from source
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    log_step "发现本地镜像，尝试更新..."
+    docker pull "$image" 2>/dev/null || log_warn "无法拉取远程镜像，使用本地缓存"
+  elif docker pull "$image" 2>/dev/null; then
+    log_info "镜像拉取成功"
+  else
+    log_warn "远程镜像不可用，将从源码构建..."
+    local repo_dir
+    repo_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+    # Check if we are inside the full repo (Dockerfile exists at parent)
+    if [ -f "$repo_dir/Dockerfile" ]; then
+      log_step "从本地源码构建镜像..."
+      docker build -t "$image" "$repo_dir"
+    else
+      # Clone the repo into a temp dir and build
+      local tmp_dir
+      tmp_dir="$(mktemp -d)"
+      log_step "克隆仓库并构建镜像..."
+      git clone --depth 1 https://github.com/GTAStudio/GTA-Claw.git "$tmp_dir"
+      docker build -t "$image" "$tmp_dir"
+      rm -rf "$tmp_dir"
+    fi
+    log_info "镜像构建完成: $image"
+  fi
 
   log_step "启动服务..."
   docker rm -f gta-claw >/dev/null 2>&1 || true
@@ -634,14 +658,27 @@ do_deploy() {
 
 # ---- 更新镜像 ----
 do_update() {
-  log_step "更新 GTA-Claw 镜像..."
+  log_step "更新 GTA-Claw..."
 
-  if [ -f "$ENV_FILE" ]; then
-    local image
-    image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
-    docker pull "$image"
+  local image
+  image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
+
+  if docker pull "$image" 2>/dev/null; then
+    log_info "镜像更新成功"
   else
-    docker pull gtastudio/gta-claw:latest
+    log_warn "远程镜像不可用，从源码重新构建..."
+    local repo_dir
+    repo_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
+    if [ -f "$repo_dir/Dockerfile" ]; then
+      docker build -t "$image" "$repo_dir"
+    else
+      local tmp_dir
+      tmp_dir="$(mktemp -d)"
+      git clone --depth 1 https://github.com/GTAStudio/GTA-Claw.git "$tmp_dir"
+      docker build -t "$image" "$tmp_dir"
+      rm -rf "$tmp_dir"
+    fi
+    log_info "镜像构建完成"
   fi
 
   log_step "重启服务..."
