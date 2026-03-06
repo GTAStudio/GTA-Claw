@@ -66,6 +66,7 @@ msg() {
     ask_auto_update) if is_en; then echo "Auto-update SDK/CLI (true/false)"; else echo "自动更新 SDK/CLI (true/false)"; fi ;;
     ask_trust_proxy) if is_en; then echo "Trust proxy headers (true/false)"; else echo "信任反向代理头 (true/false)"; fi ;;
     ask_admin_token) if is_en; then echo "Admin API token (empty to disable)"; else echo "Admin API 令牌 (留空禁用)"; fi ;;
+    ask_proxy) if is_en; then echo "HTTP proxy (e.g. http://127.0.0.1:7890, empty to skip)"; else echo "HTTP 代理 (如 http://127.0.0.1:7890, 留空跳过)"; fi ;;
     ask_enable_teams) if is_en; then echo "Enable Teams channel (true/false)"; else echo "启用 Teams 通道 (true/false)"; fi ;;
     ask_enable_telegram) if is_en; then echo "Enable Telegram polling channel (true/false)"; else echo "启用 Telegram Polling 通道 (true/false)"; fi ;;
     ask_enable_discord) if is_en; then echo "Enable Discord gateway channel (true/false)"; else echo "启用 Discord Gateway 通道 (true/false)"; fi ;;
@@ -510,13 +511,14 @@ do_interactive() {
 
   log_step "$(msg step_advanced)"
   echo -e "  ${CYAN}$(msg domain_hint)${NC}"
-  local domain docker_image rate_limit admin_token auto_update trust_proxy
+  local domain docker_image rate_limit admin_token auto_update trust_proxy http_proxy
   domain=$(prompt_optional "$(msg ask_domain)" "localhost")
   docker_image=$(prompt_optional "$(msg ask_image)" "gtastudio/gta-claw:latest")
   rate_limit=$(prompt_optional "$(msg ask_rate)" "30")
   auto_update=$(prompt_optional "$(msg ask_auto_update)" "false")
   trust_proxy=$(prompt_optional "$(msg ask_trust_proxy)" "false")
   admin_token=$(prompt_optional "$(msg ask_admin_token)" "")
+  http_proxy=$(prompt_optional "$(msg ask_proxy)" "")
 
   validate_image_ref "$docker_image"
   validate_positive_integer "$rate_limit" "RATE_LIMIT_PER_MIN"
@@ -550,6 +552,8 @@ RATE_LIMIT_PER_MIN=${rate_limit}
 TRUST_PROXY=${trust_proxy}
 AUTO_UPDATE=${auto_update}
 ADMIN_TOKEN=${admin_token}
+HTTPS_PROXY=${http_proxy}
+HTTP_PROXY=${http_proxy}
 ENABLE_TEAMS=${enable_teams}
 ENABLE_TELEGRAM=${enable_telegram}
 TELEGRAM_BOT_TOKEN=${telegram_bot_token}

@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { logger } from "./utils/logger.js";
+import { setupProxy } from "./utils/proxy.js";
 import { loadRole } from "./loader/roleLoader.js";
 import { loadSkills } from "./loader/skillLoader.js";
 import { ToolExecutor } from "./engine/toolExecutor.js";
@@ -15,6 +16,9 @@ import { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
 
 async function main(): Promise<void> {
   logger.info("=== GTA-Claw Engine Starting ===");
+
+  // 0. Configure HTTP proxy (if HTTPS_PROXY / HTTP_PROXY is set)
+  setupProxy();
 
   // 1. Load and validate configuration
   const config = loadConfig();

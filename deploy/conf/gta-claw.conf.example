@@ -67,6 +67,11 @@ AUTO_UPDATE=false
 # Admin API 令牌 (留空则禁用 /admin/reload 端点)
 ADMIN_TOKEN=
 
+# HTTP 代理 (访问 GitHub API、Skill 远程加载等出站请求)
+# 国内服务器建议配置本地代理
+# HTTPS_PROXY=http://127.0.0.1:7890
+# HTTP_PROXY=http://127.0.0.1:7890
+
 # ---- 通道开关 ----
 
 # Teams (Bot Framework)
