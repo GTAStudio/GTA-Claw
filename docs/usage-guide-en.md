@@ -340,12 +340,29 @@ docker rm -f gta-claw
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Quick onboarding info (recommended first call) |
+| `/auth/device` | GET | Get GitHub Device Flow authorization instructions and code |
 | `/health` | GET | Health check + status info |
 | `/chat` | POST | HTTP chat interface (no channel needed) |
 | `/api/messages` | POST | Bot Framework messages (Teams) |
 | `/admin/reload` | POST | Hot-reload role and skills (requires `ADMIN_TOKEN`) |
 | `/admin/system` | GET | System info (Node.js process + OS) |
 | `/admin/exec` | POST | Execute whitelisted system commands |
+
+### Recommended First-Use Flow
+
+```bash
+# 1) Check status and suggested next steps
+curl http://localhost:3978/
+
+# 2) Get Device Flow auth instructions/code
+curl http://localhost:3978/auth/device
+
+# 3) After authorization, chat directly over HTTP
+curl -X POST http://localhost:3978/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "hello"}'
+```
 
 ### HTTP Chat Interface
 

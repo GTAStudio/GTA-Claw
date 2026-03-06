@@ -100,6 +100,13 @@ export function createServer(deps: ServerDeps): restify.Server {
     : null;
   const rateLimiter = new RateLimiter(config.RATE_LIMIT_PER_MIN);
 
+  const channelStatus = {
+    teams: config.ENABLE_TEAMS,
+    telegram: config.ENABLE_TELEGRAM,
+    discord: config.ENABLE_DISCORD,
+    whatsapp: config.ENABLE_WHATSAPP,
+  };
+
   if (adapter) {
     // Adapter error handler
     adapter.onTurnError = async (context: TurnContext, error: Error) => {
@@ -156,18 +163,118 @@ export function createServer(deps: ServerDeps): restify.Server {
       model: status.activeModel,
       authenticated: Boolean(engine),
       deviceFlowEnabled: config.DEVICE_FLOW_ENABLED,
+      channels: channelStatus,
     });
+    next();
+  });
+
+  // Root endpoint: quick onboarding hints for first-time setup and testing.
+  server.get("/", (req: Request, res: Response, next: Next) => {
+    const engine = getEngine();
+    const hasAnyChannel = Object.values(channelStatus).some(Boolean);
+    const tips: string[] = [];
+
+    if (!engine && config.DEVICE_FLOW_ENABLED) {
+      tips.push("Authenticate first via GET /auth/device (or check logs for the user code).");
+    }
+    if (!hasAnyChannel) {
+      tips.push("No chat channels enabled. Use POST /chat directly for testing.");
+    }
+
+    res.send(200, {
+      service: "GTA-Claw",
+      status: "ok",
+      authenticated: Boolean(engine),
+      deviceFlowEnabled: config.DEVICE_FLOW_ENABLED,
+      channels: channelStatus,
+      endpoints: {
+        health: "GET /health",
+        deviceAuth: "GET /auth/device",
+        chat: "POST /chat",
+      },
+      examples: {
+        chatCurl: "curl -X POST http://localhost:3978/chat -H \"Content-Type: application/json\" -d '{\"message\":\"hello\"}'",
+      },
+      tips,
+    });
+    next();
+  });
+
+  // Device Flow instructions endpoint for easier authorization UX.
+  server.get("/auth/device", async (req: Request, res: Response, next: Next) => {
+    const engine = getEngine();
+    if (engine) {
+      res.send(200, {
+        authenticated: true,
+        message: "Already authenticated.",
+      });
+      next();
+      return;
+    }
+
+    if (!deps.deviceFlow) {
+      res.send(400, {
+        authenticated: false,
+        error: "Device Flow is disabled. Set DEVICE_FLOW_ENABLED=true and GITHUB_CLIENT_ID.",
+      });
+      next();
+      return;
+    }
+
+    try {
+      const authInstructions = await deps.deviceFlow.getAuthMessage();
+      res.send(200, {
+        authenticated: false,
+        auth_instructions: authInstructions,
+      });
+    } catch (err) {
+      logger.error({ err }, "Failed to get Device Flow auth instructions");
+      res.send(500, { error: "Failed to get Device Flow instructions" });
+    }
     next();
   });
 
   // POST /chat — simple HTTP chat endpoint (no channel setup needed)
   server.post("/chat", async (req: Request, res: Response, next: Next) => {
     const body = req.body as Record<string, unknown> | undefined;
-    const message = typeof body?.message === "string" ? body.message.trim() : "";
-    const conversationId = typeof body?.conversation_id === "string" ? body.conversation_id : `http-${req.socket.remoteAddress ?? "anon"}`;
+    const messageRaw =
+      typeof body?.message === "string"
+        ? body.message
+        : typeof body?.text === "string"
+          ? body.text
+          : typeof body?.prompt === "string"
+            ? body.prompt
+            : "";
+    const message = messageRaw.trim();
+    const conversationId =
+      typeof body?.conversation_id === "string"
+        ? body.conversation_id
+        : typeof body?.conversationId === "string"
+          ? body.conversationId
+          : `http-${req.socket.remoteAddress ?? "anon"}`;
 
     if (!message) {
       res.send(400, { error: "Missing 'message' field" });
+      next();
+      return;
+    }
+
+    if (/^\/(help|start)$/i.test(message)) {
+      const help = [
+        "GTA-Claw HTTP Chat Help",
+        "",
+        "Use: POST /chat with JSON body",
+        "- message (or text/prompt): your question",
+        "- conversation_id (optional): keep context across turns",
+        "",
+        "Examples:",
+        "1) {\"message\":\"hello\"}",
+        "2) {\"message\":\"continue\",\"conversation_id\":\"demo-1\"}",
+        "",
+        "Auth:",
+        "- If not authenticated, call GET /auth/device and complete GitHub Device Flow.",
+      ].join("\n");
+      res.send(200, { reply: help });
       next();
       return;
     }

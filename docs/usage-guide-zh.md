@@ -340,12 +340,29 @@ docker rm -f gta-claw
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
+| `/` | GET | 快速引导信息（推荐先访问） |
+| `/auth/device` | GET | 获取 GitHub Device Flow 授权指引和授权码 |
 | `/health` | GET | 健康检查 + 状态信息 |
 | `/chat` | POST | HTTP 直聊接口（无需聊天频道） |
 | `/api/messages` | POST | Bot Framework 消息（Teams） |
 | `/admin/reload` | POST | 热重载角色和技能（需 `ADMIN_TOKEN`） |
 | `/admin/system` | GET | 系统信息（Node.js 进程 + OS） |
 | `/admin/exec` | POST | 执行白名单系统命令 |
+
+### 首次使用推荐路径
+
+```bash
+# 1) 看当前状态和推荐操作
+curl http://localhost:3978/
+
+# 2) 拉取 Device Flow 授权码
+curl http://localhost:3978/auth/device
+
+# 3) 授权后直接 HTTP 对话
+curl -X POST http://localhost:3978/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "你好"}'
+```
 
 ### HTTP 直聊接口
 

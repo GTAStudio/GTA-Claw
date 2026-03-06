@@ -200,6 +200,8 @@ Generated tags include:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Quick onboarding info + endpoint hints |
+| `/auth/device` | GET | Get GitHub Device Flow authorization instructions |
 | `/api/messages` | POST | Bot Framework messages (Teams) |
 | `/chat` | POST | Simple HTTP chat (no channel needed) |
 | `/health` | GET | Health check + status |
