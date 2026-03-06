@@ -178,7 +178,7 @@ It automatically builds and pushes Docker images when:
 In your GitHub repo, add these secrets:
 - `DOCKERHUB_USERNAME`: your Docker Hub username
 - `DOCKERHUB_TOKEN`: Docker Hub access token (not password)
-- `DOCKERHUB_IMAGE` (recommended): full image name, e.g. `docker.io/gtastudio/gta-claw`
+- `DOCKERHUB_IMAGE` (recommended): full image name, e.g. `docker.io/aizhihuxiao/gta-claw`
 
 ### Published Image
 

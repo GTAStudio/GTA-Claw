@@ -59,7 +59,7 @@ jobs:
           if ! [[ "$image" =~ $image_regex ]]; then
             echo "Invalid Docker image name: '$image'"
             echo "Expected format: docker.io/<namespace>/<repo> (lowercase only)"
-            echo "Tip: set DOCKERHUB_IMAGE to something like docker.io/gtastudio/gta-claw"
+            echo "Tip: set DOCKERHUB_IMAGE to something like docker.io/aizhihuxiao/gta-claw"
             exit 1
           fi
 

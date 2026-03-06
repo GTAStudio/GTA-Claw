@@ -236,7 +236,7 @@ validate_image_ref() {
   local value="$1"
   if [[ ! "$value" =~ ^([a-z0-9.-]+(:[0-9]+)?/)?[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*(:[A-Za-z0-9._-]+)?$ ]]; then
     log_error "DOCKER_IMAGE 格式无效: $value"
-    log_error "示例: gtastudio/gta-claw:latest"
+    log_error "示例: aizhihuxiao/gta-claw:latest"
     return 1
   fi
   return 0
@@ -369,7 +369,7 @@ do_config() {
     exit 1
   fi
 
-  validate_image_ref "$(grep '^DOCKER_IMAGE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'gtastudio/gta-claw:latest')"
+  validate_image_ref "$(grep '^DOCKER_IMAGE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'aizhihuxiao/gta-claw:latest')"
   validate_positive_integer "$(grep '^RATE_LIMIT_PER_MIN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo '30')" "RATE_LIMIT_PER_MIN"
   validate_boolean "$(grep '^AUTO_UPDATE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "AUTO_UPDATE"
   validate_boolean "$(grep '^TRUST_PROXY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "TRUST_PROXY"
@@ -518,7 +518,7 @@ do_interactive() {
   echo -e "  ${CYAN}$(msg domain_hint)${NC}"
   local domain docker_image rate_limit admin_token auto_update trust_proxy http_proxy
   domain=$(prompt_optional "$(msg ask_domain)" "localhost")
-  docker_image=$(prompt_optional "$(msg ask_image)" "gtastudio/gta-claw:latest")
+  docker_image=$(prompt_optional "$(msg ask_image)" "aizhihuxiao/gta-claw:latest")
   rate_limit=$(prompt_optional "$(msg ask_rate)" "30")
   auto_update=$(prompt_optional "$(msg ask_auto_update)" "false")
   trust_proxy=$(prompt_optional "$(msg ask_trust_proxy)" "false")
@@ -584,7 +584,7 @@ EOF
 # ---- 部署 ----
 do_deploy() {
   local image
-  image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
+  image="$(get_env_value "DOCKER_IMAGE" "aizhihuxiao/gta-claw:latest")"
 
   # Try pull first; if fails, check local; if no local image, build from source
   if docker image inspect "$image" >/dev/null 2>&1; then
@@ -661,7 +661,7 @@ do_update() {
   log_step "更新 GTA-Claw..."
 
   local image
-  image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
+  image="$(get_env_value "DOCKER_IMAGE" "aizhihuxiao/gta-claw:latest")"
 
   if docker pull "$image" 2>/dev/null; then
     log_info "镜像更新成功"
@@ -683,7 +683,7 @@ do_update() {
 
   log_step "重启服务..."
   local image
-  image="$(get_env_value "DOCKER_IMAGE" "gtastudio/gta-claw:latest")"
+  image="$(get_env_value "DOCKER_IMAGE" "aizhihuxiao/gta-claw:latest")"
   docker rm -f gta-claw >/dev/null 2>&1 || true
   docker run -d \
     --name gta-claw \

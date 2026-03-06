@@ -29,7 +29,7 @@ ENABLED_SKILLS=
 # ---- 可选项 (有默认值) ----
 
 # Docker 镜像名称 (Docker Hub)
-DOCKER_IMAGE=gtastudio/gta-claw:latest
+DOCKER_IMAGE=aizhihuxiao/gta-claw:latest
 
 # AI 模型 (会被 role config 中的 model 字段覆盖)
 COPILOT_MODEL=gpt-4o
