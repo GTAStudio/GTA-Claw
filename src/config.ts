@@ -227,7 +227,7 @@ export function loadConfig(): AppConfig {
   );
 
   const ENABLED_SKILLS = parseCommaSeparatedUrls(
-    requireEnv("ENABLED_SKILLS"),
+    process.env["ENABLED_SKILLS"] ?? "",
     "ENABLED_SKILLS",
   );
 

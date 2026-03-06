@@ -244,6 +244,9 @@ validate_image_ref() {
 
 validate_skills_urls() {
   local raw="$1"
+  if [ -z "$raw" ]; then
+    return 0
+  fi
   IFS=',' read -r -a items <<< "$raw"
   for item in "${items[@]}"; do
     local url
@@ -342,7 +345,7 @@ do_config() {
 
   # 验证基础必填项
   local has_error=0
-  for var in AGENT_ROLE_URL ENABLED_SKILLS; do
+  for var in AGENT_ROLE_URL; do
     if ! grep -Eq "^${var}=.+" "$ENV_FILE"; then
       log_error "缺少必填配置: $var"
       has_error=1
@@ -440,8 +443,10 @@ do_interactive() {
   log_step "$(msg step_skills)"
   echo -e "  ${CYAN}$(msg skills_hint)${NC}"
   local skills_urls
-  skills_urls=$(prompt_required "ENABLED_SKILLS" "Skill URLs")
-  validate_skills_urls "$skills_urls"
+  skills_urls=$(prompt_optional "Skill URLs" "")
+  if [ -n "$skills_urls" ]; then
+    validate_skills_urls "$skills_urls"
+  fi
 
   log_step "$(msg step_model)"
   local model
