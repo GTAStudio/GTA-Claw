@@ -1,0 +1,27 @@
+{
+  "name": "github_commits",
+  "description": "Get recent commits from a GitHub repository. Shows commit messages, authors, dates, and SHAs. Useful for tracking project activity, reviewing recent changes, or checking who committed what.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository in owner/name format (e.g. 'GTAStudio/GTA-Claw')"
+      },
+      "branch": {
+        "type": "string",
+        "description": "Branch name (default: repo's default branch)"
+      },
+      "limit": {
+        "type": "number",
+        "description": "Number of commits to return (default 10, max 30)"
+      },
+      "path": {
+        "type": "string",
+        "description": "Filter commits to a specific file or directory path (optional)"
+      }
+    },
+    "required": ["repo"]
+  },
+  "executeCode": "async function run(params, api) {\n  var repo = params.repo;\n  var limit = Math.min(params.limit || 10, 30);\n  var qs = '?per_page=' + limit;\n  if (params.branch) qs += '&sha=' + encodeURIComponent(params.branch);\n  if (params.path) qs += '&path=' + encodeURIComponent(params.path);\n  var url = 'https://api.github.com/repos/' + repo + '/commits' + qs;\n  api.log('Fetching commits: ' + repo);\n  var raw = await api.httpGet(url);\n  var data = JSON.parse(raw);\n  var commits = data.map(function(c) {\n    return {\n      sha: c.sha.slice(0, 7),\n      message: c.commit.message.split('\\n')[0].slice(0, 120),\n      author: c.commit.author.name,\n      date: c.commit.author.date,\n      url: c.html_url\n    };\n  });\n  return JSON.stringify({ repo: repo, count: commits.length, commits: commits }, null, 2);\n}"
+}

@@ -1,0 +1,23 @@
+{
+  "name": "github_file_reader",
+  "description": "Read the content of a file or directory listing from a GitHub repository. Useful for reviewing code, checking configs, reading README files, or browsing project structure without cloning the repo.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository in owner/name format (e.g. 'GTAStudio/GTA-Claw')"
+      },
+      "path": {
+        "type": "string",
+        "description": "File or directory path within the repo (e.g. 'src/index.ts' or 'src/'). Leave empty for root listing."
+      },
+      "ref": {
+        "type": "string",
+        "description": "Branch, tag, or commit SHA (default: repo's default branch)"
+      }
+    },
+    "required": ["repo"]
+  },
+  "executeCode": "async function run(params, api) {\n  var repo = params.repo;\n  var path = params.path || '';\n  var ref = params.ref ? '?ref=' + encodeURIComponent(params.ref) : '';\n  var url = 'https://api.github.com/repos/' + repo + '/contents/' + path + ref;\n  api.log('Reading: ' + repo + '/' + path);\n  var raw = await api.httpGet(url);\n  var data = JSON.parse(raw);\n  if (Array.isArray(data)) {\n    var listing = data.map(function(item) {\n      return { name: item.name, type: item.type, size: item.size, path: item.path };\n    });\n    return JSON.stringify({ type: 'directory', path: path || '/', items: listing }, null, 2);\n  }\n  if (data.encoding === 'base64' && data.content) {\n    var decoded = '';\n    var b64 = data.content.replace(/\\n/g, '');\n    for (var i = 0; i < b64.length; i += 1024) {\n      decoded += atob(b64.slice(i, i + 1024));\n    }\n    if (decoded.length > 20000) decoded = decoded.slice(0, 20000) + '\\n... [truncated]';\n    return JSON.stringify({ type: 'file', path: data.path, size: data.size, content: decoded }, null, 2);\n  }\n  return JSON.stringify(data, null, 2);\n}"
+}

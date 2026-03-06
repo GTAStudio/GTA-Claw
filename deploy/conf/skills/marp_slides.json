@@ -1,0 +1,37 @@
+{
+  "name": "marp_slides",
+  "description": "Generate a professional presentation in Marp Markdown format. Returns ready-to-use Marp slides that can be converted to PDF/PPTX/HTML using 'marp --pptx slides.md'. Use this when the user asks to create a PPT, presentation, slide deck, or keynote.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Presentation title"
+      },
+      "author": {
+        "type": "string",
+        "description": "Author name (optional)"
+      },
+      "theme": {
+        "type": "string",
+        "enum": ["default", "gaia", "uncover"],
+        "description": "Marp theme (default: 'default')"
+      },
+      "slides": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "heading": { "type": "string", "description": "Slide title/heading" },
+            "content": { "type": "string", "description": "Slide body content in Markdown (bullet points, text, code blocks, etc.)" },
+            "notes": { "type": "string", "description": "Speaker notes for this slide (optional)" }
+          },
+          "required": ["heading", "content"]
+        },
+        "description": "Array of slide objects"
+      }
+    },
+    "required": ["title", "slides"]
+  },
+  "executeCode": "async function run(params, api) {\n  var theme = params.theme || 'default';\n  var lines = [];\n  lines.push('---');\n  lines.push('marp: true');\n  lines.push('theme: ' + theme);\n  lines.push('paginate: true');\n  lines.push('header: \"' + params.title.replace(/\"/g, '\\\\\"') + '\"');\n  if (params.author) lines.push('footer: \"' + params.author.replace(/\"/g, '\\\\\"') + '\"');\n  lines.push('---');\n  lines.push('');\n  lines.push('# ' + params.title);\n  if (params.author) lines.push('\\n**' + params.author + '**');\n  lines.push('');\n  for (var i = 0; i < params.slides.length; i++) {\n    var s = params.slides[i];\n    lines.push('---');\n    lines.push('');\n    lines.push('## ' + s.heading);\n    lines.push('');\n    lines.push(s.content);\n    if (s.notes) {\n      lines.push('');\n      lines.push('<!--');\n      lines.push(s.notes);\n      lines.push('-->');\n    }\n    lines.push('');\n  }\n  lines.push('---');\n  lines.push('');\n  lines.push('# Thank You');\n  lines.push('');\n  var md = lines.join('\\n');\n  api.log('Generated ' + params.slides.length + ' slides');\n  return md;\n}"
+}

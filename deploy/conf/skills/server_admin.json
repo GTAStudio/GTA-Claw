@@ -1,0 +1,20 @@
+{
+  "name": "server_admin",
+  "description": "Execute server management commands on the GTA-Claw host. Supports: uptime, disk usage, memory, process list, Docker container status/stats/images/logs, network ports, hostname, and system date. Use when the user asks to check server status, monitor resources, view Docker containers, or diagnose infrastructure issues.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["system_info", "uptime", "disk", "memory", "top", "docker_ps", "docker_stats", "docker_images", "docker_logs", "netstat", "who", "hostname", "date"],
+        "description": "The server command to execute. 'system_info' returns Node.js/OS details via API; others run actual shell commands."
+      },
+      "target": {
+        "type": "string",
+        "description": "For docker_logs: the container name to fetch logs from (optional)"
+      }
+    },
+    "required": ["action"]
+  },
+  "executeCode": "async function run(params, api) {\n  var baseUrl = 'http://127.0.0.1:3978';\n  var action = params.action;\n  api.log('Server admin: ' + action);\n  if (action === 'system_info') {\n    var raw = await api.httpGet(baseUrl + '/admin/system');\n    return raw;\n  }\n  var body = JSON.stringify({ action: action, target: params.target || '' });\n  var headers = { 'Content-Type': 'application/json' };\n  var result = await api.httpPost(baseUrl + '/admin/exec', body, headers);\n  return result;\n}"
+}
