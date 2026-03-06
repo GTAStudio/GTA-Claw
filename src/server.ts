@@ -304,11 +304,10 @@ export function createServer(deps: ServerDeps): restify.Server {
   // Admin: reload skills (protected by ADMIN_TOKEN)
   if (config.ADMIN_TOKEN && deps.reloadFn) {
     const reloadFn = deps.reloadFn;
-    server.post("/admin/reload", async (req: Request, res: Response, next: Next) => {
+    server.post("/admin/reload", async (req: Request, res: Response) => {
       const token = parseBearerToken(req.headers["authorization"]);
       if (token !== config.ADMIN_TOKEN) {
         res.send(403, { error: "Forbidden" });
-        next();
         return;
       }
 
@@ -330,7 +329,6 @@ export function createServer(deps: ServerDeps): restify.Server {
           res.send(500, { error: "Reload failed" });
         }
       }
-      next();
     });
   }
 
