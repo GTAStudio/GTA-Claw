@@ -16,6 +16,27 @@ export interface AppConfig {
   OAUTH_CALLBACK_PATH: string;
   OAUTH_SCOPE: string;
 
+  // Channel switches
+  ENABLE_TEAMS: boolean;
+  ENABLE_TELEGRAM: boolean;
+  ENABLE_DISCORD: boolean;
+  ENABLE_WHATSAPP: boolean;
+
+  // Telegram
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_POLL_INTERVAL_MS: number;
+
+  // Discord gateway
+  DISCORD_BOT_TOKEN?: string;
+  DISCORD_GATEWAY_URL: string;
+  DISCORD_GATEWAY_INTENTS: number;
+
+  // WhatsApp webhook
+  WHATSAPP_VERIFY_TOKEN?: string;
+  WHATSAPP_ACCESS_TOKEN?: string;
+  WHATSAPP_PHONE_NUMBER_ID?: string;
+  WHATSAPP_WEBHOOK_PATH: string;
+
   // Optional with defaults
   PORT: number;
   LOG_LEVEL: string;
@@ -100,6 +121,11 @@ function parseBooleanEnv(name: string, defaultValue: boolean): boolean {
   throw new Error(`Invalid boolean for ${name}: ${raw}. Use true or false.`);
 }
 
+function parseOptionalNonEmptyEnv(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  return raw ? raw : undefined;
+}
+
 function parseDomainList(name: string): string[] {
   const raw = process.env[name];
   if (!raw) return [];
@@ -127,6 +153,40 @@ export function loadConfig(): AppConfig {
     process.env["OAUTH_CALLBACK_PATH"]?.trim() || "/auth/callback";
   const OAUTH_SCOPE = process.env["OAUTH_SCOPE"]?.trim() || "copilot";
 
+  const ENABLE_TEAMS = parseBooleanEnv("ENABLE_TEAMS", true);
+  const ENABLE_TELEGRAM = parseBooleanEnv("ENABLE_TELEGRAM", false);
+  const ENABLE_DISCORD = parseBooleanEnv("ENABLE_DISCORD", false);
+  const ENABLE_WHATSAPP = parseBooleanEnv("ENABLE_WHATSAPP", false);
+
+  const TELEGRAM_BOT_TOKEN = parseOptionalNonEmptyEnv("TELEGRAM_BOT_TOKEN");
+  const TELEGRAM_POLL_INTERVAL_MS = parseIntegerEnv(
+    "TELEGRAM_POLL_INTERVAL_MS",
+    2000,
+    { min: 500, max: 60_000 },
+  );
+
+  const DISCORD_BOT_TOKEN = parseOptionalNonEmptyEnv("DISCORD_BOT_TOKEN");
+  const DISCORD_GATEWAY_URL =
+    process.env["DISCORD_GATEWAY_URL"]?.trim() ||
+    "wss://gateway.discord.gg/?v=10&encoding=json";
+  const DISCORD_GATEWAY_INTENTS = parseIntegerEnv(
+    "DISCORD_GATEWAY_INTENTS",
+    33281,
+    { min: 1 },
+  );
+
+  const WHATSAPP_VERIFY_TOKEN = parseOptionalNonEmptyEnv(
+    "WHATSAPP_VERIFY_TOKEN",
+  );
+  const WHATSAPP_ACCESS_TOKEN = parseOptionalNonEmptyEnv(
+    "WHATSAPP_ACCESS_TOKEN",
+  );
+  const WHATSAPP_PHONE_NUMBER_ID = parseOptionalNonEmptyEnv(
+    "WHATSAPP_PHONE_NUMBER_ID",
+  );
+  const WHATSAPP_WEBHOOK_PATH =
+    process.env["WHATSAPP_WEBHOOK_PATH"]?.trim() || "/whatsapp/webhook";
+
   const hasOAuthConfig = Boolean(
     GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && AUTH_BASE_URL,
   );
@@ -147,6 +207,28 @@ export function loadConfig(): AppConfig {
   if (!OAUTH_CALLBACK_PATH.startsWith("/")) {
     throw new Error(
       `OAUTH_CALLBACK_PATH must start with '/': ${OAUTH_CALLBACK_PATH}`,
+    );
+  }
+
+  if (ENABLE_TELEGRAM && !TELEGRAM_BOT_TOKEN) {
+    throw new Error("ENABLE_TELEGRAM=true requires TELEGRAM_BOT_TOKEN");
+  }
+  if (ENABLE_DISCORD && !DISCORD_BOT_TOKEN) {
+    throw new Error("ENABLE_DISCORD=true requires DISCORD_BOT_TOKEN");
+  }
+  if (
+    ENABLE_WHATSAPP &&
+    (!WHATSAPP_VERIFY_TOKEN ||
+      !WHATSAPP_ACCESS_TOKEN ||
+      !WHATSAPP_PHONE_NUMBER_ID)
+  ) {
+    throw new Error(
+      "ENABLE_WHATSAPP=true requires WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, and WHATSAPP_PHONE_NUMBER_ID",
+    );
+  }
+  if (!WHATSAPP_WEBHOOK_PATH.startsWith("/")) {
+    throw new Error(
+      `WHATSAPP_WEBHOOK_PATH must start with '/': ${WHATSAPP_WEBHOOK_PATH}`,
     );
   }
 
@@ -182,6 +264,19 @@ export function loadConfig(): AppConfig {
     AUTH_BASE_URL,
     OAUTH_CALLBACK_PATH,
     OAUTH_SCOPE,
+    ENABLE_TEAMS,
+    ENABLE_TELEGRAM,
+    ENABLE_DISCORD,
+    ENABLE_WHATSAPP,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_POLL_INTERVAL_MS,
+    DISCORD_BOT_TOKEN,
+    DISCORD_GATEWAY_URL,
+    DISCORD_GATEWAY_INTENTS,
+    WHATSAPP_VERIFY_TOKEN,
+    WHATSAPP_ACCESS_TOKEN,
+    WHATSAPP_PHONE_NUMBER_ID,
+    WHATSAPP_WEBHOOK_PATH,
 
     PORT: parseIntegerEnv("PORT", 3978, { min: 1, max: 65535 }),
     LOG_LEVEL: logLevel,
@@ -214,6 +309,12 @@ export function loadConfig(): AppConfig {
           ? "oauth+token"
           : "oauth"
         : "token",
+      channels: {
+        teams: config.ENABLE_TEAMS,
+        telegram: config.ENABLE_TELEGRAM,
+        discord: config.ENABLE_DISCORD,
+        whatsapp: config.ENABLE_WHATSAPP,
+      },
       trustProxy: config.TRUST_PROXY,
       autoUpdate: config.AUTO_UPDATE,
     },

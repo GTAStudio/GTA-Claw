@@ -70,3 +70,26 @@ AUTO_UPDATE=false
 
 # Admin API 令牌 (留空则禁用 /admin/reload 端点)
 ADMIN_TOKEN=
+
+# ---- 通道开关 ----
+
+# Teams (Bot Framework)
+ENABLE_TEAMS=true
+
+# Telegram (Polling, 内网可用)
+ENABLE_TELEGRAM=false
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_POLL_INTERVAL_MS=2000
+
+# Discord (Gateway, 内网可用)
+ENABLE_DISCORD=false
+DISCORD_BOT_TOKEN=
+DISCORD_GATEWAY_URL=wss://gateway.discord.gg/?v=10&encoding=json
+DISCORD_GATEWAY_INTENTS=33281
+
+# WhatsApp (Webhook, 通常需要公网回调)
+ENABLE_WHATSAPP=false
+WHATSAPP_VERIFY_TOKEN=
+WHATSAPP_ACCESS_TOKEN=
+WHATSAPP_PHONE_NUMBER_ID=
+WHATSAPP_WEBHOOK_PATH=/whatsapp/webhook

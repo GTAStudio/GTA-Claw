@@ -8,6 +8,7 @@ import type { AgentBot } from "./bot/teamsBot.js";
 import type { AppConfig } from "./config.js";
 import type { CopilotEngine } from "./engine/copilotEngine.js";
 import type { GitHubOAuthManager } from "./auth/githubOAuth.js";
+import type { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
 
 interface RuntimeStatus {
   skillCount: number;
@@ -72,6 +73,7 @@ interface ServerDeps {
   getEngine: () => CopilotEngine | null;
   getRuntimeStatus: () => RuntimeStatus;
   oauthManager?: GitHubOAuthManager;
+  whatsappHandler?: WhatsAppWebhookHandler;
   reloadFn?: () => Promise<ReloadResult>;
 }
 
@@ -82,6 +84,7 @@ export function createServer(deps: ServerDeps): restify.Server {
 
   const server = restify.createServer({ name: "GTA-Claw" });
   server.use(restify.plugins.queryParser());
+  server.use(restify.plugins.bodyParser());
   const adapter = new BotFrameworkAdapter({
     appId: config.MICROSOFT_APP_ID,
     appPassword: config.MICROSOFT_APP_PASSWORD,
@@ -118,12 +121,14 @@ export function createServer(deps: ServerDeps): restify.Server {
     next();
   });
 
-  // Bot Framework messages endpoint
-  server.post("/api/messages", async (req: Request, res: Response) => {
-    await adapter.processActivity(req, res, async (context) => {
-      await bot.run(context);
+  // Bot Framework messages endpoint (Teams)
+  if (config.ENABLE_TEAMS) {
+    server.post("/api/messages", async (req: Request, res: Response) => {
+      await adapter.processActivity(req, res, async (context) => {
+        await bot.run(context);
+      });
     });
-  });
+  }
 
   // Health check endpoint
   server.get("/health", (req: Request, res: Response, next: Next) => {
@@ -152,6 +157,13 @@ export function createServer(deps: ServerDeps): restify.Server {
       next();
     });
     server.post("/auth/logout", oauth.logout);
+  }
+
+  if (deps.whatsappHandler) {
+    const whatsapp = deps.whatsappHandler;
+    const path = config.WHATSAPP_WEBHOOK_PATH;
+    server.get(path, whatsapp.verify);
+    server.post(path, whatsapp.incoming);
   }
 
   // Admin: reload skills (protected by ADMIN_TOKEN)

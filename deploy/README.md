@@ -40,6 +40,26 @@ OAUTH_SCOPE=copilot
 - `https://<你的域名>/auth/login` 完成授权
 - `https://<你的域名>/auth/status` 查看授权状态
 
+## 四通道兼容
+
+可同时启用以下通道：
+
+1. Teams（默认开启）
+2. Telegram Polling（无需公网回调）
+3. Discord Gateway（无需公网回调）
+4. WhatsApp Webhook（通常需要公网回调）
+
+在 `conf/gta-claw.conf` 里通过以下开关控制：
+
+```ini
+ENABLE_TEAMS=true
+ENABLE_TELEGRAM=false
+ENABLE_DISCORD=false
+ENABLE_WHATSAPP=false
+```
+
+内网部署建议：优先 Telegram/Discord + PAT (`GITHUB_TOKEN`)。
+
 ## 常用命令
 
 | 命令 | 说明 |

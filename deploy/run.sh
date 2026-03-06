@@ -200,6 +200,42 @@ validate_auth_mode() {
   return 1
 }
 
+validate_channel_mode() {
+  local enable_teams="$1"
+  local enable_telegram="$2"
+  local telegram_token="$3"
+  local enable_discord="$4"
+  local discord_token="$5"
+  local enable_whatsapp="$6"
+  local whatsapp_verify_token="$7"
+  local whatsapp_access_token="$8"
+  local whatsapp_phone_number_id="$9"
+
+  validate_boolean "$enable_teams" "ENABLE_TEAMS" || return 1
+  validate_boolean "$enable_telegram" "ENABLE_TELEGRAM" || return 1
+  validate_boolean "$enable_discord" "ENABLE_DISCORD" || return 1
+  validate_boolean "$enable_whatsapp" "ENABLE_WHATSAPP" || return 1
+
+  if [ "$enable_telegram" = "true" ] && [ -z "$telegram_token" ]; then
+    log_error "ENABLE_TELEGRAM=true 时必须提供 TELEGRAM_BOT_TOKEN"
+    return 1
+  fi
+
+  if [ "$enable_discord" = "true" ] && [ -z "$discord_token" ]; then
+    log_error "ENABLE_DISCORD=true 时必须提供 DISCORD_BOT_TOKEN"
+    return 1
+  fi
+
+  if [ "$enable_whatsapp" = "true" ]; then
+    if [ -z "$whatsapp_verify_token" ] || [ -z "$whatsapp_access_token" ] || [ -z "$whatsapp_phone_number_id" ]; then
+      log_error "ENABLE_WHATSAPP=true 时必须提供 WHATSAPP_VERIFY_TOKEN / WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 set_env_file_permissions() {
   if command -v chmod &>/dev/null; then
     chmod 600 "$ENV_FILE" 2>/dev/null || true
@@ -267,6 +303,16 @@ do_config() {
     "$(grep '^GITHUB_CLIENT_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
     "$(grep '^GITHUB_CLIENT_SECRET=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
     "$(grep '^AUTH_BASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
+  validate_channel_mode \
+    "$(grep '^ENABLE_TEAMS=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'true')" \
+    "$(grep '^ENABLE_TELEGRAM=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
+    "$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^ENABLE_DISCORD=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
+    "$(grep '^DISCORD_BOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^ENABLE_WHATSAPP=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
+    "$(grep '^WHATSAPP_VERIFY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^WHATSAPP_ACCESS_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^WHATSAPP_PHONE_NUMBER_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
 
   log_info "配置文件验证通过"
   do_deploy
@@ -357,6 +403,55 @@ do_interactive() {
   validate_boolean "$trust_proxy" "TRUST_PROXY"
   validate_auth_mode "$github_token" "$oauth_enabled" "$github_client_id" "$github_client_secret" "$auth_base_url"
 
+  local enable_teams enable_telegram enable_discord enable_whatsapp
+  local telegram_bot_token telegram_poll_interval_ms discord_bot_token discord_gateway_url discord_gateway_intents
+  local whatsapp_verify_token whatsapp_access_token whatsapp_phone_number_id whatsapp_webhook_path
+
+  enable_teams=$(prompt_optional "启用 Teams 通道 (true/false)" "true")
+  enable_telegram=$(prompt_optional "启用 Telegram Polling 通道 (true/false)" "false")
+  enable_discord=$(prompt_optional "启用 Discord Gateway 通道 (true/false)" "false")
+  enable_whatsapp=$(prompt_optional "启用 WhatsApp Webhook 通道 (true/false)" "false")
+
+  telegram_bot_token=""
+  telegram_poll_interval_ms="2000"
+  if [ "$enable_telegram" = "true" ]; then
+    telegram_bot_token=$(prompt_secret "TELEGRAM_BOT_TOKEN" "Telegram Bot Token")
+    telegram_poll_interval_ms=$(prompt_optional "Telegram 轮询间隔毫秒" "2000")
+    validate_positive_integer "$telegram_poll_interval_ms" "TELEGRAM_POLL_INTERVAL_MS"
+  fi
+
+  discord_bot_token=""
+  discord_gateway_url="wss://gateway.discord.gg/?v=10&encoding=json"
+  discord_gateway_intents="33281"
+  if [ "$enable_discord" = "true" ]; then
+    discord_bot_token=$(prompt_secret "DISCORD_BOT_TOKEN" "Discord Bot Token")
+    discord_gateway_url=$(prompt_optional "Discord Gateway URL" "$discord_gateway_url")
+    discord_gateway_intents=$(prompt_optional "Discord Gateway Intents" "$discord_gateway_intents")
+    validate_positive_integer "$discord_gateway_intents" "DISCORD_GATEWAY_INTENTS"
+  fi
+
+  whatsapp_verify_token=""
+  whatsapp_access_token=""
+  whatsapp_phone_number_id=""
+  whatsapp_webhook_path="/whatsapp/webhook"
+  if [ "$enable_whatsapp" = "true" ]; then
+    whatsapp_verify_token=$(prompt_secret "WHATSAPP_VERIFY_TOKEN" "WhatsApp Verify Token")
+    whatsapp_access_token=$(prompt_secret "WHATSAPP_ACCESS_TOKEN" "WhatsApp Access Token")
+    whatsapp_phone_number_id=$(prompt_required "WHATSAPP_PHONE_NUMBER_ID" "WhatsApp Phone Number ID")
+    whatsapp_webhook_path=$(prompt_optional "WhatsApp Webhook 路径" "$whatsapp_webhook_path")
+  fi
+
+  validate_channel_mode \
+    "$enable_teams" \
+    "$enable_telegram" \
+    "$telegram_bot_token" \
+    "$enable_discord" \
+    "$discord_bot_token" \
+    "$enable_whatsapp" \
+    "$whatsapp_verify_token" \
+    "$whatsapp_access_token" \
+    "$whatsapp_phone_number_id"
+
   log_step "[8/8] 写入配置"
 
   # 写入 .env
@@ -387,6 +482,19 @@ RATE_LIMIT_PER_MIN=${rate_limit}
 TRUST_PROXY=${trust_proxy}
 AUTO_UPDATE=${auto_update}
 ADMIN_TOKEN=${admin_token}
+ENABLE_TEAMS=${enable_teams}
+ENABLE_TELEGRAM=${enable_telegram}
+TELEGRAM_BOT_TOKEN=${telegram_bot_token}
+TELEGRAM_POLL_INTERVAL_MS=${telegram_poll_interval_ms}
+ENABLE_DISCORD=${enable_discord}
+DISCORD_BOT_TOKEN=${discord_bot_token}
+DISCORD_GATEWAY_URL=${discord_gateway_url}
+DISCORD_GATEWAY_INTENTS=${discord_gateway_intents}
+ENABLE_WHATSAPP=${enable_whatsapp}
+WHATSAPP_VERIFY_TOKEN=${whatsapp_verify_token}
+WHATSAPP_ACCESS_TOKEN=${whatsapp_access_token}
+WHATSAPP_PHONE_NUMBER_ID=${whatsapp_phone_number_id}
+WHATSAPP_WEBHOOK_PATH=${whatsapp_webhook_path}
 EOF
 
   set_env_file_permissions

@@ -197,6 +197,20 @@ Generated tags include:
 | `/auth/logout` | POST | Clear OAuth session cookie |
 | `/admin/reload` | POST | Hot-reload role+skills and reset active sessions (requires `ADMIN_TOKEN`) |
 
+## Channel Compatibility
+
+GTA-Claw supports four channel modes (can be enabled together):
+
+1. Teams (`ENABLE_TEAMS=true`)
+2. Telegram Polling (`ENABLE_TELEGRAM=true`) — no public webhook required
+3. Discord Gateway (`ENABLE_DISCORD=true`) — no public webhook required
+4. WhatsApp Webhook (`ENABLE_WHATSAPP=true`) — public callback usually required
+
+Recommended auth strategy:
+
+1. Enterprise/public deployment: OAuth (`OAUTH_ENABLED=true`)
+2. Internal-only deployment: PAT (`GITHUB_TOKEN`) to avoid OAuth callback exposure
+
 ## Prerequisites
 
 - Docker & Docker Compose

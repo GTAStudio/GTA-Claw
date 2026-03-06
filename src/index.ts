@@ -8,6 +8,10 @@ import { AgentBot } from "./bot/teamsBot.js";
 import { createServer } from "./server.js";
 import { checkForUpdates } from "./updater/sdkUpdater.js";
 import { GitHubOAuthManager } from "./auth/githubOAuth.js";
+import { processIncomingMessage } from "./channels/messageProcessor.js";
+import { TelegramPollingClient } from "./channels/telegramPolling.js";
+import { DiscordGatewayClient } from "./channels/discordGateway.js";
+import { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
 
 async function main(): Promise<void> {
   logger.info("=== GTA-Claw Engine Starting ===");
@@ -108,11 +112,49 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  // 5. Create Teams bot
   const oauthLoginPath =
     config.OAUTH_ENABLED && config.AUTH_BASE_URL
       ? `${config.AUTH_BASE_URL}/auth/login`
       : undefined;
+
+  const processChannelMessage = async (input: {
+    channel: "telegram" | "discord" | "whatsapp";
+    conversationId: string;
+    userName: string;
+    text: string;
+  }): Promise<string> =>
+    processIncomingMessage(() => engine, oauthLoginPath, input);
+
+  const telegramClient = config.ENABLE_TELEGRAM
+    ? new TelegramPollingClient({
+        botToken: config.TELEGRAM_BOT_TOKEN!,
+        pollIntervalMs: config.TELEGRAM_POLL_INTERVAL_MS,
+        onMessage: async (msg) =>
+          processChannelMessage({ channel: "telegram", ...msg }),
+      })
+    : null;
+
+  const discordClient = config.ENABLE_DISCORD
+    ? new DiscordGatewayClient({
+        botToken: config.DISCORD_BOT_TOKEN!,
+        gatewayUrl: config.DISCORD_GATEWAY_URL,
+        intents: config.DISCORD_GATEWAY_INTENTS,
+        onMessage: async (msg) =>
+          processChannelMessage({ channel: "discord", ...msg }),
+      })
+    : null;
+
+  const whatsappHandler = config.ENABLE_WHATSAPP
+    ? new WhatsAppWebhookHandler({
+        verifyToken: config.WHATSAPP_VERIFY_TOKEN!,
+        accessToken: config.WHATSAPP_ACCESS_TOKEN!,
+        phoneNumberId: config.WHATSAPP_PHONE_NUMBER_ID!,
+        onMessage: async (msg) =>
+          processChannelMessage({ channel: "whatsapp", ...msg }),
+      })
+    : undefined;
+
+  // 5. Create Teams bot
   const bot = new AgentBot(() => engine, oauthLoginPath);
 
   // 6. Create and start HTTP server
@@ -121,6 +163,7 @@ async function main(): Promise<void> {
     config,
     getEngine: () => engine,
     oauthManager,
+    whatsappHandler,
     getRuntimeStatus: () => ({
       skillCount: skills.length,
       activeModel: roleConfig.model ?? config.COPILOT_MODEL,
@@ -202,6 +245,13 @@ async function main(): Promise<void> {
     );
   });
 
+  if (telegramClient) {
+    await telegramClient.start();
+  }
+  if (discordClient) {
+    discordClient.start();
+  }
+
   // 7. Non-blocking SDK/CLI update check
   checkForUpdates(config.AUTO_UPDATE).catch((err) => {
     logger.warn({ err }, "SDK/CLI update check failed (non-blocking)");
@@ -219,6 +269,12 @@ async function main(): Promise<void> {
     logger.info({ signal }, "Shutdown signal received");
 
     server.close();
+    if (telegramClient) {
+      await telegramClient.stop();
+    }
+    if (discordClient) {
+      await discordClient.stop();
+    }
     if (engine) {
       await engine.stop();
     }
