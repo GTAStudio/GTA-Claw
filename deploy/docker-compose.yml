@@ -3,7 +3,13 @@ services:
     image: ${DOCKER_IMAGE:-gtastudio/gta-claw:latest}
     restart: unless-stopped
     environment:
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - AUTH_BASE_URL=${AUTH_BASE_URL:-}
+      - OAUTH_CALLBACK_PATH=${OAUTH_CALLBACK_PATH:-/auth/callback}
+      - OAUTH_SCOPE=${OAUTH_SCOPE:-copilot}
       - MicrosoftAppId=${MicrosoftAppId}
       - MicrosoftAppPassword=${MicrosoftAppPassword}
       - AGENT_ROLE_URL=${AGENT_ROLE_URL}
@@ -16,7 +22,7 @@ services:
       - SDK_REQUEST_TIMEOUT_MS=${SDK_REQUEST_TIMEOUT_MS:-120000}
       - RATE_LIMIT_PER_MIN=${RATE_LIMIT_PER_MIN:-30}
       - ALLOWED_SKILL_DOMAINS=${ALLOWED_SKILL_DOMAINS:-}
-      - TRUST_PROXY=${TRUST_PROXY:-true}
+      - TRUST_PROXY=${TRUST_PROXY:-false}
       - DOMAIN=${DOMAIN:-localhost}
       - AUTO_UPDATE=${AUTO_UPDATE:-false}
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}

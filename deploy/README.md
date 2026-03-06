@@ -17,6 +17,29 @@ vim conf/gta-claw.conf    # 填写实际值
 ./run.sh --config conf/gta-claw.conf
 ```
 
+## 鉴权模式
+
+支持两种方式（二选一）：
+
+1. `GITHUB_TOKEN` (PAT)
+2. OAuth 网页授权（企业推荐）
+
+OAuth 模式需要在 `conf/gta-claw.conf` 中配置：
+
+```ini
+OAUTH_ENABLED=true
+GITHUB_CLIENT_ID=...
+GITHUB_CLIENT_SECRET=...
+AUTH_BASE_URL=https://your-domain.com
+OAUTH_CALLBACK_PATH=/auth/callback
+OAUTH_SCOPE=copilot
+```
+
+部署后先访问：
+
+- `https://<你的域名>/auth/login` 完成授权
+- `https://<你的域名>/auth/status` 查看授权状态
+
 ## 常用命令
 
 | 命令 | 说明 |

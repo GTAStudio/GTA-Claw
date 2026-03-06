@@ -3,7 +3,13 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - OAUTH_ENABLED=${OAUTH_ENABLED:-false}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - AUTH_BASE_URL=${AUTH_BASE_URL:-}
+      - OAUTH_CALLBACK_PATH=${OAUTH_CALLBACK_PATH:-/auth/callback}
+      - OAUTH_SCOPE=${OAUTH_SCOPE:-copilot}
       - MicrosoftAppId=${MicrosoftAppId}
       - MicrosoftAppPassword=${MicrosoftAppPassword}
       - AGENT_ROLE_URL=${AGENT_ROLE_URL}

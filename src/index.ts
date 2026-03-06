@@ -7,6 +7,7 @@ import { CopilotEngine } from "./engine/copilotEngine.js";
 import { AgentBot } from "./bot/teamsBot.js";
 import { createServer } from "./server.js";
 import { checkForUpdates } from "./updater/sdkUpdater.js";
+import { GitHubOAuthManager } from "./auth/githubOAuth.js";
 
 async function main(): Promise<void> {
   logger.info("=== GTA-Claw Engine Starting ===");
@@ -47,18 +48,79 @@ async function main(): Promise<void> {
     toolExecutor.registerSkill(skill.name, skill.executeCode);
   }
 
-  // 4. Initialize AI engine
-  const engine = new CopilotEngine(config, roleConfig, skills, toolExecutor);
-  await engine.start();
+  // 4. Initialize active engine if token exists (OAuth mode can bootstrap later)
+  let engine: CopilotEngine | null = null;
+  let engineSwitchPromise: Promise<void> | null = null;
+
+  const activateEngineWithToken = async (
+    githubToken: string,
+    source: string,
+  ): Promise<void> => {
+    if (engineSwitchPromise) {
+      await engineSwitchPromise;
+    }
+
+    engineSwitchPromise = (async () => {
+      logger.info({ source }, "Activating Copilot engine with token");
+      const nextEngine = new CopilotEngine(
+        config,
+        roleConfig,
+        skills,
+        toolExecutor,
+        githubToken,
+      );
+      await nextEngine.start();
+
+      const prevEngine = engine;
+      engine = nextEngine;
+
+      if (prevEngine) {
+        await prevEngine.stop();
+      }
+    })();
+
+    try {
+      await engineSwitchPromise;
+    } finally {
+      engineSwitchPromise = null;
+    }
+  };
+
+  if (config.GITHUB_TOKEN) {
+    await activateEngineWithToken(config.GITHUB_TOKEN, "startup:GITHUB_TOKEN");
+  } else {
+    logger.warn(
+      "No GITHUB_TOKEN configured at startup; waiting for OAuth authorization",
+    );
+  }
+
+  const oauthManager = config.OAUTH_ENABLED
+    ? new GitHubOAuthManager({
+        clientId: config.GITHUB_CLIENT_ID!,
+        clientSecret: config.GITHUB_CLIENT_SECRET!,
+        baseUrl: config.AUTH_BASE_URL!,
+        callbackPath: config.OAUTH_CALLBACK_PATH,
+        scope: config.OAUTH_SCOPE,
+        sessionTtlMs: config.SESSION_TTL_MS,
+        onTokenAuthorized: async (token, login) => {
+          await activateEngineWithToken(token, `oauth:${login}`);
+        },
+      })
+    : undefined;
 
   // 5. Create Teams bot
-  const bot = new AgentBot(engine);
+  const oauthLoginPath =
+    config.OAUTH_ENABLED && config.AUTH_BASE_URL
+      ? `${config.AUTH_BASE_URL}/auth/login`
+      : undefined;
+  const bot = new AgentBot(() => engine, oauthLoginPath);
 
   // 6. Create and start HTTP server
   const server = createServer({
     bot,
     config,
-    engine,
+    getEngine: () => engine,
+    oauthManager,
     getRuntimeStatus: () => ({
       skillCount: skills.length,
       activeModel: roleConfig.model ?? config.COPILOT_MODEL,
@@ -100,7 +162,9 @@ async function main(): Promise<void> {
             nextExecutor.registerSkill(skill.name, skill.executeCode);
           }
 
-          engine.reload(nextRole, nextSkills, nextExecutor);
+          if (engine) {
+            engine.reload(nextRole, nextSkills, nextExecutor);
+          }
           toolExecutor.dispose();
 
           roleConfig = nextRole;
@@ -155,7 +219,9 @@ async function main(): Promise<void> {
     logger.info({ signal }, "Shutdown signal received");
 
     server.close();
-    await engine.stop();
+    if (engine) {
+      await engine.stop();
+    }
     toolExecutor.dispose();
 
     logger.info("GTA-Claw engine shut down cleanly");

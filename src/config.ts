@@ -1,12 +1,20 @@
 import { logger } from "./utils/logger.js";
 
 export interface AppConfig {
-  // Required
-  GITHUB_TOKEN: string;
+  // Required core
   MICROSOFT_APP_ID: string;
   MICROSOFT_APP_PASSWORD: string;
   AGENT_ROLE_URL: string;
   ENABLED_SKILLS: string[];
+
+  // Auth
+  GITHUB_TOKEN?: string;
+  OAUTH_ENABLED: boolean;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  AUTH_BASE_URL?: string;
+  OAUTH_CALLBACK_PATH: string;
+  OAUTH_SCOPE: string;
 
   // Optional with defaults
   PORT: number;
@@ -108,7 +116,40 @@ function parseDomainList(name: string): string[] {
 export function loadConfig(): AppConfig {
   logger.info("Loading configuration...");
 
-  const GITHUB_TOKEN = requireEnv("GITHUB_TOKEN");
+  const GITHUB_TOKEN = process.env["GITHUB_TOKEN"]?.trim();
+  const GITHUB_CLIENT_ID = process.env["GITHUB_CLIENT_ID"]?.trim();
+  const GITHUB_CLIENT_SECRET = process.env["GITHUB_CLIENT_SECRET"]?.trim();
+  const AUTH_BASE_URL_RAW = process.env["AUTH_BASE_URL"]?.trim();
+  const AUTH_BASE_URL = AUTH_BASE_URL_RAW
+    ? validateUrl(AUTH_BASE_URL_RAW, "AUTH_BASE_URL")
+    : undefined;
+  const OAUTH_CALLBACK_PATH =
+    process.env["OAUTH_CALLBACK_PATH"]?.trim() || "/auth/callback";
+  const OAUTH_SCOPE = process.env["OAUTH_SCOPE"]?.trim() || "copilot";
+
+  const hasOAuthConfig = Boolean(
+    GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET && AUTH_BASE_URL,
+  );
+  const OAUTH_ENABLED = parseBooleanEnv("OAUTH_ENABLED", hasOAuthConfig);
+
+  if (OAUTH_ENABLED && !hasOAuthConfig) {
+    throw new Error(
+      "OAUTH_ENABLED=true requires GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and AUTH_BASE_URL",
+    );
+  }
+
+  if (!GITHUB_TOKEN && !OAUTH_ENABLED) {
+    throw new Error(
+      "Either GITHUB_TOKEN must be set or OAuth must be enabled with OAUTH_ENABLED=true",
+    );
+  }
+
+  if (!OAUTH_CALLBACK_PATH.startsWith("/")) {
+    throw new Error(
+      `OAUTH_CALLBACK_PATH must start with '/': ${OAUTH_CALLBACK_PATH}`,
+    );
+  }
+
   const MICROSOFT_APP_ID = requireEnv("MicrosoftAppId");
   const MICROSOFT_APP_PASSWORD = requireEnv("MicrosoftAppPassword");
 
@@ -130,11 +171,17 @@ export function loadConfig(): AppConfig {
   }
 
   const config: AppConfig = {
-    GITHUB_TOKEN,
     MICROSOFT_APP_ID,
     MICROSOFT_APP_PASSWORD,
     AGENT_ROLE_URL,
     ENABLED_SKILLS,
+    GITHUB_TOKEN,
+    OAUTH_ENABLED,
+    GITHUB_CLIENT_ID,
+    GITHUB_CLIENT_SECRET,
+    AUTH_BASE_URL,
+    OAUTH_CALLBACK_PATH,
+    OAUTH_SCOPE,
 
     PORT: parseIntegerEnv("PORT", 3978, { min: 1, max: 65535 }),
     LOG_LEVEL: logLevel,
@@ -162,6 +209,11 @@ export function loadConfig(): AppConfig {
       skillUrls: config.ENABLED_SKILLS.length,
       rateLimitPerMin: config.RATE_LIMIT_PER_MIN,
       domain: config.DOMAIN,
+      authMode: config.OAUTH_ENABLED
+        ? config.GITHUB_TOKEN
+          ? "oauth+token"
+          : "oauth"
+        : "token",
       trustProxy: config.TRUST_PROXY,
       autoUpdate: config.AUTO_UPDATE,
     },

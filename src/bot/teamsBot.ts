@@ -8,16 +8,32 @@ import type { CopilotEngine } from "../engine/copilotEngine.js";
 const TEAMS_MAX_MESSAGE_LENGTH = 4000;
 
 export class AgentBot extends TeamsActivityHandler {
-  private readonly engine: CopilotEngine;
+  private readonly getEngine: () => CopilotEngine | null;
+  private readonly oauthLoginPath: string | undefined;
 
-  constructor(engine: CopilotEngine) {
+  constructor(
+    getEngine: () => CopilotEngine | null,
+    oauthLoginPath?: string,
+  ) {
     super();
-    this.engine = engine;
+    this.getEngine = getEngine;
+    this.oauthLoginPath = oauthLoginPath;
   }
 
   protected async onMessageActivity(context: TurnContext): Promise<void> {
     const text = context.activity.text?.trim();
     if (!text) return;
+
+    const engine = this.getEngine();
+    if (!engine) {
+      const authHint = this.oauthLoginPath
+        ? `Please authorize first: ${this.oauthLoginPath}`
+        : "No active GitHub token is configured.";
+      await context.sendActivity(
+        `GTA-Claw is not authenticated yet. ${authHint}`,
+      );
+      return;
+    }
 
     const conversationId = context.activity.conversation?.id;
     if (!conversationId) {
@@ -32,7 +48,7 @@ export class AgentBot extends TeamsActivityHandler {
     await context.sendActivities([{ type: "typing" }]);
 
     try {
-      const response = await this.engine.chat(conversationId, text);
+      const response = await engine.chat(conversationId, text);
 
       // Split long messages for Teams 4000-char limit
       const chunks = splitMessage(response, TEAMS_MAX_MESSAGE_LENGTH);

@@ -41,13 +41,28 @@ Internet → Caddy (:443 HTTPS) → GTA-Claw Engine (:3978)
 
 ### Required Environment Variables
 
+Authentication now supports two modes:
+- **PAT mode**: set `GITHUB_TOKEN`
+- **OAuth mode**: set `OAUTH_ENABLED=true` and OAuth variables below
+
 | Variable | Description |
 |----------|-------------|
-| `GITHUB_TOKEN` | GitHub PAT with "Copilot Requests" permission |
 | `MicrosoftAppId` | Azure Bot Service App ID |
 | `MicrosoftAppPassword` | Azure Bot Service App Password |
 | `AGENT_ROLE_URL` | URL to role config JSON |
 | `ENABLED_SKILLS` | Comma-separated URLs to skill JSON modules |
+
+### Authentication Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_TOKEN` | *(empty)* | PAT token for direct auth mode |
+| `OAUTH_ENABLED` | `false` | Enable GitHub OAuth web authorization flow |
+| `GITHUB_CLIENT_ID` | *(empty)* | GitHub OAuth App Client ID |
+| `GITHUB_CLIENT_SECRET` | *(empty)* | GitHub OAuth App Client Secret |
+| `AUTH_BASE_URL` | *(empty)* | Public base URL, e.g. `https://bot.example.com` |
+| `OAUTH_CALLBACK_PATH` | `/auth/callback` | OAuth callback path |
+| `OAUTH_SCOPE` | `copilot` | Requested GitHub OAuth scope |
 
 ### Optional Environment Variables
 
@@ -176,6 +191,10 @@ Generated tags include:
 |----------|--------|-------------|
 | `/api/messages` | POST | Bot Framework messages (Teams) |
 | `/health` | GET | Health check + status |
+| `/auth/login` | GET | Start GitHub OAuth flow |
+| `/auth/callback` | GET | OAuth callback endpoint |
+| `/auth/status` | GET | OAuth session/authentication status |
+| `/auth/logout` | POST | Clear OAuth session cookie |
 | `/admin/reload` | POST | Hot-reload role+skills and reset active sessions (requires `ADMIN_TOKEN`) |
 
 ## Prerequisites

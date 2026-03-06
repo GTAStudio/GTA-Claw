@@ -20,12 +20,20 @@ export class CopilotEngine {
     roleConfig: RoleConfig,
     skills: Skill[],
     toolExecutor: ToolExecutor,
+    githubTokenOverride?: string,
   ) {
     this.config = config;
     this.roleConfig = roleConfig;
 
+    const githubToken = githubTokenOverride ?? config.GITHUB_TOKEN;
+    if (!githubToken) {
+      throw new Error(
+        "CopilotEngine requires a GitHub token (set GITHUB_TOKEN or use OAuth)",
+      );
+    }
+
     this.client = new CopilotClient({
-      githubToken: config.GITHUB_TOKEN,
+      githubToken,
       autoRestart: true,
     });
 

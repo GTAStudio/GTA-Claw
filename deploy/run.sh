@@ -136,6 +136,84 @@ validate_url() {
   return 0
 }
 
+validate_boolean() {
+  local value="$1"
+  local label="$2"
+  if [[ "$value" != "true" && "$value" != "false" ]]; then
+    log_error "$label 必须是 true 或 false，当前值: $value"
+    return 1
+  fi
+  return 0
+}
+
+validate_positive_integer() {
+  local value="$1"
+  local label="$2"
+  if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ]; then
+    log_error "$label 必须是正整数，当前值: $value"
+    return 1
+  fi
+  return 0
+}
+
+validate_image_ref() {
+  local value="$1"
+  if [[ ! "$value" =~ ^([a-z0-9.-]+(:[0-9]+)?/)?[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*(:[A-Za-z0-9._-]+)?$ ]]; then
+    log_error "DOCKER_IMAGE 格式无效: $value"
+    log_error "示例: gtastudio/gta-claw:latest"
+    return 1
+  fi
+  return 0
+}
+
+validate_skills_urls() {
+  local raw="$1"
+  IFS=',' read -r -a items <<< "$raw"
+  for item in "${items[@]}"; do
+    local url
+    url="$(echo "$item" | xargs)"
+    if [ -z "$url" ]; then
+      continue
+    fi
+    validate_url "$url" "ENABLED_SKILLS" || return 1
+  done
+  return 0
+}
+
+validate_auth_mode() {
+  local github_token="$1"
+  local oauth_enabled="$2"
+  local client_id="$3"
+  local client_secret="$4"
+  local auth_base_url="$5"
+
+  if [ -n "$github_token" ]; then
+    return 0
+  fi
+
+  if [ -n "$client_id" ] && [ -n "$client_secret" ] && [ -n "$auth_base_url" ] && [ "$oauth_enabled" != "false" ]; then
+    validate_url "$auth_base_url" "AUTH_BASE_URL" || return 1
+    return 0
+  fi
+
+  log_error "鉴权配置无效：请提供 GITHUB_TOKEN，或启用 OAuth 并配置 GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET / AUTH_BASE_URL"
+  return 1
+}
+
+set_env_file_permissions() {
+  if command -v chmod &>/dev/null; then
+    chmod 600 "$ENV_FILE" 2>/dev/null || true
+  fi
+}
+
+compose() {
+  if [ -f "$ENV_FILE" ]; then
+    docker compose --env-file "$ENV_FILE" "$@"
+  else
+    docker compose "$@"
+  fi
+}
+
 # ---- 从配置文件部署 ----
 do_config() {
   local config_file="$1"
@@ -146,13 +224,25 @@ do_config() {
 
   log_step "正在加载配置文件: $config_file"
 
-  # 读取配置文件到 .env (去掉注释和空行)
-  grep -v '^\s*#' "$config_file" | grep -v '^\s*$' | grep '=' > "$ENV_FILE"
+  # 读取配置文件到 .env (去掉注释和空行, 兼容 CRLF)
+  local tmp_env
+  tmp_env="$(mktemp)"
+  grep -Ev '^[[:space:]]*#|^[[:space:]]*$' "$config_file" | tr -d '\r' | grep '=' > "$tmp_env" || true
 
-  # 验证必填项
+  if [ ! -s "$tmp_env" ]; then
+    rm -f "$tmp_env"
+    log_error "配置文件为空或格式无效: $config_file"
+    log_error "请至少包含 key=value 形式的配置项"
+    exit 1
+  fi
+
+  mv "$tmp_env" "$ENV_FILE"
+  set_env_file_permissions
+
+  # 验证基础必填项
   local has_error=0
-  for var in GITHUB_TOKEN MicrosoftAppId MicrosoftAppPassword AGENT_ROLE_URL ENABLED_SKILLS; do
-    if ! grep -q "^${var}=.\+" "$ENV_FILE"; then
+  for var in MicrosoftAppId MicrosoftAppPassword AGENT_ROLE_URL ENABLED_SKILLS; do
+    if ! grep -Eq "^${var}=.+" "$ENV_FILE"; then
       log_error "缺少必填配置: $var"
       has_error=1
     fi
@@ -163,6 +253,20 @@ do_config() {
     rm -f "$ENV_FILE"
     exit 1
   fi
+
+  validate_image_ref "$(grep '^DOCKER_IMAGE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'gtastudio/gta-claw:latest')"
+  validate_positive_integer "$(grep '^RATE_LIMIT_PER_MIN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo '30')" "RATE_LIMIT_PER_MIN"
+  validate_boolean "$(grep '^AUTO_UPDATE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "AUTO_UPDATE"
+  validate_boolean "$(grep '^TRUST_PROXY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "TRUST_PROXY"
+  validate_boolean "$(grep '^OAUTH_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "OAUTH_ENABLED"
+  validate_url "$(grep '^AGENT_ROLE_URL=' "$ENV_FILE" | cut -d'=' -f2-)" "AGENT_ROLE_URL"
+  validate_skills_urls "$(grep '^ENABLED_SKILLS=' "$ENV_FILE" | cut -d'=' -f2-)"
+  validate_auth_mode \
+    "$(grep '^GITHUB_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^OAUTH_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || true)" \
+    "$(grep '^GITHUB_CLIENT_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^GITHUB_CLIENT_SECRET=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
+    "$(grep '^AUTH_BASE_URL=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
 
   log_info "配置文件验证通过"
   do_deploy
@@ -188,43 +292,72 @@ do_interactive() {
     fi
   fi
 
-  log_step "[1/7] GitHub 认证"
-  local github_token
-  github_token=$(prompt_secret "GITHUB_TOKEN" "GitHub PAT (需要 Copilot Requests 权限)")
+  log_step "[1/8] GitHub 认证方式"
+  echo "  1) Personal Access Token"
+  echo "  2) OAuth 网页授权 (企业推荐)"
+  local auth_mode
+  auth_mode=$(prompt_optional "认证方式编号" "2")
 
-  log_step "[2/7] Azure Bot 凭据"
+  local github_token=""
+  local oauth_enabled="false"
+  local github_client_id=""
+  local github_client_secret=""
+  local auth_base_url=""
+  local oauth_callback_path="/auth/callback"
+  local oauth_scope="copilot"
+
+  if [ "$auth_mode" = "1" ]; then
+    github_token=$(prompt_secret "GITHUB_TOKEN" "GitHub PAT (需要 Copilot Requests 权限)")
+  else
+    oauth_enabled="true"
+    github_client_id=$(prompt_required "GITHUB_CLIENT_ID" "GitHub OAuth Client ID")
+    github_client_secret=$(prompt_secret "GITHUB_CLIENT_SECRET" "GitHub OAuth Client Secret")
+    auth_base_url=$(prompt_required "AUTH_BASE_URL" "OAuth 回调基础 URL (如 https://bot.example.com)")
+    validate_url "$auth_base_url" "AUTH_BASE_URL"
+  fi
+
+  log_step "[2/8] Azure Bot 凭据"
   local app_id app_password
   app_id=$(prompt_required "MicrosoftAppId" "Microsoft App ID")
   app_password=$(prompt_secret "MicrosoftAppPassword" "Microsoft App Password")
 
-  log_step "[3/7] Role 配置"
+  log_step "[3/8] Role 配置"
   echo -e "  ${CYAN}提示: 指向一个 JSON 文件, 格式: {\"content\": \"You are...\", \"model\": \"gpt-4o\"}${NC}"
   local role_url
   role_url=$(prompt_required "AGENT_ROLE_URL" "Role 配置 URL")
   validate_url "$role_url" "AGENT_ROLE_URL"
 
-  log_step "[4/7] Skills 配置"
+  log_step "[4/8] Skills 配置"
   echo -e "  ${CYAN}提示: 多个 Skill URL 用逗号分隔${NC}"
   local skills_urls
   skills_urls=$(prompt_required "ENABLED_SKILLS" "Skill URLs")
+  validate_skills_urls "$skills_urls"
 
-  log_step "[5/7] AI 模型"
+  log_step "[5/8] AI 模型"
   local model
   model=$(select_model)
   log_info "已选择模型: $model"
 
-  log_step "[6/7] 域名配置"
+  log_step "[6/8] 域名配置"
   echo -e "  ${CYAN}提示: Caddy 会自动申请 HTTPS 证书, 本地测试用 localhost${NC}"
   local domain
   domain=$(prompt_optional "域名" "localhost")
 
-  log_step "[7/7] 高级选项"
+  log_step "[7/8] 高级选项"
   local docker_image rate_limit admin_token auto_update trust_proxy
   docker_image=$(prompt_optional "Docker 镜像" "gtastudio/gta-claw:latest")
   rate_limit=$(prompt_optional "速率限制 (每IP每分钟请求数)" "30")
   auto_update=$(prompt_optional "自动更新 SDK/CLI (true/false)" "false")
   trust_proxy=$(prompt_optional "信任反向代理头 (true/false)" "false")
   admin_token=$(prompt_optional "Admin API 令牌 (留空禁用)" "")
+
+  validate_image_ref "$docker_image"
+  validate_positive_integer "$rate_limit" "RATE_LIMIT_PER_MIN"
+  validate_boolean "$auto_update" "AUTO_UPDATE"
+  validate_boolean "$trust_proxy" "TRUST_PROXY"
+  validate_auth_mode "$github_token" "$oauth_enabled" "$github_client_id" "$github_client_secret" "$auth_base_url"
+
+  log_step "[8/8] 写入配置"
 
   # 写入 .env
   cat > "$ENV_FILE" <<EOF
@@ -233,6 +366,12 @@ do_interactive() {
 
 DOCKER_IMAGE=${docker_image}
 GITHUB_TOKEN=${github_token}
+OAUTH_ENABLED=${oauth_enabled}
+GITHUB_CLIENT_ID=${github_client_id}
+GITHUB_CLIENT_SECRET=${github_client_secret}
+AUTH_BASE_URL=${auth_base_url}
+OAUTH_CALLBACK_PATH=${oauth_callback_path}
+OAUTH_SCOPE=${oauth_scope}
 MicrosoftAppId=${app_id}
 MicrosoftAppPassword=${app_password}
 AGENT_ROLE_URL=${role_url}
@@ -250,6 +389,8 @@ AUTO_UPDATE=${auto_update}
 ADMIN_TOKEN=${admin_token}
 EOF
 
+  set_env_file_permissions
+
   log_info "配置已保存到 .env"
   echo ""
   do_deploy
@@ -264,7 +405,7 @@ do_deploy() {
   docker pull "$image" || log_warn "镜像拉取失败，将使用本地缓存 (如有)"
 
   log_step "启动服务..."
-  docker compose up -d
+  compose up -d --remove-orphans
 
   echo ""
   log_info "部署完成！"
@@ -272,17 +413,23 @@ do_deploy() {
 
   # 等待健康检查
   log_step "等待服务就绪..."
+  local container_id
+  container_id="$(compose ps -q gta-claw 2>/dev/null || true)"
   local retries=0
   while [ "$retries" -lt 30 ]; do
-    if docker compose ps --format json 2>/dev/null | grep -q '"healthy"'; then
-      break
+    if [ -n "$container_id" ]; then
+      local health
+      health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+      if [ "$health" = "healthy" ] || [ "$health" = "running" ]; then
+        break
+      fi
     fi
     sleep 2
     retries=$((retries + 1))
   done
 
   echo ""
-  docker compose ps
+  compose ps
   echo ""
 
   local domain
@@ -309,40 +456,38 @@ do_update() {
   fi
 
   log_step "重启服务..."
-  docker compose up -d
+  compose up -d --remove-orphans
   log_info "更新完成"
-  docker compose ps
+  compose ps
 }
 
 # ---- 停止 ----
 do_stop() {
   log_step "停止所有 GTA-Claw 服务..."
-  docker compose down
+  compose down
   log_info "所有服务已停止"
 }
 
 # ---- 状态 ----
 do_status() {
   log_step "服务状态:"
-  docker compose ps
+  compose ps
 
   echo ""
   # 尝试获取健康检查
-  local domain
-  domain=$(grep "^DOMAIN=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo "localhost")
   if curl -sf "http://localhost:3978/health" &>/dev/null 2>&1; then
     log_info "健康检查:"
     curl -s "http://localhost:3978/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || \
       curl -s "http://localhost:3978/health" 2>/dev/null || true
-  elif docker compose exec -T gta-claw curl -sf "http://localhost:3978/health" &>/dev/null 2>&1; then
+  elif compose exec -T gta-claw curl -sf "http://localhost:3978/health" &>/dev/null 2>&1; then
     log_info "健康检查 (容器内):"
-    docker compose exec -T gta-claw curl -s "http://localhost:3978/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
+    compose exec -T gta-claw curl -s "http://localhost:3978/health" 2>/dev/null | python3 -m json.tool 2>/dev/null || true
   fi
 }
 
 # ---- 日志 ----
 do_logs() {
-  docker compose logs -f --tail=100
+  compose logs -f --tail=100
 }
 
 # ---- 帮助 ----
@@ -375,10 +520,9 @@ do_help() {
 }
 
 # ---- Main ----
-check_prerequisites
-
 case "${1:-}" in
   --config|-c)
+    check_prerequisites
     if [ -z "${2:-}" ]; then
       log_error "用法: ./run.sh --config <配置文件路径>"
       log_error "示例: ./run.sh --config conf/gta-claw.conf"
@@ -387,21 +531,26 @@ case "${1:-}" in
     do_config "$2"
     ;;
   --update|-u)
+    check_prerequisites
     do_update
     ;;
   --stop|-s)
+    check_prerequisites
     do_stop
     ;;
   --status)
+    check_prerequisites
     do_status
     ;;
   --logs|-l)
+    check_prerequisites
     do_logs
     ;;
   --help|-h)
     do_help
     ;;
   *)
+    check_prerequisites
     do_interactive
     ;;
 esac

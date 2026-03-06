@@ -4,10 +4,20 @@
 # 用法: ./run.sh --config conf/gta-claw.conf
 # ==============================================================================
 
-# ---- 必填项 ----
+# ---- 鉴权 (二选一) ----
 
-# GitHub Personal Access Token (需要 Copilot Requests 权限)
+# 方案 A: Personal Access Token
 GITHUB_TOKEN=
+
+# 方案 B: OAuth 网页授权 (企业推荐)
+OAUTH_ENABLED=false
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+AUTH_BASE_URL=
+OAUTH_CALLBACK_PATH=/auth/callback
+OAUTH_SCOPE=copilot
+
+# ---- 必填项 ----
 
 # Azure Bot Service 凭据 (Azure Portal → Bot 注册)
 MicrosoftAppId=
