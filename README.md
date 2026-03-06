@@ -2,6 +2,10 @@
 
 > A pure empty-shell engine that dynamically loads roles and skills from remote URLs. Zero hardcoded intelligence.
 
+📖 **Usage Guides / 使用教程**:
+- [中文使用指南](docs/usage-guide-zh.md)
+- [English Usage Guide](docs/usage-guide-en.md)
+
 ## Quick Start
 
 ```bash
