@@ -1,0 +1,24 @@
+{
+  "name": "github_search",
+  "description": "Search GitHub for repositories, issues, pull requests, code, or users. Returns top results with key details. Use this when the user asks to find repos, look up issues, search code on GitHub, or investigate open-source projects.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "type": {
+        "type": "string",
+        "enum": ["repositories", "issues", "code", "users"],
+        "description": "The type of GitHub search to perform"
+      },
+      "query": {
+        "type": "string",
+        "description": "The search query string (supports GitHub search syntax, e.g. 'language:rust stars:>1000')"
+      },
+      "limit": {
+        "type": "number",
+        "description": "Max number of results to return (default 5, max 10)"
+      }
+    },
+    "required": ["type", "query"]
+  },
+  "executeCode": "async function run(params, api) {\n  const type = params.type || 'repositories';\n  const query = encodeURIComponent(params.query);\n  const limit = Math.min(params.limit || 5, 10);\n  const url = 'https://api.github.com/search/' + type + '?q=' + query + '&per_page=' + limit;\n  api.log('Searching GitHub: ' + type + ' / ' + params.query);\n  const raw = await api.httpGet(url);\n  const data = JSON.parse(raw);\n  const total = data.total_count || 0;\n  const items = data.items || [];\n  const results = items.map(function(item) {\n    if (type === 'repositories') return { name: item.full_name, stars: item.stargazers_count, language: item.language, description: (item.description || '').slice(0, 120), url: item.html_url };\n    if (type === 'issues') return { title: item.title, repo: item.repository_url.split('/').slice(-2).join('/'), state: item.state, labels: item.labels.map(function(l) { return l.name; }), url: item.html_url };\n    if (type === 'code') return { file: item.name, repo: item.repository.full_name, path: item.path, url: item.html_url };\n    if (type === 'users') return { login: item.login, type: item.type, url: item.html_url };\n    return item;\n  });\n  return JSON.stringify({ total_count: total, results: results }, null, 2);\n}"
+}

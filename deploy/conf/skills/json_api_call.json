@@ -1,0 +1,28 @@
+{
+  "name": "json_api_call",
+  "description": "Make a JSON API call (GET or POST) to any endpoint and return the parsed response. This is a general-purpose tool for interacting with REST APIs — useful for data collection, webhook triggers, service integration, or any HTTP-based operation the user requests.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "The API endpoint URL"
+      },
+      "method": {
+        "type": "string",
+        "enum": ["GET", "POST"],
+        "description": "HTTP method (default GET)"
+      },
+      "body": {
+        "type": "object",
+        "description": "JSON body for POST requests"
+      },
+      "headers": {
+        "type": "object",
+        "description": "Additional HTTP headers as key-value pairs"
+      }
+    },
+    "required": ["url"]
+  },
+  "executeCode": "async function run(params, api) {\n  var method = params.method || 'GET';\n  api.log(method + ' ' + params.url);\n  var raw;\n  if (method === 'POST') {\n    var body = params.body ? JSON.stringify(params.body) : '';\n    var headers = params.headers || {};\n    headers['Content-Type'] = headers['Content-Type'] || 'application/json';\n    raw = await api.httpPost(params.url, body, headers);\n  } else {\n    raw = await api.httpGet(params.url);\n  }\n  try {\n    var parsed = JSON.parse(raw);\n    return JSON.stringify(parsed, null, 2);\n  } catch (e) {\n    if (raw.length > 10000) raw = raw.slice(0, 10000) + '\\n... [truncated]';\n    return raw;\n  }\n}"
+}

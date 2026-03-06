@@ -1,0 +1,20 @@
+{
+  "name": "ip_dns_lookup",
+  "description": "Look up DNS records, IP geolocation, and WHOIS-like information for a domain or IP address. Useful for server management, diagnosing DNS issues, checking domain configuration, or investigating network problems.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Domain name or IP address to look up"
+      },
+      "type": {
+        "type": "string",
+        "enum": ["dns", "ip", "all"],
+        "description": "Type of lookup: 'dns' for DNS records, 'ip' for IP geolocation, 'all' for both (default 'all')"
+      }
+    },
+    "required": ["target"]
+  },
+  "executeCode": "async function run(params, api) {\n  var target = params.target;\n  var type = params.type || 'all';\n  var result = {};\n  if (type === 'dns' || type === 'all') {\n    try {\n      api.log('DNS lookup: ' + target);\n      var dnsRaw = await api.httpGet('https://dns.google/resolve?name=' + encodeURIComponent(target) + '&type=A');\n      var dns = JSON.parse(dnsRaw);\n      result.dns_a = dns.Answer ? dns.Answer.map(function(a) { return { name: a.name, type: a.type, ttl: a.TTL, data: a.data }; }) : [];\n      var dnsRawMx = await api.httpGet('https://dns.google/resolve?name=' + encodeURIComponent(target) + '&type=MX');\n      var dnsMx = JSON.parse(dnsRawMx);\n      result.dns_mx = dnsMx.Answer ? dnsMx.Answer.map(function(a) { return { data: a.data }; }) : [];\n    } catch (e) {\n      result.dns_error = String(e).slice(0, 200);\n    }\n  }\n  if (type === 'ip' || type === 'all') {\n    try {\n      var ipTarget = target;\n      if (result.dns_a && result.dns_a.length > 0) ipTarget = result.dns_a[0].data;\n      api.log('IP lookup: ' + ipTarget);\n      var ipRaw = await api.httpGet('http://ip-api.com/json/' + encodeURIComponent(ipTarget) + '?fields=status,country,regionName,city,isp,org,as,query');\n      result.ip_info = JSON.parse(ipRaw);\n    } catch (e) {\n      result.ip_error = String(e).slice(0, 200);\n    }\n  }\n  return JSON.stringify(result, null, 2);\n}"
+}

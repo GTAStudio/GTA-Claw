@@ -1,0 +1,19 @@
+{
+  "name": "github_repo_info",
+  "description": "Get detailed information about a GitHub repository including stats, latest release, open issues count, and recent activity. Use when the user asks about a specific repo's status, stats, or latest version.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "Repository in owner/name format (e.g. 'GTAStudio/GTA-Claw')"
+      },
+      "include_releases": {
+        "type": "boolean",
+        "description": "Whether to fetch latest release info (default true)"
+      }
+    },
+    "required": ["repo"]
+  },
+  "executeCode": "async function run(params, api) {\n  var repo = params.repo;\n  api.log('Fetching repo info: ' + repo);\n  var repoRaw = await api.httpGet('https://api.github.com/repos/' + repo);\n  var info = JSON.parse(repoRaw);\n  var result = {\n    full_name: info.full_name,\n    description: info.description,\n    language: info.language,\n    stars: info.stargazers_count,\n    forks: info.forks_count,\n    open_issues: info.open_issues_count,\n    default_branch: info.default_branch,\n    created_at: info.created_at,\n    updated_at: info.updated_at,\n    pushed_at: info.pushed_at,\n    topics: info.topics,\n    license: info.license ? info.license.spdx_id : null,\n    url: info.html_url\n  };\n  if (params.include_releases !== false) {\n    try {\n      var relRaw = await api.httpGet('https://api.github.com/repos/' + repo + '/releases/latest');\n      var rel = JSON.parse(relRaw);\n      result.latest_release = { tag: rel.tag_name, name: rel.name, published_at: rel.published_at, url: rel.html_url };\n    } catch (e) {\n      result.latest_release = null;\n    }\n  }\n  return JSON.stringify(result, null, 2);\n}"
+}

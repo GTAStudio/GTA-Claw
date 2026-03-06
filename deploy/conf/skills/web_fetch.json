@@ -1,0 +1,19 @@
+{
+  "name": "web_fetch",
+  "description": "Fetch the content of a web page or API endpoint and return the raw text. Useful for data collection, research, reading documentation, checking API responses, or scraping public information. Supports any URL that returns text content.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "The URL to fetch"
+      },
+      "max_length": {
+        "type": "number",
+        "description": "Maximum characters to return (default 8000, max 50000)"
+      }
+    },
+    "required": ["url"]
+  },
+  "executeCode": "async function run(params, api) {\n  var maxLen = Math.min(params.max_length || 8000, 50000);\n  api.log('Fetching: ' + params.url);\n  var raw = await api.httpGet(params.url);\n  var text = raw;\n  if (text.length > maxLen) {\n    text = text.slice(0, maxLen) + '\\n... [truncated, total ' + raw.length + ' chars]';\n  }\n  return text;\n}"
+}

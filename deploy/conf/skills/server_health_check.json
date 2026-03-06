@@ -1,0 +1,16 @@
+{
+  "name": "server_health_check",
+  "description": "Check the health and availability of one or more HTTP endpoints. Returns status code, response time, and a snippet of the response body. Use this when the user asks to check if a server/service is up, monitor endpoints, or diagnose connectivity issues.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "urls": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "List of URLs to check (e.g. ['https://example.com/health', 'https://api.example.com/status'])"
+      }
+    },
+    "required": ["urls"]
+  },
+  "executeCode": "async function run(params, api) {\n  var results = [];\n  for (var i = 0; i < params.urls.length; i++) {\n    var url = params.urls[i];\n    var start = Date.now();\n    try {\n      var body = await api.httpGet(url);\n      var elapsed = Date.now() - start;\n      results.push({ url: url, status: 'up', response_time_ms: elapsed, body_preview: body.slice(0, 500) });\n    } catch (err) {\n      var elapsed2 = Date.now() - start;\n      results.push({ url: url, status: 'down', response_time_ms: elapsed2, error: String(err).slice(0, 200) });\n    }\n  }\n  return JSON.stringify(results, null, 2);\n}"
+}
