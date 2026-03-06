@@ -745,6 +745,12 @@ case "${1:-}" in
     ;;
   *)
     check_prerequisites
-    do_interactive
+    # Auto-detect config: if conf/gta-claw.conf exists, use it; otherwise interactive
+    if [ -f "$SCRIPT_DIR/conf/gta-claw.conf" ]; then
+      log_info "检测到配置文件 conf/gta-claw.conf，自动加载..."
+      do_config "$SCRIPT_DIR/conf/gta-claw.conf"
+    else
+      do_interactive
+    fi
     ;;
 esac
