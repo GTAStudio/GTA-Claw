@@ -66,10 +66,12 @@ codesign \
 codesign --verify --deep --strict --verbose=2 "$app"
 details="$(codesign -dvvv "$app" 2>&1)"
 requirement="$(codesign -d -r- "$app" 2>&1)"
-grep -F "identifier \"$BUNDLE_ID\"" <<<"$requirement" >/dev/null ||
-  die "designated requirement does not contain $BUNDLE_ID"
+grep -F "designated =>" <<<"$requirement" >/dev/null ||
+  die "code signature has no designated requirement"
 
 if [[ "$mode" == "release" ]]; then
+  grep -F "identifier \"$BUNDLE_ID\"" <<<"$requirement" >/dev/null ||
+    die "release designated requirement does not contain $BUNDLE_ID"
   grep -F "Authority=Developer ID Application:" <<<"$details" >/dev/null ||
     die "release signature has no Developer ID Application authority"
   grep -F "Timestamp=" <<<"$details" >/dev/null ||

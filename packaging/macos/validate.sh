@@ -71,7 +71,12 @@ plutil -convert xml1 -o "$expected_entitlements" "$MACOS_DIR/gta-claw.entitlemen
 cmp -s "$actual_entitlements" "$expected_entitlements" || die "signed entitlements differ from source"
 
 details="$(codesign -dvvv "$app" 2>&1)"
+requirement="$(codesign -d -r- "$app" 2>&1)"
+grep -F "designated =>" <<<"$requirement" >/dev/null ||
+  die "code signature has no designated requirement"
 if [[ "$signature_mode" == "release" ]]; then
+  grep -F "identifier \"$BUNDLE_ID\"" <<<"$requirement" >/dev/null ||
+    die "release designated requirement does not contain $BUNDLE_ID"
   grep -F "Authority=Developer ID Application:" <<<"$details" >/dev/null ||
     die "release app lacks Developer ID Application authority"
   grep -F "Timestamp=" <<<"$details" >/dev/null || die "release app lacks a secure timestamp"
