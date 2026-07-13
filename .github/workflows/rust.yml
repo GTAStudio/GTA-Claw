@@ -75,6 +75,57 @@ jobs:
           cargo metadata --locked --format-version 1 |
             python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"root metadata contains Slint packages: {forbidden}"'
 
+  state-lock-regressions:
+    name: SQLite identity locks (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_WARNINGS: deny
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Run bounded lock regressions in exact, serial, and parallel modes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import sys
+
+          commands = [
+              (
+                  "exact migration race",
+                  [
+                      "cargo", "test", "--locked", "--package", "claw-state",
+                      "tests::migration_transaction_excludes_external_schema_writer",
+                      "--", "--exact", "--nocapture",
+                  ],
+              ),
+              (
+                  "serial claw-state suite",
+                  [
+                      "cargo", "test", "--locked", "--package", "claw-state",
+                      "--", "--test-threads=1",
+                  ],
+              ),
+              (
+                  "parallel claw-state suite",
+                  ["cargo", "test", "--locked", "--package", "claw-state"],
+              ),
+          ]
+
+          for label, command in commands:
+              print(f"::group::{label}", flush=True)
+              try:
+                  subprocess.run(command, check=True, timeout=300)
+              except subprocess.TimeoutExpired:
+                  print(f"::error::{label} exceeded the 300-second hard bound")
+                  sys.exit(124)
+              finally:
+                  print("::endgroup::", flush=True)
+          PY
+
   msrv:
     name: MSRV (1.94.0)
     runs-on: ubuntu-latest
