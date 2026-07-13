@@ -322,6 +322,7 @@ export component TextField {
     in property <string> accessible-name: root.label;
     in-out property <string> text <=> field.text;
     in property <string> placeholder: "";
+    in property <InputType> input-type: InputType.text;
     in property <bool> enabled: true;
     in property <bool> read-only: false;
     out property <bool> has-focus: field.has-focus;
@@ -345,6 +346,7 @@ export component TextField {
 
         field := LineEdit {
             placeholder-text: root.placeholder;
+            input-type: root.input-type;
             enabled: root.enabled;
             read-only: root.read-only;
             accessible-label: root.accessible-name;

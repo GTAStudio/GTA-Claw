@@ -1,51 +1,85 @@
-import { ApplicationShell, PaneMode } from "@gta-ui/shell.slint";
+import { GatewayOnboardingSurface } from "@gta-ui/gateway-onboarding.slint";
 import { DesignTokens, StatusKind, ThemeMode, VisualPreferences } from "@gta-ui/tokens.slint";
 export { DesignTokens, VisualPreferences }
 
 export component AppWindow inherits Window {
-    title: "GTA Claw";
-    preferred-width: 1240px;
-    preferred-height: 760px;
+    title: "GTA Claw Gateway";
+    preferred-width: 1080px;
+    preferred-height: 720px;
     min-width: 720px;
     min-height: 520px;
 
-    in property <string> status-text: "Starting GTA Claw...";
+    in property <string> state-title: "Connect to your Gateway";
+    in property <string> state-detail: "Run a real bounded Gateway diagnostic.";
+    in property <string> status-text: "Not connected";
     in property <string> status-label: "Status";
     in property <string> status-icon: "-";
     in property <StatusKind> status-kind: StatusKind.neutral;
-    in property <bool> navigation-drawer-open: false;
-    in property <bool> inspector-open: false;
+    in property <string> endpoint-summary: "Not selected";
+    in property <string> server-summary: "Not connected";
+    in property <string> protocol-summary: "Not negotiated";
+    in property <string> role-summary: "Not authenticated";
+    in property <string> scopes-summary: "No effective scopes";
+    in property <string> health-summary: "Not checked";
+    in property <string> identity-summary: "Created only after consent";
+    in property <string> error-message: "";
+    in property <string> error-action: "";
+    in property <bool> busy: false;
+    in property <bool> can-connect: true;
+    in property <bool> can-cancel: false;
+    in property <bool> can-disconnect: false;
+    in property <bool> can-retry: false;
+    in-out property <string> endpoint-input: "ws://localhost:18789";
+    in-out property <string> token-input: "";
+    in-out property <bool> consent-checked: false;
     in property <length> layout-width: root.width;
+    out property <bool> narrow-layout <=> onboarding.narrow-layout;
     in-out property <ThemeMode> theme-mode <=> VisualPreferences.theme-mode;
     in-out property <bool> high-contrast <=> VisualPreferences.high-contrast;
     in-out property <bool> reduced-motion <=> VisualPreferences.reduced-motion;
     in-out property <float> density-scale <=> VisualPreferences.density-scale;
-    in property <PaneMode> pane-mode: PaneMode.three-pane;
-    in property <bool> inspector-backdrop-active: false;
 
-    callback refresh-requested();
-    callback navigation-toggle-requested();
-    callback inspector-toggle-requested();
-    callback viewport-width-changed(float);
+    callback connect-requested(string, string, bool);
+    callback retry-requested(string, string, bool);
+    callback cancel-requested();
+    callback disconnect-requested();
+    callback error-dismiss-requested();
 
-    changed layout-width => {
-        root.viewport-width-changed(root.layout-width / 1px);
-    }
-
-    shell := ApplicationShell {
+    onboarding := GatewayOnboardingSurface {
         width: 100%;
         height: 100%;
         available-width: root.layout-width;
+        state-title: root.state-title;
+        state-detail: root.state-detail;
         status-text: root.status-text;
         status-label: root.status-label;
         status-icon: root.status-icon;
         status-kind: root.status-kind;
-        pane-mode: root.pane-mode;
-        navigation-drawer-open: root.navigation-drawer-open;
-        inspector-open: root.inspector-open;
-        inspector-backdrop-active: root.inspector-backdrop-active;
-        refresh-requested => { root.refresh-requested(); }
-        navigation-toggle-requested => { root.navigation-toggle-requested(); }
-        inspector-toggle-requested => { root.inspector-toggle-requested(); }
+        endpoint-summary: root.endpoint-summary;
+        server-summary: root.server-summary;
+        protocol-summary: root.protocol-summary;
+        role-summary: root.role-summary;
+        scopes-summary: root.scopes-summary;
+        health-summary: root.health-summary;
+        identity-summary: root.identity-summary;
+        error-message: root.error-message;
+        error-action: root.error-action;
+        busy: root.busy;
+        can-connect: root.can-connect;
+        can-cancel: root.can-cancel;
+        can-disconnect: root.can-disconnect;
+        can-retry: root.can-retry;
+        endpoint-input <=> root.endpoint-input;
+        token-input <=> root.token-input;
+        consent-checked <=> root.consent-checked;
+        connect-requested(endpoint, token, consent) => {
+            root.connect-requested(endpoint, token, consent);
+        }
+        retry-requested(endpoint, token, consent) => {
+            root.retry-requested(endpoint, token, consent);
+        }
+        cancel-requested => { root.cancel-requested(); }
+        disconnect-requested => { root.disconnect-requested(); }
+        error-dismiss-requested => { root.error-dismiss-requested(); }
     }
 }

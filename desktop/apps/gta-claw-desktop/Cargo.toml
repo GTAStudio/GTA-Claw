@@ -10,7 +10,13 @@ build = "build.rs"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 claw-application.workspace = true
+claw-gateway-client.workspace = true
 claw-platform.workspace = true
+claw-protocol.workspace = true
+claw-security.workspace = true
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+secrecy = "=0.10.3"
+serde_json = { version = "=1.0.150", features = ["raw_value"] }
 slint = { version = "=1.17.1", default-features = false, features = [
   "accessibility",
   "backend-winit",
@@ -19,9 +25,18 @@ slint = { version = "=1.17.1", default-features = false, features = [
   "renderer-software",
   "std",
 ] }
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+url = "=2.5.8"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.build-dependencies]
 slint-build = { version = "=1.17.1" }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dev-dependencies]
+base64 = "=0.22.1"
+fastwebsockets = { version = "=0.10.0", default-features = false }
+httparse = "=1.10.1"
+sha1 = "=0.11.0"
 
 [lints]
 workspace = true
