@@ -293,38 +293,6 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
-    fn assert_child_open_rejected(database: &Path, ready: &Path, home: &Path) {
-        let executable = std::env::current_exe().expect("current test executable");
-        let child = Command::new(executable)
-            .arg("--exact")
-            .arg("tests::child_process_writer")
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env("HOME", home)
-            .env("CLAW_STATE_CHILD_DATABASE", database)
-            .env("CLAW_STATE_CHILD_READY", ready)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn rejected-open child");
-        let mut child = ChildGuard::new(child);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("inspect rejected-open child") {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                child.kill().expect("stop blocked rejected-open child");
-                child.wait().expect("reap blocked rejected-open child");
-                panic!("rejected child open did not finish within five seconds");
-            }
-            thread::sleep(Duration::from_millis(25));
-        };
-        assert!(!status.success());
-        assert!(!ready.exists());
-    }
-
     fn device(id: &str, created_at: i64) -> DeviceRecord {
         DeviceRecord::new(
             DeviceId::new(id).expect("test device id is valid"),
@@ -2195,76 +2163,6 @@ mod tests {
             .err()
             .expect("stale lock contents are rejected");
         assert!(matches!(error, StateError::InvalidPath { .. }));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn canonical_private_lock_namespace_attacks_are_rejected_in_child_processes() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-
-        let directory = tempfile::tempdir().expect("temporary directory");
-
-        let symlink_home = directory.path().join("symlink-home");
-        let symlink_target = directory.path().join("symlink-state-target");
-        fs::create_dir(&symlink_home).expect("create symlink test home");
-        fs::create_dir(&symlink_target).expect("create symlink state target");
-        symlink(&symlink_target, symlink_home.join(".gta-claw"))
-            .expect("replace private state directory with symlink");
-        let symlink_db = database_path(&directory, "canonical-symlink.sqlite");
-        fs::File::create(&symlink_db).expect("create canonical symlink DB");
-        assert_child_open_rejected(
-            &symlink_db,
-            &database_path(&directory, "canonical-symlink.ready"),
-            &symlink_home,
-        );
-
-        let permissive_home = directory.path().join("permissive-home");
-        let permissive_state = permissive_home.join(".gta-claw");
-        fs::create_dir(&permissive_home).expect("create permissive test home");
-        fs::create_dir(&permissive_state).expect("create permissive state directory");
-        fs::set_permissions(&permissive_state, fs::Permissions::from_mode(0o755))
-            .expect("make state directory permissive");
-        let permissive_db = database_path(&directory, "canonical-permissive.sqlite");
-        fs::File::create(&permissive_db).expect("create canonical permissive DB");
-        assert_child_open_rejected(
-            &permissive_db,
-            &database_path(&directory, "canonical-permissive.ready"),
-            &permissive_home,
-        );
-
-        for (name, hardlink) in [("hardlink", true), ("stale", false)] {
-            let home = directory.path().join(format!("{name}-home"));
-            let state = home.join(".gta-claw");
-            let locks = state.join("locks");
-            fs::create_dir(&home).expect("create artifact test home");
-            fs::create_dir(&state).expect("create artifact state directory");
-            fs::create_dir(&locks).expect("create artifact lock directory");
-            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
-                .expect("secure artifact state directory");
-            fs::set_permissions(&locks, fs::Permissions::from_mode(0o700))
-                .expect("secure artifact lock directory");
-            let database = database_path(&directory, &format!("canonical-{name}.sqlite"));
-            fs::File::create(&database).expect("create artifact database");
-            let metadata = fs::metadata(&database).expect("read artifact DB identity");
-            let lock_path = locks.join(format!(
-                "dev-{}-ino-{}-test.lock",
-                metadata.dev(),
-                metadata.ino()
-            ));
-            fs::write(&lock_path, b"stale identity").expect("create artifact lock file");
-            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
-                .expect("secure artifact lock file");
-            if hardlink {
-                fs::hard_link(&lock_path, locks.join("second-link"))
-                    .expect("hardlink canonical lock file");
-            }
-            set_unix_lock_identity(&database, &lock_path);
-            assert_child_open_rejected(
-                &database,
-                &database_path(&directory, &format!("canonical-{name}.ready")),
-                &home,
-            );
-        }
     }
 
     #[cfg(unix)]

@@ -1462,13 +1462,21 @@ fn acquire_creation_lock(_path: &Path) -> Result<Option<File>, StateError> {
 #[cfg(unix)]
 fn default_private_lock_root() -> Result<PathBuf, StateError> {
     use std::os::unix::fs::DirBuilderExt as _;
+    use uzers::os::unix::UserExt as _;
 
-    let home = std::env::var_os("HOME").ok_or_else(|| StateError::InvalidPath {
+    let uid = uzers::get_effective_uid();
+    let account = uzers::get_user_by_uid(uid).ok_or_else(|| StateError::InvalidPath {
         path: PathBuf::new(),
-        reason: "HOME is required for the private writer-lock namespace",
+        reason: "OS account home is required for the private writer-lock namespace",
     })?;
-    let home = std::fs::canonicalize(PathBuf::from(home))
-        .map_err(|error| file_error("canonicalize private lock home", Path::new("HOME"), error))?;
+    let account_home = account.home_dir();
+    let home = std::fs::canonicalize(account_home).map_err(|error| {
+        file_error(
+            "canonicalize OS account home for private locks",
+            account_home,
+            error,
+        )
+    })?;
     let state = home.join(".gta-claw");
     let locks = state.join("locks");
     for directory in [&state, &locks] {
