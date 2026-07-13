@@ -12,6 +12,8 @@ use crate::{
     TaskStatus, TimestampMs,
 };
 
+const APPLICATION_ID: i64 = 0x4754_4143;
+
 #[cfg(test)]
 static WRITE_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -60,7 +62,13 @@ impl<'store> SessionRepository<'store> {
         .execute(&mut *transaction)
         .await
         .map_err(|error| create_error(error, "session", record.id.as_str(), None))?;
-        commit_verified(transaction, self.identity, "commit session create").await?;
+        commit_verified(
+            transaction,
+            self.owner,
+            self.identity,
+            "commit session create",
+        )
+        .await?;
         Ok(())
     }
 
@@ -150,7 +158,13 @@ impl<'store> SessionRepository<'store> {
             .map(session_from_row)
             .transpose()?
             .ok_or_else(|| conflict("session", id.as_str(), expected_version))?;
-        commit_verified(transaction, self.identity, "commit session update").await?;
+        commit_verified(
+            transaction,
+            self.owner,
+            self.identity,
+            "commit session update",
+        )
+        .await?;
         Ok(record)
     }
 }
@@ -182,7 +196,13 @@ impl<'store> DeviceRepository<'store> {
             begin_verified_write(self.pool, self.owner, self.identity, "begin device create")
                 .await?;
         insert_device(&mut transaction, record).await?;
-        commit_verified(transaction, self.identity, "commit device create").await?;
+        commit_verified(
+            transaction,
+            self.owner,
+            self.identity,
+            "commit device create",
+        )
+        .await?;
         Ok(())
     }
 
@@ -211,6 +231,7 @@ impl<'store> DeviceRepository<'store> {
         insert_authentication(&mut transaction, authentication).await?;
         commit_verified(
             transaction,
+            self.owner,
             self.identity,
             "commit device and authentication create",
         )
@@ -295,7 +316,13 @@ impl<'store> DeviceRepository<'store> {
             .map(device_from_row)
             .transpose()?
             .ok_or_else(|| conflict("device", id.as_str(), expected_version))?;
-        commit_verified(transaction, self.identity, "commit device rename").await?;
+        commit_verified(
+            transaction,
+            self.owner,
+            self.identity,
+            "commit device rename",
+        )
+        .await?;
         Ok(record)
     }
 }
@@ -331,7 +358,13 @@ impl<'store> AuthenticationRepository<'store> {
         )
         .await?;
         insert_authentication(&mut transaction, record).await?;
-        commit_verified(transaction, self.identity, "commit authentication create").await?;
+        commit_verified(
+            transaction,
+            self.owner,
+            self.identity,
+            "commit authentication create",
+        )
+        .await?;
         Ok(())
     }
 
@@ -446,7 +479,13 @@ impl<'store> AuthenticationRepository<'store> {
             .map(authentication_from_row)
             .transpose()?
             .ok_or_else(|| conflict("authentication", id.as_str(), expected_version))?;
-        commit_verified(transaction, self.identity, "commit authentication update").await?;
+        commit_verified(
+            transaction,
+            self.owner,
+            self.identity,
+            "commit authentication update",
+        )
+        .await?;
         Ok(record)
     }
 }
@@ -477,7 +516,7 @@ impl<'store> TaskRepository<'store> {
         let mut transaction =
             begin_verified_write(self.pool, self.owner, self.identity, "begin task create").await?;
         insert_task(&mut transaction, record).await?;
-        commit_verified(transaction, self.identity, "commit task create").await
+        commit_verified(transaction, self.owner, self.identity, "commit task create").await
     }
 
     /// Reads one task.
@@ -577,7 +616,7 @@ impl<'store> TaskRepository<'store> {
             .map(task_from_row)
             .transpose()?
             .ok_or_else(|| conflict("task", id.as_str(), expected_version))?;
-        commit_verified(transaction, self.identity, "commit task update").await?;
+        commit_verified(transaction, self.owner, self.identity, "commit task update").await?;
         Ok(record)
     }
 }
@@ -588,8 +627,6 @@ async fn begin_verified_write<'pool>(
     identity: OperationalIdentity<'_>,
     operation: &'static str,
 ) -> Result<Transaction<'pool, Sqlite>, StateError> {
-    const APPLICATION_ID: i64 = 0x4754_4143;
-
     let mut transaction = pool
         .begin()
         .await
@@ -649,7 +686,7 @@ async fn wait_at_write_test_barrier(owner: &str) {
 
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {
-    use super::{Arc, WRITE_TEST_BARRIER, WriteTestBarrier};
+    use super::{Arc, WRITE_TEST_BARRIERS, WriteTestBarrier};
 
     pub(crate) fn set_write_barrier(
         owner: &str,
@@ -671,14 +708,32 @@ pub(crate) mod test_support {
 }
 
 async fn commit_verified(
-    transaction: Transaction<'_, Sqlite>,
+    mut transaction: Transaction<'_, Sqlite>,
+    owner: &str,
     identity: OperationalIdentity<'_>,
     operation: &'static str,
 ) -> Result<(), StateError> {
-    #[cfg(unix)]
-    let mut transaction = transaction;
-    #[cfg(not(unix))]
-    let transaction = transaction;
+    let persisted_owner =
+        sqlx::query_scalar::<_, String>("SELECT owner FROM claw_writer_lock WHERE singleton = 1")
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| database("reverify repository writer owner", error))?;
+    if persisted_owner.as_deref() != Some(owner) {
+        return Err(StateError::InvalidMigrationHistory {
+            reason: "application writer ownership changed before repository commit".to_owned(),
+        });
+    }
+    let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database("reverify repository application id", error))?;
+    if application_id != APPLICATION_ID {
+        return Err(StateError::InvalidValue {
+            field: "SQLite application id",
+            reason: "database ownership changed before repository commit",
+        });
+    }
+    validate_operational_schema(&mut transaction).await?;
     identity.verify()?;
     #[cfg(unix)]
     {
