@@ -18,13 +18,18 @@ pub use repository::{
     AuthenticationRepository, DeviceRepository, SessionRepository, TaskRepository,
 };
 pub use store::{
-    CheckpointReport, HealthReport, StateStore, StoreConfig, StoreSettings, SynchronousPolicy,
+    CheckpointReport, HealthReport, RecoveredWriterLock, StateStore, StoreConfig, StoreSettings,
+    SynchronousPolicy,
 };
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::fs::{self, OpenOptions};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use claw_domain::SessionId;
     use sqlx::sqlite::SqliteConnectOptions;
@@ -36,6 +41,93 @@ mod tests {
 
     fn database_path(directory: &TempDir, name: &str) -> PathBuf {
         directory.path().join(name)
+    }
+
+    fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut value: OsString = path.as_os_str().to_owned();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn database_artifact_bytes(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        [
+            path.to_owned(),
+            sidecar(path, "-wal"),
+            sidecar(path, "-shm"),
+        ]
+        .into_iter()
+        .map(|artifact| {
+            let bytes = fs::read(&artifact).ok();
+            (artifact, bytes)
+        })
+        .collect()
+    }
+
+    fn assert_database_artifacts_unchanged(
+        before: &[(PathBuf, Option<Vec<u8>>)],
+        after: &[(PathBuf, Option<Vec<u8>>)],
+    ) {
+        assert_eq!(before.len(), after.len());
+        for ((before_path, before_bytes), (after_path, after_bytes)) in before.iter().zip(after) {
+            assert_eq!(before_path, after_path);
+            assert!(
+                before_bytes == after_bytes,
+                "database artifact changed: {} (before length {:?}, after length {:?})",
+                before_path.display(),
+                before_bytes.as_ref().map(Vec::len),
+                after_bytes.as_ref().map(Vec::len)
+            );
+        }
+    }
+
+    async fn execute_direct(path: &Path, sql: &'static str) {
+        let options = SqliteConnectOptions::new().filename(path);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open database directly");
+        sqlx::raw_sql(sql)
+            .execute(&mut connection)
+            .await
+            .expect("execute direct SQL");
+        connection.close().await.expect("close direct database");
+    }
+
+    async fn persisted_writer(path: &Path) -> Option<(String, i64)> {
+        let options = SqliteConnectOptions::new().filename(path).read_only(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("inspect persisted writer");
+        let row =
+            sqlx::query("SELECT owner, acquired_at_ms FROM claw_writer_lock WHERE singleton = 1")
+                .fetch_optional(&mut connection)
+                .await
+                .expect("read persisted writer");
+        connection.close().await.expect("close writer inspection");
+        row.map(|row| {
+            use sqlx::Row as _;
+            (row.get("owner"), row.get("acquired_at_ms"))
+        })
+    }
+
+    async fn assert_restore_rejected(source: &Path, destination: &Path) {
+        let error = StateStore::restore_backup(source, destination)
+            .await
+            .expect_err("invalid restore source is rejected");
+        assert!(
+            matches!(error, StateError::InvalidBackup { .. }),
+            "unexpected restore error: {error:?}"
+        );
+        for artifact in [
+            destination.to_owned(),
+            sidecar(destination, "-wal"),
+            sidecar(destination, "-shm"),
+        ] {
+            assert!(
+                !artifact.exists(),
+                "restore rejection left artifact {}",
+                artifact.display()
+            );
+        }
     }
 
     fn timestamp(value: i64) -> TimestampMs {
@@ -293,6 +385,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_rejects_an_archived_session() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "archived-task.sqlite")).await;
+        let session = session("archived-session", 1);
+        store
+            .sessions()
+            .create(&session)
+            .await
+            .expect("create session");
+        store
+            .sessions()
+            .update_status(&session.id, 1, SessionStatus::Archived, timestamp(2))
+            .await
+            .expect("archive session");
+
+        let error = store
+            .tasks()
+            .create(&task("rejected-task", &session.id, 3))
+            .await
+            .expect_err("archived session rejects task");
+        assert_eq!(
+            error,
+            StateError::InactiveParent {
+                entity: "session",
+                id: "archived-session".to_owned(),
+                state: "archived",
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_and_task_create_race_has_only_serializable_outcomes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "archive-race.sqlite")).await;
+        for index in 0..20 {
+            let session = session(&format!("race-session-{index}"), index * 10 + 1);
+            let task = task(&format!("race-task-{index}"), &session.id, index * 10 + 2);
+            store
+                .sessions()
+                .create(&session)
+                .await
+                .expect("create racing session");
+            let sessions = store.sessions();
+            let tasks = store.tasks();
+            let (archived, created) = tokio::join!(
+                sessions.update_status(
+                    &session.id,
+                    1,
+                    SessionStatus::Archived,
+                    timestamp(index * 10 + 3)
+                ),
+                tasks.create(&task)
+            );
+            archived.expect("archive wins or follows task creation");
+            match created {
+                Ok(()) => assert!(
+                    store
+                        .tasks()
+                        .get(&task.id)
+                        .await
+                        .expect("read racing task")
+                        .is_some()
+                ),
+                Err(StateError::InactiveParent {
+                    entity: "session",
+                    state: "archived",
+                    ..
+                }) => {}
+                Err(error) => panic!("unexpected archive/create race result: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cursor_pagination_is_stable_for_equal_timestamps() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = open(&database_path(&directory, "pagination.sqlite")).await;
@@ -373,6 +539,16 @@ mod tests {
             .await
             .expect("tamper migration checksum");
         store.close().await.expect("tampered store closes");
+        execute_direct(
+            &path,
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'drift-owner', 11)",
+        )
+        .await;
+        let journal_before = test_support::journal_mode(&path)
+            .await
+            .expect("read journal mode before checksum rejection");
+        let before = database_artifact_bytes(&path);
 
         let error = StateStore::open(StoreConfig::new(&path))
             .await
@@ -382,6 +558,17 @@ mod tests {
             error,
             StateError::MigrationChecksumDrift { version: 1, .. }
         ));
+        assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
+        assert_eq!(
+            test_support::journal_mode(&path)
+                .await
+                .expect("read journal mode after checksum rejection"),
+            journal_before
+        );
+        assert_eq!(
+            persisted_writer(&path).await,
+            Some(("drift-owner".to_owned(), 11))
+        );
     }
 
     #[test]
@@ -406,6 +593,16 @@ mod tests {
         .await
         .expect("insert future migration");
         store.close().await.expect("future store closes");
+        execute_direct(
+            &path,
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'newer-owner', 12)",
+        )
+        .await;
+        let journal_before = test_support::journal_mode(&path)
+            .await
+            .expect("read journal mode before newer-schema rejection");
+        let before = database_artifact_bytes(&path);
 
         let error = StateStore::open(StoreConfig::new(&path))
             .await
@@ -418,6 +615,104 @@ mod tests {
                 supported: 1,
             }
         );
+        assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
+        assert_eq!(
+            test_support::journal_mode(&path)
+                .await
+                .expect("read journal mode after newer-schema rejection"),
+            journal_before
+        );
+        assert_eq!(
+            persisted_writer(&path).await,
+            Some(("newer-owner".to_owned(), 12))
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_gap_is_rejected_without_mutation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "gap.sqlite");
+        let store = open(&path).await;
+        store.close().await.expect("seed store closes");
+        execute_direct(
+            &path,
+            "DELETE FROM claw_schema_migrations;
+             INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+             VALUES (2, 'gap', 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg', 1);
+             INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'gap-owner', 13)",
+        )
+        .await;
+        let journal_before = test_support::journal_mode(&path)
+            .await
+            .expect("read journal mode before migration-gap rejection");
+        let before = database_artifact_bytes(&path);
+
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("migration gap rejects reopen");
+        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
+        assert_eq!(
+            test_support::journal_mode(&path)
+                .await
+                .expect("read journal mode after migration-gap rejection"),
+            journal_before
+        );
+        assert_eq!(
+            persisted_writer(&path).await,
+            Some(("gap-owner".to_owned(), 13))
+        );
+    }
+
+    #[tokio::test]
+    async fn health_reports_migration_name_and_checksum_drift() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "health-drift.sqlite");
+        let store = open(&path).await;
+        let original_checksum =
+            sqlx::query_scalar::<_, String>("SELECT checksum FROM claw_schema_migrations")
+                .fetch_one(test_support::pool(&store))
+                .await
+                .expect("read embedded checksum");
+        sqlx::query("UPDATE claw_schema_migrations SET checksum = ? WHERE version = 1")
+            .bind("0".repeat(64))
+            .execute(test_support::pool(&store))
+            .await
+            .expect("tamper migration checksum");
+
+        let health = store.health().await.expect("health report");
+        assert!(!health.is_healthy());
+        assert_eq!(health.migration_errors.len(), 1);
+        assert!(health.migration_errors[0].contains("checksum drift"));
+
+        sqlx::query(
+            "UPDATE claw_schema_migrations
+             SET name = 'renamed', checksum = ?
+             WHERE version = 1",
+        )
+        .bind(original_checksum)
+        .execute(test_support::pool(&store))
+        .await
+        .expect("tamper migration name");
+        let health = store.health().await.expect("name drift health report");
+        assert!(!health.is_healthy());
+        assert_eq!(health.migration_errors.len(), 1);
+        assert!(health.migration_errors[0].contains("is named renamed"));
+
+        sqlx::raw_sql(
+            "UPDATE claw_schema_migrations SET name = 'initial' WHERE version = 1;
+             DROP TABLE tasks",
+        )
+        .execute(test_support::pool(&store))
+        .await
+        .expect("remove required schema object");
+        let health = store.health().await.expect("schema drift health report");
+        assert!(!health.is_healthy());
+        assert_eq!(health.migration_errors.len(), 1);
+        assert!(health.migration_errors[0].contains("schema objects"));
+        store.close().await.expect("drifted store closes");
     }
 
     #[tokio::test]
@@ -499,6 +794,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_materializes_committed_wal_content() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "wal-source.sqlite");
+        let restored_path = database_path(&directory, "wal-restored.sqlite");
+        let source = open(&source_path).await;
+        let mut connection = test_support::pool(&source)
+            .acquire()
+            .await
+            .expect("acquire WAL writer");
+        connection
+            .execute("PRAGMA wal_autocheckpoint = 0")
+            .await
+            .expect("disable automatic checkpoint");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+                 VALUES ('wal-session', 'active', 1, 1, 1)",
+            )
+            .await
+            .expect("commit row to WAL");
+        drop(connection);
+        assert!(sidecar(&source_path, "-wal").exists());
+
+        StateStore::restore_backup(&source_path, &restored_path)
+            .await
+            .expect("restore live WAL database");
+        let restored = open(&restored_path).await;
+        let id = SessionId::new("wal-session").expect("valid test session");
+        assert!(
+            restored
+                .sessions()
+                .get(&id)
+                .await
+                .expect("read restored WAL row")
+                .is_some()
+        );
+        restored.close().await.expect("restored store closes");
+        source.close().await.expect("source store closes");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_stale_destination_sidecars() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "sidecar-source.sqlite");
+        let backup_path = database_path(&directory, "sidecar-backup.sqlite");
+        let destination = database_path(&directory, "sidecar-destination.sqlite");
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+        fs::write(sidecar(&destination, "-wal"), b"stale WAL").expect("create stale WAL");
+
+        let error = StateStore::restore_backup(&backup_path, &destination)
+            .await
+            .expect_err("stale destination WAL rejects restore");
+        assert_eq!(
+            error,
+            StateError::BackupDestinationExists {
+                path: sidecar(&destination, "-wal"),
+            }
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(sidecar(&destination, "-wal")).expect("read stale WAL"),
+            b"stale WAL"
+        );
+        source.close().await.expect("source store closes");
+    }
+
+    #[tokio::test]
+    async fn restore_requires_exact_history_foreign_keys_and_integrity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "validation-source.sqlite");
+        let base_backup = database_path(&directory, "validation-base.sqlite");
+        let source = open(&source_path).await;
+        source
+            .backup_to(&base_backup)
+            .await
+            .expect("create validation backup");
+        source.close().await.expect("source store closes");
+
+        let cases = [
+            (
+                "name",
+                "UPDATE claw_schema_migrations SET name = 'renamed' WHERE version = 1",
+            ),
+            (
+                "checksum",
+                "UPDATE claw_schema_migrations
+                 SET checksum = '0000000000000000000000000000000000000000000000000000000000000000'
+                 WHERE version = 1",
+            ),
+            ("older", "DELETE FROM claw_schema_migrations"),
+            (
+                "gap",
+                "DELETE FROM claw_schema_migrations;
+                 INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+                 VALUES (2, 'gap', 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg', 1)",
+            ),
+            (
+                "newer",
+                "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+                 VALUES (2, 'future', 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 1)",
+            ),
+            (
+                "invalid-type",
+                "DROP TABLE claw_schema_migrations;
+                 CREATE TABLE claw_schema_migrations(
+                    version,
+                    name,
+                    checksum,
+                    applied_at_ms
+                 );
+                 INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+                 VALUES (X'01', 'initial',
+                    '0000000000000000000000000000000000000000000000000000000000000000',
+                    1)",
+            ),
+            ("missing-table", "DROP TABLE tasks"),
+            (
+                "foreign-key",
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO tasks(
+                    id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
+                 ) VALUES ('orphan', 'missing', 'test', '', 'pending', 1, 1, 1)",
+            ),
+        ];
+        for (name, sql) in cases {
+            let variant = database_path(&directory, &format!("{name}.sqlite"));
+            let destination = database_path(&directory, &format!("{name}-restored.sqlite"));
+            fs::copy(&base_backup, &variant).expect("copy backup variant");
+            execute_direct(&variant, sql).await;
+            assert_restore_rejected(&variant, &destination).await;
+        }
+
+        let corrupt = database_path(&directory, "corrupt.sqlite");
+        let corrupt_destination = database_path(&directory, "corrupt-restored.sqlite");
+        fs::copy(&base_backup, &corrupt).expect("copy corrupt variant");
+        let length = fs::metadata(&corrupt).expect("corrupt metadata").len();
+        OpenOptions::new()
+            .write(true)
+            .open(&corrupt)
+            .expect("open corrupt variant")
+            .set_len(length / 2)
+            .expect("truncate corrupt variant");
+        assert_restore_rejected(&corrupt, &corrupt_destination).await;
+    }
+
+    #[tokio::test]
     async fn writer_lock_rejects_a_second_store_without_stealing() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "locked.sqlite");
@@ -522,7 +964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_application_lock_is_not_silently_stolen() {
+    async fn stale_application_lock_is_recovered_under_the_os_lock() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "stale-lock.sqlite");
         let store = open(&path).await;
@@ -541,11 +983,98 @@ mod tests {
         .expect("record stale owner");
         connection.close().await.expect("close direct connection");
 
-        let error = StateStore::open(StoreConfig::new(&path))
+        let recovered = StateStore::open(StoreConfig::new(&path))
+            .await
+            .expect("stale lock is recoverable after OS lock acquisition");
+        assert_eq!(
+            recovered.recovered_writer(),
+            Some(&RecoveredWriterLock {
+                previous_owner: "crashed-process".to_owned(),
+                previous_acquired_at_ms: 1,
+            })
+        );
+        recovered.close().await.expect("recovered store closes");
+    }
+
+    #[test]
+    fn child_process_writer() {
+        let Some(path) = std::env::var_os("CLAW_STATE_CHILD_DATABASE") else {
+            return;
+        };
+        let ready = PathBuf::from(
+            std::env::var_os("CLAW_STATE_CHILD_READY").expect("child ready path is configured"),
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("child Tokio runtime");
+        let _store = runtime
+            .block_on(StateStore::open(StoreConfig::new(PathBuf::from(path))))
+            .expect("child state store opens");
+        fs::write(ready, b"ready").expect("signal child readiness");
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn killed_writer_is_recovered_but_live_writer_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "crashed-writer.sqlite");
+        let ready = database_path(&directory, "child.ready");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("tests::child_process_writer")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("CLAW_STATE_CHILD_DATABASE", &path)
+            .env("CLAW_STATE_CHILD_READY", &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn writer child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready.exists(), "writer child did not become ready");
+
+        let live_error = StateStore::open(StoreConfig::new(&path))
             .await
             .err()
-            .expect("stale lock blocks reopen");
-        assert!(matches!(error, StateError::StoreLocked { .. }));
+            .expect("live writer is rejected");
+        assert!(matches!(live_error, StateError::StoreLocked { .. }));
+        child.kill().expect("kill writer child");
+        child.wait().expect("reap writer child");
+
+        let recovered = StateStore::open(StoreConfig::new(&path))
+            .await
+            .expect("killed writer is recovered");
+        assert!(recovered.recovered_writer().is_some());
+        recovered.close().await.expect("recovered store closes");
+    }
+
+    #[tokio::test]
+    async fn hardlink_alias_cannot_open_a_second_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "hardlink-source.sqlite");
+        let alias = database_path(&directory, "hardlink-alias.sqlite");
+        let owner = open(&path).await;
+        fs::hard_link(&path, &alias).expect("create database hard link");
+
+        let error = StateStore::open(StoreConfig::new(&alias))
+            .await
+            .err()
+            .expect("hard-link alias is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        owner.close().await.expect("lock owner closes");
+
+        let error = StateStore::open(StoreConfig::new(&alias))
+            .await
+            .err()
+            .expect("hard-link alias remains rejected after the owner closes");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        open(&path)
+            .await
+            .close()
+            .await
+            .expect("canonical database name still opens");
     }
 
     #[tokio::test]

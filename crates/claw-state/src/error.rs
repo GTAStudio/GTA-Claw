@@ -141,6 +141,15 @@ pub enum StateError {
         /// Referenced identifier.
         id: String,
     },
+    /// A parent record exists but cannot accept the requested child.
+    InactiveParent {
+        /// Parent record kind.
+        entity: &'static str,
+        /// Parent identifier.
+        id: String,
+        /// Current parent state.
+        state: &'static str,
+    },
     /// A caller attempted a forbidden state-machine transition.
     InvalidTransition {
         /// Record kind.
@@ -220,6 +229,12 @@ impl Display for StateError {
             Self::NotFound { entity, id } => write!(formatter, "{entity} {id} was not found"),
             Self::ForeignKeyViolation { entity, id } => {
                 write!(formatter, "referenced {entity} {id} was not found")
+            }
+            Self::InactiveParent { entity, id, state } => {
+                write!(
+                    formatter,
+                    "{entity} {id} is {state} and cannot accept children"
+                )
             }
             Self::InvalidTransition { entity, from, to } => {
                 write!(formatter, "invalid {entity} transition from {from} to {to}")

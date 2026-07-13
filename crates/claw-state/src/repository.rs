@@ -415,8 +415,7 @@ impl<'store> TaskRepository<'store> {
         transaction
             .commit()
             .await
-            .map_err(|error| database("commit task create", error))?;
-        Ok(())
+            .map_err(|error| database("commit task create", error))
     }
 
     /// Reads one task.
@@ -569,10 +568,14 @@ async fn insert_task(
     transaction: &mut Transaction<'_, Sqlite>,
     record: &TaskRecord,
 ) -> Result<(), StateError> {
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO tasks(
             id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         )
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+             SELECT 1 FROM sessions WHERE id = ? AND status = 'active'
+         )",
     )
     .bind(record.id.as_str())
     .bind(record.session_id.as_str())
@@ -582,6 +585,7 @@ async fn insert_task(
     .bind(record.created_at.get())
     .bind(record.updated_at.get())
     .bind(record.version)
+    .bind(record.session_id.as_str())
     .execute(&mut **transaction)
     .await
     .map_err(|error| {
@@ -592,6 +596,25 @@ async fn insert_task(
             Some(("session", record.session_id.as_str())),
         )
     })?;
+    if result.rows_affected() == 0 {
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM sessions WHERE id = ?")
+            .bind(record.session_id.as_str())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|error| database("inspect task parent session", error))?;
+        return match status.as_deref() {
+            None => Err(StateError::ForeignKeyViolation {
+                entity: "session",
+                id: record.session_id.as_str().to_owned(),
+            }),
+            Some("archived") => Err(StateError::InactiveParent {
+                entity: "session",
+                id: record.session_id.as_str().to_owned(),
+                state: "archived",
+            }),
+            Some(_) => Err(invalid_stored("task parent session status")),
+        };
+    }
     Ok(())
 }
 

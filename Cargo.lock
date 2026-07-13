@@ -107,6 +107,7 @@ name = "claw-state"
 version = "0.1.0"
 dependencies = [
  "claw-domain",
+ "rustix",
  "sha2 0.11.0",
  "sqlx",
  "tempfile",

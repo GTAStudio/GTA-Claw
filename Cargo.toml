@@ -17,6 +17,7 @@ claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-state = { path = "crates/claw-state", version = "0.1.0" }
+rustix = { version = "1.1.4", features = ["fs"] }
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
