@@ -111,7 +111,8 @@ rpm_scripts="$(rpm -qp --scripts "$rpm_artifact")"
 for contract in \
   'systemctl daemon-reload' \
   'systemctl preset gta-claw-daemon.service' \
-  'systemctl try-restart gta-claw-daemon.service' \
+  'systemctl restart gta-claw-daemon.service' \
+  'systemctl is-active --quiet gta-claw-daemon.service' \
   'systemctl disable --now gta-claw-daemon.service'; do
   grep -F "$contract" <<<"$rpm_scripts" >/dev/null ||
     die "RPM lifecycle script contract missing: $contract"

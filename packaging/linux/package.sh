@@ -568,22 +568,40 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/lib/systemd/system-preset/80-gta-claw.preset
 /usr/share/doc/gta-claw
 
+%pre
+set -e
+if [ "\$1" -gt 1 ] && [ -d /run/systemd/system ]; then
+  if systemctl is-active --quiet gta-claw-daemon.service; then
+    touch /run/gta-claw-daemon.was-active
+  else
+    rm -f /run/gta-claw-daemon.was-active
+  fi
+else
+  rm -f /run/gta-claw-daemon.was-active
+fi
+exit 0
+
 %post
 set -e
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1
   if [ "\$1" -eq 1 ]; then
     systemctl preset gta-claw-daemon.service >/dev/null 2>&1
-  elif [ "\$1" -gt 1 ]; then
-    systemctl try-restart gta-claw-daemon.service >/dev/null 2>&1
+  elif [ "\$1" -gt 1 ] && [ -e /run/gta-claw-daemon.was-active ]; then
+    systemctl restart gta-claw-daemon.service >/dev/null 2>&1
   fi
 fi
 exit 0
 
 %preun
 set -e
-if [ "\$1" -eq 0 ] && [ -d /run/systemd/system ]; then
-  systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
+if [ -d /run/systemd/system ]; then
+  if [ "\$1" -eq 0 ]; then
+    systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
+  elif [ -e /run/gta-claw-daemon.was-active ]; then
+    systemctl is-active --quiet gta-claw-daemon.service
+    rm -f /run/gta-claw-daemon.was-active
+  fi
 fi
 exit 0
 
