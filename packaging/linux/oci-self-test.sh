@@ -10,9 +10,12 @@ require_linux
 for tool in gzip jq python3 sha256sum tar wc; do
   require_tool "$tool"
 done
-[[ "$#" -eq 2 ]] || die "usage: oci-self-test.sh OCI_ARCHIVE ARCH"
+[[ "$#" -eq 4 ]] ||
+  die "usage: oci-self-test.sh OCI_ARCHIVE ARCH BUILD_MANIFEST EXPECTED_BUILD_KEY_SHA256"
 source_archive="$1"
 arch="$2"
+expected_build_manifest="$3"
+expected_build_key_sha="$4"
 assert_regular_unaliased "$source_archive" "OCI mutation source"
 base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
 layout_name="$base_name.oci"
@@ -23,7 +26,9 @@ tests=0
 "$SCRIPT_DIR/validate-oci-artifact.sh" \
   "$source_archive" \
   "$arch" \
-  "$OUTPUT_ROOT/validation-original"
+  "$OUTPUT_ROOT/validation-original" \
+  "$expected_build_manifest" \
+  "$expected_build_key_sha"
 
 expect_invalid() {
   local name="$1"
@@ -33,6 +38,8 @@ expect_invalid() {
     "$archive" \
     "$arch" \
     "$OUTPUT_ROOT/validation-$name" \
+    "$expected_build_manifest" \
+    "$expected_build_key_sha" \
     >"$OUTPUT_ROOT/$name.stdout" \
     2>"$OUTPUT_ROOT/$name.stderr"; then
     die "OCI mutation unexpectedly validated: $name"
@@ -155,6 +162,58 @@ reseal_all() {
   reseal_manifest_to_index "$layout" "$manifest"
 }
 
+rewrite_rootfs_checksums() {
+  local rootfs="$1"
+  local manifest="$rootfs/usr/share/doc/gta-claw/SHA256SUMS"
+  mv "$manifest" "$OUTPUT_ROOT/discard/SHA256SUMS-$RANDOM"
+  open_output_file "$manifest" 0644
+  while IFS= read -r -d '' relative; do
+    printf '%s  %s\n' "$(sha256_file "$rootfs/$relative")" "$relative" \
+      >&"$OPEN_OUTPUT_FD"
+  done < <(cd "$rootfs" && find . -type f ! -path './usr/share/doc/gta-claw/SHA256SUMS' -print0 | LC_ALL=C sort -z)
+  finish_output_file
+}
+
+repack_root_layer() {
+  local layout="$1"
+  local rootfs="$2"
+  local manifest
+  local layer_digest
+  local layer
+  manifest="$(manifest_blob "$layout")"
+  layer_digest="$(jq -er '.layers[0].digest' "$manifest")"
+  layer="$layout/blobs/sha256/${layer_digest#sha256:}"
+  mv "$layer" "$OUTPUT_ROOT/discard/repacked-layer-$RANDOM"
+  open_output_file "$layer" 0644
+  (
+    cd "$rootfs"
+    tar \
+      --sort=name \
+      --format=posix \
+      --owner=0 \
+      --group=0 \
+      --numeric-owner \
+      -cf - \
+      .
+  ) >&"$OPEN_OUTPUT_FD"
+  finish_output_file
+  reseal_all "$layout"
+}
+
+prepare_rootfs_case() {
+  local name="$1"
+  local layout
+  local manifest
+  local layer_digest
+  local rootfs="$OUTPUT_ROOT/rootfs-$name"
+  layout="$(prepare_case "$name")"
+  manifest="$(manifest_blob "$layout")"
+  layer_digest="$(jq -er '.layers[0].digest' "$manifest")"
+  ensure_output_directory "$rootfs"
+  tar -xf "$layout/blobs/sha256/${layer_digest#sha256:}" -C "$rootfs"
+  printf '%s|%s\n' "$layout" "$rootfs"
+}
+
 layout="$(prepare_case index-descriptor)"
 replace_json "$layout/index.json" '.manifests[0].size += 1'
 expect_invalid index-descriptor "$(pack_case index-descriptor "$layout")"
@@ -202,7 +261,7 @@ printf 'x' >&"$OPEN_OUTPUT_FD"
 finish_output_file
 expect_invalid layer-blob "$(pack_case layer-blob "$layout")"
 
-for kind in traversal symlink hardlink fifo device whiteout; do
+for kind in traversal symlink hardlink fifo device whiteout duplicate bomb; do
   layout="$(prepare_case "layer-$kind")"
   manifest="$(manifest_blob "$layout")"
   layer_digest="$(jq -er '.layers[0].digest' "$manifest")"
@@ -214,6 +273,77 @@ for kind in traversal symlink hardlink fifo device whiteout; do
   expect_invalid "layer-$kind" "$(pack_case "layer-$kind" "$layout")"
 done
 
+layout="$(prepare_case duplicate-json-key)"
+manifest="$(manifest_blob "$layout")"
+mv "$manifest" "$OUTPUT_ROOT/discard/duplicate-json-manifest"
+open_output_file "$manifest" 0644
+python3 -c '
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+position = text.index("{") + 1
+sys.stdout.write(text[:position] + "\"schemaVersion\":2," + text[position:])
+' "$OUTPUT_ROOT/discard/duplicate-json-manifest" >&"$OPEN_OUTPUT_FD"
+finish_output_file
+reseal_manifest_to_index "$layout" "$manifest"
+expect_invalid duplicate-json-key "$(pack_case duplicate-json-key "$layout")"
+
+layout="$(prepare_case oversized-json-number)"
+manifest="$(manifest_blob "$layout")"
+replace_json "$manifest" '.config.size = 9223372036854775808'
+reseal_manifest_to_index "$layout" "$manifest"
+expect_invalid oversized-json-number "$(pack_case oversized-json-number "$layout")"
+
+root_case="$(prepare_rootfs_case extra-executable)"
+layout="${root_case%%|*}"
+rootfs="${root_case##*|}"
+ensure_output_directory "$rootfs/usr/local/bin"
+write_output_text "$rootfs/usr/local/bin/undeclared-executable" 0755 $'#!/bin/false\n'
+rewrite_rootfs_checksums "$rootfs"
+repack_root_layer "$layout" "$rootfs"
+expect_invalid extra-executable "$(pack_case extra-executable "$layout")"
+
+root_case="$(prepare_rootfs_case substituted-runtime)"
+layout="${root_case%%|*}"
+rootfs="${root_case##*|}"
+runtime_target="$(
+  jq -er '.packages[] | select(.id == "libc6") | .files[] | select(.targetPath | endswith("/libc.so.6")) | .targetPath' \
+    "$(dirname "$expected_build_manifest")/runtime/runtime-manifest.json"
+)"
+runtime_file="$rootfs$runtime_target"
+mv "$runtime_file" "$OUTPUT_ROOT/discard/original-libc"
+copy_regular_input "$rootfs/usr/bin/gta-claw-cli" "$runtime_file" 0755
+replace_json \
+  "$rootfs/usr/share/doc/gta-claw/runtime-manifest.json" \
+  --arg target "$runtime_target" \
+  --arg sha "$(sha256_file "$runtime_file")" \
+  '(.packages[].files[] | select(.targetPath == $target) | .sha256) = $sha'
+replace_json \
+  "$rootfs/usr/share/doc/gta-claw/sbom.spdx.json" \
+  --arg name "./${runtime_target#/}" \
+  --arg sha "$(sha256_file "$runtime_file")" \
+  '(.files[] | select(.fileName == $name) | .checksums[] | select(.algorithm == "SHA256") | .checksumValue) = $sha'
+rewrite_rootfs_checksums "$rootfs"
+repack_root_layer "$layout" "$rootfs"
+expect_invalid substituted-runtime "$(pack_case substituted-runtime "$layout")"
+
+root_case="$(prepare_rootfs_case substituted-application)"
+layout="${root_case%%|*}"
+rootfs="${root_case##*|}"
+application_file="$rootfs/usr/bin/gta-claw-cli"
+mv "$application_file" "$OUTPUT_ROOT/discard/original-cli"
+copy_regular_input \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-daemon" \
+  "$application_file" \
+  0755
+replace_json \
+  "$rootfs/usr/share/doc/gta-claw/sbom.spdx.json" \
+  --arg name "./usr/bin/gta-claw-cli" \
+  --arg sha "$(sha256_file "$application_file")" \
+  '(.files[] | select(.fileName == $name) | .checksums[] | select(.algorithm == "SHA256") | .checksumValue) = $sha'
+rewrite_rootfs_checksums "$rootfs"
+repack_root_layer "$layout" "$rootfs"
+expect_invalid substituted-application "$(pack_case substituted-application "$layout")"
+
 layout="$(prepare_case outer-traversal)"
 outer="$OUTPUT_ROOT/outer-traversal.oci.tar.gz"
 open_output_file "$outer" 0644
@@ -223,5 +353,22 @@ open_output_file "$outer" 0644
 ) | gzip -n -9 >&"$OPEN_OUTPUT_FD"
 finish_output_file
 expect_invalid outer-traversal "$outer"
+
+python3 "$SCRIPT_DIR/tests/make-malicious-tar.py" bomb "$OUTPUT_ROOT/decompression-bomb.tar"
+bomb_archive="$OUTPUT_ROOT/decompression-bomb.oci.tar.gz"
+open_output_file "$bomb_archive" 0644
+gzip -n -9 -c "$OUTPUT_ROOT/decompression-bomb.tar" >&"$OPEN_OUTPUT_FD"
+finish_output_file
+expect_invalid decompression-bomb "$bomb_archive"
+
+python3 \
+  "$SCRIPT_DIR/tests/make-malicious-tar.py" \
+  pax-bomb \
+  "$OUTPUT_ROOT/pax-decompression-bomb.tar"
+pax_bomb_archive="$OUTPUT_ROOT/pax-decompression-bomb.oci.tar.gz"
+open_output_file "$pax_bomb_archive" 0644
+gzip -n -9 -c "$OUTPUT_ROOT/pax-decompression-bomb.tar" >&"$OPEN_OUTPUT_FD"
+finish_output_file
+expect_invalid pax-decompression-bomb "$pax_bomb_archive"
 
 printf 'Published OCI mutation self-tests passed (%d cases)\n' "$tests"

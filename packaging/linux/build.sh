@@ -7,7 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in cargo dpkg-query git jq readelf realpath rustc sha256sum; do
+[[ "${SAFEIO_ACTIVE:-0}" == "1" ]] ||
+  die "build.sh is internal; use build-container.sh for directory-FD confinement"
+for tool in cargo dpkg-query git jq openssl readelf realpath rustc sha256sum; do
   require_tool "$tool"
 done
 [[ "$#" -eq 1 ]] || die "usage: build.sh ARCH"
@@ -18,6 +20,7 @@ target="$(arch_target "$arch")"
 : "${CARGO_HOME:?CARGO_HOME is required}"
 : "${HOME:?HOME is required}"
 : "${BUILD_IMAGE:?BUILD_IMAGE is required}"
+: "${BUILD_ENVIRONMENT_IMAGE_ID:?BUILD_ENVIRONMENT_IMAGE_ID is required}"
 : "${BUILD_INPUT_UMASK:?BUILD_INPUT_UMASK is required}"
 : "${BUILD_RECIPE_SHA256:?BUILD_RECIPE_SHA256 is required}"
 : "${DEBIAN_SNAPSHOT:?DEBIAN_SNAPSHOT is required}"
@@ -29,6 +32,8 @@ target="$(arch_target "$arch")"
 [[ "$BUILD_INPUT_UMASK" == "000" || "$BUILD_INPUT_UMASK" == "002" ]] ||
   die "unexpected build input umask"
 [[ "$BUILD_RECIPE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "invalid build recipe digest"
+[[ "$BUILD_ENVIRONMENT_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+  die "invalid build environment image ID"
 
 OUTPUT_ROOT="$CARGO_TARGET_DIR"
 initialize_output_root
@@ -138,13 +143,106 @@ esac
 copy_verified_input "$loader_source" "$runtime_root/rootfs$loader_target" 0755
 copy_verified_input "$libc_source" "$runtime_root/rootfs$libc_target" 0755
 copy_verified_input "$libgcc_source" "$runtime_root/rootfs$libgcc_target" 0755
-copy_verified_input "$(realpath -e "$libc_copyright")" "$runtime_root/licenses/libc6.copyright" 0644
-copy_verified_input "$(realpath -e "$libgcc_copyright")" "$runtime_root/licenses/libgcc-s1.copyright" 0644
+libc_copyright="$(realpath -e "$libc_copyright")"
+libgcc_copyright="$(realpath -e "$libgcc_copyright")"
+lgpl_source="$(realpath -e /usr/share/common-licenses/LGPL-2.1)"
+gpl2_source="$(realpath -e /usr/share/common-licenses/GPL-2)"
+gpl3_source="$(realpath -e /usr/share/common-licenses/GPL-3)"
+runtime_exception_source="$(
+  find /usr/share/doc -type f \
+    \( -name 'COPYING.RUNTIME' -o -name 'COPYING.RUNTIME.gz' \) \
+    -print |
+    LC_ALL=C sort |
+    head -1
+)"
+[[ -n "$runtime_exception_source" ]] ||
+  die "GCC Runtime Library Exception text is not installed"
+runtime_exception_source="$(realpath -e "$runtime_exception_source")"
+
+copy_verified_input "$libc_copyright" "$runtime_root/licenses/libc6.copyright" 0644
+copy_verified_input "$lgpl_source" "$runtime_root/licenses/LGPL-2.1" 0644
+copy_verified_input "$gpl2_source" "$runtime_root/licenses/GPL-2" 0644
+copy_verified_input "$libgcc_copyright" "$runtime_root/licenses/libgcc-s1.copyright" 0644
+copy_verified_input "$gpl3_source" "$runtime_root/licenses/GPL-3" 0644
+copy_verified_input \
+  "$runtime_exception_source" \
+  "$runtime_root/licenses/GCC-RUNTIME-LIBRARY-EXCEPTION-3.1$(
+    [[ "$runtime_exception_source" == *.gz ]] && printf '.gz'
+  )" \
+  0644
 
 libc_version="$(dpkg-query -W -f='${Version}' "$libc_package")"
 libc_arch="$(dpkg-query -W -f='${Architecture}' "$libc_package")"
 libgcc_version="$(dpkg-query -W -f='${Version}' "$libgcc_package")"
 libgcc_arch="$(dpkg-query -W -f='${Architecture}' "$libgcc_package")"
+
+license_material_json() {
+  local package_id="$1"
+  local name="$2"
+  local source="$3"
+  local staged="$4"
+  local target_path="$5"
+  local encoding="$6"
+  local owner_line
+  local provider
+  owner_line="$(dpkg-query -S "$source" | head -1)"
+  provider="${owner_line%%: /*}"
+  [[ -n "$provider" ]] || die "license material has no dpkg owner: $source"
+  jq -c -n \
+    --arg package_id "$package_id" \
+    --arg name "$name" \
+    --arg source "$source" \
+    --arg staged "$staged" \
+    --arg target "$target_path" \
+    --arg sha "$(sha256_file "$OUTPUT_ROOT/$staged")" \
+    --arg encoding "$encoding" \
+    --arg provider "$provider" \
+    --arg provider_version "$(dpkg-query -W -f='${Version}' "$provider")" \
+    --arg provider_arch "$(dpkg-query -W -f='${Architecture}' "$provider")" \
+    '{
+      packageId: $package_id,
+      name: $name,
+      sourcePath: $source,
+      stagedPath: $staged,
+      targetPath: $target,
+      sha256: $sha,
+      mode: "0644",
+      contentEncoding: $encoding,
+      providerPackage: $provider,
+      providerVersion: $provider_version,
+      providerArchitecture: $provider_arch
+    }'
+}
+
+exception_suffix=""
+exception_encoding="identity"
+if [[ "$runtime_exception_source" == *.gz ]]; then
+  exception_suffix=".gz"
+  exception_encoding="gzip"
+fi
+libc_materials="$(
+  {
+    license_material_json libc6 copyright "$libc_copyright" \
+      runtime/licenses/libc6.copyright /usr/share/licenses/libc6/copyright identity
+    license_material_json libc6 LGPL-2.1 "$lgpl_source" \
+      runtime/licenses/LGPL-2.1 /usr/share/licenses/libc6/LGPL-2.1 identity
+    license_material_json libc6 GPL-2 "$gpl2_source" \
+      runtime/licenses/GPL-2 /usr/share/licenses/libc6/GPL-2 identity
+  } | jq -s .
+)"
+libgcc_materials="$(
+  {
+    license_material_json libgcc-s1 copyright "$libgcc_copyright" \
+      runtime/licenses/libgcc-s1.copyright /usr/share/licenses/libgcc-s1/copyright identity
+    license_material_json libgcc-s1 GPL-3 "$gpl3_source" \
+      runtime/licenses/GPL-3 /usr/share/licenses/libgcc-s1/GPL-3 identity
+    license_material_json libgcc-s1 GCC-RUNTIME-LIBRARY-EXCEPTION-3.1 \
+      "$runtime_exception_source" \
+      "runtime/licenses/GCC-RUNTIME-LIBRARY-EXCEPTION-3.1$exception_suffix" \
+      "/usr/share/licenses/libgcc-s1/GCC-RUNTIME-LIBRARY-EXCEPTION-3.1$exception_suffix" \
+      "$exception_encoding"
+  } | jq -s .
+)"
 
 write_json_file() {
   local output="$1"
@@ -162,11 +260,11 @@ write_json_file "$runtime_manifest" -n \
   --arg libc_package "$libc_package" \
   --arg libc_version "$libc_version" \
   --arg libc_arch "$libc_arch" \
-  --arg libc_copyright_sha "$(sha256_file "$runtime_root/licenses/libc6.copyright")" \
+  --argjson libc_materials "$libc_materials" \
   --arg libgcc_package "$libgcc_package" \
   --arg libgcc_version "$libgcc_version" \
   --arg libgcc_arch "$libgcc_arch" \
-  --arg libgcc_copyright_sha "$(sha256_file "$runtime_root/licenses/libgcc-s1.copyright")" \
+  --argjson libgcc_materials "$libgcc_materials" \
   --arg loader_source "runtime/rootfs$loader_target" \
   --arg loader_target "$loader_target" \
   --arg loader_sha "$(sha256_file "$runtime_root/rootfs$loader_target")" \
@@ -187,8 +285,7 @@ write_json_file "$runtime_manifest" -n \
         version: $libc_version,
         architecture: $libc_arch,
         licenseExpression: "LGPL-2.1-or-later",
-        copyrightFile: "runtime/licenses/libc6.copyright",
-        copyrightSha256: $libc_copyright_sha,
+        licenseMaterials: $libc_materials,
         files: [
           {stagedPath: $loader_source, targetPath: $loader_target, sha256: $loader_sha, mode: "0755"},
           {stagedPath: $libc_source, targetPath: $libc_target, sha256: $libc_sha, mode: "0755"}
@@ -200,8 +297,7 @@ write_json_file "$runtime_manifest" -n \
         version: $libgcc_version,
         architecture: $libgcc_arch,
         licenseExpression: "GPL-3.0-or-later WITH GCC-exception-3.1",
-        copyrightFile: "runtime/licenses/libgcc-s1.copyright",
-        copyrightSha256: $libgcc_copyright_sha,
+        licenseMaterials: $libgcc_materials,
         files: [
           {stagedPath: $libgcc_source, targetPath: $libgcc_target, sha256: $libgcc_sha, mode: "0755"}
         ]
@@ -217,6 +313,7 @@ write_json_file "$manifest" -n \
   --arg source_tree "$source_tree" \
   --arg source_epoch "$SOURCE_DATE_EPOCH" \
   --arg build_image "$BUILD_IMAGE" \
+  --arg environment_image_id "$BUILD_ENVIRONMENT_IMAGE_ID" \
   --arg build_recipe_sha "$BUILD_RECIPE_SHA256" \
   --arg debian_snapshot "$DEBIAN_SNAPSHOT" \
   --arg rustc_verbose "$rustc_verbose" \
@@ -242,6 +339,7 @@ write_json_file "$manifest" -n \
     },
     builder: {
       image: $build_image,
+      environmentImageId: $environment_image_id,
       recipeSha256: $build_recipe_sha,
       debianSnapshot: $debian_snapshot,
       rustcVerbose: $rustc_verbose,
@@ -263,6 +361,27 @@ write_json_file "$manifest" -n \
     runtimeManifest: {path: $runtime_path, sha256: $runtime_sha}
   }'
 manifest_sha="$(sha256_file "$manifest")"
-write_output_text "$OUTPUT_ROOT/BUILD_COMPLETE" 0644 "$manifest_sha  build-manifest.json"$'\n'
+private_key="$(mktemp /tmp/gta-claw-build-key.XXXXXXXXXX)"
+trap 'rm -f -- "$private_key"; release_output_lock' EXIT INT TERM
+openssl genpkey -algorithm ED25519 -out "$private_key"
+open_output_file "$OUTPUT_ROOT/build-public-key.pem" 0644
+openssl pkey -in "$private_key" -pubout >&"$OPEN_OUTPUT_FD"
+finish_output_file
+open_output_file "$OUTPUT_ROOT/build-manifest.sig" 0644
+openssl pkeyutl \
+  -sign \
+  -rawin \
+  -inkey "$private_key" \
+  -in "$manifest" \
+  >&"$OPEN_OUTPUT_FD"
+finish_output_file
+public_key_sha="$(sha256_file "$OUTPUT_ROOT/build-public-key.pem")"
+signature_sha="$(sha256_file "$OUTPUT_ROOT/build-manifest.sig")"
+write_output_text \
+  "$OUTPUT_ROOT/BUILD_COMPLETE" \
+  0644 \
+  "$manifest_sha  build-manifest.json"$'\n'"$public_key_sha  build-public-key.pem"$'\n'"$signature_sha  build-manifest.sig"$'\n'
+rm -f -- "$private_key"
+trap release_output_lock EXIT INT TERM
 
-printf '%s\n' "$manifest"
+printf '%s|%s\n' "$manifest" "$public_key_sha"

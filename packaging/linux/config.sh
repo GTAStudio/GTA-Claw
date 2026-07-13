@@ -16,6 +16,8 @@ LINUX_GLIBC_CEILING="2.36"
 LINUX_BUILD_IMAGE="rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a"
 # shellcheck disable=SC2034
 LINUX_DEBIAN_SNAPSHOT="20260701T000000Z"
+# shellcheck disable=SC2034
+LINUX_MINIMAL_IMAGE="debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
 
 workspace_version="$(
   awk '

@@ -3,11 +3,14 @@
 verify_build_manifest() {
   local manifest="$1"
   local arch="$2"
+  local expected_public_key_sha="$3"
   local target
   local target_root
   local build_root
   local complete
   local expected_seal
+  local public_key
+  local signature
   local runtime_relative
   local binary_name
   local binary_relative
@@ -15,7 +18,18 @@ verify_build_manifest() {
   local expected_sha
   local runtime_file
   local staged_relative
-  local copyright_relative
+  local material_name
+  local material_source
+  local material_staged
+  local material_target
+  local material_sha
+  local material_mode
+  local material_encoding
+  local material_provider
+  local material_provider_version
+  local material_provider_arch
+  local expected_material_set
+  local actual_material_set
   local package_id
   local package_name
   local package_license
@@ -24,15 +38,27 @@ verify_build_manifest() {
   local expected_runtime_set
   local source_status
 
+  require_tool dpkg-query
   require_tool git
   require_tool jq
+  require_tool openssl
   require_tool readelf
   require_tool sha256sum
   target="$(arch_target "$arch")"
   validate_absolute_path "$manifest" "build manifest"
   target_root="$(canonical_target_root)"
-  [[ "$manifest" == "$target_root/"* ]] ||
-    die "build manifest must remain below canonical repository target"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    if [[ "${BUILD_MANIFEST_TEST_MODE:-0}" == "1" ]]; then
+      [[ "$manifest" == "$OUTPUT_ROOT/cases/"*/build-manifest.json ]] ||
+        die "test build manifest path is invalid"
+    else
+      [[ "$manifest" == "/proc/self/fd/$SAFEIO_BUILD_FD/build-manifest.json" ]] ||
+        die "build manifest does not match inherited build capability"
+    fi
+  else
+    [[ "$manifest" == "$target_root/"* ]] ||
+      die "build manifest must remain below canonical repository target"
+  fi
   assert_no_symlink_components "$target_root" "$manifest"
   assert_regular_unaliased "$manifest" "build manifest"
   build_root="$(dirname "$manifest")"
@@ -42,7 +68,29 @@ verify_build_manifest() {
 
   complete="$build_root/BUILD_COMPLETE"
   assert_regular_unaliased "$complete" "build completion seal"
-  expected_seal="$(sha256_file "$manifest")  build-manifest.json"
+  public_key="$build_root/build-public-key.pem"
+  signature="$build_root/build-manifest.sig"
+  assert_regular_unaliased "$public_key" "build public key"
+  assert_regular_unaliased "$signature" "build manifest signature"
+  [[ "$expected_public_key_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    die "expected build public-key fingerprint is invalid"
+  [[ "$(sha256_file "$public_key")" == "$expected_public_key_sha" ]] ||
+    die "build public key does not match out-of-band fingerprint"
+  openssl pkeyutl \
+    -verify \
+    -pubin \
+    -inkey "$public_key" \
+    -sigfile "$signature" \
+    -rawin \
+    -in "$manifest" \
+    >/dev/null 2>&1 ||
+    die "build manifest signature verification failed"
+  expected_seal="$(
+    printf '%s  %s\n' \
+      "$(sha256_file "$manifest")" build-manifest.json \
+      "$(sha256_file "$public_key")" build-public-key.pem \
+      "$(sha256_file "$signature")" build-manifest.sig
+  )"
   [[ "$(cat "$complete")" == "$expected_seal" ]] ||
     die "build completion seal does not match build manifest"
 
@@ -58,6 +106,7 @@ verify_build_manifest() {
       (.source.commit | test("^[0-9a-f]{40}$")) and
       (.source.tree | test("^[0-9a-f]{40}$")) and
       .builder.image == $image and
+      (.builder.environmentImageId | test("^sha256:[0-9a-f]{64}$")) and
       .builder.debianSnapshot == $snapshot and
       (.builder.recipeSha256 | test("^[0-9a-f]{64}$")) and
       (.builder.rustcVerbose | startswith("rustc " + $rust_toolchain + " ")) and
@@ -72,6 +121,11 @@ verify_build_manifest() {
       .runtimeManifest.path == "runtime/runtime-manifest.json" and
       (.runtimeManifest.sha256 | test("^[0-9a-f]{64}$"))
     ' "$manifest" >/dev/null || die "build manifest contract is invalid"
+  if [[ -n "${PACKAGING_IMAGE_ID:-}" ]]; then
+    [[ "$(jq -er '.builder.environmentImageId' "$manifest")" == \
+      "$PACKAGING_IMAGE_ID" ]] ||
+      die "packaging container image differs from authenticated build environment"
+  fi
     [[ "$(jq -er '.builder.recipeSha256' "$manifest")" == \
       "$(sha256_file "$LINUX_DIR/Dockerfile.build")" ]] ||
       die "build recipe digest does not match current Dockerfile.build"
@@ -179,22 +233,70 @@ verify_build_manifest() {
         .[0].licenseExpression == $license and
         (.[0].version | length > 0) and
         (.[0].architecture | length > 0) and
-        (.[0].copyrightSha256 | test("^[0-9a-f]{64}$"))
+        (.[0].licenseMaterials | length == 3)
       ' "$BUILD_RUNTIME_MANIFEST" >/dev/null ||
       die "runtime package metadata is invalid: $package_id"
-    copyright_relative="$(
-      jq -er --arg id "$package_id" '.packages[] | select(.id == $id) | .copyrightFile' \
-        "$BUILD_RUNTIME_MANIFEST"
+    case "$package_id" in
+      libc6)
+        expected_material_set=$'GPL-2\t/usr/share/licenses/libc6/GPL-2\nLGPL-2.1\t/usr/share/licenses/libc6/LGPL-2.1\ncopyright\t/usr/share/licenses/libc6/copyright'
+        ;;
+      libgcc-s1)
+        expected_material_set=$'GPL-3\t/usr/share/licenses/libgcc-s1/GPL-3\ncopyright\t/usr/share/licenses/libgcc-s1/copyright'
+        ;;
+    esac
+    actual_material_set="$(
+      jq -r --arg id "$package_id" '
+        .packages[] | select(.id == $id) | .licenseMaterials[] |
+        [.name, .targetPath] | @tsv
+      ' "$BUILD_RUNTIME_MANIFEST" |
+        LC_ALL=C sort
     )"
-    [[ "$copyright_relative" =~ ^runtime/licenses/[A-Za-z0-9._-]+$ ]] ||
-      die "unsafe runtime copyright path: $copyright_relative"
-    runtime_file="$build_root/$copyright_relative"
-    assert_regular_unaliased "$runtime_file" "runtime copyright"
-    [[ "$(sha256_file "$runtime_file")" == "$(
-      jq -er --arg id "$package_id" '.packages[] | select(.id == $id) | .copyrightSha256' \
-        "$BUILD_RUNTIME_MANIFEST"
-    )" ]] || die "runtime copyright digest mismatch: $package_id"
+    if [[ "$package_id" == "libgcc-s1" ]]; then
+      grep -Eq '^GCC-RUNTIME-LIBRARY-EXCEPTION-3\.1	/usr/share/licenses/libgcc-s1/GCC-RUNTIME-LIBRARY-EXCEPTION-3\.1(\.gz)?$' \
+        <<<"$actual_material_set" ||
+        die "libgcc runtime exception material is missing"
+      actual_material_set="$(
+        grep -v '^GCC-RUNTIME-LIBRARY-EXCEPTION-3\.1	' <<<"$actual_material_set"
+      )"
+    fi
+    [[ "$actual_material_set" == "$(LC_ALL=C sort <<<"$expected_material_set")" ]] ||
+      die "runtime license material set is invalid: $package_id"
   done
+
+  while IFS=$'\t' read -r \
+    package_id material_name material_source material_staged material_target \
+    material_sha material_mode material_encoding material_provider \
+    material_provider_version material_provider_arch; do
+    [[ "$material_staged" =~ ^runtime/licenses/[A-Za-z0-9._-]+$ ]] ||
+      die "unsafe staged license material path: $material_staged"
+    validate_absolute_path "$material_target" "license material target"
+    validate_absolute_path "$material_source" "license material source"
+    [[ "$material_mode" == "0644" ]] || die "license material mode must be 0644"
+    [[ "$material_encoding" == "identity" || "$material_encoding" == "gzip" ]] ||
+      die "license material encoding is invalid"
+    [[ "$material_sha" =~ ^[0-9a-f]{64}$ ]] ||
+      die "license material digest is invalid"
+    [[ "$(dpkg-query -W -f='${Version}' "$material_provider")" == \
+      "$material_provider_version" &&
+      "$(dpkg-query -W -f='${Architecture}' "$material_provider")" == \
+        "$material_provider_arch" ]] ||
+      die "license material provider metadata is invalid: $material_name"
+    [[ "$(dpkg-query -S "$material_source" | head -1)" == "$material_provider: "* ]] ||
+      die "license material provider does not own source: $material_name"
+    runtime_file="$build_root/$material_staged"
+    assert_regular_unaliased "$runtime_file" "runtime license material"
+    [[ "$(sha256_file "$runtime_file")" == "$material_sha" ]] ||
+      die "runtime license material digest mismatch: $material_name"
+  done < <(
+    jq -r '
+      .packages[].licenseMaterials[] |
+      [
+        .packageId, .name, .sourcePath, .stagedPath, .targetPath, .sha256,
+        .mode, .contentEncoding, .providerPackage, .providerVersion,
+        .providerArchitecture
+      ] | @tsv
+    ' "$BUILD_RUNTIME_MANIFEST"
+  )
 
   while IFS=$'\t' read -r package_id staged_relative target_path expected_sha mode; do
     [[ "$staged_relative" =~ ^runtime/rootfs/[A-Za-z0-9._/-]+$ &&
@@ -229,4 +331,6 @@ verify_build_manifest() {
   BUILD_ROOT="$build_root"
   # shellcheck disable=SC2034
   BUILD_MANIFEST="$manifest"
+  # shellcheck disable=SC2034
+  BUILD_PUBLIC_KEY_FINGERPRINT="$expected_public_key_sha"
 }

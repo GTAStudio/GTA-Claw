@@ -5,6 +5,7 @@ IFS=$'\n\t'
 
 LINUX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 REPO_ROOT="$(cd "$LINUX_DIR/../.." && pwd -P)"
+SAFEIO_HELPER="$LINUX_DIR/safeio.py"
 : "${OUTPUT_ROOT:=$REPO_ROOT/target/linux-package}"
 
 die() {
@@ -67,6 +68,11 @@ canonical_target_root() {
   local repository
   local target="$REPO_ROOT/target"
   local canonical
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    "$SAFEIO_HELPER" check "$SAFEIO_TARGET_FD"
+    printf '/proc/self/fd/%s\n' "$SAFEIO_TARGET_FD"
+    return
+  fi
   repository="$(cd "$REPO_ROOT" && pwd -P)"
   [[ "$repository" == "$REPO_ROOT" ]] || die "repository root changed during validation"
   [[ ! -L "$target" ]] || die "repository target directory must not be a symlink"
@@ -93,6 +99,13 @@ assert_no_symlink_components() {
   local component
   local current="$boundary"
   local canonical
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    case "$path" in
+      "/proc/self/fd/$SAFEIO_TARGET_FD"/* |\
+        "/proc/self/fd/$SAFEIO_OUTPUT_FD"/* |\
+        "/proc/self/fd/${SAFEIO_BUILD_FD:-missing}"/*) return ;;
+    esac
+  fi
   [[ "$path" == "$boundary" || "$path" == "$boundary/"* ]] ||
     die "path escapes canonical target boundary: $path"
   relative="${path#"$boundary"}"
@@ -125,6 +138,9 @@ assert_nearest_existing_parent() {
   local path="$2"
   local candidate
   local canonical
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    return
+  fi
   candidate="$(dirname "$path")"
   while [[ ! -e "$candidate" && ! -L "$candidate" ]]; do
     [[ "$candidate" != "/" ]] || die "no existing parent found for $path"
@@ -176,6 +192,30 @@ validate_new_private_root_path() {
 assert_private_owned_root() {
   local root="$1"
   local target
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" &&
+    "$root" == "/proc/self/fd/${SAFEIO_BUILD_FD:-missing}" ]]; then
+    "$SAFEIO_HELPER" check "$SAFEIO_BUILD_FD"
+    assert_regular_unaliased "$root/.linux-packaging-owner" "private root ownership marker"
+    [[ "$(cat "$root/.linux-packaging-owner")" == "gta-claw-linux-packaging-v2" ]] ||
+      die "private root ownership marker is invalid: $root"
+    return
+  fi
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" &&
+    "$root" == "/proc/self/fd/${SAFEIO_OUTPUT_FD:-missing}" ]]; then
+    "$SAFEIO_HELPER" check "$SAFEIO_OUTPUT_FD"
+    assert_regular_unaliased "$root/.linux-packaging-owner" "private root ownership marker"
+    [[ "$(cat "$root/.linux-packaging-owner")" == "gta-claw-linux-packaging-v2" ]] ||
+      die "private root ownership marker is invalid: $root"
+    return
+  fi
+  if [[ "${BUILD_MANIFEST_TEST_MODE:-0}" == "1" &&
+    "${SAFEIO_ACTIVE:-0}" == "1" &&
+    "$root" == "$OUTPUT_ROOT/cases/"* ]]; then
+    assert_regular_unaliased "$root/.linux-packaging-owner" "test build ownership marker"
+    [[ "$(cat "$root/.linux-packaging-owner")" == "gta-claw-linux-packaging-v2" ]] ||
+      die "test build ownership marker is invalid: $root"
+    return
+  fi
   validate_absolute_path "$root" "private root"
   target="$(canonical_target_root)"
   [[ "$root" != "$target" && "$root" == "$target/"* ]] ||
@@ -197,6 +237,10 @@ OUTPUT_ROOT_ID=""
 OUTPUT_LOCK_HELD=0
 
 release_output_lock() {
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    OUTPUT_LOCK_HELD=0
+    return
+  fi
   if [[ "$OUTPUT_LOCK_HELD" -eq 1 ]]; then
     [[ -d "$OUTPUT_LOCK_PATH" && ! -L "$OUTPUT_LOCK_PATH" ]] ||
       die "output lock changed before release"
@@ -209,6 +253,19 @@ release_output_lock() {
 
 initialize_output_root() {
   local target
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    [[ "$OUTPUT_ROOT" == "/proc/self/fd/$SAFEIO_OUTPUT_FD" ]] ||
+      die "OUTPUT_ROOT does not match inherited safeio capability"
+    "$SAFEIO_HELPER" check "$SAFEIO_OUTPUT_FD"
+    OUTPUT_ROOT_ID="$(output_identity "$OUTPUT_ROOT")"
+    OUTPUT_LOCK_HELD=1
+    printf 'gta-claw-linux-packaging-v2\n' |
+      "$SAFEIO_HELPER" write "$SAFEIO_OUTPUT_FD" .linux-packaging-owner 0600 \
+        >/dev/null
+    trap release_output_lock EXIT INT TERM
+    assert_output_root_owned
+    return
+  fi
   validate_absolute_path "$OUTPUT_ROOT" "OUTPUT_ROOT"
   target="$(canonical_target_root)"
   case "$OUTPUT_ROOT/" in
@@ -247,6 +304,17 @@ initialize_output_root() {
 assert_output_root_owned() {
   local target
   [[ "$OUTPUT_LOCK_HELD" -eq 1 ]] || die "exclusive output lock is not held"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    "$SAFEIO_HELPER" check "$SAFEIO_OUTPUT_FD"
+    [[ "$(output_identity "$OUTPUT_ROOT")" == "$OUTPUT_ROOT_ID" ]] ||
+      die "OUTPUT_ROOT capability identity changed"
+    assert_regular_unaliased \
+      "$OUTPUT_ROOT/.linux-packaging-owner" \
+      "OUTPUT_ROOT ownership marker"
+    [[ "$(cat "$OUTPUT_ROOT/.linux-packaging-owner")" == "gta-claw-linux-packaging-v2" ]] ||
+      die "OUTPUT_ROOT ownership marker changed"
+    return
+  fi
   [[ -d "$OUTPUT_LOCK_PATH" && ! -L "$OUTPUT_LOCK_PATH" ]] ||
     die "output lock is no longer a real directory"
   [[ "$(output_identity "$OUTPUT_LOCK_PATH")" == "$OUTPUT_LOCK_ID" ]] ||
@@ -274,6 +342,9 @@ assert_output_path() {
   validate_absolute_path "$path" "output path"
   [[ "$path" == "$OUTPUT_ROOT" || "$path" == "$OUTPUT_ROOT/"* ]] ||
     die "path escapes OUTPUT_ROOT: $path"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    return
+  fi
   assert_no_symlink_components "$(canonical_target_root)" "$path"
   if [[ "$path" != "$OUTPUT_ROOT" ]]; then
     assert_nearest_existing_parent "$OUTPUT_ROOT" "$path"
@@ -286,6 +357,13 @@ ensure_output_directory() {
   local component
   local current="$OUTPUT_ROOT"
   assert_output_path "$path"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    if [[ "$path" != "$OUTPUT_ROOT" ]]; then
+      "$SAFEIO_HELPER" mkdirs "$SAFEIO_OUTPUT_FD" "${path#"$OUTPUT_ROOT/"}"
+    fi
+    [[ -d "$path" && ! -L "$path" ]] || die "failed to create directory: $path"
+    return
+  fi
   [[ ! -e "$path" || -d "$path" ]] ||
     die "output directory collides with a non-directory object: $path"
   mkdir -p -- "$path"
@@ -319,6 +397,8 @@ assert_new_output_file() {
 OPEN_OUTPUT_FD=""
 OPEN_OUTPUT_PATH=""
 OPEN_OUTPUT_ID=""
+OPEN_OUTPUT_PID=""
+OPEN_OUTPUT_READ_FD=""
 
 open_output_file() {
   local path="$1"
@@ -326,6 +406,23 @@ open_output_file() {
   local restore_noclobber=0
   [[ -z "$OPEN_OUTPUT_FD" ]] || die "an output file is already open"
   [[ "$mode" =~ ^0[0-7][0-7][0-7]$ ]] || die "invalid output file mode: $mode"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    assert_output_path "$path"
+    coproc SAFEIO_WRITER {
+      "$SAFEIO_HELPER" write "$SAFEIO_OUTPUT_FD" "${path#"$OUTPUT_ROOT/"}" "$mode"
+    }
+    OPEN_OUTPUT_READ_FD="${SAFEIO_WRITER[0]}"
+    OPEN_OUTPUT_FD="${SAFEIO_WRITER[1]}"
+    OPEN_OUTPUT_PID="$SAFEIO_WRITER_PID"
+    OPEN_OUTPUT_PATH="$path"
+    local ready
+    read -r ready <&"$OPEN_OUTPUT_READ_FD" ||
+      die "safeio writer failed before reserving output: $path"
+    [[ "$ready" =~ ^READY\ ([0-9]+):([0-9]+)$ ]] ||
+      die "safeio writer returned an invalid reservation: $ready"
+    OPEN_OUTPUT_ID="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+    return
+  fi
   assert_new_output_file "$path"
   case "$-" in
     *C*) ;;
@@ -351,6 +448,26 @@ finish_output_file() {
   local path="$OPEN_OUTPUT_PATH"
   local descriptor
   [[ -n "$OPEN_OUTPUT_FD" && -n "$path" ]] || die "no output file is open"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    exec {OPEN_OUTPUT_FD}>&-
+    if ! wait "$OPEN_OUTPUT_PID"; then
+      OPEN_OUTPUT_FD=""
+      OPEN_OUTPUT_PATH=""
+      OPEN_OUTPUT_ID=""
+      OPEN_OUTPUT_PID=""
+      OPEN_OUTPUT_READ_FD=""
+      die "safeio writer failed: $path"
+    fi
+    exec {OPEN_OUTPUT_READ_FD}>&- || true
+    OPEN_OUTPUT_FD=""
+    OPEN_OUTPUT_PATH=""
+    OPEN_OUTPUT_ID=""
+    OPEN_OUTPUT_PID=""
+    OPEN_OUTPUT_READ_FD=""
+    unset SAFEIO_WRITER SAFEIO_WRITER_PID
+    assert_regular_unaliased "$path" "completed output"
+    return
+  fi
   descriptor="/proc/$BASHPID/fd/$OPEN_OUTPUT_FD"
   [[ "$(stat -Lc '%d:%i' "$descriptor")" == "$OPEN_OUTPUT_ID" ]] ||
     die "open output descriptor identity changed: $path"
@@ -442,6 +559,16 @@ publish_output_file() {
   local temporary="$1"
   local final="$2"
   local identity
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    assert_regular_unaliased "$temporary" "temporary output"
+    assert_new_output_file "$final"
+    "$SAFEIO_HELPER" publish \
+      "$SAFEIO_OUTPUT_FD" \
+      "${temporary#"$OUTPUT_ROOT/"}" \
+      "${final#"$OUTPUT_ROOT/"}"
+    assert_regular_unaliased "$final" "published output"
+    return
+  fi
   assert_regular_unaliased "$temporary" "temporary output"
   assert_new_output_file "$final"
   identity="$(output_identity "$temporary")"
@@ -578,13 +705,9 @@ oci_arch() {
 validate_elf_arch() {
   local binary="$1"
   local arch="$2"
-  local machine
   assert_regular_file "$binary" "ELF binary"
-  machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
-  case "$arch:$machine" in
-    "x86_64:Advanced Micro Devices X86-64" | "arm64:AArch64") ;;
-    *) die "ELF architecture mismatch for $binary: expected $arch, found $machine" ;;
-  esac
+  python3 "$LINUX_DIR/strict_elf.py" "$binary" "$arch" "$LINUX_GLIBC_CEILING" \
+    >/dev/null
 }
 
 expected_elf_interpreter() {
@@ -596,18 +719,15 @@ expected_elf_interpreter() {
 }
 
 elf_interpreter() {
-  readelf -l "$1" |
-    sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p'
+  python3 "$LINUX_DIR/strict_elf.py" "$1" auto "$LINUX_GLIBC_CEILING" |
+    jq -er '.interpreter'
 }
 
 max_glibc_version() {
   local maximum
   maximum="$(
-    readelf --version-info "$1" |
-      grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' |
-      sed 's/^GLIBC_//' |
-      sort -V |
-      tail -1
+    python3 "$LINUX_DIR/strict_elf.py" "$1" auto "$LINUX_GLIBC_CEILING" |
+      jq -er '.maxGlibc'
   )"
   [[ -n "$maximum" ]] || die "ELF has no GLIBC version requirements: $1"
   printf '%s\n' "$maximum"
@@ -624,47 +744,14 @@ validate_glibc_requirement() {
 
 validate_elf_dependencies() {
   local binary="$1"
-  local dependency
-  local allowed
-  local matched
-  while IFS= read -r dependency; do
-    [[ -n "$dependency" ]] || continue
-    matched=0
-    while IFS= read -r allowed; do
-      [[ -n "$allowed" && "$allowed" != \#* ]] || continue
-      if [[ "$dependency" == "$allowed" ]]; then
-        matched=1
-        break
-      fi
-    done <"$LINUX_DIR/dependencies.allowlist"
-    [[ "$matched" -eq 1 ]] ||
-      die "unexpected ELF dependency in $binary: $dependency"
-  done < <(
-    readelf -d "$binary" |
-      sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
-      LC_ALL=C sort -u
-  )
+  python3 "$LINUX_DIR/strict_elf.py" "$binary" auto "$LINUX_GLIBC_CEILING" \
+    >/dev/null
 }
 
 validate_elf_binary() {
-  local elf_type
-  local interpreter
-  local expected
-  validate_elf_arch "$1" "$2"
-  elf_type="$(readelf -h "$1" | awk -F: '/Type:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
-  [[ "$elf_type" == DYN* ]] || die "ELF is not PIE/ET_DYN: $1 ($elf_type)"
-  expected="$(expected_elf_interpreter "$2")"
-  interpreter="$(elf_interpreter "$1")"
-  [[ "$interpreter" == "$expected" ]] ||
-    die "ELF PT_INTERP mismatch for $1 (expected $expected, found $interpreter)"
-  if readelf -d "$1" | grep -Eq '\((RPATH|RUNPATH)\)'; then
-    die "ELF contains forbidden DT_RPATH/DT_RUNPATH: $1"
-  fi
-  validate_elf_dependencies "$1"
-  validate_glibc_requirement "$1"
-  if readelf -d "$1" | grep -Eiq 'slint|node|javascript|npm|pnpm|bun'; then
-    die "forbidden dynamic dependency found in $1"
-  fi
+  assert_regular_file "$1" "ELF binary"
+  python3 "$LINUX_DIR/strict_elf.py" "$1" "$2" "$LINUX_GLIBC_CEILING" \
+    >/dev/null
 }
 
 reject_forbidden_runtime_content() {

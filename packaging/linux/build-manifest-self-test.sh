@@ -8,13 +8,15 @@ source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/build-manifest.sh"
 
 require_linux
-for tool in jq readelf sha256sum; do
+for tool in jq openssl readelf sha256sum; do
   require_tool "$tool"
 done
-[[ "$#" -eq 2 ]] || die "usage: build-manifest-self-test.sh BUILD_MANIFEST ARCH"
+[[ "$#" -eq 3 ]] ||
+  die "usage: build-manifest-self-test.sh BUILD_MANIFEST ARCH EXPECTED_BUILD_KEY_SHA256"
 input_manifest="$1"
 arch="$2"
-verify_build_manifest "$input_manifest" "$arch"
+expected_build_key_sha="$3"
+verify_build_manifest "$input_manifest" "$arch" "$expected_build_key_sha"
 source_build_root="$BUILD_ROOT"
 source_target="$(arch_target "$arch")"
 
@@ -36,9 +38,10 @@ expect_failure() {
 verify_case() {
   local manifest="$1"
   bash -c "
+    export BUILD_MANIFEST_TEST_MODE=1
     source '$SCRIPT_DIR/lib/common.sh'
     source '$SCRIPT_DIR/lib/build-manifest.sh'
-    verify_build_manifest '$manifest' '$arch'
+    verify_build_manifest '$manifest' '$arch' '$expected_build_key_sha'
   "
 }
 
@@ -53,6 +56,8 @@ prepare_clone() {
   for source in \
     "$source_build_root/build-manifest.json" \
     "$source_build_root/BUILD_COMPLETE" \
+    "$source_build_root/build-public-key.pem" \
+    "$source_build_root/build-manifest.sig" \
     "$source_build_root/$source_target/release/$LINUX_DAEMON_NAME" \
     "$source_build_root/$source_target/release/$LINUX_CLI_NAME"; do
     relative="${source#"$source_build_root/"}"
@@ -112,5 +117,43 @@ copy_verified_input \
   0755
 expect_failure substituted-binary \
   verify_case "$case_root/build-manifest.json"
+
+case_root="$(prepare_clone forged-root)"
+mv \
+  "$case_root/$source_target/release/$LINUX_CLI_NAME" \
+  "$case_root/$source_target/release/$LINUX_CLI_NAME.original"
+copy_verified_input \
+  "$case_root/$source_target/release/$LINUX_DAEMON_NAME" \
+  "$case_root/$source_target/release/$LINUX_CLI_NAME" \
+  0755
+mv "$case_root/build-manifest.json" "$case_root/build-manifest.original"
+open_output_file "$case_root/build-manifest.json" 0644
+jq -S \
+  --arg sha "$(sha256_file "$case_root/$source_target/release/$LINUX_CLI_NAME")" \
+  '(.binaries[] | select(.name == "gta-claw-cli") | .sha256) = $sha' \
+  "$case_root/build-manifest.original" \
+  >&"$OPEN_OUTPUT_FD"
+finish_output_file
+attacker_key="$case_root/attacker-private-key.pem"
+openssl genpkey -algorithm ED25519 -out "$attacker_key"
+mv "$case_root/build-public-key.pem" "$case_root/build-public-key.original"
+open_output_file "$case_root/build-public-key.pem" 0644
+openssl pkey -in "$attacker_key" -pubout >&"$OPEN_OUTPUT_FD"
+finish_output_file
+mv "$case_root/build-manifest.sig" "$case_root/build-manifest.sig.original"
+open_output_file "$case_root/build-manifest.sig" 0644
+openssl pkeyutl \
+  -sign \
+  -rawin \
+  -inkey "$attacker_key" \
+  -in "$case_root/build-manifest.json" \
+  >&"$OPEN_OUTPUT_FD"
+finish_output_file
+mv "$case_root/BUILD_COMPLETE" "$case_root/BUILD_COMPLETE.original"
+write_output_text \
+  "$case_root/BUILD_COMPLETE" \
+  0644 \
+  "$(sha256_file "$case_root/build-manifest.json")  build-manifest.json"$'\n'"$(sha256_file "$case_root/build-public-key.pem")  build-public-key.pem"$'\n'"$(sha256_file "$case_root/build-manifest.sig")  build-manifest.sig"$'\n'
+expect_failure forged-root verify_case "$case_root/build-manifest.json"
 
 printf 'Build manifest tamper self-tests passed (%d cases)\n' "$tests"

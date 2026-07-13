@@ -12,11 +12,13 @@ require_linux
 for tool in cpio cmp dpkg-deb jq readelf rpm rpm2cpio sha256sum stat tar; do
   require_tool "$tool"
 done
-[[ "$#" -eq 3 ]] || die "usage: validate.sh OUTPUT_ROOT ARCH BUILD_MANIFEST"
+[[ "$#" -eq 4 ]] ||
+  die "usage: validate.sh OUTPUT_ROOT ARCH BUILD_MANIFEST EXPECTED_BUILD_KEY_SHA256"
 validation_root="$1"
 arch="$2"
 input_manifest="$3"
-verify_build_manifest "$input_manifest" "$arch"
+expected_build_key_sha="$4"
+verify_build_manifest "$input_manifest" "$arch" "$expected_build_key_sha"
 assert_private_owned_root "$validation_root"
 reject_links_and_special_files "$validation_root"
 
@@ -74,6 +76,9 @@ for script in postinst prerm postrm; do
     "$LINUX_DIR/debian/$script" \
     <(dpkg-deb --ctrl-tarfile "$deb_artifact" | tar -xOf - "./$script") ||
     die "Debian maintainer script differs from reviewed source: $script"
+  if grep -Eq '\|\|[[:space:]]*(true|:)' "$LINUX_DIR/debian/$script"; then
+    die "Debian maintainer script swallows a lifecycle failure: $script"
+  fi
 done
 if awk 'substr($1, 1, 1) !~ /^[-d]$/ { bad = 1 } END { exit !bad }' \
   <<<"$deb_contents"; then
@@ -114,6 +119,9 @@ if grep -Eiq '(^|[[:space:]])(curl|wget|nc|bash -c|sh -c|eval)([[:space:]]|$)' \
   <<<"$rpm_scripts"; then
   die "RPM lifecycle script contains network or dynamic execution"
 fi
+if grep -Eq '\|\|[[:space:]]*(true|:)' <<<"$rpm_scripts"; then
+  die "RPM lifecycle script swallows a lifecycle failure"
+fi
 rpm_payload_listing="$(rpm -qplv "$rpm_artifact")"
 if awk 'substr($1, 1, 1) !~ /^[-d]$/ { bad = 1 } END { exit !bad }' \
   <<<"$rpm_payload_listing"; then
@@ -131,6 +139,23 @@ verify_sha256_manifest \
   "$rpm_payload_root/usr/share/doc/gta-claw/SHA256SUMS"
 
 rootfs="$work_dir/rootfs"
+python3 "$LINUX_DIR/strict_artifact.py" \
+  json \
+  "$rootfs/usr/share/doc/gta-claw/package-toolchain.json" \
+  >/dev/null
+jq -e \
+  --arg image "$LINUX_BUILD_IMAGE" \
+  --arg snapshot "$LINUX_DEBIAN_SNAPSHOT" \
+  --arg dpkg "$(dpkg-query -W -f='${Version}' dpkg)" \
+  --arg rpm "$(dpkg-query -W -f='${Version}' rpm)" \
+  '
+    .image == $image and
+    .environmentImageId == env.PACKAGING_IMAGE_ID and
+    .debianSnapshot == $snapshot and
+    .packages.dpkg == $dpkg and
+    .packages.rpm == $rpm
+  ' "$rootfs/usr/share/doc/gta-claw/package-toolchain.json" >/dev/null ||
+  die "packaging toolchain provenance is invalid"
 validate_elf_binary "$rootfs/usr/bin/$LINUX_CLI_NAME" "$arch"
 validate_elf_binary "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME" "$arch"
 validate_service_contract "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service"
@@ -183,6 +208,8 @@ jq -e \
 validate_published_oci \
   "$oci_artifact" \
   "$arch" \
-  "$work_dir/published-oci-validation"
+  "$work_dir/published-oci-validation" \
+  "$BUILD_MANIFEST" \
+  "$BUILD_PUBLIC_KEY_FINGERPRINT"
 
 note "validated published Linux $arch tar, package, lifecycle, and OCI artifacts"

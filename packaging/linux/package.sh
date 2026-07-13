@@ -8,16 +8,20 @@ source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/build-manifest.sh"
 
 require_linux
+[[ "${SAFEIO_ACTIVE:-0}" == "1" ]] ||
+  die "package.sh is internal; use package-container.sh for directory-FD confinement"
 for tool in \
-  awk date dpkg-deb du find gzip jq md5sum readelf rpm \
+  awk date dpkg-deb dpkg-query du find gzip jq md5sum python3 readelf rpm \
   rpmbuild sed sha1sum sha256sum stat tar wc; do
   require_tool "$tool"
 done
-[[ "$#" -eq 2 ]] || die "usage: package.sh ARCH BUILD_MANIFEST"
+[[ "$#" -eq 3 ]] || die "usage: package.sh ARCH BUILD_MANIFEST EXPECTED_BUILD_KEY_SHA256"
 arch="$1"
 input_manifest="$2"
+expected_build_key_sha="$3"
+: "${PACKAGING_IMAGE_ID:?PACKAGING_IMAGE_ID is required}"
 validate_safe_component "$arch" "architecture"
-verify_build_manifest "$input_manifest" "$arch"
+verify_build_manifest "$input_manifest" "$arch" "$expected_build_key_sha"
 daemon_binary="$BUILD_DAEMON_BINARY"
 cli_binary="$BUILD_CLI_BINARY"
 
@@ -46,6 +50,34 @@ write_json() {
   finish_output_file
 }
 
+package_toolchain="$WORK_DIR/package-toolchain.json"
+write_json "$package_toolchain" -n \
+  --arg image "$LINUX_BUILD_IMAGE" \
+  --arg environment_image_id "$PACKAGING_IMAGE_ID" \
+  --arg snapshot "$LINUX_DEBIAN_SNAPSHOT" \
+  --arg dpkg "$(dpkg-query -W -f='${Version}' dpkg)" \
+  --arg rpm "$(dpkg-query -W -f='${Version}' rpm)" \
+  --arg tar "$(dpkg-query -W -f='${Version}' tar)" \
+  --arg gzip "$(dpkg-query -W -f='${Version}' gzip)" \
+  --arg jq "$(dpkg-query -W -f='${Version}' jq)" \
+  --arg python3 "$(dpkg-query -W -f='${Version}' python3)" \
+  --arg cpio "$(dpkg-query -W -f='${Version}' cpio)" \
+  '{
+    schemaVersion: 1,
+    image: $image,
+    environmentImageId: $environment_image_id,
+    debianSnapshot: $snapshot,
+    packages: {
+      dpkg: $dpkg,
+      rpm: $rpm,
+      tar: $tar,
+      gzip: $gzip,
+      jq: $jq,
+      python3: $python3,
+      cpio: $cpio
+    }
+  }'
+
 generate_provenance() {
   local root="$1"
   local output="$2"
@@ -54,6 +86,7 @@ generate_provenance() {
   write_json "$output" -n \
     --slurpfile build_manifest "$BUILD_MANIFEST" \
     --slurpfile runtime_manifest "$BUILD_RUNTIME_MANIFEST" \
+    --slurpfile package_toolchain "$package_toolchain" \
     --arg source_sha "$source_sha" \
     --arg source_tree "$source_tree" \
     --arg build_manifest_sha "$build_manifest_sha" \
@@ -92,6 +125,7 @@ generate_provenance() {
             "content": $build_manifest[0]
           },
           "runtimeDependencies": $runtime_manifest[0].packages
+          ,"packageToolchain": $package_toolchain[0]
         },
         "runDetails": {
           "builder": {
@@ -137,13 +171,16 @@ generate_spdx() {
     if [[ "$label" == "oci" ]]; then
       owner="$(
         jq -r --arg path "$path" '
-          [.packages[] | select(any(.files[]; .targetPath == $path)) | .id][0] // "gta-claw"
+          [
+            .packages[] |
+            select(
+              any(.files[]; .targetPath == $path) or
+              any(.licenseMaterials[]; .targetPath == $path)
+            ) |
+            .id
+          ][0] // "gta-claw"
         ' "$BUILD_RUNTIME_MANIFEST"
       )"
-      case "$path" in
-        /usr/share/licenses/libc6/copyright) owner="libc6" ;;
-        /usr/share/licenses/libgcc-s1/copyright) owner="libgcc-s1" ;;
-      esac
     fi
     case "$owner" in
       libc6) file_license="LGPL-2.1-or-later" ;;
@@ -317,6 +354,10 @@ stage_documentation() {
   copy_verified_input \
     "$BUILD_RUNTIME_MANIFEST" \
     "$destination/runtime-manifest.json" \
+    0644
+  copy_regular_input \
+    "$package_toolchain" \
+    "$destination/package-toolchain.json" \
     0644
   copy_regular_input \
     "$LINUX_DIR/systemd/gta-claw-daemon.socket.deferred" \
@@ -527,27 +568,30 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/share/doc/gta-claw
 
 %post
+set -e
 if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1 || :
+  systemctl daemon-reload >/dev/null 2>&1
   if [ "\$1" -eq 1 ]; then
-    systemctl preset gta-claw-daemon.service >/dev/null 2>&1 || :
+    systemctl preset gta-claw-daemon.service >/dev/null 2>&1
   elif [ "\$1" -gt 1 ]; then
-    systemctl try-restart gta-claw-daemon.service >/dev/null 2>&1 || :
+    systemctl try-restart gta-claw-daemon.service >/dev/null 2>&1
   fi
 fi
-:
+exit 0
 
 %preun
+set -e
 if [ "\$1" -eq 0 ] && [ -d /run/systemd/system ]; then
-  systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1 || :
+  systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
 fi
-:
+exit 0
 
 %postun
+set -e
 if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1 || :
+  systemctl daemon-reload >/dev/null 2>&1
 fi
-:
+exit 0
 
 %changelog
 * $changelog_date GTAStudio <noreply@github.com> - $VERSION-$LINUX_PACKAGE_RELEASE
@@ -606,20 +650,20 @@ done < <(
   jq -r '.packages[].files[] | [.stagedPath, .targetPath, .mode] | @tsv' \
     "$BUILD_RUNTIME_MANIFEST"
 )
-copy_verified_input \
-  "$BUILD_ROOT/$(
-    jq -er '.packages[] | select(.id == "libc6") | .copyrightFile' \
-      "$BUILD_RUNTIME_MANIFEST"
-  )" \
-  "$oci_rootfs/usr/share/licenses/libc6/copyright" \
-  0644
-copy_verified_input \
-  "$BUILD_ROOT/$(
-    jq -er '.packages[] | select(.id == "libgcc-s1") | .copyrightFile' \
-      "$BUILD_RUNTIME_MANIFEST"
-  )" \
-  "$oci_rootfs/usr/share/licenses/libgcc-s1/copyright" \
-  0644
+while IFS=$'\t' read -r staged_path target_path mode; do
+  [[ "$target_path" == /usr/share/licenses/* ]] ||
+    die "runtime license target path is outside /usr/share/licenses"
+  copy_verified_input \
+    "$BUILD_ROOT/$staged_path" \
+    "$oci_rootfs$target_path" \
+    "$mode"
+done < <(
+  jq -r '
+    .packages[].licenseMaterials[] |
+    [.stagedPath, .targetPath, .mode] |
+    @tsv
+  ' "$BUILD_RUNTIME_MANIFEST"
+)
 generate_provenance \
   "$oci_rootfs" \
   "$oci_rootfs/usr/share/doc/gta-claw/provenance.json" \
@@ -812,6 +856,7 @@ artifact_provenance="$ARTIFACT_DIR/provenance-$arch.json"
 write_json "$artifact_provenance" -n \
   --slurpfile build_manifest "$BUILD_MANIFEST" \
   --slurpfile runtime_manifest "$BUILD_RUNTIME_MANIFEST" \
+  --slurpfile package_toolchain "$package_toolchain" \
   --arg source_sha "$source_sha" \
   --arg source_tree "$source_tree" \
   --arg build_manifest_sha "$build_manifest_sha" \
@@ -837,6 +882,7 @@ write_json "$artifact_provenance" -n \
       content: $build_manifest[0]
     },
     runtimeDependencies: $runtime_manifest[0].packages,
+    packageToolchain: $package_toolchain[0],
     package: {name: "gta-claw", version: $version, architecture: $architecture},
     subjects: [
       {name: $tar_name, digest: {sha256: $tar_sha}},
@@ -847,5 +893,9 @@ write_json "$artifact_provenance" -n \
   }'
 write_sha256_manifest "$ARTIFACT_DIR" "$ARTIFACT_DIR/SHA256SUMS"
 
-"$LINUX_DIR/validate.sh" "$OUTPUT_ROOT" "$arch" "$BUILD_MANIFEST"
+"$LINUX_DIR/validate.sh" \
+  "$OUTPUT_ROOT" \
+  "$arch" \
+  "$BUILD_MANIFEST" \
+  "$BUILD_PUBLIC_KEY_FINGERPRINT"
 note "created deterministic Linux artifacts in $ARTIFACT_DIR"

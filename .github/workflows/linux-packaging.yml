@@ -9,6 +9,7 @@ on:
       - "packaging/linux/**"
       - "apps/**"
       - "crates/**"
+      - "compat/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "deny.toml"
@@ -20,6 +21,7 @@ on:
       - "packaging/linux/**"
       - "apps/**"
       - "crates/**"
+      - "compat/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "deny.toml"
@@ -94,10 +96,16 @@ jobs:
               # intentionally use single quotes to prevent shell expansion.
               shellcheck -x -e SC1091,SC2016 "$script"
             done
-          python3 -c 'path = "packaging/linux/tests/make-malicious-tar.py"; compile(open(path, encoding="utf-8").read(), path, "exec")'
+          find packaging/linux -type f -name '*.py' -print0 |
+            while IFS= read -r -d '' script; do
+              python3 -c 'import sys; path = sys.argv[1]; compile(open(path, encoding="utf-8").read(), path, "exec")' "$script"
+            done
           actionlint .github/workflows/linux-packaging.yml
           ./packaging/linux/workflow-self-test.sh
           ./packaging/linux/self-test.sh
+          python3 packaging/linux/safeio.py \
+            run-create linux-safeio-self-test -- \
+            ./packaging/linux/safeio-self-test.sh
 
       - name: Preserve root Linux metadata and desktop rejection
         shell: bash
@@ -190,16 +198,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          first_manifest="$(
+          first_build="$(
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask000" \
             BUILD_INPUT_UMASK=000 \
               ./packaging/linux/build-container.sh x86_64
           )"
-          second_manifest="$(
+          second_build="$(
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask002" \
             BUILD_INPUT_UMASK=002 \
               ./packaging/linux/build-container.sh x86_64
           )"
+          first_manifest="${first_build%%|*}"
+          first_key_sha="${first_build##*|}"
+          second_manifest="${second_build%%|*}"
+          second_key_sha="${second_build##*|}"
           first_cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$first_manifest")"
           second_cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$second_manifest")"
           first_daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$first_manifest")"
@@ -207,7 +219,9 @@ jobs:
           cmp -s "$(dirname "$first_manifest")/$first_cli" "$(dirname "$second_manifest")/$second_cli"
           cmp -s "$(dirname "$first_manifest")/$first_daemon" "$(dirname "$second_manifest")/$second_daemon"
           echo "first-manifest=$first_manifest" >>"$GITHUB_OUTPUT"
+          echo "first-key-sha=$first_key_sha" >>"$GITHUB_OUTPUT"
           echo "second-manifest=$second_manifest" >>"$GITHUB_OUTPUT"
+          echo "second-key-sha=$second_key_sha" >>"$GITHUB_OUTPUT"
 
       - name: Execute binaries on the pinned oldest supported environment
         shell: bash
@@ -239,12 +253,12 @@ jobs:
 
       - name: Reject forged build manifests and substituted binaries
         shell: bash
-        env:
-          OUTPUT_ROOT: ${{ github.workspace }}/target/linux-build-manifest-self-test
         run: |
-          ./packaging/linux/build-manifest-self-test.sh \
-            "${{ steps.build.outputs.first-manifest }}" \
-            x86_64
+          OUTPUT_ROOT="$GITHUB_WORKSPACE/target/linux-build-manifest-self-test" \
+            ./packaging/linux/build-manifest-self-test-container.sh \
+              x86_64 \
+              "${{ steps.build.outputs.first-manifest }}" \
+              "${{ steps.build.outputs.first-key-sha }}"
 
       - name: Package independent builds and prove deterministic outputs
         id: package
@@ -256,14 +270,16 @@ jobs:
           upgrade="$GITHUB_WORKSPACE/target/linux-x86_64-upgrade"
           umask 000
           PACKAGE_RELEASE=1 OUTPUT_ROOT="$first" \
-            ./packaging/linux/package.sh \
+            ./packaging/linux/package-container.sh \
               x86_64 \
-              "${{ steps.build.outputs.first-manifest }}"
+              "${{ steps.build.outputs.first-manifest }}" \
+              "${{ steps.build.outputs.first-key-sha }}"
           umask 002
           PACKAGE_RELEASE=1 OUTPUT_ROOT="$second" \
-            ./packaging/linux/package.sh \
+            ./packaging/linux/package-container.sh \
               x86_64 \
-              "${{ steps.build.outputs.second-manifest }}"
+              "${{ steps.build.outputs.second-manifest }}" \
+              "${{ steps.build.outputs.second-key-sha }}"
           diff \
             <(cd "$first/artifacts" && find . -type f -print | LC_ALL=C sort) \
             <(cd "$second/artifacts" && find . -type f -print | LC_ALL=C sort)
@@ -271,20 +287,22 @@ jobs:
             cmp -s "$first/artifacts/$relative" "$second/artifacts/$relative"
           done < <(cd "$first/artifacts" && find . -type f -printf '%P\n' | LC_ALL=C sort)
           PACKAGE_RELEASE=2 OUTPUT_ROOT="$upgrade" \
-            ./packaging/linux/package.sh \
+            ./packaging/linux/package-container.sh \
               x86_64 \
-              "${{ steps.build.outputs.first-manifest }}"
+              "${{ steps.build.outputs.first-manifest }}" \
+              "${{ steps.build.outputs.first-key-sha }}"
           echo "release1=$first" >>"$GITHUB_OUTPUT"
           echo "release2=$upgrade" >>"$GITHUB_OUTPUT"
 
       - name: Mutate every published OCI trust edge
         shell: bash
-        env:
-          OUTPUT_ROOT: ${{ github.workspace }}/target/linux-oci-mutation-tests
         run: |
-          ./packaging/linux/oci-self-test.sh \
+          OUTPUT_ROOT="$GITHUB_WORKSPACE/target/linux-oci-mutation-tests" \
+            ./packaging/linux/oci-self-test-container.sh \
+            x86_64 \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-linux-x86_64.oci.tar.gz" \
-            x86_64
+            "${{ steps.build.outputs.first-manifest }}" \
+            "${{ steps.build.outputs.first-key-sha }}"
 
       - name: Install and execute Debian package on pinned Bookworm
         shell: bash
@@ -293,15 +311,24 @@ jobs:
           package="${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb"
           docker run --rm \
             --cap-drop ALL \
-            --security-opt no-new-privileges \
             --volume "$package:/tmp/gta-claw.deb:ro" \
-            gta-claw-linux-build:rust-1.97.0-bookworm \
+            debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df \
             bash -c '
               set -euo pipefail
-              dpkg -i /tmp/gta-claw.deb
+              for forbidden in gcc cargo rustc rpm make; do
+                ! command -v "$forbidden"
+              done
+              test ! -d /usr/include
+              printf "%s\n" \
+                "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260701T000000Z bookworm main" \
+                > /etc/apt/sources.list
+              rm -f /etc/apt/sources.list.d/*
+              apt-get -o Acquire::Check-Valid-Until=false update
+              apt-get -o Acquire::Check-Valid-Until=false install --no-install-recommends -y \
+                /tmp/gta-claw.deb
               /usr/bin/gta-claw-cli health | grep -F "healthy runtime="
               /usr/libexec/gta-claw/gta-claw-daemon --probe | grep -F "healthy runtime="
-              dpkg --remove gta-claw
+              apt-get remove -y gta-claw
               test ! -e /usr/libexec/gta-claw/gta-claw-daemon
             '
 
@@ -376,16 +403,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          first_manifest="$(
+          first_build="$(
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask000" \
             BUILD_INPUT_UMASK=000 \
               ./packaging/linux/build-container.sh arm64
           )"
-          second_manifest="$(
+          second_build="$(
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask002" \
             BUILD_INPUT_UMASK=002 \
               ./packaging/linux/build-container.sh arm64
           )"
+          first_manifest="${first_build%%|*}"
+          first_key_sha="${first_build##*|}"
+          second_manifest="${second_build%%|*}"
+          second_key_sha="${second_build##*|}"
           for manifest in "$first_manifest" "$second_manifest"; do
             root="$(dirname "$manifest")"
             cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$manifest")"
@@ -394,7 +425,9 @@ jobs:
             readelf -h "$root/$daemon" | grep -F 'AArch64'
           done
           echo "first-manifest=$first_manifest" >>"$GITHUB_OUTPUT"
+          echo "first-key-sha=$first_key_sha" >>"$GITHUB_OUTPUT"
           echo "second-manifest=$second_manifest" >>"$GITHUB_OUTPUT"
+          echo "second-key-sha=$second_key_sha" >>"$GITHUB_OUTPUT"
 
       - name: Package twice and prove deterministic arm64 layouts
         shell: bash
@@ -404,14 +437,16 @@ jobs:
           second="$GITHUB_WORKSPACE/target/linux-arm64-run2"
           umask 000
           OUTPUT_ROOT="$first" \
-            ./packaging/linux/package.sh \
+            ./packaging/linux/package-container.sh \
               arm64 \
-              "${{ steps.build.outputs.first-manifest }}"
+              "${{ steps.build.outputs.first-manifest }}" \
+              "${{ steps.build.outputs.first-key-sha }}"
           umask 002
           OUTPUT_ROOT="$second" \
-            ./packaging/linux/package.sh \
+            ./packaging/linux/package-container.sh \
               arm64 \
-              "${{ steps.build.outputs.second-manifest }}"
+              "${{ steps.build.outputs.second-manifest }}" \
+              "${{ steps.build.outputs.second-key-sha }}"
           diff \
             <(cd "$first/artifacts" && find . -type f -print | LC_ALL=C sort) \
             <(cd "$second/artifacts" && find . -type f -print | LC_ALL=C sort)

@@ -43,6 +43,20 @@ for contract in \
   }
 done
 
+for build_input in \
+  '"apps/**"' \
+  '"crates/**"' \
+  '"compat/**"' \
+  '"Cargo.lock"' \
+  '"Cargo.toml"' \
+  '"rust-toolchain.toml"'; do
+  count="$(grep -Fc -- "$build_input" "$workflow")"
+  [[ "$count" -ge 2 ]] || {
+    printf 'workflow trigger omits tracked build input: %s\n' "$build_input" >&2
+    exit 1
+  }
+done
+
 if grep -RInE '(^|[[:space:]])(npm|npx|node|nodejs|bun|pnpm)([[:space:]]|$)' \
   "$SCRIPT_DIR" "$workflow" \
   --include='*.sh' --include='*.yml'; then

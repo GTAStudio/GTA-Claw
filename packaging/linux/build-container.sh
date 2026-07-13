@@ -18,7 +18,7 @@ arch_target "$arch" >/dev/null
 target_root="$(canonical_target_root)"
 validate_new_private_root_path "$CARGO_TARGET_DIR" "CARGO_TARGET_DIR"
 target_relative="${CARGO_TARGET_DIR#"$target_root/"}"
-container_target="/workspace/target/$target_relative"
+validate_safe_component "$target_relative" "CARGO_TARGET_DIR component"
 
 build_input_umask="${BUILD_INPUT_UMASK:-002}"
 case "$build_input_umask" in
@@ -28,31 +28,63 @@ esac
 
 recipe_sha="$(sha256_file "$SCRIPT_DIR/Dockerfile.build")"
 image_tag="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
+git -C "$REPO_ROOT" archive --format=tar HEAD |
 docker build \
-  --file "$SCRIPT_DIR/Dockerfile.build" \
+  --file packaging/linux/Dockerfile.build \
   --build-arg "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
   --tag "$image_tag" \
-  "$REPO_ROOT"
+  -
+environment_image_id="$(docker image inspect --format '{{.Id}}' "$image_tag")"
+[[ "$environment_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+  die "pinned build environment produced an invalid image ID"
 
+exec {repo_mount_fd}<"$REPO_ROOT"
+exec {target_mount_fd}<"$target_root"
+repo_mount="/proc/$BASHPID/fd/$repo_mount_fd"
+target_mount="/proc/$BASHPID/fd/$target_mount_fd"
+repo_mount_id="$(stat -Lc '%d:%i' "$repo_mount")"
+target_mount_id="$(stat -Lc '%d:%i' "$target_mount")"
 container_manifest="$(
 docker run --rm \
-  --user "$(id -u):$(id -g)" \
   --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE \
+  --cap-add FOWNER \
   --security-opt no-new-privileges \
   --env "BUILD_IMAGE=$LINUX_BUILD_IMAGE" \
   --env "BUILD_INPUT_UMASK=$build_input_umask" \
+  --env "BUILD_ENVIRONMENT_IMAGE_ID=$environment_image_id" \
   --env "BUILD_RECIPE_SHA256=$recipe_sha" \
-  --env "CARGO_HOME=$container_target/cargo-home" \
-  --env "CARGO_TARGET_DIR=$container_target" \
   --env "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
-  --env "HOME=$container_target/home" \
   --env "RUSTFLAGS=-Dwarnings" \
-  --volume "$REPO_ROOT:/workspace:ro" \
-  --volume "$target_root:/workspace/target:rw" \
+  --env "SAFEIO_RETURN_UID=$(id -u)" \
+  --env "SAFEIO_RETURN_GID=$(id -g)" \
+  --mount "type=bind,source=$repo_mount,target=/workspace,readonly" \
+  --mount "type=bind,source=$target_mount,target=/workspace/target" \
   --workdir /workspace \
   "$image_tag" \
-  bash -c "umask '$build_input_umask'; ./packaging/linux/build.sh '$arch'"
+  /usr/local/bin/gta-claw-safeio \
+  run-create \
+  "$target_relative" \
+  -- \
+  bash -c "
+    export CARGO_TARGET_DIR=\"\$OUTPUT_ROOT\"
+    export CARGO_HOME=\"\$OUTPUT_ROOT/cargo-home\"
+    export HOME=\"\$OUTPUT_ROOT/home\"
+    umask '$build_input_umask'
+    ./packaging/linux/build.sh '$arch'
+  "
 )"
-[[ "$container_manifest" == "$container_target/build-manifest.json" ]] ||
+[[ "$(stat -Lc '%d:%i' "$REPO_ROOT")" == "$repo_mount_id" ]] ||
+  die "repository path identity changed during container build"
+[[ "$(stat -Lc '%d:%i' "$target_root")" == "$target_mount_id" ]] ||
+  die "target path identity changed during container build"
+[[ "$(stat -Lc '%d:%i' "$CARGO_TARGET_DIR")" == \
+  "$(stat -Lc '%d:%i' "$target_mount/$target_relative")" ]] ||
+  die "Cargo output component identity changed during container build"
+[[ "$container_manifest" == "/proc/self/fd/"*"/build-manifest.json|"* ]] ||
   die "build container returned an unexpected manifest path: $container_manifest"
-printf '%s\n' "$CARGO_TARGET_DIR/build-manifest.json"
+container_fingerprint="${container_manifest##*|}"
+[[ "$container_fingerprint" =~ ^[0-9a-f]{64}$ ]] ||
+  die "build container returned an invalid key fingerprint"
+printf '%s|%s\n' "$CARGO_TARGET_DIR/build-manifest.json" "$container_fingerprint"

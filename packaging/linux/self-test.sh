@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in gcc patchelf readelf sha256sum tar; do
+for tool in gcc jq patchelf python3 readelf sha256sum tar; do
   require_tool "$tool"
 done
 initialize_output_root
@@ -161,7 +161,9 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
     bash -c "source '$common'; validate_elf_binary '$work/hello-exec' x86_64"
 
   cp "$work/hello-pie" "$work/hello-interpreter"
-  patchelf --set-interpreter /tmp/evil-loader "$work/hello-interpreter"
+  patchelf \
+    --set-interpreter '/lib64/ld-linux-x86-64.so.2]evil' \
+    "$work/hello-interpreter"
   expect_failure elf-interpreter \
     bash -c "source '$common'; validate_elf_binary '$work/hello-interpreter' x86_64"
 
@@ -170,24 +172,48 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
   expect_failure elf-runpath \
     bash -c "source '$common'; validate_elf_binary '$work/hello-runpath' x86_64"
 
+  cp "$work/hello-pie" "$work/hello-needed"
+  patchelf \
+    --replace-needed libc.so.6 'libc.so.6]evil' \
+    "$work/hello-needed"
+  expect_failure elf-needed-delimiter \
+    bash -c "source '$common'; validate_elf_binary '$work/hello-needed' x86_64"
+
   write_output_text "$work/glibc-version.map" 0644 \
     $'GLIBC_9.99 { global: too_new; };\n'
   write_output_text "$work/too-new.c" 0644 \
     $'int too_new(void) { return 0; }\n'
-  write_output_text "$work/use-too-new.c" 0644 \
-    $'int too_new(void); int main(void) { return too_new(); }\n'
+  write_output_text "$work/use-too-new.S" 0644 \
+    $'.global _start\n_start:\n  call too_new\n  mov $60, %rax\n  xor %rdi, %rdi\n  syscall\n'
   gcc -shared -fPIC \
     -Wl,--version-script="$work/glibc-version.map" \
+    -Wl,-soname,libc.so.6 \
     "$work/too-new.c" \
-    -o "$work/libtoo-new.so"
-  gcc \
-    "$work/use-too-new.c" \
-    -L"$work" \
-    -Wl,-rpath-link="$work" \
-    -ltoo-new \
+    -o "$work/libc-too-new.so"
+  gcc -nostdlib -fPIE -pie \
+    "$work/use-too-new.S" \
+    "$work/libc-too-new.so" \
     -o "$work/use-too-new"
   expect_failure glibc-ceiling \
     bash -c "source '$common'; validate_glibc_requirement '$work/use-too-new'"
+
+  write_output_text "$work/glibc-malformed.map" 0644 \
+    $'GLIBC_2.34evil { global: malformed; };\n'
+  write_output_text "$work/malformed.c" 0644 \
+    $'int malformed(void) { return 0; }\n'
+  write_output_text "$work/use-malformed.S" 0644 \
+    $'.global _start\n_start:\n  call malformed\n  mov $60, %rax\n  xor %rdi, %rdi\n  syscall\n'
+  gcc -shared -fPIC \
+    -Wl,--version-script="$work/glibc-malformed.map" \
+    -Wl,-soname,libc.so.6 \
+    "$work/malformed.c" \
+    -o "$work/libc-malformed.so"
+  gcc -nostdlib -fPIE -pie \
+    "$work/use-malformed.S" \
+    "$work/libc-malformed.so" \
+    -o "$work/use-malformed"
+  expect_failure glibc-malformed-boundary \
+    bash -c "source '$common'; validate_elf_binary '$work/use-malformed' x86_64"
 fi
 
 mkdir "$work/forbidden-runtime"

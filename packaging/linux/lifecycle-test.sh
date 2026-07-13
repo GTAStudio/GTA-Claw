@@ -23,6 +23,7 @@ done
   die "lifecycle test requires systemd as PID 1"
 
 cleanup() {
+  sudo rm -rf /etc/systemd/system/gta-claw-daemon.service.d
   sudo systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1 || true
   if dpkg-query -W gta-claw >/dev/null 2>&1; then
     sudo dpkg --purge gta-claw >/dev/null 2>&1 || true
@@ -53,16 +54,51 @@ assert_active_restart() {
     die "active service was not restarted during package upgrade"
 }
 
+install_failure_dropin() {
+  local directive="$1"
+  sudo mkdir -p /etc/systemd/system/gta-claw-daemon.service.d
+  printf '[Service]\n%s\n' "$directive" |
+    sudo tee /etc/systemd/system/gta-claw-daemon.service.d/failure.conf >/dev/null
+  sudo systemctl daemon-reload
+}
+
+remove_failure_dropin() {
+  sudo rm -rf /etc/systemd/system/gta-claw-daemon.service.d
+  sudo systemctl daemon-reload
+  sudo systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 || true
+}
+
 sudo dpkg -i "$deb1"
 assert_disabled_and_inactive
+install_failure_dropin 'ExecStartPre=/bin/false'
+if sudo systemctl start gta-claw-daemon.service; then
+  die "intentional Debian start failure unexpectedly succeeded"
+fi
+remove_failure_dropin
 sudo systemctl enable --now gta-claw-daemon.service
 deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-sudo dpkg -i "$deb2"
+install_failure_dropin 'ExecStartPre=/bin/false'
+if sudo dpkg -i "$deb2"; then
+  die "Debian upgrade swallowed an intentional restart failure"
+fi
+[[ "$(dpkg-query -W -f='${Status}' gta-claw)" != "install ok installed" ]] ||
+  die "Debian package reported configured after restart failure"
+remove_failure_dropin
+sudo systemctl start gta-claw-daemon.service
+sudo dpkg --configure gta-claw
 assert_active_restart "$deb_pid"
 sudo systemctl stop gta-claw-daemon.service
 sudo dpkg -i --force-downgrade "$deb1"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "inactive service was started during Debian package replacement"
+sudo systemctl start gta-claw-daemon.service
+install_failure_dropin 'ExecStop=/bin/false'
+if sudo dpkg --remove gta-claw; then
+  die "Debian removal swallowed an intentional stop failure"
+fi
+[[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "Debian removal unlinked the daemon after stop failure"
+remove_failure_dropin
 sudo systemctl start gta-claw-daemon.service
 sudo dpkg --remove gta-claw
 ! systemctl is-active --quiet gta-claw-daemon.service ||
@@ -74,14 +110,35 @@ sudo dpkg --purge gta-claw
 
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
+install_failure_dropin 'ExecStartPre=/bin/false'
+if sudo systemctl start gta-claw-daemon.service; then
+  die "intentional RPM start failure unexpectedly succeeded"
+fi
+remove_failure_dropin
 sudo systemctl enable --now gta-claw-daemon.service
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-sudo rpm -Uvh --nodeps "$rpm2"
+install_failure_dropin 'ExecStartPre=/bin/false'
+if sudo rpm -Uvh --nodeps "$rpm2"; then
+  die "RPM upgrade swallowed an intentional restart failure"
+fi
+remove_failure_dropin
+sudo systemctl start gta-claw-daemon.service
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
 assert_active_restart "$rpm_pid"
 sudo systemctl stop gta-claw-daemon.service
 sudo rpm -Uvh --nodeps --oldpackage "$rpm1"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "inactive service was started during RPM replacement"
+sudo systemctl start gta-claw-daemon.service
+install_failure_dropin 'ExecStop=/bin/false'
+if sudo rpm -e --nodeps gta-claw; then
+  die "RPM removal swallowed an intentional stop failure"
+fi
+rpm -q gta-claw >/dev/null ||
+  die "RPM removal erased package after stop failure"
+[[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "RPM removal unlinked daemon after stop failure"
+remove_failure_dropin
 sudo systemctl start gta-claw-daemon.service
 sudo rpm -e --nodeps gta-claw
 ! systemctl is-active --quiet gta-claw-daemon.service ||

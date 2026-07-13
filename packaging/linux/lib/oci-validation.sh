@@ -3,6 +3,13 @@
 create_private_validation_directory() {
   local path="$1"
   local target
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
+    [[ "$path" == "$OUTPUT_ROOT/"* ]] ||
+      die "validation directory must remain below safe output root"
+    [[ ! -e "$path" && ! -L "$path" ]] || die "validation directory must be new: $path"
+    ensure_output_directory "$path"
+    return
+  fi
   validate_absolute_path "$path" "validation directory"
   target="$(canonical_target_root)"
   [[ "$path" == "$target/"* ]] || die "validation directory must remain below target"
@@ -18,31 +25,31 @@ create_private_validation_directory() {
 validate_archive_entries() {
   local archive="$1"
   local compression="$2"
-  local listing
-  local verbose
+  local max_compressed
+  local max_expanded
+  local max_file
   case "$compression" in
     gzip)
-      listing="$(tar --quoting-style=escape -tzf "$archive")"
-      verbose="$(tar --numeric-owner --quoting-style=escape -tvzf "$archive")"
+      max_compressed=$((64 * 1024 * 1024))
+      max_expanded=$((64 * 1024 * 1024))
+      max_file=$((32 * 1024 * 1024))
       ;;
     none)
-      listing="$(tar --quoting-style=escape -tf "$archive")"
-      verbose="$(tar --numeric-owner --quoting-style=escape -tvf "$archive")"
+      max_compressed=$((64 * 1024 * 1024))
+      max_expanded=$((64 * 1024 * 1024))
+      max_file=$((32 * 1024 * 1024))
       ;;
     *) die "unsupported archive compression: $compression" ;;
   esac
-  [[ -n "$listing" ]] || die "archive is empty: $archive"
-  # shellcheck disable=SC2001
-  listing="$(sed 's#^\./##; /^$/d' <<<"$listing")"
-  if grep -E '(^/|(^|/)\.\.?(/|$)|\\|(^|/)\.wh\.)' <<<"$listing"; then
-    die "archive contains an unsafe path: $archive"
-  fi
-  if awk 'substr($1, 1, 1) !~ /^[-d]$/ { bad = 1 } END { exit !bad }' <<<"$verbose"; then
-    die "archive contains a link or special entry: $archive"
-  fi
-  if awk '$1 ~ /[sStT]/ { bad = 1 } END { exit !bad }' <<<"$verbose"; then
-    die "archive contains setuid, setgid, or sticky mode bits: $archive"
-  fi
+  python3 "$LINUX_DIR/strict_artifact.py" \
+    tar \
+    "$archive" \
+    "$compression" \
+    "$max_compressed" \
+    "$max_expanded" \
+    "$max_file" \
+    4096 \
+    >/dev/null
 }
 
 validate_descriptor_blob() {
@@ -66,6 +73,8 @@ validate_published_oci() {
   local archive="$1"
   local arch="$2"
   local validation_root="$3"
+  local expected_build_manifest="$4"
+  local expected_build_key_sha="$5"
   local base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
   local expected_layout_name="$base_name.oci"
   local extract_root="$validation_root/extracted"
@@ -94,10 +103,17 @@ validate_published_oci() {
   local package_id
   local expected_version
   local expected_license
-  local copyright_sha
-  local copyright_path
+  local material_name
+  local material_target
+  local material_sha
+  local archive_sha
+  local root_layer_sha=""
+  local expected_rootfs_files
+  local actual_rootfs_files
 
   assert_regular_unaliased "$archive" "published OCI archive"
+  verify_build_manifest "$expected_build_manifest" "$arch" "$expected_build_key_sha"
+  archive_sha="$(sha256_file "$archive")"
   [[ ! -e "$validation_root" && ! -L "$validation_root" ]] ||
     die "OCI validation root must be new"
   create_private_validation_directory "$validation_root"
@@ -119,9 +135,13 @@ validate_published_oci() {
       --no-same-owner \
       --numeric-owner
   )
+  [[ "$(sha256_file "$archive")" == "$archive_sha" ]] ||
+    die "published OCI archive changed during extraction"
   reject_links_and_special_files "$extract_root"
   layout="$extract_root/$expected_layout_name"
   [[ -d "$layout" && ! -L "$layout" ]] || die "published OCI layout directory is missing"
+  python3 "$LINUX_DIR/strict_artifact.py" json "$layout/oci-layout" >/dev/null
+  python3 "$LINUX_DIR/strict_artifact.py" json "$layout/index.json" >/dev/null
   jq -e '.imageLayoutVersion == "1.0.0"' "$layout/oci-layout" >/dev/null ||
     die "published OCI layout version is invalid"
   jq -e '
@@ -137,6 +157,7 @@ validate_published_oci() {
   manifest_digest="$(jq -er '.manifests[0].digest' "$layout/index.json")"
   manifest_size="$(jq -er '.manifests[0].size' "$layout/index.json")"
   manifest="$(validate_descriptor_blob "$layout" "$manifest_digest" "$manifest_size" "manifest")"
+  python3 "$LINUX_DIR/strict_artifact.py" json "$manifest" >/dev/null
   jq -e '
     .schemaVersion == 2 and
     .mediaType == "application/vnd.oci.image.manifest.v1+json" and
@@ -147,6 +168,7 @@ validate_published_oci() {
   config_digest="$(jq -er '.config.digest' "$manifest")"
   config_size="$(jq -er '.config.size' "$manifest")"
   config="$(validate_descriptor_blob "$layout" "$config_digest" "$config_size" "config")"
+  python3 "$LINUX_DIR/strict_artifact.py" json "$config" >/dev/null
   [[ "$(jq -er '.architecture' "$config")" == "$(oci_arch "$arch")" ]] ||
     die "published OCI config architecture mismatch"
   jq -e '
@@ -177,6 +199,7 @@ validate_published_oci() {
     validate_archive_entries "$layer" none
     if [[ "$index" -eq 0 ]]; then
       root_layer="$layer"
+      root_layer_sha="$(sha256_file "$layer")"
     else
       writable_layer="$layer"
     fi
@@ -208,9 +231,21 @@ validate_published_oci() {
       --no-same-owner \
       --numeric-owner
   )
+  [[ "$(sha256_file "$root_layer")" == "$root_layer_sha" ]] ||
+    die "published OCI root layer changed during extraction"
   reject_links_and_special_files "$rootfs"
   validate_elf_binary "$rootfs/usr/bin/$LINUX_CLI_NAME" "$arch"
   validate_elf_binary "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME" "$arch"
+  [[ "$(sha256_file "$rootfs/usr/bin/$LINUX_CLI_NAME")" == "$(
+    jq -er --arg name "$LINUX_CLI_NAME" '
+      .binaries[] | select(.name == $name) | .sha256
+    ' "$BUILD_MANIFEST"
+  )" ]] || die "published OCI CLI differs from authenticated build"
+  [[ "$(sha256_file "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME")" == "$(
+    jq -er --arg name "$LINUX_DAEMON_NAME" '
+      .binaries[] | select(.name == $name) | .sha256
+    ' "$BUILD_MANIFEST"
+  )" ]] || die "published OCI daemon differs from authenticated build"
   [[ "$(stat -c '%a' "$rootfs/usr/bin/$LINUX_CLI_NAME")" == "755" ]] ||
     die "published OCI CLI mode mismatch"
   [[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME")" == "755" ]] ||
@@ -222,6 +257,25 @@ validate_published_oci() {
 
   PUBLISHED_RUNTIME_MANIFEST="$rootfs/usr/share/doc/gta-claw/runtime-manifest.json"
   assert_regular_unaliased "$PUBLISHED_RUNTIME_MANIFEST" "published runtime manifest"
+  python3 "$LINUX_DIR/strict_artifact.py" json "$PUBLISHED_RUNTIME_MANIFEST" >/dev/null
+  python3 "$LINUX_DIR/strict_artifact.py" \
+    json \
+    "$rootfs/usr/share/doc/gta-claw/build-manifest.json" \
+    >/dev/null
+  python3 "$LINUX_DIR/strict_artifact.py" \
+    json \
+    "$rootfs/usr/share/doc/gta-claw/sbom.spdx.json" \
+    >/dev/null
+  python3 "$LINUX_DIR/strict_artifact.py" \
+    json \
+    "$rootfs/usr/share/doc/gta-claw/package-toolchain.json" \
+    >/dev/null
+  [[ "$(sha256_file "$rootfs/usr/share/doc/gta-claw/build-manifest.json")" == \
+    "$(sha256_file "$BUILD_MANIFEST")" ]] ||
+    die "published OCI build manifest differs from authenticated build manifest"
+  [[ "$(sha256_file "$PUBLISHED_RUNTIME_MANIFEST")" == \
+    "$(sha256_file "$BUILD_RUNTIME_MANIFEST")" ]] ||
+    die "published OCI runtime manifest differs from authenticated runtime manifest"
   while IFS=$'\t' read -r package_id staged_path target_path expected_sha; do
     [[ "$staged_path" =~ ^runtime/rootfs/ && "$target_path" == /* ]] ||
       die "published runtime manifest contains an unsafe path"
@@ -255,25 +309,17 @@ validate_published_oci() {
       $package.files[] |
       [$package.id, .stagedPath, .targetPath, .sha256] |
       @tsv
-    ' "$PUBLISHED_RUNTIME_MANIFEST"
+    ' "$BUILD_RUNTIME_MANIFEST"
   )
   for package_id in libc6 libgcc-s1; do
     expected_version="$(
       jq -er --arg id "$package_id" '.packages[] | select(.id == $id) | .version' \
-        "$PUBLISHED_RUNTIME_MANIFEST"
+        "$BUILD_RUNTIME_MANIFEST"
     )"
     expected_license="$(
       jq -er --arg id "$package_id" '.packages[] | select(.id == $id) | .licenseExpression' \
-        "$PUBLISHED_RUNTIME_MANIFEST"
+        "$BUILD_RUNTIME_MANIFEST"
     )"
-    copyright_sha="$(
-      jq -er --arg id "$package_id" '.packages[] | select(.id == $id) | .copyrightSha256' \
-        "$PUBLISHED_RUNTIME_MANIFEST"
-    )"
-    copyright_path="$rootfs/usr/share/licenses/$package_id/copyright"
-    assert_regular_unaliased "$copyright_path" "published runtime copyright"
-    [[ "$(sha256_file "$copyright_path")" == "$copyright_sha" ]] ||
-      die "published runtime copyright digest mismatch: $package_id"
     jq -e \
       --arg id "$package_id" \
       --arg version "$expected_version" \
@@ -292,10 +338,15 @@ validate_published_oci() {
         )
       ' "$rootfs/usr/share/doc/gta-claw/sbom.spdx.json" >/dev/null ||
       die "published OCI SBOM does not bind runtime package $package_id"
+  done
+  while IFS=$'\t' read -r package_id material_name material_target material_sha; do
+    assert_regular_unaliased "$rootfs$material_target" "published license material"
+    [[ "$(sha256_file "$rootfs$material_target")" == "$material_sha" ]] ||
+      die "published license material digest mismatch: $material_name"
     jq -e \
       --arg id "$package_id" \
-      --arg file_name "./usr/share/licenses/$package_id/copyright" \
-      --arg sha "$copyright_sha" \
+      --arg file_name "./${material_target#/}" \
+      --arg sha "$material_sha" \
       '
         ((.files | map(select(
           .fileName == $file_name and
@@ -309,11 +360,43 @@ validate_published_oci() {
           )
         )
       ' "$rootfs/usr/share/doc/gta-claw/sbom.spdx.json" >/dev/null ||
-      die "published OCI SBOM does not bind runtime copyright $package_id"
-  done
+      die "published OCI SBOM does not bind license material $material_name"
+  done < <(
+    jq -r '
+      .packages[].licenseMaterials[] |
+      [.packageId, .name, .targetPath, .sha256] |
+      @tsv
+    ' "$BUILD_RUNTIME_MANIFEST"
+  )
   verify_sha256_manifest \
     "$rootfs" \
     "$rootfs/usr/share/doc/gta-claw/SHA256SUMS"
+
+  expected_rootfs_files="$(
+    {
+      printf '%s\n' \
+        etc/group \
+        etc/passwd \
+        "usr/bin/$LINUX_CLI_NAME" \
+        "usr/libexec/gta-claw/$LINUX_DAEMON_NAME" \
+        usr/share/doc/gta-claw/LICENSE.txt \
+        usr/share/doc/gta-claw/NOTICE.txt \
+        usr/share/doc/gta-claw/README.md \
+        usr/share/doc/gta-claw/SHA256SUMS \
+        usr/share/doc/gta-claw/build-manifest.json \
+        usr/share/doc/gta-claw/gta-claw-daemon.socket.deferred \
+        usr/share/doc/gta-claw/package-toolchain.json \
+        usr/share/doc/gta-claw/provenance.json \
+        usr/share/doc/gta-claw/runtime-manifest.json \
+        usr/share/doc/gta-claw/sbom.spdx.json
+      jq -r '.packages[].files[].targetPath | sub("^/"; "")' "$BUILD_RUNTIME_MANIFEST"
+      jq -r '.packages[].licenseMaterials[].targetPath | sub("^/"; "")' \
+        "$BUILD_RUNTIME_MANIFEST"
+    } | LC_ALL=C sort -u
+  )"
+  actual_rootfs_files="$(find "$rootfs" -type f -printf '%P\n' | LC_ALL=C sort -u)"
+  [[ "$actual_rootfs_files" == "$expected_rootfs_files" ]] ||
+    die "published OCI rootfs differs from independently derived file policy"
 
   listing="$(
     tar --numeric-owner -tvf "$writable_layer" |
