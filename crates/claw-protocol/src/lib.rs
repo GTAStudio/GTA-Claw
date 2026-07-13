@@ -5,6 +5,9 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_domain::{DomainError, SessionId};
 
+/// OpenClaw Gateway v4 wire contracts, negotiation, registries, and authorization.
+pub mod gateway;
+
 /// The protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u16 = 1;
 
