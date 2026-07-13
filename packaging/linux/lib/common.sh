@@ -515,7 +515,11 @@ assert_regular_unaliased() {
 reject_links_and_special_files() {
   local root="$1"
   local bad
-  [[ -d "$root" && ! -L "$root" ]] || die "tree root is not a real directory: $root"
+  if [[ "${SAFEIO_ACTIVE:-0}" == "1" && "$root" == "$OUTPUT_ROOT" ]]; then
+    "$SAFEIO_HELPER" check "$SAFEIO_OUTPUT_FD"
+  else
+    [[ -d "$root" && ! -L "$root" ]] || die "tree root is not a real directory: $root"
+  fi
   bad="$(find "$root" -type l -print -quit)"
   [[ -z "$bad" ]] || die "symlink is not permitted in staged content: $bad"
   bad="$(find "$root" -type f -links +1 -print -quit)"
