@@ -435,23 +435,26 @@ function Assert-JsonSchema {
 
     if (Has-Property $SchemaNode "type") {
         $expectedType = [string](Get-PropertyValue $SchemaNode "type")
-        $typeMatches = switch -CaseSensitive ($expectedType) {
-            "object" { Test-JsonObject $Instance; break }
-            "array" { $Instance -is [System.Array]; break }
-            "string" { $Instance -is [string]; break }
-            "boolean" { $Instance -is [bool]; break }
-            "integer" {
-                ($Instance -is [byte]) -or ($Instance -is [int16]) -or
-                ($Instance -is [int32]) -or ($Instance -is [int64]); break
-            }
-            "number" {
-                ($Instance -is [byte]) -or ($Instance -is [int16]) -or
+        if (Test-OrdinalStringEqual $expectedType "object") {
+            $typeMatches = Test-JsonObject $Instance
+        } elseif (Test-OrdinalStringEqual $expectedType "array") {
+            $typeMatches = $Instance -is [System.Array]
+        } elseif (Test-OrdinalStringEqual $expectedType "string") {
+            $typeMatches = $Instance -is [string]
+        } elseif (Test-OrdinalStringEqual $expectedType "boolean") {
+            $typeMatches = $Instance -is [bool]
+        } elseif (Test-OrdinalStringEqual $expectedType "integer") {
+            $typeMatches = ($Instance -is [byte]) -or ($Instance -is [int16]) -or
+                ($Instance -is [int32]) -or ($Instance -is [int64])
+        } elseif (Test-OrdinalStringEqual $expectedType "number") {
+            $typeMatches = ($Instance -is [byte]) -or ($Instance -is [int16]) -or
                 ($Instance -is [int32]) -or ($Instance -is [int64]) -or
                 ($Instance -is [single]) -or ($Instance -is [double]) -or
-                ($Instance -is [decimal]); break
-            }
-            "null" { $null -eq $Instance; break }
-            default { Fail "$Path uses unsupported JSON Schema type $expectedType" }
+                ($Instance -is [decimal])
+        } elseif (Test-OrdinalStringEqual $expectedType "null") {
+            $typeMatches = $null -eq $Instance
+        } else {
+            Fail "$Path uses unsupported JSON Schema type $expectedType"
         }
         if (-not $typeMatches) {
             $actualType = if ($null -eq $Instance) { "null" } else { $Instance.GetType().FullName }
@@ -590,27 +593,39 @@ function Get-ExpectedRecordId {
         [string]$InventoryId,
         [object]$Item
     )
-    $prefix = switch ($InventoryId) {
-        "plugins" { "plugin"; break }
-        "skills" { "skill"; break }
-        "gateway-protocol" {
-            switch -CaseSensitive ([string]$Item.kind) {
-                "method" { "gateway_method"; break }
-                "event" { "gateway_event"; break }
-                "role" { "gateway_role"; break }
-                "scope" { "gateway_scope"; break }
-                default { Fail "gateway-protocol item has invalid kind '$($Item.kind)'" }
-            }
-            break
+    if (Test-OrdinalStringEqual $InventoryId "plugins") {
+        $prefix = "plugin"
+    } elseif (Test-OrdinalStringEqual $InventoryId "skills") {
+        $prefix = "skill"
+    } elseif (Test-OrdinalStringEqual $InventoryId "gateway-protocol") {
+        $kind = [string]$Item.kind
+        if (Test-OrdinalStringEqual $kind "method") {
+            $prefix = "gateway_method"
+        } elseif (Test-OrdinalStringEqual $kind "event") {
+            $prefix = "gateway_event"
+        } elseif (Test-OrdinalStringEqual $kind "role") {
+            $prefix = "gateway_role"
+        } elseif (Test-OrdinalStringEqual $kind "scope") {
+            $prefix = "gateway_scope"
+        } else {
+            Fail "gateway-protocol item has invalid kind '$kind'"
         }
-        "config-domains" { "config_domain"; break }
-        "providers" { "provider"; break }
-        "channels" { "channel"; break }
-        "http-sse-endpoints" { "http"; break }
-        "clients" { "client"; break }
-        "migrations" { "migration"; break }
-        "release-deployment" { "release_surface"; break }
-        default { Fail "unknown inventory $InventoryId" }
+    } elseif (Test-OrdinalStringEqual $InventoryId "config-domains") {
+        $prefix = "config_domain"
+    } elseif (Test-OrdinalStringEqual $InventoryId "providers") {
+        $prefix = "provider"
+    } elseif (Test-OrdinalStringEqual $InventoryId "channels") {
+        $prefix = "channel"
+    } elseif (Test-OrdinalStringEqual $InventoryId "http-sse-endpoints") {
+        $prefix = "http"
+    } elseif (Test-OrdinalStringEqual $InventoryId "clients") {
+        $prefix = "client"
+    } elseif (Test-OrdinalStringEqual $InventoryId "migrations") {
+        $prefix = "migration"
+    } elseif (Test-OrdinalStringEqual $InventoryId "release-deployment") {
+        $prefix = "release_surface"
+    } else {
+        Fail "unknown inventory $InventoryId"
     }
     return "${prefix}:$($Item.id)"
 }
@@ -621,7 +636,7 @@ function Assert-InventoryItemContract {
         [object]$Item,
         [string]$Context
     )
-    if ([string]$Item.record_id -cne (Get-ExpectedRecordId $InventoryId $Item)) {
+    if (-not (Test-OrdinalStringEqual ([string]$Item.record_id) (Get-ExpectedRecordId $InventoryId $Item))) {
         Fail "$Context record_id does not match its natural id"
     }
     Assert-RelativeSourcePath ([string]$Item.source_path) "$Context.source_path"
@@ -631,83 +646,72 @@ function Assert-InventoryItemContract {
         }
     }
 
-    switch ($InventoryId) {
-        "plugins" {
-            if (@("core", "official_external", "source_only_qa") -cnotcontains [string]$Item.delivery_class) {
-                Fail "$Context has invalid delivery_class"
-            }
+    if (Test-OrdinalStringEqual $InventoryId "plugins") {
+        if (-not (Test-OrdinalContains @("core", "official_external", "source_only_qa") ([string]$Item.delivery_class))) {
+            Fail "$Context has invalid delivery_class"
         }
-        "skills" {
-            if (@("MIT", "Apache-2.0") -cnotcontains [string]$Item.license) {
-                Fail "$Context has invalid license"
-            }
-            if (($Item.id -ceq "skill-creator") -ne ($Item.license -ceq "Apache-2.0")) {
-                Fail "$Context has stale skill license evidence"
-            }
+    } elseif (Test-OrdinalStringEqual $InventoryId "skills") {
+        if (-not (Test-OrdinalContains @("MIT", "Apache-2.0") ([string]$Item.license))) {
+            Fail "$Context has invalid license"
         }
-        "gateway-protocol" {
-            $base = @("record_id", "id", "classification", "source_path", "kind")
-            switch -CaseSensitive ([string]$Item.kind) {
-                "method" {
-                    Assert-ExactPropertySet $Item ($base + @("scope", "advertised")) $Context
-                    if ($AllowedOperatorScopes -cnotcontains [string]$Item.scope -or
-                        -not ($Item.advertised -is [bool])) {
-                        Fail "$Context has invalid method scope or advertised flag"
-                    }
-                }
-                "event" {
-                    Assert-ExactPropertySet $Item $base $Context
-                }
-                "role" {
-                    Assert-ExactPropertySet $Item ($base + @("protocol_class")) $Context
-                    if (@("gateway", "closed_worker") -cnotcontains [string]$Item.protocol_class) {
-                        Fail "$Context has invalid role protocol_class"
-                    }
-                }
-                "scope" {
-                    Assert-ExactPropertySet $Item $base $Context
-                }
-                default {
-                    Fail "$Context has invalid protocol kind"
-                }
-            }
+        if ((Test-OrdinalStringEqual ([string]$Item.id) "skill-creator") -ne
+            (Test-OrdinalStringEqual ([string]$Item.license) "Apache-2.0")) {
+            Fail "$Context has stale skill license evidence"
         }
-        "channels" {
-            if (@("source_manifest", "official_catalog_only") -cnotcontains [string]$Item.provenance) {
-                Fail "$Context has invalid provenance"
+    } elseif (Test-OrdinalStringEqual $InventoryId "gateway-protocol") {
+        $base = @("record_id", "id", "classification", "source_path", "kind")
+        $kind = [string]$Item.kind
+        if (Test-OrdinalStringEqual $kind "method") {
+            Assert-ExactPropertySet $Item ($base + @("scope", "advertised")) $Context
+            if (-not (Test-OrdinalContains $AllowedOperatorScopes ([string]$Item.scope)) -or
+                -not ($Item.advertised -is [bool])) {
+                Fail "$Context has invalid method scope or advertised flag"
             }
-            if ($Item.provenance -ceq "source_manifest" -and -not (Has-Property $Item "plugin_id")) {
-                Fail "$Context source manifest row requires plugin_id"
+        } elseif (Test-OrdinalStringEqual $kind "event") {
+            Assert-ExactPropertySet $Item $base $Context
+        } elseif (Test-OrdinalStringEqual $kind "role") {
+            Assert-ExactPropertySet $Item ($base + @("protocol_class")) $Context
+            if (-not (Test-OrdinalContains @("gateway", "closed_worker") ([string]$Item.protocol_class))) {
+                Fail "$Context has invalid role protocol_class"
             }
-            if ($Item.provenance -ceq "official_catalog_only" -and -not (Has-Property $Item "package_name")) {
-                Fail "$Context catalog-only row requires package_name"
-            }
+        } elseif (Test-OrdinalStringEqual $kind "scope") {
+            Assert-ExactPropertySet $Item $base $Context
+        } else {
+            Fail "$Context has invalid protocol kind"
         }
-        "http-sse-endpoints" {
-            if (@("GET", "POST") -cnotcontains [string]$Item.method -or
-                @("none", "optional_sse", "long_poll", "streamable_http") -cnotcontains [string]$Item.streaming -or
-                -not ([string]$Item.path).StartsWith("/")) {
-                Fail "$Context has invalid HTTP method, path, or streaming kind"
-            }
+    } elseif (Test-OrdinalStringEqual $InventoryId "channels") {
+        if (-not (Test-OrdinalContains @("source_manifest", "official_catalog_only") ([string]$Item.provenance))) {
+            Fail "$Context has invalid provenance"
         }
-        "clients" {
-            $allowedKinds = @(
-                "browser_extension", "headless_node", "native_app", "native_helper",
-                "native_sidecar", "terminal_app", "terminal_client", "web_app"
-            )
-            if ($allowedKinds -cnotcontains [string]$Item.kind) {
-                Fail "$Context has invalid client kind"
-            }
+        if ((Test-OrdinalStringEqual ([string]$Item.provenance) "source_manifest") -and
+            -not (Has-Property $Item "plugin_id")) {
+            Fail "$Context source manifest row requires plugin_id"
         }
-        "migrations" {
-            if ($Item.kind -cne "migration_provider") {
-                Fail "$Context has invalid migration kind"
-            }
+        if ((Test-OrdinalStringEqual ([string]$Item.provenance) "official_catalog_only") -and
+            -not (Has-Property $Item "package_name")) {
+            Fail "$Context catalog-only row requires package_name"
         }
-        "release-deployment" {
-            if (@("release", "installation", "deployment") -cnotcontains [string]$Item.kind) {
-                Fail "$Context has invalid release/deployment kind"
-            }
+    } elseif (Test-OrdinalStringEqual $InventoryId "http-sse-endpoints") {
+        if (-not (Test-OrdinalContains @("GET", "POST") ([string]$Item.method)) -or
+            -not (Test-OrdinalContains @("none", "optional_sse", "long_poll", "streamable_http") ([string]$Item.streaming)) -or
+            -not ([string]$Item.path).StartsWith("/", [StringComparison]::Ordinal)) {
+            Fail "$Context has invalid HTTP method, path, or streaming kind"
+        }
+    } elseif (Test-OrdinalStringEqual $InventoryId "clients") {
+        $allowedKinds = @(
+            "browser_extension", "headless_node", "native_app", "native_helper",
+            "native_sidecar", "terminal_app", "terminal_client", "web_app"
+        )
+        if (-not (Test-OrdinalContains $allowedKinds ([string]$Item.kind))) {
+            Fail "$Context has invalid client kind"
+        }
+    } elseif (Test-OrdinalStringEqual $InventoryId "migrations") {
+        if (-not (Test-OrdinalStringEqual ([string]$Item.kind) "migration_provider")) {
+            Fail "$Context has invalid migration kind"
+        }
+    } elseif (Test-OrdinalStringEqual $InventoryId "release-deployment") {
+        if (-not (Test-OrdinalContains @("release", "installation", "deployment") ([string]$Item.kind))) {
+            Fail "$Context has invalid release/deployment kind"
         }
     }
 }
@@ -717,72 +721,102 @@ function Get-DerivedInventoryCounts {
         [string]$InventoryId,
         [object[]]$Items
     )
-    switch ($InventoryId) {
-        "plugins" {
-            return [ordered]@{
-                total = $Items.Count
-                core = @($Items | Where-Object { $_.delivery_class -ceq "core" }).Count
-                official_external = @($Items | Where-Object { $_.delivery_class -ceq "official_external" }).Count
-                source_only_qa = @($Items | Where-Object { $_.delivery_class -ceq "source_only_qa" }).Count
-            }
-        }
-        "skills" {
-            return [ordered]@{ total = $Items.Count; bundled = $Items.Count }
-        }
-        "gateway-protocol" {
-            $methods = @($Items | Where-Object { $_.kind -ceq "method" })
-            return [ordered]@{
-                total = $Items.Count
-                methods = $methods.Count
-                advertised_methods = @($methods | Where-Object { $_.advertised -eq $true }).Count
-                events = @($Items | Where-Object { $_.kind -ceq "event" }).Count
-                roles = @($Items | Where-Object { $_.kind -ceq "role" }).Count
-                scopes = @($Items | Where-Object { $_.kind -ceq "scope" }).Count
-                dynamic_plugin_methods = "runtime-dependent"
-            }
-        }
-        "config-domains" {
-            return [ordered]@{ total = $Items.Count }
-        }
-        "providers" {
-            return [ordered]@{
-                total = $Items.Count
-                unique = @($Items.id | Sort-Object -Unique).Count
-            }
-        }
-        "channels" {
-            return [ordered]@{
-                total = $Items.Count
-                source_manifest = @($Items | Where-Object { $_.provenance -ceq "source_manifest" }).Count
-                official_catalog_only = @($Items | Where-Object { $_.provenance -ceq "official_catalog_only" }).Count
-            }
-        }
-        "http-sse-endpoints" {
-            return [ordered]@{
-                total = $Items.Count
-                optional_sse = @($Items | Where-Object { $_.streaming -ceq "optional_sse" }).Count
-                long_poll = @($Items | Where-Object { $_.streaming -ceq "long_poll" }).Count
-                streamable_http = @($Items | Where-Object { $_.streaming -ceq "streamable_http" }).Count
-            }
-        }
-        "clients" {
-            return [ordered]@{ total = $Items.Count }
-        }
-        "migrations" {
-            return [ordered]@{ total = $Items.Count }
-        }
-        "release-deployment" {
-            return [ordered]@{
-                total = $Items.Count
-                release = @($Items | Where-Object { $_.kind -ceq "release" }).Count
-                installation = @($Items | Where-Object { $_.kind -ceq "installation" }).Count
-                deployment = @($Items | Where-Object { $_.kind -ceq "deployment" }).Count
-            }
-        }
-        default {
-            Fail "unknown inventory $InventoryId"
+    if (Test-OrdinalStringEqual $InventoryId "plugins") {
+        return [ordered]@{
+            total = $Items.Count
+            core = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.delivery_class) "core"
+            }).Count
+            official_external = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.delivery_class) "official_external"
+            }).Count
+            source_only_qa = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.delivery_class) "source_only_qa"
+            }).Count
         }
     }
+    if (Test-OrdinalStringEqual $InventoryId "skills") {
+        return [ordered]@{ total = $Items.Count; bundled = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "gateway-protocol") {
+        $methods = @($Items | Where-Object {
+            Test-OrdinalStringEqual ([string]$_.kind) "method"
+        })
+        return [ordered]@{
+            total = $Items.Count
+            methods = $methods.Count
+            advertised_methods = @($methods | Where-Object { $_.advertised -eq $true }).Count
+            events = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "event"
+            }).Count
+            roles = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "role"
+            }).Count
+            scopes = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "scope"
+            }).Count
+            dynamic_plugin_methods = "runtime-dependent"
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "config-domains") {
+        return [ordered]@{ total = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "providers") {
+        $uniqueIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($item in $Items) {
+            [void]$uniqueIds.Add([string]$item.id)
+        }
+        return [ordered]@{
+            total = $Items.Count
+            unique = $uniqueIds.Count
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "channels") {
+        return [ordered]@{
+            total = $Items.Count
+            source_manifest = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.provenance) "source_manifest"
+            }).Count
+            official_catalog_only = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.provenance) "official_catalog_only"
+            }).Count
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "http-sse-endpoints") {
+        return [ordered]@{
+            total = $Items.Count
+            optional_sse = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.streaming) "optional_sse"
+            }).Count
+            long_poll = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.streaming) "long_poll"
+            }).Count
+            streamable_http = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.streaming) "streamable_http"
+            }).Count
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "clients") {
+        return [ordered]@{ total = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "migrations") {
+        return [ordered]@{ total = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "release-deployment") {
+        return [ordered]@{
+            total = $Items.Count
+            release = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "release"
+            }).Count
+            installation = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "installation"
+            }).Count
+            deployment = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "deployment"
+            }).Count
+        }
+    }
+    Fail "unknown inventory $InventoryId"
 }
 
 function Assert-ManifestDeclarations {
@@ -801,12 +835,12 @@ function Assert-ManifestDeclarations {
         "evidence_policy"
     ) "manifest"
     if ($Manifest.schema_version -ne 1 -or
-        $Manifest.artifact_set -cne "openclaw-upstream-compatibility-baseline" -or
-        $Manifest.baseline_sha -cne $ExpectedSha -or
-        $Manifest.baseline_path -cne "baseline.json" -or
-        $Manifest.feature_schema_path -cne "feature-ledger.schema.json" -or
-        $Manifest.validation_script -cne "validate.ps1" -or
-        $Manifest.validation_self_test -cne "validate-self-test.ps1") {
+        -not (Test-OrdinalStringEqual ([string]$Manifest.artifact_set) "openclaw-upstream-compatibility-baseline") -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.baseline_sha) $ExpectedSha) -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.baseline_path) "baseline.json") -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.feature_schema_path) "feature-ledger.schema.json") -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.validation_script) "validate.ps1") -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.validation_self_test) "validate-self-test.ps1")) {
         Fail "manifest fixed metadata mismatch"
     }
 
@@ -815,12 +849,14 @@ function Assert-ManifestDeclarations {
         Fail "manifest must declare exactly 3 ledgers"
     }
     foreach ($spec in $LedgerSpecs) {
-        $matches = @($ledgerDeclarations | Where-Object { $_.path -ceq $spec.path })
+        $matches = @($ledgerDeclarations | Where-Object {
+            Test-OrdinalStringEqual ([string]$_.path) ([string]$spec.path)
+        })
         if ($matches.Count -ne 1) {
             Fail "manifest must declare ledger $($spec.path) exactly once"
         }
         Assert-ExactPropertySet $matches[0] @("path", "classification", "expected_features") "manifest.$($spec.path)"
-        if ($matches[0].classification -cne $spec.classification -or
+        if (-not (Test-OrdinalStringEqual ([string]$matches[0].classification) ([string]$spec.classification)) -or
             [int]$matches[0].expected_features -ne [int]$spec.expected_features) {
             Fail "manifest ledger declaration drift for $($spec.path)"
         }
@@ -832,7 +868,9 @@ function Assert-ManifestDeclarations {
     }
     foreach ($inventoryId in $InventorySpecs.Keys) {
         $spec = $InventorySpecs[$inventoryId]
-        $matches = @($inventoryDeclarations | Where-Object { $_.path -ceq $spec.path })
+        $matches = @($inventoryDeclarations | Where-Object {
+            Test-OrdinalStringEqual ([string]$_.path) ([string]$spec.path)
+        })
         if ($matches.Count -ne 1) {
             Fail "manifest must declare inventory $($spec.path) exactly once"
         }
@@ -848,8 +886,8 @@ function Assert-ManifestDeclarations {
         "acceptance_evidence_state",
         "legacy_typescript_is_not_rust_acceptance_evidence"
     ) "manifest.evidence_policy"
-    if ($Manifest.evidence_policy.initial_status -cne "unimplemented" -or
-        $Manifest.evidence_policy.acceptance_evidence_state -cne "missing" -or
+    if (-not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.initial_status) "unimplemented") -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.acceptance_evidence_state) "missing") -or
         $Manifest.evidence_policy.legacy_typescript_is_not_rust_acceptance_evidence -ne $true) {
         Fail "manifest evidence policy mismatch"
     }
@@ -858,14 +896,15 @@ function Assert-ManifestDeclarations {
 $actualJsonPaths = @(
     Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "*.json" | ForEach-Object {
         $relative = $_.FullName.Substring($Root.Length)
-        while ($relative.StartsWith("\") -or $relative.StartsWith("/")) {
+        while ($relative.StartsWith("\", [StringComparison]::Ordinal) -or
+            $relative.StartsWith("/", [StringComparison]::Ordinal)) {
             $relative = $relative.Substring(1)
         }
         $relative.Replace("\", "/")
     }
 )
-$missingJsonFiles = @($ExpectedJsonPaths | Where-Object { $actualJsonPaths -cnotcontains $_ })
-$unexpectedJsonFiles = @($actualJsonPaths | Where-Object { $ExpectedJsonPaths -cnotcontains $_ })
+$missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
+$unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
 if ($actualJsonPaths.Count -ne 16 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
@@ -885,29 +924,29 @@ Assert-ExactPropertySet $baseline.upstream @(
     "package_version", "package_manifest_path"
 ) "baseline.upstream"
 if ($baseline.schema_version -ne 1 -or
-    $baseline.upstream.repository -cne "openclaw/openclaw" -or
-    $baseline.upstream.repository_url -cne "https://github.com/openclaw/openclaw" -or
-    $baseline.upstream.branch -cne "main" -or
-    $baseline.upstream.commit_sha -cne $ExpectedSha -or
-    $baseline.upstream.tree_sha -cne "ba3177d3dd666b702d59c4daab74f62a9f7a84fb" -or
-    $baseline.upstream.parent_sha -cne "a674ce5e0d1ab0774546086fa7b2730516eca176" -or
-    $baseline.upstream.commit_timestamp -cne "2026-07-13T03:29:58Z" -or
-    $baseline.upstream.commit_url -cne "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85" -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.repository) "openclaw/openclaw") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.repository_url) "https://github.com/openclaw/openclaw") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.branch) "main") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_sha) $ExpectedSha) -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.tree_sha) "ba3177d3dd666b702d59c4daab74f62a9f7a84fb") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.parent_sha) "a674ce5e0d1ab0774546086fa7b2730516eca176") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_timestamp) "2026-07-13T03:29:58Z") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_url) "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85") -or
     $baseline.upstream.commit_signature_verified -ne $true -or
-    $baseline.upstream.package_name -cne "openclaw" -or
-    $baseline.upstream.package_version -cne "2026.7.2" -or
-    $baseline.upstream.package_manifest_path -cne "package.json") {
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.package_name) "openclaw") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.package_version) "2026.7.2") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.package_manifest_path) "package.json")) {
     Fail "baseline upstream provenance mismatch"
 }
 Assert-ExactPropertySet $baseline.stable_release @(
     "tag", "name", "tag_object_sha", "commit_sha", "published_at", "release_url"
 ) "baseline.stable_release"
-if ($baseline.stable_release.tag -ne "v2026.6.11" -or
-    $baseline.stable_release.name -ne "openclaw 2026.6.11" -or
-    $baseline.stable_release.tag_object_sha -ne "08d1bbad1bd6ee5700082e1c0f65f63f07600d1f" -or
-    $baseline.stable_release.commit_sha -ne "e085fa1a3ffd32d0ea6917e1e6fb4ecbffbb77d2" -or
-    $baseline.stable_release.published_at -ne "2026-06-30T16:06:39Z" -or
-    $baseline.stable_release.release_url -ne "https://github.com/openclaw/openclaw/releases/tag/v2026.6.11") {
+if (-not (Test-OrdinalStringEqual ([string]$baseline.stable_release.tag) "v2026.6.11") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.name) "openclaw 2026.6.11") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.tag_object_sha) "08d1bbad1bd6ee5700082e1c0f65f63f07600d1f") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.commit_sha) "e085fa1a3ffd32d0ea6917e1e6fb4ecbffbb77d2") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.published_at) "2026-06-30T16:06:39Z") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.release_url) "https://github.com/openclaw/openclaw/releases/tag/v2026.6.11")) {
     Fail "stable release provenance mismatch"
 }
 Assert-ExactPropertySet $baseline.gateway_protocol @(
@@ -918,31 +957,31 @@ if ($baseline.gateway_protocol.current -ne 4 -or
     $baseline.gateway_protocol.minimum_general_client -ne 4 -or
     $baseline.gateway_protocol.minimum_authenticated_node -ne 3 -or
     $baseline.gateway_protocol.minimum_probe -ne 3 -or
-    $baseline.gateway_protocol.compatibility_window -ne "Authenticated role=node and client.mode=node clients may use v3 (N-1); general clients require v4." -or
-    $baseline.gateway_protocol.source_path -ne "packages/gateway-protocol/src/version.ts" -or
-    $baseline.gateway_protocol.documentation_path -ne "docs/gateway/protocol.md") {
+    -not (Test-OrdinalStringEqual ([string]$baseline.gateway_protocol.compatibility_window) "Authenticated role=node and client.mode=node clients may use v3 (N-1); general clients require v4.") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.gateway_protocol.source_path) "packages/gateway-protocol/src/version.ts") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.gateway_protocol.documentation_path) "docs/gateway/protocol.md")) {
     Fail "Gateway protocol baseline mismatch"
 }
 Assert-ExactPropertySet $baseline.licensing @(
     "repository_license", "repository_license_path", "repository_copyright",
     "third_party_notices_path", "exceptions", "content_policy"
 ) "baseline.licensing"
-if ($baseline.licensing.repository_license -ne "MIT" -or
-    $baseline.licensing.repository_license_path -ne "LICENSE" -or
-    $baseline.licensing.repository_copyright -ne "Copyright (c) 2026 OpenClaw Foundation" -or
-    $baseline.licensing.third_party_notices_path -ne "THIRD_PARTY_NOTICES.md" -or
+if (-not (Test-OrdinalStringEqual ([string]$baseline.licensing.repository_license) "MIT") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.licensing.repository_license_path) "LICENSE") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.licensing.repository_copyright) "Copyright (c) 2026 OpenClaw Foundation") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.licensing.third_party_notices_path) "THIRD_PARTY_NOTICES.md") -or
     @($baseline.licensing.exceptions).Count -ne 1 -or
-    $baseline.licensing.exceptions[0].path -ne "skills/skill-creator/license.txt" -or
-    $baseline.licensing.exceptions[0].license -ne "Apache-2.0" -or
-    $baseline.licensing.content_policy -ne "Contracts, identifiers, paths, metadata, and evidence references only; no upstream implementation code is copied.") {
+    -not (Test-OrdinalStringEqual ([string]$baseline.licensing.exceptions[0].path) "skills/skill-creator/license.txt") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.licensing.exceptions[0].license) "Apache-2.0") -or
+    -not (Test-OrdinalStringEqual ([string]$baseline.licensing.content_policy) "Contracts, identifiers, paths, metadata, and evidence references only; no upstream implementation code is copied.")) {
     Fail "baseline licensing metadata mismatch"
 }
 Assert-ExactPropertySet $baseline.licensing.exceptions[0] @("path", "license") "baseline.licensing.exceptions[0]"
 
 $schema = $documents["feature-ledger.schema.json"]
-if ($schema.'$schema' -ne "https://json-schema.org/draft/2020-12/schema" -or
-    $schema.'$id' -ne "https://github.com/GTAStudio/GTA-Claw/compat/upstream/feature-ledger.schema.json" -or
-    (Get-ObjectDigest $schema) -ne $ExpectedSchemaDigest) {
+if (-not (Test-OrdinalStringEqual ([string]$schema.'$schema') "https://json-schema.org/draft/2020-12/schema") -or
+    -not (Test-OrdinalStringEqual ([string]$schema.'$id') "https://github.com/GTAStudio/GTA-Claw/compat/upstream/feature-ledger.schema.json") -or
+    -not (Test-OrdinalStringEqual (Get-ObjectDigest $schema) $ExpectedSchemaDigest)) {
     Fail "feature ledger schema is not the frozen Draft 2020-12 contract"
 }
 
@@ -955,16 +994,16 @@ $missingEvidenceCount = 0
 foreach ($spec in $LedgerSpecs) {
     $ledger = $documents[$spec.path]
     Assert-JsonSchema $ledger $schema $schema '$'
-    if ($ledger.ledger_id -cne $spec.ledger_id -or
-        $ledger.classification -cne $spec.classification -or
-        $ledger.baseline_sha -cne $ExpectedSha) {
+    if (-not (Test-OrdinalStringEqual ([string]$ledger.ledger_id) ([string]$spec.ledger_id)) -or
+        -not (Test-OrdinalStringEqual ([string]$ledger.classification) ([string]$spec.classification)) -or
+        -not (Test-OrdinalStringEqual ([string]$ledger.baseline_sha) $ExpectedSha)) {
         Fail "$($spec.path) fixed ledger metadata mismatch"
     }
     $features = @($ledger.features)
     if ($features.Count -ne [int]$spec.expected_features) {
         Fail "$($spec.path) must contain exactly $($spec.expected_features) features"
     }
-    if ((Get-FeatureDigest $features) -ne $spec.digest) {
+    if (-not (Test-OrdinalStringEqual (Get-FeatureDigest $features) ([string]$spec.digest))) {
         Fail "$($spec.path) canonical feature/source evidence fingerprint mismatch"
     }
     foreach ($feature in $features) {
@@ -972,15 +1011,15 @@ foreach ($spec in $LedgerSpecs) {
         if (-not $featureIds.Add([string]$feature.feature_id)) {
             Fail "duplicate feature_id '$($feature.feature_id)'"
         }
-        if ($feature.classification -cne $ledger.classification) {
+        if (-not (Test-OrdinalStringEqual ([string]$feature.classification) ([string]$ledger.classification))) {
             Fail "$($feature.feature_id) classification does not match its ledger"
         }
-        if ($feature.status -cne "unimplemented" -or
-            $feature.acceptance_evidence.status -cne "missing" -or
+        if (-not (Test-OrdinalStringEqual ([string]$feature.status) "unimplemented") -or
+            -not (Test-OrdinalStringEqual ([string]$feature.acceptance_evidence.status) "missing") -or
             @($feature.acceptance_evidence.artifacts).Count -ne 0) {
             Fail "$($feature.feature_id) must start unimplemented with an empty evidence placeholder"
         }
-        if ($feature.last_verified_sha -cne $ExpectedSha) {
+        if (-not (Test-OrdinalStringEqual ([string]$feature.last_verified_sha) $ExpectedSha)) {
             Fail "$($feature.feature_id) last_verified_sha mismatch"
         }
         $missingEvidenceCount += 1
@@ -1000,9 +1039,9 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         "schema_version", "inventory_id", "classification", "baseline_sha", "counts", "items"
     ) $spec.path
     if ($inventory.schema_version -ne 1 -or
-        $inventory.inventory_id -cne $inventoryId -or
-        $inventory.classification -cne $spec.classification -or
-        $inventory.baseline_sha -cne $ExpectedSha) {
+        -not (Test-OrdinalStringEqual ([string]$inventory.inventory_id) ([string]$inventoryId)) -or
+        -not (Test-OrdinalStringEqual ([string]$inventory.classification) ([string]$spec.classification)) -or
+        -not (Test-OrdinalStringEqual ([string]$inventory.baseline_sha) $ExpectedSha)) {
         Fail "$($spec.path) fixed inventory metadata mismatch"
     }
     if (-not ($inventory.items -is [System.Array])) {
@@ -1018,7 +1057,10 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         $item = $items[$index]
         $context = "$($spec.path).items[$index]"
         Assert-RequiredProperties $item @($spec.required_fields) $context
-        $unexpectedFields = @((Get-PropertyNames $item) | Where-Object { @($spec.allowed_fields) -cnotcontains $_ })
+        $unexpectedFields = @(
+            (Get-PropertyNames $item) |
+                Where-Object { -not (Test-OrdinalContains @($spec.allowed_fields) $_) }
+        )
         if ($unexpectedFields.Count -gt 0) {
             Fail "$context contains unsupported fields [$($unexpectedFields -join ',')]"
         }
@@ -1027,10 +1069,11 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
                 Fail "$context has empty required field $field"
             }
         }
-        if ($AllowedClassifications -cnotcontains [string]$item.classification) {
+        if (-not (Test-OrdinalContains $AllowedClassifications ([string]$item.classification))) {
             Fail "$context is unclassified"
         }
-        if ($inventoryId -cne "http-sse-endpoints" -and $item.classification -cne $spec.classification) {
+        if (-not (Test-OrdinalStringEqual ([string]$inventoryId) "http-sse-endpoints") -and
+            -not (Test-OrdinalStringEqual ([string]$item.classification) ([string]$spec.classification))) {
             Fail "$context classification differs from its inventory"
         }
         if (-not $globalRecordIds.Add([string]$item.record_id)) {
@@ -1048,11 +1091,11 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         $inventoryRowCount += 1
     }
 
-    if ((Get-InventoryDigest $items @($spec.canonical_fields)) -ne $spec.digest) {
-        Fail "$($spec.path) canonical identity/source evidence fingerprint mismatch"
-    }
     $derivedCounts = Get-DerivedInventoryCounts $inventoryId $items
     Assert-ExactCounts $inventory.counts $derivedCounts $spec.path
+    if (-not (Test-OrdinalStringEqual (Get-InventoryDigest $items @($spec.canonical_fields)) ([string]$spec.digest))) {
+        Fail "$($spec.path) canonical identity/source evidence fingerprint mismatch"
+    }
     $derivedByInventory[$inventoryId] = $derivedCounts
 }
 if ($InventorySpecs.Count -ne 10 -or $inventoryRowCount -ne 717 -or $globalRecordIds.Count -ne 717) {
