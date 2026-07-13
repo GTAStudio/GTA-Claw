@@ -882,8 +882,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = StateStore::open(
             StoreConfig::new(database_path(&directory, "busy.sqlite"))
+                .with_max_connections(2)
                 .with_busy_timeout(Duration::from_millis(50))
-                .with_acquire_timeout(Duration::from_millis(500)),
+                .with_acquire_timeout(Duration::from_secs(2)),
         )
         .await
         .expect("state store opens");
@@ -894,16 +895,26 @@ mod tests {
             .await
             .expect("hold write transaction");
 
-        let error = store
-            .sessions()
-            .create(&session("blocked", 1))
-            .await
-            .expect_err("concurrent writer times out");
-        assert!(matches!(error, StateError::Database(_)));
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.sessions().create(&session("blocked", 1)),
+        )
+        .await
+        .expect("SQLite busy handling remains hard-bounded")
+        .expect_err("concurrent SQLite writer times out");
+        let StateError::Database(failure) = error else {
+            panic!("expected a typed SQLite busy failure, received {error:?}");
+        };
+        assert_eq!(failure.operation(), "lock and verify application writer");
+        assert_eq!(failure.code(), Some("5"));
+        assert!(started.elapsed() < Duration::from_secs(1));
         blocking_connection
             .execute("ROLLBACK")
             .await
             .expect("release write transaction");
+        drop(blocking_connection);
+        store.close().await.expect("busy test store closes cleanly");
     }
 
     #[tokio::test]

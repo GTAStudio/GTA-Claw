@@ -109,7 +109,7 @@ impl StoreConfig {
             max_connections: 1,
             busy_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
-            close_timeout: Duration::from_secs(1),
+            close_timeout: Duration::from_millis(1_500),
             synchronous: SynchronousPolicy::Full,
         }
     }
@@ -334,7 +334,7 @@ impl StateStore {
         let acquire_lock_identity = verified_lock_identity.clone();
         let pool = SqlitePoolOptions::new()
             .min_connections(1)
-            .max_connections(1)
+            .max_connections(config.max_connections)
             .acquire_timeout(config.acquire_timeout)
             .after_connect(move |connection, _metadata| {
                 let path = verified_path.clone();
@@ -666,12 +666,17 @@ impl StateStore {
         };
 
         let closing_pool = self.pool.clone();
-        let mut close_task = tokio::spawn(async move {
-            closing_pool.close().await;
-        });
-        while !self.pool.is_closed() && tokio::time::Instant::now() < deadline {
-            tokio::task::yield_now().await;
-        }
+        let mut close_future = Box::pin(closing_pool.close());
+        let pool_closed_immediately = std::future::poll_fn(|context| {
+            use std::future::Future as _;
+            use std::task::Poll;
+
+            Poll::Ready(matches!(
+                close_future.as_mut().poll(context),
+                Poll::Ready(())
+            ))
+        })
+        .await;
 
         let checkpoint = if let Some(connection) = connection.as_mut() {
             let checkpoint_result = tokio::time::timeout_at(
@@ -741,20 +746,21 @@ impl StateStore {
         } else {
             false
         };
-        drop(connection);
+        if let Some(connection) = connection.take() {
+            match tokio::time::timeout_at(deadline, connection.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => reasons.push(format!(
+                    "final connection close failed: {}",
+                    database("close final state connection", error)
+                )),
+                Err(_) => reasons.push("final connection close exceeded close deadline".to_owned()),
+            }
+        }
 
-        let pool_closed = match tokio::time::timeout_at(deadline, &mut close_task).await {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => {
-                reasons.push(format!("pool close task failed: {error}"));
-                false
-            }
-            Err(_) => {
-                close_task.abort();
-                let _ = close_task.await;
-                false
-            }
-        };
+        let pool_closed = pool_closed_immediately
+            || tokio::time::timeout_at(deadline, close_future)
+                .await
+                .is_ok();
         if !pool_closed {
             reasons.push(format!(
                 "pool drain exceeded the single {} ms close deadline",
@@ -835,10 +841,10 @@ fn validate_config(config: &StoreConfig) -> Result<(), StateError> {
             reason: "must be valid Unicode",
         });
     }
-    if config.max_connections != 1 {
+    if config.max_connections == 0 || config.max_connections > 8 {
         return Err(StateError::InvalidValue {
             field: "maximum connections",
-            reason: "must be one so every SQLite connection remains identity-bound",
+            reason: "must be between one and eight identity-bound connections",
         });
     }
     if config.busy_timeout.is_zero() {
