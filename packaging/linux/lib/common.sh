@@ -275,7 +275,9 @@ assert_output_path() {
   [[ "$path" == "$OUTPUT_ROOT" || "$path" == "$OUTPUT_ROOT/"* ]] ||
     die "path escapes OUTPUT_ROOT: $path"
   assert_no_symlink_components "$(canonical_target_root)" "$path"
-  assert_nearest_existing_parent "$OUTPUT_ROOT" "$path"
+  if [[ "$path" != "$OUTPUT_ROOT" ]]; then
+    assert_nearest_existing_parent "$OUTPUT_ROOT" "$path"
+  fi
 }
 
 ensure_output_directory() {
