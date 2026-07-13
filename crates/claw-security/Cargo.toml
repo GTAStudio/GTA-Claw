@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0.0", features = ["digest", "rand_core"] }
 rand_core = "0.10.1"
 secrecy = "0.10.3"
 serde = "1.0.228"
