@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use claw_gateway_client::{
@@ -27,6 +28,7 @@ use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::json;
 use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
+use tokio::task::JoinHandle;
 use url::Url;
 
 use support::{
@@ -68,21 +70,35 @@ fn side_effect_method() -> GatewayMethodName {
     GatewayMethodName::Core(resolve_core_method("config.set").expect("config.set registry"))
 }
 
+const GATEWAY_SCENARIO_DEADLINE: Duration = Duration::from_secs(15);
+
 struct WriteGateRuntime {
     system: SystemRuntime,
     gate_next: AtomicBool,
     entered: Notify,
     release: Arc<Semaphore>,
+    released: AtomicBool,
+    writes_entered: AtomicUsize,
+}
+
+struct WriteGateGuard {
+    runtime: Arc<WriteGateRuntime>,
 }
 
 impl WriteGateRuntime {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+    fn new() -> (Arc<Self>, WriteGateGuard) {
+        let runtime = Arc::new(Self {
             system: SystemRuntime::default(),
             gate_next: AtomicBool::new(true),
             entered: Notify::new(),
             release: Arc::new(Semaphore::new(0)),
-        })
+            released: AtomicBool::new(false),
+            writes_entered: AtomicUsize::new(0),
+        });
+        let guard = WriteGateGuard {
+            runtime: Arc::clone(&runtime),
+        };
+        (runtime, guard)
     }
 
     async fn wait_until_blocked(&self) {
@@ -92,7 +108,25 @@ impl WriteGateRuntime {
     }
 
     fn unblock(&self) {
-        self.release.add_permits(1);
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.release.add_permits(1);
+        }
+    }
+
+    fn writes_entered(&self) -> usize {
+        self.writes_entered.load(Ordering::SeqCst)
+    }
+}
+
+impl WriteGateGuard {
+    fn unblock(&self) {
+        self.runtime.unblock();
+    }
+}
+
+impl Drop for WriteGateGuard {
+    fn drop(&mut self) {
+        self.runtime.unblock();
     }
 }
 
@@ -110,6 +144,7 @@ impl ClientRuntime for WriteGateRuntime {
     }
 
     fn before_application_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.writes_entered.fetch_add(1, Ordering::SeqCst);
         if self.gate_next.swap(false, Ordering::SeqCst) {
             self.entered.notify_one();
             let release = Arc::clone(&self.release);
@@ -123,6 +158,63 @@ impl ClientRuntime for WriteGateRuntime {
         } else {
             Box::pin(async {})
         }
+    }
+}
+
+fn encoded_request_len<T>(id: &str, method: &GatewayMethodName, params: &T) -> usize
+where
+    T: Serialize + ?Sized,
+{
+    Codec::authenticated()
+        .encode_request(&request_id(id), method, params)
+        .expect("encode request for byte-budget assertion")
+        .len()
+}
+
+async fn poll_once_pending<F>(mut future: Pin<&mut F>, label: &str)
+where
+    F: Future,
+    F::Output: std::fmt::Debug,
+{
+    std::future::poll_fn(|context| match future.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(result) => {
+            panic!("{label} completed before its synchronization barrier: {result:?}")
+        }
+    })
+    .await;
+}
+
+async fn finish_gateway_scenario(
+    name: &'static str,
+    client: GatewayClient,
+    gateway: TestGateway,
+    gate: WriteGateGuard,
+    mut scenario: JoinHandle<()>,
+) {
+    let outcome = tokio::time::timeout(GATEWAY_SCENARIO_DEADLINE, &mut scenario).await;
+    if outcome.is_err() {
+        scenario.abort();
+        let _ = scenario.await;
+    }
+    let diagnostics = format!(
+        "state={:?}, application_writes_entered={}",
+        client.state(),
+        gate.runtime.writes_entered()
+    );
+    gate.unblock();
+    let shutdown = client.shutdown().await;
+    gateway.shutdown().await;
+
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("{name} failed: {error}; {diagnostics}"),
+        Err(_) => {
+            panic!("{name} exceeded its {GATEWAY_SCENARIO_DEADLINE:?} hard deadline; {diagnostics}")
+        }
+    }
+    if let Err(error) = shutdown {
+        panic!("{name} cleanup failed: {error}; {diagnostics}");
     }
 }
 
@@ -1320,6 +1412,19 @@ async fn command_queue_saturation_is_explicit_backpressure() {
 #[tokio::test]
 async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer() {
     const LARGE_BYTES: usize = 20 * 1024 * 1024;
+    const REJECTED_BYTES: usize = 2 * 1024 * 1024;
+    const OUTBOUND_BYTES: usize = 21 * 1024 * 1024;
+    let large = json!({"value": "x".repeat(LARGE_BYTES)});
+    let rejected = json!({"value": "y".repeat(REJECTED_BYTES)});
+    let method = side_effect_method();
+    let held_bytes = encoded_request_len("large-held", &method, &large);
+    let rejected_bytes = encoded_request_len("large-rejected-one", &method, &rejected);
+    assert!(held_bytes <= OUTBOUND_BYTES);
+    assert!(rejected_bytes <= OUTBOUND_BYTES);
+    assert!(
+        held_bytes + rejected_bytes > OUTBOUND_BYTES,
+        "requests must fit individually but exceed the aggregate ceiling"
+    );
     let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
         complete_handshake_with_tick_interval(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES, 10_000)
             .await;
@@ -1332,70 +1437,101 @@ async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer
     let mut client_config = config(gateway.url.clone());
     client_config.limits.max_in_flight_requests = 4;
     client_config.limits.command_queue_capacity = 4;
-    client_config.limits.outbound_queue_bytes = 21 * 1024 * 1024;
+    client_config.limits.outbound_queue_bytes = OUTBOUND_BYTES;
     client_config.timeouts.request = Duration::from_secs(5);
-    let runtime = WriteGateRuntime::new();
+    let (runtime, gate) = WriteGateRuntime::new();
     let (client, _) = GatewayClient::start_with_runtime(
         client_config,
         Arc::clone(&runtime) as Arc<dyn ClientRuntime>,
     )
     .expect("start");
-    client.wait_ready().await.expect("ready");
-    let large = json!({"value": "x".repeat(LARGE_BYTES)});
-    let held_client = client.clone();
-    let held = tokio::spawn(async move {
-        held_client
-            .request(request_id("large-held"), side_effect_method(), &large)
-            .await
-    });
-    runtime.wait_until_blocked().await;
-    for id in ["large-rejected-one", "large-rejected-two"] {
-        let large = json!({"value": "y".repeat(LARGE_BYTES)});
-        let result = client
-            .request(request_id(id), side_effect_method(), &large)
-            .await;
-        assert!(
-            matches!(
-                result,
-                Err(GatewayClientError::Backpressure(
-                    BackpressureError::CommandBytesSaturated
-                ))
-            ),
-            "unexpected aggregate-budget result: {result:?}"
+    let scenario_client = client.clone();
+    let scenario_runtime = Arc::clone(&runtime);
+    let scenario = tokio::spawn(async move {
+        scenario_client.wait_ready().await.expect("ready");
+        let held = scenario_client.request(request_id("large-held"), side_effect_method(), &large);
+        tokio::pin!(held);
+        poll_once_pending(held.as_mut(), "held aggregate request").await;
+        scenario_runtime.wait_until_blocked().await;
+        assert_eq!(
+            scenario_runtime.writes_entered(),
+            1,
+            "the held request must own the single writer"
         );
-    }
-    runtime.unblock();
-    held.await
-        .expect("held request task")
-        .expect("held request response");
-    client.shutdown().await.expect("shutdown");
-    gateway.shutdown().await;
+        for id in ["large-rejected-one", "large-rejected-two"] {
+            let result = scenario_client
+                .request(request_id(id), side_effect_method(), &rejected)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(GatewayClientError::Backpressure(
+                        BackpressureError::CommandBytesSaturated
+                    ))
+                ),
+                "unexpected aggregate-budget result for {id}: {result:?}"
+            );
+        }
+        scenario_runtime.unblock();
+        held.await.expect("held request response");
+    });
+    finish_gateway_scenario(
+        "cumulative outbound byte bound",
+        client,
+        gateway,
+        gate,
+        scenario,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn expired_queued_side_effect_is_never_transmitted_and_releases_budgets() {
-    const LARGE_BYTES: usize = 20 * 1024 * 1024;
-    let (no_expired_tx, no_expired_rx) = oneshot::channel();
-    let no_expired_tx = Arc::new(Mutex::new(Some(no_expired_tx)));
+    let blocking_params = json!({"value": "blocking"});
+    let expired_params = json!({"value": "x".repeat(4096)});
+    let barrier_params = json!({});
+    let after_params = json!({"value": "y".repeat(4096)});
+    let probe_params = json!({});
+    let method = side_effect_method();
+    let blocking_bytes = encoded_request_len("blocking-write", &method, &blocking_params);
+    let expired_bytes = encoded_request_len("must-not-send", &method, &expired_params);
+    let barrier_bytes = encoded_request_len("ordering-barrier", &method, &barrier_params);
+    let after_bytes = encoded_request_len("after-expired", &method, &after_params);
+    let outbound_bytes = blocking_bytes + expired_bytes + barrier_bytes;
+    assert!(after_bytes <= outbound_bytes);
+    assert!(
+        after_bytes > outbound_bytes - expired_bytes,
+        "the later request must require the expired command's byte permits"
+    );
+
+    let (after_received_tx, after_received_rx) = oneshot::channel();
+    let after_received_tx = Arc::new(Mutex::new(Some(after_received_tx)));
     let gateway = TestGateway::spawn(handler(move |mut socket, _| {
-        let no_expired_tx = Arc::clone(&no_expired_tx);
+        let after_received_tx = Arc::clone(&after_received_tx);
         async move {
             complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
             let first = receive_request(&mut socket).await;
             assert_eq!(first.id().as_str(), "blocking-write");
-            send_response(&mut socket, first.id().as_str(), 1).await;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(150), receive_request(&mut socket))
-                    .await
-                    .is_err(),
-                "expired side-effect request reached the server"
+
+            let barrier = receive_request(&mut socket).await;
+            assert_eq!(
+                barrier.id().as_str(),
+                "ordering-barrier",
+                "an expired side effect was transmitted ahead of the FIFO barrier"
             );
-            if let Some(sender) = no_expired_tx.lock().await.take() {
+            send_response(&mut socket, barrier.id().as_str(), 2).await;
+
+            let after = receive_request(&mut socket).await;
+            assert_eq!(after.id().as_str(), "after-expired");
+            if let Some(sender) = after_received_tx.lock().await.take() {
                 let _ = sender.send(());
             }
-            let third = receive_request(&mut socket).await;
-            assert_eq!(third.id().as_str(), "after-expired");
-            send_response(&mut socket, third.id().as_str(), 3).await;
+
+            let probe = receive_request(&mut socket).await;
+            assert_eq!(probe.id().as_str(), "permit-probe");
+            send_response(&mut socket, probe.id().as_str(), 4).await;
+            send_response(&mut socket, after.id().as_str(), 3).await;
+            send_response(&mut socket, first.id().as_str(), 1).await;
             wait_for_close(&mut socket).await;
         }
     }))
@@ -1403,55 +1539,82 @@ async fn expired_queued_side_effect_is_never_transmitted_and_releases_budgets() 
     let mut client_config = config(gateway.url.clone());
     client_config.limits.max_in_flight_requests = 3;
     client_config.limits.command_queue_capacity = 3;
-    client_config.limits.outbound_queue_bytes = AUTHENTICATED_MAX_FRAME_BYTES;
+    client_config.limits.outbound_queue_bytes = outbound_bytes;
     client_config.timeouts.request = Duration::from_secs(3);
-    let runtime = WriteGateRuntime::new();
+    let (runtime, gate) = WriteGateRuntime::new();
     let (client, _) = GatewayClient::start_with_runtime(
         client_config,
         Arc::clone(&runtime) as Arc<dyn ClientRuntime>,
     )
     .expect("start");
-    client.wait_ready().await.expect("ready");
-    let large = json!({"value": "x".repeat(LARGE_BYTES)});
-    let first_client = client.clone();
-    let first = tokio::spawn(async move {
-        first_client
-            .request_with_timeout(
-                request_id("blocking-write"),
-                side_effect_method(),
-                &large,
-                Duration::from_secs(3),
-            )
-            .await
-    });
-    runtime.wait_until_blocked().await;
-    assert!(matches!(
-        client
-            .request_with_timeout(
-                request_id("must-not-send"),
-                side_effect_method(),
-                &json!({"value": "side-effect"}),
-                Duration::from_millis(50),
-            )
-            .await,
-        Err(GatewayClientError::RequestTimedOut(_))
-    ));
-    runtime.unblock();
-    first
-        .await
-        .expect("blocking request task")
-        .expect("blocking request response");
-    no_expired_rx.await.expect("server checked expired request");
-    client
-        .request(
+    let scenario_client = client.clone();
+    let scenario_runtime = Arc::clone(&runtime);
+    let scenario = tokio::spawn(async move {
+        scenario_client.wait_ready().await.expect("ready");
+        let first = scenario_client.request_with_timeout(
+            request_id("blocking-write"),
+            side_effect_method(),
+            &blocking_params,
+            Duration::from_secs(3),
+        );
+        tokio::pin!(first);
+        poll_once_pending(first.as_mut(), "blocking request").await;
+        scenario_runtime.wait_until_blocked().await;
+
+        assert!(matches!(
+            scenario_client
+                .request_with_timeout(
+                    request_id("must-not-send"),
+                    side_effect_method(),
+                    &expired_params,
+                    Duration::from_millis(50),
+                )
+                .await,
+            Err(GatewayClientError::RequestTimedOut(_))
+        ));
+
+        let barrier = scenario_client.request(
+            request_id("ordering-barrier"),
+            side_effect_method(),
+            &barrier_params,
+        );
+        tokio::pin!(barrier);
+        poll_once_pending(barrier.as_mut(), "FIFO ordering barrier").await;
+        scenario_runtime.unblock();
+        barrier.await.expect("FIFO ordering barrier response");
+
+        let after = scenario_client.request(
             request_id("after-expired"),
             side_effect_method(),
-            &json!({"value": "still-usable"}),
-        )
-        .await
-        .expect("all permits released");
-    client.shutdown().await.expect("shutdown");
-    gateway.shutdown().await;
+            &after_params,
+        );
+        tokio::pin!(after);
+        poll_once_pending(after.as_mut(), "post-expiry byte-budget probe").await;
+        after_received_rx
+            .await
+            .expect("server received post-expiry byte-budget probe");
+
+        scenario_client
+            .request(
+                request_id("permit-probe"),
+                side_effect_method(),
+                &probe_params,
+            )
+            .await
+            .expect("expired request released its in-flight permit");
+        after
+            .await
+            .expect("expired request released its outbound byte permits");
+        first.await.expect("blocking request response");
+    });
+    finish_gateway_scenario(
+        "expired queued side effect",
+        client,
+        gateway,
+        gate,
+        scenario,
+    )
+    .await;
 }
 
 #[tokio::test]
