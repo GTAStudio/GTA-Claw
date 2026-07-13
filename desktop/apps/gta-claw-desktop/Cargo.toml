@@ -13,7 +13,7 @@ claw-application.workspace = true
 claw-platform.workspace = true
 slint = { version = "=1.17.1", default-features = false, features = [
   "accessibility",
-  "backend-winit",
+  "backend-winit-x11",
   "compat-1-2",
   "renderer-femtovg",
   "renderer-software",

@@ -189,11 +189,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: desktop
 
-      - name: Test patched wayland-scanner parser
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/wayland-scanner-target
-        run: cargo test --manifest-path desktop/vendor/wayland-scanner-0.31.10/Cargo.toml --locked --lib parse::tests
-
       - name: Check Windows desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:

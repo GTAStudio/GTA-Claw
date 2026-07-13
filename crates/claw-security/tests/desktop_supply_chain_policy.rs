@@ -1,12 +1,8 @@
-//! Static policy checks for the desktop dependency security backport.
+//! Static policy checks for the isolated desktop dependency graph.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -20,53 +16,38 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
-fn sha256(path: &Path) -> String {
-    let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    encoded
-}
-
-fn json_string<'a>(value: &'a Value, pointer: &str) -> &'a str {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("missing JSON string at {pointer}"))
-}
-
-fn collect_files(directory: &Path, root: &Path, files: &mut BTreeSet<String>) {
-    for entry in fs::read_dir(directory)
-        .unwrap_or_else(|error| panic!("read directory {}: {error}", directory.display()))
-    {
-        let path = entry.expect("read directory entry").path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == "target") {
-                continue;
-            }
-            collect_files(&path, root, files);
-        } else {
-            let relative = path
-                .strip_prefix(root)
-                .expect("file is below vendor root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.insert(relative);
-        }
-    }
-}
-
-fn package_block<'a>(lockfile: &'a str, package: &str) -> &'a str {
+fn package_names(lockfile: &str) -> BTreeSet<&str> {
     lockfile
         .split("[[package]]")
-        .find(|block| {
-            block
+        .filter_map(|package| {
+            package
                 .lines()
-                .any(|line| line.trim() == format!("name = \"{package}\""))
+                .find_map(|line| line.trim().strip_prefix("name = \""))
+                .and_then(|name| name.strip_suffix('"'))
         })
-        .unwrap_or_else(|| panic!("missing {package} package"))
+        .collect()
+}
+
+fn slint_features(manifest: &str) -> BTreeSet<&str> {
+    let (_, dependency) = manifest
+        .split_once("slint = {")
+        .expect("desktop manifest has a Slint dependency");
+    let (_, features) = dependency
+        .split_once("features = [")
+        .expect("Slint dependency has explicit features");
+    let (features, _) = features
+        .split_once(']')
+        .expect("Slint feature list is closed");
+
+    features
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .trim_end_matches(',')
+                .strip_prefix('"')
+                .and_then(|feature| feature.strip_suffix('"'))
+        })
+        .collect()
 }
 
 #[test]
@@ -92,35 +73,6 @@ fn hosted_supply_chain_policy_audits_both_lockfiles_fail_closed() {
         "both raw audits must remain explicit"
     );
     assert!(
-        workflow.contains("CARGO_TARGET_DIR: ${{ runner.temp }}/wayland-scanner-target"),
-        "focused vendor tests must not write build outputs into the verified source tree"
-    );
-    assert_eq!(
-        workflow
-            .matches(
-                "command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources",
-            )
-            .count(),
-        2,
-        "both target policies must pass the config after the cargo-deny check subcommand"
-    );
-    for arguments in [
-        "arguments: --target x86_64-pc-windows-msvc",
-        "arguments: --target aarch64-apple-darwin",
-    ] {
-        assert_eq!(
-            workflow.matches(arguments).count(),
-            1,
-            "missing exact desktop policy target: {arguments}"
-        );
-    }
-    for line in workflow.lines().map(str::trim) {
-        assert!(
-            !line.starts_with("arguments:") || !line.contains("--config"),
-            "cargo-deny 0.19.8 rejects top-level --config: {line}"
-        );
-    }
-    assert!(
         !workflow.contains("\n          ignore:"),
         "hosted audits must not ignore advisories"
     );
@@ -132,15 +84,47 @@ fn hosted_supply_chain_policy_audits_both_lockfiles_fail_closed() {
         "every Rust workflow checkout must disable persisted credentials"
     );
     for line in workflow.lines().map(str::trim) {
-        let Some(action) = line.strip_prefix("uses: ") else {
-            continue;
-        };
-        let Some((_, revision)) = action.rsplit_once('@') else {
-            panic!("action is not revision pinned: {action}");
-        };
+        if let Some(action) = line.strip_prefix("uses: ") {
+            let (_, revision) = action
+                .rsplit_once('@')
+                .unwrap_or_else(|| panic!("action is not revision pinned: {action}"));
+            assert!(
+                revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "action is not pinned to an immutable commit: {action}"
+            );
+        }
         assert!(
-            revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "action is not pinned to an immutable commit: {action}"
+            !line.starts_with("arguments:") || !line.contains("--config"),
+            "cargo-deny 0.19.8 rejects top-level --config: {line}"
+        );
+    }
+
+    assert_eq!(
+        workflow
+            .matches(
+                "command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources",
+            )
+            .count(),
+        2,
+        "both target policies must load the desktop config after the check subcommand"
+    );
+    for arguments in [
+        "arguments: --target x86_64-pc-windows-msvc",
+        "arguments: --target aarch64-apple-darwin",
+    ] {
+        assert_eq!(
+            workflow.matches(arguments).count(),
+            1,
+            "missing exact desktop policy target: {arguments}"
+        );
+    }
+    for required in [
+        "Desktop rejects Linux",
+        "gta-claw-desktop supports only Windows and macOS",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing desktop source policy: {required}"
         );
     }
     for forbidden in [
@@ -158,175 +142,56 @@ fn hosted_supply_chain_policy_audits_both_lockfiles_fail_closed() {
 }
 
 #[test]
-fn desktop_patch_matches_registry_provenance_and_security_floor() {
+fn desktop_uses_real_winit_without_wayland_or_root_leakage() {
     let root = workspace_root();
     let desktop = root.join("desktop");
-    let vendor = desktop.join("vendor/wayland-scanner-0.31.10");
-    let provenance: Value = serde_json::from_str(&read(
-        &desktop.join("vendor/wayland-scanner-0.31.10.provenance.json"),
-    ))
-    .expect("parse vendor provenance");
-    let checksums: Value = serde_json::from_str(&read(&vendor.join(".cargo-checksum.json")))
-        .expect("parse Cargo checksum manifest");
-    let attributes = read(&root.join(".gitattributes"));
-    assert!(
-        attributes.contains("desktop/vendor/wayland-scanner-0.31.10/** text eol=lf"),
-        "vendor bytes must remain stable on Windows and Unix checkouts"
-    );
-
-    assert_eq!(provenance["schema"], 1);
-    assert_eq!(
-        json_string(&provenance, "/upstream/repository"),
-        "https://github.com/Smithay/wayland-rs"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/base_package/crates_io_sha256"),
-        json_string(&checksums, "/package")
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/base_package/vcs_commit"),
-        "a3d7927d87799b2955bf491b51c7c2a3a82da661"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/security_commit/sha"),
-        "d07c4f91f28b42e5a485823ffd9d8d5a210b1053"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/security_commit/parent"),
-        "41d6f7ffb0b39f2479eaa3f8c2826371e951f3d2"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/security_commit/tree"),
-        "802cdc245c2e82e2234436198fb7485d7dc0aa03"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/compatibility_commit/sha"),
-        "ec2d932855593d48aa83c76820f3efbcfea86d39"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/compatibility_commit/parent"),
-        "429a1bc200a0a2d73d89902a6f3499dcb19e5490"
-    );
-    assert_eq!(
-        json_string(&provenance, "/upstream/compatibility_commit/tree"),
-        "3fdac40d2cc1632641cbbb3bc63cf43f19cc1ae5"
-    );
-    assert_eq!(
-        sha256(&vendor.join(".cargo-checksum.json")),
-        json_string(&provenance, "/vendored/cargo_checksum_manifest_sha256")
-    );
-
-    let deltas = provenance["allowed_delta"]
-        .as_array()
-        .expect("allowed_delta is an array");
-    let mut allowed = BTreeMap::new();
-    for delta in deltas {
-        let path = json_string(delta, "/path").to_owned();
-        let previous = allowed.insert(
-            path,
-            (
-                json_string(delta, "/original_sha256").to_owned(),
-                json_string(delta, "/patched_sha256").to_owned(),
-            ),
-        );
-        assert!(previous.is_none(), "duplicate allowed delta");
-    }
-    assert_eq!(
-        allowed.keys().map(String::as_str).collect::<Vec<_>>(),
-        [
-            "Cargo.lock",
-            "Cargo.toml",
-            "Cargo.toml.orig",
-            "src/parse.rs"
-        ]
-    );
-
-    let expected = checksums["files"]
-        .as_object()
-        .expect("Cargo checksum files is an object");
-    let mut actual_files = BTreeSet::new();
-    collect_files(&vendor, &vendor, &mut actual_files);
-    actual_files.remove(".cargo-checksum.json");
-    assert_eq!(
-        actual_files,
-        expected.keys().cloned().collect(),
-        "vendored files must exactly match the registry artifact"
-    );
-
-    for (relative, expected_hash) in expected {
-        let registry_hash = expected_hash.as_str().expect("checksum is a string");
-        let actual_hash = sha256(&vendor.join(relative));
-        if let Some((original_hash, patched_hash)) = allowed.get(relative) {
-            assert_eq!(registry_hash, original_hash);
-            assert_eq!(&actual_hash, patched_hash);
-        } else {
-            assert_eq!(actual_hash, registry_hash, "unexpected delta in {relative}");
-        }
-    }
-    assert_eq!(
-        sha256(&vendor.join("LICENSE.txt")),
-        json_string(&provenance, "/vendored/license/sha256")
-    );
-
     let desktop_manifest = read(&desktop.join("Cargo.toml"));
-    assert!(
-        desktop_manifest
-            .contains("wayland-scanner = { path = \"vendor/wayland-scanner-0.31.10\" }")
-    );
     let app_manifest = read(&desktop.join("apps/gta-claw-desktop/Cargo.toml"));
+    let features = slint_features(&app_manifest);
+
+    assert!(features.contains("backend-winit-x11"));
+    assert!(!features.contains("backend-winit"));
+    assert!(!features.contains("backend-winit-wayland"));
     assert!(
-        app_manifest.contains("\"backend-winit\""),
-        "Windows and macOS must retain the real Slint window backend"
+        !desktop_manifest.contains("[patch.crates-io]") && !desktop_manifest.contains("vendor/"),
+        "desktop must use only released registry dependencies"
     );
 
     let desktop_lock = read(&desktop.join("Cargo.lock"));
-    let quick_xml = package_block(&desktop_lock, "quick-xml");
-    let versions = desktop_lock
-        .split("[[package]]")
-        .filter(|block| {
-            block
-                .lines()
-                .any(|line| line.trim() == "name = \"quick-xml\"")
-        })
-        .filter_map(|block| {
-            block
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("version = \""))
-                .and_then(|version| version.strip_suffix('"'))
-        })
-        .collect::<Vec<_>>();
-    assert!(!versions.is_empty(), "desktop lock must contain quick-xml");
-    for version in versions {
-        let mut parts = version.split('.');
-        let major: u64 = parts.next().expect("major").parse().expect("numeric major");
-        let minor: u64 = parts.next().expect("minor").parse().expect("numeric minor");
+    let desktop_packages = package_names(&desktop_lock);
+    for required in ["slint", "i-slint-backend-winit", "winit"] {
         assert!(
-            major > 0 || minor >= 41,
-            "desktop lock contains vulnerable quick-xml {version}"
+            desktop_packages.contains(required),
+            "desktop lost real GUI backend package: {required}"
         );
     }
-    assert!(quick_xml.contains("version = \"0.41.0\""));
-    assert!(quick_xml.contains(
-        "checksum = \"e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1\""
-    ));
-    let scanner = package_block(&desktop_lock, "wayland-scanner");
-    assert!(scanner.contains("version = \"0.31.10\""));
+    let forbidden = desktop_packages
+        .iter()
+        .filter(|name| {
+            **name == "quick-xml"
+                || name.contains("wayland")
+                || name.starts_with("smithay")
+                || matches!(
+                    **name,
+                    "calloop-wayland-source" | "sctk-adwaita" | "smithay-clipboard"
+                )
+        })
+        .copied()
+        .collect::<Vec<_>>();
     assert!(
-        !scanner.contains("source = "),
-        "wayland-scanner must resolve to the bounded local patch"
+        forbidden.is_empty(),
+        "desktop lock contains unused Wayland dependency chain: {forbidden:?}"
     );
 
     let root_lock = read(&root.join("Cargo.lock"));
-    for forbidden in [
-        "name = \"slint\"",
-        "name = \"slint-build\"",
-        "name = \"wayland-scanner\"",
-        "name = \"quick-xml\"",
-        "name = \"i-slint",
-    ] {
-        assert!(
-            !root_lock.contains(forbidden),
-            "root runtime lock gained desktop dependency: {forbidden}"
-        );
-    }
+    let root_packages = package_names(&root_lock);
+    let root_slint = root_packages
+        .iter()
+        .filter(|name| **name == "slint" || **name == "slint-build" || name.starts_with("i-slint"))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        root_slint.is_empty(),
+        "root runtime lock contains Slint packages: {root_slint:?}"
+    );
 }
