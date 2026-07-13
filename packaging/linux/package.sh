@@ -5,25 +5,21 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/build-manifest.sh"
 
 require_linux
 for tool in \
-  awk date dpkg-deb du find gzip install jq md5sum readelf realpath rpm \
+  awk date dpkg-deb du find gzip jq md5sum readelf rpm \
   rpmbuild sed sha1sum sha256sum stat tar wc; do
   require_tool "$tool"
 done
-[[ "$#" -eq 2 ]] || die "usage: package.sh ARCH BINARY_DIRECTORY"
+[[ "$#" -eq 2 ]] || die "usage: package.sh ARCH BUILD_MANIFEST"
 arch="$1"
-binary_dir="$2"
+input_manifest="$2"
 validate_safe_component "$arch" "architecture"
-[[ "$binary_dir" == /* ]] || die "binary directory must be absolute"
-[[ -d "$binary_dir" && ! -L "$binary_dir" ]] ||
-  die "binary directory is not a real directory: $binary_dir"
-
-daemon_binary="$binary_dir/$LINUX_DAEMON_NAME"
-cli_binary="$binary_dir/$LINUX_CLI_NAME"
-validate_elf_binary "$daemon_binary" "$arch"
-validate_elf_binary "$cli_binary" "$arch"
+verify_build_manifest "$input_manifest" "$arch"
+daemon_binary="$BUILD_DAEMON_BINARY"
+cli_binary="$BUILD_CLI_BINARY"
 
 initialize_output_root
 ARTIFACT_DIR="$OUTPUT_ROOT/artifacts"
@@ -31,8 +27,9 @@ WORK_DIR="$OUTPUT_ROOT/work"
 ensure_output_directory "$ARTIFACT_DIR"
 ensure_output_directory "$WORK_DIR"
 
-source_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-[[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || die "source revision is not a full commit SHA"
+source_sha="$BUILD_SOURCE_SHA"
+source_tree="$BUILD_SOURCE_TREE"
+build_manifest_sha="$(sha256_file "$BUILD_MANIFEST")"
 created_at="$(date -u --date="@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ')"
 target="$(arch_target "$arch")"
 deb_architecture="$(deb_arch "$arch")"
@@ -43,11 +40,10 @@ base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
 write_json() {
   local output="$1"
   shift
-  assert_new_output_file "$output"
   ensure_output_directory "$(dirname "$output")"
-  jq -S "$@" >"$output"
-  chmod 0644 "$output"
-  assert_regular_unaliased "$output" "JSON output"
+  open_output_file "$output" 0644
+  jq -S "$@" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
 }
 
 generate_provenance() {
@@ -56,7 +52,11 @@ generate_provenance() {
   local daemon_path="$3"
   local cli_path="$4"
   write_json "$output" -n \
+    --slurpfile build_manifest "$BUILD_MANIFEST" \
+    --slurpfile runtime_manifest "$BUILD_RUNTIME_MANIFEST" \
     --arg source_sha "$source_sha" \
+    --arg source_tree "$source_tree" \
+    --arg build_manifest_sha "$build_manifest_sha" \
     --arg source_epoch "$SOURCE_DATE_EPOCH" \
     --arg version "$VERSION" \
     --arg arch "$arch" \
@@ -85,8 +85,13 @@ generate_provenance() {
           },
           "resolvedDependencies": [{
             "uri": ("git+https://github.com/GTAStudio/GTA-Claw.git@" + $source_sha),
-            "digest": {"gitCommit": $source_sha}
-          }]
+            "digest": {"gitCommit": $source_sha, "gitTree": $source_tree}
+          }],
+          "buildManifest": {
+            "digest": {"sha256": $build_manifest_sha},
+            "content": $build_manifest[0]
+          },
+          "runtimeDependencies": $runtime_manifest[0].packages
         },
         "runDetails": {
           "builder": {
@@ -104,45 +109,104 @@ generate_spdx() {
   local list="$WORK_DIR/spdx-$label.ndjson"
   local relative
   local index=0
+  local owner
+  local path
+  local file_license
   local sha1
-  local verification_code
-  assert_new_output_file "$list"
-  : >"$list"
+  local gta_verification
+  local libc_verification
+  local libgcc_verification
+  local libc_version
+  local libc_arch
+  local libgcc_version
+  local libgcc_arch
+  local sbom_relative
+  local checksum_relative
+  libc_version="$(jq -er '.packages[] | select(.id == "libc6") | .version' "$BUILD_RUNTIME_MANIFEST")"
+  libc_arch="$(jq -er '.packages[] | select(.id == "libc6") | .architecture' "$BUILD_RUNTIME_MANIFEST")"
+  libgcc_version="$(jq -er '.packages[] | select(.id == "libgcc-s1") | .version' "$BUILD_RUNTIME_MANIFEST")"
+  libgcc_arch="$(jq -er '.packages[] | select(.id == "libgcc-s1") | .architecture' "$BUILD_RUNTIME_MANIFEST")"
+  sbom_relative="./${output#"$root/"}"
+  checksum_relative="$(dirname "$sbom_relative")/SHA256SUMS"
+  open_output_file "$list" 0644
   while IFS= read -r -d '' relative; do
     [[ "$root/$relative" != "$output" ]] || continue
     index=$((index + 1))
+    path="/${relative#./}"
+    owner="gta-claw"
+    if [[ "$label" == "oci" ]]; then
+      owner="$(
+        jq -r --arg path "$path" '
+          [.packages[] | select(any(.files[]; .targetPath == $path)) | .id][0] // "gta-claw"
+        ' "$BUILD_RUNTIME_MANIFEST"
+      )"
+      case "$path" in
+        /usr/share/licenses/libc6/copyright) owner="libc6" ;;
+        /usr/share/licenses/libgcc-s1/copyright) owner="libgcc-s1" ;;
+      esac
+    fi
+    case "$owner" in
+      libc6) file_license="LGPL-2.1-or-later" ;;
+      libgcc-s1) file_license="GPL-3.0-or-later WITH GCC-exception-3.1" ;;
+      *) file_license="MIT" ;;
+    esac
     sha1="$(sha1sum "$root/$relative" | awk '{ print $1 }')"
     jq -c -n \
       --arg id "SPDXRef-File-$index" \
       --arg name "./${relative#./}" \
+      --arg owner "$owner" \
+      --arg license "$file_license" \
       --arg sha1 "$sha1" \
       --arg sha "$(sha256_file "$root/$relative")" \
       '{
         SPDXID: $id,
+        owner: $owner,
         fileName: $name,
         checksums: [
           {algorithm: "SHA1", checksumValue: $sha1},
           {algorithm: "SHA256", checksumValue: $sha}
         ],
-        licenseConcluded: "NOASSERTION",
-        licenseInfoInFiles: ["NOASSERTION"],
+        licenseConcluded: $license,
+        licenseInfoInFiles: [$license],
         copyrightText: "NOASSERTION"
-      }' >>"$list"
+      }' >&"$OPEN_OUTPUT_FD"
   done < <(cd "$root" && find . -type f -print0 | LC_ALL=C sort -z)
-  verification_code="$(
+  finish_output_file
+  package_verification() {
+    local package="$1"
     jq -r '
+      select(.owner == $package) |
       .checksums[] |
       select(.algorithm == "SHA1") |
       .checksumValue
-    ' "$list" |
+    ' --arg package "$package" "$list" |
       LC_ALL=C sort |
       tr -d '\n' |
       sha1sum |
       awk '{ print $1 }'
-  )"
+  }
+  gta_verification="$(package_verification gta-claw)"
+  if grep -F '"owner":"libc6"' "$list" >/dev/null; then
+    libc_verification="$(package_verification libc6)"
+  else
+    libc_verification=""
+  fi
+  if grep -F '"owner":"libgcc-s1"' "$list" >/dev/null; then
+    libgcc_verification="$(package_verification libgcc-s1)"
+  else
+    libgcc_verification=""
+  fi
   write_json "$output" -n \
-    --slurpfile files "$list" \
-    --arg verification_code "$verification_code" \
+    --slurpfile records "$list" \
+    --arg gta_verification "$gta_verification" \
+    --arg libc_verification "$libc_verification" \
+    --arg libgcc_verification "$libgcc_verification" \
+    --arg libc_version "$libc_version" \
+    --arg libc_arch "$libc_arch" \
+    --arg libgcc_version "$libgcc_version" \
+    --arg libgcc_arch "$libgcc_arch" \
+    --arg sbom_relative "$sbom_relative" \
+    --arg checksum_relative "$checksum_relative" \
     --arg namespace "https://github.com/GTAStudio/GTA-Claw/spdx/$source_sha/$arch/$label" \
     --arg created "$created_at" \
     --arg version "$VERSION" \
@@ -157,34 +221,85 @@ generate_spdx() {
         created: $created,
         creators: ["Tool: packaging/linux/package.sh"]
       },
-      packages: [{
-        SPDXID: "SPDXRef-Package-GTA-Claw",
-        name: "gta-claw",
-        versionInfo: $version,
-        downloadLocation: "NOASSERTION",
-        filesAnalyzed: true,
-        packageVerificationCode: {
-          packageVerificationCodeValue: $verification_code
+      packages: [
+        {
+          SPDXID: "SPDXRef-Package-GTA-Claw",
+          name: "gta-claw",
+          versionInfo: $version,
+          downloadLocation: "NOASSERTION",
+          filesAnalyzed: true,
+          packageVerificationCode: {
+            packageVerificationCodeValue: $gta_verification,
+            packageVerificationCodeExcludedFiles: [
+              $sbom_relative,
+              $checksum_relative
+            ]
+          },
+          licenseConcluded: "MIT",
+          licenseDeclared: "MIT",
+          copyrightText: "NOASSERTION",
+          externalRefs: [{
+            referenceCategory: "PACKAGE-MANAGER",
+            referenceType: "purl",
+            referenceLocator: ("pkg:github/GTAStudio/GTA-Claw@" + $source_sha)
+          }]
         },
-        licenseConcluded: "MIT",
-        licenseDeclared: "MIT",
-        copyrightText: "NOASSERTION",
-        externalRefs: [{
-          referenceCategory: "PACKAGE-MANAGER",
-          referenceType: "purl",
-          referenceLocator: ("pkg:github/GTAStudio/GTA-Claw@" + $source_sha)
-        }]
-      }],
-      files: $files,
+        ({
+          SPDXID: "SPDXRef-Package-libc6",
+          name: "libc6",
+          versionInfo: $libc_version,
+          comment: ("Debian architecture: " + $libc_arch),
+          supplier: "Organization: Debian",
+          downloadLocation: "NOASSERTION",
+          filesAnalyzed: ($libc_verification != ""),
+          licenseConcluded: "LGPL-2.1-or-later",
+          licenseDeclared: "LGPL-2.1-or-later",
+          copyrightText: "NOASSERTION"
+        } + if $libc_verification == "" then {} else {
+          packageVerificationCode: {packageVerificationCodeValue: $libc_verification}
+        } end),
+        ({
+          SPDXID: "SPDXRef-Package-libgcc-s1",
+          name: "libgcc-s1",
+          versionInfo: $libgcc_version,
+          comment: ("Debian architecture: " + $libgcc_arch),
+          supplier: "Organization: Debian",
+          downloadLocation: "NOASSERTION",
+          filesAnalyzed: ($libgcc_verification != ""),
+          licenseConcluded: "GPL-3.0-or-later WITH GCC-exception-3.1",
+          licenseDeclared: "GPL-3.0-or-later WITH GCC-exception-3.1",
+          copyrightText: "NOASSERTION"
+        } + if $libgcc_verification == "" then {} else {
+          packageVerificationCode: {packageVerificationCodeValue: $libgcc_verification}
+        } end)
+      ],
+      files: ($records | map(del(.owner))),
       relationships: (
-        [{
-          spdxElementId: "SPDXRef-DOCUMENT",
-          relationshipType: "DESCRIBES",
-          relatedSpdxElement: "SPDXRef-Package-GTA-Claw"
-        }] + (
-          $files |
-          map({
+        [
+          {
+            spdxElementId: "SPDXRef-DOCUMENT",
+            relationshipType: "DESCRIBES",
+            relatedSpdxElement: "SPDXRef-Package-GTA-Claw"
+          },
+          {
             spdxElementId: "SPDXRef-Package-GTA-Claw",
+            relationshipType: "DEPENDS_ON",
+            relatedSpdxElement: "SPDXRef-Package-libc6"
+          },
+          {
+            spdxElementId: "SPDXRef-Package-GTA-Claw",
+            relationshipType: "DEPENDS_ON",
+            relatedSpdxElement: "SPDXRef-Package-libgcc-s1"
+          }
+        ] + (
+          $records |
+          map({
+            spdxElementId: (
+              if .owner == "libc6" then "SPDXRef-Package-libc6"
+              elif .owner == "libgcc-s1" then "SPDXRef-Package-libgcc-s1"
+              else "SPDXRef-Package-GTA-Claw"
+              end
+            ),
             relationshipType: "CONTAINS",
             relatedSpdxElement: .SPDXID
           })
@@ -198,6 +313,11 @@ stage_documentation() {
   copy_regular_input "$LINUX_DIR/LICENSE.txt" "$destination/LICENSE.txt" 0644
   copy_regular_input "$LINUX_DIR/NOTICE.txt" "$destination/NOTICE.txt" 0644
   copy_regular_input "$LINUX_DIR/README.md" "$destination/README.md" 0644
+  copy_verified_input "$BUILD_MANIFEST" "$destination/build-manifest.json" 0644
+  copy_verified_input \
+    "$BUILD_RUNTIME_MANIFEST" \
+    "$destination/runtime-manifest.json" \
+    0644
   copy_regular_input \
     "$LINUX_DIR/systemd/gta-claw-daemon.socket.deferred" \
     "$destination/gta-claw-daemon.socket.deferred" \
@@ -225,12 +345,9 @@ rootfs="$WORK_DIR/rootfs"
 ensure_output_directory "$rootfs/usr/bin"
 ensure_output_directory "$rootfs/usr/libexec/gta-claw"
 ensure_output_directory "$rootfs/usr/lib/systemd/system"
+ensure_output_directory "$rootfs/usr/lib/systemd/system-preset"
 ensure_output_directory "$rootfs/usr/share/doc/gta-claw"
 ensure_output_directory "$rootfs/etc/gta-claw/credentials"
-ensure_output_directory "$rootfs/var/lib/gta-claw"
-ensure_output_directory "$rootfs/var/cache/gta-claw"
-ensure_output_directory "$rootfs/var/log/gta-claw"
-ensure_output_directory "$rootfs/run/gta-claw"
 copy_verified_input "$cli_binary" "$rootfs/usr/bin/$LINUX_CLI_NAME" 0755
 copy_verified_input \
   "$daemon_binary" \
@@ -239,6 +356,10 @@ copy_verified_input \
 copy_regular_input \
   "$LINUX_DIR/systemd/gta-claw-daemon.service" \
   "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/80-gta-claw.preset" \
+  "$rootfs/usr/lib/systemd/system-preset/80-gta-claw.preset" \
   0644
 copy_regular_input \
   "$LINUX_DIR/systemd/gta-claw.env" \
@@ -266,11 +387,6 @@ chmod 0755 "$rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
 chmod 0640 "$rootfs/etc/gta-claw/gta-claw.env"
 chmod 0600 "$rootfs/etc/gta-claw/credentials/daemon.conf"
-chmod 0700 \
-  "$rootfs/var/lib/gta-claw" \
-  "$rootfs/var/cache/gta-claw" \
-  "$rootfs/var/log/gta-claw" \
-  "$rootfs/run/gta-claw"
 validate_service_contract "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service"
 reject_forbidden_runtime_content "$rootfs"
 
@@ -281,8 +397,8 @@ reject_links_and_special_files "$deb_root"
 ensure_output_directory "$deb_root/DEBIAN"
 installed_size="$(du -sk "$rootfs" | awk '{ print $1 }')"
 control="$deb_root/DEBIAN/control"
-assert_new_output_file "$control"
-cat >"$control" <<EOF
+open_output_file "$control" 0644
+cat >&"$OPEN_OUTPUT_FD" <<EOF
 Package: $LINUX_PACKAGE_NAME
 Version: $VERSION-$LINUX_PACKAGE_RELEASE
 Section: utils
@@ -290,42 +406,51 @@ Priority: optional
 Architecture: $deb_architecture
 Maintainer: GTAStudio <noreply@github.com>
 Installed-Size: $installed_size
-Depends: libc6 (>= 2.31), libgcc-s1, systemd (>= 249)
+Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249)
 Homepage: https://github.com/GTAStudio/GTA-Claw
 Description: GTA Claw native Rust headless prototype
  Packages gta-claw-daemon and gta-claw-cli without the legacy JavaScript
  runtime or the Slint desktop application. This is not a feature-parity claim.
 EOF
-assert_new_output_file "$deb_root/DEBIAN/conffiles"
-cat >"$deb_root/DEBIAN/conffiles" <<'EOF'
+finish_output_file
+open_output_file "$deb_root/DEBIAN/conffiles" 0644
+cat >&"$OPEN_OUTPUT_FD" <<'EOF'
 /etc/gta-claw/gta-claw.env
 /etc/gta-claw/credentials/daemon.conf
 EOF
-assert_new_output_file "$deb_root/DEBIAN/md5sums"
+finish_output_file
+copy_regular_input "$LINUX_DIR/debian/postinst" "$deb_root/DEBIAN/postinst" 0755
+copy_regular_input "$LINUX_DIR/debian/prerm" "$deb_root/DEBIAN/prerm" 0755
+copy_regular_input "$LINUX_DIR/debian/postrm" "$deb_root/DEBIAN/postrm" 0755
+open_output_file "$deb_root/DEBIAN/md5sums" 0644
 (
   cd "$deb_root"
   find . -path ./DEBIAN -prune -o -type f -print |
     sed 's#^\./##' |
     LC_ALL=C sort |
     xargs md5sum
-) >"$deb_root/DEBIAN/md5sums"
+) >&"$OPEN_OUTPUT_FD"
+finish_output_file
 normalize_tree "$deb_root"
 chmod 0755 "$deb_root/DEBIAN"
+chmod 0755 "$deb_root/DEBIAN/postinst" "$deb_root/DEBIAN/prerm" "$deb_root/DEBIAN/postrm"
 chmod 0644 "$deb_root/DEBIAN/control" "$deb_root/DEBIAN/conffiles" "$deb_root/DEBIAN/md5sums"
 chmod 0640 "$deb_root/etc/gta-claw/gta-claw.env"
 chmod 0600 "$deb_root/etc/gta-claw/credentials/daemon.conf"
-chmod 0700 \
-  "$deb_root/var/lib/gta-claw" \
-  "$deb_root/var/cache/gta-claw" \
-  "$deb_root/var/log/gta-claw" \
-  "$deb_root/run/gta-claw"
 deb_artifact="$ARTIFACT_DIR/${LINUX_PACKAGE_NAME}_${VERSION}-${LINUX_PACKAGE_RELEASE}_${deb_architecture}.deb"
 deb_temporary="$deb_artifact.tmp"
-assert_new_output_file "$deb_temporary"
+open_output_file "$deb_temporary" 0644
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-  dpkg-deb --root-owner-group -Zgzip -z9 --build "$deb_root" "$deb_temporary"
+  dpkg-deb \
+    --root-owner-group \
+    -Zgzip \
+    -z9 \
+    --build \
+    "$deb_root" \
+    - \
+    >&"$OPEN_OUTPUT_FD"
+finish_output_file
 assert_regular_unaliased "$deb_temporary" "Debian package temporary"
-chmod 0644 "$deb_temporary"
 touch --date="@$SOURCE_DATE_EPOCH" "$deb_temporary"
 publish_output_file "$deb_temporary" "$deb_artifact"
 
@@ -338,7 +463,7 @@ ensure_output_directory "$rpm_work/SPECS"
 ensure_output_directory "$rpm_work/SRPMS"
 rpm_source="$rpm_work/SOURCES/gta-claw-rootfs.tar"
 rpm_source_temporary="$rpm_source.tmp"
-assert_new_output_file "$rpm_source_temporary"
+open_output_file "$rpm_source_temporary" 0644
 (
   cd "$rootfs"
   tar \
@@ -350,16 +475,18 @@ assert_new_output_file "$rpm_source_temporary"
     --owner=0 \
     --group=0 \
     --numeric-owner \
-    -cf "$rpm_source_temporary" \
+    -cf - \
     .
-)
+) >&"$OPEN_OUTPUT_FD"
+finish_output_file
 touch --date="@$SOURCE_DATE_EPOCH" "$rpm_source_temporary"
 publish_output_file "$rpm_source_temporary" "$rpm_source"
 rpm_spec="$rpm_work/SPECS/gta-claw.spec"
-assert_new_output_file "$rpm_spec"
 changelog_date="$(LC_ALL=C date -u --date="@$SOURCE_DATE_EPOCH" '+%a %b %d %Y')"
-cat >"$rpm_spec" <<EOF
+open_output_file "$rpm_spec" 0644
+cat >&"$OPEN_OUTPUT_FD" <<EOF
 %global debug_package %{nil}
+%global __os_install_post %{nil}
 %global _build_id_links none
 %global _buildhost reproducible.invalid
 %global use_source_date_epoch_as_buildtime 1
@@ -373,7 +500,7 @@ Summary:        GTA Claw native Rust headless prototype
 License:        MIT
 URL:            https://github.com/GTAStudio/GTA-Claw
 Source0:        gta-claw-rootfs.tar
-Requires:       glibc >= 2.31
+Requires:       glibc >= $BUILD_GLIBC_REQUIREMENT
 Requires:       libgcc
 Requires:       systemd >= 249
 
@@ -397,17 +524,37 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/bin/gta-claw-cli
 /usr/libexec/gta-claw/gta-claw-daemon
 /usr/lib/systemd/system/gta-claw-daemon.service
+/usr/lib/systemd/system-preset/80-gta-claw.preset
 /usr/share/doc/gta-claw
-%dir %attr(0700,root,root) /var/lib/gta-claw
-%dir %attr(0700,root,root) /var/cache/gta-claw
-%dir %attr(0700,root,root) /var/log/gta-claw
-%dir %attr(0700,root,root) /run/gta-claw
+
+%post
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || :
+  if [ "\$1" -eq 1 ]; then
+    systemctl preset gta-claw-daemon.service >/dev/null 2>&1 || :
+  elif [ "\$1" -gt 1 ]; then
+    systemctl try-restart gta-claw-daemon.service >/dev/null 2>&1 || :
+  fi
+fi
+:
+
+%preun
+if [ "\$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+  systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1 || :
+fi
+:
+
+%postun
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || :
+fi
+:
 
 %changelog
 * $changelog_date GTAStudio <noreply@github.com> - $VERSION-$LINUX_PACKAGE_RELEASE
 - Deterministic native Rust headless packaging prototype
 EOF
-chmod 0644 "$rpm_spec"
+finish_output_file
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
   rpmbuild \
     -bb \
@@ -425,101 +572,12 @@ copy_regular_input "${built_rpms[0]}" "$rpm_temporary" 0644
 touch --date="@$SOURCE_DATE_EPOCH" "$rpm_temporary"
 publish_output_file "$rpm_temporary" "$rpm_artifact"
 
-copy_runtime_library() {
-  local source="$1"
-  local destination="$2"
-  source="$(realpath -e "$source")"
-  copy_verified_input "$source" "$destination" 0755
-}
-
-copy_x86_runtime() {
-  local binary
-  local interpreter
-  local library
-  for binary in "$daemon_binary" "$cli_binary"; do
-    interpreter="$(
-      readelf -l "$binary" |
-        sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p'
-    )"
-    [[ "$interpreter" == /* ]] || die "ELF interpreter is missing for $binary"
-    if [[ ! -e "$oci_rootfs$interpreter" ]]; then
-      copy_runtime_library "$interpreter" "$oci_rootfs$interpreter"
-    fi
-    while IFS= read -r library; do
-      [[ -n "$library" ]] || continue
-      if [[ ! -e "$oci_rootfs$library" ]]; then
-        copy_runtime_library "$library" "$oci_rootfs$library"
-      fi
-    done < <(
-      ldd "$binary" |
-        awk '/=> \// { print $3 } /^\// { print $1 }' |
-        LC_ALL=C sort -u
-    )
-  done
-}
-
-find_arm_library() {
-  local name="$1"
-  local candidate
-  for candidate in \
-    "/usr/aarch64-linux-gnu/lib/$name" \
-    "/lib/aarch64-linux-gnu/$name" \
-    "/usr/lib/aarch64-linux-gnu/$name"; do
-    if [[ -e "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-  die "arm64 runtime library not found: $name"
-}
-
-copy_arm_runtime() {
-  local interpreter
-  local name
-  local source
-  local dependency
-  local index=0
-  local -a queue=()
-  local -A seen=()
-  interpreter="$(
-    readelf -l "$daemon_binary" |
-      sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p'
-  )"
-  [[ "$interpreter" == "/lib/ld-linux-aarch64.so.1" ]] ||
-    die "unexpected arm64 ELF interpreter: $interpreter"
-  source="$(find_arm_library ld-linux-aarch64.so.1)"
-  copy_runtime_library "$source" "$oci_rootfs$interpreter"
-  while IFS= read -r name; do
-    [[ -n "$name" ]] && queue+=("$name")
-  done < <(
-    {
-      readelf -d "$daemon_binary"
-      readelf -d "$cli_binary"
-    } |
-      sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
-      LC_ALL=C sort -u
-  )
-  while [[ "$index" -lt "${#queue[@]}" ]]; do
-    name="${queue[$index]}"
-    index=$((index + 1))
-    [[ -z "${seen[$name]:-}" ]] || continue
-    seen[$name]=1
-    source="$(find_arm_library "$name")"
-    copy_runtime_library "$source" "$oci_rootfs/lib/aarch64-linux-gnu/$name"
-    while IFS= read -r dependency; do
-      [[ -n "$dependency" && -z "${seen[$dependency]:-}" ]] &&
-        queue+=("$dependency")
-    done < <(
-      readelf -d "$(realpath -e "$source")" |
-        sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p'
-    )
-  done
-}
-
 oci_rootfs="$WORK_DIR/oci-rootfs"
 ensure_output_directory "$oci_rootfs/usr/bin"
 ensure_output_directory "$oci_rootfs/usr/libexec/gta-claw"
 ensure_output_directory "$oci_rootfs/usr/share/doc/gta-claw"
+ensure_output_directory "$oci_rootfs/usr/share/licenses/libc6"
+ensure_output_directory "$oci_rootfs/usr/share/licenses/libgcc-s1"
 ensure_output_directory "$oci_rootfs/etc"
 ensure_output_directory "$oci_rootfs/var/lib/gta-claw"
 ensure_output_directory "$oci_rootfs/var/cache/gta-claw"
@@ -531,24 +589,38 @@ copy_verified_input \
   "$oci_rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME" \
   0755
 stage_documentation "$oci_rootfs/usr/share/doc/gta-claw"
-assert_new_output_file "$oci_rootfs/etc/passwd"
-cat >"$oci_rootfs/etc/passwd" <<'EOF'
-root:x:0:0:root:/nonexistent:/sbin/nologin
-gta-claw:x:65532:65532:GTA Claw:/nonexistent:/sbin/nologin
-EOF
-assert_new_output_file "$oci_rootfs/etc/group"
-cat >"$oci_rootfs/etc/group" <<'EOF'
-root:x:0:
-gta-claw:x:65532:
-EOF
-case "$arch" in
-  x86_64)
-    require_tool ldd
-    copy_x86_runtime
-    ;;
-  arm64) copy_arm_runtime ;;
-  *) die "unsupported OCI architecture: $arch" ;;
-esac
+write_output_text \
+  "$oci_rootfs/etc/passwd" \
+  0644 \
+  $'root:x:0:0:root:/nonexistent:/sbin/nologin\ngta-claw:x:65532:65532:GTA Claw:/nonexistent:/sbin/nologin\n'
+write_output_text \
+  "$oci_rootfs/etc/group" \
+  0644 \
+  $'root:x:0:\ngta-claw:x:65532:\n'
+while IFS=$'\t' read -r staged_path target_path mode; do
+  [[ "$target_path" == /* ]] || die "runtime target path must be absolute"
+  copy_verified_input \
+    "$BUILD_ROOT/$staged_path" \
+    "$oci_rootfs$target_path" \
+    "$mode"
+done < <(
+  jq -r '.packages[].files[] | [.stagedPath, .targetPath, .mode] | @tsv' \
+    "$BUILD_RUNTIME_MANIFEST"
+)
+copy_verified_input \
+  "$BUILD_ROOT/$(
+    jq -er '.packages[] | select(.id == "libc6") | .copyrightFile' \
+      "$BUILD_RUNTIME_MANIFEST"
+  )" \
+  "$oci_rootfs/usr/share/licenses/libc6/copyright" \
+  0644
+copy_verified_input \
+  "$BUILD_ROOT/$(
+    jq -er '.packages[] | select(.id == "libgcc-s1") | .copyrightFile' \
+      "$BUILD_RUNTIME_MANIFEST"
+  )" \
+  "$oci_rootfs/usr/share/licenses/libgcc-s1/copyright" \
+  0644
 generate_provenance \
   "$oci_rootfs" \
   "$oci_rootfs/usr/share/doc/gta-claw/provenance.json" \
@@ -564,7 +636,8 @@ write_sha256_manifest \
 normalize_tree "$oci_rootfs"
 chmod 0755 "$oci_rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$oci_rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
-find "$oci_rootfs/lib" -type f -exec chmod 0755 {} + 2>/dev/null || true
+chmod 0644 "$oci_rootfs/etc/passwd" "$oci_rootfs/etc/group"
+find "$oci_rootfs/lib" -type f -exec chmod 0755 {} +
 chmod 0700 \
   "$oci_rootfs/var/lib/gta-claw" \
   "$oci_rootfs/var/cache/gta-claw" \
@@ -577,7 +650,7 @@ oci_layout="$oci_work/$base_name.oci"
 ensure_output_directory "$oci_layout/blobs/sha256"
 root_layer="$oci_work/rootfs.tar"
 writable_layer="$oci_work/writable.tar"
-assert_new_output_file "$root_layer"
+open_output_file "$root_layer" 0644
 (
   cd "$oci_rootfs"
   tar \
@@ -589,10 +662,11 @@ assert_new_output_file "$root_layer"
     --owner=0 \
     --group=0 \
     --numeric-owner \
-    -cf "$root_layer" \
+    -cf - \
     .
-)
-assert_new_output_file "$writable_layer"
+) >&"$OPEN_OUTPUT_FD"
+finish_output_file
+open_output_file "$writable_layer" 0644
 (
   cd "$oci_rootfs"
   tar \
@@ -604,12 +678,13 @@ assert_new_output_file "$writable_layer"
     --group=65532 \
     --numeric-owner \
     --no-recursion \
-    -cf "$writable_layer" \
+    -cf - \
     var/lib/gta-claw \
     var/cache/gta-claw \
     var/log/gta-claw \
     run/gta-claw
-)
+) >&"$OPEN_OUTPUT_FD"
+finish_output_file
 root_layer_digest="$(sha256_file "$root_layer")"
 writable_layer_digest="$(sha256_file "$writable_layer")"
 root_layer_size="$(wc -c <"$root_layer" | tr -d ' ')"
@@ -649,7 +724,7 @@ write_json "$oci_config_source" -n \
       Labels: {
         "org.opencontainers.image.created": $created,
         "org.opencontainers.image.description": "GTA Claw native Rust headless prototype",
-        "org.opencontainers.image.licenses": "MIT",
+        "org.opencontainers.image.licenses": "MIT AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)",
         "org.opencontainers.image.revision": $revision,
         "org.opencontainers.image.source": "https://github.com/GTAStudio/GTA-Claw",
         "org.opencontainers.image.title": "gta-claw",
@@ -736,7 +811,11 @@ create_deterministic_tar_gz "$(dirname "$oci_layout")" "$(basename "$oci_layout"
 
 artifact_provenance="$ARTIFACT_DIR/provenance-$arch.json"
 write_json "$artifact_provenance" -n \
+  --slurpfile build_manifest "$BUILD_MANIFEST" \
+  --slurpfile runtime_manifest "$BUILD_RUNTIME_MANIFEST" \
   --arg source_sha "$source_sha" \
+  --arg source_tree "$source_tree" \
+  --arg build_manifest_sha "$build_manifest_sha" \
   --arg version "$VERSION" \
   --arg architecture "$arch" \
   --arg tar_name "$(basename "$tar_artifact")" \
@@ -751,8 +830,14 @@ write_json "$artifact_provenance" -n \
     schemaVersion: 1,
     source: {
       repository: "https://github.com/GTAStudio/GTA-Claw",
-      revision: $source_sha
+      revision: $source_sha,
+      tree: $source_tree
     },
+    buildManifest: {
+      digest: {sha256: $build_manifest_sha},
+      content: $build_manifest[0]
+    },
+    runtimeDependencies: $runtime_manifest[0].packages,
     package: {name: "gta-claw", version: $version, architecture: $architecture},
     subjects: [
       {name: $tar_name, digest: {sha256: $tar_sha}},
@@ -763,5 +848,5 @@ write_json "$artifact_provenance" -n \
   }'
 write_sha256_manifest "$ARTIFACT_DIR" "$ARTIFACT_DIR/SHA256SUMS"
 
-"$LINUX_DIR/validate.sh" "$OUTPUT_ROOT" "$arch"
+"$LINUX_DIR/validate.sh" "$OUTPUT_ROOT" "$arch" "$BUILD_MANIFEST"
 note "created deterministic Linux artifacts in $ARTIFACT_DIR"

@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils jq rpm shellcheck
+            binutils gcc jq patchelf python3 rpm shellcheck
           archive="$RUNNER_TEMP/actionlint.tar.gz"
           curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
             --output "$archive" \
@@ -94,6 +94,7 @@ jobs:
               # intentionally use single quotes to prevent shell expansion.
               shellcheck -x -e SC1091,SC2016 "$script"
             done
+          python3 -c 'path = "packaging/linux/tests/make-malicious-tar.py"; compile(open(path, encoding="utf-8").read(), path, "exec")'
           actionlint .github/workflows/linux-packaging.yml
           ./packaging/linux/workflow-self-test.sh
           ./packaging/linux/self-test.sh
@@ -182,54 +183,153 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils jq rpm
-          rustup target add x86_64-unknown-linux-gnu
+            binutils cpio jq python3 rpm
 
-      - name: Build and execute native Rust binaries
+      - name: Build twice in pinned Bookworm with different umasks
         id: build
         shell: bash
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-x86_64
         run: |
           set -euo pipefail
-          binary_dir="$(./packaging/linux/build.sh x86_64)"
-          "$binary_dir/gta-claw-cli" health | grep -F 'healthy runtime='
-          "$binary_dir/gta-claw-daemon" --probe | grep -F 'healthy runtime='
-          echo "binary-dir=$binary_dir" >>"$GITHUB_OUTPUT"
+          first_manifest="$(
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask000" \
+            BUILD_INPUT_UMASK=000 \
+              ./packaging/linux/build-container.sh x86_64
+          )"
+          second_manifest="$(
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask002" \
+            BUILD_INPUT_UMASK=002 \
+              ./packaging/linux/build-container.sh x86_64
+          )"
+          first_cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$first_manifest")"
+          second_cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$second_manifest")"
+          first_daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$first_manifest")"
+          second_daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$second_manifest")"
+          cmp -s "$(dirname "$first_manifest")/$first_cli" "$(dirname "$second_manifest")/$second_cli"
+          cmp -s "$(dirname "$first_manifest")/$first_daemon" "$(dirname "$second_manifest")/$second_daemon"
+          echo "first-manifest=$first_manifest" >>"$GITHUB_OUTPUT"
+          echo "second-manifest=$second_manifest" >>"$GITHUB_OUTPUT"
 
-      - name: Package twice and prove deterministic outputs
+      - name: Execute binaries on the pinned oldest supported environment
         shell: bash
         env:
-          BINARY_DIR: ${{ steps.build.outputs.binary-dir }}
+          BUILD_MANIFEST: ${{ steps.build.outputs.first-manifest }}
+        run: |
+          set -euo pipefail
+          build_root="$(dirname "$BUILD_MANIFEST")"
+          relative_root="${build_root#"$GITHUB_WORKSPACE/target/"}"
+          cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$BUILD_MANIFEST")"
+          daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$BUILD_MANIFEST")"
+          image='gta-claw-linux-build:rust-1.97.0-bookworm'
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --volume "$GITHUB_WORKSPACE/target:/workspace/target:ro" \
+            "$image" \
+            "/workspace/target/$relative_root/$cli" health |
+            grep -F 'healthy runtime='
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --volume "$GITHUB_WORKSPACE/target:/workspace/target:ro" \
+            "$image" \
+            "/workspace/target/$relative_root/$daemon" --probe |
+            grep -F 'healthy runtime='
+
+      - name: Reject forged build manifests and substituted binaries
+        shell: bash
+        env:
+          OUTPUT_ROOT: ${{ github.workspace }}/target/linux-build-manifest-self-test
+        run: |
+          ./packaging/linux/build-manifest-self-test.sh \
+            "${{ steps.build.outputs.first-manifest }}" \
+            x86_64
+
+      - name: Package independent builds and prove deterministic outputs
+        id: package
+        shell: bash
         run: |
           set -euo pipefail
           first="$GITHUB_WORKSPACE/target/linux-x86_64-run1"
           second="$GITHUB_WORKSPACE/target/linux-x86_64-run2"
-          OUTPUT_ROOT="$first" \
-            ./packaging/linux/package.sh x86_64 "$BINARY_DIR"
-          OUTPUT_ROOT="$second" \
-            ./packaging/linux/package.sh x86_64 "$BINARY_DIR"
+          upgrade="$GITHUB_WORKSPACE/target/linux-x86_64-upgrade"
+          umask 000
+          PACKAGE_RELEASE=1 OUTPUT_ROOT="$first" \
+            ./packaging/linux/package.sh \
+              x86_64 \
+              "${{ steps.build.outputs.first-manifest }}"
+          umask 002
+          PACKAGE_RELEASE=1 OUTPUT_ROOT="$second" \
+            ./packaging/linux/package.sh \
+              x86_64 \
+              "${{ steps.build.outputs.second-manifest }}"
           diff \
             <(cd "$first/artifacts" && find . -type f -print | LC_ALL=C sort) \
             <(cd "$second/artifacts" && find . -type f -print | LC_ALL=C sort)
           while IFS= read -r relative; do
             cmp -s "$first/artifacts/$relative" "$second/artifacts/$relative"
           done < <(cd "$first/artifacts" && find . -type f -printf '%P\n' | LC_ALL=C sort)
+          PACKAGE_RELEASE=2 OUTPUT_ROOT="$upgrade" \
+            ./packaging/linux/package.sh \
+              x86_64 \
+              "${{ steps.build.outputs.first-manifest }}"
+          echo "release1=$first" >>"$GITHUB_OUTPUT"
+          echo "release2=$upgrade" >>"$GITHUB_OUTPUT"
+
+      - name: Mutate every published OCI trust edge
+        shell: bash
+        env:
+          OUTPUT_ROOT: ${{ github.workspace }}/target/linux-oci-mutation-tests
+        run: |
+          ./packaging/linux/oci-self-test.sh \
+            "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-linux-x86_64.oci.tar.gz" \
+            x86_64
+
+      - name: Install and execute Debian package on pinned Bookworm
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb"
+          docker run --rm \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --volume "$package:/tmp/gta-claw.deb:ro" \
+            gta-claw-linux-build:rust-1.97.0-bookworm \
+            bash -c '
+              set -euo pipefail
+              dpkg -i /tmp/gta-claw.deb
+              /usr/bin/gta-claw-cli health | grep -F "healthy runtime="
+              /usr/libexec/gta-claw/gta-claw-daemon --probe | grep -F "healthy runtime="
+              dpkg --remove gta-claw
+              test ! -e /usr/libexec/gta-claw/gta-claw-daemon
+            '
 
       - name: Verify systemd unit with packaged executable
         shell: bash
-        env:
-          BINARY_DIR: ${{ steps.build.outputs.binary-dir }}
         run: |
           set -euo pipefail
+          manifest="${{ steps.build.outputs.first-manifest }}"
+          build_root="$(dirname "$manifest")"
+          daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$manifest")"
           sudo install -D -m 0755 \
-            "$BINARY_DIR/gta-claw-daemon" \
+            "$build_root/$daemon" \
             /usr/libexec/gta-claw/gta-claw-daemon
           systemd-analyze verify packaging/linux/systemd/gta-claw-daemon.service
           systemd-analyze security --offline=yes \
             packaging/linux/systemd/gta-claw-daemon.service |
             tee "$RUNNER_TEMP/systemd-security.txt"
           grep -F 'NoNewPrivileges=' "$RUNNER_TEMP/systemd-security.txt"
+          sudo rm -f /usr/libexec/gta-claw/gta-claw-daemon
+
+      - name: Prove real Debian and RPM lifecycle
+        shell: bash
+        run: |
+          ./packaging/linux/lifecycle-test.sh \
+            "${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb" \
+            "${{ steps.package.outputs.release2 }}/artifacts/gta-claw_0.1.0-2_amd64.deb" \
+            "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-1.x86_64.rpm" \
+            "${{ steps.package.outputs.release2 }}/artifacts/gta-claw-0.1.0-2.x86_64.rpm"
 
       - name: Prove release and publication stay disabled
         shell: bash
@@ -269,34 +369,49 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils gcc-aarch64-linux-gnu jq libc6-dev-arm64-cross rpm
-          rustup target add aarch64-unknown-linux-gnu
+            binutils cpio jq python3 rpm
 
-      - name: Cross-build real arm64 Rust target
+      - name: Cross-build arm64 twice in pinned Bookworm
         id: build
         shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target-arm64
         run: |
           set -euo pipefail
-          binary_dir="$(./packaging/linux/build.sh arm64)"
-          readelf -h "$binary_dir/gta-claw-cli" | grep -F 'AArch64'
-          readelf -h "$binary_dir/gta-claw-daemon" | grep -F 'AArch64'
-          echo "binary-dir=$binary_dir" >>"$GITHUB_OUTPUT"
+          first_manifest="$(
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask000" \
+            BUILD_INPUT_UMASK=000 \
+              ./packaging/linux/build-container.sh arm64
+          )"
+          second_manifest="$(
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask002" \
+            BUILD_INPUT_UMASK=002 \
+              ./packaging/linux/build-container.sh arm64
+          )"
+          for manifest in "$first_manifest" "$second_manifest"; do
+            root="$(dirname "$manifest")"
+            cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$manifest")"
+            daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$manifest")"
+            readelf -h "$root/$cli" | grep -F 'AArch64'
+            readelf -h "$root/$daemon" | grep -F 'AArch64'
+          done
+          echo "first-manifest=$first_manifest" >>"$GITHUB_OUTPUT"
+          echo "second-manifest=$second_manifest" >>"$GITHUB_OUTPUT"
 
       - name: Package twice and prove deterministic arm64 layouts
         shell: bash
-        env:
-          BINARY_DIR: ${{ steps.build.outputs.binary-dir }}
         run: |
           set -euo pipefail
           first="$GITHUB_WORKSPACE/target/linux-arm64-run1"
           second="$GITHUB_WORKSPACE/target/linux-arm64-run2"
+          umask 000
           OUTPUT_ROOT="$first" \
-            ./packaging/linux/package.sh arm64 "$BINARY_DIR"
+            ./packaging/linux/package.sh \
+              arm64 \
+              "${{ steps.build.outputs.first-manifest }}"
+          umask 002
           OUTPUT_ROOT="$second" \
-            ./packaging/linux/package.sh arm64 "$BINARY_DIR"
+            ./packaging/linux/package.sh \
+              arm64 \
+              "${{ steps.build.outputs.second-manifest }}"
           diff \
             <(cd "$first/artifacts" && find . -type f -print | LC_ALL=C sort) \
             <(cd "$second/artifacts" && find . -type f -print | LC_ALL=C sort)

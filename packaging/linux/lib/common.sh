@@ -71,10 +71,15 @@ canonical_target_root() {
   [[ "$repository" == "$REPO_ROOT" ]] || die "repository root changed during validation"
   [[ ! -L "$target" ]] || die "repository target directory must not be a symlink"
   if [[ ! -e "$target" ]]; then
-    mkdir -- "$target"
+    mkdir -m 0700 -- "$target"
   fi
   [[ -d "$target" && ! -L "$target" ]] ||
     die "repository target path is not a real directory"
+  [[ "$(stat -c '%u' "$target")" -eq "$(id -u)" ]] ||
+    die "repository target directory is not owned by the current user"
+  chmod 0700 -- "$target"
+  [[ "$(stat -c '%a' "$target")" == "700" ]] ||
+    die "repository target directory is not private"
   canonical="$(cd "$target" && pwd -P)"
   [[ "$canonical" == "$target" ]] ||
     die "repository target directory resolves outside the repository"
@@ -155,6 +160,37 @@ assert_output_candidate() {
   assert_nearest_existing_parent "$target" "$path"
 }
 
+validate_new_private_root_path() {
+  local root="$1"
+  local label="$2"
+  local target
+  validate_absolute_path "$root" "$label"
+  target="$(canonical_target_root)"
+  [[ "$root" != "$target" && "$root" == "$target/"* ]] ||
+    die "$label must be a child of canonical repository target"
+  assert_no_symlink_components "$target" "$root"
+  assert_nearest_existing_parent "$target" "$root"
+  [[ ! -e "$root" && ! -L "$root" ]] || die "$label must be new: $root"
+}
+
+assert_private_owned_root() {
+  local root="$1"
+  local target
+  validate_absolute_path "$root" "private root"
+  target="$(canonical_target_root)"
+  [[ "$root" != "$target" && "$root" == "$target/"* ]] ||
+    die "private root must be a child of repository target"
+  assert_no_symlink_components "$target" "$root"
+  [[ -d "$root" && ! -L "$root" ]] || die "private root is not a real directory: $root"
+  [[ "$(stat -c '%u' "$root")" -eq "$(id -u)" ]] ||
+    die "private root is not owned by the current user: $root"
+  [[ "$(stat -c '%a' "$root")" == "700" ]] ||
+    die "private root mode is not 0700: $root"
+  assert_regular_unaliased "$root/.linux-packaging-owner" "private root ownership marker"
+  [[ "$(cat "$root/.linux-packaging-owner")" == "gta-claw-linux-packaging-v2" ]] ||
+    die "private root ownership marker is invalid: $root"
+}
+
 OUTPUT_LOCK_PATH=""
 OUTPUT_LOCK_ID=""
 OUTPUT_ROOT_ID=""
@@ -189,17 +225,22 @@ initialize_output_root() {
   assert_output_candidate "$OUTPUT_LOCK_PATH"
   [[ ! -e "$OUTPUT_LOCK_PATH" && ! -L "$OUTPUT_LOCK_PATH" ]] ||
     die "output lock already exists: $OUTPUT_LOCK_PATH"
-  mkdir -- "$OUTPUT_LOCK_PATH"
+  mkdir -m 0700 -- "$OUTPUT_LOCK_PATH"
+  chmod 0700 -- "$OUTPUT_LOCK_PATH"
   OUTPUT_LOCK_ID="$(output_identity "$OUTPUT_LOCK_PATH")"
   OUTPUT_LOCK_HELD=1
   trap release_output_lock EXIT INT TERM
 
-  mkdir -- "$OUTPUT_ROOT"
+  mkdir -m 0700 -- "$OUTPUT_ROOT"
+  chmod 0700 -- "$OUTPUT_ROOT"
   [[ -d "$OUTPUT_ROOT" && ! -L "$OUTPUT_ROOT" ]] ||
     die "failed to create a real OUTPUT_ROOT"
   OUTPUT_ROOT_ID="$(output_identity "$OUTPUT_ROOT")"
-  printf 'gta-claw-linux-packaging-v1\n' >"$OUTPUT_ROOT/.linux-packaging-owner"
-  chmod 0600 "$OUTPUT_ROOT/.linux-packaging-owner"
+  (
+    set -o noclobber
+    printf 'gta-claw-linux-packaging-v2\n' >"$OUTPUT_ROOT/.linux-packaging-owner"
+  )
+  chmod 0600 -- "$OUTPUT_ROOT/.linux-packaging-owner"
   assert_output_root_owned
 }
 
@@ -214,7 +255,14 @@ assert_output_root_owned() {
     die "OUTPUT_ROOT is no longer a real directory"
   [[ "$(output_identity "$OUTPUT_ROOT")" == "$OUTPUT_ROOT_ID" ]] ||
     die "OUTPUT_ROOT identity changed"
-  [[ "$(cat "$OUTPUT_ROOT/.linux-packaging-owner")" == "gta-claw-linux-packaging-v1" ]] ||
+  [[ "$(stat -c '%u' "$OUTPUT_ROOT")" -eq "$(id -u)" ]] ||
+    die "OUTPUT_ROOT owner changed"
+  [[ "$(stat -c '%a' "$OUTPUT_ROOT")" == "700" ]] ||
+    die "OUTPUT_ROOT is not private"
+  assert_regular_unaliased \
+    "$OUTPUT_ROOT/.linux-packaging-owner" \
+    "OUTPUT_ROOT ownership marker"
+  [[ "$(cat "$OUTPUT_ROOT/.linux-packaging-owner")" == "gta-claw-linux-packaging-v2" ]] ||
     die "OUTPUT_ROOT ownership marker changed"
   target="$(canonical_target_root)"
   assert_no_symlink_components "$target" "$OUTPUT_ROOT"
@@ -232,10 +280,29 @@ assert_output_path() {
 
 ensure_output_directory() {
   local path="$1"
+  local relative
+  local component
+  local current="$OUTPUT_ROOT"
   assert_output_path "$path"
   [[ ! -e "$path" || -d "$path" ]] ||
     die "output directory collides with a non-directory object: $path"
   mkdir -p -- "$path"
+  relative="${path#"$OUTPUT_ROOT"}"
+  relative="${relative#/}"
+  while [[ -n "$relative" ]]; do
+    component="${relative%%/*}"
+    if [[ "$relative" == */* ]]; then
+      relative="${relative#*/}"
+    else
+      relative=""
+    fi
+    current="$current/$component"
+    [[ -d "$current" && ! -L "$current" ]] ||
+      die "output directory component is not a real directory: $current"
+    [[ "$(stat -c '%u' "$current")" -eq "$(id -u)" ]] ||
+      die "output directory component has an unexpected owner: $current"
+    chmod 0700 -- "$current"
+  done
   assert_output_path "$path"
   [[ -d "$path" && ! -L "$path" ]] || die "failed to create directory: $path"
 }
@@ -245,6 +312,67 @@ assert_new_output_file() {
   assert_output_path "$path"
   [[ ! -e "$path" && ! -L "$path" ]] ||
     die "output file collision: $path"
+}
+
+OPEN_OUTPUT_FD=""
+OPEN_OUTPUT_PATH=""
+OPEN_OUTPUT_ID=""
+
+open_output_file() {
+  local path="$1"
+  local mode="$2"
+  local restore_noclobber=0
+  [[ -z "$OPEN_OUTPUT_FD" ]] || die "an output file is already open"
+  [[ "$mode" =~ ^0[0-7][0-7][0-7]$ ]] || die "invalid output file mode: $mode"
+  assert_new_output_file "$path"
+  case "$-" in
+    *C*) ;;
+    *)
+      set -o noclobber
+      restore_noclobber=1
+      ;;
+  esac
+  if ! exec {OPEN_OUTPUT_FD}>"$path"; then
+    [[ "$restore_noclobber" -eq 0 ]] || set +o noclobber
+    die "failed to reserve output file: $path"
+  fi
+  [[ "$restore_noclobber" -eq 0 ]] || set +o noclobber
+  OPEN_OUTPUT_PATH="$path"
+  OPEN_OUTPUT_ID="$(stat -Lc '%d:%i' "/proc/$$/fd/$OPEN_OUTPUT_FD")"
+  chmod "$mode" "/proc/$$/fd/$OPEN_OUTPUT_FD"
+  assert_regular_unaliased "$path" "reserved output"
+  [[ "$(output_identity "$path")" == "$OPEN_OUTPUT_ID" ]] ||
+    die "reserved output path does not identify its open file: $path"
+}
+
+finish_output_file() {
+  local path="$OPEN_OUTPUT_PATH"
+  local descriptor
+  [[ -n "$OPEN_OUTPUT_FD" && -n "$path" ]] || die "no output file is open"
+  descriptor="/proc/$$/fd/$OPEN_OUTPUT_FD"
+  [[ "$(stat -Lc '%d:%i' "$descriptor")" == "$OPEN_OUTPUT_ID" ]] ||
+    die "open output descriptor identity changed: $path"
+  if [[ ! -f "$path" || -L "$path" || "$(output_identity "$path")" != "$OPEN_OUTPUT_ID" ]]; then
+    exec {OPEN_OUTPUT_FD}>&-
+    OPEN_OUTPUT_FD=""
+    OPEN_OUTPUT_PATH=""
+    OPEN_OUTPUT_ID=""
+    die "output path changed while its file was open: $path"
+  fi
+  exec {OPEN_OUTPUT_FD}>&-
+  OPEN_OUTPUT_FD=""
+  OPEN_OUTPUT_PATH=""
+  OPEN_OUTPUT_ID=""
+  assert_regular_unaliased "$path" "completed output"
+}
+
+write_output_text() {
+  local path="$1"
+  local mode="$2"
+  local content="$3"
+  open_output_file "$path" "$mode"
+  printf '%s' "$content" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
 }
 
 assert_regular_file() {
@@ -278,9 +406,10 @@ copy_regular_input() {
   local destination="$2"
   local mode="$3"
   assert_regular_unaliased "$source" "input"
-  assert_new_output_file "$destination"
   ensure_output_directory "$(dirname "$destination")"
-  install -m "$mode" -- "$source" "$destination"
+  open_output_file "$destination" "$mode"
+  cat -- "$source" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
   assert_regular_unaliased "$destination" "copied output"
 }
 
@@ -293,9 +422,10 @@ copy_verified_input() {
   assert_regular_file "$source" "trusted input"
   source_identity="$(output_identity "$source")"
   source_sha="$(sha256_file "$source")"
-  assert_new_output_file "$destination"
   ensure_output_directory "$(dirname "$destination")"
-  install -m "$mode" -- "$source" "$destination"
+  open_output_file "$destination" "$mode"
+  cat -- "$source" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
   assert_regular_file "$source" "trusted input after copy"
   [[ "$(output_identity "$source")" == "$source_identity" ]] ||
     die "trusted input identity changed during copy: $source"
@@ -334,22 +464,16 @@ write_sha256_manifest() {
   local relative
   assert_output_path "$root"
   assert_new_output_file "$output"
-  assert_new_output_file "$temporary"
   [[ "$output" == "$root/"* ]] || die "manifest must be written inside its scanned root"
   output_relative="./${output#"$root/"}"
   temporary_relative="$output_relative.tmp"
-  (
-    umask 077
-    set -o noclobber
-    : >"$temporary"
-  )
-  assert_regular_unaliased "$temporary" "manifest temporary"
+  open_output_file "$temporary" 0644
   while IFS= read -r -d '' relative; do
     [[ "$relative" != "$output_relative" && "$relative" != "$temporary_relative" ]] ||
       continue
-    printf '%s  %s\n' "$(sha256_file "$root/$relative")" "$relative" >>"$temporary"
+    printf '%s  %s\n' "$(sha256_file "$root/$relative")" "$relative" >&"$OPEN_OUTPUT_FD"
   done < <(cd "$root" && find . -type f -print0 | LC_ALL=C sort -z)
-  chmod 0644 "$temporary"
+  finish_output_file
   touch --date="@$SOURCE_DATE_EPOCH" "$temporary"
   publish_output_file "$temporary" "$output"
 }
@@ -357,7 +481,23 @@ write_sha256_manifest() {
 verify_sha256_manifest() {
   local root="$1"
   local manifest="$2"
+  local manifest_relative
+  local declared
+  local actual
   (cd "$root" && sha256sum -c "$manifest")
+  [[ "$manifest" == "$root/"* ]] || die "checksum manifest must be inside verified root"
+  manifest_relative="./${manifest#"$root/"}"
+  declared="$(
+    awk '{ sub(/^[0-9a-f]{64}  /, ""); print }' "$manifest" |
+      LC_ALL=C sort
+  )"
+  actual="$(
+    cd "$root"
+    find . -type f ! -path "$manifest_relative" -print |
+      LC_ALL=C sort
+  )"
+  [[ "$actual" == "$declared" ]] ||
+    die "checksum manifest file set does not exactly match verified root"
 }
 
 normalize_tree() {
@@ -377,13 +517,8 @@ create_deterministic_tar_gz() {
   assert_output_path "$source_parent/$source_name"
   reject_links_and_special_files "$source_parent/$source_name"
   assert_new_output_file "$output"
-  assert_new_output_file "$temporary"
-  (
-    umask 077
-    set -o noclobber
-    : >"$temporary"
-  )
-  identity="$(output_identity "$temporary")"
+  open_output_file "$temporary" 0644
+  identity="$OPEN_OUTPUT_ID"
   (
     cd "$source_parent"
     tar \
@@ -397,11 +532,11 @@ create_deterministic_tar_gz() {
       --numeric-owner \
       -cf - \
       "$source_name"
-  ) | gzip -n -9 >"$temporary"
+  ) | gzip -n -9 >&"$OPEN_OUTPUT_FD"
+  finish_output_file
   assert_regular_unaliased "$temporary" "tar temporary"
   [[ "$(output_identity "$temporary")" == "$identity" ]] ||
     die "tar temporary identity changed while writing"
-  chmod 0644 "$temporary"
   touch --date="@$SOURCE_DATE_EPOCH" "$temporary"
   publish_output_file "$temporary" "$output"
 }
@@ -450,6 +585,41 @@ validate_elf_arch() {
   esac
 }
 
+expected_elf_interpreter() {
+  case "$1" in
+    x86_64) printf '/lib64/ld-linux-x86-64.so.2\n' ;;
+    arm64) printf '/lib/ld-linux-aarch64.so.1\n' ;;
+    *) die "unsupported architecture for ELF interpreter: $1" ;;
+  esac
+}
+
+elf_interpreter() {
+  readelf -l "$1" |
+    sed -n 's/.*Requesting program interpreter: \([^]]*\)\].*/\1/p'
+}
+
+max_glibc_version() {
+  local maximum
+  maximum="$(
+    readelf --version-info "$1" |
+      grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' |
+      sed 's/^GLIBC_//' |
+      sort -V |
+      tail -1
+  )"
+  [[ -n "$maximum" ]] || die "ELF has no GLIBC version requirements: $1"
+  printf '%s\n' "$maximum"
+}
+
+validate_glibc_requirement() {
+  local binary="$1"
+  local maximum
+  maximum="$(max_glibc_version "$binary")"
+  if ! printf '%s\n%s\n' "$maximum" "$LINUX_GLIBC_CEILING" | sort -VC; then
+    die "ELF requires GLIBC $maximum above pinned ceiling $LINUX_GLIBC_CEILING: $binary"
+  fi
+}
+
 validate_elf_dependencies() {
   local binary="$1"
   local dependency
@@ -475,8 +645,21 @@ validate_elf_dependencies() {
 }
 
 validate_elf_binary() {
+  local elf_type
+  local interpreter
+  local expected
   validate_elf_arch "$1" "$2"
+  elf_type="$(readelf -h "$1" | awk -F: '/Type:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
+  [[ "$elf_type" == DYN* ]] || die "ELF is not PIE/ET_DYN: $1 ($elf_type)"
+  expected="$(expected_elf_interpreter "$2")"
+  interpreter="$(elf_interpreter "$1")"
+  [[ "$interpreter" == "$expected" ]] ||
+    die "ELF PT_INTERP mismatch for $1 (expected $expected, found $interpreter)"
+  if readelf -d "$1" | grep -Eq '\((RPATH|RUNPATH)\)'; then
+    die "ELF contains forbidden DT_RPATH/DT_RUNPATH: $1"
+  fi
   validate_elf_dependencies "$1"
+  validate_glibc_requirement "$1"
   if readelf -d "$1" | grep -Eiq 'slint|node|javascript|npm|pnpm|bun'; then
     die "forbidden dynamic dependency found in $1"
   fi

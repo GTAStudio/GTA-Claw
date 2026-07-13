@@ -1,0 +1,27 @@
+FROM rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a
+
+ARG DEBIAN_SNAPSHOT=20260701T000000Z
+
+RUN printf '%s\n' \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \
+      > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/* \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::Check-Valid-Until=false install --no-install-recommends -y \
+      binutils \
+      ca-certificates \
+      gcc \
+      gcc-aarch64-linux-gnu \
+      git \
+      jq \
+      libc6-dev \
+      libc6-dev-arm64-cross \
+      libgcc-s1 \
+      libgcc-s1-arm64-cross \
+      systemd \
+    && rustup target add --toolchain 1.97.0 aarch64-unknown-linux-gnu \
+    && rm -rf /var/lib/apt/lists/*
+
+LABEL org.opencontainers.image.source="https://github.com/GTAStudio/GTA-Claw" \
+      org.opencontainers.image.title="GTA Claw pinned Linux build environment" \
+      org.opencontainers.image.version="rust-1.97.0-bookworm"

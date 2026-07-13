@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in readelf sha256sum tar; do
+for tool in gcc patchelf readelf sha256sum tar; do
   require_tool "$tool"
 done
 initialize_output_root
@@ -47,6 +47,29 @@ expect_failure unsafe-output-absolute \
   bash -c "source '$common'; initialize_output_root"
 expect_failure unsafe-architecture \
   bash -c "source '$common'; arch_target '../arm64'"
+expect_failure cargo-target-relative \
+  bash -c "source '$common'; validate_new_private_root_path 'target/build' CARGO_TARGET_DIR"
+expect_failure cargo-target-traversal \
+  bash -c "source '$common'; validate_new_private_root_path '$REPO_ROOT/target/../escape' CARGO_TARGET_DIR"
+expect_failure cargo-target-outside \
+  bash -c "source '$common'; validate_new_private_root_path '/tmp/gta-claw-build' CARGO_TARGET_DIR"
+
+expect_success umask-000-private-root \
+  env OUTPUT_ROOT="$work/umask-000" bash -c "
+    umask 000
+    source '$common'
+    initialize_output_root
+    test \"\$(stat -c '%a' \"\$OUTPUT_ROOT\")\" = 700
+    test \"\$(stat -c '%a' \"\$OUTPUT_ROOT.lock\")\" = 700
+  "
+expect_success umask-002-private-root \
+  env OUTPUT_ROOT="$work/umask-002" bash -c "
+    umask 002
+    source '$common'
+    initialize_output_root
+    test \"\$(stat -c '%a' \"\$OUTPUT_ROOT\")\" = 700
+    test \"\$(stat -c '%a' \"\$OUTPUT_ROOT.lock\")\" = 700
+  "
 
 existing="$work/existing-output"
 mkdir "$existing"
@@ -83,6 +106,26 @@ expect_failure regular-output-collision \
     publish_output_file '$work/publish.tmp' '$work/publish.final'
   "
 
+write_output_text "$work/outside-sentinel" 0644 $'outside sentinel\n'
+expect_failure symlink-replacement-during-write \
+  env \
+    OUTPUT_ROOT="$work/swap-output" \
+    OUTSIDE_SENTINEL="$work/outside-sentinel" \
+    bash -c "
+      source '$common'
+      initialize_output_root
+      open_output_file \"\$OUTPUT_ROOT/payload\" 0644
+      mv \"\$OUTPUT_ROOT/payload\" \"\$OUTPUT_ROOT/displaced\"
+      ln -s \"\$OUTSIDE_SENTINEL\" \"\$OUTPUT_ROOT/payload\"
+      printf 'attacker-controlled bytes\n' >&\"\$OPEN_OUTPUT_FD\"
+      finish_output_file
+    "
+[[ "$(cat "$work/outside-sentinel")" == "outside sentinel" ]] ||
+  die "open-descriptor write followed a replacement symlink"
+[[ "$(cat "$work/swap-output/displaced")" == "attacker-controlled bytes" ]] ||
+  die "open-descriptor write did not remain bound to the reserved inode"
+tests=$((tests + 1))
+
 mkdir "$work/tree-with-link"
 ln -s "$work/hardlink-a" "$work/tree-with-link/link"
 expect_failure staged-symlink \
@@ -107,6 +150,44 @@ expect_failure traversal-archive bash -c "
 if [[ "$(uname -m)" == "x86_64" ]]; then
   expect_failure architecture-mismatch \
     bash -c "source '$common'; validate_elf_arch /bin/true arm64"
+
+  write_output_text "$work/hello.c" 0644 $'int main(void) { return 0; }\n'
+  gcc "$work/hello.c" -o "$work/hello-pie"
+  expect_success valid-pie \
+    bash -c "source '$common'; validate_elf_binary '$work/hello-pie' x86_64"
+
+  gcc -no-pie "$work/hello.c" -o "$work/hello-exec"
+  expect_failure elf-type \
+    bash -c "source '$common'; validate_elf_binary '$work/hello-exec' x86_64"
+
+  cp "$work/hello-pie" "$work/hello-interpreter"
+  patchelf --set-interpreter /tmp/evil-loader "$work/hello-interpreter"
+  expect_failure elf-interpreter \
+    bash -c "source '$common'; validate_elf_binary '$work/hello-interpreter' x86_64"
+
+  cp "$work/hello-pie" "$work/hello-runpath"
+  patchelf --set-rpath /tmp/evil-library "$work/hello-runpath"
+  expect_failure elf-runpath \
+    bash -c "source '$common'; validate_elf_binary '$work/hello-runpath' x86_64"
+
+  write_output_text "$work/glibc-version.map" 0644 \
+    $'GLIBC_9.99 { global: too_new; };\n'
+  write_output_text "$work/too-new.c" 0644 \
+    $'int too_new(void) { return 0; }\n'
+  write_output_text "$work/use-too-new.c" 0644 \
+    $'int too_new(void); int main(void) { return too_new(); }\n'
+  gcc -shared -fPIC \
+    -Wl,--version-script="$work/glibc-version.map" \
+    "$work/too-new.c" \
+    -o "$work/libtoo-new.so"
+  gcc \
+    "$work/use-too-new.c" \
+    -L"$work" \
+    -Wl,-rpath-link="$work" \
+    -ltoo-new \
+    -o "$work/use-too-new"
+  expect_failure glibc-ceiling \
+    bash -c "source '$common'; validate_glibc_requirement '$work/use-too-new'"
 fi
 
 mkdir "$work/forbidden-runtime"
