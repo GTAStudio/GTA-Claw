@@ -314,7 +314,10 @@ impl Error for SignatureError {}
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::Signer;
-    use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
+    use rand_chacha::{
+        ChaCha20Rng,
+        rand_core::{Rng, SeedableRng},
+    };
 
     use super::*;
     use crate::authorization::{ClientClass, Role, Scope, ScopeSet};
@@ -368,13 +371,18 @@ mod tests {
         let identity = DeviceIdentity::generate(&mut rng);
         let public = identity.public_key();
         let device_id = identity.device_id();
-        let signature = identity.sign_handshake(input(&device_id, b"nonce", b"challenge"));
+        let mut nonce = [0_u8; 16];
+        let mut challenge = [0_u8; 32];
+        rng.fill_bytes(&mut nonce);
+        rng.fill_bytes(&mut challenge);
+        let signature = identity.sign_handshake(input(&device_id, &nonce, &challenge));
 
         public
-            .verify_handshake(input(&device_id, b"nonce", b"challenge"), &signature)
+            .verify_handshake(input(&device_id, &nonce, &challenge), &signature)
             .expect("valid proof");
+        challenge[0] ^= 1;
         assert_eq!(
-            public.verify_handshake(input(&device_id, b"nonce", b"tampered"), &signature),
+            public.verify_handshake(input(&device_id, &nonce, &challenge), &signature),
             Err(SignatureError::VerificationFailed)
         );
     }
@@ -385,13 +393,20 @@ mod tests {
         let identity = DeviceIdentity::generate(&mut rng);
         let public = identity.public_key();
         let device_id = identity.device_id();
-        let signature = identity.sign_handshake(input(&device_id, b"ab", b"c"));
+        let mut combined = [0_u8; 3];
+        rng.fill_bytes(&mut combined);
+        let (nonce, challenge) = combined.split_at(2);
+        let signature = identity.sign_handshake(input(&device_id, nonce, challenge));
 
+        let (different_nonce, different_challenge) = combined.split_at(1);
         assert_eq!(
-            public.verify_handshake(input(&device_id, b"a", b"bc"), &signature),
+            public.verify_handshake(
+                input(&device_id, different_nonce, different_challenge),
+                &signature
+            ),
             Err(SignatureError::VerificationFailed)
         );
-        let mut changed = input(&device_id, b"ab", b"c");
+        let mut changed = input(&device_id, nonce, challenge);
         changed.protocol_version = 3;
         assert_eq!(
             public.verify_handshake(changed, &signature),
