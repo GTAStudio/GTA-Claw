@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
@@ -247,7 +248,12 @@ fn require(condition: bool, message: &'static str) -> Result<(), RegistrySourceE
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    encoded
 }
 
 #[derive(Debug)]

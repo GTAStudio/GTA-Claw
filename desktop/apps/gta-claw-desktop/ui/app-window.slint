@@ -1,40 +1,51 @@
-import { Button, VerticalBox } from "std-widgets.slint";
+import { ApplicationShell, PaneMode } from "@gta-ui/shell.slint";
+import { DesignTokens, StatusKind, ThemeMode, VisualPreferences } from "@gta-ui/tokens.slint";
+export { DesignTokens, VisualPreferences }
 
 export component AppWindow inherits Window {
     title: "GTA Claw";
-    width: 520px;
-    height: 300px;
+    preferred-width: 1240px;
+    preferred-height: 760px;
+    min-width: 720px;
+    min-height: 520px;
 
     in property <string> status-text: "Starting GTA Claw...";
+    in property <string> status-label: "Status";
+    in property <string> status-icon: "-";
+    in property <StatusKind> status-kind: StatusKind.neutral;
+    in property <bool> navigation-drawer-open: false;
+    in property <bool> inspector-open: false;
+    in property <length> layout-width: root.width;
+    in-out property <ThemeMode> theme-mode <=> VisualPreferences.theme-mode;
+    in-out property <bool> high-contrast <=> VisualPreferences.high-contrast;
+    in-out property <bool> reduced-motion <=> VisualPreferences.reduced-motion;
+    in-out property <float> density-scale <=> VisualPreferences.density-scale;
+    in property <PaneMode> pane-mode: PaneMode.three-pane;
+    in property <bool> inspector-backdrop-active: false;
+
     callback refresh-requested();
+    callback navigation-toggle-requested();
+    callback inspector-toggle-requested();
+    callback viewport-width-changed(float);
 
-    VerticalBox {
-        padding: 28px;
-        spacing: 18px;
+    changed layout-width => {
+        root.viewport-width-changed(root.layout-width / 1px);
+    }
 
-        Text {
-            text: "GTA Claw";
-            font-size: 28px;
-            font-weight: 700;
-        }
-
-        Text {
-            text: "Native desktop foundation";
-            font-size: 18px;
-        }
-
-        Text {
-            text: root.status-text;
-            wrap: word-wrap;
-            accessible-label: root.status-text;
-        }
-
-        Button {
-            text: "Refresh status";
-            accessible-label: "Refresh runtime status";
-            clicked => {
-                root.refresh-requested();
-            }
-        }
+    shell := ApplicationShell {
+        width: 100%;
+        height: 100%;
+        available-width: root.layout-width;
+        status-text: root.status-text;
+        status-label: root.status-label;
+        status-icon: root.status-icon;
+        status-kind: root.status-kind;
+        pane-mode: root.pane-mode;
+        navigation-drawer-open: root.navigation-drawer-open;
+        inspector-open: root.inspector-open;
+        inspector-backdrop-active: root.inspector-backdrop-active;
+        refresh-requested => { root.refresh-requested(); }
+        navigation-toggle-requested => { root.navigation-toggle-requested(); }
+        inspector-toggle-requested => { root.inspector-toggle-requested(); }
     }
 }

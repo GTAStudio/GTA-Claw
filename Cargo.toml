@@ -6,6 +6,7 @@ members = [
   "crates/claw-domain",
   "crates/claw-platform",
   "crates/claw-protocol",
+  "crates/claw-security",
 ]
 exclude = ["desktop"]
 resolver = "3"
@@ -15,10 +16,11 @@ claw-application = { path = "crates/claw-application", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
+claw-security = { path = "crates/claw-security", version = "0.1.0" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
 serde_path_to_error = "=0.1.20"
-sha2 = "=0.10.9"
+sha2 = "=0.11.0"
 
 [workspace.package]
 version = "0.1.0"
