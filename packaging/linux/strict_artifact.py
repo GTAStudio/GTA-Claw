@@ -52,6 +52,8 @@ def validate_json(path: str) -> None:
 
 
 def normalize_member(name: str) -> str:
+    if name in (".", "./"):
+        return ""
     if (
         "\x00" in name
         or "\\" in name
