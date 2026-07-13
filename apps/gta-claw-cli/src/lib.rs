@@ -7,6 +7,8 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use claw_application::Application;
@@ -38,30 +40,93 @@ const MAX_ARGUMENTS: usize = 32;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_OUTPUT_TEXT_BYTES: usize = 256;
 const MAX_SECRET_SOURCE_BYTES: usize = 4_096;
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Runs the CLI using process standard streams and returns its stable exit status.
+/// Runs the async CLI adapter with bounded process-output writes.
 pub async fn entrypoint(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
-    let result = dispatch(arguments.into_iter().collect()).await;
-    let exit_code = result.exit_code;
-    let write_result = if result.stdout.is_empty() {
-        Ok(())
-    } else {
-        io::stdout().lock().write_all(result.stdout.as_bytes())
-    }
-    .and_then(|()| {
-        if result.stderr.is_empty() {
-            Ok(())
-        } else {
-            io::stderr().lock().write_all(result.stderr.as_bytes())
-        }
-    });
+    write_rendered_result(dispatch(arguments.into_iter().collect()).await)
+}
 
-    let exit_code = if write_result.is_err() {
-        ExitCategory::Internal.code()
-    } else {
-        exit_code
+/// Runs the CLI with bounded async-runtime and process-output teardown.
+pub fn run_process(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
+    run_process_with(arguments, |_| {})
+}
+
+fn run_process_with(
+    arguments: impl IntoIterator<Item = OsString>,
+    initialize: impl FnOnce(&tokio::runtime::Runtime),
+) -> ExitCode {
+    run_process_with_builder(arguments, initialize, || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    })
+}
+
+fn run_process_with_builder(
+    arguments: impl IntoIterator<Item = OsString>,
+    initialize: impl FnOnce(&tokio::runtime::Runtime),
+    build_runtime: impl FnOnce() -> io::Result<tokio::runtime::Runtime>,
+) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return write_rendered_result(RenderedResult::failure(
+                ExitCategory::Internal,
+                "error: could not initialize the async runtime\n".to_owned(),
+            ));
+        }
     };
-    ExitCode::from(exit_code)
+    initialize(&runtime);
+    let result = runtime.block_on(dispatch(arguments.into_iter().collect()));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    write_rendered_result(result)
+}
+
+fn write_rendered_result(result: RenderedResult) -> ExitCode {
+    let intended_exit = result.exit_code;
+    let (completion, finished) = mpsc::sync_channel(1);
+    let writer = thread::Builder::new()
+        .name("gta-claw-cli-output".to_owned())
+        .spawn(move || {
+            let written = write_process_streams(&result);
+            let _ = completion.send(written);
+        });
+    let Ok(writer) = writer else {
+        return ExitCode::from(ExitCategory::Internal.code());
+    };
+    match finished.recv_timeout(OUTPUT_SHUTDOWN_TIMEOUT) {
+        Ok(Ok(())) => {
+            let _ = writer.join();
+            ExitCode::from(intended_exit)
+        }
+        Ok(Err(())) => {
+            let _ = writer.join();
+            ExitCode::from(ExitCategory::Internal.code())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+            ExitCode::from(ExitCategory::Internal.code())
+        }
+    }
+}
+
+fn write_process_streams(result: &RenderedResult) -> Result<(), ()> {
+    if !result.stdout.is_empty() {
+        let mut output = io::stdout().lock();
+        output
+            .write_all(result.stdout.as_bytes())
+            .and_then(|()| output.flush())
+            .map_err(|_| ())?;
+    }
+    if !result.stderr.is_empty() {
+        let mut error = io::stderr().lock();
+        error
+            .write_all(result.stderr.as_bytes())
+            .and_then(|()| error.flush())
+            .map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 async fn dispatch(arguments: Vec<OsString>) -> RenderedResult {
@@ -249,7 +314,12 @@ fn endpoint_origin_from_arguments(arguments: &[OsString]) -> Option<String> {
 }
 
 fn sanitized_origin(endpoint: &str) -> Option<String> {
-    if endpoint.len() > MAX_ENDPOINT_BYTES || contains_forbidden_endpoint_char(endpoint) {
+    if endpoint.len() > MAX_ENDPOINT_BYTES
+        || !endpoint.is_ascii()
+        || contains_forbidden_endpoint_char(endpoint)
+        || endpoint.contains('\\')
+        || endpoint.contains('%')
+    {
         return None;
     }
     let origin = Url::parse(endpoint).ok()?.origin().ascii_serialization();
@@ -266,8 +336,10 @@ fn validate_endpoint(
     allow_insecure_remote_ws: bool,
 ) -> Result<ValidatedEndpoint, DiagnosticFailure> {
     if endpoint.len() > MAX_ENDPOINT_BYTES
+        || !endpoint.is_ascii()
         || contains_forbidden_endpoint_char(endpoint)
         || endpoint.contains('\\')
+        || endpoint.contains('%')
     {
         return Err(DiagnosticFailure::usage(
             "invalid_endpoint_spelling",
@@ -302,7 +374,12 @@ fn validate_endpoint(
             "Gateway endpoint must not contain credentials, query data, or a fragment",
         ));
     }
-    validate_ascii_hostname_spelling(endpoint, &url)?;
+    if url.port() == Some(0) || canonical_endpoint_text(&url).as_deref() != Some(endpoint) {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint_spelling",
+            "Gateway endpoint spelling is not canonical",
+        ));
+    }
     if expected_scheme == "ws" && !allow_insecure_remote_ws && !is_loopback_host(url.host()) {
         return Err(DiagnosticFailure::usage(
             "insecure_remote_ws",
@@ -319,44 +396,42 @@ fn validate_endpoint(
     Ok(ValidatedEndpoint { url, origin })
 }
 
-fn validate_ascii_hostname_spelling(endpoint: &str, url: &Url) -> Result<(), DiagnosticFailure> {
-    let authority = endpoint
-        .split_once("://")
-        .map(|(_, remainder)| remainder)
-        .unwrap_or_default()
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    if authority.contains('%') {
-        return Err(DiagnosticFailure::usage(
-            "invalid_endpoint_spelling",
-            "Gateway endpoint spelling is not canonical",
-        ));
-    }
-    let raw_host = if authority.starts_with('[') {
-        return Ok(());
-    } else {
-        authority
-            .rsplit_once(':')
-            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-            .map_or(authority, |(host, _)| host)
+fn canonical_endpoint_text(url: &Url) -> Option<String> {
+    let host = match url.host()? {
+        Host::Domain(domain) if is_canonical_dns_name(domain) => domain.to_owned(),
+        Host::Domain(_) => return None,
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
     };
-    if raw_host
-        .chars()
-        .any(|character| character.is_ascii_uppercase())
-    {
-        return Err(DiagnosticFailure::usage(
-            "invalid_endpoint_spelling",
-            "Gateway endpoint spelling is not canonical",
-        ));
-    }
-    if raw_host.is_ascii() && url.host_str() != Some(raw_host) {
-        return Err(DiagnosticFailure::usage(
-            "invalid_endpoint_spelling",
-            "Gateway endpoint spelling is not canonical",
-        ));
-    }
-    Ok(())
+    let port = url
+        .port()
+        .map_or_else(String::new, |port| format!(":{port}"));
+    let path = match url.path() {
+        "/" => "",
+        path => path,
+    };
+    Some(format!("{}://{host}{port}{path}", url.scheme()))
+}
+
+fn is_canonical_dns_name(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && !domain.ends_with('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
 }
 
 fn is_loopback_host(host: Option<Host<&str>>) -> bool {
@@ -822,6 +897,12 @@ impl TryFrom<ConnectionInfo> for SafeConnectionInfo {
     type Error = DiagnosticFailure;
 
     fn try_from(info: ConnectionInfo) -> Result<Self, Self::Error> {
+        if info.role != "operator" || info.scopes.len() != 1 || info.scopes[0] != "operator.read" {
+            return Err(DiagnosticFailure::protocol(
+                "hello_authorization_mismatch",
+                "Gateway hello authorization claims do not match the diagnostic request",
+            ));
+        }
         validate_safe_output_text(&info.role)?;
         let mut scopes = BTreeSet::new();
         for scope in info.scopes.iter() {
@@ -1231,6 +1312,7 @@ impl RenderedResult {
 mod tests {
     use std::cell::Cell;
     use std::fmt::{self, Display, Formatter};
+    use std::process::{Command, Stdio};
 
     use super::*;
 
@@ -1267,6 +1349,57 @@ mod tests {
             destination.fill(0x5a);
             Ok(())
         }
+    }
+
+    #[test]
+    fn bounded_runtime_teardown_exits_a_subprocess_with_stuck_blocking_work() {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::stuck_blocking_work_subprocess_helper",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("helper process starts");
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("helper process status") {
+                assert!(status.success());
+                assert!(started.elapsed() < Duration::from_secs(2));
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                child.kill().expect("terminate hung helper");
+                panic!("runtime teardown exceeded its process bound");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for bounded runtime teardown"]
+    fn stuck_blocking_work_subprocess_helper() {
+        let exit = run_process_with(["health".into()], |runtime| {
+            runtime.spawn_blocking(|| {
+                loop {
+                    std::thread::park();
+                }
+            });
+        });
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn runtime_initialization_failure_is_typed_and_non_panicking() {
+        let exit = run_process_with_builder(
+            ["health".into()],
+            |_| {},
+            || Err(io::Error::other("injected runtime initialization failure")),
+        );
+        assert_eq!(exit, ExitCode::from(8));
     }
 
     #[test]
@@ -1355,11 +1488,21 @@ mod tests {
             "WS://127.0.0.1:9",
             "ws://LOCALHOST:9",
             "wss://例え.COM/socket",
+            "wss://ｅxample.com",
+            "wss://example。com",
+            "ws://[0:0:0:0:0:0:0:1]:9",
+            "wss://example.com:0443",
+            "wss://example.com:0",
+            "wss://example.com/a/../b",
+            "wss://example.com/%62",
+            "wss://example.com.",
+            "wss://example..com",
+            "wss://_foo.example",
         ] {
             assert!(validate_endpoint(endpoint, false).is_err(), "{endpoint:?}");
         }
         assert!(validate_endpoint("ws://[::1]:18789/socket", false).is_ok());
-        assert!(validate_endpoint("wss://例え.テスト/socket", false).is_ok());
+        assert!(validate_endpoint("wss://xn--r8jz45g.xn--zckzah/socket", false).is_ok());
     }
 
     #[test]

@@ -6,7 +6,16 @@ the authenticated Gateway v4 challenge/connect/hello flow, sends one
 `operator.read` `health` RPC, and performs a bounded clean shutdown.
 
 ```sh
-IFS= read -r -s GTA_CLAW_TOKEN
+restore_tty() { stty echo; }
+trap 'restore_tty' 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 131' 3
+trap 'exit 143' 15
+stty -echo
+IFS= read -r GTA_CLAW_TOKEN
+stty echo
+trap - 0 1 2 3 15
 gta-claw-cli gateway health \
   --endpoint wss://gateway.example.test \
   --ephemeral-device \
@@ -17,8 +26,10 @@ EOF
 unset GTA_CLAW_TOKEN
 ```
 
-This hidden prompt plus shell-managed standard input works in POSIX shells and
-the default macOS shell without putting the token in an external process argv.
+This POSIX `sh` sequence disables terminal echo, restores it on normal exit or
+signals, and uses shell-managed standard input without putting the token in an
+external process argv. It works with `dash`, other POSIX shells, and the default
+macOS shell. PowerShell can likewise prompt securely and write only to the CLI standard
 PowerShell can likewise prompt securely and write only to the CLI standard
 input:
 
@@ -45,7 +56,10 @@ rendered. Non-loopback plaintext `ws://` remains rejected unless
 `--allow-insecure-remote-ws` is explicitly supplied; `wss://` uses the client's
 rustls transport. Endpoint spelling rejects whitespace, invisible format/bidi
 characters, non-canonical ASCII host casing, credentials, query strings, and
-fragments before reading standard input.
+fragments before reading standard input. Host text is ASCII-only; international
+domains must use their lowercase canonical A-label (punycode) form. Ports use
+unpadded decimal values greater than zero, IPv6 uses compressed bracket form,
+and paths must contain no dot-segment or percent-normalization ambiguity.
 
 `--ephemeral-device` is mandatory. It generates a one-shot in-memory P03c
 Ed25519 identity and never persists the key or any device token returned by the

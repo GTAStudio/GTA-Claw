@@ -40,6 +40,10 @@ enum GatewayBehavior {
     MalformedResponse,
     OversizedResponse,
     ImmediateClose,
+    HelloClaims {
+        role: &'static str,
+        scopes: &'static [&'static str],
+    },
 }
 
 async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize>) -> TestGateway {
@@ -81,13 +85,18 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                 GatewayBehavior::OversizedResponse => ("test-gateway", 4, 1_024),
                 _ => ("test-gateway", 4, AUTHENTICATED_MAX_FRAME_BYTES),
             };
+            let (hello_role, hello_scopes) = match behavior {
+                GatewayBehavior::HelloClaims { role, scopes } => (role, scopes),
+                _ => ("operator", &["operator.read"][..]),
+            };
             send_hello(
                 &mut socket,
                 connect.id(),
-                &params,
                 server_version,
                 protocol,
                 max_payload,
+                hello_role,
+                hello_scopes,
             )
             .await;
             if matches!(behavior, GatewayBehavior::HelloProtocol(_)) {
@@ -99,6 +108,10 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                     .await
                     .expect("send immediate close");
                 socket.flush().await.expect("flush immediate close");
+                return;
+            }
+            if matches!(behavior, GatewayBehavior::HelloClaims { .. }) {
+                count_requests_until_close(&mut socket, &request_count).await;
                 return;
             }
 
@@ -163,7 +176,8 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                 GatewayBehavior::AuthenticationFailure
                 | GatewayBehavior::PairingRequired
                 | GatewayBehavior::HelloProtocol(_)
-                | GatewayBehavior::ImmediateClose => unreachable!("handled before health"),
+                | GatewayBehavior::ImmediateClose
+                | GatewayBehavior::HelloClaims { .. } => unreachable!("handled before health"),
             }
         }
     }))
@@ -219,21 +233,12 @@ fn connect_matches(params: &ConnectParams, expected_token: Option<&str>) -> bool
 async fn send_hello(
     socket: &mut support::TestSocket,
     id: &RequestId,
-    params: &ConnectParams,
     server_version: &str,
     protocol: u64,
     max_payload: usize,
+    role: &str,
+    scopes: &[&str],
 ) {
-    let role = params
-        .role
-        .as_ref()
-        .map_or("operator", |role| role.as_str());
-    let scopes = params.scopes.as_ref().map_or_else(Vec::new, |scopes| {
-        scopes
-            .iter()
-            .map(|scope| scope.as_str())
-            .collect::<Vec<_>>()
-    });
     send_json(
         socket,
         json!({
@@ -265,6 +270,19 @@ async fn send_hello(
         }),
     )
     .await;
+}
+
+async fn count_requests_until_close(socket: &mut support::TestSocket, request_count: &AtomicUsize) {
+    loop {
+        match socket.read_frame().await {
+            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {
+                request_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 async fn send_health(socket: &mut support::TestSocket, id: &str, ok: bool) {
@@ -337,6 +355,7 @@ async fn run_cli_with_open_stdin(arguments: Vec<OsString>) -> (Output, Duration)
 }
 
 fn gateway_arguments(url: &str) -> Vec<OsString> {
+    let url = url.strip_suffix('/').unwrap_or(url);
     [
         "gateway",
         "health",
@@ -517,7 +536,11 @@ async fn no_token_is_explicit_and_wrong_token_is_rejected_by_the_server() {
         "gateway",
         "health",
         "--endpoint",
-        gateway.url.as_str(),
+        gateway
+            .url
+            .as_str()
+            .strip_suffix('/')
+            .expect("root endpoint"),
         "--ephemeral-device",
         "--json",
     ]
@@ -571,6 +594,32 @@ async fn immediate_post_hello_disconnect_is_stably_transport_failure() {
         assert_eq!(summary["category"], "transport_transient");
         assert_eq!(summary["status"], "transport_failure");
         gateway.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unexpected_hello_role_or_scopes_are_protocol_failures_without_health_rpc() {
+    for (role, scopes) in [
+        ("operator", &[][..]),
+        ("operator", &["operator.admin"][..]),
+        ("operator", &["operator.read", "operator.admin"][..]),
+        ("node", &["operator.read"][..]),
+    ] {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let gateway = spawn_gateway(
+            GatewayBehavior::HelloClaims { role, scopes },
+            Arc::clone(&request_count),
+        )
+        .await;
+        let output = run_cli(
+            gateway_arguments(gateway.url.as_str()),
+            Some(&format!("{TOKEN}\n")),
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(5));
+        assert_eq!(parse_json(&output)["category"], "protocol");
+        gateway.shutdown().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -669,6 +718,16 @@ async fn invalid_or_insecure_endpoints_exit_before_reading_stdin() {
         "WS://127.0.0.1:9",
         "ws://LOCALHOST:9",
         "wss://例え.COM/socket",
+        "wss://ｅxample.com",
+        "wss://example。com",
+        "ws://[0:0:0:0:0:0:0:1]:9",
+        "wss://example.com:0443",
+        "wss://example.com:0",
+        "wss://example.com/a/../b",
+        "wss://example.com/%62",
+        "wss://example.com.",
+        "wss://example..com",
+        "wss://_foo.example",
         "ws://192.0.2.1:18789",
     ] {
         let (output, elapsed) = run_cli_with_open_stdin(gateway_arguments(endpoint)).await;
@@ -680,7 +739,7 @@ async fn invalid_or_insecure_endpoints_exit_before_reading_stdin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_resolving_dns_cannot_hold_the_process_past_its_bound() {
-    let mut arguments = gateway_arguments("wss://never-resolves.invalid:443");
+    let mut arguments = gateway_arguments("wss://never-resolves.invalid");
     arguments.extend([OsString::from("--timeout-ms"), OsString::from("300")]);
     let started = Instant::now();
     let output = run_cli(arguments, Some(&format!("{TOKEN}\n"))).await;
