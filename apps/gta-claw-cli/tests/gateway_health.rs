@@ -14,8 +14,9 @@ use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, ConnectParams, RequestId,
 };
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt as _;
-use tokio::process::Command;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::process::{Child, Command};
+use tokio::sync::Notify;
 
 use support::{
     TestGateway, handler, receive_connect, receive_request, send_challenge, send_connect_error,
@@ -37,9 +38,12 @@ enum GatewayBehavior {
     HealthNegative,
     HealthRpcFailure,
     HealthTimeout,
+    HealthThenClose,
     MalformedResponse,
     OversizedResponse,
-    ImmediateClose,
+    ImmediateClose {
+        close_sent: Arc<Notify>,
+    },
     HelloClaims {
         role: &'static str,
         scopes: &'static [&'static str],
@@ -102,12 +106,14 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
             if matches!(behavior, GatewayBehavior::HelloProtocol(_)) {
                 return;
             }
-            if matches!(behavior, GatewayBehavior::ImmediateClose) {
+            if let GatewayBehavior::ImmediateClose { close_sent } = &behavior {
                 socket
                     .write_frame(fastwebsockets::Frame::close(1000, b"diagnostic close"))
                     .await
                     .expect("send immediate close");
                 socket.flush().await.expect("flush immediate close");
+                close_sent.notify_waiters();
+                count_requests_until_close(&mut socket, &request_count).await;
                 return;
             }
             if matches!(behavior, GatewayBehavior::HelloClaims { .. }) {
@@ -165,6 +171,15 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                     wait_for_close(&mut socket).await;
                 }
                 GatewayBehavior::HealthTimeout => wait_for_close(&mut socket).await,
+                GatewayBehavior::HealthThenClose => {
+                    send_health(&mut socket, request.id().as_str(), true).await;
+                    socket
+                        .write_frame(fastwebsockets::Frame::close(1000, b"response complete"))
+                        .await
+                        .expect("send close after health");
+                    socket.flush().await.expect("flush response close");
+                    count_requests_until_close(&mut socket, &request_count).await;
+                }
                 GatewayBehavior::MalformedResponse => {
                     send_raw_text(&mut socket, b"{not-json".to_vec()).await;
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -176,7 +191,7 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                 GatewayBehavior::AuthenticationFailure
                 | GatewayBehavior::PairingRequired
                 | GatewayBehavior::HelloProtocol(_)
-                | GatewayBehavior::ImmediateClose
+                | GatewayBehavior::ImmediateClose { .. }
                 | GatewayBehavior::HelloClaims { .. } => unreachable!("handled before health"),
             }
         }
@@ -328,10 +343,7 @@ async fn run_cli(arguments: Vec<OsString>, stdin: Option<&str>) -> Output {
             .expect("write token stdin");
         drop(pipe);
     }
-    tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
-        .await
-        .expect("CLI process timeout")
-        .expect("CLI process output")
+    collect_child_output(child, Duration::from_secs(8), "CLI process").await
 }
 
 async fn run_cli_with_open_stdin(arguments: Vec<OsString>) -> (Output, Duration) {
@@ -345,13 +357,48 @@ async fn run_cli_with_open_stdin(arguments: Vec<OsString>) -> (Output, Duration)
     let mut child = command.spawn().expect("CLI process starts");
     let open_stdin = child.stdin.take().expect("open stdin pipe");
     let started = Instant::now();
-    let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
-        .await
-        .expect("CLI must exit before reading invalid input")
-        .expect("CLI process output");
+    let output =
+        collect_child_output(child, Duration::from_secs(3), "invalid-input CLI process").await;
     let elapsed = started.elapsed();
     drop(open_stdin);
     (output, elapsed)
+}
+
+async fn collect_child_output(mut child: Child, limit: Duration, label: &str) -> Output {
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.expect("read stdout");
+        bytes
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.expect("read stderr");
+        bytes
+    });
+    let status = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(status) => status.expect("CLI process status"),
+        Err(_) => {
+            child.start_kill().expect("terminate timed-out CLI");
+            let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .expect("reap timed-out CLI")
+                .expect("timed-out CLI status");
+            let stdout = stdout_task.await.expect("stdout task");
+            let stderr = stderr_task.await.expect("stderr task");
+            panic!(
+                "{label} exceeded {limit:?}: status={status} stdout={} stderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    };
+    Output {
+        status,
+        stdout: stdout_task.await.expect("stdout task"),
+        stderr: stderr_task.await.expect("stderr task"),
+    }
 }
 
 fn gateway_arguments(url: &str) -> Vec<OsString> {
@@ -578,22 +625,58 @@ async fn no_token_is_explicit_and_wrong_token_is_rejected_by_the_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn immediate_post_hello_disconnect_is_stably_transport_failure() {
-    for _ in 0..8 {
+    for iteration in 0..100 {
+        let close_sent = Arc::new(Notify::new());
+        let request_count = Arc::new(AtomicUsize::new(0));
         let gateway = spawn_gateway(
-            GatewayBehavior::ImmediateClose,
-            Arc::new(AtomicUsize::new(0)),
+            GatewayBehavior::ImmediateClose {
+                close_sent: Arc::clone(&close_sent),
+            },
+            Arc::clone(&request_count),
         )
         .await;
-        let output = run_cli(
-            gateway_arguments(gateway.url.as_str()),
-            Some(&format!("{TOKEN}\n")),
-        )
-        .await;
+        let close_notification = close_sent.notified();
+        tokio::pin!(close_notification);
+        let token_input = format!("{TOKEN}\n");
+        let running = run_cli(gateway_arguments(gateway.url.as_str()), Some(&token_input));
+        tokio::pin!(running);
+        tokio::select! {
+            biased;
+            () = &mut close_notification => {}
+            output = &mut running => {
+                panic!(
+                    "iteration {iteration} exited before server close barrier: status={} stdout={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let output = running.await;
         assert_eq!(output.status.code(), Some(3));
         let summary = parse_json(&output);
         assert_eq!(summary["category"], "transport_transient");
         assert_eq!(summary["status"], "transport_failure");
         gateway.shutdown().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn health_response_wins_a_following_close_without_replay() {
+    for _ in 0..25 {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let gateway =
+            spawn_gateway(GatewayBehavior::HealthThenClose, Arc::clone(&request_count)).await;
+        let output = run_cli(
+            gateway_arguments(gateway.url.as_str()),
+            Some(&format!("{TOKEN}\n")),
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parse_json(&output)["status"], "healthy");
+        gateway.shutdown().await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 }
 

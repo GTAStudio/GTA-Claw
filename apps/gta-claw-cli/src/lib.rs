@@ -712,10 +712,17 @@ async fn request_health(
     request_id: RequestId,
     method: GatewayMethodName,
 ) -> Result<ResponseFrame, DiagnosticFailure> {
+    let mut states = client.subscribe_state();
+    if let Some(failure) = terminal_state_failure(states.borrow().clone()) {
+        return Err(failure);
+    }
+    tokio::task::yield_now().await;
+    if let Some(failure) = terminal_state_failure(states.borrow().clone()) {
+        return Err(failure);
+    }
     let params = EmptyParams {};
     let request = client.request(request_id, method, &params);
     tokio::pin!(request);
-    let mut states = client.subscribe_state();
     loop {
         tokio::select! {
             biased;
@@ -753,10 +760,10 @@ async fn classify_request_error(
     let mut states = client.subscribe_state();
     loop {
         let state = states.borrow().clone();
-        if let Some(failure) = terminal_state_failure(state) {
+        if let Some(failure) = terminal_state_failure(state.clone()) {
             return failure;
         }
-        match states.borrow().clone() {
+        match state {
             ConnectionState::Starting
             | ConnectionState::Connecting
             | ConnectionState::Authenticating
