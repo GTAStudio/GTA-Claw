@@ -1,0 +1,141 @@
+export enum ThemeMode {
+    light,
+    dark,
+}
+
+export enum StatusKind {
+    neutral,
+    success,
+    warning,
+    danger,
+    info,
+}
+
+export global VisualPreferences {
+    in-out property <ThemeMode> theme-mode: ThemeMode.light;
+    in-out property <bool> high-contrast: false;
+    in-out property <bool> reduced-motion: false;
+    in-out property <float> density-scale: 1.0;
+
+    callback theme-mode-requested(ThemeMode);
+    callback high-contrast-requested(bool);
+    callback reduced-motion-requested(bool);
+    callback density-scale-requested(float);
+}
+
+export global DesignTokens {
+    out property <color> surface-app: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #000000 : #ffffff)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #0d1412 : #f3f7f5);
+    out property <color> surface-pane: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #000000 : #ffffff)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #141d1a : #ffffff);
+    out property <color> surface-raised: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #101010 : #ffffff)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #1a2521 : #fbfdfc);
+    out property <color> surface-subtle: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #1b1b1b : #eeeeee)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #202e29 : #e8f0ed);
+    out property <color> surface-overlay: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #000000 : #ffffff)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #111a18f7 : #fffffff7);
+
+    out property <color> text-primary: VisualPreferences.theme-mode == ThemeMode.dark ? #f0f7f4 : #14211e;
+    out property <color> text-secondary: VisualPreferences.high-contrast
+        ? DesignTokens.text-primary
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #b6c8c2 : #425952);
+    out property <color> text-muted: VisualPreferences.high-contrast
+        ? DesignTokens.text-primary
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #8da39c : #657a73);
+    out property <color> text-inverse: VisualPreferences.theme-mode == ThemeMode.dark ? #111916 : #ffffff;
+    out property <color> text-link: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #64ffff : #0000cc)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #68d8c2 : #126f64);
+
+    out property <color> border-default: VisualPreferences.high-contrast
+        ? DesignTokens.text-primary
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #344640 : #cad8d3);
+    out property <color> border-strong: VisualPreferences.high-contrast
+        ? DesignTokens.text-primary
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #5a7068 : #8da19a);
+    out property <color> focus-ring: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #ffff00 : #0000ff)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #7de3ce : #0e7669);
+
+    out property <color> accent: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #64ffff : #0050c8)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #55d6bd : #147d6f);
+    out property <color> accent-hover: VisualPreferences.theme-mode == ThemeMode.dark ? #79e6d0 : #0f695e;
+    out property <color> accent-pressed: VisualPreferences.theme-mode == ThemeMode.dark ? #3bbda5 : #0a554c;
+    out property <color> accent-surface: VisualPreferences.high-contrast
+        ? DesignTokens.surface-pane
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #173a34 : #d9f3ed);
+    out property <color> accent-on: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #000000 : #ffffff)
+        : #ffffff;
+
+    out property <color> success: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #75ff75 : #006b22)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #61d47f : #267a42);
+    out property <color> success-surface: VisualPreferences.high-contrast
+        ? DesignTokens.surface-pane
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #183523 : #e1f4e6);
+    out property <color> warning: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #ffff00 : #704900)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #f0bd55 : #9a650e);
+    out property <color> warning-surface: VisualPreferences.high-contrast
+        ? DesignTokens.surface-pane
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #3a2d14 : #fff0cf);
+    out property <color> danger: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #ff8080 : #a00000)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #f17b7b : #b53b3b);
+    out property <color> danger-hover: VisualPreferences.theme-mode == ThemeMode.dark ? #ff9292 : #9d3030;
+    out property <color> danger-pressed: VisualPreferences.theme-mode == ThemeMode.dark ? #d76565 : #812626;
+    out property <color> danger-surface: VisualPreferences.high-contrast
+        ? DesignTokens.surface-pane
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #3b2020 : #fde5e5);
+    out property <color> info: VisualPreferences.high-contrast
+        ? (VisualPreferences.theme-mode == ThemeMode.dark ? #79c8ff : #004ba8)
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #69b9ec : #2e72a6);
+    out property <color> info-surface: VisualPreferences.high-contrast
+        ? DesignTokens.surface-pane
+        : (VisualPreferences.theme-mode == ThemeMode.dark ? #172f40 : #e2f1fb);
+}
+
+export global Metrics {
+    private property <float> density: clamp(VisualPreferences.density-scale, 0.85, 1.35);
+
+    out property <length> space-1: 4px * Metrics.density;
+    out property <length> space-2: 8px * Metrics.density;
+    out property <length> space-3: 12px * Metrics.density;
+    out property <length> space-4: 16px * Metrics.density;
+    out property <length> space-6: 24px * Metrics.density;
+    out property <length> space-8: 32px * Metrics.density;
+    out property <length> space-12: 48px * Metrics.density;
+
+    out property <length> radius-small: 4px * Metrics.density;
+    out property <length> radius-medium: 8px * Metrics.density;
+    out property <length> radius-large: 12px * Metrics.density;
+    out property <length> radius-pill: 999px;
+
+    out property <length> type-caption: 11px * Metrics.density;
+    out property <length> type-small: 13px * Metrics.density;
+    out property <length> type-body: 15px * Metrics.density;
+    out property <length> type-title: 18px * Metrics.density;
+    out property <length> type-display: 26px * Metrics.density;
+    out property <length> line-caption: 16px * Metrics.density;
+    out property <length> line-body: 22px * Metrics.density;
+    out property <length> line-title: 26px * Metrics.density;
+
+    out property <length> control-small: 28px * Metrics.density;
+    out property <length> control-medium: 36px * Metrics.density;
+    out property <length> control-large: 44px * Metrics.density;
+    out property <length> touch-target: 48px * Metrics.density;
+
+    out property <length> focus-width: VisualPreferences.high-contrast ? 3px : 2px;
+    out property <length> focus-offset: 2px;
+
+    out property <duration> motion-fast: VisualPreferences.reduced-motion ? 0ms : 90ms;
+    out property <duration> motion-standard: VisualPreferences.reduced-motion ? 0ms : 160ms;
+    out property <duration> motion-deliberate: VisualPreferences.reduced-motion ? 0ms : 240ms;
+}

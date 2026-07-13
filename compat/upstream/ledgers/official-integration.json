@@ -1,0 +1,360 @@
+﻿{
+    "schema_version":  1,
+    "ledger_id":  "official-integration",
+    "classification":  "official_integration",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "features":  [
+                     {
+                         "feature_id":  "integration.plugins.core",
+                         "title":  "Core plugin inventory",
+                         "domain":  "plugins",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/plugins/plugin-inventory.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Exactly 64 core plugin contracts have Rust registration or explicit compatibility stubs."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.plugins.official-external",
+                         "title":  "Official external plugin inventory",
+                         "domain":  "plugins",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/plugins/plugin-inventory.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Exactly 70 official external plugin contracts have install and compatibility decisions."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.plugins.source-qa",
+                         "title":  "Source-only QA plugin inventory",
+                         "domain":  "plugins",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/plugins/plugin-inventory.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Exactly three source-only QA plugin contracts are represented in test tooling."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.skills.bundled",
+                         "title":  "Bundled skill inventory",
+                         "domain":  "skills",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "skills"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Exactly 51 bundled skill manifests are discoverable with Rust-native loading tests."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.providers",
+                         "title":  "Provider registry",
+                         "domain":  "providers",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions",
+                                                               "scripts/lib/official-external-provider-catalog.json"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Provider inventory IDs, aliases, configuration, auth, and capability routing pass fixtures."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.channels",
+                         "title":  "Channel registry",
+                         "domain":  "channels",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions",
+                                                               "scripts/lib/official-external-channel-catalog.json"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Channel inventory IDs, account routing, inbound/outbound, commands, and lifecycle contracts pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.clawhub.lifecycle",
+                         "title":  "ClawHub lifecycle",
+                         "domain":  "marketplace",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/plugins/clawhub.ts",
+                                                               "src/skills/lifecycle/clawhub.ts",
+                                                               "src/infra/clawhub-install-trust.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Search, install, update, publish, risk acknowledgement, trust, and uninstall tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.fleet",
+                         "title":  "Fleet cell lifecycle",
+                         "domain":  "fleet",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/fleet/registry.ts",
+                                                               "src/fleet/containers.runtime.ts",
+                                                               "docs/cli/fleet.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Create, status, logs, backup, doctor, and remove tests pass for local container cells."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.discovery.dns-sd",
+                         "title":  "Bonjour and DNS-SD discovery",
+                         "domain":  "discovery",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/bonjour/src/advertiser.ts",
+                                                               "src/infra/bonjour-discovery.ts",
+                                                               "src/infra/widearea-dns.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "mDNS advertise/discover and wide-area DNS-SD fixtures match pinned TXT and resolution contracts."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.discovery.ssh",
+                         "title":  "SSH discovery and tunnels",
+                         "domain":  "discovery",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/infra/ssh-config.ts",
+                                                               "src/infra/ssh-tunnel.ts",
+                                                               "src/gateway/node-pairing-ssh-verify.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "SSH config, host-key, pairing verification, and tunnel lifecycle tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.discovery.tailscale",
+                         "title":  "Tailscale exposure and discovery",
+                         "domain":  "discovery",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/infra/tailscale.ts",
+                                                               "src/gateway/server-tailscale.ts",
+                                                               "docs/gateway/tailscale.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Serve/Funnel, auth policy, status, and cleanup tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.webhooks",
+                         "title":  "Authenticated TaskFlow webhooks",
+                         "domain":  "webhooks",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/webhooks/src/config.ts",
+                                                               "extensions/webhooks/src/http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Configurable route, secret, replay, body-limit, session binding, and TaskFlow dispatch tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "integration.release-deployment",
+                         "title":  "Release and deployment surfaces",
+                         "domain":  "release",
+                         "tier":  "tier_3",
+                         "profile":  "platform_integration",
+                         "classification":  "official_integration",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               ".github/workflows/openclaw-release-publish.yml",
+                                                               "docs/install/index.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Reproducible Rust release artifacts and deployment smoke evidence exist for every inventoried surface."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     }
+                 ]
+}

@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "background": "#13233F",
+  "foreground": "#F4F7FB",
+  "mark": {
+    "outerInsetPercent": 20,
+    "barWidthPercent": 14,
+    "gapPercent": 10
+  }
+}

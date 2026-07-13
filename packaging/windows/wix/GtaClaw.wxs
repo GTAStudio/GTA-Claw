@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="GTA Claw"
+    Manufacturer="GTAStudio"
+    Version="$(var.ProductVersion)"
+    ProductCode="$(var.ProductCode)"
+    UpgradeCode="$(var.UpgradeCode)"
+    Language="1033"
+    Codepage="1252"
+    Scope="perMachine"
+    InstallerVersion="500"
+    Compressed="yes">
+    <SummaryInformation Description="GTA Claw Windows installer prototype" />
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of GTA Claw is already installed."
+      Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="ManufacturerFolder" Name="GTAStudio">
+        <Directory Id="INSTALLFOLDER" Name="GTA Claw">
+          <Directory Id="HEADLESSFOLDER" Name="headless" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="LicenseFile" Directory="INSTALLFOLDER" Guid="$(var.LicenseComponentGuid)">
+      <File Id="LicenseTxt" Source="$(var.StageDir)\LICENSE.txt" KeyPath="yes" />
+    </Component>
+    <Component Id="NonReleaseMarker" Directory="INSTALLFOLDER" Guid="$(var.NonReleaseComponentGuid)">
+      <File Id="NonReleaseTxt" Source="$(var.StageDir)\NON-RELEASE.txt" KeyPath="yes" />
+    </Component>
+    <Component Id="HashManifest" Directory="INSTALLFOLDER" Guid="$(var.HashManifestComponentGuid)">
+      <File Id="Sha256SumsTxt" Source="$(var.StageDir)\SHA256SUMS.txt" KeyPath="yes" />
+    </Component>
+    <Component Id="DesktopExecutable" Directory="INSTALLFOLDER" Guid="$(var.DesktopComponentGuid)">
+      <File Id="DesktopExe" Source="$(var.StageDir)\gta-claw-desktop.exe" KeyPath="yes" />
+    </Component>
+    <Component Id="CliExecutable" Directory="HEADLESSFOLDER" Guid="$(var.CliComponentGuid)">
+      <File Id="CliExe" Source="$(var.StageDir)\gta-claw-cli.exe" KeyPath="yes" />
+    </Component>
+    <Component Id="DaemonExecutable" Directory="HEADLESSFOLDER" Guid="$(var.DaemonComponentGuid)">
+      <File Id="DaemonExe" Source="$(var.StageDir)\gta-claw-daemon.exe" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="GTAClaw" Title="GTA Claw" Level="1" ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentRef Id="LicenseFile" />
+      <ComponentRef Id="NonReleaseMarker" />
+      <ComponentRef Id="HashManifest" />
+      <Feature Id="Gui" Title="Desktop application" Description="Install the native GTA Claw GUI." Level="1">
+        <ComponentRef Id="DesktopExecutable" />
+      </Feature>
+      <Feature Id="Headless" Title="Headless tools" Description="Install the CLI and daemon executables." Level="1">
+        <ComponentRef Id="CliExecutable" />
+        <ComponentRef Id="DaemonExecutable" />
+      </Feature>
+    </Feature>
+  </Package>
+</Wix>
