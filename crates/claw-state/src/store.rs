@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::io::{Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,21 +35,6 @@ const MIGRATIONS: &[Migration] = &[Migration {
     sql: include_str!("../migrations/0001_initial.sql"),
     destructive: false,
 }];
-
-const LATEST_SCHEMA_OBJECTS: &[(&str, &str, &str)] = &[
-    (
-        "index",
-        "authentication_records_device_order",
-        "authentication_records",
-    ),
-    ("index", "tasks_session_order", "tasks"),
-    ("table", "authentication_records", "authentication_records"),
-    ("table", "claw_schema_migrations", "claw_schema_migrations"),
-    ("table", "claw_writer_lock", "claw_writer_lock"),
-    ("table", "devices", "devices"),
-    ("table", "sessions", "sessions"),
-    ("table", "tasks", "tasks"),
-];
 
 /// SQLite durability policy applied to every connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +172,7 @@ pub struct StateStore {
     recovered_writer: Option<RecoveredWriterLock>,
     pool: SqlitePool,
     lock_file: File,
+    _database_file: File,
     max_connections: u32,
 }
 
@@ -194,18 +181,19 @@ impl StateStore {
     pub async fn open(config: StoreConfig) -> Result<Self, StateError> {
         validate_config(&config)?;
         let path = resolve_database_path(&config.path)?;
-        ensure_database_file(&path)?;
-        reject_hard_link(&path)?;
-        inspect_database(&path, false).await?;
+        let database_file = open_database_file(&path)?;
+        verify_path_identity(&path, &database_file)?;
+        reject_hard_link(&path, &database_file)?;
+        inspect_database(&path, &database_file, false).await?;
         prepare_windows_database_identity(&path)?;
-        let lock_path = lock_path_for(&path);
-        let lock_file = acquire_writer_lock(&lock_path)?;
+        let (lock_path, lock_file) = acquire_store_lock(&path, &database_file)?;
         let owner = writer_owner()?;
-        let locked_state = inspect_database(&path, false).await?;
+        verify_path_identity(&path, &database_file)?;
+        let locked_state = inspect_database(&path, &database_file, false).await?;
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
-            .create_if_missing(true)
+            .create_if_missing(false)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
             .busy_timeout(config.busy_timeout)
@@ -216,19 +204,27 @@ impl StateStore {
             .connect_with(options)
             .await
             .map_err(|error| database("open state database", error))?;
+        if let Err(error) = verify_path_identity(&path, &database_file) {
+            pool.close().await;
+            return Err(error);
+        }
 
         let mut recovered_writer = None;
-        if matches!(locked_state, InspectedDatabase::Existing { .. }) {
+        let writer_table_existed = matches!(
+            locked_state,
+            InspectedDatabase::Existing { schema_version } if schema_version >= 1
+        );
+        if writer_table_existed {
             recovered_writer = claim_application_lock(&pool, &owner).await?;
         }
         if let Err(error) = initialize_database(&pool, &path, locked_state).await {
-            if matches!(locked_state, InspectedDatabase::Existing { .. }) {
+            if writer_table_existed {
                 restore_application_lock(&pool, &owner, recovered_writer.as_ref()).await?;
             }
             pool.close().await;
             return Err(error);
         }
-        if matches!(locked_state, InspectedDatabase::Fresh) {
+        if !writer_table_existed {
             recovered_writer = claim_application_lock(&pool, &owner).await?;
         }
         Ok(Self {
@@ -238,6 +234,7 @@ impl StateStore {
             recovered_writer,
             pool,
             lock_file,
+            _database_file: database_file,
             max_connections: config.max_connections,
         })
     }
@@ -313,13 +310,17 @@ impl StateStore {
         backup: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> Result<(), StateError> {
-        let backup = backup.as_ref();
+        let backup = resolve_database_path(backup.as_ref())?;
+        let backup_file = open_existing_file_no_follow(&backup)?;
+        verify_path_identity(&backup, &backup_file)?;
+        reject_hard_link(&backup, &backup_file)?;
+        validate_windows_restore_identity(&backup)?;
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
         ensure_database_artifacts_absent(&destination)?;
         let temporary = snapshot_temporary_path(&destination, "restore")?;
-        snapshot_database(backup, &temporary).await?;
+        snapshot_database(&backup, &backup_file, &temporary).await?;
         if let Err(error) = clear_backup_writer_lock(&temporary).await {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
@@ -426,9 +427,30 @@ fn validate_config(config: &StoreConfig) -> Result<(), StateError> {
 }
 
 fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
-    if path.exists() {
-        return std::fs::canonicalize(path)
-            .map_err(|error| file_error("canonicalize state database", path, error));
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StateError::InvalidPath {
+                path: path.to_owned(),
+                reason: "symbolic-link database paths are not supported",
+            });
+        }
+        Ok(_) => {
+            let file_name = path.file_name().ok_or_else(|| StateError::InvalidPath {
+                path: path.to_owned(),
+                reason: "must include a database file name",
+            })?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|error| file_error("canonicalize state directory", parent, error))?;
+            return Ok(canonical_parent.join(file_name));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(file_error("inspect state database path", path, error));
+        }
     }
     let file_name = path.file_name().ok_or_else(|| StateError::InvalidPath {
         path: path.to_owned(),
@@ -443,26 +465,49 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
     Ok(canonical_parent.join(file_name))
 }
 
-fn ensure_database_file(path: &Path) -> Result<(), StateError> {
+#[cfg(unix)]
+fn open_database_file(path: &Path) -> Result<File, StateError> {
+    let exists = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StateError::InvalidPath {
+                path: path.to_owned(),
+                reason: "symbolic-link database paths are not supported",
+            });
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(file_error("inspect state database path", path, error)),
+    };
+    let mut flags =
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
+    if !exists {
+        flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
+    }
+    rustix::fs::open(path, flags, rustix::fs::Mode::from_bits_retain(0o600))
+        .map(File::from)
+        .map_err(|error| file_error("open state database file", path, error.into()))
+}
+
+#[cfg(not(unix))]
+fn open_database_file(path: &Path) -> Result<File, StateError> {
     OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)
-        .map(|_| ())
         .map_err(|error| file_error("open state database file", path, error))
 }
 
 #[cfg(unix)]
-fn reject_hard_link(path: &Path) -> Result<(), StateError> {
+fn reject_hard_link(path: &Path, file: &File) -> Result<(), StateError> {
     use std::os::unix::fs::MetadataExt as _;
 
-    if path.exists()
-        && std::fs::metadata(path)
-            .map_err(|error| file_error("inspect state database links", path, error))?
-            .nlink()
-            > 1
+    if file
+        .metadata()
+        .map_err(|error| file_error("inspect state database links", path, error))?
+        .nlink()
+        > 1
     {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
@@ -473,8 +518,90 @@ fn reject_hard_link(path: &Path) -> Result<(), StateError> {
 }
 
 #[cfg(not(unix))]
-fn reject_hard_link(_path: &Path) -> Result<(), StateError> {
+fn reject_hard_link(_path: &Path, _file: &File) -> Result<(), StateError> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn verify_path_identity(path: &Path, file: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path_metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| file_error("verify state database path", path, error))?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "symbolic-link database paths are not supported",
+        });
+    }
+    let file_metadata = file
+        .metadata()
+        .map_err(|error| file_error("verify state database handle", path, error))?;
+    if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino() {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "database path changed after its identity was verified",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_path_identity(path: &Path, _file: &File) -> Result<(), StateError> {
+    if std::fs::symlink_metadata(path)
+        .map_err(|error| file_error("verify state database path", path, error))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "symbolic-link database paths are not supported",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| file_error("open file without following links", path, error.into()))
+}
+
+#[cfg(not(unix))]
+fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
+    if std::fs::symlink_metadata(path)
+        .map_err(|error| file_error("inspect file without following links", path, error))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "symbolic-link file paths are not supported",
+        });
+    }
+    File::open(path).map_err(|error| file_error("open file without following links", path, error))
+}
+
+fn copy_existing_file_no_follow(source: &Path, destination: &Path) -> Result<(), StateError> {
+    let mut source_file = open_existing_file_no_follow(source)?;
+    verify_path_identity(source, &source_file)?;
+    reject_hard_link(source, &source_file)?;
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| file_error("create copied file", destination, error))?;
+    std::io::copy(&mut source_file, &mut destination_file)
+        .map_err(|error| file_error("copy verified file", source, error))?;
+    destination_file
+        .sync_all()
+        .map_err(|error| file_error("sync copied file", destination, error))?;
+    verify_path_identity(source, &source_file)
 }
 
 fn writer_owner() -> Result<String, StateError> {
@@ -510,15 +637,96 @@ fn database_artifacts(database: &Path) -> [PathBuf; 3] {
 
 fn ensure_database_artifacts_absent(database: &Path) -> Result<(), StateError> {
     for collision in database_artifacts(database) {
-        if collision.exists() {
+        if path_entry_exists(&collision)? {
             return Err(StateError::BackupDestinationExists { path: collision });
         }
     }
     Ok(())
 }
 
+fn path_entry_exists(path: &Path) -> Result<bool, StateError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(file_error("inspect filesystem entry", path, error)),
+    }
+}
+
+struct SidecarReservations {
+    wal_path: PathBuf,
+    shm_path: PathBuf,
+    _wal_file: File,
+    _shm_file: File,
+}
+
+impl SidecarReservations {
+    fn release(self) -> Result<(), StateError> {
+        let Self {
+            wal_path,
+            shm_path,
+            _wal_file,
+            _shm_file,
+        } = self;
+        drop((_wal_file, _shm_file));
+        std::fs::remove_file(&wal_path)
+            .map_err(|error| file_error("release destination WAL reservation", &wal_path, error))?;
+        std::fs::remove_file(&shm_path)
+            .map_err(|error| file_error("release destination SHM reservation", &shm_path, error))
+    }
+}
+
+fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, StateError> {
+    ensure_database_artifacts_absent(database)?;
+    let wal_path = sqlite_sidecar(database, "-wal");
+    let shm_path = sqlite_sidecar(database, "-shm");
+    let wal_file = match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&wal_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return if path_entry_exists(&wal_path)? {
+                Err(StateError::BackupDestinationExists { path: wal_path })
+            } else {
+                Err(file_error("reserve destination WAL", &wal_path, error))
+            };
+        }
+    };
+    let shm_file = match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&shm_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            drop(wal_file);
+            std::fs::remove_file(&wal_path).map_err(|cleanup| {
+                file_error(
+                    "release failed destination WAL reservation",
+                    &wal_path,
+                    cleanup,
+                )
+            })?;
+            return if path_entry_exists(&shm_path)? {
+                Err(StateError::BackupDestinationExists { path: shm_path })
+            } else {
+                Err(file_error("reserve destination SHM", &shm_path, error))
+            };
+        }
+    };
+    Ok(SidecarReservations {
+        wal_path,
+        shm_path,
+        _wal_file: wal_file,
+        _shm_file: shm_file,
+    })
+}
+
 fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError> {
-    ensure_database_artifacts_absent(destination)?;
+    let reservations = reserve_destination_sidecars(destination)?;
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -549,10 +757,11 @@ fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError>
         "atomic no-replace publication is unsupported on this target",
     ));
     if let Err(error) = published {
-        for collision in database_artifacts(destination) {
-            if collision.exists() {
-                return Err(StateError::BackupDestinationExists { path: collision });
-            }
+        reservations.release()?;
+        if path_entry_exists(destination)? {
+            return Err(StateError::BackupDestinationExists {
+                path: destination.to_owned(),
+            });
         }
         return Err(file_error(
             "publish SQLite snapshot without replacement",
@@ -560,6 +769,7 @@ fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError>
             error,
         ));
     }
+    reservations.release()?;
     sync_parent_directory(destination)
 }
 
@@ -664,6 +874,28 @@ fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
     }
 }
 
+#[cfg(unix)]
+fn acquire_store_lock(path: &Path, database_file: &File) -> Result<(PathBuf, File), StateError> {
+    let lock_file = database_file
+        .try_clone()
+        .map_err(|error| file_error("clone database identity handle", path, error))?;
+    match lock_file.try_lock() {
+        Ok(()) => Ok((path.to_owned(), lock_file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StateError::StoreLocked {
+            path: path.to_owned(),
+        }),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(file_error("acquire database identity lock", path, error))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn acquire_store_lock(path: &Path, _database_file: &File) -> Result<(PathBuf, File), StateError> {
+    let lock_path = lock_path_for(path);
+    acquire_writer_lock(&lock_path).map(|file| (lock_path, file))
+}
+
 #[cfg(not(windows))]
 fn prepare_windows_database_identity(_database: &Path) -> Result<(), StateError> {
     Ok(())
@@ -689,6 +921,7 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
             reason: "writer lock identity metadata is too large",
         });
     }
+
     identity_file
         .seek(SeekFrom::Start(0))
         .map_err(|error| file_error("seek writer lock identity", database, error))?;
@@ -759,8 +992,8 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
                         }
                     }
                 }
-            } else if sqlite_sidecar(&stored, "-wal").exists()
-                || sqlite_sidecar(&stored, "-shm").exists()
+            } else if path_entry_exists(&sqlite_sidecar(&stored, "-wal"))?
+                || path_entry_exists(&sqlite_sidecar(&stored, "-shm"))?
             {
                 return Err(StateError::InvalidPath {
                     path: database.to_owned(),
@@ -783,6 +1016,42 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
         .map_err(|error| file_error("release writer identity lock", &identity_path, error))
 }
 
+#[cfg(not(windows))]
+fn validate_windows_restore_identity(_database: &Path) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_restore_identity(database: &Path) -> Result<(), StateError> {
+    use std::io::Read as _;
+
+    const PREFIX: &str = "gta-claw-writer-v1\n";
+
+    let identity_path = writer_identity_path_for(database);
+    let mut identity_file = OpenOptions::new()
+        .read(true)
+        .open(&identity_path)
+        .map_err(|error| file_error("open restore source identity", &identity_path, error))?;
+    let mut identity = String::new();
+    identity_file
+        .read_to_string(&mut identity)
+        .map_err(|error| file_error("read restore source identity", &identity_path, error))?;
+    let stored = identity
+        .strip_prefix(PREFIX)
+        .filter(|stored| !stored.is_empty())
+        .ok_or_else(|| StateError::InvalidPath {
+            path: database.to_owned(),
+            reason: "restore source identity metadata has an unsupported format",
+        })?;
+    if Path::new(stored) != database {
+        return Err(StateError::InvalidPath {
+            path: database.to_owned(),
+            reason: "hard-linked restore source aliases are not supported",
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectedDatabase {
     Fresh,
@@ -791,18 +1060,22 @@ enum InspectedDatabase {
 
 async fn inspect_database(
     path: &Path,
+    database_file: &File,
     require_latest: bool,
 ) -> Result<InspectedDatabase, StateError> {
-    if std::fs::metadata(path)
+    if database_file
+        .metadata()
         .map_err(|error| file_error("inspect state database", path, error))?
         .len()
         == 0
     {
         return Ok(InspectedDatabase::Fresh);
     }
-    let temporary = copy_database_for_inspection(path)?;
+    verify_path_identity(path, database_file)?;
+    let temporary = copy_database_for_inspection(path, database_file)?;
     let result = inspect_database_snapshot(&temporary, require_latest).await;
     let cleanup = remove_snapshot_artifacts(&temporary);
+    verify_path_identity(path, database_file)?;
     match (result, cleanup) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -810,21 +1083,31 @@ async fn inspect_database(
     }
 }
 
-fn copy_database_for_inspection(path: &Path) -> Result<PathBuf, StateError> {
+fn copy_database_for_inspection(path: &Path, database_file: &File) -> Result<PathBuf, StateError> {
     let temporary = inspection_temporary_path(path)?;
-    std::fs::copy(path, &temporary)
+    let mut source = database_file
+        .try_clone()
+        .map_err(|error| file_error("clone database for read-only inspection", path, error))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| file_error("seek database for read-only inspection", path, error))?;
+    let mut destination = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| file_error("create read-only inspection snapshot", &temporary, error))?;
+    std::io::copy(&mut source, &mut destination)
         .map_err(|error| file_error("copy database for read-only inspection", path, error))?;
+    destination
+        .sync_all()
+        .map_err(|error| file_error("sync read-only inspection snapshot", &temporary, error))?;
     let source_wal = sqlite_sidecar(path, "-wal");
     let temporary_wal = sqlite_sidecar(&temporary, "-wal");
-    if source_wal.exists()
-        && let Err(error) = std::fs::copy(&source_wal, &temporary_wal)
+    if path_entry_exists(&source_wal)?
+        && let Err(error) = copy_existing_file_no_follow(&source_wal, &temporary_wal)
     {
         remove_snapshot_artifacts(&temporary)?;
-        return Err(file_error(
-            "copy database WAL for read-only inspection",
-            &source_wal,
-            error,
-        ));
+        return Err(error);
     }
     Ok(temporary)
 }
@@ -1075,9 +1358,7 @@ async fn validate_migration_history_connection(
     .await
     .map_err(|error| database("read migration history", error))?;
     let current_version = validate_migration_rows(&applied)?;
-    if current_version == LATEST_SCHEMA_VERSION {
-        validate_latest_schema_objects(connection).await?;
-    }
+    validate_schema_prefix(connection, current_version).await?;
     if require_latest && current_version != LATEST_SCHEMA_VERSION {
         return Err(StateError::InvalidMigrationHistory {
             reason: format!(
@@ -1088,11 +1369,54 @@ async fn validate_migration_history_connection(
     Ok(current_version)
 }
 
-async fn validate_latest_schema_objects(
+#[derive(Debug, Eq, PartialEq)]
+struct SchemaObjectDefinition {
+    kind: String,
+    name: String,
+    table: String,
+    sql: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ForeignKeyDefinition {
+    table: String,
+    id: i64,
+    sequence: i64,
+    referenced_table: String,
+    from_column: String,
+    to_column: Option<String>,
+    on_update: String,
+    on_delete: String,
+    match_type: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SchemaFingerprint {
+    objects: Vec<SchemaObjectDefinition>,
+    foreign_keys: Vec<ForeignKeyDefinition>,
+}
+
+async fn validate_schema_prefix(
     connection: &mut SqliteConnection,
+    version: i64,
 ) -> Result<(), StateError> {
+    let actual = schema_fingerprint(connection).await?;
+    let expected = expected_schema_fingerprint(version).await?;
+    if actual != expected {
+        return Err(StateError::InvalidMigrationHistory {
+            reason: format!(
+                "database schema definitions do not match migration history version {version}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn schema_fingerprint(
+    connection: &mut SqliteConnection,
+) -> Result<SchemaFingerprint, StateError> {
     let rows = sqlx::query(
-        "SELECT type, name, tbl_name
+        "SELECT type, name, tbl_name, sql
          FROM sqlite_schema
          WHERE name NOT LIKE 'sqlite_%'
            AND type IN ('index', 'table', 'trigger', 'view')
@@ -1101,7 +1425,8 @@ async fn validate_latest_schema_objects(
     .fetch_all(&mut *connection)
     .await
     .map_err(|error| database("read canonical schema objects", error))?;
-    let mut actual = Vec::with_capacity(rows.len());
+    let mut objects = Vec::with_capacity(rows.len());
+    let mut table_names = Vec::new();
     for row in rows {
         let kind: String =
             row.try_get("type")
@@ -1118,19 +1443,134 @@ async fn validate_latest_schema_objects(
                 .map_err(|error| StateError::InvalidMigrationHistory {
                     reason: format!("schema object {name} has an invalid table name: {error}"),
                 })?;
-        actual.push((kind, name, table));
-    }
-    let expected = LATEST_SCHEMA_OBJECTS
-        .iter()
-        .map(|&(kind, name, table)| (kind.to_owned(), name.to_owned(), table.to_owned()))
-        .collect::<Vec<_>>();
-    if actual != expected {
-        return Err(StateError::InvalidMigrationHistory {
-            reason: "database schema objects do not match the embedded migration history"
-                .to_owned(),
+        let sql = row
+            .try_get::<Option<String>, _>("sql")
+            .map_err(|error| StateError::InvalidMigrationHistory {
+                reason: format!("schema object {name} has an invalid definition: {error}"),
+            })?
+            .map(|sql| normalize_schema_sql(&sql));
+        if kind == "table" {
+            table_names.push(name.clone());
+        }
+        objects.push(SchemaObjectDefinition {
+            kind,
+            name,
+            table,
+            sql,
         });
     }
-    Ok(())
+    let mut foreign_keys = Vec::new();
+    for table in table_names {
+        let rows = sqlx::query(
+            "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete,
+                    \"match\" AS match_type
+             FROM pragma_foreign_key_list(?)
+             ORDER BY id, seq",
+        )
+        .bind(&table)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| database("read canonical foreign keys", error))?;
+        for row in rows {
+            foreign_keys.push(ForeignKeyDefinition {
+                table: table.clone(),
+                id: row
+                    .try_get("id")
+                    .map_err(|error| StateError::InvalidMigrationHistory {
+                        reason: format!("foreign key on {table} has an invalid id: {error}"),
+                    })?,
+                sequence: row.try_get("seq").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!("foreign key on {table} has an invalid sequence: {error}"),
+                    }
+                })?,
+                referenced_table: row.try_get("table").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!(
+                            "foreign key on {table} has an invalid referenced table: {error}"
+                        ),
+                    }
+                })?,
+                from_column: row.try_get("from").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!(
+                            "foreign key on {table} has an invalid source column: {error}"
+                        ),
+                    }
+                })?,
+                to_column: row.try_get("to").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!(
+                            "foreign key on {table} has an invalid target column: {error}"
+                        ),
+                    }
+                })?,
+                on_update: row.try_get("on_update").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!(
+                            "foreign key on {table} has invalid update action: {error}"
+                        ),
+                    }
+                })?,
+                on_delete: row.try_get("on_delete").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!(
+                            "foreign key on {table} has invalid delete action: {error}"
+                        ),
+                    }
+                })?,
+                match_type: row.try_get("match_type").map_err(|error| {
+                    StateError::InvalidMigrationHistory {
+                        reason: format!("foreign key on {table} has invalid match type: {error}"),
+                    }
+                })?,
+            });
+        }
+    }
+    Ok(SchemaFingerprint {
+        objects,
+        foreign_keys,
+    })
+}
+
+async fn expected_schema_fingerprint(version: i64) -> Result<SchemaFingerprint, StateError> {
+    let options = SqliteConnectOptions::new()
+        .filename(":memory:")
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| database("open expected schema database", error))?;
+    let build = async {
+        sqlx::query(MIGRATION_TABLE_SQL)
+            .execute(&mut connection)
+            .await
+            .map_err(|error| database("create expected migration table", error))?;
+        for migration in MIGRATIONS {
+            if migration.version > version {
+                break;
+            }
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut connection)
+                .await
+                .map_err(|error| database("apply expected schema migration", error))?;
+        }
+        schema_fingerprint(&mut connection).await
+    }
+    .await;
+    let close = connection
+        .close()
+        .await
+        .map_err(|error| database("close expected schema database", error));
+    match (build, close) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(fingerprint), Ok(())) => Ok(fingerprint),
+    }
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn validate_migration_rows(applied: &[sqlx::sqlite::SqliteRow]) -> Result<i64, StateError> {
@@ -1237,7 +1677,7 @@ async fn ensure_destructive_backup(
     destination: &Path,
     expected_version: i64,
 ) -> Result<(), StateError> {
-    if destination.exists() {
+    if path_entry_exists(destination)? {
         return validate_backup(destination, Some(expected_version))
             .await
             .map(|_| ());
@@ -1245,8 +1685,15 @@ async fn ensure_destructive_backup(
     backup_pool(pool, destination, expected_version).await
 }
 
-async fn snapshot_database(source: &Path, destination: &Path) -> Result<(), StateError> {
+async fn snapshot_database(
+    source: &Path,
+    source_file: &File,
+    destination: &Path,
+) -> Result<(), StateError> {
+    verify_path_identity(source, source_file)?;
+    reject_hard_link(source, source_file)?;
     ensure_database_artifacts_absent(destination)?;
+    let verified_source = copy_database_for_inspection(source, source_file)?;
     let destination_text = destination
         .to_str()
         .ok_or_else(|| StateError::InvalidPath {
@@ -1254,13 +1701,21 @@ async fn snapshot_database(source: &Path, destination: &Path) -> Result<(), Stat
             reason: "snapshot path must be valid Unicode",
         })?;
     let options = SqliteConnectOptions::new()
-        .filename(source)
+        .filename(&verified_source)
         .read_only(true)
         .create_if_missing(false)
         .foreign_keys(true);
-    let mut connection = SqliteConnection::connect_with(&options)
-        .await
-        .map_err(|error| invalid_backup(source, "open snapshot source", error))?;
+    let mut connection = match SqliteConnection::connect_with(&options).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            remove_snapshot_artifacts(&verified_source)?;
+            return Err(invalid_backup(
+                source,
+                "open verified snapshot source",
+                error,
+            ));
+        }
+    };
     let snapshot = sqlx::query("VACUUM main INTO ?")
         .bind(destination_text)
         .execute(&mut connection)
@@ -1276,9 +1731,14 @@ async fn snapshot_database(source: &Path, destination: &Path) -> Result<(), Stat
         (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     };
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => Err(cleanup_failed_snapshot(destination, error)),
+    let source_cleanup = remove_snapshot_artifacts(&verified_source);
+    let identity = verify_path_identity(source, source_file);
+    match (result, source_cleanup, identity) {
+        (Err(error), _, _) => Err(cleanup_failed_snapshot(destination, error)),
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
+            Err(cleanup_failed_snapshot(destination, error))
+        }
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -1499,7 +1959,7 @@ pub(crate) mod test_support {
 
     use super::{
         StateStore, copy_database_for_inspection, database, migration_checksum,
-        remove_snapshot_artifacts,
+        open_existing_file_no_follow, remove_snapshot_artifacts,
     };
     use crate::StateError;
 
@@ -1512,7 +1972,8 @@ pub(crate) mod test_support {
     }
 
     pub(crate) async fn journal_mode(path: &Path) -> Result<String, StateError> {
-        let temporary = copy_database_for_inspection(path)?;
+        let database_file = open_existing_file_no_follow(path)?;
+        let temporary = copy_database_for_inspection(path, &database_file)?;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&temporary)
             .read_only(true)

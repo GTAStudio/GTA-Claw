@@ -130,6 +130,58 @@ mod tests {
         }
     }
 
+    fn schema_drift_cases() -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "foreign-key-definition",
+                "PRAGMA foreign_keys = OFF;
+                 DROP INDEX tasks_session_order;
+                 DROP TABLE tasks;
+                 CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')
+                    ),
+                    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+                    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1)
+                 ) STRICT;
+                 CREATE INDEX tasks_session_order ON tasks(session_id, created_at_ms, id)",
+            ),
+            (
+                "column-definition",
+                "ALTER TABLE tasks ADD COLUMN unexpected TEXT",
+            ),
+            (
+                "constraint-definition",
+                "PRAGMA foreign_keys = OFF;
+                 DROP INDEX tasks_session_order;
+                 DROP TABLE tasks;
+                 CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+                    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                        ON UPDATE RESTRICT ON DELETE RESTRICT
+                 ) STRICT;
+                 CREATE INDEX tasks_session_order ON tasks(session_id, created_at_ms, id)",
+            ),
+            (
+                "index-definition",
+                "DROP INDEX tasks_session_order;
+                 CREATE INDEX tasks_session_order ON tasks(session_id, id, created_at_ms)",
+            ),
+        ]
+    }
+
     fn timestamp(value: i64) -> TimestampMs {
         TimestampMs::new(value).expect("test timestamp is valid")
     }
@@ -200,6 +252,41 @@ mod tests {
         assert!(health.is_healthy());
         assert!(path.is_file());
         store.close().await.expect("store closes cleanly");
+    }
+
+    #[tokio::test]
+    async fn canonical_version_zero_prefix_migrates_before_writer_claim() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "version-zero.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create version-zero database");
+        sqlx::raw_sql(
+            "PRAGMA application_id = 1196704067;
+             CREATE TABLE IF NOT EXISTS claw_schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+                applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+             ) STRICT",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("create canonical version-zero prefix");
+        connection
+            .close()
+            .await
+            .expect("close version-zero database");
+
+        let store = StateStore::open(StoreConfig::new(&path))
+            .await
+            .expect("version-zero prefix migrates");
+        assert!(store.health().await.expect("migrated health").is_healthy());
+        assert!(store.recovered_writer().is_none());
+        store.close().await.expect("migrated store closes");
     }
 
     #[tokio::test]
@@ -667,6 +754,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_history_with_complete_schema_is_rejected_without_mutation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "empty-history.sqlite");
+        open(&path).await.close().await.expect("seed store closes");
+        execute_direct(&path, "DELETE FROM claw_schema_migrations").await;
+        let journal_before = test_support::journal_mode(&path)
+            .await
+            .expect("read journal before empty-history rejection");
+        let writer_before = persisted_writer(&path).await;
+        let before = database_artifact_bytes(&path);
+
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("complete schema with empty history is rejected");
+        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
+        assert_eq!(
+            test_support::journal_mode(&path)
+                .await
+                .expect("read journal after empty-history rejection"),
+            journal_before
+        );
+        assert_eq!(persisted_writer(&path).await, writer_before);
+    }
+
+    #[tokio::test]
+    async fn full_schema_definition_drift_is_rejected_without_mutation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (name, sql) in schema_drift_cases() {
+            let path = database_path(&directory, &format!("open-{name}.sqlite"));
+            open(&path)
+                .await
+                .close()
+                .await
+                .expect("seed schema store closes");
+            execute_direct(&path, sql).await;
+            let journal_before = test_support::journal_mode(&path)
+                .await
+                .expect("read journal before schema rejection");
+            let writer_before = persisted_writer(&path).await;
+            let before = database_artifact_bytes(&path);
+
+            let error = StateStore::open(StoreConfig::new(&path))
+                .await
+                .err()
+                .expect("schema-definition drift rejects open");
+            assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+            assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
+            assert_eq!(
+                test_support::journal_mode(&path)
+                    .await
+                    .expect("read journal after schema rejection"),
+                journal_before
+            );
+            assert_eq!(persisted_writer(&path).await, writer_before);
+        }
+    }
+
+    #[tokio::test]
     async fn health_reports_migration_name_and_checksum_drift() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "health-drift.sqlite");
@@ -711,8 +858,26 @@ mod tests {
         let health = store.health().await.expect("schema drift health report");
         assert!(!health.is_healthy());
         assert_eq!(health.migration_errors.len(), 1);
-        assert!(health.migration_errors[0].contains("schema objects"));
+        assert!(health.migration_errors[0].contains("schema definitions"));
         store.close().await.expect("drifted store closes");
+    }
+
+    #[tokio::test]
+    async fn health_reports_full_schema_definition_drift() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (name, sql) in schema_drift_cases() {
+            let path = database_path(&directory, &format!("health-{name}.sqlite"));
+            let store = open(&path).await;
+            sqlx::raw_sql(sql)
+                .execute(test_support::pool(&store))
+                .await
+                .expect("tamper full schema definition");
+            let health = store.health().await.expect("schema drift health report");
+            assert!(!health.is_healthy());
+            assert_eq!(health.migration_errors.len(), 1);
+            assert!(health.migration_errors[0].contains("schema definitions"));
+            store.close().await.expect("drifted store closes");
+        }
     }
 
     #[tokio::test]
@@ -835,6 +1000,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_rejects_hardlink_alias_with_committed_wal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "wal-hardlink-source.sqlite");
+        let alias = database_path(&directory, "wal-hardlink-alias.sqlite");
+        let destination = database_path(&directory, "wal-hardlink-restored.sqlite");
+        let source = open(&source_path).await;
+        let mut connection = test_support::pool(&source)
+            .acquire()
+            .await
+            .expect("acquire WAL writer");
+        connection
+            .execute("PRAGMA wal_autocheckpoint = 0")
+            .await
+            .expect("disable automatic checkpoint");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+                 VALUES ('hardlink-wal-session', 'active', 1, 1, 1)",
+            )
+            .await
+            .expect("commit hardlink row to WAL");
+        drop(connection);
+        assert!(sidecar(&source_path, "-wal").exists());
+        fs::hard_link(&source_path, &alias).expect("create WAL source hard link");
+
+        let error = StateStore::restore_backup(&alias, &destination)
+            .await
+            .expect_err("hard-linked restore source is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(!destination.exists());
+        fs::remove_file(alias).expect("remove rejected restore alias");
+        source.close().await.expect("WAL source closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_rejects_symlinked_source_wal() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "symlink-wal-source.sqlite");
+        let backup_path = database_path(&directory, "symlink-wal-backup.sqlite");
+        let destination = database_path(&directory, "symlink-wal-restored.sqlite");
+        let missing_wal = database_path(&directory, "missing-source-wal");
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+        symlink(&missing_wal, sidecar(&backup_path, "-wal")).expect("create symlinked source WAL");
+
+        let error = StateStore::restore_backup(&backup_path, &destination)
+            .await
+            .expect_err("symlinked source WAL is rejected");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath { .. } | StateError::FileSystem { .. }
+        ));
+        assert!(!destination.exists());
+        source.close().await.expect("source store closes");
+    }
+
+    #[tokio::test]
     async fn restore_rejects_stale_destination_sidecars() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "sidecar-source.sqlite");
@@ -858,6 +1083,65 @@ mod tests {
             fs::read(sidecar(&destination, "-wal")).expect("read stale WAL"),
             b"stale WAL"
         );
+        source.close().await.expect("source store closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_rejects_dangling_destination_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "symlink-sidecar-source.sqlite");
+        let backup_path = database_path(&directory, "symlink-sidecar-backup.sqlite");
+        let destination = database_path(&directory, "symlink-sidecar-destination.sqlite");
+        let dangling_target = database_path(&directory, "missing-wal-target");
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+        symlink(&dangling_target, sidecar(&destination, "-wal"))
+            .expect("create dangling destination WAL symlink");
+
+        let error = StateStore::restore_backup(&backup_path, &destination)
+            .await
+            .expect_err("dangling destination sidecar rejects restore");
+        assert_eq!(
+            error,
+            StateError::BackupDestinationExists {
+                path: sidecar(&destination, "-wal"),
+            }
+        );
+        assert!(!destination.exists());
+        assert!(fs::symlink_metadata(sidecar(&destination, "-wal")).is_ok());
+        source.close().await.expect("source store closes");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn restore_rejects_destination_sidecar_reparse_when_available() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "reparse-sidecar-source.sqlite");
+        let backup_path = database_path(&directory, "reparse-sidecar-backup.sqlite");
+        let destination = database_path(&directory, "reparse-sidecar-destination.sqlite");
+        let dangling_target = database_path(&directory, "missing-wal-target");
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+        if let Err(error) = symlink_file(&dangling_target, sidecar(&destination, "-wal")) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                source.close().await.expect("source store closes");
+                return;
+            }
+            panic!("create destination WAL reparse point: {error}");
+        }
+
+        let error = StateStore::restore_backup(&backup_path, &destination)
+            .await
+            .expect_err("destination reparse sidecar rejects restore");
+        assert!(matches!(error, StateError::BackupDestinationExists { .. }));
+        assert!(!destination.exists());
         source.close().await.expect("source store closes");
     }
 
@@ -922,14 +1206,28 @@ mod tests {
         for (name, sql) in cases {
             let variant = database_path(&directory, &format!("{name}.sqlite"));
             let destination = database_path(&directory, &format!("{name}-restored.sqlite"));
-            fs::copy(&base_backup, &variant).expect("copy backup variant");
+            StateStore::restore_backup(&base_backup, &variant)
+                .await
+                .expect("materialize backup variant");
+            execute_direct(&variant, sql).await;
+            assert_restore_rejected(&variant, &destination).await;
+        }
+        for (name, sql) in schema_drift_cases() {
+            let variant = database_path(&directory, &format!("restore-{name}.sqlite"));
+            let destination =
+                database_path(&directory, &format!("restore-{name}-destination.sqlite"));
+            StateStore::restore_backup(&base_backup, &variant)
+                .await
+                .expect("materialize schema drift backup");
             execute_direct(&variant, sql).await;
             assert_restore_rejected(&variant, &destination).await;
         }
 
         let corrupt = database_path(&directory, "corrupt.sqlite");
         let corrupt_destination = database_path(&directory, "corrupt-restored.sqlite");
-        fs::copy(&base_backup, &corrupt).expect("copy corrupt variant");
+        StateStore::restore_backup(&base_backup, &corrupt)
+            .await
+            .expect("materialize corrupt variant");
         let length = fs::metadata(&corrupt).expect("corrupt metadata").len();
         OpenOptions::new()
             .write(true)
@@ -1077,6 +1375,44 @@ mod tests {
             .close()
             .await
             .expect("canonical database name still opens");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlink_cannot_create_a_database() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = database_path(&directory, "missing-target.sqlite");
+        let alias = database_path(&directory, "dangling-alias.sqlite");
+        symlink(&target, &alias).expect("create dangling database symlink");
+
+        let error = StateStore::open(StoreConfig::new(&alias))
+            .await
+            .expect_err("dangling database symlink is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_lock_survives_hardlink_and_original_unlink() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "identity-source.sqlite");
+        let alias = database_path(&directory, "identity-alias.sqlite");
+        let owner = open(&path).await;
+        owner
+            .checkpoint()
+            .await
+            .expect("checkpoint identity source");
+        fs::hard_link(&path, &alias).expect("create live database hard link");
+        fs::remove_file(&path).expect("unlink original live database name");
+
+        let error = StateStore::open(StoreConfig::new(&alias))
+            .await
+            .expect_err("identity-bound lock rejects remaining hard-link name");
+        assert!(matches!(error, StateError::StoreLocked { .. }));
+        owner.close().await.expect("identity owner closes");
     }
 
     #[tokio::test]
