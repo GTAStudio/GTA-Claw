@@ -13,7 +13,7 @@ impl TestDirectory {
             std::process::id()
         ));
         std::fs::create_dir(&path).expect("create test directory");
-        Self(path)
+        Self(std::fs::canonicalize(path).expect("canonicalize test directory"))
     }
 
     pub(crate) fn path(&self) -> &Path {
