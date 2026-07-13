@@ -149,7 +149,7 @@ lgpl_source="$(realpath -e /usr/share/common-licenses/LGPL-2.1)"
 gpl2_source="$(realpath -e /usr/share/common-licenses/GPL-2)"
 gpl3_source="$(realpath -e /usr/share/common-licenses/GPL-3)"
 runtime_exception_source="$(
-  find /usr/share/doc -type f \
+  find -L /usr/share/doc -type f \
     \( -name 'COPYING.RUNTIME' -o -name 'COPYING.RUNTIME.gz' \) \
     -print |
     LC_ALL=C sort |
