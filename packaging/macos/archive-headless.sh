@@ -26,16 +26,23 @@ validate_macho_dependencies "$binary" "$OUTPUT_ROOT"
 
 archive_root="$OUTPUT_ROOT/headless/$arch_label"
 stage="$OUTPUT_ROOT/staging/$component-$VERSION-macos-$arch_label"
+archive="$archive_root/$component-$VERSION-macos-$arch_label.tar.gz"
+checksum="$archive.sha256"
+assert_output_path "$archive_root"
+assert_output_path "$stage"
+assert_output_path "$archive"
+assert_output_path "$checksum"
 safe_reset_dir "$stage"
+assert_output_path "$archive_root"
 mkdir -p "$archive_root"
 install -m 0755 "$binary" "$stage/$component"
 printf '%s  %s\n' "$(sha256_file "$stage/$component")" "$component" >"$stage/SHA256SUMS"
 chmod 0644 "$stage/SHA256SUMS"
 find "$stage" -exec touch -t "$NORMALIZED_MTIME" {} +
 
-archive="$archive_root/$component-$VERSION-macos-$arch_label.tar.gz"
 assert_output_path "$archive"
 rm -f -- "$archive"
+assert_output_path "$archive"
 (
   cd "$(dirname "$stage")"
   COPYFILE_DISABLE=1 tar \
@@ -47,5 +54,6 @@ rm -f -- "$archive"
     -cf - \
     "$(basename "$stage")"
 ) | gzip -n -9 >"$archive"
-printf '%s  %s\n' "$(sha256_file "$archive")" "$(basename "$archive")" >"$archive.sha256"
+assert_output_path "$checksum"
+printf '%s  %s\n' "$(sha256_file "$archive")" "$(basename "$archive")" >"$checksum"
 note "created $archive"

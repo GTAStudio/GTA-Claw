@@ -60,6 +60,11 @@ expect_failure path-traversal bash -c "source '$common'; assert_output_path '$OU
 ln -s "$outside" "$escape_link"
 expect_failure output-root-intermediate-symlink \
   env OUTPUT_ROOT="$escape_link/package" bash -c "source '$common'"
+rm -f -- "$escape_link"
+ln -s "$outside/missing" "$escape_link"
+expect_failure output-root-dangling-symlink \
+  env OUTPUT_ROOT="$escape_link/package" bash -c "source '$common'"
+rm -f -- "$escape_link"
 
 mkdir -p "$work/symlink-root"
 ln -s "$work" "$work/symlink-root/link"
@@ -69,6 +74,11 @@ expect_failure output-path-intermediate-symlink \
   bash -c "source '$common'; assert_output_path '$work/intermediate-link/file'"
 expect_failure reset-dir-intermediate-symlink \
   bash -c "source '$common'; safe_reset_dir '$work/intermediate-link/delete'"
+ln -s "$outside/missing" "$work/dangling-link"
+expect_failure output-path-dangling-symlink \
+  bash -c "source '$common'; assert_output_path '$work/dangling-link/file'"
+expect_failure reset-dir-dangling-symlink \
+  bash -c "source '$common'; safe_reset_dir '$work/dangling-link/delete'"
 
 printf 'content\n' >"$work/hash.txt"
 printf '%s  ./hash.txt\n' "$(sha256_file "$work/hash.txt")" >"$work/hash.sha256"
@@ -81,6 +91,10 @@ EOF
 xcrun clang -target arm64-apple-macos"$MINIMUM_MACOS_VERSION" "$work/hello.c" -o "$work/hello-arm64"
 xcrun clang -target x86_64-apple-macos"$MINIMUM_MACOS_VERSION" "$work/hello.c" -o "$work/hello-x86_64"
 host_arch="$(expected_lipo_arch "$(host_target)")"
+expect_failure assemble-app-name-traversal \
+  env APP_NAME=../escape "$MACOS_DIR/assemble-app.sh" "$work/hello-$host_arch" "$host_arch" "$host_arch"
+expect_failure assemble-executable-name-traversal \
+  env EXECUTABLE_NAME=../escape "$MACOS_DIR/assemble-app.sh" "$work/hello-$host_arch" "$host_arch" "$host_arch"
 expect_success universal-merge \
   "$MACOS_DIR/merge-universal.sh" "$work/hello-arm64" "$work/hello-x86_64" "$work/hello-universal"
 expect_failure wrong-slice \

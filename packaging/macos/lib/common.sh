@@ -217,6 +217,7 @@ safe_reset_dir() {
   assert_nearest_existing_parent "$target" "$path"
   [[ ! -L "$path" ]] || die "refusing to delete a symlink: $path"
   rm -rf -- "$path"
+  assert_output_path "$path"
   mkdir -p "$path"
   assert_output_path "$path"
 }
@@ -249,6 +250,9 @@ write_sha256_manifest() {
     output_relative="./${output#"$root/"}"
     temporary_relative="$output_relative.tmp"
   fi
+  if [[ "$temporary" == "$OUTPUT_ROOT/"* ]]; then
+    assert_output_path "$temporary"
+  fi
   : >"$temporary"
   while IFS= read -r relative; do
     [[ "$relative" != "$output_relative" && "$relative" != "$temporary_relative" ]] || continue
@@ -256,6 +260,9 @@ write_sha256_manifest() {
   done < <(cd "$root" && find . -type f -print | LC_ALL=C sort)
   if [[ "$output" == "$OUTPUT_ROOT/"* ]]; then
     assert_output_path "$output"
+  fi
+  if [[ "$temporary" == "$OUTPUT_ROOT/"* ]]; then
+    assert_output_path "$temporary"
   fi
   mv "$temporary" "$output"
 }

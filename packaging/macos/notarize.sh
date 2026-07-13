@@ -31,15 +31,21 @@ submission="$artifact"
 temporary_zip=""
 if [[ -d "$artifact" && "$artifact" == *.app ]]; then
   temporary_zip="$OUTPUT_ROOT/notarization/$(basename "$artifact").zip"
+  assert_output_path "$temporary_zip"
+  assert_output_path "$(dirname "$temporary_zip")"
   mkdir -p "$(dirname "$temporary_zip")"
+  assert_output_path "$temporary_zip"
   rm -f -- "$temporary_zip"
+  assert_output_path "$temporary_zip"
   ditto -c -k --keepParent "$artifact" "$temporary_zip"
   submission="$temporary_zip"
 elif [[ "$artifact" != *.dmg && "$artifact" != *.pkg ]]; then
   die "notarytool submission must be an app, DMG, or PKG"
 fi
 
-result="$(mktemp "$OUTPUT_ROOT/notary-result.XXXXXX")"
+result_template="$OUTPUT_ROOT/notary-result.XXXXXX"
+assert_output_path "$result_template"
+result="$(mktemp "$result_template")"
 cleanup() {
   rm -f -- "$result"
   if [[ -n "$temporary_zip" ]]; then

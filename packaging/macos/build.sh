@@ -36,6 +36,12 @@ build_target() {
   local arch
   local encoded_rustflags
   arch="$(expected_lipo_arch "$target")"
+  assert_output_path "$cargo_target_dir"
+  assert_output_path "$cargo_target_dir/root"
+  assert_output_path "$cargo_target_dir/desktop"
+  if [[ -d "$cargo_target_dir" ]]; then
+    reject_symlinks "$cargo_target_dir"
+  fi
   encoded_rustflags="${CARGO_ENCODED_RUSTFLAGS:-}"
   if [[ -n "$encoded_rustflags" ]]; then
     encoded_rustflags+=$'\x1f'
