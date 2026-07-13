@@ -7,6 +7,8 @@ on:
     paths:
       - ".cargo/**"
       - ".gitattributes"
+      - ".github/fixtures/cargo-audit/**"
+      - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
       - "crates/**"
@@ -20,6 +22,8 @@ on:
     paths:
       - ".cargo/**"
       - ".gitattributes"
+      - ".github/fixtures/cargo-audit/**"
+      - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
       - "crates/**"
@@ -197,6 +201,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate supply-chain policy
+        run: cargo test --locked --package claw-security --test desktop_supply_chain_policy
+
       - name: Check dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
@@ -204,18 +211,65 @@ jobs:
           command: check
           manifest-path: ./Cargo.toml
 
+      - name: Install pinned cargo-audit
+        shell: bash
+        env:
+          CARGO_AUDIT_CRATE_SHA256: 700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a
+          CARGO_AUDIT_VERSION: 0.22.2
+        run: |
+          set -euo pipefail
+          cargo info "cargo-audit@${CARGO_AUDIT_VERSION}" --quiet
+          mapfile -t archives < <(
+            find "${CARGO_HOME:-$HOME/.cargo}/registry/cache" \
+              -type f -name "cargo-audit-${CARGO_AUDIT_VERSION}.crate"
+          )
+          test "${#archives[@]}" -gt 0
+          for archive in "${archives[@]}"; do
+            printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$archive" |
+              sha256sum --check -
+          done
+          cargo install cargo-audit --version "=${CARGO_AUDIT_VERSION}" --locked --force
+          test "$(cargo audit --version)" = "cargo-audit-audit ${CARGO_AUDIT_VERSION}"
+
       - name: Audit root lockfile
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --file Cargo.lock
 
       - name: Audit desktop lockfile
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: desktop
+        run: cargo audit --file desktop/Cargo.lock --no-fetch
 
-      - name: Check Windows desktop dependency policy
+      - name: Test cargo-audit exit policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          for event_name in pull_request push; do
+            export GITHUB_EVENT_NAME="$event_name"
+            if [[ "$event_name" == "pull_request" ]]; then
+              export GITHUB_HEAD_REF="audit-policy-fixture"
+            else
+              unset GITHUB_HEAD_REF
+            fi
+
+            warning_output="$(
+              cargo audit --no-fetch \
+                --file .github/fixtures/cargo-audit/unmaintained/Cargo.lock 2>&1
+            )"
+            printf '%s\n' "$warning_output"
+            grep -F "RUSTSEC-2025-0141" <<<"$warning_output"
+
+            set +e
+            vulnerable_output="$(
+              cargo audit --no-fetch \
+                --file .github/fixtures/cargo-audit/vulnerable/Cargo.lock 2>&1
+            )"
+            vulnerable_status=$?
+            set -e
+            printf '%s\n' "$vulnerable_output"
+            test "$vulnerable_status" -ne 0
+            grep -F "RUSTSEC-2026-0194" <<<"$vulnerable_output"
+            grep -F "RUSTSEC-2026-0195" <<<"$vulnerable_output"
+          done
+
+      - name: Check Windows x64 desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
           arguments: --target x86_64-pc-windows-msvc
@@ -223,7 +277,23 @@ jobs:
           command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
           manifest-path: ./desktop/Cargo.toml
 
-      - name: Check macOS desktop dependency policy
+      - name: Check Windows ARM64 desktop dependency policy
+        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
+        with:
+          arguments: --target aarch64-pc-windows-msvc
+          command: check
+          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
+          manifest-path: ./desktop/Cargo.toml
+
+      - name: Check macOS Intel desktop dependency policy
+        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
+        with:
+          arguments: --target x86_64-apple-darwin
+          command: check
+          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
+          manifest-path: ./desktop/Cargo.toml
+
+      - name: Check macOS ARM64 desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
           arguments: --target aarch64-apple-darwin

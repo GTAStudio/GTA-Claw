@@ -1,0 +1,64 @@
+[[case]]
+name = "root-audit-continue-on-error"
+mutation = "root-audit-continue-on-error"
+expected = "Audit root lockfile must not set continue-on-error"
+
+[[case]]
+name = "desktop-audit-disabled"
+mutation = "desktop-audit-disabled"
+expected = "Audit desktop lockfile must not have an if condition"
+
+[[case]]
+name = "desktop-audit-redirected"
+mutation = "desktop-audit-redirected"
+expected = "Audit desktop lockfile must not set working-directory"
+
+[[case]]
+name = "cargo-audit-install-latest"
+mutation = "cargo-audit-install-latest"
+expected = "cargo-audit install command is not exact"
+
+[[case]]
+name = "windows-arm64-deny-missing"
+mutation = "windows-arm64-deny-missing"
+expected = "desktop deny targets do not match the supported target set"
+
+[[case]]
+name = "job-checks-write"
+mutation = "job-checks-write"
+expected = "job supply-chain permissions exceed read-only allow-list"
+
+[[case]]
+name = "job-write-all"
+mutation = "job-write-all"
+expected = "job supply-chain permissions must be a read-only mapping"
+
+[[case]]
+name = "negative-desktop-path"
+mutation = "negative-desktop-path"
+expected = "pull_request paths must exactly match the ordered dependency policy inputs"
+
+[[case]]
+name = "deny-advisory-ignore"
+mutation = "deny-advisory-ignore"
+expected = "desktop deny advisories.ignore must be empty"
+
+[[case]]
+name = "audit-config-ignore"
+mutation = "audit-config-ignore"
+expected = "cargo audit advisories.ignore must be empty"
+
+[[case]]
+name = "deny-git-source"
+mutation = "deny-git-source"
+expected = "desktop deny sources.allow-git must be empty"
+
+[[case]]
+name = "deny-license-widening"
+mutation = "deny-license-widening"
+expected = "desktop deny license allow-list changed"
+
+[[case]]
+name = "deny-graph-exclude"
+mutation = "deny-graph-exclude"
+expected = "desktop deny graph policy keys changed"

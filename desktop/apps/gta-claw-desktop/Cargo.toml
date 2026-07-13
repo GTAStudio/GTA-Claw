@@ -23,5 +23,10 @@ slint = { version = "=1.17.1", default-features = false, features = [
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.build-dependencies]
 slint-build = { version = "=1.17.1" }
 
+[[test]]
+name = "macos_winit_smoke"
+path = "tests/macos_winit_smoke.rs"
+harness = false
+
 [lints]
 workspace = true
