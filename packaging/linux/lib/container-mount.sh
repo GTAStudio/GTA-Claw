@@ -25,9 +25,11 @@ create_anchored_mounts() {
     "$ANCHORED_MOUNT_ROOT/target"
   sudo mount --bind "$repository_fd_path/" "$ANCHORED_MOUNT_ROOT/repository"
   sudo mount --bind "$target_fd_path/" "$ANCHORED_MOUNT_ROOT/target"
-  mountpoint -q "$ANCHORED_MOUNT_ROOT/repository" ||
-    die "failed to create anchored repository mount"
-  mountpoint -q "$ANCHORED_MOUNT_ROOT/target" ||
-    die "failed to create anchored target mount"
+  [[ "$(stat -Lc '%d:%i' "$ANCHORED_MOUNT_ROOT/repository")" == \
+    "$(stat -Lc '%d:%i' "$repository_fd_path")" ]] ||
+    die "anchored repository mount identity mismatch"
+  [[ "$(stat -Lc '%d:%i' "$ANCHORED_MOUNT_ROOT/target")" == \
+    "$(stat -Lc '%d:%i' "$target_fd_path")" ]] ||
+    die "anchored target mount identity mismatch"
   trap cleanup_anchored_mounts EXIT INT TERM
 }
