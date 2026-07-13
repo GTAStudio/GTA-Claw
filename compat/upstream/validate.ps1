@@ -257,6 +257,32 @@ function Assert-ExactPropertySet {
     if ($missing.Count -gt 0 -or $unexpected.Count -gt 0) {
         Fail "$Context property mismatch; missing=[$($missing -join ',')], unexpected=[$($unexpected -join ',')]"
     }
+    Assert-ExactProperties $entry[0] @("path", "classification", "expected_features") @("path", "classification", "expected_features") "manifest ledger '$($contract.Path)'"
+}
+foreach ($contract in $InventoryContracts) {
+    $entry = @($manifest.inventories | Where-Object { $_.path -ceq $contract.Path })
+    if ($entry.Count -ne 1 -or [int]$entry[0].expected_items -ne $contract.Items) {
+        Fail "manifest inventory contract mismatch for '$($contract.Path)'"
+    }
+    Assert-ExactProperties $entry[0] @("path", "expected_items") @("path", "expected_items") "manifest inventory '$($contract.Path)'"
+}
+$expectedCanonicalCounts = [ordered]@{
+    core_plugins = 64
+    official_external_plugins = 70
+    source_only_qa_plugins = 3
+    bundled_skills = 51
+    gateway_methods = 278
+    gateway_events = 33
+    config_domains = 47
+    providers = 78
+    channels = 29
+}
+Assert-HashtableEquals $manifest.canonical_counts $expectedCanonicalCounts "manifest.canonical_counts"
+Assert-ExactProperties $manifest.evidence_policy @("initial_status", "acceptance_evidence_state", "legacy_typescript_is_not_rust_acceptance_evidence") @("initial_status", "acceptance_evidence_state", "legacy_typescript_is_not_rust_acceptance_evidence") "manifest.evidence_policy"
+if ($manifest.evidence_policy.initial_status -cne "unimplemented" -or
+    $manifest.evidence_policy.acceptance_evidence_state -cne "missing" -or
+    $manifest.evidence_policy.legacy_typescript_is_not_rust_acceptance_evidence -ne $true) {
+    Fail "manifest evidence policy mismatch"
 }
 
 function Assert-RequiredProperties {
@@ -924,7 +950,7 @@ foreach ($spec in $LedgerSpecs) {
     foreach ($feature in $features) {
         $featureCount += 1
         if (-not $featureIds.Add([string]$feature.feature_id)) {
-            Fail "duplicate feature_id $($feature.feature_id)"
+            Fail "duplicate feature_id '$($feature.feature_id)'"
         }
         if ($feature.classification -ne $ledger.classification) {
             Fail "$($feature.feature_id) classification does not match its ledger"
@@ -1038,6 +1064,13 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
     if ($derivedCanonicalCounts[$key] -ne $ExpectedCanonicalCounts[$key]) {
         Fail "derived canonical count $key must be $($ExpectedCanonicalCounts[$key]), got $($derivedCanonicalCounts[$key])"
     }
+    $derivedCounts = Get-InventoryDerivedCounts $contract.InventoryId $items
+    Assert-HashtableEquals ([pscustomobject]$derivedCounts) $contract.Counts "$($contract.Path).derived_counts"
+    Assert-HashtableEquals $inventory.counts $derivedCounts "$($contract.Path).counts"
+    $derivedByInventory[$contract.InventoryId] = $derivedCounts
+}
+if ($inventoryTotal -ne 717 -or $recordIds.Count -ne 717) {
+    Fail "fixed inventory total must be 717 unique rows, got $inventoryTotal rows and $($recordIds.Count) record IDs"
 }
 
 [ordered]@{
