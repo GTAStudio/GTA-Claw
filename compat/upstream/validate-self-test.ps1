@@ -89,6 +89,28 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "manifest-ledger-path-ordinal"
+        expected_message = "manifest must declare ledger ledgers/gateway-core.json exactly once"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "manifest.json"
+            $manifest = Read-Json $path
+            $manifest.ledgers[0].path = ([string]$manifest.ledgers[0].path) + [char]0x00AD
+            Write-Json $path $manifest
+        }
+    },
+    [ordered]@{
+        name = "manifest-inventory-path-ordinal"
+        expected_message = "manifest must declare inventory inventories/plugins.json exactly once"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "manifest.json"
+            $manifest = Read-Json $path
+            $manifest.inventories[0].path = ([string]$manifest.inventories[0].path) + [char]0x00AD
+            Write-Json $path $manifest
+        }
+    },
+    [ordered]@{
         name = "fixed-row-total"
         expected_message = "inventories/skills.json must contain exactly 51 rows"
         mutate = {
