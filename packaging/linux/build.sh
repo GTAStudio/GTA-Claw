@@ -119,9 +119,11 @@ case "$arch" in
     libgcc_package="libgcc-s1:amd64"
     loader_source="$(dpkg_file "$libc_package" "/ld-linux-x86-64.so.2")"
     libc_source="$(dpkg_file "$libc_package" "/libc.so.6")"
+    libm_source="$(dpkg_file "$libc_package" "/libm.so.6")"
     libgcc_source="$(dpkg_file "$libgcc_package" "/libgcc_s.so.1")"
     loader_target="/lib64/ld-linux-x86-64.so.2"
     libc_target="/lib/x86_64-linux-gnu/libc.so.6"
+    libm_target="/lib/x86_64-linux-gnu/libm.so.6"
     libgcc_target="/lib/x86_64-linux-gnu/libgcc_s.so.1"
     libc_copyright="/usr/share/doc/libc6/copyright"
     libgcc_copyright="/usr/share/doc/libgcc-s1/copyright"
@@ -131,9 +133,11 @@ case "$arch" in
     libgcc_package="libgcc-s1-arm64-cross"
     loader_source="$(dpkg_file "$libc_package" "/ld-linux-aarch64.so.1")"
     libc_source="$(dpkg_file "$libc_package" "/libc.so.6")"
+    libm_source="$(dpkg_file "$libc_package" "/libm.so.6")"
     libgcc_source="$(dpkg_file "$libgcc_package" "/libgcc_s.so.1")"
     loader_target="/lib/ld-linux-aarch64.so.1"
     libc_target="/lib/aarch64-linux-gnu/libc.so.6"
+    libm_target="/lib/aarch64-linux-gnu/libm.so.6"
     libgcc_target="/lib/aarch64-linux-gnu/libgcc_s.so.1"
     libc_copyright="/usr/share/doc/libc6-arm64-cross/copyright"
     libgcc_copyright="/usr/share/doc/libgcc-s1-arm64-cross/copyright"
@@ -142,6 +146,7 @@ esac
 
 copy_verified_input "$loader_source" "$runtime_root/rootfs$loader_target" 0755
 copy_verified_input "$libc_source" "$runtime_root/rootfs$libc_target" 0755
+copy_verified_input "$libm_source" "$runtime_root/rootfs$libm_target" 0755
 copy_verified_input "$libgcc_source" "$runtime_root/rootfs$libgcc_target" 0755
 libc_copyright="$(realpath -e "$libc_copyright")"
 libgcc_copyright="$(realpath -e "$libgcc_copyright")"
@@ -244,6 +249,9 @@ write_json_file "$runtime_manifest" -n \
   --arg libc_source "runtime/rootfs$libc_target" \
   --arg libc_target "$libc_target" \
   --arg libc_sha "$(sha256_file "$runtime_root/rootfs$libc_target")" \
+  --arg libm_source "runtime/rootfs$libm_target" \
+  --arg libm_target "$libm_target" \
+  --arg libm_sha "$(sha256_file "$runtime_root/rootfs$libm_target")" \
   --arg libgcc_source "runtime/rootfs$libgcc_target" \
   --arg libgcc_target "$libgcc_target" \
   --arg libgcc_sha "$(sha256_file "$runtime_root/rootfs$libgcc_target")" \
@@ -261,7 +269,8 @@ write_json_file "$runtime_manifest" -n \
         licenseMaterials: $libc_materials,
         files: [
           {stagedPath: $loader_source, targetPath: $loader_target, sha256: $loader_sha, mode: "0755"},
-          {stagedPath: $libc_source, targetPath: $libc_target, sha256: $libc_sha, mode: "0755"}
+          {stagedPath: $libc_source, targetPath: $libc_target, sha256: $libc_sha, mode: "0755"},
+          {stagedPath: $libm_source, targetPath: $libm_target, sha256: $libm_sha, mode: "0755"}
         ]
       },
       {

@@ -25,7 +25,7 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
   scratch root filesystem, numeric non-root user `65532:65532`, OCI labels,
   two deterministic layers, explicit writable volumes, and no shell or
   package manager. The first layer contains only the Rust executables,
-  documentation/metadata, account files, and exact glibc/libgcc runtime objects
+  documentation/metadata, account files, and exact glibc/libm/libgcc runtime objects
   from the pinned build sysroot. Their Debian versions, hashes, SPDX
   expressions, and copyright files are embedded in the SBOM and provenance.
   The second layer assigns the writable directories to uid/gid 65532.

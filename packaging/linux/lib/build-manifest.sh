@@ -196,10 +196,10 @@ verify_build_manifest() {
   ' "$BUILD_RUNTIME_MANIFEST" >/dev/null || die "runtime manifest contract is invalid"
   case "$arch" in
     x86_64)
-      expected_runtime_set=$'libc6\t/lib64/ld-linux-x86-64.so.2\nlibc6\t/lib/x86_64-linux-gnu/libc.so.6\nlibgcc-s1\t/lib/x86_64-linux-gnu/libgcc_s.so.1'
+      expected_runtime_set=$'libc6\t/lib64/ld-linux-x86-64.so.2\nlibc6\t/lib/x86_64-linux-gnu/libc.so.6\nlibc6\t/lib/x86_64-linux-gnu/libm.so.6\nlibgcc-s1\t/lib/x86_64-linux-gnu/libgcc_s.so.1'
       ;;
     arm64)
-      expected_runtime_set=$'libc6\t/lib/ld-linux-aarch64.so.1\nlibc6\t/lib/aarch64-linux-gnu/libc.so.6\nlibgcc-s1\t/lib/aarch64-linux-gnu/libgcc_s.so.1'
+      expected_runtime_set=$'libc6\t/lib/ld-linux-aarch64.so.1\nlibc6\t/lib/aarch64-linux-gnu/libc.so.6\nlibc6\t/lib/aarch64-linux-gnu/libm.so.6\nlibgcc-s1\t/lib/aarch64-linux-gnu/libgcc_s.so.1'
       ;;
   esac
   [[ "$(
@@ -305,9 +305,11 @@ verify_build_manifest() {
     case "$arch:$package_id:$target_path" in
       x86_64:libc6:/lib64/ld-linux-x86-64.so.2|\
         x86_64:libc6:/lib/x86_64-linux-gnu/libc.so.6|\
+        x86_64:libc6:/lib/x86_64-linux-gnu/libm.so.6|\
         x86_64:libgcc-s1:/lib/x86_64-linux-gnu/libgcc_s.so.1|\
         arm64:libc6:/lib/ld-linux-aarch64.so.1|\
         arm64:libc6:/lib/aarch64-linux-gnu/libc.so.6|\
+        arm64:libc6:/lib/aarch64-linux-gnu/libm.so.6|\
         arm64:libgcc-s1:/lib/aarch64-linux-gnu/libgcc_s.so.1) ;;
       *) die "unexpected runtime package target: $package_id:$target_path" ;;
     esac

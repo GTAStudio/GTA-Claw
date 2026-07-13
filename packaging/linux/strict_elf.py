@@ -19,7 +19,7 @@ ARCH = {
     "x86_64": (62, "/lib64/ld-linux-x86-64.so.2"),
     "arm64": (183, "/lib/ld-linux-aarch64.so.1"),
 }
-ALLOWED_NEEDED = {"libc.so.6", "libgcc_s.so.1"}
+ALLOWED_NEEDED = {"libc.so.6", "libgcc_s.so.1", "libm.so.6"}
 
 
 def fail(message: str) -> None:
