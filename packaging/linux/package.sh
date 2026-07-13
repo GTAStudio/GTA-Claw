@@ -598,6 +598,9 @@ set -e
 if [ -d /run/systemd/system ]; then
   if [ "\$1" -eq 0 ]; then
     systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
+    if systemctl is-active --quiet gta-claw-daemon.service; then
+      exit 1
+    fi
   elif [ -e /run/gta-claw-daemon.was-active ]; then
     systemctl is-active --quiet gta-claw-daemon.service
     rm -f /run/gta-claw-daemon.was-active
