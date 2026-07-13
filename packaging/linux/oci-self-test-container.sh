@@ -5,6 +5,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/container-mount.sh"
 
 require_linux
 require_tool docker
@@ -34,6 +35,9 @@ exec {repo_mount_fd}<"$REPO_ROOT"
 exec {target_mount_fd}<"$target_root"
 repo_mount_id="$(stat -Lc '%d:%i' "/proc/$BASHPID/fd/$repo_mount_fd")"
 target_mount_id="$(stat -Lc '%d:%i' "/proc/$BASHPID/fd/$target_mount_fd")"
+create_anchored_mounts \
+  "/proc/$BASHPID/fd/$repo_mount_fd" \
+  "/proc/$BASHPID/fd/$target_mount_fd"
 docker run --rm \
   --cap-drop ALL \
   --cap-add CHOWN \
@@ -43,8 +47,8 @@ docker run --rm \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
   --env "PACKAGING_IMAGE_ID=$packaging_image_id" \
-  --mount "type=bind,source=/proc/$BASHPID/fd/$repo_mount_fd,target=/workspace,readonly" \
-  --mount "type=bind,source=/proc/$BASHPID/fd/$target_mount_fd,target=/workspace/target" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/workspace/target" \
   --workdir /workspace \
   "$image" \
   /usr/local/bin/gta-claw-safeio \
@@ -63,6 +67,7 @@ docker run --rm \
   "/workspace/target/$archive_relative" \
   "$arch" \
   "$expected_key_sha"
+cleanup_anchored_mounts
 [[ "$(stat -Lc '%d:%i' "$REPO_ROOT")" == "$repo_mount_id" ]] ||
   die "repository path identity changed during OCI mutation transaction"
 [[ "$(stat -Lc '%d:%i' "$target_root")" == "$target_mount_id" ]] ||

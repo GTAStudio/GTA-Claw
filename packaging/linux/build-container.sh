@@ -5,6 +5,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/container-mount.sh"
 
 require_linux
 for tool in docker id sha256sum; do
@@ -44,6 +45,7 @@ repo_mount="/proc/$BASHPID/fd/$repo_mount_fd"
 target_mount="/proc/$BASHPID/fd/$target_mount_fd"
 repo_mount_id="$(stat -Lc '%d:%i' "$repo_mount")"
 target_mount_id="$(stat -Lc '%d:%i' "$target_mount")"
+create_anchored_mounts "$repo_mount" "$target_mount"
 container_manifest="$(
 docker run --rm \
   --cap-drop ALL \
@@ -59,8 +61,8 @@ docker run --rm \
   --env "RUSTFLAGS=-Dwarnings" \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
-  --mount "type=bind,source=$repo_mount,target=/workspace,readonly" \
-  --mount "type=bind,source=$target_mount,target=/workspace/target" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/workspace/target" \
   --workdir /workspace \
   "$image_tag" \
   /usr/local/bin/gta-claw-safeio \
@@ -75,6 +77,7 @@ docker run --rm \
     ./packaging/linux/build.sh '$arch'
   "
 )"
+cleanup_anchored_mounts
 [[ "$(stat -Lc '%d:%i' "$REPO_ROOT")" == "$repo_mount_id" ]] ||
   die "repository path identity changed during container build"
 [[ "$(stat -Lc '%d:%i' "$target_root")" == "$target_mount_id" ]] ||
