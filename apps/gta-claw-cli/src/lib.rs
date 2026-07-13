@@ -3,10 +3,8 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::OsString;
-use std::fs::{self, File};
 use std::future::Future;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +28,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
-use url::Url;
+use url::{Host, Url};
 use zeroize::Zeroizing;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,13 +38,11 @@ const MAX_ARGUMENTS: usize = 32;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_OUTPUT_TEXT_BYTES: usize = 256;
 const MAX_SECRET_SOURCE_BYTES: usize = 4_096;
-const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// Runs the CLI using process standard streams and returns its stable exit status.
 pub async fn entrypoint(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
     let result = dispatch(arguments.into_iter().collect()).await;
     let exit_code = result.exit_code;
-    let force_exit = result.force_exit;
     let write_result = if result.stdout.is_empty() {
         Ok(())
     } else {
@@ -65,10 +61,6 @@ pub async fn entrypoint(arguments: impl IntoIterator<Item = OsString>) -> ExitCo
     } else {
         exit_code
     };
-    if force_exit {
-        // Tokio cannot cancel an OS stdin read; exit after flushing the bounded result.
-        std::process::exit(i32::from(exit_code));
-    }
     ExitCode::from(exit_code)
 }
 
@@ -93,7 +85,7 @@ usage:
   gta-claw-cli health
   gta-claw-cli send <session-id> <message>
   gta-claw-cli gateway health --endpoint <ws-or-wss-url> --ephemeral-device
-      [--token-stdin | --token-file <path>] [--timeout-ms <250..120000>]
+      [--token-stdin] [--timeout-ms <250..120000>]
       [--allow-insecure-remote-ws] [--json]";
 
 enum Invocation {
@@ -107,14 +99,13 @@ enum Invocation {
 enum SecretSourceKind {
     None,
     Stdin,
+    UnsupportedFile,
 }
 
 struct GatewayOptions {
     endpoint: String,
-    endpoint_origin: Option<String>,
     ephemeral_device: bool,
     secret_source: SecretSourceKind,
-    secret_file: Option<PathBuf>,
     timeout: Duration,
     allow_insecure_remote_ws: bool,
     json: bool,
@@ -152,8 +143,8 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
     let mut endpoint = None;
     let mut ephemeral_device = false;
     let mut secret_source = SecretSourceKind::None;
-    let mut secret_file = None;
     let mut timeout = DEFAULT_TIMEOUT;
+    let mut timeout_seen = false;
     let mut allow_insecure_remote_ws = false;
     let mut json = false;
     let mut index = 2;
@@ -165,42 +156,35 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
         match flag {
             "--endpoint" if endpoint.is_none() => {
                 index += 1;
-                let value = arguments
-                    .get(index)
-                    .and_then(|value| value.to_str())
-                    .ok_or_else(|| parse_failure("missing endpoint value", arguments))?;
-                if value.len() > MAX_ENDPOINT_BYTES || contains_control(value) {
+                let value = option_value(arguments, index, "missing endpoint value")?
+                    .to_str()
+                    .ok_or_else(|| parse_failure("endpoint must be valid UTF-8", arguments))?;
+                if value.len() > MAX_ENDPOINT_BYTES {
                     return Err(parse_failure("invalid endpoint value", arguments));
                 }
                 endpoint = Some(value.to_owned());
             }
             "--ephemeral-device" if !ephemeral_device => ephemeral_device = true,
-            "--token-stdin"
-                if matches!(secret_source, SecretSourceKind::None) && secret_file.is_none() =>
-            {
+            "--token-stdin" if matches!(secret_source, SecretSourceKind::None) => {
                 secret_source = SecretSourceKind::Stdin;
             }
-            "--token-file"
-                if matches!(secret_source, SecretSourceKind::None) && secret_file.is_none() =>
-            {
+            "--token-file" if matches!(secret_source, SecretSourceKind::None) => {
                 index += 1;
-                let value = arguments
-                    .get(index)
-                    .ok_or_else(|| parse_failure("missing token file path", arguments))?;
-                secret_file = Some(PathBuf::from(value));
+                option_value(arguments, index, "missing token file path")?;
+                secret_source = SecretSourceKind::UnsupportedFile;
             }
-            "--timeout-ms" => {
+            "--timeout-ms" if !timeout_seen => {
                 index += 1;
-                let value = arguments
-                    .get(index)
-                    .and_then(|value| value.to_str())
-                    .ok_or_else(|| parse_failure("missing timeout value", arguments))?;
+                let value = option_value(arguments, index, "missing timeout value")?
+                    .to_str()
+                    .ok_or_else(|| parse_failure("timeout must be valid UTF-8", arguments))?;
                 let millis = value
                     .parse::<u64>()
                     .ok()
                     .filter(|value| (MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(value))
                     .ok_or_else(|| parse_failure("invalid timeout value", arguments))?;
                 timeout = Duration::from_millis(millis);
+                timeout_seen = true;
             }
             "--allow-insecure-remote-ws" if !allow_insecure_remote_ws => {
                 allow_insecure_remote_ws = true;
@@ -224,17 +208,28 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
             arguments,
         ));
     }
-    let endpoint_origin = sanitized_origin(&endpoint);
     Ok(Invocation::Gateway(GatewayOptions {
         endpoint,
-        endpoint_origin,
         ephemeral_device,
         secret_source,
-        secret_file,
         timeout,
         allow_insecure_remote_ws,
         json,
     }))
+}
+
+fn option_value<'a>(
+    arguments: &'a [OsString],
+    index: usize,
+    missing: &'static str,
+) -> Result<&'a OsString, ParseFailure> {
+    let value = arguments
+        .get(index)
+        .ok_or_else(|| parse_failure(missing, arguments))?;
+    if value.to_str().is_some_and(|value| value.starts_with('-')) {
+        return Err(parse_failure(missing, arguments));
+    }
+    Ok(value)
 }
 
 fn parse_failure(message: &'static str, arguments: &[OsString]) -> ParseFailure {
@@ -254,8 +249,150 @@ fn endpoint_origin_from_arguments(arguments: &[OsString]) -> Option<String> {
 }
 
 fn sanitized_origin(endpoint: &str) -> Option<String> {
+    if endpoint.len() > MAX_ENDPOINT_BYTES || contains_forbidden_endpoint_char(endpoint) {
+        return None;
+    }
     let origin = Url::parse(endpoint).ok()?.origin().ascii_serialization();
-    (!contains_control(&origin) && origin.len() <= MAX_OUTPUT_TEXT_BYTES).then_some(origin)
+    (origin.len() <= MAX_OUTPUT_TEXT_BYTES).then_some(origin)
+}
+
+struct ValidatedEndpoint {
+    url: Url,
+    origin: String,
+}
+
+fn validate_endpoint(
+    endpoint: &str,
+    allow_insecure_remote_ws: bool,
+) -> Result<ValidatedEndpoint, DiagnosticFailure> {
+    if endpoint.len() > MAX_ENDPOINT_BYTES
+        || contains_forbidden_endpoint_char(endpoint)
+        || endpoint.contains('\\')
+    {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint_spelling",
+            "Gateway endpoint spelling is not canonical",
+        ));
+    }
+    let expected_scheme = if endpoint.starts_with("ws://") {
+        "ws"
+    } else if endpoint.starts_with("wss://") {
+        "wss"
+    } else {
+        return Err(DiagnosticFailure::usage(
+            "unsupported_scheme",
+            "Gateway endpoint must use canonical ws or wss",
+        ));
+    };
+    let url = Url::parse(endpoint)
+        .map_err(|_| DiagnosticFailure::usage("invalid_endpoint", "invalid Gateway endpoint"))?;
+    if url.scheme() != expected_scheme {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint_spelling",
+            "Gateway endpoint spelling is not canonical",
+        ));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(DiagnosticFailure::usage(
+            "credential_bearing_endpoint",
+            "Gateway endpoint must not contain credentials, query data, or a fragment",
+        ));
+    }
+    validate_ascii_hostname_spelling(endpoint, &url)?;
+    if expected_scheme == "ws" && !allow_insecure_remote_ws && !is_loopback_host(url.host()) {
+        return Err(DiagnosticFailure::usage(
+            "insecure_remote_ws",
+            "remote plaintext ws requires explicit diagnostic opt-in",
+        ));
+    }
+    let origin = url.origin().ascii_serialization();
+    if origin.len() > MAX_OUTPUT_TEXT_BYTES {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint",
+            "Gateway endpoint origin is too long",
+        ));
+    }
+    Ok(ValidatedEndpoint { url, origin })
+}
+
+fn validate_ascii_hostname_spelling(endpoint: &str, url: &Url) -> Result<(), DiagnosticFailure> {
+    let authority = endpoint
+        .split_once("://")
+        .map(|(_, remainder)| remainder)
+        .unwrap_or_default()
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('%') {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint_spelling",
+            "Gateway endpoint spelling is not canonical",
+        ));
+    }
+    let raw_host = if authority.starts_with('[') {
+        return Ok(());
+    } else {
+        authority
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .map_or(authority, |(host, _)| host)
+    };
+    if raw_host
+        .chars()
+        .any(|character| character.is_ascii_uppercase())
+    {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint_spelling",
+            "Gateway endpoint spelling is not canonical",
+        ));
+    }
+    if raw_host.is_ascii() && url.host_str() != Some(raw_host) {
+        return Err(DiagnosticFailure::usage(
+            "invalid_endpoint_spelling",
+            "Gateway endpoint spelling is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Domain("localhost")) => true,
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(_)) | None => false,
+    }
+}
+
+fn contains_forbidden_endpoint_char(value: &str) -> bool {
+    value.chars().any(|character| {
+        character.is_control()
+            || character.is_whitespace()
+            || matches!(
+                character,
+                '\u{00ad}'
+                    | '\u{034f}'
+                    | '\u{061c}'
+                    | '\u{070f}'
+                    | '\u{115f}'
+                    | '\u{1160}'
+                    | '\u{17b4}'
+                    | '\u{17b5}'
+                    | '\u{180b}'..='\u{180f}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{3164}'
+                    | '\u{fe00}'..='\u{fe0f}'
+                    | '\u{feff}'
+                    | '\u{ffa0}'
+                    | '\u{e0100}'..='\u{e01ef}'
+            )
+    })
 }
 
 fn run_foundation(arguments: Vec<OsString>) -> RenderedResult {
@@ -303,7 +440,20 @@ async fn run_gateway(
     interrupt: impl Future<Output = Result<(), ()>>,
 ) -> RenderedResult {
     let started = Instant::now();
-    let endpoint = options.endpoint_origin.clone();
+    let validated = match validate_endpoint(&options.endpoint, options.allow_insecure_remote_ws) {
+        Ok(validated) => validated,
+        Err(failure) => {
+            return render_diagnostic(
+                &options,
+                DiagnosticSummary::failure(
+                    sanitized_origin(&options.endpoint),
+                    started.elapsed(),
+                    failure,
+                ),
+            );
+        }
+    };
+    let endpoint = Some(validated.origin);
     tokio::pin!(interrupt);
     let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
@@ -331,8 +481,7 @@ async fn run_gateway(
             return render_diagnostic(
                 &options,
                 DiagnosticSummary::failure(endpoint, started.elapsed(), failure),
-            )
-            .forcing_exit();
+            );
         }
         () = &mut deadline => {
             return render_diagnostic(
@@ -345,8 +494,7 @@ async fn run_gateway(
                         "Gateway diagnostic timed out",
                     ),
                 ),
-            )
-            .forcing_exit();
+            );
         }
     };
     let identity = match generate_ephemeral_identity() {
@@ -358,21 +506,7 @@ async fn run_gateway(
             );
         }
     };
-    let url = match Url::parse(&options.endpoint) {
-        Ok(url) => url,
-        Err(_) => {
-            return render_diagnostic(
-                &options,
-                DiagnosticSummary::failure(
-                    endpoint,
-                    started.elapsed(),
-                    DiagnosticFailure::usage("invalid_endpoint", "invalid Gateway endpoint"),
-                ),
-            );
-        }
-    };
-
-    let mut config = GatewayClientConfig::new(url, identity);
+    let mut config = GatewayClientConfig::new(validated.url, identity);
     config.credential = credential;
     config.role = Role::Operator;
     config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
@@ -437,7 +571,9 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
             Ok(info) => info,
             Err(failure) => return DiagnosticAttempt::failure(failure),
         },
-        Err(error) => return DiagnosticAttempt::failure(map_client_error(&error)),
+        Err(error) => {
+            return DiagnosticAttempt::failure(classify_request_error(client, &error).await);
+        }
     };
     let request_id = RequestId::new("gta-claw-cli-health-1", AUTHENTICATED_MAX_FRAME_BYTES)
         .expect("static request id");
@@ -505,48 +641,47 @@ async fn classify_request_error(
     client: &GatewayClient,
     error: &GatewayClientError,
 ) -> DiagnosticFailure {
-    if !matches!(error, GatewayClientError::DisconnectedNotReplayed) {
+    if !matches!(
+        error,
+        GatewayClientError::DisconnectedNotReplayed
+            | GatewayClientError::NotReady
+            | GatewayClientError::Cancelled
+    ) {
         return map_client_error(error);
     }
     let mut states = client.subscribe_state();
-    let terminal = tokio::time::timeout(Duration::from_millis(250), async {
-        loop {
-            let state = states.borrow().clone();
-            match state {
-                ConnectionState::ProtocolFailed { .. }
-                | ConnectionState::ResyncRequired(_)
-                | ConnectionState::AuthenticationFailed(_)
-                | ConnectionState::ReconnectExhausted
-                | ConnectionState::Stopped => return state,
-                ConnectionState::Starting
-                | ConnectionState::Connecting
-                | ConnectionState::Authenticating
-                | ConnectionState::Ready(_)
-                | ConnectionState::Reconnecting { .. } => {}
+    loop {
+        let state = states.borrow().clone();
+        match state {
+            ConnectionState::ProtocolFailed { .. } | ConnectionState::ResyncRequired(_) => {
+                return DiagnosticFailure::protocol(
+                    "protocol_error",
+                    "Gateway protocol validation failed",
+                );
             }
-            if states.changed().await.is_err() {
-                return ConnectionState::Stopped;
+            ConnectionState::AuthenticationFailed(authentication) => {
+                return map_authentication_error(authentication);
             }
-        }
-    })
-    .await;
-    match terminal {
-        Ok(ConnectionState::ProtocolFailed { .. } | ConnectionState::ResyncRequired(_)) => {
-            DiagnosticFailure::protocol("protocol_error", "Gateway protocol validation failed")
-        }
-        Ok(ConnectionState::AuthenticationFailed(authentication)) => {
-            map_authentication_error(authentication)
-        }
-        Ok(
-            ConnectionState::ReconnectExhausted
-            | ConnectionState::Stopped
-            | ConnectionState::Starting
+            ConnectionState::ReconnectExhausted | ConnectionState::Stopped => {
+                return DiagnosticFailure {
+                    category: ExitCategory::TransportTransient,
+                    status: "transport_failure",
+                    message: "Gateway transport failed",
+                };
+            }
+            ConnectionState::Starting
             | ConnectionState::Connecting
             | ConnectionState::Authenticating
             | ConnectionState::Ready(_)
-            | ConnectionState::Reconnecting { .. },
-        )
-        | Err(_) => map_client_error(error),
+            | ConnectionState::Reconnecting { .. } => {}
+        }
+        if states.changed().await.is_err() {
+            return DiagnosticFailure {
+                category: ExitCategory::TransportTransient,
+                status: "transport_failure",
+                message: "Gateway transport failed",
+            };
+        }
     }
 }
 
@@ -562,9 +697,9 @@ struct HealthPayload {
 }
 
 async fn read_credential(options: &GatewayOptions) -> Result<GatewayCredential, DiagnosticFailure> {
-    match (&options.secret_source, &options.secret_file) {
-        (SecretSourceKind::None, None) => Ok(GatewayCredential::None),
-        (SecretSourceKind::Stdin, None) => {
+    match options.secret_source {
+        SecretSourceKind::None => Ok(GatewayCredential::None),
+        SecretSourceKind::Stdin => {
             let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_SECRET_SOURCE_BYTES));
             tokio::io::stdin()
                 .take((MAX_SECRET_SOURCE_BYTES + 1) as u64)
@@ -578,12 +713,9 @@ async fn read_credential(options: &GatewayOptions) -> Result<GatewayCredential, 
                 })?;
             parse_secret(bytes.as_slice()).map(GatewayCredential::Token)
         }
-        (SecretSourceKind::None, Some(path)) => {
-            read_secret_file(path).map(GatewayCredential::Token)
-        }
-        (SecretSourceKind::Stdin, Some(_)) => Err(DiagnosticFailure::usage(
-            "secret_source_conflict",
-            "exactly one token source may be selected",
+        SecretSourceKind::UnsupportedFile => Err(DiagnosticFailure::usage(
+            "token_file_unsupported",
+            "token-file input is disabled because secure permissions cannot be proven portably",
         )),
     }
 }
@@ -611,135 +743,6 @@ fn parse_secret(bytes: &[u8]) -> Result<SecretString, DiagnosticFailure> {
         ));
     }
     Ok(SecretString::from(text.to_owned()))
-}
-
-fn read_secret_file(path: &Path) -> Result<SecretString, DiagnosticFailure> {
-    validate_secret_file_path(path)?;
-    let before = fs::symlink_metadata(path).map_err(|_| {
-        DiagnosticFailure::usage("secret_file_error", "token file could not be inspected")
-    })?;
-    if before.file_type().is_symlink() || is_windows_reparse_point(&before) {
-        return Err(DiagnosticFailure::usage(
-            "secret_file_alias",
-            "token file aliases are not allowed",
-        ));
-    }
-    validate_secret_file_metadata(&before)?;
-    let mut file = open_secret_file(path).map_err(|_| {
-        DiagnosticFailure::usage("secret_file_error", "token file could not be opened")
-    })?;
-    let after = file.metadata().map_err(|_| {
-        DiagnosticFailure::usage("secret_file_error", "token file could not be inspected")
-    })?;
-    if is_windows_reparse_point(&after) {
-        return Err(DiagnosticFailure::usage(
-            "secret_file_alias",
-            "token file aliases are not allowed",
-        ));
-    }
-    validate_secret_file_metadata(&after)?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_SECRET_SOURCE_BYTES));
-    (&mut file)
-        .take((MAX_SECRET_SOURCE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            DiagnosticFailure::usage("secret_file_error", "token file could not be read")
-        })?;
-    parse_secret(bytes.as_slice())
-}
-
-fn validate_secret_file_path(path: &Path) -> Result<(), DiagnosticFailure> {
-    let mut components = path.components();
-    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
-        || components.next().is_some()
-    {
-        return Err(DiagnosticFailure::usage(
-            "secret_file_alias",
-            "token file must be one relative filename in the working directory",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn open_secret_file(path: &Path) -> io::Result<File> {
-    use std::fs::OpenOptions;
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(target_os = "linux")]
-fn open_secret_file(path: &Path) -> io::Result<File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    const O_NOFOLLOW: i32 = 0x0002_0000;
-    const O_NONBLOCK: i32 = 0x0000_0800;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(path)
-}
-
-#[cfg(target_os = "macos")]
-fn open_secret_file(path: &Path) -> io::Result<File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    const O_NOFOLLOW: i32 = 0x0000_0100;
-    const O_NONBLOCK: i32 = 0x0000_0004;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(path)
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn open_secret_file(path: &Path) -> io::Result<File> {
-    File::open(path)
-}
-
-fn validate_secret_file_metadata(metadata: &fs::Metadata) -> Result<(), DiagnosticFailure> {
-    if !metadata.is_file() {
-        return Err(DiagnosticFailure::usage(
-            "secret_file_type",
-            "token source must be a regular file",
-        ));
-    }
-    if metadata.len() > MAX_SECRET_SOURCE_BYTES as u64 {
-        return Err(DiagnosticFailure::usage(
-            "secret_too_large",
-            "token source exceeds 4096 bytes",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(DiagnosticFailure::usage(
-                "secret_file_permissions",
-                "token file must not be accessible by group or other users",
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    metadata.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
-    let _ = WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT;
-    false
 }
 
 fn generate_ephemeral_identity() -> Result<DeviceIdentity, DiagnosticFailure> {
@@ -811,7 +814,6 @@ impl<R> TryCryptoRng for IdentityRandom<'_, R> where R: RandomFill {}
 
 struct SafeConnectionInfo {
     protocol: u64,
-    server_version: String,
     role: String,
     scopes: Vec<String>,
 }
@@ -820,7 +822,6 @@ impl TryFrom<ConnectionInfo> for SafeConnectionInfo {
     type Error = DiagnosticFailure;
 
     fn try_from(info: ConnectionInfo) -> Result<Self, Self::Error> {
-        validate_safe_output_text(&info.server_version)?;
         validate_safe_output_text(&info.role)?;
         let mut scopes = BTreeSet::new();
         for scope in info.scopes.iter() {
@@ -829,7 +830,6 @@ impl TryFrom<ConnectionInfo> for SafeConnectionInfo {
         }
         Ok(Self {
             protocol: info.protocol.get(),
-            server_version: info.server_version,
             role: info.role,
             scopes: scopes.into_iter().collect(),
         })
@@ -884,7 +884,8 @@ impl DiagnosticAttempt {
                     Some(info.role),
                     info.scopes,
                     Some(ServerSummary {
-                        version: info.server_version,
+                        version: None,
+                        version_status: "redacted_peer_value",
                     }),
                 )
             },
@@ -901,7 +902,7 @@ impl DiagnosticAttempt {
             },
         );
         DiagnosticSummary {
-            schema_version: 1,
+            schema_version: 2,
             command: "gateway.health",
             status,
             category,
@@ -948,7 +949,8 @@ impl DiagnosticSummary {
 
 #[derive(Serialize)]
 struct ServerSummary {
-    version: String,
+    version: Option<&'static str>,
+    version_status: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1151,10 +1153,6 @@ fn render_diagnostic(options: &GatewayOptions, summary: DiagnosticSummary) -> Re
     if options.json {
         render_json(summary)
     } else if summary.exit_code == 0 {
-        let server_version = summary
-            .server
-            .as_ref()
-            .map_or("<unknown>", |server| server.version.as_str());
         let health = summary.health.as_ref().expect("successful health summary");
         RenderedResult::success(format!(
             "Gateway health: healthy\n\
@@ -1162,7 +1160,8 @@ fn render_diagnostic(options: &GatewayOptions, summary: DiagnosticSummary) -> Re
              protocol: {}\n\
              role: {}\n\
              scopes: {}\n\
-             server_version: {server_version}\n\
+             server_version: [redacted peer value]\n\
+             server_version_status: redacted_peer_value\n\
              health_ok: {}\n\
              health_timestamp_ms: {}\n\
              health_duration_ms: {}\n\
@@ -1185,7 +1184,6 @@ fn render_diagnostic(options: &GatewayOptions, summary: DiagnosticSummary) -> Re
                 summary.message, summary.category
             ),
             exit_code: summary.exit_code,
-            force_exit: false,
         }
     }
 }
@@ -1197,7 +1195,6 @@ fn render_json(summary: DiagnosticSummary) -> RenderedResult {
             stdout: format!("{json}\n"),
             stderr: String::new(),
             exit_code,
-            force_exit: false,
         },
         Err(_) => RenderedResult::failure(
             ExitCategory::Internal,
@@ -1210,7 +1207,6 @@ struct RenderedResult {
     stdout: String,
     stderr: String,
     exit_code: u8,
-    force_exit: bool,
 }
 
 impl RenderedResult {
@@ -1219,7 +1215,6 @@ impl RenderedResult {
             stdout,
             stderr: String::new(),
             exit_code: 0,
-            force_exit: false,
         }
     }
 
@@ -1228,13 +1223,7 @@ impl RenderedResult {
             stdout: String::new(),
             stderr,
             exit_code: category.code(),
-            force_exit: false,
         }
-    }
-
-    fn forcing_exit(mut self) -> Self {
-        self.force_exit = true;
-        self
     }
 }
 
@@ -1312,6 +1301,65 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parser_rejects_option_values_and_all_singleton_duplicates() {
+        let base = [
+            "gateway",
+            "health",
+            "--endpoint",
+            "ws://127.0.0.1:18789",
+            "--ephemeral-device",
+        ];
+        let cases: [(&[&str], &str); 6] = [
+            (
+                &["--token-file", "--token-stdin"],
+                "missing token file path",
+            ),
+            (&["--timeout-ms", "--json"], "missing timeout value"),
+            (
+                &["--endpoint", "ws://127.0.0.1:9"],
+                "unknown or repeated gateway option",
+            ),
+            (
+                &["--timeout-ms", "1000", "--timeout-ms", "2000"],
+                "unknown or repeated gateway option",
+            ),
+            (&["--json", "--json"], "unknown or repeated gateway option"),
+            (
+                &["--token-stdin", "--token-stdin"],
+                "unknown or repeated gateway option",
+            ),
+        ];
+        for (suffix, expected) in cases {
+            let arguments = base
+                .into_iter()
+                .chain(suffix.iter().copied())
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                parse_invocation(&arguments),
+                Err(ParseFailure { message, .. }) if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_ambiguous_spelling_and_preserves_legal_hosts() {
+        for endpoint in [
+            " ws://127.0.0.1:9",
+            "ws://exa\u{200b}mple.com",
+            "ws://exa\u{2060}mple.com",
+            "ws://exa\u{feff}mple.com",
+            "WS://127.0.0.1:9",
+            "ws://LOCALHOST:9",
+            "wss://例え.COM/socket",
+        ] {
+            assert!(validate_endpoint(endpoint, false).is_err(), "{endpoint:?}");
+        }
+        assert!(validate_endpoint("ws://[::1]:18789/socket", false).is_ok());
+        assert!(validate_endpoint("wss://例え.テスト/socket", false).is_ok());
     }
 
     #[test]

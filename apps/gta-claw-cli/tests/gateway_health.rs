@@ -5,13 +5,14 @@
 mod support;
 
 use std::ffi::OsString;
-use std::fs;
 use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use claw_protocol::gateway::{AUTHENTICATED_MAX_FRAME_BYTES, ConnectParams, RequestId};
+use claw_protocol::gateway::{
+    AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, ConnectParams, RequestId,
+};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
@@ -22,10 +23,14 @@ use support::{
 };
 
 const TOKEN: &str = "stdin-only-diagnostic-token";
+const TOKEN_WRAPPED: &str = "prefix-stdin-only-diagnostic-token-suffix";
 
 #[derive(Clone, Debug)]
 enum GatewayBehavior {
-    Healthy { server_version: &'static str },
+    Healthy {
+        server_version: &'static str,
+        expected_token: Option<&'static str>,
+    },
     AuthenticationFailure,
     PairingRequired,
     HelloProtocol(u64),
@@ -34,6 +39,7 @@ enum GatewayBehavior {
     HealthTimeout,
     MalformedResponse,
     OversizedResponse,
+    ImmediateClose,
 }
 
 async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize>) -> TestGateway {
@@ -56,9 +62,17 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                 send_connect_error(&mut socket, connect.id(), code).await;
                 return;
             }
+            let expected_token = match behavior {
+                GatewayBehavior::Healthy { expected_token, .. } => expected_token,
+                _ => Some(TOKEN),
+            };
+            if !connect_matches(&params, expected_token) {
+                send_connect_error(&mut socket, connect.id(), "AUTH_TOKEN_MISMATCH").await;
+                return;
+            }
 
             let (server_version, protocol, max_payload) = match behavior {
-                GatewayBehavior::Healthy { server_version } => {
+                GatewayBehavior::Healthy { server_version, .. } => {
                     (server_version, 4, AUTHENTICATED_MAX_FRAME_BYTES)
                 }
                 GatewayBehavior::HelloProtocol(protocol) => {
@@ -79,14 +93,39 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
             if matches!(behavior, GatewayBehavior::HelloProtocol(_)) {
                 return;
             }
-            if server_version.chars().any(char::is_control) {
-                wait_for_close(&mut socket).await;
+            if matches!(behavior, GatewayBehavior::ImmediateClose) {
+                socket
+                    .write_frame(fastwebsockets::Frame::close(1000, b"diagnostic close"))
+                    .await
+                    .expect("send immediate close");
+                socket.flush().await.expect("flush immediate close");
                 return;
             }
 
             let request = receive_request(&mut socket).await;
             request_count.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.method().as_str(), "health");
+            let params_are_empty = request
+                .params()
+                .value()
+                .and_then(|value| Codec::authenticated().decode_opaque::<Value>(value).ok())
+                .is_some_and(|value| value == json!({}));
+            if request.method().as_str() != "health" || !params_are_empty {
+                send_json(
+                    &mut socket,
+                    json!({
+                        "type": "res",
+                        "id": request.id().as_str(),
+                        "ok": false,
+                        "error": {
+                            "code": "INVALID_REQUEST",
+                            "message": "unexpected diagnostic request"
+                        }
+                    }),
+                )
+                .await;
+                wait_for_close(&mut socket).await;
+                return;
+            }
             match behavior {
                 GatewayBehavior::Healthy { .. } => {
                     send_health(&mut socket, request.id().as_str(), true).await;
@@ -123,11 +162,58 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
                 }
                 GatewayBehavior::AuthenticationFailure
                 | GatewayBehavior::PairingRequired
-                | GatewayBehavior::HelloProtocol(_) => unreachable!("handled before health"),
+                | GatewayBehavior::HelloProtocol(_)
+                | GatewayBehavior::ImmediateClose => unreachable!("handled before health"),
             }
         }
     }))
     .await
+}
+
+fn connect_matches(params: &ConnectParams, expected_token: Option<&str>) -> bool {
+    let auth_matches = match (expected_token, params.auth.as_ref()) {
+        (None, None) => true,
+        (Some(expected), Some(auth)) => {
+            auth.token.as_deref() == Some(expected)
+                && auth.bootstrap_token.is_none()
+                && auth.device_token.is_none()
+                && auth.password.is_none()
+                && auth.approval_runtime_token.is_none()
+                && auth.agent_runtime_identity_token.is_none()
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    params.min_protocol.get() == 4
+        && params.max_protocol.get() == 4
+        && params.client.id == ClientId::Probe
+        && params
+            .client
+            .display_name
+            .as_ref()
+            .map(|name| name.as_str())
+            == Some("GTA Claw Gateway diagnostic")
+        && params.client.version.as_str() == env!("CARGO_PKG_VERSION")
+        && params.client.platform.as_str() == std::env::consts::OS
+        && params.client.device_family.is_none()
+        && params.client.model_identifier.is_none()
+        && params.client.mode == ClientMode::Probe
+        && params.client.instance_id.is_none()
+        && params.caps.as_ref().is_some_and(Vec::is_empty)
+        && params.commands.is_none()
+        && params.permissions.is_none()
+        && params.path_env.is_none()
+        && params.role.as_ref().map(|role| role.as_str()) == Some("operator")
+        && params
+            .scopes
+            .as_ref()
+            .is_some_and(|scopes| scopes.len() == 1 && scopes[0].as_str() == "operator.read")
+        && params
+            .device
+            .as_ref()
+            .is_some_and(|device| device.nonce.as_str() == "test-nonce")
+        && auth_matches
+        && params.locale.is_none()
+        && params.user_agent.is_none()
 }
 
 async fn send_hello(
@@ -230,6 +316,26 @@ async fn run_cli(arguments: Vec<OsString>, stdin: Option<&str>) -> Output {
         .expect("CLI process output")
 }
 
+async fn run_cli_with_open_stdin(arguments: Vec<OsString>) -> (Output, Duration) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"));
+    command
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("CLI process starts");
+    let open_stdin = child.stdin.take().expect("open stdin pipe");
+    let started = Instant::now();
+    let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+        .await
+        .expect("CLI must exit before reading invalid input")
+        .expect("CLI process output");
+    let elapsed = started.elapsed();
+    drop(open_stdin);
+    (output, elapsed)
+}
+
 fn gateway_arguments(url: &str) -> Vec<OsString> {
     [
         "gateway",
@@ -260,6 +366,7 @@ async fn successful_hello_health_is_redacted_deterministic_and_closes_once() {
     let gateway = spawn_gateway(
         GatewayBehavior::Healthy {
             server_version: "网关-v4",
+            expected_token: Some(TOKEN),
         },
         Arc::clone(&request_count),
     )
@@ -300,6 +407,7 @@ async fn successful_hello_health_is_redacted_deterministic_and_closes_once() {
         ]
     );
     assert_eq!(summary["category"], "success");
+    assert_eq!(summary["schema_version"], 2);
     assert_eq!(summary["status"], "healthy");
     assert_eq!(
         summary["endpoint"],
@@ -308,7 +416,8 @@ async fn successful_hello_health_is_redacted_deterministic_and_closes_once() {
     assert_eq!(summary["protocol"], 4);
     assert_eq!(summary["role"], "operator");
     assert_eq!(summary["scopes"], json!(["operator.read"]));
-    assert_eq!(summary["server"]["version"], "网关-v4");
+    assert_eq!(summary["server"]["version"], Value::Null);
+    assert_eq!(summary["server"]["version_status"], "redacted_peer_value");
     assert_eq!(summary["health"]["ok"], true);
     assert_eq!(summary["health"]["timestamp_ms"], 1_700_000_000_123_u64);
     assert_eq!(summary["health"]["duration_ms"], 17);
@@ -323,6 +432,52 @@ async fn successful_hello_health_is_redacted_deterministic_and_closes_once() {
     assert!(!captured.contains("not-rendered"));
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
     gateway.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_version_never_reflects_credentials_separators_or_bidi() {
+    for peer_version in [
+        TOKEN,
+        TOKEN_WRAPPED,
+        "gateway\u{2028}forged",
+        "gateway\u{2029}forged",
+        "gateway\u{202e}forged",
+    ] {
+        for json_output in [true, false] {
+            let gateway = spawn_gateway(
+                GatewayBehavior::Healthy {
+                    server_version: peer_version,
+                    expected_token: Some(TOKEN),
+                },
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+            let mut arguments = gateway_arguments(gateway.url.as_str());
+            if !json_output {
+                arguments.retain(|argument| argument != "--json");
+            }
+            let output = run_cli(arguments, Some(&format!("{TOKEN}\n"))).await;
+            assert_eq!(output.status.code(), Some(0));
+            let captured = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!captured.contains(TOKEN));
+            assert!(!captured.contains(peer_version));
+            assert!(!captured.contains('\u{2028}'));
+            assert!(!captured.contains('\u{2029}'));
+            assert!(!captured.contains('\u{202e}'));
+            if json_output {
+                let summary = parse_json(&output);
+                assert_eq!(summary["server"]["version"], Value::Null);
+                assert_eq!(summary["server"]["version_status"], "redacted_peer_value");
+            } else {
+                assert!(captured.contains("server_version: [redacted peer value]"));
+            }
+            gateway.shutdown().await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -349,12 +504,80 @@ async fn authentication_and_pairing_failures_have_stable_category() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_token_is_explicit_and_wrong_token_is_rejected_by_the_server() {
+    let gateway = spawn_gateway(
+        GatewayBehavior::Healthy {
+            server_version: "no-token-gateway",
+            expected_token: None,
+        },
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let arguments = [
+        "gateway",
+        "health",
+        "--endpoint",
+        gateway.url.as_str(),
+        "--ephemeral-device",
+        "--json",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    let output = run_cli(arguments, None).await;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(parse_json(&output)["status"], "healthy");
+    gateway.shutdown().await;
+
+    let gateway = spawn_gateway(
+        GatewayBehavior::Healthy {
+            server_version: "token-gateway",
+            expected_token: Some(TOKEN),
+        },
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let wrong_token = "wrong-stdin-token";
+    let output = run_cli(
+        gateway_arguments(gateway.url.as_str()),
+        Some(&format!("{wrong_token}\n")),
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(4));
+    let captured = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!captured.contains(wrong_token));
+    gateway.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immediate_post_hello_disconnect_is_stably_transport_failure() {
+    for _ in 0..8 {
+        let gateway = spawn_gateway(
+            GatewayBehavior::ImmediateClose,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let output = run_cli(
+            gateway_arguments(gateway.url.as_str()),
+            Some(&format!("{TOKEN}\n")),
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(3));
+        let summary = parse_json(&output);
+        assert_eq!(summary["category"], "transport_transient");
+        assert_eq!(summary["status"], "transport_failure");
+        gateway.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn protocol_version_control_text_malformed_and_oversized_are_rejected() {
     for behavior in [
         GatewayBehavior::HelloProtocol(3),
-        GatewayBehavior::Healthy {
-            server_version: "gateway\nforged",
-        },
         GatewayBehavior::MalformedResponse,
         GatewayBehavior::OversizedResponse,
     ] {
@@ -373,7 +596,6 @@ async fn protocol_version_control_text_malformed_and_oversized_are_rejected() {
         );
         let summary = parse_json(&output);
         assert_eq!(summary["category"], "protocol");
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("forged"));
         gateway.shutdown().await;
     }
 }
@@ -437,6 +659,41 @@ async fn unreachable_and_remote_plaintext_are_distinct_stable_failures() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_or_insecure_endpoints_exit_before_reading_stdin() {
+    for endpoint in [
+        "not-a-url",
+        " ws://127.0.0.1:9",
+        "ws://exa\u{200b}mple.com",
+        "ws://exa\u{2060}mple.com",
+        "ws://exa\u{feff}mple.com",
+        "WS://127.0.0.1:9",
+        "ws://LOCALHOST:9",
+        "wss://例え.COM/socket",
+        "ws://192.0.2.1:18789",
+    ] {
+        let (output, elapsed) = run_cli_with_open_stdin(gateway_arguments(endpoint)).await;
+        assert_eq!(output.status.code(), Some(2), "endpoint {endpoint:?}");
+        assert!(elapsed < Duration::from_secs(1), "endpoint {endpoint:?}");
+        assert_eq!(parse_json(&output)["category"], "usage_config");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_resolving_dns_cannot_hold_the_process_past_its_bound() {
+    let mut arguments = gateway_arguments("wss://never-resolves.invalid:443");
+    arguments.extend([OsString::from("--timeout-ms"), OsString::from("300")]);
+    let started = Instant::now();
+    let output = run_cli(arguments, Some(&format!("{TOKEN}\n"))).await;
+    assert!(
+        matches!(output.status.code(), Some(3) | Some(7)),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn endpoint_credentials_query_and_fragment_are_never_rendered() {
     let endpoint = "ws://operator:argv-secret@127.0.0.1:9/path?token=query-secret#fragment-secret";
     let output = run_cli(gateway_arguments(endpoint), Some(&format!("{TOKEN}\n"))).await;
@@ -450,7 +707,7 @@ async fn endpoint_credentials_query_and_fragment_are_never_rendered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stdin_and_file_contract_errors_fail_before_network() {
+async fn stdin_errors_and_token_file_fail_closed_before_network() {
     let output = run_cli(
         gateway_arguments("ws://127.0.0.1:9"),
         Some("two lines\nare rejected\n"),
@@ -459,7 +716,6 @@ async fn stdin_and_file_contract_errors_fail_before_network() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(parse_json(&output)["status"], "secret_invalid");
 
-    let missing = unique_temp_path("missing");
     let arguments = [
         "gateway".into(),
         "health".into(),
@@ -467,67 +723,13 @@ async fn stdin_and_file_contract_errors_fail_before_network() {
         "ws://127.0.0.1:9".into(),
         "--ephemeral-device".into(),
         "--token-file".into(),
-        missing.into_os_string(),
+        "token.txt".into(),
         "--json".into(),
     ]
     .to_vec();
     let output = run_cli(arguments, None).await;
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_json(&output)["status"], "secret_file_error");
-
-    let oversized = unique_temp_path("oversized");
-    fs::write(&oversized, vec![b'x'; 4_097]).expect("write oversized token");
-    secure_test_file(&oversized);
-    let arguments = [
-        "gateway".into(),
-        "health".into(),
-        "--endpoint".into(),
-        "ws://127.0.0.1:9".into(),
-        "--ephemeral-device".into(),
-        "--token-file".into(),
-        oversized.clone().into_os_string(),
-        "--json".into(),
-    ]
-    .to_vec();
-    let output = run_cli(arguments, None).await;
-    fs::remove_file(oversized).expect("remove oversized token");
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_json(&output)["status"], "secret_too_large");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn token_file_can_drive_a_successful_probe_without_an_argv_secret() {
-    let gateway = spawn_gateway(
-        GatewayBehavior::Healthy {
-            server_version: "file-token-gateway",
-        },
-        Arc::new(AtomicUsize::new(0)),
-    )
-    .await;
-    let token_file = unique_temp_path("secure-token");
-    fs::write(&token_file, TOKEN).expect("write token file");
-    secure_test_file(&token_file);
-    let arguments = [
-        "gateway".into(),
-        "health".into(),
-        "--endpoint".into(),
-        gateway.url.as_str().into(),
-        "--ephemeral-device".into(),
-        "--token-file".into(),
-        token_file.clone().into_os_string(),
-        "--json".into(),
-    ]
-    .to_vec();
-    assert!(
-        arguments
-            .iter()
-            .all(|argument: &OsString| argument.to_string_lossy() != TOKEN)
-    );
-    let output = run_cli(arguments, None).await;
-    fs::remove_file(token_file).expect("remove token file");
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(parse_json(&output)["status"], "healthy");
-    gateway.shutdown().await;
+    assert_eq!(parse_json(&output)["status"], "token_file_unsupported");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -560,76 +762,6 @@ async fn timeout_terminates_an_open_stdin_secret_source() {
     let summary = parse_json(&output);
     assert_eq!(summary["category"], "timeout_cancel");
     assert_eq!(summary["status"], "timeout");
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn insecure_and_symlinked_unix_token_files_are_rejected() {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-
-    let token = unique_temp_path("token");
-    fs::write(&token, TOKEN).expect("write token");
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o644)).expect("set insecure mode");
-    let mut arguments: Vec<OsString> = [
-        "gateway",
-        "health",
-        "--endpoint",
-        "ws://127.0.0.1:9",
-        "--ephemeral-device",
-        "--token-file",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
-    arguments.extend([token.clone().into_os_string(), "--json".into()]);
-    let output = run_cli(arguments, None).await;
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_json(&output)["status"], "secret_file_permissions");
-
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("set secure mode");
-    let alias = unique_temp_path("alias");
-    symlink(&token, &alias).expect("create token symlink");
-    let mut arguments: Vec<OsString> = [
-        "gateway",
-        "health",
-        "--endpoint",
-        "ws://127.0.0.1:9",
-        "--ephemeral-device",
-        "--token-file",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
-    arguments.extend([alias.clone().into_os_string(), "--json".into()]);
-    let output = run_cli(arguments, None).await;
-    fs::remove_file(alias).expect("remove alias");
-    fs::remove_file(token).expect("remove token");
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_json(&output)["status"], "secret_file_alias");
-
-    let fifo = unique_temp_path("fifo");
-    let created = Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .await
-        .expect("create FIFO");
-    assert!(created.success());
-    let mut arguments: Vec<OsString> = [
-        "gateway",
-        "health",
-        "--endpoint",
-        "ws://127.0.0.1:9",
-        "--ephemeral-device",
-        "--token-file",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
-    arguments.extend([fifo.clone().into_os_string(), "--json".into()]);
-    let output = run_cli(arguments, None).await;
-    fs::remove_file(fifo).expect("remove FIFO");
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_json(&output)["status"], "secret_file_type");
 }
 
 #[cfg(unix)]
@@ -675,26 +807,4 @@ async fn sigint_cancels_and_joins_the_gateway_task() {
     assert_eq!(summary["status"], "cancelled");
     gateway.shutdown().await;
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
-}
-
-fn unique_temp_path(label: &str) -> std::path::PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock")
-        .as_nanos();
-    std::path::PathBuf::from(format!(
-        "gta-claw-cli-{label}-{}-{nonce}",
-        std::process::id()
-    ))
-}
-
-fn secure_test_file(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .expect("secure test file mode");
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }

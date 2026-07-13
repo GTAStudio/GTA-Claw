@@ -47,3 +47,17 @@ fn unknown_commands_remain_fail_closed() {
         "error: unknown command\n"
     );
 }
+
+#[test]
+fn documentation_never_places_literal_secrets_in_command_arguments() {
+    let documentation = include_str!("../README.md");
+    assert!(documentation.contains("IFS= read -r -s GTA_CLAW_TOKEN"));
+    assert!(documentation.contains("Read-Host \"Gateway token\" -AsSecureString"));
+    assert!(documentation.contains("version_status: \"redacted_peer_value\""));
+    assert!(!documentation.contains("example-automation-token"));
+    assert!(!documentation.contains("replace-with-token"));
+    assert!(!documentation.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("printf ") || line.starts_with("echo ")
+    }));
+}
