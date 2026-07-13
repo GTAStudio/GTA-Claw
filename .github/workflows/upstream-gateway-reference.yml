@@ -25,9 +25,13 @@ jobs:
     name: OpenClaw b43e832 Linux reference
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
     steps:
       - name: Checkout GTA Claw
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Verify frozen compatibility identity
         shell: bash
@@ -43,6 +47,23 @@ jobs:
           ref: b43e832fcc8000ed7287c7accc54e381db607f85
           path: _upstream/openclaw
           persist-credentials: false
+
+      - name: Verify checkout credential isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repository in "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/_upstream/openclaw"; do
+            if git -C "$repository" config --local --get-regexp \
+              '^(credential\..*|http\..*\.extraheader)$'; then
+              echo "checkout left credential configuration in $repository"
+              exit 1
+            fi
+          done
+          if git config --global --get-regexp \
+            '^(credential\..*|http\..*\.extraheader)$'; then
+            echo "runner global git configuration exposes credentials"
+            exit 1
+          fi
 
       - name: Verify upstream checkout and lockfile
         working-directory: _upstream/openclaw
@@ -75,8 +96,20 @@ jobs:
           set -euo pipefail
           corepack enable
           test "$(pnpm --version)" = "11.2.2"
-          pnpm install --frozen-lockfile
+          test "$(pnpm config get ignore-scripts)" = "true"
+          pnpm install --frozen-lockfile --ignore-scripts
+          test -d node_modules
+          if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
+            -type f -name '*.node' -print -quit 2>/dev/null | grep -q .; then
+            echo "unverified Matrix native lifecycle artifact was downloaded"
+            exit 1
+          fi
           pnpm build
+          if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
+            -type f -name '*.node' -print -quit 2>/dev/null | grep -q .; then
+            echo "build introduced an unverified Matrix native artifact"
+            exit 1
+          fi
 
       - name: Start official Gateway in isolated reference boundary
         working-directory: _upstream/openclaw

@@ -15,6 +15,14 @@ pub trait ClientRuntime: Send + Sync + 'static {
 
     /// Returns additive jitter in the inclusive range from zero through `maximum`.
     fn jitter(&self, maximum: Duration) -> Duration;
+
+    /// Optional scheduling barrier before an authenticated application write.
+    ///
+    /// Production runtimes normally use the no-op default. Deterministic tests
+    /// can pause the single writer without mocking the WebSocket transport.
+    fn before_application_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(async {})
+    }
 }
 
 /// Production runtime backed by Tokio time and a process-local jitter state.

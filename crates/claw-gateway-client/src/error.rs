@@ -35,6 +35,11 @@ pub enum TransportFailure {
     Write,
     /// Peer closed the connection.
     Closed,
+    /// Peer closed with one explicitly transient RFC 6455 status.
+    PeerClosed {
+        /// Received close status, when present.
+        code: Option<u16>,
+    },
     /// Connection operation exceeded its configured timeout.
     TimedOut,
     /// Peer negotiated an unsupported WebSocket extension.
@@ -48,6 +53,7 @@ impl Display for TransportFailure {
             Self::Read => "Gateway transport read failed",
             Self::Write => "Gateway transport write failed",
             Self::Closed => "Gateway transport closed",
+            Self::PeerClosed { .. } => "Gateway peer requested a transient reconnect",
             Self::TimedOut => "Gateway transport operation timed out",
             Self::UnsupportedExtension => "Gateway negotiated an unsupported WebSocket extension",
         })
@@ -60,17 +66,30 @@ impl Error for TransportFailure {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthenticationFailure {
     detail_code: Option<ConnectErrorDetailCode>,
+    device_retry_recommended: bool,
 }
 
 impl AuthenticationFailure {
-    pub(crate) const fn new(detail_code: Option<ConnectErrorDetailCode>) -> Self {
-        Self { detail_code }
+    pub(crate) const fn new(
+        detail_code: Option<ConnectErrorDetailCode>,
+        device_retry_recommended: bool,
+    ) -> Self {
+        Self {
+            detail_code,
+            device_retry_recommended,
+        }
     }
 
     /// Returns the pinned structured detail code when the peer supplied one.
     #[must_use]
     pub const fn detail_code(self) -> Option<ConnectErrorDetailCode> {
         self.detail_code
+    }
+
+    /// Returns whether the pinned server explicitly recommended one device-token correction.
+    #[must_use]
+    pub const fn device_retry_recommended(self) -> bool {
+        self.device_retry_recommended
     }
 }
 
@@ -172,6 +191,11 @@ pub enum ProtocolFailure {
     InvalidFragmentation,
     /// WebSocket framing violated RFC 6455.
     WebSocketProtocol(&'static str),
+    /// Peer sent a valid but terminal Close status.
+    PeerClose {
+        /// Received close status, when present.
+        code: Option<u16>,
+    },
     /// Server sent a request to this client transport.
     UnexpectedServerRequest,
     /// Encoded request exceeds the server-advertised payload policy.
@@ -226,6 +250,10 @@ impl Display for ProtocolFailure {
                     "Gateway WebSocket framing violated RFC 6455 ({category})"
                 )
             }
+            Self::PeerClose { code } => match code {
+                Some(code) => write!(formatter, "Gateway peer closed permanently ({code})"),
+                None => formatter.write_str("Gateway peer closed permanently"),
+            },
             Self::UnexpectedServerRequest => {
                 formatter.write_str("Gateway server sent an unexpected request frame")
             }
@@ -258,6 +286,7 @@ impl ProtocolFailure {
             Self::InvalidUtf8 => "invalid UTF-8",
             Self::InvalidFragmentation => "invalid fragmentation",
             Self::WebSocketProtocol(category) => category,
+            Self::PeerClose { .. } => "terminal peer close",
             Self::UnexpectedServerRequest => "unexpected server request",
             Self::OutboundMessageTooLarge { .. } => "outbound message too large",
             Self::UnknownResponse(_) => "unknown response identifier",
@@ -285,6 +314,10 @@ pub enum BackpressureError {
     InFlightLimit,
     /// The bounded socket command queue is full.
     CommandQueueSaturated,
+    /// The cumulative encoded command-byte budget is exhausted.
+    CommandBytesSaturated,
+    /// Another request is currently using the bounded serialization allocation.
+    SerializationSaturated,
     /// The bounded per-connection unique identifier budget is exhausted.
     IdentifierCapacity,
 }
@@ -294,6 +327,8 @@ impl Display for BackpressureError {
         formatter.write_str(match self {
             Self::InFlightLimit => "Gateway in-flight request limit reached",
             Self::CommandQueueSaturated => "Gateway command queue saturated",
+            Self::CommandBytesSaturated => "Gateway command byte budget saturated",
+            Self::SerializationSaturated => "Gateway request serialization budget saturated",
             Self::IdentifierCapacity => {
                 "Gateway per-connection request identifier capacity reached"
             }

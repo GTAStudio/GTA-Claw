@@ -19,6 +19,7 @@ use url::{Host, Position, Url};
 use crate::error::{ProtocolFailure, TransportFailure};
 
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
+const MAX_CONTROL_PAYLOAD_BYTES: usize = 125;
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub(crate) trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -254,7 +255,7 @@ impl MessageReader {
         loop {
             let remaining =
                 limit.saturating_sub(self.fragmented_text.as_ref().map_or(0, std::vec::Vec::len));
-            socket.set_max_message_size(remaining.saturating_add(1));
+            socket.set_max_message_size(remaining.max(MAX_CONTROL_PAYLOAD_BYTES).saturating_add(1));
             let frame = socket
                 .read_frame()
                 .await
@@ -262,10 +263,10 @@ impl MessageReader {
             if let Some(inbound) = self.consume(frame, limit)? {
                 match inbound {
                     Inbound::Text(bytes) => return Ok(bytes),
-                    Inbound::Close => {
-                        return Err(WireFailure::Transport(TransportFailure::Closed));
+                    Inbound::Close(close) => {
+                        return Err(WireFailure::Close(close));
                     }
-                    Inbound::Ping(_) | Inbound::Pong => {}
+                    Inbound::Ping(_) | Inbound::Pong(_) => {}
                 }
             }
         }
@@ -279,7 +280,7 @@ impl MessageReader {
         loop {
             let remaining =
                 limit.saturating_sub(self.fragmented_text.as_ref().map_or(0, std::vec::Vec::len));
-            socket.set_max_message_size(remaining.saturating_add(1));
+            socket.set_max_message_size(remaining.max(MAX_CONTROL_PAYLOAD_BYTES).saturating_add(1));
             let frame = socket
                 .read_frame(&mut |_| async { Ok::<(), std::io::Error>(()) })
                 .await
@@ -329,16 +330,62 @@ impl MessageReader {
             }
             OpCode::Close => {
                 self.fragmented_text = None;
-                Ok(Some(Inbound::Close))
+                parse_close(Vec::from(frame.payload))
+                    .map(Inbound::Close)
+                    .map(Some)
             }
-            OpCode::Ping => Ok(Some(Inbound::Ping(Vec::from(frame.payload)))),
-            OpCode::Pong => Ok(Some(Inbound::Pong)),
+            OpCode::Ping => validate_control_payload(frame.payload.len())
+                .map(|()| Some(Inbound::Ping(Vec::from(frame.payload)))),
+            OpCode::Pong => validate_control_payload(frame.payload.len())
+                .map(|()| Some(Inbound::Pong(Vec::from(frame.payload)))),
             OpCode::Continuation | OpCode::Text => {
                 self.fragmented_text = None;
                 Err(WireFailure::Protocol(ProtocolFailure::InvalidFragmentation))
             }
         }
     }
+}
+
+fn validate_control_payload(payload_bytes: usize) -> Result<(), WireFailure> {
+    if payload_bytes <= MAX_CONTROL_PAYLOAD_BYTES {
+        Ok(())
+    } else {
+        Err(WireFailure::Protocol(ProtocolFailure::WebSocketProtocol(
+            "oversized control frame",
+        )))
+    }
+}
+
+fn parse_close(payload: Vec<u8>) -> Result<PeerCloseFrame, WireFailure> {
+    validate_control_payload(payload.len())?;
+    if payload.len() == 1 {
+        return Err(WireFailure::Protocol(ProtocolFailure::WebSocketProtocol(
+            "invalid close frame",
+        )));
+    }
+    let code = if payload.is_empty() {
+        None
+    } else {
+        Some(u16::from_be_bytes([payload[0], payload[1]]))
+    };
+    if code.is_some_and(|code| !valid_close_code(code)) {
+        return Err(WireFailure::Protocol(ProtocolFailure::WebSocketProtocol(
+            "invalid close code",
+        )));
+    }
+    if payload.len() > 2 && std::str::from_utf8(&payload[2..]).is_err() {
+        return Err(WireFailure::Protocol(ProtocolFailure::WebSocketProtocol(
+            "invalid close reason UTF-8",
+        )));
+    }
+    Ok(PeerCloseFrame { code, payload })
+}
+
+fn valid_close_code(code: u16) -> bool {
+    matches!(
+        code,
+        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 1012 | 1013 | 1014
+    ) || (3000..=4999).contains(&code)
 }
 
 fn map_read_error(error: WebSocketError, limit: usize) -> WireFailure {
@@ -438,6 +485,17 @@ pub(crate) async fn close_split(socket: &mut GatewayWriteHalf) -> Result<(), Tra
     socket.flush().await.map_err(|_| TransportFailure::Write)
 }
 
+pub(crate) async fn reply_close(
+    socket: &mut GatewayWriteHalf,
+    close: &PeerCloseFrame,
+) -> Result<(), TransportFailure> {
+    socket
+        .write_frame(Frame::close_raw(Payload::Owned(close.payload.clone())))
+        .await
+        .map_err(|_| TransportFailure::Write)?;
+    socket.flush().await.map_err(|_| TransportFailure::Write)
+}
+
 pub(crate) async fn close(socket: &mut GatewaySocket) -> Result<(), TransportFailure> {
     socket
         .write_frame(Frame::close(1000, b"client shutdown"))
@@ -457,11 +515,31 @@ pub(crate) async fn close(socket: &mut GatewaySocket) -> Result<(), TransportFai
 pub(crate) enum WireFailure {
     Transport(TransportFailure),
     Protocol(ProtocolFailure),
+    Close(PeerCloseFrame),
 }
 
 pub(crate) enum Inbound {
     Text(Vec<u8>),
     Ping(Vec<u8>),
-    Pong,
-    Close,
+    Pong(Vec<u8>),
+    Close(PeerCloseFrame),
+}
+
+pub(crate) struct PeerCloseFrame {
+    code: Option<u16>,
+    payload: Vec<u8>,
+}
+
+impl PeerCloseFrame {
+    pub(crate) const fn code(&self) -> Option<u16> {
+        self.code
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self.code, Some(1001 | 1011 | 1012 | 1013))
+    }
+
+    pub(crate) const fn is_normal(&self) -> bool {
+        self.code.is_none() || matches!(self.code, Some(1000))
+    }
 }

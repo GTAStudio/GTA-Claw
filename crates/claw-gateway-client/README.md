@@ -18,20 +18,24 @@ strict codec decision, and `claw-security` for device identity and signing.
   for a bounded per-connection identifier budget without unsafe eviction.
 - Event gaps, duplicates, regressions, and bounded queue saturation enter a typed
   resync-required terminal state.
-- Every command/event queue, cumulative queued-event byte budget, pending map,
-  identifier budget, frame, and retry series is bounded. In-flight requests are
-  never replayed after reconnect.
+- Every command/event queue, cumulative outbound/event byte budget, serialization
+  allocation, pending map, identifier budget, frame, and retry series is bounded.
+  Expired queued requests are discarded and in-flight requests are never replayed.
 - A single supervised socket lifecycle re-authenticates every connection and
   cancels pending requests before bounded close/task shutdown.
 - All primary/secondary tokens issued after bootstrap are exposed atomically
   through secrecy wrappers; the primary replaces the one-time bootstrap
   credential for subsequent reconnects.
+- Shared authentication retains the latest primary device token separately and
+  permits exactly one server-hinted corrective device authentication.
+- Ping, Pong, and Close frames are strictly bounded and validated; only explicit
+  transient Close statuses can enter reconnect policy.
 - Credentials are secrecy wrappers and never appear in client `Debug`, errors,
   state, events, or tracing.
 
-The local suite has 28 active client checks: 24 real in-process WebSocket
-scenarios, three configuration/redaction regressions, and deterministic
-injected clock/jitter coverage. One ignored live contract test is run only by
+The local suite has 39 active client/policy checks: 37 integration and
+regression cases, deterministic injected clock/jitter coverage, and a static
+reference-workflow policy test. One ignored live contract test is run only by
 the isolated upstream workflow.
 
 ## Pinned upstream reference
@@ -40,7 +44,8 @@ the isolated upstream workflow.
 `openclaw/openclaw` at exactly
 `b43e832fcc8000ed7287c7accc54e381db607f85` (package `2026.7.2`), verifies the
 checkout and pinned `pnpm-lock.yaml` digest, installs the package-declared
-`pnpm@11.2.2`, and starts:
+`pnpm@11.2.2` with lifecycle scripts disabled, proves the known downloaded
+Matrix native artifact is absent, and starts:
 
 ```text
 OPENCLAW_SKIP_CHANNELS=1 OPENCLAW_STATE_DIR=<isolated> OPENCLAW_GATEWAY_TOKEN=<redacted> node openclaw.mjs gateway --port 18789 --bind loopback --auth token --allow-unconfigured --ws-log compact

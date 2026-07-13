@@ -345,7 +345,31 @@ fn encode_gateway_device(
 }
 
 fn normalize_gateway_metadata(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+    value
+        .trim_matches(is_ecmascript_trim_character)
+        .to_ascii_lowercase()
+}
+
+fn is_ecmascript_trim_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'
+            | '\u{000a}'
+            | '\u{000b}'
+            | '\u{000c}'
+            | '\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
 }
 
 /// In-memory Ed25519 signer.
@@ -613,5 +637,32 @@ mod tests {
         let rendered = format!("{input:?}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("never-log-this"));
+    }
+
+    #[test]
+    fn gateway_metadata_uses_exact_ecmascript_trim_boundaries() {
+        let trim_characters = [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{00a0}',
+            '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}',
+            '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}',
+            '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
+        ];
+        for character in trim_characters {
+            assert_eq!(
+                normalize_gateway_metadata(&format!("{character}WinDows{character}")),
+                "windows",
+                "ECMAScript trim character U+{:04X}",
+                u32::from(character)
+            );
+        }
+        assert_eq!(
+            normalize_gateway_metadata("\u{0085}WinDows\u{0085}"),
+            "\u{0085}windows\u{0085}",
+            "U+0085 is not ECMAScript WhiteSpace or LineTerminator"
+        );
+        assert_eq!(
+            normalize_gateway_metadata("\u{feff}\u{0085}WinDows\u{0085}\u{feff}"),
+            "\u{0085}windows\u{0085}"
+        );
     }
 }

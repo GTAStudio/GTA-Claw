@@ -29,6 +29,7 @@ use crate::transport::{self, Inbound, MessageReader, WireFailure};
 
 const CONNECT_REQUEST_ID: &str = "gateway-connect";
 const INBOUND_QUEUE_CAPACITY: usize = 1;
+const MAX_ISSUED_DEVICE_TOKENS: usize = 16;
 
 /// Cloneable handle to one reconnecting Gateway transport task.
 #[derive(Clone)]
@@ -42,6 +43,8 @@ struct ClientInner {
     cancellation: CancellationToken,
     tasks: TaskTracker,
     permits: Arc<Semaphore>,
+    serialization_bytes: Arc<Semaphore>,
+    outbound_bytes: Arc<Semaphore>,
     request_timeout: Duration,
     shutdown_timeout: Duration,
     codec: Codec,
@@ -82,13 +85,18 @@ impl GatewayClient {
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
         let permits = Arc::new(Semaphore::new(config.limits.max_in_flight_requests));
+        let serialization_bytes = Arc::new(Semaphore::new(AUTHENTICATED_MAX_FRAME_BYTES));
+        let outbound_bytes = Arc::new(Semaphore::new(config.limits.outbound_queue_bytes));
         let issued_device_tokens = Arc::new(Mutex::new(Vec::new()));
+        let latest_device_token = Arc::new(Mutex::new(None));
         let inner = Arc::new(ClientInner {
             commands: command_tx,
             state: state_rx,
             cancellation: cancellation.clone(),
             tasks: tasks.clone(),
             permits,
+            serialization_bytes,
+            outbound_bytes,
             request_timeout: config.timeouts.request,
             shutdown_timeout: config.timeouts.shutdown,
             codec: Codec::authenticated(),
@@ -101,6 +109,7 @@ impl GatewayClient {
             tasks: tasks.clone(),
             event_bytes: Arc::new(Semaphore::new(config.limits.event_queue_bytes)),
             issued_device_tokens,
+            latest_device_token,
         };
         tasks.spawn(supervise(config, runtime, command_rx, resources));
         Ok((Self { inner }, GatewayEventStream { receiver: event_rx }))
@@ -171,21 +180,66 @@ impl GatewayClient {
     where
         T: Serialize + ?Sized,
     {
-        if !matches!(*self.inner.state.borrow(), ConnectionState::Ready(_)) {
-            return Err(GatewayClientError::NotReady);
+        self.request_with_timeout(id, method, params, self.inner.request_timeout)
+            .await
+    }
+
+    /// Sends one typed request with an explicit caller deadline.
+    pub async fn request_with_timeout<T>(
+        &self,
+        id: RequestId,
+        method: GatewayMethodName,
+        params: &T,
+        timeout: Duration,
+    ) -> Result<ResponseFrame, GatewayClientError>
+    where
+        T: Serialize + ?Sized,
+    {
+        if timeout.is_zero() {
+            return Err(GatewayClientError::RequestTimedOut(id));
         }
+        let max_payload_bytes = match self.inner.state.borrow().clone() {
+            ConnectionState::Ready(info) => info.max_payload_bytes,
+            _ => return Err(GatewayClientError::NotReady),
+        };
         let permit = Arc::clone(&self.inner.permits)
             .try_acquire_owned()
             .map_err(|_| GatewayClientError::Backpressure(BackpressureError::InFlightLimit))?;
+        let serialization_permits =
+            u32::try_from(max_payload_bytes).expect("protocol payload cap fits u32");
+        let serialization_permit = Arc::clone(&self.inner.serialization_bytes)
+            .try_acquire_many_owned(serialization_permits)
+            .map_err(|_| {
+                GatewayClientError::Backpressure(BackpressureError::SerializationSaturated)
+            })?;
         let bytes = self.inner.codec.encode_request(&id, &method, params)?;
+        if bytes.len() > max_payload_bytes {
+            return Err(GatewayClientError::Protocol(
+                ProtocolFailure::OutboundMessageTooLarge {
+                    actual: bytes.len(),
+                    limit: max_payload_bytes,
+                },
+            ));
+        }
+        let byte_permits =
+            u32::try_from(bytes.len().max(1)).expect("protocol payload cap fits u32");
+        let byte_permit = Arc::clone(&self.inner.outbound_bytes)
+            .try_acquire_many_owned(byte_permits)
+            .map_err(|_| {
+                GatewayClientError::Backpressure(BackpressureError::CommandBytesSaturated)
+            })?;
+        drop(serialization_permit);
         let (completion, response) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + timeout;
         self.inner
             .commands
             .try_send(Command::Request {
                 id: id.clone(),
                 bytes,
                 completion,
+                deadline,
                 _permit: permit,
+                _byte_permit: byte_permit,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
@@ -195,7 +249,7 @@ impl GatewayClient {
             })?;
         tokio::select! {
             () = self.inner.cancellation.cancelled() => Err(GatewayClientError::Cancelled),
-            result = tokio::time::timeout(self.inner.request_timeout, response) => {
+            result = tokio::time::timeout_at(deadline, response) => {
                 match result {
                     Ok(Ok(response)) => response,
                     Ok(Err(_)) => Err(GatewayClientError::DisconnectedNotReplayed),
@@ -232,7 +286,9 @@ enum Command {
         id: RequestId,
         bytes: Vec<u8>,
         completion: oneshot::Sender<Result<ResponseFrame, GatewayClientError>>,
+        deadline: tokio::time::Instant,
         _permit: OwnedSemaphorePermit,
+        _byte_permit: OwnedSemaphorePermit,
     },
 }
 
@@ -253,6 +309,7 @@ struct SupervisorResources {
     tasks: TaskTracker,
     event_bytes: Arc<Semaphore>,
     issued_device_tokens: Arc<Mutex<Vec<IssuedDeviceToken>>>,
+    latest_device_token: Arc<Mutex<Option<SecretString>>>,
 }
 
 async fn supervise(
@@ -262,6 +319,7 @@ async fn supervise(
     resources: SupervisorResources,
 ) {
     let mut retry = 0_u32;
+    let mut corrective_device_retry_used = false;
     loop {
         set_state(&resources.states, ConnectionState::Connecting);
         let outcome =
@@ -273,6 +331,47 @@ async fn supervise(
                 break;
             }
             Err(GatewayClientError::Authentication(error)) => {
+                if error.device_retry_recommended()
+                    && !corrective_device_retry_used
+                    && matches!(config.credential, GatewayCredential::Token(_))
+                {
+                    let replacement = resources
+                        .latest_device_token
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|token| SecretString::from(token.expose_secret().to_owned()));
+                    if let Some(replacement) = replacement {
+                        config.credential = GatewayCredential::DeviceToken(replacement);
+                        corrective_device_retry_used = true;
+                        retry = retry.saturating_add(1);
+                        let Some(delay) =
+                            reconnect_delay(config.reconnect, retry, runtime.as_ref())
+                        else {
+                            set_state(&resources.states, ConnectionState::ReconnectExhausted);
+                            break;
+                        };
+                        set_state(
+                            &resources.states,
+                            ConnectionState::Reconnecting {
+                                attempt: retry,
+                                delay,
+                            },
+                        );
+                        if wait_to_reconnect(
+                            runtime.as_ref(),
+                            delay,
+                            &mut commands,
+                            &resources.cancellation,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        set_state(&resources.states, ConnectionState::Stopped);
+                        break;
+                    }
+                }
                 set_state(
                     &resources.states,
                     ConnectionState::AuthenticationFailed(error),
@@ -417,21 +516,17 @@ async fn run_connection(
         }
     };
     if !authenticated.issued_device_tokens.is_empty() {
-        resources.issued_device_tokens.lock().await.extend(
-            authenticated.issued_device_tokens.iter().map(|issued| {
-                IssuedDeviceToken::new(
-                    SecretString::from(issued.token.clone()),
-                    issued.role.clone(),
-                    issued.scopes.clone().into(),
-                    issued.issued_at_unix_millis,
-                )
-            }),
-        );
+        *resources.issued_device_tokens.lock().await = authenticated.issued_device_tokens;
     }
-    if let Some(token) = authenticated.reconnect_device_token.as_deref()
-        && matches!(config.credential, GatewayCredential::BootstrapToken(_))
-    {
-        config.credential = GatewayCredential::DeviceToken(SecretString::from(token.to_owned()));
+    if let Some(token) = authenticated.reconnect_device_token {
+        *resources.latest_device_token.lock().await =
+            Some(SecretString::from(token.expose_secret().to_owned()));
+        if matches!(
+            config.credential,
+            GatewayCredential::BootstrapToken(_) | GatewayCredential::DeviceToken(_)
+        ) {
+            config.credential = GatewayCredential::DeviceToken(token);
+        }
     }
     set_state(
         &resources.states,
@@ -444,6 +539,7 @@ async fn run_connection(
         commands,
         resources,
         authenticated.tick_interval,
+        Arc::clone(&runtime),
     )
     .await;
     SessionOutcome {
@@ -456,15 +552,8 @@ struct Authenticated {
     info: ConnectionInfo,
     max_payload_bytes: usize,
     tick_interval: Duration,
-    reconnect_device_token: Option<String>,
-    issued_device_tokens: Vec<IssuedTokenData>,
-}
-
-struct IssuedTokenData {
-    token: String,
-    role: String,
-    scopes: Vec<String>,
-    issued_at_unix_millis: Option<u64>,
+    reconnect_device_token: Option<SecretString>,
+    issued_device_tokens: Vec<IssuedDeviceToken>,
 }
 
 async fn authenticate(
@@ -516,12 +605,19 @@ async fn authenticate(
         }
         if response.error().is_some_and(|error| {
             error.retryable == Some(true) && error.code.core() == Some(CoreErrorCode::Unavailable)
-        }) || recovery.is_some_and(|recovery| recovery.allows_retry())
+        }) || recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.allows_retry())
         {
             return Err(GatewayClientError::Transport(TransportFailure::Closed));
         }
         return Err(GatewayClientError::Authentication(
-            AuthenticationFailure::new(detail_code),
+            AuthenticationFailure::new(
+                detail_code,
+                recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.recommends_device_retry()),
+            ),
         ));
     }
     let hello = preauth
@@ -563,29 +659,43 @@ async fn authenticate(
         .auth
         .device_token
         .as_ref()
-        .map(|token| token.as_str().to_owned());
+        .map(|token| SecretString::from(token.as_str().to_owned()));
+    let raw_issued_count = usize::from(hello.auth.device_token.is_some())
+        + hello.auth.device_tokens.as_ref().map_or(0, Vec::len);
+    if raw_issued_count > MAX_ISSUED_DEVICE_TOKENS {
+        return Err(GatewayClientError::Protocol(
+            ProtocolFailure::HelloAuthenticationMismatch,
+        ));
+    }
     let mut issued_device_tokens = Vec::new();
     if let Some(token) = &hello.auth.device_token {
-        issued_device_tokens.push(IssuedTokenData {
-            token: token.as_str().to_owned(),
-            role: hello_role.clone(),
-            scopes: hello_scopes.clone(),
-            issued_at_unix_millis: hello.auth.issued_at_ms.map(NonNegativeInteger::get),
-        });
+        issued_device_tokens.push(IssuedDeviceToken::new(
+            SecretString::from(token.as_str().to_owned()),
+            hello_role.clone(),
+            hello_scopes.clone().into(),
+            hello.auth.issued_at_ms.map(NonNegativeInteger::get),
+        ));
     }
     if let Some(tokens) = &hello.auth.device_tokens {
-        issued_device_tokens.extend(tokens.iter().map(|token| {
-            IssuedTokenData {
-                token: token.device_token.as_str().to_owned(),
-                role: token.role.as_str().to_owned(),
-                scopes: token
+        for token in tokens {
+            if issued_device_tokens
+                .iter()
+                .any(|existing| existing.token().expose_secret() == token.device_token.as_str())
+            {
+                continue;
+            }
+            issued_device_tokens.push(IssuedDeviceToken::new(
+                SecretString::from(token.device_token.as_str().to_owned()),
+                token.role.as_str().to_owned(),
+                token
                     .scopes
                     .iter()
                     .map(|scope| scope.as_str().to_owned())
-                    .collect(),
-                issued_at_unix_millis: Some(token.issued_at_ms.get()),
-            }
-        }));
+                    .collect::<Vec<_>>()
+                    .into(),
+                Some(token.issued_at_ms.get()),
+            ));
+        }
     }
     let info = ConnectionInfo {
         protocol: hello.protocol,
@@ -720,15 +830,25 @@ struct ConnectRecoveryProbe {
     pause_reconnect: Option<bool>,
     #[serde(default)]
     recommended_next_step: Option<ConnectRecoveryNextStep>,
+    #[serde(default)]
+    can_retry_with_device_token: Option<bool>,
 }
 
 impl ConnectRecoveryProbe {
     fn allows_retry(&self) -> bool {
-        self.retryable == Some(true)
+        self.code != ConnectErrorDetailCode::AuthTokenMismatch
+            && self.retryable == Some(true)
             && self.pause_reconnect != Some(true)
             && (self.pause_reconnect == Some(false)
                 || self.recommended_next_step == Some(ConnectRecoveryNextStep::WaitThenRetry)
                 || self.code == ConnectErrorDetailCode::AuthRateLimited)
+    }
+
+    fn recommends_device_retry(&self) -> bool {
+        self.code == ConnectErrorDetailCode::AuthTokenMismatch
+            && (self.can_retry_with_device_token == Some(true)
+                || self.recommended_next_step
+                    == Some(ConnectRecoveryNextStep::RetryWithDeviceToken))
     }
 }
 
@@ -744,6 +864,7 @@ async fn run_ready(
     commands: &mut mpsc::Receiver<Command>,
     resources: &SupervisorResources,
     tick_interval: Duration,
+    runtime: Arc<dyn ClientRuntime>,
 ) -> Result<(), GatewayClientError> {
     let (mut read, mut write) = transport::split(socket);
     let reader_cancellation = resources.cancellation.child_token();
@@ -756,7 +877,7 @@ async fn run_ready(
                 () = reader_token.cancelled() => break,
                 result = reader.read_split(&mut read, max_payload_bytes) => result,
             };
-            let terminal = matches!(inbound, Ok(Inbound::Close) | Err(_));
+            let terminal = matches!(inbound, Ok(Inbound::Close(_)) | Err(_));
             let sent = tokio::select! {
                 () = reader_token.cancelled() => false,
                 result = inbound_tx.send(inbound) => result.is_ok(),
@@ -801,14 +922,18 @@ async fn run_ready(
                 let Some(command) = command else {
                     break Err(GatewayClientError::Cancelled);
                 };
+                let context = CommandContext {
+                    policy: command_policy,
+                    cancellation: &resources.cancellation,
+                    runtime: runtime.as_ref(),
+                    completed: &completed,
+                    abandoned: &abandoned,
+                };
                 if let Err(error) = handle_command(
                     command,
                     &mut write,
-                    command_policy,
-                    &resources.cancellation,
+                    &context,
                     &mut pending,
-                    &completed,
-                    &abandoned,
                 ).await {
                     break Err(error);
                 }
@@ -855,14 +980,24 @@ async fn run_ready(
                             }
                         }
                     }
-                    Ok(Inbound::Pong) => {}
-                    Ok(Inbound::Close) => {
+                    Ok(Inbound::Pong(payload)) => drop(payload),
+                    Ok(Inbound::Close(close)) => {
                         let _ = tokio::time::timeout(
                             config.timeouts.shutdown,
-                            transport::close_split(&mut write),
+                            transport::reply_close(&mut write, &close),
                         )
                         .await;
-                        break Err(GatewayClientError::Transport(TransportFailure::Closed));
+                        if close.is_normal() {
+                            break Ok(());
+                        }
+                        if close.is_transient() {
+                            break Err(GatewayClientError::Transport(
+                                TransportFailure::PeerClosed { code: close.code() },
+                            ));
+                        }
+                        break Err(GatewayClientError::Protocol(ProtocolFailure::PeerClose {
+                            code: close.code(),
+                        }));
                     }
                     Err(error) => break Err(map_wire_failure(error)),
                 }
@@ -886,56 +1021,77 @@ struct CommandPolicy {
     write_timeout: Duration,
 }
 
+struct CommandContext<'a> {
+    policy: CommandPolicy,
+    cancellation: &'a CancellationToken,
+    runtime: &'a dyn ClientRuntime,
+    completed: &'a CompletedIds,
+    abandoned: &'a CompletedIds,
+}
+
 async fn handle_command(
     command: Command,
     write: &mut transport::GatewayWriteHalf,
-    policy: CommandPolicy,
-    cancellation: &CancellationToken,
+    context: &CommandContext<'_>,
     pending: &mut HashMap<RequestId, PendingRequest>,
-    completed: &CompletedIds,
-    abandoned: &CompletedIds,
 ) -> Result<(), GatewayClientError> {
     let Command::Request {
         id,
         bytes,
-        completion,
+        mut completion,
+        deadline,
         _permit,
+        _byte_permit,
     } = command;
-    if pending.contains_key(&id) || completed.contains(&id) || abandoned.contains(&id) {
+    if completion.is_closed() || tokio::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    if pending.contains_key(&id)
+        || context.completed.contains(&id)
+        || context.abandoned.contains(&id)
+    {
         let error = GatewayClientError::Protocol(ProtocolFailure::DuplicateRequest(id));
         let _ = completion.send(Err(error));
         return Ok(());
     }
-    if pending.len() >= policy.max_in_flight {
+    if pending.len() >= context.policy.max_in_flight {
         let _ = completion.send(Err(GatewayClientError::Backpressure(
             BackpressureError::InFlightLimit,
         )));
         return Ok(());
     }
-    if pending.len() + completed.len() + abandoned.len() >= policy.identifier_capacity {
+    if pending.len() + context.completed.len() + context.abandoned.len()
+        >= context.policy.identifier_capacity
+    {
         let _ = completion.send(Err(GatewayClientError::Backpressure(
             BackpressureError::IdentifierCapacity,
         )));
         return Ok(());
     }
-    if bytes.len() > policy.max_payload_bytes {
+    if bytes.len() > context.policy.max_payload_bytes {
         let _ = completion.send(Err(GatewayClientError::Protocol(
             ProtocolFailure::OutboundMessageTooLarge {
                 actual: bytes.len(),
-                limit: policy.max_payload_bytes,
+                limit: context.policy.max_payload_bytes,
             },
         )));
         return Ok(());
     }
     let write_result = tokio::select! {
-        () = cancellation.cancelled() => {
+        () = context.cancellation.cancelled() => {
             let _ = completion.send(Err(GatewayClientError::Cancelled));
             return Err(GatewayClientError::Cancelled);
         }
-        result = tokio::time::timeout(
-            policy.write_timeout,
-            transport::write_text_split(write, bytes),
-        ) => result,
+        () = completion.closed() => {
+            return Err(GatewayClientError::Transport(TransportFailure::Closed));
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            return Err(GatewayClientError::Transport(TransportFailure::TimedOut));
+        }
+        result = tokio::time::timeout(context.policy.write_timeout, async {
+            context.runtime.before_application_write().await;
+            transport::write_text_split(write, bytes).await
+        }) => result,
     };
     match write_result {
         Ok(Ok(())) => {}
@@ -949,6 +1105,9 @@ async fn handle_command(
             )));
             return Err(GatewayClientError::Transport(TransportFailure::TimedOut));
         }
+    }
+    if completion.is_closed() || tokio::time::Instant::now() >= deadline {
+        return Err(GatewayClientError::Transport(TransportFailure::Closed));
     }
     pending.insert(
         id,
@@ -1119,6 +1278,12 @@ fn map_wire_failure(error: WireFailure) -> GatewayClientError {
     match error {
         WireFailure::Transport(error) => GatewayClientError::Transport(error),
         WireFailure::Protocol(error) => GatewayClientError::Protocol(error),
+        WireFailure::Close(close) if close.is_transient() => {
+            GatewayClientError::Transport(TransportFailure::PeerClosed { code: close.code() })
+        }
+        WireFailure::Close(close) => {
+            GatewayClientError::Protocol(ProtocolFailure::PeerClose { code: close.code() })
+        }
     }
 }
 

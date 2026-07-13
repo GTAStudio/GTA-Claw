@@ -92,13 +92,17 @@ pub(crate) struct TestGateway {
 
 impl TestGateway {
     pub(crate) async fn spawn(handler: ConnectionHandler) -> Self {
-        Self::spawn_with_extensions(handler, false).await
+        Self::spawn_options(handler, false).await
     }
 
     pub(crate) async fn spawn_with_extensions(
         handler: ConnectionHandler,
         advertise_compression: bool,
     ) -> Self {
+        Self::spawn_options(handler, advertise_compression).await
+    }
+
+    async fn spawn_options(handler: ConnectionHandler, advertise_compression: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let cancellation = CancellationToken::new();
@@ -437,6 +441,14 @@ async fn send_hello_with_policy(
 }
 
 pub(crate) async fn send_connect_error(socket: &mut TestSocket, id: &RequestId, detail_code: &str) {
+    send_connect_error_details(socket, id, json!({"code": detail_code})).await;
+}
+
+pub(crate) async fn send_connect_error_details(
+    socket: &mut TestSocket,
+    id: &RequestId,
+    details: Value,
+) {
     send_json(
         socket,
         json!({
@@ -446,7 +458,7 @@ pub(crate) async fn send_connect_error(socket: &mut TestSocket, id: &RequestId, 
             "error": {
                 "code": "INVALID_REQUEST",
                 "message": "connection rejected",
-                "details": {"code": detail_code}
+                "details": details
             }
         }),
     )

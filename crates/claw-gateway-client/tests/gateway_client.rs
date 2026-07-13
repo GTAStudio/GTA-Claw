@@ -2,14 +2,16 @@
 
 mod support;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use claw_gateway_client::{
-    BackpressureError, ClientLimits, ClientMetadata, ClientTimeouts, ConnectionState,
-    GatewayClient, GatewayClientConfig, GatewayClientError, GatewayCredential, ProtocolFailure,
-    ReconnectPolicy, ResyncRequired,
+    BackpressureError, ClientLimits, ClientMetadata, ClientRuntime, ClientTimeouts,
+    ConnectionState, GatewayClient, GatewayClientConfig, GatewayClientError, GatewayCredential,
+    ProtocolFailure, ReconnectPolicy, ResyncRequired, SystemRuntime,
 };
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, CodecError, GatewayMethodName,
@@ -24,12 +26,12 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::json;
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 use url::Url;
 
 use support::{
     TestGateway, complete_handshake, handler, raw_stalled_server, receive_connect, receive_request,
-    send_challenge, send_connect_error, send_hello_with_device_token,
+    send_challenge, send_connect_error, send_connect_error_details, send_hello_with_device_token,
     send_hello_with_tick_interval, send_json, send_raw_text, send_response, wait_for_close,
 };
 
@@ -59,6 +61,68 @@ fn request_id(value: &str) -> RequestId {
 
 fn health_method() -> GatewayMethodName {
     GatewayMethodName::Core(resolve_core_method("health").expect("health registry"))
+}
+
+fn side_effect_method() -> GatewayMethodName {
+    GatewayMethodName::Core(resolve_core_method("config.set").expect("config.set registry"))
+}
+
+struct WriteGateRuntime {
+    system: SystemRuntime,
+    gate_next: AtomicBool,
+    entered: Notify,
+    release: Arc<Semaphore>,
+}
+
+impl WriteGateRuntime {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            system: SystemRuntime::default(),
+            gate_next: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Arc::new(Semaphore::new(0)),
+        })
+    }
+
+    async fn wait_until_blocked(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.entered.notified())
+            .await
+            .expect("writer reached deterministic gate");
+    }
+
+    fn unblock(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl ClientRuntime for WriteGateRuntime {
+    fn unix_millis(&self) -> u64 {
+        self.system.unix_millis()
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.system.sleep(duration)
+    }
+
+    fn jitter(&self, maximum: Duration) -> Duration {
+        self.system.jitter(maximum)
+    }
+
+    fn before_application_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        if self.gate_next.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                release
+                    .acquire_owned()
+                    .await
+                    .expect("write gate remains open")
+                    .forget();
+            })
+        } else {
+            Box::pin(async {})
+        }
+    }
 }
 
 async fn wait_for_state(
@@ -301,6 +365,210 @@ async fn rejects_protocol_mismatch_and_permanent_auth_without_reconnect() {
 }
 
 #[tokio::test]
+async fn shared_token_uses_one_server_hinted_device_token_correction_and_rotates() {
+    const SHARED: &str = "shared-token-before-rotation";
+    const FIRST_DEVICE: &str = "first-issued-device-token";
+    const ROTATED_DEVICE: &str = "rotated-device-token";
+    let gateway = TestGateway::spawn(handler(|mut socket, index| async move {
+        send_challenge(&mut socket).await;
+        let (request, params) = receive_connect(&mut socket).await;
+        support::verify_connect_proof(&params);
+        match index {
+            0 => {
+                assert_eq!(
+                    params.auth.as_ref().and_then(|auth| auth.token.as_deref()),
+                    Some(SHARED)
+                );
+                send_hello_with_device_token(
+                    &mut socket,
+                    request.id(),
+                    &params,
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                    Some(FIRST_DEVICE),
+                )
+                .await;
+                socket
+                    .write_frame(Frame::close(1012, b"shared token rotated"))
+                    .await
+                    .expect("transient close");
+                socket.flush().await.expect("flush");
+            }
+            1 => {
+                let auth = params.auth.as_ref().expect("shared auth");
+                assert_eq!(auth.token.as_deref(), Some(SHARED));
+                assert_eq!(auth.device_token, None);
+                send_connect_error_details(
+                    &mut socket,
+                    request.id(),
+                    json!({
+                        "code": "AUTH_TOKEN_MISMATCH",
+                        "canRetryWithDeviceToken": true,
+                        "recommendedNextStep": "retry_with_device_token"
+                    }),
+                )
+                .await;
+                wait_for_close(&mut socket).await;
+            }
+            2 => {
+                let auth = params.auth.as_ref().expect("corrective device auth");
+                assert_eq!(auth.token.as_deref(), Some(FIRST_DEVICE));
+                assert_eq!(auth.device_token.as_deref(), Some(FIRST_DEVICE));
+                send_hello_with_device_token(
+                    &mut socket,
+                    request.id(),
+                    &params,
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                    Some(ROTATED_DEVICE),
+                )
+                .await;
+                wait_for_close(&mut socket).await;
+            }
+            _ => panic!("unexpected arbitrary corrective retry"),
+        }
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.credential = GatewayCredential::Token(SecretString::from(SHARED.to_owned()));
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 3,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start");
+    client.wait_ready().await.expect("initial shared auth");
+    wait_for_state(&client, |state| {
+        matches!(state, ConnectionState::Ready(_))
+            && gateway.connections.load(Ordering::SeqCst) == 3
+    })
+    .await;
+    let issued = client.take_issued_device_tokens().await;
+    assert_eq!(issued[0].token().expose_secret(), ROTATED_DEVICE);
+    assert!(!format!("{issued:?}").contains(ROTATED_DEVICE));
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn wrong_device_retry_hint_is_terminal_and_redacted() {
+    const SHARED: &str = "wrong-hint-shared-secret";
+    const DEVICE: &str = "wrong-hint-device-secret";
+    let gateway = TestGateway::spawn(handler(|mut socket, index| async move {
+        send_challenge(&mut socket).await;
+        let (request, params) = receive_connect(&mut socket).await;
+        support::verify_connect_proof(&params);
+        if index == 0 {
+            send_hello_with_device_token(
+                &mut socket,
+                request.id(),
+                &params,
+                AUTHENTICATED_MAX_FRAME_BYTES,
+                Some(DEVICE),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            socket
+                .write_frame(Frame::close(1012, b"retry auth"))
+                .await
+                .expect("close");
+            socket.flush().await.expect("flush");
+        } else {
+            send_connect_error_details(
+                &mut socket,
+                request.id(),
+                json!({
+                    "code": "AUTH_TOKEN_MISMATCH",
+                    "retryable": true,
+                    "recommendedNextStep": "wait_then_retry"
+                }),
+            )
+            .await;
+            wait_for_close(&mut socket).await;
+        }
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.credential = GatewayCredential::Token(SecretString::from(SHARED.to_owned()));
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 3,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start");
+    client.wait_ready().await.expect("initial ready");
+    let state = wait_for_state(&client, |state| {
+        matches!(state, ConnectionState::AuthenticationFailed(_))
+    })
+    .await;
+    let rendered = format!("{state:?}");
+    assert!(!rendered.contains(SHARED));
+    assert!(!rendered.contains(DEVICE));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(gateway.connections.load(Ordering::SeqCst), 2);
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn second_device_token_correction_failure_is_terminal() {
+    const SHARED: &str = "single-correction-shared";
+    const DEVICE: &str = "single-correction-device";
+    let gateway = TestGateway::spawn(handler(|mut socket, index| async move {
+        send_challenge(&mut socket).await;
+        let (request, params) = receive_connect(&mut socket).await;
+        support::verify_connect_proof(&params);
+        if index == 0 {
+            send_hello_with_device_token(
+                &mut socket,
+                request.id(),
+                &params,
+                AUTHENTICATED_MAX_FRAME_BYTES,
+                Some(DEVICE),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            socket
+                .write_frame(Frame::close(1012, b"rotate"))
+                .await
+                .expect("close");
+            socket.flush().await.expect("flush");
+        } else {
+            send_connect_error_details(
+                &mut socket,
+                request.id(),
+                json!({
+                    "code": "AUTH_TOKEN_MISMATCH",
+                    "canRetryWithDeviceToken": true,
+                    "recommendedNextStep": "retry_with_device_token"
+                }),
+            )
+            .await;
+            wait_for_close(&mut socket).await;
+        }
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.credential = GatewayCredential::Token(SecretString::from(SHARED.to_owned()));
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 4,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start");
+    client.wait_ready().await.expect("initial ready");
+    wait_for_state(&client, |state| {
+        matches!(state, ConnectionState::AuthenticationFailed(_))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(gateway.connections.load(Ordering::SeqCst), 3);
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn retries_pinned_retryable_startup_unavailable_response() {
     let gateway = TestGateway::spawn(handler(|mut socket, index| async move {
         if index == 0 {
@@ -502,6 +770,191 @@ async fn rejects_invalid_utf8_text_frames() {
         matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn rejects_malformed_and_oversized_control_frames() {
+    let cases = [
+        Frame::close_raw(Payload::Owned(1005_u16.to_be_bytes().to_vec())),
+        Frame::close_raw(Payload::Owned(vec![0x03, 0xf0, 0xff])),
+        Frame::pong(Payload::Owned(vec![0_u8; 126])),
+        Frame::new(true, OpCode::Ping, None, Payload::Owned(vec![0_u8; 126])),
+        Frame::close_raw(Payload::Owned(vec![0_u8; 126])),
+    ];
+    for frame in cases {
+        let frame = Arc::new(Mutex::new(Some(frame)));
+        let frame_for_server = Arc::clone(&frame);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let frame = Arc::clone(&frame_for_server);
+            async move {
+                complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+                socket
+                    .write_frame(frame.lock().await.take().expect("one frame"))
+                    .await
+                    .expect("write malformed control");
+                socket.flush().await.expect("flush");
+                wait_for_close(&mut socket).await;
+            }
+        }))
+        .await;
+        let (client, _) = GatewayClient::start(config(gateway.url.clone())).expect("start");
+        wait_for_state(&client, |state| {
+            matches!(state, ConnectionState::ProtocolFailed { .. })
+        })
+        .await;
+        client.shutdown().await.expect("shutdown");
+        gateway.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn auth_policy_close_is_terminal_but_service_restart_close_reconnects() {
+    let policy_gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+        complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+        socket
+            .write_frame(Frame::close(1008, b"authentication policy"))
+            .await
+            .expect("policy close");
+        socket.flush().await.expect("flush");
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let mut client_config = config(policy_gateway.url.clone());
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 3,
+        initial_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(5),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start");
+    wait_for_state(&client, |state| {
+        matches!(state, ConnectionState::ProtocolFailed { .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(policy_gateway.connections.load(Ordering::SeqCst), 1);
+    client.shutdown().await.expect("shutdown");
+    policy_gateway.shutdown().await;
+
+    let transient_gateway = TestGateway::spawn(handler(|mut socket, index| async move {
+        complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+        if index == 0 {
+            socket
+                .write_frame(Frame::close(1012, b"service restart"))
+                .await
+                .expect("restart close");
+            socket.flush().await.expect("flush");
+        } else {
+            wait_for_close(&mut socket).await;
+        }
+    }))
+    .await;
+    let mut client_config = config(transient_gateway.url.clone());
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 2,
+        initial_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(5),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start");
+    wait_for_state(&client, |state| {
+        matches!(state, ConnectionState::Ready(_))
+            && transient_gateway.connections.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    client.shutdown().await.expect("shutdown");
+    transient_gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn max_controls_remain_legal_near_fragmented_data_cap() {
+    const SERVER_LIMIT: usize = 4096;
+    let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+        complete_handshake(&mut socket, SERVER_LIMIT).await;
+        let event = serde_json::to_vec(&json!({
+            "type": "event",
+            "event": "tick",
+            "payload": {"data": "x".repeat(3900)},
+            "seq": 1
+        }))
+        .expect("event");
+        assert!(event.len() < SERVER_LIMIT);
+        let split = event.len() - 10;
+        socket
+            .write_frame(Frame::new(
+                false,
+                OpCode::Text,
+                None,
+                Payload::Owned(event[..split].to_vec()),
+            ))
+            .await
+            .expect("fragment");
+        socket
+            .write_frame(Frame::new(
+                true,
+                OpCode::Ping,
+                None,
+                Payload::Owned(vec![7_u8; 125]),
+            ))
+            .await
+            .expect("max ping");
+        socket
+            .write_frame(Frame::pong(Payload::Owned(vec![8_u8; 125])))
+            .await
+            .expect("max pong");
+        socket
+            .write_frame(Frame::new(
+                true,
+                OpCode::Continuation,
+                None,
+                Payload::Owned(event[split..].to_vec()),
+            ))
+            .await
+            .expect("continuation");
+        socket.flush().await.expect("flush");
+        let pong = socket.read_frame().await.expect("client pong");
+        assert_eq!(pong.opcode, OpCode::Pong);
+        assert_eq!(pong.payload.len(), 125);
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let (client, mut events) = GatewayClient::start(config(gateway.url.clone())).expect("start");
+    client.wait_ready().await.expect("ready");
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("event timeout")
+        .expect("event");
+    assert_eq!(event.frame().sequence().expect("sequence").get(), 1);
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn max_close_remains_legal_near_fragmented_data_cap() {
+    const SERVER_LIMIT: usize = 4096;
+    let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+        complete_handshake(&mut socket, SERVER_LIMIT).await;
+        socket
+            .write_frame(Frame::new(
+                false,
+                OpCode::Text,
+                None,
+                Payload::Owned(vec![b'x'; SERVER_LIMIT - 10]),
+            ))
+            .await
+            .expect("near-cap fragment");
+        socket
+            .write_frame(Frame::close(1000, &[b'z'; 123]))
+            .await
+            .expect("max close");
+        socket.flush().await.expect("flush");
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let (client, _) = GatewayClient::start(config(gateway.url.clone())).expect("start");
+    wait_for_state(&client, |state| matches!(state, ConnectionState::Stopped)).await;
     client.shutdown().await.expect("shutdown");
     gateway.shutdown().await;
 }
@@ -796,6 +1249,7 @@ async fn bounds_in_flight_requests_and_cancels_pending_on_shutdown() {
     client_config.limits = ClientLimits {
         max_in_flight_requests: 1,
         command_queue_capacity: 1,
+        outbound_queue_bytes: AUTHENTICATED_MAX_FRAME_BYTES,
         event_queue_capacity: 8,
         event_queue_bytes: AUTHENTICATED_MAX_FRAME_BYTES,
         completed_id_capacity: 8,
@@ -838,6 +1292,7 @@ async fn command_queue_saturation_is_explicit_backpressure() {
     client_config.limits = ClientLimits {
         max_in_flight_requests: 2,
         command_queue_capacity: 1,
+        outbound_queue_bytes: AUTHENTICATED_MAX_FRAME_BYTES,
         event_queue_capacity: 8,
         event_queue_bytes: AUTHENTICATED_MAX_FRAME_BYTES,
         completed_id_capacity: 8,
@@ -857,6 +1312,142 @@ async fn command_queue_saturation_is_explicit_backpressure() {
             BackpressureError::CommandQueueSaturated
         ))
     ));
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer() {
+    const LARGE_BYTES: usize = 20 * 1024 * 1024;
+    let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+        complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+        let request = receive_request(&mut socket).await;
+        assert_eq!(request.id().as_str(), "large-held");
+        send_response(&mut socket, request.id().as_str(), 1).await;
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.limits.max_in_flight_requests = 4;
+    client_config.limits.command_queue_capacity = 4;
+    client_config.limits.outbound_queue_bytes = 21 * 1024 * 1024;
+    client_config.timeouts.request = Duration::from_secs(5);
+    let runtime = WriteGateRuntime::new();
+    let (client, _) = GatewayClient::start_with_runtime(
+        client_config,
+        Arc::clone(&runtime) as Arc<dyn ClientRuntime>,
+    )
+    .expect("start");
+    client.wait_ready().await.expect("ready");
+    let large = json!({"value": "x".repeat(LARGE_BYTES)});
+    let held_client = client.clone();
+    let held = tokio::spawn(async move {
+        held_client
+            .request(request_id("large-held"), side_effect_method(), &large)
+            .await
+    });
+    runtime.wait_until_blocked().await;
+    for id in ["large-rejected-one", "large-rejected-two"] {
+        let large = json!({"value": "y".repeat(LARGE_BYTES)});
+        let result = client
+            .request(request_id(id), side_effect_method(), &large)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(GatewayClientError::Backpressure(
+                    BackpressureError::CommandBytesSaturated
+                ))
+            ),
+            "unexpected aggregate-budget result: {result:?}"
+        );
+    }
+    runtime.unblock();
+    held.await
+        .expect("held request task")
+        .expect("held request response");
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn expired_queued_side_effect_is_never_transmitted_and_releases_budgets() {
+    const LARGE_BYTES: usize = 20 * 1024 * 1024;
+    let (no_expired_tx, no_expired_rx) = oneshot::channel();
+    let no_expired_tx = Arc::new(Mutex::new(Some(no_expired_tx)));
+    let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+        let no_expired_tx = Arc::clone(&no_expired_tx);
+        async move {
+            complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+            let first = receive_request(&mut socket).await;
+            assert_eq!(first.id().as_str(), "blocking-write");
+            send_response(&mut socket, first.id().as_str(), 1).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), receive_request(&mut socket))
+                    .await
+                    .is_err(),
+                "expired side-effect request reached the server"
+            );
+            if let Some(sender) = no_expired_tx.lock().await.take() {
+                let _ = sender.send(());
+            }
+            let third = receive_request(&mut socket).await;
+            assert_eq!(third.id().as_str(), "after-expired");
+            send_response(&mut socket, third.id().as_str(), 3).await;
+            wait_for_close(&mut socket).await;
+        }
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.limits.max_in_flight_requests = 3;
+    client_config.limits.command_queue_capacity = 3;
+    client_config.limits.outbound_queue_bytes = AUTHENTICATED_MAX_FRAME_BYTES;
+    client_config.timeouts.request = Duration::from_secs(3);
+    let runtime = WriteGateRuntime::new();
+    let (client, _) = GatewayClient::start_with_runtime(
+        client_config,
+        Arc::clone(&runtime) as Arc<dyn ClientRuntime>,
+    )
+    .expect("start");
+    client.wait_ready().await.expect("ready");
+    let large = json!({"value": "x".repeat(LARGE_BYTES)});
+    let first_client = client.clone();
+    let first = tokio::spawn(async move {
+        first_client
+            .request_with_timeout(
+                request_id("blocking-write"),
+                side_effect_method(),
+                &large,
+                Duration::from_secs(3),
+            )
+            .await
+    });
+    runtime.wait_until_blocked().await;
+    assert!(matches!(
+        client
+            .request_with_timeout(
+                request_id("must-not-send"),
+                side_effect_method(),
+                &json!({"value": "side-effect"}),
+                Duration::from_millis(50),
+            )
+            .await,
+        Err(GatewayClientError::RequestTimedOut(_))
+    ));
+    runtime.unblock();
+    first
+        .await
+        .expect("blocking request task")
+        .expect("blocking request response");
+    no_expired_rx.await.expect("server checked expired request");
+    client
+        .request(
+            request_id("after-expired"),
+            side_effect_method(),
+            &json!({"value": "still-usable"}),
+        )
+        .await
+        .expect("all permits released");
     client.shutdown().await.expect("shutdown");
     gateway.shutdown().await;
 }
@@ -1084,6 +1675,67 @@ async fn bootstrap_token_is_surfaced_and_rotated_for_reconnect() {
             && gateway.connections.load(Ordering::SeqCst) >= 2
     })
     .await;
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn issued_token_delivery_replaces_old_reconnect_state_at_fixed_bound() {
+    const CONNECTIONS: usize = 5;
+    let gateway = TestGateway::spawn(handler(|mut socket, index| async move {
+        send_challenge(&mut socket).await;
+        let (request, params) = receive_connect(&mut socket).await;
+        support::verify_connect_proof(&params);
+        let auth = params.auth.as_ref().expect("auth");
+        if index == 0 {
+            assert_eq!(auth.bootstrap_token.as_deref(), Some("bounded-bootstrap"));
+        } else {
+            let expected = format!("bounded-device-{}", index - 1);
+            assert_eq!(auth.device_token.as_deref(), Some(expected.as_str()));
+        }
+        let issued = format!("bounded-device-{index}");
+        send_hello_with_device_token(
+            &mut socket,
+            request.id(),
+            &params,
+            AUTHENTICATED_MAX_FRAME_BYTES,
+            Some(&issued),
+        )
+        .await;
+        if index + 1 < CONNECTIONS {
+            socket
+                .write_frame(Frame::close(1012, b"rotate again"))
+                .await
+                .expect("close");
+            socket.flush().await.expect("flush");
+        } else {
+            wait_for_close(&mut socket).await;
+        }
+    }))
+    .await;
+    let mut client_config = config(gateway.url.clone());
+    client_config.credential =
+        GatewayCredential::BootstrapToken(SecretString::from("bounded-bootstrap".to_owned()));
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 2,
+        initial_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(5),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) = GatewayClient::start(client_config).expect("start");
+    client.wait_ready().await.expect("first ready");
+    wait_for_state(&client, |state| {
+        matches!(state, ConnectionState::Ready(_))
+            && gateway.connections.load(Ordering::SeqCst) == CONNECTIONS
+    })
+    .await;
+    let issued = client.take_issued_device_tokens().await;
+    assert_eq!(issued.len(), 2);
+    assert_eq!(
+        issued[0].token().expose_secret(),
+        format!("bounded-device-{}", CONNECTIONS - 1)
+    );
+    assert_eq!(issued[1].token().expose_secret(), "secondary-device-token");
     client.shutdown().await.expect("shutdown");
     gateway.shutdown().await;
 }

@@ -87,6 +87,8 @@ pub struct ClientLimits {
     pub max_in_flight_requests: usize,
     /// Maximum commands waiting for the single socket task.
     pub command_queue_capacity: usize,
+    /// Maximum cumulative encoded request bytes retained by the command queue.
+    pub outbound_queue_bytes: usize,
     /// Maximum delivered events waiting for the caller.
     pub event_queue_capacity: usize,
     /// Maximum cumulative encoded bytes retained by the event queue.
@@ -100,6 +102,7 @@ impl Default for ClientLimits {
         Self {
             max_in_flight_requests: 64,
             command_queue_capacity: 64,
+            outbound_queue_bytes: AUTHENTICATED_MAX_FRAME_BYTES,
             event_queue_capacity: 256,
             event_queue_bytes: AUTHENTICATED_MAX_FRAME_BYTES,
             completed_id_capacity: 256,
@@ -247,6 +250,7 @@ impl GatewayClientConfig {
         for value in [
             self.limits.max_in_flight_requests,
             self.limits.command_queue_capacity,
+            self.limits.outbound_queue_bytes,
             self.limits.event_queue_capacity,
             self.limits.event_queue_bytes,
             self.limits.completed_id_capacity,
