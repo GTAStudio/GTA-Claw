@@ -55,9 +55,10 @@ assert_active_restart() {
 }
 
 install_failure_dropin() {
-  local directive="$1"
+  local section="$1"
+  local directive="$2"
   sudo mkdir -p /etc/systemd/system/gta-claw-daemon.service.d
-  printf '[Service]\n%s\n' "$directive" |
+  printf '[%s]\n%s\n' "$section" "$directive" |
     sudo tee /etc/systemd/system/gta-claw-daemon.service.d/failure.conf >/dev/null
   sudo systemctl daemon-reload
 }
@@ -70,14 +71,14 @@ remove_failure_dropin() {
 
 sudo dpkg -i "$deb1"
 assert_disabled_and_inactive
-install_failure_dropin 'ExecStartPre=/bin/false'
+install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo systemctl start gta-claw-daemon.service; then
   die "intentional Debian start failure unexpectedly succeeded"
 fi
 remove_failure_dropin
 sudo systemctl enable --now gta-claw-daemon.service
 deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-install_failure_dropin 'ExecStartPre=/bin/false'
+install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo dpkg -i "$deb2"; then
   die "Debian upgrade swallowed an intentional restart failure"
 fi
@@ -92,7 +93,7 @@ sudo dpkg -i --force-downgrade "$deb1"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "inactive service was started during Debian package replacement"
 sudo systemctl start gta-claw-daemon.service
-install_failure_dropin 'ExecStop=/bin/false'
+install_failure_dropin Unit 'RefuseManualStop=yes'
 if sudo dpkg --remove gta-claw; then
   die "Debian removal swallowed an intentional stop failure"
 fi
@@ -110,14 +111,14 @@ sudo dpkg --purge gta-claw
 
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
-install_failure_dropin 'ExecStartPre=/bin/false'
+install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo systemctl start gta-claw-daemon.service; then
   die "intentional RPM start failure unexpectedly succeeded"
 fi
 remove_failure_dropin
 sudo systemctl enable --now gta-claw-daemon.service
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-install_failure_dropin 'ExecStartPre=/bin/false'
+install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo rpm -Uvh --nodeps "$rpm2"; then
   die "RPM upgrade swallowed an intentional restart failure"
 fi
@@ -130,7 +131,7 @@ sudo rpm -Uvh --nodeps --oldpackage "$rpm1"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "inactive service was started during RPM replacement"
 sudo systemctl start gta-claw-daemon.service
-install_failure_dropin 'ExecStop=/bin/false'
+install_failure_dropin Unit 'RefuseManualStop=yes'
 if sudo rpm -e --nodeps gta-claw; then
   die "RPM removal swallowed an intentional stop failure"
 fi
