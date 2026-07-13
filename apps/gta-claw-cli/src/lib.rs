@@ -20,7 +20,7 @@ use claw_gateway_client::{
 use claw_platform::NativeSystemProbe;
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, ConnectErrorDetailCode,
-    GatewayMethodName, Name, RequestId, resolve_core_method,
+    GatewayMethodName, Name, RequestId, ResponseFrame, resolve_core_method,
 };
 use claw_protocol::{ProtocolError, parse_command};
 use claw_security::authorization::{Role, Scope, ScopeSet};
@@ -655,14 +655,9 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
     let method = GatewayMethodName::Core(
         resolve_core_method("health").expect("P02a registry contains health"),
     );
-    let response = match client.request(request_id, method, &EmptyParams {}).await {
+    let response = match request_health(client, request_id, method).await {
         Ok(response) => response,
-        Err(error) => {
-            return DiagnosticAttempt::with_info(
-                classify_request_error(client, &error).await,
-                info,
-            );
-        }
+        Err(failure) => return DiagnosticAttempt::with_info(failure, info),
     };
     if !response.ok() {
         return DiagnosticAttempt {
@@ -712,6 +707,36 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
     }
 }
 
+async fn request_health(
+    client: &GatewayClient,
+    request_id: RequestId,
+    method: GatewayMethodName,
+) -> Result<ResponseFrame, DiagnosticFailure> {
+    let params = EmptyParams {};
+    let request = client.request(request_id, method, &params);
+    tokio::pin!(request);
+    let mut states = client.subscribe_state();
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut request => {
+                return match result {
+                    Ok(response) => Ok(response),
+                    Err(error) => Err(classify_request_error(client, &error).await),
+                };
+            }
+            changed = states.changed() => {
+                if changed.is_err() {
+                    return Err(transport_failure());
+                }
+                if let Some(failure) = terminal_state_failure(states.borrow().clone()) {
+                    return Err(failure);
+                }
+            }
+        }
+    }
+}
+
 async fn classify_request_error(
     client: &GatewayClient,
     error: &GatewayClientError,
@@ -721,42 +746,56 @@ async fn classify_request_error(
         GatewayClientError::DisconnectedNotReplayed
             | GatewayClientError::NotReady
             | GatewayClientError::Cancelled
+            | GatewayClientError::RequestTimedOut(_)
     ) {
         return map_client_error(error);
     }
     let mut states = client.subscribe_state();
     loop {
         let state = states.borrow().clone();
-        match state {
-            ConnectionState::ProtocolFailed { .. } | ConnectionState::ResyncRequired(_) => {
-                return DiagnosticFailure::protocol(
-                    "protocol_error",
-                    "Gateway protocol validation failed",
-                );
-            }
-            ConnectionState::AuthenticationFailed(authentication) => {
-                return map_authentication_error(authentication);
-            }
-            ConnectionState::ReconnectExhausted | ConnectionState::Stopped => {
-                return DiagnosticFailure {
-                    category: ExitCategory::TransportTransient,
-                    status: "transport_failure",
-                    message: "Gateway transport failed",
-                };
-            }
+        if let Some(failure) = terminal_state_failure(state) {
+            return failure;
+        }
+        match states.borrow().clone() {
             ConnectionState::Starting
             | ConnectionState::Connecting
             | ConnectionState::Authenticating
             | ConnectionState::Ready(_)
             | ConnectionState::Reconnecting { .. } => {}
+            ConnectionState::ProtocolFailed { .. }
+            | ConnectionState::ResyncRequired(_)
+            | ConnectionState::AuthenticationFailed(_)
+            | ConnectionState::ReconnectExhausted
+            | ConnectionState::Stopped => unreachable!("terminal state handled above"),
         }
         if states.changed().await.is_err() {
-            return DiagnosticFailure {
-                category: ExitCategory::TransportTransient,
-                status: "transport_failure",
-                message: "Gateway transport failed",
-            };
+            return transport_failure();
         }
+    }
+}
+
+fn terminal_state_failure(state: ConnectionState) -> Option<DiagnosticFailure> {
+    match state {
+        ConnectionState::ProtocolFailed { .. } | ConnectionState::ResyncRequired(_) => Some(
+            DiagnosticFailure::protocol("protocol_error", "Gateway protocol validation failed"),
+        ),
+        ConnectionState::AuthenticationFailed(authentication) => {
+            Some(map_authentication_error(authentication))
+        }
+        ConnectionState::ReconnectExhausted | ConnectionState::Stopped => Some(transport_failure()),
+        ConnectionState::Starting
+        | ConnectionState::Connecting
+        | ConnectionState::Authenticating
+        | ConnectionState::Ready(_)
+        | ConnectionState::Reconnecting { .. } => None,
+    }
+}
+
+const fn transport_failure() -> DiagnosticFailure {
+    DiagnosticFailure {
+        category: ExitCategory::TransportTransient,
+        status: "transport_failure",
+        message: "Gateway transport failed",
     }
 }
 
