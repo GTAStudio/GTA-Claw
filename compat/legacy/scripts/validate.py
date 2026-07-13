@@ -48,58 +48,78 @@ HTTP_CASE_COUNT = 28
 HTTP_CASE_CONTRACTS = {
     ("GET", "/", "unauthenticated-no-channels"): (
         200,
-        "object:authenticated,channels,deviceFlowEnabled,endpoints,examples,service,status,tips",
+        "object{authenticated:boolean,channels:object{discord:boolean,teams:boolean,"
+        "telegram:boolean,whatsapp:boolean},deviceFlowEnabled:boolean,endpoints:"
+        "object{chat:string,deviceAuth:string,health:string},examples:object{chatCurl:"
+        "string},service:string,status:string,tips:array<string>}",
     ),
     ("GET", "/health", "healthy-unauthenticated"): (
         200,
-        "object:authenticated,channels,deviceFlowEnabled,model,sessions,skills,status,uptime",
+        "object{authenticated:boolean,channels:object{discord:boolean,teams:boolean,"
+        "telegram:boolean,whatsapp:boolean},deviceFlowEnabled:boolean,model:string,"
+        "sessions:number,skills:number,status:string,uptime:number}",
     ),
     ("GET", "/auth/device", "already-authenticated"): (
         200,
-        "object:authenticated,message",
+        "object{authenticated:boolean,message:string}",
     ),
-    ("GET", "/auth/device", "disabled"): (400, "object:authenticated,error"),
+    ("GET", "/auth/device", "disabled"): (
+        400,
+        "object{authenticated:boolean,error:string}",
+    ),
     ("GET", "/auth/device", "instructions"): (
         200,
-        "object:auth_instructions,authenticated",
+        "object{auth_instructions:string,authenticated:boolean}",
     ),
-    ("GET", "/auth/device", "unexpected-error"): (500, "object:error"),
-    ("POST", "/chat", "missing-message"): (400, "object:error"),
-    ("POST", "/chat", "help-before-auth"): (200, "object:reply"),
-    ("POST", "/chat", "unauthenticated-token-mode"): (401, "object:error"),
+    ("GET", "/auth/device", "unexpected-error"): (500, "object{error:string}"),
+    ("POST", "/chat", "missing-message"): (400, "object{error:string}"),
+    ("POST", "/chat", "help-before-auth"): (200, "object{reply:string}"),
+    ("POST", "/chat", "unauthenticated-token-mode"): (
+        401,
+        "object{error:string}",
+    ),
     ("POST", "/chat", "unauthenticated-device-flow"): (
         401,
-        "object:auth_instructions,error",
+        "object{auth_instructions:string,error:string}",
     ),
-    ("POST", "/chat", "success"): (200, "object:reply"),
-    ("POST", "/chat", "endpoint-error"): (500, "object:error"),
+    ("POST", "/chat", "success"): (200, "object{reply:string}"),
+    ("POST", "/chat", "endpoint-error"): (500, "object{error:string}"),
     ("POST", "/api/messages", "adapter-ack"): (200, "null"),
-    ("POST", "/api/messages", "rate-limited"): (429, "object:error"),
+    ("POST", "/api/messages", "rate-limited"): (429, "object{error:string}"),
     ("GET", "/whatsapp/webhook", "verified"): (200, "string"),
-    ("GET", "/whatsapp/webhook", "forbidden"): (403, "object:error"),
-    ("POST", "/whatsapp/webhook", "accepted"): (200, "object:ok"),
-    ("POST", "/whatsapp/webhook", "handling-failed"): (500, "object:error"),
-    ("POST", "/admin/reload", "forbidden"): (403, "object:error"),
+    ("GET", "/whatsapp/webhook", "forbidden"): (403, "object{error:string}"),
+    ("POST", "/whatsapp/webhook", "accepted"): (200, "object{ok:boolean}"),
+    ("POST", "/whatsapp/webhook", "handling-failed"): (
+        500,
+        "object{error:string}",
+    ),
+    ("POST", "/admin/reload", "forbidden"): (403, "object{error:string}"),
     ("POST", "/admin/reload", "reloaded"): (
         200,
-        "object:message,model,skills",
+        "object{message:string,model:string,skills:number}",
     ),
-    ("POST", "/admin/reload", "conflict"): (409, "object:error"),
-    ("POST", "/admin/reload", "failed"): (500, "object:error"),
-    ("GET", "/admin/system", "forbidden"): (403, "object:error"),
-    ("GET", "/admin/system", "system-info"): (200, "object:node,os"),
-    ("POST", "/admin/exec", "forbidden"): (403, "object:error"),
+    ("POST", "/admin/reload", "conflict"): (409, "object{error:string}"),
+    ("POST", "/admin/reload", "failed"): (500, "object{error:string}"),
+    ("GET", "/admin/system", "forbidden"): (403, "object{error:string}"),
+    ("GET", "/admin/system", "system-info"): (
+        200,
+        "object{node:object{memory_mb:object{heapTotal:number,heapUsed:number,rss:"
+        "number},pid:number,uptime_s:number,version:string},os:object{arch:string,"
+        "cpus:number,freeMemory_mb:number,hostname:string,loadavg:array<number>,"
+        "platform:string,totalMemory_mb:number,uptime_s:number}}",
+    ),
+    ("POST", "/admin/exec", "forbidden"): (403, "object{error:string}"),
     ("POST", "/admin/exec", "unknown-action"): (
         400,
-        "object:allowed,error",
+        "object{allowed:array<string>,error:string}",
     ),
     ("POST", "/admin/exec", "command-success"): (
         200,
-        "object:action,output,success",
+        "object{action:string,output:string,success:boolean}",
     ),
     ("POST", "/admin/exec", "command-failure"): (
         200,
-        "object:action,error,stderr,success",
+        "object{action:string,error:string,stderr:string,success:boolean}",
     ),
 }
 
@@ -385,13 +405,28 @@ def validate_config(mapping):
 def http_response_shape(response):
     if response is None:
         return "null"
+    if isinstance(response, bool):
+        return "boolean"
+    if isinstance(response, (int, float)):
+        return "number"
     if isinstance(response, str):
         return "string"
-    if isinstance(response, dict):
-        return "object:" + ",".join(sorted(response))
     if isinstance(response, list):
-        return "array"
+        item_shapes = sorted({http_response_shape(item) for item in response})
+        return f"array<{'|'.join(item_shapes) if item_shapes else 'empty'}>"
+    if isinstance(response, dict):
+        fields = ",".join(
+            f"{http_response_shape_key(key)}:{http_response_shape(response[key])}"
+            for key in sorted(response)
+        )
+        return f"object{{{fields}}}"
     return type(response).__name__
+
+
+def http_response_shape_key(key):
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        return key
+    return json.dumps(key, ensure_ascii=True)
 
 
 def validate_http(http_examples):
@@ -654,7 +689,7 @@ def validate_migration(contract):
     )
 
 
-def run_regression_self_tests(mapping, coverage, http_examples):
+def run_regression_self_tests(schemas, registry, mapping, coverage, http_examples):
     role_result = role_source_outcome(
         {
             "content_type": "application/json",
@@ -714,6 +749,48 @@ def run_regression_self_tests(mapping, coverage, http_examples):
         "HTTP case contract mismatch",
     )
 
+    changed_response_type = copy.deepcopy(http_examples)
+    changed_response_type["endpoints"][0]["cases"][0]["response"][
+        "authenticated"
+    ] = "true"
+    http_schema = schemas["http-examples.schema.json"]
+    http_validator = validator_for(http_schema)(http_schema, registry=registry)
+    schema_errors = list(http_validator.iter_errors(changed_response_type))
+    ensure(
+        not schema_errors,
+        "HTTP response type regression must remain schema-valid: "
+        + "; ".join(error.message for error in schema_errors[:3]),
+    )
+    expect_contract_error(
+        "changed schema-valid HTTP response value type",
+        lambda: validate_http(changed_response_type),
+        "HTTP case contract mismatch",
+    )
+
+    changed_nested_shape = copy.deepcopy(http_examples)
+    changed_nested_shape["endpoints"][0]["cases"][0]["response"]["channels"][
+        "teams"
+    ] = "true"
+    expect_contract_error(
+        "changed nested HTTP response value type",
+        lambda: validate_http(changed_nested_shape),
+        "HTTP case contract mismatch",
+    )
+
+    changed_array_shape = copy.deepcopy(http_examples)
+    changed_array_shape["endpoints"][0]["cases"][0]["response"]["tips"][0] = 1
+    expect_contract_error(
+        "changed nested HTTP response array item type",
+        lambda: validate_http(changed_array_shape),
+        "HTTP case contract mismatch",
+    )
+
+    ensure(
+        http_response_shape({"a,b": 1})
+        != http_response_shape({"a": 1, "b": 1}),
+        "HTTP response-shape key encoding is ambiguous",
+    )
+
     expect_contract_error(
         "structural-only evidence range",
         lambda: validate_source_reference(
@@ -756,7 +833,9 @@ def main():
         skill_count = validate_skills(schemas, registry, skills)
         role_source_count = validate_role_sources()
         validate_migration(contract)
-        run_regression_self_tests(mapping, coverage, http_examples)
+        run_regression_self_tests(
+            schemas, registry, mapping, coverage, http_examples
+        )
 
         result = {
             "status": "ok",
