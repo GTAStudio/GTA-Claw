@@ -738,6 +738,21 @@ fn validate_dependency_graph(
         errors.push("desktop Slint backend feature policy changed".to_owned());
     }
 
+    let smoke_tests = app_manifest
+        .get("test")
+        .and_then(TomlValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|test| test.get("name").and_then(TomlValue::as_str) == Some("macos_winit_smoke"))
+        .collect::<Vec<_>>();
+    if smoke_tests.len() != 1
+        || smoke_tests[0].get("path").and_then(TomlValue::as_str)
+            != Some("tests/macos_winit_smoke.rs")
+        || smoke_tests[0].get("harness").and_then(TomlValue::as_bool) != Some(false)
+    {
+        errors.push("macOS backend smoke must be the exact harness-free test target".to_owned());
+    }
+
     let desktop_packages = lock_packages(desktop_lock);
     for required in ["slint", "i-slint-backend-winit", "winit"] {
         if !desktop_packages.contains_key(required) {

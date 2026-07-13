@@ -1,6 +1,11 @@
 //! Main-thread smoke test for the native macOS Slint winit backend.
 
-#[cfg(target_os = "macos")]
+#![allow(
+    missing_docs,
+    reason = "Slint generates public bindings for this dedicated smoke executable"
+)]
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 slint::slint! {
     export component BackendSmokeWindow inherits Window {
         title: "GTA Claw backend smoke";
