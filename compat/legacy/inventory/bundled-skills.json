@@ -1,0 +1,96 @@
+{
+  "$schema": "../schemas/skill-inventory.schema.json",
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "skills": [
+    {
+      "name": "github_commits",
+      "source_path": "deploy/conf/skills/github_commits.json",
+      "bridges": ["httpGet", "log"],
+      "external_hosts": ["api.github.com"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Ports query construction, truncation, mapping, and JSON formatting."]
+    },
+    {
+      "name": "github_file_reader",
+      "source_path": "deploy/conf/skills/github_file_reader.json",
+      "bridges": ["httpGet", "log"],
+      "external_hosts": ["api.github.com"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Uses atob and chunked base64 decoding in addition to bridge calls."]
+    },
+    {
+      "name": "github_repo_info",
+      "source_path": "deploy/conf/skills/github_repo_info.json",
+      "bridges": ["httpGet", "log"],
+      "external_hosts": ["api.github.com"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Latest-release failure is converted to latest_release null."]
+    },
+    {
+      "name": "github_search",
+      "source_path": "deploy/conf/skills/github_search.json",
+      "bridges": ["httpGet", "log"],
+      "external_hosts": ["api.github.com"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Supports repositories, issues, code, and users result projections."]
+    },
+    {
+      "name": "ip_dns_lookup",
+      "source_path": "deploy/conf/skills/ip_dns_lookup.json",
+      "bridges": ["httpGet", "log"],
+      "external_hosts": ["dns.google", "ip-api.com"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Uses cleartext HTTP for ip-api.com and converts per-stage failures into result fields."]
+    },
+    {
+      "name": "json_api_call",
+      "source_path": "deploy/conf/skills/json_api_call.json",
+      "bridges": ["httpGet", "httpPost", "log"],
+      "external_hosts": ["<dynamic>"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Mutates the caller-provided headers object when adding Content-Type."]
+    },
+    {
+      "name": "marp_slides",
+      "source_path": "deploy/conf/skills/marp_slides.json",
+      "bridges": ["log"],
+      "external_hosts": [],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Pure string generation still requires a reviewed Rust port."]
+    },
+    {
+      "name": "server_admin",
+      "source_path": "deploy/conf/skills/server_admin.json",
+      "bridges": ["httpGet", "httpPost", "log"],
+      "external_hosts": ["127.0.0.1"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Relies on the loopback bypass for admin system and exec endpoints."]
+    },
+    {
+      "name": "server_health_check",
+      "source_path": "deploy/conf/skills/server_health_check.json",
+      "bridges": ["httpGet"],
+      "external_hosts": ["<dynamic>"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Measures sequential request duration and converts errors to down results."]
+    },
+    {
+      "name": "web_fetch",
+      "source_path": "deploy/conf/skills/web_fetch.json",
+      "bridges": ["httpGet", "log"],
+      "external_hosts": ["<dynamic>"],
+      "migration_decision": "manual_rust_wasi_port",
+      "final_javascript_execution": false,
+      "notes": ["Default maximum is 8000 characters and configured maximum is capped at 50000."]
+    }
+  ]
+}

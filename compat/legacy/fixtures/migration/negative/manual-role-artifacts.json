@@ -1,0 +1,40 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "legacy_skill",
+    "source": "legacy.json",
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "status": "manual_port_required",
+  "exit_code": 2,
+  "recognized_bridges": ["log"],
+  "remaining_javascript": [
+    {
+      "location": "executeCode",
+      "reason": "JavaScript remains."
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "role",
+      "path": "one.json",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    },
+    {
+      "kind": "role",
+      "path": "two.json",
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": []
+}

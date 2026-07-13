@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gta.studio/schemas/legacy/skill-inventory.schema.json",
+  "type": "object",
+  "required": ["source_revision", "skills"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "source_path",
+          "bridges",
+          "external_hosts",
+          "migration_decision",
+          "final_javascript_execution"
+        ],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "source_path": { "type": "string", "pattern": "^deploy/conf/skills/.+\\.json$" },
+          "bridges": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "enum": ["httpGet", "httpPost", "log"] }
+          },
+          "external_hosts": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "migration_decision": { "const": "manual_rust_wasi_port" },
+          "final_javascript_execution": { "const": false },
+          "notes": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

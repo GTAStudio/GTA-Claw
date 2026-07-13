@@ -1,0 +1,7 @@
+# Keep Rust workspace inputs deterministic on Windows checkouts.
+*.rs text eol=lf
+*.slint text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Cargo.lock text eol=lf

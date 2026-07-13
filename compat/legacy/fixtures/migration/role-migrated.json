@@ -1,0 +1,25 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "role",
+    "source": "https://example.test/role.json",
+    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": [],
+  "remaining_javascript": [],
+  "artifacts": [
+    {
+      "kind": "role",
+      "path": "roles/default.json",
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": []
+}

@@ -1,0 +1,27 @@
+[package]
+name = "gta-claw-desktop"
+description = "Native Slint desktop shell for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+claw-application.workspace = true
+claw-platform.workspace = true
+slint = { version = "=1.17.1", default-features = false, features = [
+  "accessibility",
+  "backend-winit",
+  "compat-1-2",
+  "renderer-femtovg",
+  "renderer-software",
+  "std",
+] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.build-dependencies]
+slint-build = { version = "=1.17.1" }
+
+[lints]
+workspace = true

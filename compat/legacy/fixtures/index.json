@@ -1,0 +1,184 @@
+{
+  "fixtures": [
+    {
+      "path": "contract.json",
+      "schema": "schemas/legacy-contract.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "ledger/features.json",
+      "schema": "schemas/feature-ledger.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "ledger/behaviors.json",
+      "schema": "schemas/behavior-inventory.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "config/env-mapping.json",
+      "schema": "schemas/config-mapping.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "inventory/bundled-skills.json",
+      "schema": "schemas/skill-inventory.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "inventory/source-coverage.json",
+      "schema": "schemas/source-coverage.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/http/examples.json",
+      "schema": "schemas/http-examples.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/http/negative/invalid-status.json",
+      "schema": "schemas/http-examples.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/role/positive/content.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/positive/prompt.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/positive/content-precedence.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/positive/non-string-content-fallback.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/positive/non-string-model.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/negative/missing-content.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/role/negative/empty-content.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/role/negative/non-string-content.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/role/sources/json-content.json",
+      "schema": "schemas/role-source.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/sources/non-string-model.json",
+      "schema": "schemas/role-source.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/sources/plain-text.json",
+      "schema": "schemas/role-source.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/sources/text-json-fallback.json",
+      "schema": "schemas/role-source.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/sources/json-error.json",
+      "schema": "schemas/role-source.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/skill/positive/http-bridge.json",
+      "schema": "schemas/legacy-skill.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/skill/positive/array-parameters.json",
+      "schema": "schemas/legacy-skill.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/skill/negative/unsafe-name.json",
+      "schema": "schemas/legacy-skill.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/skill/negative/missing-execute-code.json",
+      "schema": "schemas/legacy-skill.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/skill/negative/null-parameters.json",
+      "schema": "schemas/legacy-skill.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/manual-port-required.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/migration/role-migrated.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/migration/legacy-skill-migrated.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/migration/environment-migrated.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/migration/negative/silent-javascript-success.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/failed-zero-exit.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/manual-role-artifacts.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/legacy-skill-missing-port-evidence.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/role-javascript-evidence.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/environment-wasi-artifact.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    }
+  ]
+}

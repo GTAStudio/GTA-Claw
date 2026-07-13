@@ -1,0 +1,30 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "role",
+    "source": "role.json",
+    "sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": [],
+  "remaining_javascript": [
+    {
+      "location": "content",
+      "reason": "Roles are data and cannot contain migration JavaScript evidence."
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "role",
+      "path": "roles/default.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": []
+}

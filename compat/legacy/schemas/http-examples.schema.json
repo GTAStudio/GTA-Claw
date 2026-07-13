@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gta.studio/schemas/legacy/http-examples.schema.json",
+  "type": "object",
+  "required": ["source_revision", "endpoints"],
+  "properties": {
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "endpoints": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": [
+          "endpoint_id",
+          "method",
+          "path",
+          "registration",
+          "rate_limit",
+          "cases"
+        ],
+        "properties": {
+          "endpoint_id": { "type": "string", "minLength": 1 },
+          "method": { "enum": ["GET", "POST"] },
+          "path": { "type": "string", "pattern": "^/" },
+          "registration": { "enum": ["always", "teams_enabled", "whatsapp_enabled", "admin_token_set"] },
+          "rate_limit": { "enum": ["none", "per_ip_token_bucket"] },
+          "cases": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["case_id", "condition", "status", "response"],
+              "properties": {
+                "case_id": { "type": "string", "minLength": 1 },
+                "condition": { "type": "string", "minLength": 1 },
+                "request": { "type": "object" },
+                "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+                "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                "response": {}
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

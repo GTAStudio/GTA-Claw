@@ -1,0 +1,46 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "legacy_skill",
+    "source": "deploy/conf/skills/web_fetch.json",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "status": "manual_port_required",
+  "exit_code": 2,
+  "recognized_bridges": ["httpGet", "log"],
+  "remaining_javascript": [
+    {
+      "location": "executeCode",
+      "reason": "Control flow, truncation, and return semantics require an explicit Rust implementation."
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "wasi_manifest",
+      "path": "web_fetch/manifest.json",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    },
+    {
+      "kind": "wit_scaffold",
+      "path": "web_fetch/world.wit",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "LEGACY_JS_REMAINS",
+      "severity": "error",
+      "message": "Scaffold generated, but JavaScript was not converted or enabled."
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "environment",
+    "source": ".env",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": [],
+  "remaining_javascript": [],
+  "artifacts": [
+    {
+      "kind": "wasi_manifest",
+      "path": "environment/manifest.json",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": []
+}
