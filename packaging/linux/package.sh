@@ -447,8 +447,7 @@ SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -z9 \
     --build \
     "$deb_root" \
-    - \
-    >&"$OPEN_OUTPUT_FD"
+    "/proc/$BASHPID/fd/$OPEN_OUTPUT_FD"
 finish_output_file
 assert_regular_unaliased "$deb_temporary" "Debian package temporary"
 touch --date="@$SOURCE_DATE_EPOCH" "$deb_temporary"

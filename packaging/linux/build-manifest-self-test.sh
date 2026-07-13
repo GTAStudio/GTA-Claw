@@ -33,6 +33,15 @@ expect_failure() {
   fi
 }
 
+verify_case() {
+  local manifest="$1"
+  bash -c "
+    source '$SCRIPT_DIR/lib/common.sh'
+    source '$SCRIPT_DIR/lib/build-manifest.sh'
+    verify_build_manifest '$manifest' '$arch'
+  "
+}
+
 prepare_clone() {
   local name="$1"
   local root="$work/$name"
@@ -79,19 +88,19 @@ mutate_manifest() {
 
 case_root="$(prepare_clone wrong-rustflags)"
 mutate_manifest "$case_root" '.build.rustflags = "-C target-cpu=native"'
-expect_failure wrong-rustflags verify_build_manifest "$case_root/build-manifest.json" "$arch"
+expect_failure wrong-rustflags verify_case "$case_root/build-manifest.json"
 
 case_root="$(prepare_clone wrong-toolchain)"
 mutate_manifest "$case_root" '.builder.rustcVerbose = "rustc 9.99.0 (forged)"'
-expect_failure wrong-toolchain verify_build_manifest "$case_root/build-manifest.json" "$arch"
+expect_failure wrong-toolchain verify_case "$case_root/build-manifest.json"
 
 case_root="$(prepare_clone wrong-target)"
 mutate_manifest "$case_root" '.build.rustTarget = "x86_64-unknown-linux-musl"'
-expect_failure wrong-target verify_build_manifest "$case_root/build-manifest.json" "$arch"
+expect_failure wrong-target verify_case "$case_root/build-manifest.json"
 
 case_root="$(prepare_clone wrong-source-tree)"
 mutate_manifest "$case_root" '.source.tree = "0000000000000000000000000000000000000000"'
-expect_failure wrong-source-tree verify_build_manifest "$case_root/build-manifest.json" "$arch"
+expect_failure wrong-source-tree verify_case "$case_root/build-manifest.json"
 
 case_root="$(prepare_clone substituted-binary)"
 mv \
@@ -102,6 +111,6 @@ copy_verified_input \
   "$case_root/$source_target/release/$LINUX_CLI_NAME" \
   0755
 expect_failure substituted-binary \
-  verify_build_manifest "$case_root/build-manifest.json" "$arch"
+  verify_case "$case_root/build-manifest.json"
 
 printf 'Build manifest tamper self-tests passed (%d cases)\n' "$tests"
