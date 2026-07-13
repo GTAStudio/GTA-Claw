@@ -233,7 +233,7 @@ async fn rejects_protocol_mismatch_and_permanent_auth_without_reconnect() {
         let state = wait_for_state(&client, |state| {
             matches!(
                 state,
-                ConnectionState::AuthenticationFailed(_) | ConnectionState::ProtocolFailed
+                ConnectionState::AuthenticationFailed(_) | ConnectionState::ProtocolFailed { .. }
             )
         })
         .await;
@@ -354,7 +354,7 @@ async fn rejects_malformed_duplicate_keys_before_and_after_authentication() {
     .await;
     let (client, _) = GatewayClient::start(config(preauth.url.clone())).expect("start");
     wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
     client.shutdown().await.expect("shutdown");
@@ -373,7 +373,7 @@ async fn rejects_malformed_duplicate_keys_before_and_after_authentication() {
     .await;
     let (client, _) = GatewayClient::start(config(postauth.url.clone())).expect("start");
     wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
     client.shutdown().await.expect("shutdown");
@@ -412,7 +412,7 @@ async fn enforces_pre_and_post_authentication_inbound_caps() {
     .await;
     let (client, _) = GatewayClient::start(config(preauth.url.clone())).expect("start");
     wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
     client.shutdown().await.expect("shutdown");
@@ -426,7 +426,7 @@ async fn enforces_pre_and_post_authentication_inbound_caps() {
     .await;
     let (client, _) = GatewayClient::start(config(postauth.url.clone())).expect("start");
     wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
     client.shutdown().await.expect("shutdown");
@@ -447,7 +447,7 @@ async fn rejects_invalid_utf8_text_frames() {
     .await;
     let (client, _) = GatewayClient::start(config(gateway.url.clone())).expect("start");
     wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
     client.shutdown().await.expect("shutdown");
@@ -660,10 +660,10 @@ async fn rejects_unknown_and_duplicate_responses() {
     let params = json!({});
     let request = client.request(request_id("known"), health_method(), &params);
     let state = wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     });
     let (_, observed) = tokio::join!(request, state);
-    assert_eq!(observed, ConnectionState::ProtocolFailed);
+    assert!(matches!(observed, ConnectionState::ProtocolFailed { .. }));
     client.shutdown().await.expect("shutdown");
     unknown.shutdown().await;
 
@@ -681,7 +681,7 @@ async fn rejects_unknown_and_duplicate_responses() {
         .await
         .expect("first response");
     wait_for_state(&client, |state| {
-        matches!(state, ConnectionState::ProtocolFailed)
+        matches!(state, ConnectionState::ProtocolFailed { .. })
     })
     .await;
     client.shutdown().await.expect("shutdown");

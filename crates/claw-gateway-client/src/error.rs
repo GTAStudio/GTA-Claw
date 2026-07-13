@@ -245,6 +245,29 @@ impl Display for ProtocolFailure {
     }
 }
 
+impl ProtocolFailure {
+    pub(crate) const fn category(&self) -> &'static str {
+        match self {
+            Self::Codec(_) => "strict codec failure",
+            Self::ExpectedChallenge => "expected connect challenge",
+            Self::HelloProtocol { .. } => "hello protocol mismatch",
+            Self::HelloAuthenticationMismatch => "hello authentication mismatch",
+            Self::HandshakeRejected(_) => "handshake rejected",
+            Self::BinaryMessage => "binary application message",
+            Self::InboundMessageTooLarge { .. } => "inbound message too large",
+            Self::InvalidUtf8 => "invalid UTF-8",
+            Self::InvalidFragmentation => "invalid fragmentation",
+            Self::WebSocketProtocol(category) => category,
+            Self::UnexpectedServerRequest => "unexpected server request",
+            Self::OutboundMessageTooLarge { .. } => "outbound message too large",
+            Self::UnknownResponse(_) => "unknown response identifier",
+            Self::DuplicateResponse(_) => "duplicate response identifier",
+            Self::DuplicateRequest(_) => "duplicate request identifier",
+            Self::ResyncRequired(_) => "resync required",
+        }
+    }
+}
+
 impl Error for ProtocolFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -470,7 +493,10 @@ pub enum ConnectionState {
     /// Authentication permanently stopped reconnect.
     AuthenticationFailed(AuthenticationFailure),
     /// Protocol failure permanently stopped reconnect.
-    ProtocolFailed,
+    ProtocolFailed {
+        /// Redaction-safe protocol failure category.
+        category: &'static str,
+    },
     /// Retry policy was exhausted.
     ReconnectExhausted,
     /// Caller requested deterministic shutdown.

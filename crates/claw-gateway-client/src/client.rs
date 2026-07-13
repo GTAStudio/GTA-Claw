@@ -140,9 +140,9 @@ impl GatewayClient {
                         ProtocolFailure::ResyncRequired(reason),
                     ));
                 }
-                ConnectionState::ProtocolFailed => {
+                ConnectionState::ProtocolFailed { category } => {
                     return Err(GatewayClientError::Protocol(
-                        ProtocolFailure::WebSocketProtocol("terminal protocol failure"),
+                        ProtocolFailure::WebSocketProtocol(category),
                     ));
                 }
                 ConnectionState::ReconnectExhausted => {
@@ -283,8 +283,13 @@ async fn supervise(
                 set_state(&resources.states, ConnectionState::ResyncRequired(reason));
                 break;
             }
-            Err(GatewayClientError::Protocol(_)) => {
-                set_state(&resources.states, ConnectionState::ProtocolFailed);
+            Err(GatewayClientError::Protocol(error)) => {
+                set_state(
+                    &resources.states,
+                    ConnectionState::ProtocolFailed {
+                        category: error.category(),
+                    },
+                );
                 break;
             }
             Err(GatewayClientError::Transport(_)) => {
@@ -316,7 +321,12 @@ async fn supervise(
                 }
             }
             Err(_) => {
-                set_state(&resources.states, ConnectionState::ProtocolFailed);
+                set_state(
+                    &resources.states,
+                    ConnectionState::ProtocolFailed {
+                        category: "unexpected client failure",
+                    },
+                );
                 break;
             }
         }
