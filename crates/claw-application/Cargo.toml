@@ -1,0 +1,15 @@
+[package]
+name = "claw-application"
+description = "Use cases and ports for the GTA Claw application core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claw-domain.workspace = true
+claw-protocol.workspace = true
+
+[lints]
+workspace = true

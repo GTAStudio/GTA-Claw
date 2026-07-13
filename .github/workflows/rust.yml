@@ -1,0 +1,133 @@
+name: rust
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/rust.yml"
+      - "apps/**"
+      - "crates/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/rust.yml"
+      - "apps/**"
+      - "crates/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless:
+    name: Headless (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    env:
+      CARGO_BUILD_WARNINGS: deny
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+
+  msrv:
+    name: MSRV (1.94.0)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal
+
+      - name: Check workspace at MSRV
+        run: cargo +1.94.0 check --workspace --all-targets --locked
+
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    env:
+      CARGO_BUILD_WARNINGS: deny
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+
+      - name: Check workspace
+        run: cargo check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+
+      - name: Build desktop application
+        run: cargo build --manifest-path desktop/Cargo.toml --workspace --locked
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
+        with:
+          arguments: --all-features
+          command: check
+          manifest-path: ./Cargo.toml
+
+      - name: Audit advisories
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

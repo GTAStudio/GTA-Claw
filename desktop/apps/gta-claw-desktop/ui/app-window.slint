@@ -1,0 +1,40 @@
+import { Button, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "GTA Claw";
+    width: 520px;
+    height: 300px;
+
+    in property <string> status-text: "Starting GTA Claw...";
+    callback refresh-requested();
+
+    VerticalBox {
+        padding: 28px;
+        spacing: 18px;
+
+        Text {
+            text: "GTA Claw";
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        Text {
+            text: "Native desktop foundation";
+            font-size: 18px;
+        }
+
+        Text {
+            text: root.status-text;
+            wrap: word-wrap;
+            accessible-label: root.status-text;
+        }
+
+        Button {
+            text: "Refresh status";
+            accessible-label: "Refresh runtime status";
+            clicked => {
+                root.refresh-requested();
+            }
+        }
+    }
+}
