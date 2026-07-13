@@ -1,13 +1,15 @@
 //! Ed25519 device identity with versioned fingerprints and signed handshakes.
 
 use std::error::Error;
-use std::fmt::{self, Debug, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter, Write as _};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::CryptoRng;
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
-use crate::authorization::{ClientClass, Role, ScopeSet};
+use crate::authorization::{ClientClass, Role, Scope, ScopeSet};
 
 const DEVICE_ID_PREFIX: &str = "claw-device-v1:";
 const HANDSHAKE_DOMAIN: &[u8] = b"GTA-Claw/handshake-proof/v1\0";
@@ -45,6 +47,16 @@ impl DeviceId {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Returns the lowercase SHA-256 identity used by the pinned OpenClaw Gateway wire protocol.
+    #[must_use]
+    pub fn gateway_wire_id(&self) -> String {
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
     }
 }
 
@@ -139,6 +151,18 @@ impl DevicePublicKey {
             .verify_strict(&message, &signature.0)
             .map_err(|_| SignatureError::VerificationFailed)
     }
+
+    /// Strictly verifies a pinned OpenClaw Gateway v3 device proof.
+    pub fn verify_gateway_device(
+        &self,
+        input: GatewayDeviceSigningInput<'_>,
+        signature: &DeviceSignature,
+    ) -> Result<(), SignatureError> {
+        let payload = encode_gateway_device(&self.device_id(), input);
+        self.0
+            .verify_strict(payload.as_bytes(), &signature.0)
+            .map_err(|_| SignatureError::VerificationFailed)
+    }
 }
 
 /// Public-key decoding failure.
@@ -216,6 +240,48 @@ pub struct HandshakeSigningInput<'a> {
     pub challenge: &'a [u8],
 }
 
+/// Exact inputs covered by the pinned OpenClaw Gateway v3 device proof.
+///
+/// The shared credential participates in the signature but is intentionally
+/// represented by a secrecy wrapper and omitted from `Debug`.
+pub struct GatewayDeviceSigningInput<'a> {
+    /// Closed Gateway client identity.
+    pub client_id: &'a str,
+    /// Closed Gateway client mode.
+    pub client_mode: &'a str,
+    /// Requested ordinary Gateway role.
+    pub role: Role,
+    /// Requested closed operator scopes.
+    pub scopes: ScopeSet,
+    /// Signature timestamp in Unix milliseconds.
+    pub signed_at_unix_millis: u64,
+    /// Shared, bootstrap, or device token selected for this connection.
+    pub token: Option<&'a SecretString>,
+    /// Exact server challenge nonce.
+    pub nonce: &'a str,
+    /// Runtime platform metadata.
+    pub platform: &'a str,
+    /// Optional device-family metadata.
+    pub device_family: Option<&'a str>,
+}
+
+impl Debug for GatewayDeviceSigningInput<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayDeviceSigningInput")
+            .field("client_id", &self.client_id)
+            .field("client_mode", &self.client_mode)
+            .field("role", &self.role)
+            .field("scopes", &self.scopes)
+            .field("signed_at_unix_millis", &self.signed_at_unix_millis)
+            .field("token", &self.token.map(|_| "[REDACTED]"))
+            .field("nonce", &self.nonce)
+            .field("platform", &self.platform)
+            .field("device_family", &self.device_family)
+            .finish()
+    }
+}
+
 fn encode_handshake(input: HandshakeSigningInput<'_>) -> Vec<u8> {
     let nonce_len = u32::try_from(input.nonce.len()).expect("pairing bounds nonce length");
     let challenge_len =
@@ -245,6 +311,41 @@ fn encode_handshake(input: HandshakeSigningInput<'_>) -> Vec<u8> {
     message.extend_from_slice(&challenge_len.to_be_bytes());
     message.extend_from_slice(input.challenge);
     message
+}
+
+fn encode_gateway_device(
+    device_id: &DeviceId,
+    input: GatewayDeviceSigningInput<'_>,
+) -> Zeroizing<String> {
+    let scopes = input
+        .scopes
+        .iter()
+        .map(Scope::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    let token = input.token.map_or("", |secret| secret.expose_secret());
+    let platform = normalize_gateway_metadata(input.platform);
+    let device_family = input
+        .device_family
+        .map(normalize_gateway_metadata)
+        .unwrap_or_default();
+    Zeroizing::new(format!(
+        "v3|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        device_id.gateway_wire_id(),
+        input.client_id,
+        input.client_mode,
+        input.role.as_str(),
+        scopes,
+        input.signed_at_unix_millis,
+        token,
+        input.nonce,
+        platform,
+        device_family,
+    ))
+}
+
+fn normalize_gateway_metadata(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 /// In-memory Ed25519 signer.
@@ -283,6 +384,15 @@ impl DeviceIdentity {
     #[must_use]
     pub fn sign_handshake(&self, input: HandshakeSigningInput<'_>) -> DeviceSignature {
         DeviceSignature(self.signing_key.sign(&encode_handshake(input)))
+    }
+
+    /// Signs the exact pinned OpenClaw Gateway v3 device-authentication payload.
+    ///
+    /// The secret-bearing canonical payload is zeroized immediately after signing.
+    #[must_use]
+    pub fn sign_gateway_device(&self, input: GatewayDeviceSigningInput<'_>) -> DeviceSignature {
+        let payload = encode_gateway_device(&self.device_id(), input);
+        DeviceSignature(self.signing_key.sign(payload.as_bytes()))
     }
 }
 
@@ -439,5 +549,69 @@ mod tests {
         let debug = format!("{identity:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("signing_key"));
+    }
+
+    #[test]
+    fn gateway_device_proof_matches_pinned_v3_canonicalization() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let identity = DeviceIdentity { signing_key };
+        let token = SecretString::from("gateway-secret".to_owned());
+        let input = GatewayDeviceSigningInput {
+            client_id: "gateway-client",
+            client_mode: "backend",
+            role: Role::Operator,
+            scopes: ScopeSet::from_scopes([Scope::OperatorAdmin, Scope::OperatorRead]),
+            signed_at_unix_millis: 1_700_000_000_123,
+            token: Some(&token),
+            nonce: "nonce-123",
+            platform: "  WinDows  ",
+            device_family: Some(" DeskTop "),
+        };
+        let payload = encode_gateway_device(&identity.device_id(), input);
+        assert_eq!(
+            payload.as_str(),
+            format!(
+                "v3|{}|gateway-client|backend|operator|operator.admin,operator.read|1700000000123|gateway-secret|nonce-123|windows|desktop",
+                identity.device_id().gateway_wire_id()
+            )
+        );
+
+        let signature = identity.signing_key.sign(payload.as_bytes());
+        identity
+            .public_key()
+            .verify_gateway_device(
+                GatewayDeviceSigningInput {
+                    client_id: "gateway-client",
+                    client_mode: "backend",
+                    role: Role::Operator,
+                    scopes: ScopeSet::from_scopes([Scope::OperatorAdmin, Scope::OperatorRead]),
+                    signed_at_unix_millis: 1_700_000_000_123,
+                    token: Some(&token),
+                    nonce: "nonce-123",
+                    platform: "windows",
+                    device_family: Some("desktop"),
+                },
+                &DeviceSignature(signature),
+            )
+            .expect("pinned Gateway payload verifies");
+    }
+
+    #[test]
+    fn gateway_signing_debug_redacts_shared_token() {
+        let token = SecretString::from("never-log-this".to_owned());
+        let input = GatewayDeviceSigningInput {
+            client_id: "test",
+            client_mode: "test",
+            role: Role::Operator,
+            scopes: ScopeSet::EMPTY,
+            signed_at_unix_millis: 42,
+            token: Some(&token),
+            nonce: "nonce",
+            platform: "linux",
+            device_family: None,
+        };
+        let rendered = format!("{input:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("never-log-this"));
     }
 }
