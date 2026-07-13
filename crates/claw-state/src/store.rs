@@ -537,6 +537,7 @@ impl StateStore {
 
     /// Checkpoints, closes all pooled connections, and releases the writer lock.
     pub async fn close(self) -> Result<CheckpointReport, StateError> {
+        let deadline = tokio::time::Instant::now() + self.close_timeout;
         let mut reasons = Vec::new();
         let identity_valid =
             match verify_path_identity(&self.path, &self._database_file).and_then(|()| {
@@ -553,41 +554,119 @@ impl StateStore {
                     false
                 }
             };
-        let checkpoint = if identity_valid {
-            match self.checkpoint().await {
-                Ok(report) if report.busy == 0 => Some(report),
-                Ok(report) => {
+        let mut connection = if identity_valid {
+            match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
+                Ok(Ok(connection)) => Some(connection),
+                Ok(Err(error)) => {
                     reasons.push(format!(
-                        "checkpoint remained busy with {} WAL frames and {} checkpointed frames",
-                        report.log_frames, report.checkpointed_frames
+                        "acquire final close connection failed: {}",
+                        database("acquire final close connection", error)
                     ));
                     None
                 }
-                Err(error) => {
-                    reasons.push(format!("checkpoint failed: {error}"));
+                Err(_) => {
+                    reasons
+                        .push("acquire final close connection exceeded close deadline".to_owned());
                     None
                 }
             }
         } else {
             None
         };
-        let application_lock_released = if identity_valid {
-            match release_application_lock(&self.pool, &self.owner).await {
-                Ok(()) => true,
-                Err(error) => {
-                    reasons.push(format!("application writer release failed: {error}"));
+
+        let closing_pool = self.pool.clone();
+        let mut close_task = tokio::spawn(async move {
+            closing_pool.close().await;
+        });
+        while !self.pool.is_closed() && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+
+        let checkpoint = if let Some(connection) = connection.as_mut() {
+            let checkpoint_result = tokio::time::timeout_at(
+                deadline,
+                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").fetch_one(&mut **connection),
+            )
+            .await;
+            match checkpoint_result {
+                Ok(Ok(row)) => {
+                    let report = CheckpointReport {
+                        busy: row.get(0),
+                        log_frames: row.get(1),
+                        checkpointed_frames: row.get(2),
+                    };
+                    if report.busy == 0 {
+                        Some(report)
+                    } else {
+                        reasons.push(format!(
+                            "checkpoint remained busy with {} WAL frames and {} checkpointed frames",
+                            report.log_frames, report.checkpointed_frames
+                        ));
+                        None
+                    }
+                }
+                Ok(Err(error)) => {
+                    reasons.push(format!(
+                        "checkpoint failed: {}",
+                        database("checkpoint SQLite WAL", error)
+                    ));
+                    None
+                }
+                Err(_) => {
+                    reasons.push("checkpoint exceeded close deadline".to_owned());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let application_lock_released = if let Some(connection) = connection.as_mut() {
+            let release_result = tokio::time::timeout_at(
+                deadline,
+                sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
+                    .bind(&self.owner)
+                    .execute(&mut **connection),
+            )
+            .await;
+            match release_result {
+                Ok(Ok(released)) if released.rows_affected() == 1 => true,
+                Ok(Ok(_)) => {
+                    reasons
+                        .push("application writer lock ownership changed unexpectedly".to_owned());
+                    false
+                }
+                Ok(Err(error)) => {
+                    reasons.push(format!(
+                        "application writer release failed: {}",
+                        database("release application writer lock", error)
+                    ));
+                    false
+                }
+                Err(_) => {
+                    reasons.push("application writer release exceeded close deadline".to_owned());
                     false
                 }
             }
         } else {
             false
         };
-        let pool_closed = tokio::time::timeout(self.close_timeout, self.pool.close())
-            .await
-            .is_ok();
+        drop(connection);
+
+        let pool_closed = match tokio::time::timeout_at(deadline, &mut close_task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                reasons.push(format!("pool close task failed: {error}"));
+                false
+            }
+            Err(_) => {
+                close_task.abort();
+                let _ = close_task.await;
+                false
+            }
+        };
         if !pool_closed {
             reasons.push(format!(
-                "pool drain exceeded {} ms after closing new checkouts",
+                "pool drain exceeded the single {} ms close deadline",
                 self.close_timeout.as_millis()
             ));
         }
@@ -2408,20 +2487,6 @@ async fn claim_application_lock(
     Ok(previous)
 }
 
-async fn release_application_lock(pool: &SqlitePool, owner: &str) -> Result<(), StateError> {
-    let released = sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
-        .bind(owner)
-        .execute(pool)
-        .await
-        .map_err(|error| database("release application writer lock", error))?;
-    if released.rows_affected() != 1 {
-        return Err(StateError::InvalidMigrationHistory {
-            reason: "application writer lock ownership changed unexpectedly".to_owned(),
-        });
-    }
-    Ok(())
-}
-
 async fn restore_application_lock(
     pool: &SqlitePool,
     owner: &str,
@@ -3166,6 +3231,7 @@ async fn backup_pool(
         validate_backup(&temporary, Some(expected_version))
             .await
             .map(|_| ())?;
+        initialize_restored_store_identity(&temporary)?;
         OpenOptions::new()
             .write(true)
             .open(&temporary)
@@ -3236,14 +3302,30 @@ async fn validate_standalone_snapshot_source(path: &Path) -> Result<(), StateErr
         sqlite_sidecar(path, "-shm"),
         sqlite_sidecar(path, "-journal"),
     ] {
-        if path_entry_exists(&sidecar)? {
-            return Err(StateError::InvalidBackup {
-                path: path.to_owned(),
-                reason: format!(
-                    "standalone snapshot source has sidecar {}",
-                    sidecar.display()
-                ),
-            });
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StateError::InvalidPath {
+                    path: sidecar,
+                    reason: "symbolic-link SQLite sidecars are not supported",
+                });
+            }
+            Ok(_) => {
+                return Err(StateError::InvalidBackup {
+                    path: path.to_owned(),
+                    reason: format!(
+                        "standalone snapshot source has sidecar {}",
+                        sidecar.display()
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(file_error(
+                    "inspect standalone snapshot sidecar",
+                    &sidecar,
+                    error,
+                ));
+            }
         }
     }
     let options = SqliteConnectOptions::new()
