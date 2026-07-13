@@ -4,13 +4,15 @@
 mod ui_adapter;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use slint::ComponentHandle;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use ui_adapter::{UiAdapter, UiSnapshot};
+use ui_adapter::{
+    UiAdapter, UiPaneMode, UiRequest, UiSnapshot, UiStatusKind, UiTheme, VisualPreferencesState,
+};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[allow(missing_docs, unreachable_pub)]
@@ -19,26 +21,134 @@ mod generated_ui {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use generated_ui::AppWindow;
+use generated_ui::{AppWindow, PaneMode, StatusKind, ThemeMode, VisualPreferences};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn apply_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
     window.set_status_text(snapshot.status_text().into());
+    window.set_status_label(snapshot.status().label().into());
+    window.set_status_icon(snapshot.status().icon().into());
+    window.set_status_kind(match snapshot.status().kind() {
+        UiStatusKind::Neutral => StatusKind::Neutral,
+        UiStatusKind::Success => StatusKind::Success,
+        UiStatusKind::Warning => StatusKind::Warning,
+        UiStatusKind::Danger => StatusKind::Danger,
+        UiStatusKind::Info => StatusKind::Info,
+    });
+    window.set_pane_mode(match snapshot.pane_mode() {
+        UiPaneMode::ThreePane => PaneMode::ThreePane,
+        UiPaneMode::OverlayInspector => PaneMode::OverlayInspector,
+        UiPaneMode::SinglePane => PaneMode::SinglePane,
+    });
+    apply_visual_preferences(window, snapshot.preferences());
+    window.set_navigation_drawer_open(snapshot.navigation_drawer_open());
+    window.set_inspector_open(snapshot.inspector_open());
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn apply_visual_preferences(window: &AppWindow, preferences: VisualPreferencesState) {
+    window.set_theme_mode(match preferences.theme() {
+        UiTheme::Light => ThemeMode::Light,
+        UiTheme::Dark => ThemeMode::Dark,
+    });
+    window.set_high_contrast(preferences.high_contrast());
+    window.set_reduced_motion(preferences.reduced_motion());
+    window.set_density_scale(preferences.density_scale());
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn update_from_request(
+    weak_window: &slint::Weak<AppWindow>,
+    adapter: &Rc<RefCell<UiAdapter>>,
+    request: UiRequest,
+) {
+    adapter.borrow_mut().handle_request(request);
+    if let Some(window) = weak_window.upgrade() {
+        apply_snapshot(&window, &adapter.borrow().snapshot());
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn wire_callbacks(window: &AppWindow, adapter: Rc<RefCell<UiAdapter>>) {
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    window.on_refresh_requested(move || {
+        update_from_request(&weak_window, &callback_adapter, UiRequest::Refresh);
+    });
+
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    window.on_navigation_toggle_requested(move || {
+        update_from_request(&weak_window, &callback_adapter, UiRequest::ToggleNavigation);
+    });
+
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    window.on_inspector_toggle_requested(move || {
+        update_from_request(&weak_window, &callback_adapter, UiRequest::ToggleInspector);
+    });
+
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    window.on_viewport_width_changed(move |width| {
+        update_from_request(
+            &weak_window,
+            &callback_adapter,
+            UiRequest::SetViewportWidth(width.max(0.0) as u32),
+        );
+    });
+
+    let visual_preferences = window.global::<VisualPreferences>();
+
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    visual_preferences.on_theme_mode_requested(move |theme| {
+        let theme = match theme {
+            ThemeMode::Light => UiTheme::Light,
+            ThemeMode::Dark => UiTheme::Dark,
+        };
+        update_from_request(&weak_window, &callback_adapter, UiRequest::SetTheme(theme));
+    });
+
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    visual_preferences.on_high_contrast_requested(move |enabled| {
+        update_from_request(
+            &weak_window,
+            &callback_adapter,
+            UiRequest::SetHighContrast(enabled),
+        );
+    });
+
+    let weak_window = window.as_weak();
+    let callback_adapter = Rc::clone(&adapter);
+    visual_preferences.on_reduced_motion_requested(move |enabled| {
+        update_from_request(
+            &weak_window,
+            &callback_adapter,
+            UiRequest::SetReducedMotion(enabled),
+        );
+    });
+
+    let weak_window = window.as_weak();
+    visual_preferences.on_density_scale_requested(move |scale| {
+        update_from_request(&weak_window, &adapter, UiRequest::SetDensityScale(scale));
+    });
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn sync_viewport(window: &AppWindow) {
+    window.invoke_viewport_width_changed(window.get_layout_width());
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn main() -> Result<(), slint::PlatformError> {
-    let adapter = Rc::new(UiAdapter::native());
+    let adapter = Rc::new(RefCell::new(UiAdapter::native()));
     let window = AppWindow::new()?;
 
-    apply_snapshot(&window, &adapter.snapshot());
-
-    let weak_window = window.as_weak();
-    window.on_refresh_requested(move || {
-        if let Some(window) = weak_window.upgrade() {
-            apply_snapshot(&window, &adapter.snapshot());
-        }
-    });
+    apply_snapshot(&window, &adapter.borrow().snapshot());
+    wire_callbacks(&window, adapter);
+    sync_viewport(&window);
 
     window.run()
 }
@@ -46,4 +156,67 @@ fn main() -> Result<(), slint::PlatformError> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn main() {
     compile_error!("gta-claw-desktop supports only Windows and macOS");
+}
+
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use slint::ComponentHandle;
+
+    use super::{
+        generated_ui::{AppWindow, DesignTokens, PaneMode, ThemeMode, VisualPreferences},
+        ui_adapter::UiAdapter,
+        wire_callbacks,
+    };
+
+    #[test]
+    fn component_contracts_and_callbacks_use_stable_generated_apis() {
+        let adapter = Rc::new(RefCell::new(UiAdapter::native()));
+        let window = AppWindow::new().expect("component construction must succeed");
+        super::apply_snapshot(&window, &adapter.borrow().snapshot());
+        wire_callbacks(&window, Rc::clone(&adapter));
+
+        window.set_layout_width(1_180.0);
+        super::sync_viewport(&window);
+        assert_eq!(window.get_pane_mode(), PaneMode::ThreePane);
+        window.set_layout_width(1_179.0);
+        super::sync_viewport(&window);
+        assert_eq!(window.get_pane_mode(), PaneMode::OverlayInspector);
+        window.set_layout_width(839.0);
+        super::sync_viewport(&window);
+        assert_eq!(window.get_pane_mode(), PaneMode::SinglePane);
+
+        let regular_success = window.global::<DesignTokens>().get_success();
+        window
+            .global::<VisualPreferences>()
+            .invoke_theme_mode_requested(ThemeMode::Dark);
+        window
+            .global::<VisualPreferences>()
+            .invoke_high_contrast_requested(true);
+        window
+            .global::<VisualPreferences>()
+            .invoke_reduced_motion_requested(true);
+        window
+            .global::<VisualPreferences>()
+            .invoke_density_scale_requested(2.0);
+
+        assert_eq!(window.get_theme_mode(), ThemeMode::Dark);
+        assert!(window.get_high_contrast());
+        assert!(window.get_reduced_motion());
+        assert_eq!(window.get_density_scale(), 1.35);
+        assert_ne!(
+            regular_success,
+            window.global::<DesignTokens>().get_success()
+        );
+
+        window.invoke_navigation_toggle_requested();
+        assert!(window.get_navigation_drawer_open());
+        window.invoke_inspector_toggle_requested();
+        assert!(!window.get_navigation_drawer_open());
+        assert!(window.get_inspector_open());
+
+        drop(window);
+        assert_eq!(Rc::strong_count(&adapter), 1);
+    }
 }
