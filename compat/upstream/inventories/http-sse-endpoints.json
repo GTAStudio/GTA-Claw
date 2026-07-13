@@ -1,0 +1,176 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "http-sse-endpoints",
+    "classification":  "mixed",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  18,
+                   "optional_sse":  2,
+                   "long_poll":  1,
+                   "streamable_http":  1
+               },
+    "items":  [
+                  {
+                      "record_id":  "http:health",
+                      "id":  "health",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-http.ts",
+                      "method":  "GET",
+                      "path":  "/health",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:healthz",
+                      "id":  "healthz",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-http.ts",
+                      "method":  "GET",
+                      "path":  "/healthz",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:ready",
+                      "id":  "ready",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-http.ts",
+                      "method":  "GET",
+                      "path":  "/ready",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:readyz",
+                      "id":  "readyz",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-http.ts",
+                      "method":  "GET",
+                      "path":  "/readyz",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:models-list",
+                      "id":  "models-list",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/models-http.ts",
+                      "method":  "GET",
+                      "path":  "/v1/models",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:models-get",
+                      "id":  "models-get",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/models-http.ts",
+                      "method":  "GET",
+                      "path":  "/v1/models/{id}",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:embeddings",
+                      "id":  "embeddings",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/embeddings-http.ts",
+                      "method":  "POST",
+                      "path":  "/v1/embeddings",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:chat-completions",
+                      "id":  "chat-completions",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/openai-http.ts",
+                      "method":  "POST",
+                      "path":  "/v1/chat/completions",
+                      "streaming":  "optional_sse"
+                  },
+                  {
+                      "record_id":  "http:openresponses",
+                      "id":  "openresponses",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/openresponses-http.ts",
+                      "method":  "POST",
+                      "path":  "/v1/responses",
+                      "streaming":  "optional_sse"
+                  },
+                  {
+                      "record_id":  "http:tools-invoke",
+                      "id":  "tools-invoke",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/tools-invoke-http.ts",
+                      "method":  "POST",
+                      "path":  "/tools/invoke",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:mcp-loopback",
+                      "id":  "mcp-loopback",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/gateway/mcp-http.ts",
+                      "method":  "POST",
+                      "path":  "/mcp",
+                      "streaming":  "streamable_http"
+                  },
+                  {
+                      "record_id":  "http:watch-challenge",
+                      "id":  "watch-challenge",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/watch-node-http.ts",
+                      "method":  "GET",
+                      "path":  "/api/nodes/watch/challenge",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:watch-connect",
+                      "id":  "watch-connect",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/watch-node-http.ts",
+                      "method":  "POST",
+                      "path":  "/api/nodes/watch/connect",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:watch-disconnect",
+                      "id":  "watch-disconnect",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/watch-node-http.ts",
+                      "method":  "POST",
+                      "path":  "/api/nodes/watch/disconnect",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:watch-poll",
+                      "id":  "watch-poll",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/watch-node-http.ts",
+                      "method":  "POST",
+                      "path":  "/api/nodes/watch/poll",
+                      "streaming":  "long_poll"
+                  },
+                  {
+                      "record_id":  "http:watch-result",
+                      "id":  "watch-result",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/watch-node-http.ts",
+                      "method":  "POST",
+                      "path":  "/api/nodes/watch/result",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:admin-rpc",
+                      "id":  "admin-rpc",
+                      "classification":  "gateway_core",
+                      "source_path":  "extensions/admin-http-rpc/index.ts",
+                      "method":  "POST",
+                      "path":  "/api/v1/admin/rpc",
+                      "streaming":  "none"
+                  },
+                  {
+                      "record_id":  "http:webhooks",
+                      "id":  "webhooks",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/webhooks/src/config.ts",
+                      "method":  "POST",
+                      "path":  "/plugins/webhooks/{routeId}",
+                      "streaming":  "none"
+                  }
+              ]
+}

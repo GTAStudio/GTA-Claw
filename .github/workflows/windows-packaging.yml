@@ -1,0 +1,145 @@
+name: windows-packaging
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-packaging.yml"
+      - "packaging/windows/**"
+      - "apps/**"
+      - "crates/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_WARNINGS: deny
+  CARGO_TERM_COLOR: always
+
+jobs:
+  x64:
+    name: x64 build, test, and unsigned packaging
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Run packaging self-tests
+        shell: pwsh
+        run: .\packaging\windows\self-test.ps1
+
+      - name: Check root workspace formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check root workspace
+        run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Run root Clippy
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Test root workspace
+        run: cargo test --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Check desktop workspace formatting
+        run: cargo fmt --manifest-path desktop\Cargo.toml --all -- --check
+
+      - name: Check desktop workspace
+        run: cargo check --manifest-path desktop\Cargo.toml --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Run desktop Clippy
+        run: cargo clippy --manifest-path desktop\Cargo.toml --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Test desktop workspace
+        run: cargo test --manifest-path desktop\Cargo.toml --workspace --all-targets --locked --target x86_64-pc-windows-msvc
+
+      - name: Build and inspect unsigned packages
+        shell: pwsh
+        run: .\packaging\windows\package.ps1 -Architecture x64
+
+      - name: Prove deterministic portable rerun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $PWD 'packaging\windows\out'
+          $build = Join-Path $PWD 'packaging\windows\.work\build\x86_64-pc-windows-msvc'
+          $desktopZips = @(Get-ChildItem -LiteralPath (Join-Path $root 'x64') -Filter '*desktop*portable*.zip')
+          $headlessZips = @(Get-ChildItem -LiteralPath (Join-Path $root 'x64') -Filter '*headless*portable*.zip')
+          if ($desktopZips.Count -ne 1 -or $headlessZips.Count -ne 1) {
+            throw 'Expected exactly one portable archive for each deliverable.'
+          }
+          $first = @{
+            desktop = (Get-FileHash $desktopZips[0].FullName -Algorithm SHA256).Hash
+            headless = (Get-FileHash $headlessZips[0].FullName -Algorithm SHA256).Hash
+          }
+          .\packaging\windows\package.ps1 `
+            -Architecture x64 `
+            -SkipBuild `
+            -DesktopExecutable (Join-Path $build 'desktop\x86_64-pc-windows-msvc\release\gta-claw-desktop.exe') `
+            -CliExecutable (Join-Path $build 'headless\x86_64-pc-windows-msvc\release\gta-claw-cli.exe') `
+            -DaemonExecutable (Join-Path $build 'headless\x86_64-pc-windows-msvc\release\gta-claw-daemon.exe')
+          $desktopZips = @(Get-ChildItem -LiteralPath (Join-Path $root 'x64') -Filter '*desktop*portable*.zip')
+          $headlessZips = @(Get-ChildItem -LiteralPath (Join-Path $root 'x64') -Filter '*headless*portable*.zip')
+          $secondDesktop = (Get-FileHash $desktopZips[0].FullName -Algorithm SHA256).Hash
+          $secondHeadless = (Get-FileHash $headlessZips[0].FullName -Algorithm SHA256).Hash
+          if ($first.desktop -ne $secondDesktop -or $first.headless -ne $secondHeadless) {
+            throw 'Portable package rerun was not deterministic.'
+          }
+
+      - name: Upload unsigned non-release x64 artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-non-release-windows-x64
+          path: packaging/windows/out/x64
+          if-no-files-found: error
+          retention-days: 7
+
+  arm64:
+    name: arm64 compile and package-layout validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Rust arm64 target
+        run: rustup target add aarch64-pc-windows-msvc
+
+      - name: Compile-check root arm64 workspace
+        run: cargo check --workspace --all-targets --locked --target aarch64-pc-windows-msvc
+
+      - name: Compile-check desktop arm64 workspace
+        run: cargo check --manifest-path desktop\Cargo.toml --workspace --all-targets --locked --target aarch64-pc-windows-msvc
+
+      - name: Detect installed MSVC arm64 tools
+        id: msvc-arm64
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($installation)) {
+            'available=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host 'MSVC ARM64 linker is unavailable; compile-check is the proven arm64 gate on this runner.'
+          } else {
+            'available=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Cross-build and inspect unsigned arm64 packages
+        if: steps.msvc-arm64.outputs.available == 'true'
+        shell: pwsh
+        run: .\packaging\windows\package.ps1 -Architecture arm64
+
+      - name: Upload unsigned non-release arm64 artifacts
+        if: steps.msvc-arm64.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-non-release-windows-arm64
+          path: packaging/windows/out/arm64
+          if-no-files-found: error
+          retention-days: 7

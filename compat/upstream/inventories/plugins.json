@@ -1,0 +1,1110 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "plugins",
+    "classification":  "official_integration",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  137,
+                   "core":  64,
+                   "official_external":  70,
+                   "source_only_qa":  3
+               },
+    "items":  [
+                  {
+                      "record_id":  "plugin:admin-http-rpc",
+                      "id":  "admin-http-rpc",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/admin-http-rpc",
+                      "package_name":  "@openclaw/admin-http-rpc",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:alibaba",
+                      "id":  "alibaba",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/alibaba",
+                      "package_name":  "@openclaw/alibaba-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:anthropic",
+                      "id":  "anthropic",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/anthropic",
+                      "package_name":  "@openclaw/anthropic-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:azure-speech",
+                      "id":  "azure-speech",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/azure-speech",
+                      "package_name":  "@openclaw/azure-speech",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:bonjour",
+                      "id":  "bonjour",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/bonjour",
+                      "package_name":  "@openclaw/bonjour",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:browser",
+                      "id":  "browser",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/browser",
+                      "package_name":  "@openclaw/browser-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:byteplus",
+                      "id":  "byteplus",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/byteplus",
+                      "package_name":  "@openclaw/byteplus-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:canvas",
+                      "id":  "canvas",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/canvas",
+                      "package_name":  "@openclaw/canvas-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:clawrouter",
+                      "id":  "clawrouter",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/clawrouter",
+                      "package_name":  "@openclaw/clawrouter",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:cohere",
+                      "id":  "cohere",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/cohere",
+                      "package_name":  "@openclaw/cohere-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:comfy",
+                      "id":  "comfy",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/comfy",
+                      "package_name":  "@openclaw/comfy-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:copilot-proxy",
+                      "id":  "copilot-proxy",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/copilot-proxy",
+                      "package_name":  "@openclaw/copilot-proxy",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:crabbox",
+                      "id":  "crabbox",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/crabbox",
+                      "package_name":  "@openclaw/crabbox-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:deepgram",
+                      "id":  "deepgram",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/deepgram",
+                      "package_name":  "@openclaw/deepgram-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:document-extract",
+                      "id":  "document-extract",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/document-extract",
+                      "package_name":  "@openclaw/document-extract-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:duckduckgo",
+                      "id":  "duckduckgo",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/duckduckgo",
+                      "package_name":  "@openclaw/duckduckgo-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:elevenlabs",
+                      "id":  "elevenlabs",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/elevenlabs",
+                      "package_name":  "@openclaw/elevenlabs-speech",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:fal",
+                      "id":  "fal",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/fal",
+                      "package_name":  "@openclaw/fal-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:file-transfer",
+                      "id":  "file-transfer",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/file-transfer",
+                      "package_name":  "@openclaw/file-transfer",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:github-copilot",
+                      "id":  "github-copilot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/github-copilot",
+                      "package_name":  "@openclaw/github-copilot-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:google",
+                      "id":  "google",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/google",
+                      "package_name":  "@openclaw/google-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:huggingface",
+                      "id":  "huggingface",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/huggingface",
+                      "package_name":  "@openclaw/huggingface-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:imessage",
+                      "id":  "imessage",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/imessage",
+                      "package_name":  "@openclaw/imessage",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:litellm",
+                      "id":  "litellm",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/litellm",
+                      "package_name":  "@openclaw/litellm-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:llm-task",
+                      "id":  "llm-task",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/llm-task",
+                      "package_name":  "@openclaw/llm-task",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:lmstudio",
+                      "id":  "lmstudio",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/lmstudio",
+                      "package_name":  "@openclaw/lmstudio-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:logbook",
+                      "id":  "logbook",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/logbook",
+                      "package_name":  "@openclaw/logbook",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:memory-core",
+                      "id":  "memory-core",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/memory-core",
+                      "package_name":  "@openclaw/memory-core",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:memory-wiki",
+                      "id":  "memory-wiki",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/memory-wiki",
+                      "package_name":  "@openclaw/memory-wiki",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:meta",
+                      "id":  "meta",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/meta",
+                      "package_name":  "@openclaw/meta-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:microsoft",
+                      "id":  "microsoft",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/microsoft",
+                      "package_name":  "@openclaw/microsoft-speech",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:microsoft-foundry",
+                      "id":  "microsoft-foundry",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/microsoft-foundry",
+                      "package_name":  "@openclaw/microsoft-foundry",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:migrate-claude",
+                      "id":  "migrate-claude",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/migrate-claude",
+                      "package_name":  "@openclaw/migrate-claude",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:migrate-hermes",
+                      "id":  "migrate-hermes",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/migrate-hermes",
+                      "package_name":  "@openclaw/migrate-hermes",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:minimax",
+                      "id":  "minimax",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/minimax",
+                      "package_name":  "@openclaw/minimax-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:mistral",
+                      "id":  "mistral",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/mistral",
+                      "package_name":  "@openclaw/mistral-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:novita",
+                      "id":  "novita",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/novita",
+                      "package_name":  "@openclaw/novita-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:nvidia",
+                      "id":  "nvidia",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/nvidia",
+                      "package_name":  "@openclaw/nvidia-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:oc-path",
+                      "id":  "oc-path",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/oc-path",
+                      "package_name":  "@openclaw/oc-path",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:ollama",
+                      "id":  "ollama",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/ollama",
+                      "package_name":  "@openclaw/ollama-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:open-prose",
+                      "id":  "open-prose",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/open-prose",
+                      "package_name":  "@openclaw/open-prose",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:openai",
+                      "id":  "openai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/openai",
+                      "package_name":  "@openclaw/openai-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:opencode",
+                      "id":  "opencode",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/opencode",
+                      "package_name":  "@openclaw/opencode-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:opencode-go",
+                      "id":  "opencode-go",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/opencode-go",
+                      "package_name":  "@openclaw/opencode-go-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:openrouter",
+                      "id":  "openrouter",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/openrouter",
+                      "package_name":  "@openclaw/openrouter-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:policy",
+                      "id":  "policy",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/policy",
+                      "package_name":  "@openclaw/policy",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:runway",
+                      "id":  "runway",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/runway",
+                      "package_name":  "@openclaw/runway-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:senseaudio",
+                      "id":  "senseaudio",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/senseaudio",
+                      "package_name":  "@openclaw/senseaudio-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:sglang",
+                      "id":  "sglang",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/sglang",
+                      "package_name":  "@openclaw/sglang-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:synthetic",
+                      "id":  "synthetic",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/synthetic",
+                      "package_name":  "@openclaw/synthetic-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:telegram",
+                      "id":  "telegram",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/telegram",
+                      "package_name":  "@openclaw/telegram",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:together",
+                      "id":  "together",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/together",
+                      "package_name":  "@openclaw/together-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:tts-local-cli",
+                      "id":  "tts-local-cli",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tts-local-cli",
+                      "package_name":  "@openclaw/tts-local-cli",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:vault",
+                      "id":  "vault",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vault",
+                      "package_name":  "@openclaw/vault",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:vllm",
+                      "id":  "vllm",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vllm",
+                      "package_name":  "@openclaw/vllm-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:volcengine",
+                      "id":  "volcengine",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/volcengine",
+                      "package_name":  "@openclaw/volcengine-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:voyage",
+                      "id":  "voyage",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/voyage",
+                      "package_name":  "@openclaw/voyage-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:vydra",
+                      "id":  "vydra",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vydra",
+                      "package_name":  "@openclaw/vydra-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:web-readability",
+                      "id":  "web-readability",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/web-readability",
+                      "package_name":  "@openclaw/web-readability-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:webhooks",
+                      "id":  "webhooks",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/webhooks",
+                      "package_name":  "@openclaw/webhooks",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:workboard",
+                      "id":  "workboard",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/workboard",
+                      "package_name":  "@openclaw/workboard",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:workspaces",
+                      "id":  "workspaces",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/workspaces",
+                      "package_name":  "@openclaw/workspaces-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:xai",
+                      "id":  "xai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/xai",
+                      "package_name":  "@openclaw/xai-plugin",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:xiaomi",
+                      "id":  "xiaomi",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/xiaomi",
+                      "package_name":  "@openclaw/xiaomi-provider",
+                      "delivery_class":  "core"
+                  },
+                  {
+                      "record_id":  "plugin:acpx",
+                      "id":  "acpx",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/acpx",
+                      "package_name":  "@openclaw/acpx",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:amazon-bedrock",
+                      "id":  "amazon-bedrock",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/amazon-bedrock",
+                      "package_name":  "@openclaw/amazon-bedrock-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:amazon-bedrock-mantle",
+                      "id":  "amazon-bedrock-mantle",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/amazon-bedrock-mantle",
+                      "package_name":  "@openclaw/amazon-bedrock-mantle-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:anthropic-vertex",
+                      "id":  "anthropic-vertex",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/anthropic-vertex",
+                      "package_name":  "@openclaw/anthropic-vertex-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:arcee",
+                      "id":  "arcee",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/arcee",
+                      "package_name":  "@openclaw/arcee-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:brave",
+                      "id":  "brave",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/brave",
+                      "package_name":  "@openclaw/brave-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:cerebras",
+                      "id":  "cerebras",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/cerebras",
+                      "package_name":  "@openclaw/cerebras-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:chutes",
+                      "id":  "chutes",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/chutes",
+                      "package_name":  "@openclaw/chutes-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:clickclack",
+                      "id":  "clickclack",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/clickclack",
+                      "package_name":  "@openclaw/clickclack",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:cloudflare-ai-gateway",
+                      "id":  "cloudflare-ai-gateway",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/cloudflare-ai-gateway",
+                      "package_name":  "@openclaw/cloudflare-ai-gateway-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:codex",
+                      "id":  "codex",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/codex",
+                      "package_name":  "@openclaw/codex",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:copilot",
+                      "id":  "copilot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/copilot",
+                      "package_name":  "@openclaw/copilot",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:deepinfra",
+                      "id":  "deepinfra",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/deepinfra",
+                      "package_name":  "@openclaw/deepinfra-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:deepseek",
+                      "id":  "deepseek",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/deepseek",
+                      "package_name":  "@openclaw/deepseek-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:diagnostics-otel",
+                      "id":  "diagnostics-otel",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/diagnostics-otel",
+                      "package_name":  "@openclaw/diagnostics-otel",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:diagnostics-prometheus",
+                      "id":  "diagnostics-prometheus",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/diagnostics-prometheus",
+                      "package_name":  "@openclaw/diagnostics-prometheus",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:diffs",
+                      "id":  "diffs",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/diffs",
+                      "package_name":  "@openclaw/diffs",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:diffs-language-pack",
+                      "id":  "diffs-language-pack",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/diffs-language-pack",
+                      "package_name":  "@openclaw/diffs-language-pack",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:discord",
+                      "id":  "discord",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/discord",
+                      "package_name":  "@openclaw/discord",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:exa",
+                      "id":  "exa",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/exa",
+                      "package_name":  "@openclaw/exa-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:featherless",
+                      "id":  "featherless",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/featherless",
+                      "package_name":  "@openclaw/featherless-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:feishu",
+                      "id":  "feishu",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/feishu",
+                      "package_name":  "@openclaw/feishu",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:firecrawl",
+                      "id":  "firecrawl",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/firecrawl",
+                      "package_name":  "@openclaw/firecrawl-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:fireworks",
+                      "id":  "fireworks",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/fireworks",
+                      "package_name":  "@openclaw/fireworks-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:gmi",
+                      "id":  "gmi",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/gmi",
+                      "package_name":  "@openclaw/gmi-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:google-meet",
+                      "id":  "google-meet",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/google-meet",
+                      "package_name":  "@openclaw/google-meet",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:googlechat",
+                      "id":  "googlechat",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/googlechat",
+                      "package_name":  "@openclaw/googlechat",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:gradium",
+                      "id":  "gradium",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/gradium",
+                      "package_name":  "@openclaw/gradium-speech",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:groq",
+                      "id":  "groq",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/groq",
+                      "package_name":  "@openclaw/groq-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:inworld",
+                      "id":  "inworld",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/inworld",
+                      "package_name":  "@openclaw/inworld-speech",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:irc",
+                      "id":  "irc",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/irc",
+                      "package_name":  "@openclaw/irc",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:kilocode",
+                      "id":  "kilocode",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/kilocode",
+                      "package_name":  "@openclaw/kilocode-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:kimi",
+                      "id":  "kimi",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/kimi-coding",
+                      "package_name":  "@openclaw/kimi-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:line",
+                      "id":  "line",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/line",
+                      "package_name":  "@openclaw/line",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:llama-cpp",
+                      "id":  "llama-cpp",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/llama-cpp",
+                      "package_name":  "@openclaw/llama-cpp-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:lobster",
+                      "id":  "lobster",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/lobster",
+                      "package_name":  "@openclaw/lobster",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:longcat",
+                      "id":  "longcat",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/longcat",
+                      "package_name":  "@openclaw/longcat-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:matrix",
+                      "id":  "matrix",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/matrix",
+                      "package_name":  "@openclaw/matrix",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:mattermost",
+                      "id":  "mattermost",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/mattermost",
+                      "package_name":  "@openclaw/mattermost",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:memory-lancedb",
+                      "id":  "memory-lancedb",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/memory-lancedb",
+                      "package_name":  "@openclaw/memory-lancedb",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:moonshot",
+                      "id":  "moonshot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/moonshot",
+                      "package_name":  "@openclaw/moonshot-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:msteams",
+                      "id":  "msteams",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/msteams",
+                      "package_name":  "@openclaw/msteams",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:nextcloud-talk",
+                      "id":  "nextcloud-talk",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/nextcloud-talk",
+                      "package_name":  "@openclaw/nextcloud-talk",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:nostr",
+                      "id":  "nostr",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/nostr",
+                      "package_name":  "@openclaw/nostr",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:openshell",
+                      "id":  "openshell",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/openshell",
+                      "package_name":  "@openclaw/openshell-sandbox",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:parallel",
+                      "id":  "parallel",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/parallel",
+                      "package_name":  "@openclaw/parallel-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:perplexity",
+                      "id":  "perplexity",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/perplexity",
+                      "package_name":  "@openclaw/perplexity-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:pixverse",
+                      "id":  "pixverse",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/pixverse",
+                      "package_name":  "@openclaw/pixverse-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:qianfan",
+                      "id":  "qianfan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qianfan",
+                      "package_name":  "@openclaw/qianfan-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:qqbot",
+                      "id":  "qqbot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qqbot",
+                      "package_name":  "@openclaw/qqbot",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:qwen",
+                      "id":  "qwen",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen",
+                      "package_name":  "@openclaw/qwen-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:raft",
+                      "id":  "raft",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/raft",
+                      "package_name":  "@openclaw/raft",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:searxng",
+                      "id":  "searxng",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/searxng",
+                      "package_name":  "@openclaw/searxng-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:signal",
+                      "id":  "signal",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/signal",
+                      "package_name":  "@openclaw/signal",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:slack",
+                      "id":  "slack",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/slack",
+                      "package_name":  "@openclaw/slack",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:sms",
+                      "id":  "sms",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/sms",
+                      "package_name":  "@openclaw/sms",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:stepfun",
+                      "id":  "stepfun",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/stepfun",
+                      "package_name":  "@openclaw/stepfun-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:synology-chat",
+                      "id":  "synology-chat",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/synology-chat",
+                      "package_name":  "@openclaw/synology-chat",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:tavily",
+                      "id":  "tavily",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tavily",
+                      "package_name":  "@openclaw/tavily-plugin",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:tencent",
+                      "id":  "tencent",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tencent",
+                      "package_name":  "@openclaw/tencent-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:tlon",
+                      "id":  "tlon",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tlon",
+                      "package_name":  "@openclaw/tlon",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:tokenjuice",
+                      "id":  "tokenjuice",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tokenjuice",
+                      "package_name":  "@openclaw/tokenjuice",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:twitch",
+                      "id":  "twitch",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/twitch",
+                      "package_name":  "@openclaw/twitch",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:venice",
+                      "id":  "venice",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/venice",
+                      "package_name":  "@openclaw/venice-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:vercel-ai-gateway",
+                      "id":  "vercel-ai-gateway",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vercel-ai-gateway",
+                      "package_name":  "@openclaw/vercel-ai-gateway-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:voice-call",
+                      "id":  "voice-call",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/voice-call",
+                      "package_name":  "@openclaw/voice-call",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:whatsapp",
+                      "id":  "whatsapp",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/whatsapp",
+                      "package_name":  "@openclaw/whatsapp",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:zai",
+                      "id":  "zai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/zai",
+                      "package_name":  "@openclaw/zai-provider",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:zalo",
+                      "id":  "zalo",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/zalo",
+                      "package_name":  "@openclaw/zalo",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:zalouser",
+                      "id":  "zalouser",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/zalouser",
+                      "package_name":  "@openclaw/zalouser",
+                      "delivery_class":  "official_external"
+                  },
+                  {
+                      "record_id":  "plugin:qa-channel",
+                      "id":  "qa-channel",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qa-channel",
+                      "package_name":  "@openclaw/qa-channel",
+                      "delivery_class":  "source_only_qa"
+                  },
+                  {
+                      "record_id":  "plugin:qa-lab",
+                      "id":  "qa-lab",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qa-lab",
+                      "package_name":  "@openclaw/qa-lab",
+                      "delivery_class":  "source_only_qa"
+                  },
+                  {
+                      "record_id":  "plugin:qa-matrix",
+                      "id":  "qa-matrix",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qa-matrix",
+                      "package_name":  "@openclaw/qa-matrix",
+                      "delivery_class":  "source_only_qa"
+                  }
+              ]
+}

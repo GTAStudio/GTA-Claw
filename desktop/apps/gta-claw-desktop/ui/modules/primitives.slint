@@ -1,0 +1,756 @@
+import { LineEdit } from "std-widgets.slint";
+import { DesignTokens, Metrics, StatusKind, VisualPreferences } from "./tokens.slint";
+
+export enum ButtonTone {
+    primary,
+    secondary,
+    danger,
+}
+
+component FocusableClickArea {
+    in property <bool> enabled: true;
+    out property <bool> has-focus: focus-scope.has-focus;
+    out property <bool> has-hover: touch-area.has-hover;
+    out property <bool> pressed: touch-area.pressed;
+    callback clicked <=> touch-area.clicked;
+
+    forward-focus: focus-scope;
+
+    touch-area := TouchArea {
+        enabled: root.enabled;
+    }
+
+    focus-scope := FocusScope {
+        width: 0px;
+        enabled: root.enabled;
+
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                touch-area.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+component FocusRing inherits Rectangle {
+    in property <bool> active;
+    border-width: root.active ? Metrics.focus-width : 0px;
+    border-color: DesignTokens.focus-ring;
+    border-radius: Metrics.radius-medium + Metrics.focus-offset;
+    background: transparent;
+}
+
+export component ActionButton {
+    in property <string> text: "Action";
+    in property <string> accessible-name: root.text;
+    in property <bool> enabled: true;
+    in property <ButtonTone> tone: ButtonTone.secondary;
+    callback clicked;
+
+    private property <color> base-background: root.tone == ButtonTone.primary
+        ? DesignTokens.accent
+        : (root.tone == ButtonTone.danger ? DesignTokens.danger : DesignTokens.surface-raised);
+    private property <color> foreground: root.tone == ButtonTone.secondary
+        ? DesignTokens.text-primary
+        : DesignTokens.accent-on;
+
+    min-height: Metrics.control-medium;
+    min-width: max(88px, content.min-width);
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    forward-focus: interaction;
+
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            interaction.clicked();
+        }
+    }
+
+    background := Rectangle {
+        background: !root.enabled
+            ? DesignTokens.surface-subtle
+            : (interaction.pressed
+                ? (root.tone == ButtonTone.secondary
+                    ? DesignTokens.surface-subtle
+                    : (root.tone == ButtonTone.danger ? DesignTokens.danger-pressed : DesignTokens.accent-pressed))
+                : (interaction.has-hover
+                    ? (root.tone == ButtonTone.secondary
+                        ? DesignTokens.accent-surface
+                        : (root.tone == ButtonTone.danger ? DesignTokens.danger-hover : DesignTokens.accent-hover))
+                    : root.base-background));
+        border-width: root.tone == ButtonTone.secondary || VisualPreferences.high-contrast ? 1px : 0px;
+        border-color: root.enabled ? DesignTokens.border-strong : DesignTokens.border-default;
+        border-radius: Metrics.radius-medium;
+
+        animate background, border-color { duration: Metrics.motion-fast; }
+    }
+
+    content := HorizontalLayout {
+        padding-left: Metrics.space-4;
+        padding-right: Metrics.space-4;
+        padding-top: Metrics.space-2;
+        padding-bottom: Metrics.space-2;
+        alignment: center;
+
+        Text {
+            text: root.text;
+            color: root.enabled ? root.foreground : DesignTokens.text-muted;
+            font-size: Metrics.type-small;
+            font-weight: 650;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+
+    interaction := FocusableClickArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    FocusRing {
+        x: -Metrics.focus-offset;
+        y: -Metrics.focus-offset;
+        width: parent.width + 2 * Metrics.focus-offset;
+        height: parent.height + 2 * Metrics.focus-offset;
+        active: interaction.has-focus && root.enabled;
+    }
+}
+
+export component PrimaryButton inherits ActionButton {
+    tone: ButtonTone.primary;
+}
+
+export component SecondaryButton inherits ActionButton {
+    tone: ButtonTone.secondary;
+}
+
+export component DangerButton inherits ActionButton {
+    tone: ButtonTone.danger;
+}
+
+export component Toolbar {
+    in property <string> accessible-name: "Application toolbar";
+
+    min-height: Metrics.touch-target;
+    accessible-role: region;
+    accessible-label: root.accessible-name;
+
+    Rectangle {
+        background: DesignTokens.surface-pane;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+        border-radius: Metrics.radius-medium;
+
+        HorizontalLayout {
+            padding-left: Metrics.space-2;
+            padding-right: Metrics.space-2;
+            spacing: Metrics.space-1;
+            alignment: center;
+            @children
+        }
+    }
+}
+
+export component ToolbarIconButton {
+    in property <string> glyph: "+";
+    in property <string> accessible-name: "Toolbar action";
+    in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    callback clicked;
+
+    width: Metrics.control-medium;
+    height: Metrics.control-medium;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    forward-focus: interaction;
+
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-enabled: root.enabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        if (root.enabled) {
+            interaction.clicked();
+        }
+    }
+
+    Rectangle {
+        background: root.checked
+            ? DesignTokens.accent-surface
+            : (interaction.has-hover ? DesignTokens.surface-subtle : transparent);
+        border-width: VisualPreferences.high-contrast ? 1px : 0px;
+        border-color: DesignTokens.border-strong;
+        border-radius: Metrics.radius-medium;
+
+        Text {
+            text: root.glyph;
+            color: root.enabled ? DesignTokens.text-primary : DesignTokens.text-muted;
+            font-size: Metrics.type-body;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+
+    interaction := FocusableClickArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    FocusRing {
+        x: -Metrics.focus-offset;
+        y: -Metrics.focus-offset;
+        width: parent.width + 2 * Metrics.focus-offset;
+        height: parent.height + 2 * Metrics.focus-offset;
+        active: interaction.has-focus && root.enabled;
+    }
+}
+
+export component NavigationItem {
+    in property <string> glyph: "G";
+    in property <string> text: "Destination";
+    in property <string> detail: "";
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    min-height: max(Metrics.control-large, content.min-height);
+    forward-focus: interaction;
+
+    accessible-role: button;
+    accessible-label: root.detail == "" ? root.text : root.text + ", " + root.detail;
+    accessible-enabled: root.enabled;
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-action-default => {
+        if (root.enabled) {
+            interaction.clicked();
+        }
+    }
+
+    Rectangle {
+        background: root.selected
+            ? DesignTokens.accent-surface
+            : (interaction.has-hover ? DesignTokens.surface-subtle : transparent);
+        border-width: VisualPreferences.high-contrast && root.selected ? 2px : 0px;
+        border-color: DesignTokens.accent;
+        border-radius: Metrics.radius-medium;
+
+        Rectangle {
+            x: 0px;
+            y: Metrics.space-2;
+            width: root.selected ? 3px : 0px;
+            height: parent.height - 2 * Metrics.space-2;
+            background: DesignTokens.accent;
+            border-radius: Metrics.radius-pill;
+        }
+    }
+
+    content := HorizontalLayout {
+        padding-left: Metrics.space-3;
+        padding-right: Metrics.space-3;
+        padding-top: Metrics.space-2;
+        padding-bottom: Metrics.space-2;
+        spacing: Metrics.space-3;
+        alignment: center;
+
+        Rectangle {
+            width: Metrics.control-small;
+            height: Metrics.control-small;
+            horizontal-stretch: 0;
+            background: root.selected ? DesignTokens.accent : DesignTokens.surface-subtle;
+            border-radius: Metrics.radius-small;
+
+            Text {
+                text: root.glyph;
+                color: root.selected ? DesignTokens.accent-on : DesignTokens.text-secondary;
+                font-size: Metrics.type-small;
+                font-weight: 750;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+
+        VerticalLayout {
+            spacing: 1px;
+
+            Text {
+                text: root.text;
+                color: root.enabled ? DesignTokens.text-primary : DesignTokens.text-muted;
+                font-size: Metrics.type-small;
+                font-weight: root.selected ? 700 : 550;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+
+            if (root.detail != "") : Text {
+                text: root.detail;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+    }
+
+    interaction := FocusableClickArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    FocusRing {
+        x: -Metrics.focus-offset;
+        y: -Metrics.focus-offset;
+        width: parent.width + 2 * Metrics.focus-offset;
+        height: parent.height + 2 * Metrics.focus-offset;
+        active: interaction.has-focus && root.enabled;
+    }
+}
+
+export component TextField {
+    in property <string> label: "";
+    in property <string> accessible-name: root.label;
+    in-out property <string> text <=> field.text;
+    in property <string> placeholder: "";
+    in property <bool> enabled: true;
+    in property <bool> read-only: false;
+    out property <bool> has-focus: field.has-focus;
+    callback edited(string);
+    callback accepted;
+
+    min-width: 180px;
+    min-height: field.min-height + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
+    forward-focus: field;
+
+    VerticalLayout {
+        spacing: Metrics.space-1;
+
+        if (root.label != "") : Text {
+            text: root.label;
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-caption;
+            font-weight: 650;
+            accessible-role: none;
+        }
+
+        field := LineEdit {
+            placeholder-text: root.placeholder;
+            enabled: root.enabled;
+            read-only: root.read-only;
+            accessible-label: root.accessible-name;
+            edited(value) => { root.edited(value); }
+            accepted => { root.accepted(); }
+        }
+    }
+}
+
+export component ComposerShell {
+    in-out property <string> text <=> composer.text;
+    in property <string> accessible-name: "Message composer";
+    in property <string> placeholder: "Write a message";
+    in property <string> submit-label: "Send";
+    in property <bool> enabled: true;
+    callback submitted(string);
+
+    min-height: Metrics.control-large + 2 * Metrics.space-2;
+    accessible-role: form;
+    accessible-label: root.accessible-name;
+
+    Rectangle {
+        background: DesignTokens.surface-raised;
+        border-width: 1px;
+        border-color: composer.has-focus ? DesignTokens.focus-ring : DesignTokens.border-default;
+        border-radius: Metrics.radius-large;
+
+        HorizontalLayout {
+            padding: Metrics.space-2;
+            spacing: Metrics.space-2;
+            alignment: center;
+
+            composer := TextField {
+                accessible-name: root.accessible-name;
+                placeholder: root.placeholder;
+                enabled: root.enabled;
+                horizontal-stretch: 1;
+                accepted => {
+                    if (root.enabled && root.text != "") {
+                        root.submitted(root.text);
+                    }
+                }
+            }
+
+            PrimaryButton {
+                text: root.submit-label;
+                accessible-name: root.submit-label + " message";
+                enabled: root.enabled && root.text != "";
+                clicked => { root.submitted(root.text); }
+            }
+        }
+    }
+}
+
+export component StatusBadge {
+    in property <StatusKind> kind: StatusKind.neutral;
+    in property <string> text: "Status";
+
+    in property <string> icon-text: root.kind == StatusKind.success
+        ? "OK"
+        : (root.kind == StatusKind.warning
+            ? "!"
+            : (root.kind == StatusKind.danger ? "X" : (root.kind == StatusKind.info ? "i" : "-")));
+    in property <string> semantic-label: root.kind == StatusKind.success
+        ? "Success"
+        : (root.kind == StatusKind.warning
+            ? "Warning"
+            : (root.kind == StatusKind.danger ? "Danger" : (root.kind == StatusKind.info ? "Information" : "Status")));
+    private property <color> semantic-color: root.kind == StatusKind.success
+        ? DesignTokens.success
+        : (root.kind == StatusKind.warning
+            ? DesignTokens.warning
+            : (root.kind == StatusKind.danger ? DesignTokens.danger : (root.kind == StatusKind.info ? DesignTokens.info : DesignTokens.text-secondary)));
+    private property <color> semantic-surface: root.kind == StatusKind.success
+        ? DesignTokens.success-surface
+        : (root.kind == StatusKind.warning
+            ? DesignTokens.warning-surface
+            : (root.kind == StatusKind.danger ? DesignTokens.danger-surface : (root.kind == StatusKind.info ? DesignTokens.info-surface : DesignTokens.surface-subtle)));
+
+    min-height: Metrics.control-small;
+    min-width: content.min-width;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.semantic-label + ": " + root.text + ", symbol " + root.icon-text;
+    accessible-live-region: polite;
+
+    Rectangle {
+        background: root.semantic-surface;
+        border-width: VisualPreferences.high-contrast ? 2px : 1px;
+        border-color: root.semantic-color;
+        border-radius: Metrics.radius-pill;
+    }
+
+    content := HorizontalLayout {
+        padding-left: Metrics.space-2;
+        padding-right: Metrics.space-3;
+        padding-top: Metrics.space-1;
+        padding-bottom: Metrics.space-1;
+        spacing: Metrics.space-2;
+        alignment: center;
+
+        Rectangle {
+            width: Metrics.type-title;
+            height: Metrics.type-title;
+            horizontal-stretch: 0;
+            background: root.semantic-color;
+            border-radius: Metrics.radius-pill;
+
+            Text {
+                text: root.icon-text;
+                color: root.kind == StatusKind.warning && !VisualPreferences.high-contrast
+                    ? #1b1608
+                    : DesignTokens.accent-on;
+                font-size: Metrics.type-caption;
+                font-weight: 800;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: DesignTokens.text-primary;
+            font-size: Metrics.type-caption;
+            font-weight: 650;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+}
+
+export component Card {
+    in property <string> accessible-name: "Card";
+
+    accessible-role: region;
+    accessible-label: root.accessible-name;
+
+    Rectangle {
+        background: DesignTokens.surface-raised;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+        border-radius: Metrics.radius-large;
+
+        VerticalLayout {
+            padding: Metrics.space-4;
+            spacing: Metrics.space-3;
+            @children
+        }
+    }
+}
+
+export component Divider inherits Rectangle {
+    in property <bool> vertical: false;
+    min-width: root.vertical ? 1px : 0px;
+    max-width: root.vertical ? 1px : 100000px;
+    min-height: root.vertical ? 0px : 1px;
+    max-height: root.vertical ? 100000px : 1px;
+    background: DesignTokens.border-default;
+    accessible-role: none;
+}
+
+export component EmptyStatePanel {
+    in property <string> glyph: "G";
+    in property <string> title: "Nothing here yet";
+    in property <string> detail: "This area is ready for future content.";
+    in property <string> action-label: "";
+    in property <bool> enabled: true;
+    callback action-requested;
+
+    accessible-role: region;
+    accessible-label: root.title + ". " + root.detail;
+
+    Rectangle {
+        background: DesignTokens.surface-subtle;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+        border-radius: Metrics.radius-large;
+
+        VerticalLayout {
+            padding: Metrics.space-8;
+            spacing: Metrics.space-3;
+            alignment: center;
+
+            Rectangle {
+                width: Metrics.space-12;
+                height: Metrics.space-12;
+                horizontal-stretch: 0;
+                background: DesignTokens.accent-surface;
+                border-radius: Metrics.radius-large;
+
+                Text {
+                    text: root.glyph;
+                    color: DesignTokens.accent;
+                    font-size: Metrics.type-title;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+            }
+
+            Text {
+                text: root.title;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-title;
+                font-weight: 750;
+                horizontal-alignment: center;
+                accessible-role: none;
+            }
+
+            Text {
+                text: root.detail;
+                color: DesignTokens.text-secondary;
+                font-size: Metrics.type-small;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+
+            if (root.action-label != "") : SecondaryButton {
+                text: root.action-label;
+                enabled: root.enabled;
+                clicked => { root.action-requested(); }
+            }
+        }
+    }
+}
+
+export component ModalSheetShell {
+    in property <string> title: "Dialog";
+    in property <string> dismiss-label: "Close";
+    callback dismiss-requested;
+
+    forward-focus: dialog-focus;
+    accessible-role: region;
+    accessible-label: root.title;
+
+    dialog-focus := FocusScope {
+        focus-on-tab-navigation: false;
+        init => { close-button.focus(); }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.dismiss-requested();
+                return accept;
+            }
+            return reject;
+        }
+
+        before-focus-boundary := FocusScope {
+            width: 0px;
+            height: 0px;
+            focus-on-click: false;
+            focus-gained(reason) => {
+                if (reason == FocusReason.tab-navigation) {
+                    footer-close-button.focus();
+                }
+            }
+        }
+
+        Rectangle {
+            background: DesignTokens.surface-overlay;
+            border-width: VisualPreferences.high-contrast ? 2px : 1px;
+            border-color: DesignTokens.border-strong;
+            border-radius: Metrics.radius-large;
+            drop-shadow-color: #00000040;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 8px;
+        }
+
+        sheet-pointer-guard := TouchArea {
+            clicked => { }
+        }
+
+        VerticalLayout {
+            padding: Metrics.space-4;
+            spacing: Metrics.space-4;
+
+            HorizontalLayout {
+                alignment: center;
+
+                Text {
+                    text: root.title;
+                    color: DesignTokens.text-primary;
+                    font-size: Metrics.type-title;
+                    font-weight: 750;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                close-button := ToolbarIconButton {
+                    glyph: "X";
+                    accessible-name: root.dismiss-label;
+                    clicked => { root.dismiss-requested(); }
+                }
+            }
+
+            Divider { }
+            @children
+
+            HorizontalLayout {
+                alignment: end;
+
+                footer-close-button := SecondaryButton {
+                    text: root.dismiss-label;
+                    clicked => { root.dismiss-requested(); }
+                }
+            }
+        }
+
+        after-focus-boundary := FocusScope {
+            width: 0px;
+            height: 0px;
+            focus-on-click: false;
+            focus-gained(reason) => {
+                if (reason == FocusReason.tab-navigation) {
+                    close-button.focus();
+                }
+            }
+        }
+    }
+}
+
+export component ToastBanner {
+    in property <StatusKind> kind: StatusKind.info;
+    in property <string> message: "Notification";
+    in property <bool> dismissible: true;
+    callback dismiss-requested;
+
+    min-height: Metrics.control-large;
+    accessible-role: region;
+    accessible-label: message;
+    accessible-live-region: root.kind == StatusKind.danger ? assertive : polite;
+
+    Rectangle {
+        background: DesignTokens.surface-overlay;
+        border-width: VisualPreferences.high-contrast ? 2px : 1px;
+        border-color: root.kind == StatusKind.danger ? DesignTokens.danger : DesignTokens.border-strong;
+        border-radius: Metrics.radius-medium;
+
+        HorizontalLayout {
+            padding: Metrics.space-2;
+            spacing: Metrics.space-2;
+            alignment: center;
+
+            StatusBadge {
+                kind: root.kind;
+                text: root.message;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            if (root.dismissible) : ToolbarIconButton {
+                glyph: "X";
+                accessible-name: "Dismiss notification";
+                clicked => { root.dismiss-requested(); }
+            }
+        }
+    }
+}
+
+export component LoadingIndicator {
+    in property <string> accessible-name: "Loading";
+    in property <bool> indeterminate: true;
+    in property <float> progress: 0.0;
+
+    min-width: 120px;
+    min-height: Metrics.control-small;
+    accessible-role: progress-indicator;
+    accessible-label: root.accessible-name;
+    accessible-value: root.indeterminate ? "" : clamp(root.progress, 0.0, 1.0);
+    accessible-value-minimum: 0.0;
+    accessible-value-maximum: 1.0;
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: center;
+
+        Rectangle {
+            width: Metrics.space-6;
+            height: Metrics.space-1;
+            horizontal-stretch: 0;
+            clip: true;
+            background: DesignTokens.surface-subtle;
+            border-radius: Metrics.radius-pill;
+
+            Rectangle {
+                x: root.indeterminate && !VisualPreferences.reduced-motion
+                    ? (parent.width - self.width) * mod(animation-tick(), 1200ms) / 1200ms
+                    : 0px;
+                width: root.indeterminate ? parent.width * 45% : parent.width * clamp(root.progress, 0.0, 1.0);
+                height: 100%;
+                background: DesignTokens.accent;
+                border-radius: Metrics.radius-pill;
+            }
+        }
+
+        Text {
+            text: root.accessible-name;
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-caption;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+}

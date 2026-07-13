@@ -1,0 +1,495 @@
+﻿{
+    "schema_version":  1,
+    "ledger_id":  "official-client-interop",
+    "classification":  "official_client_interop",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "features":  [
+                     {
+                         "feature_id":  "interop.acp.server",
+                         "title":  "ACP server bridge",
+                         "domain":  "acp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/cli/acp.md",
+                                                               "src/acp/server.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "ACP stdio tests cover initialize, session lifecycle, prompts, cancel, streaming, modes, and permissions."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.acp.client",
+                         "title":  "ACP debug client",
+                         "domain":  "acp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/cli/acp.md",
+                                                               "src/acp/client.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "The Rust debug client negotiates and exercises the pinned ACP bridge lifecycle."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.acpx",
+                         "title":  "ACPX harness runtime",
+                         "domain":  "acp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/acpx/src/runtime.ts",
+                                                               "docs/tools/acp-agents-setup.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Harness aliases, permissions, process leases, turns, and optional MCP bridges pass compatibility tests."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.mcp.server",
+                         "title":  "MCP stdio server",
+                         "domain":  "mcp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/mcp/channel-server.ts",
+                                                               "src/mcp/tools-stdio-server.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "MCP initialize, list, call, resource, shutdown, and process-tree cleanup tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.mcp.client",
+                         "title":  "MCP client transports",
+                         "domain":  "mcp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/agents/mcp-transport.ts",
+                                                               "src/agents/mcp-stdio-transport.ts",
+                                                               "src/agents/mcp-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Stdio, SSE, and streamable-HTTP client transport tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.mcp.oauth",
+                         "title":  "MCP OAuth",
+                         "domain":  "mcp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/agents/mcp-oauth.ts",
+                                                               "src/agents/mcp-auth-profile.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "OAuth metadata, login, refresh, storage, logout, and bearer injection tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.mcp.registry",
+                         "title":  "MCP server registry",
+                         "domain":  "mcp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/cli/mcp.md",
+                                                               "src/config/types.mcp.ts",
+                                                               "src/cli/mcp-cli.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Registry list/show/status/doctor/probe/add/set/configure/tools/login/logout/reload/unset tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.mcp.conversation-projection",
+                         "title":  "MCP conversation projection",
+                         "domain":  "mcp",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/mcp/channel-bridge.ts",
+                                                               "src/mcp/channel-tools.ts",
+                                                               "docs/cli/mcp.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Conversation list/read/send, live event, attachment, and approval projection tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.openai.chat-completions",
+                         "title":  "OpenAI Chat Completions",
+                         "domain":  "openai_http",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/openai-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "JSON and SSE /v1/chat/completions golden tests match pinned request, stream, usage, and error contracts."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.openai.openresponses",
+                         "title":  "OpenResponses API",
+                         "domain":  "openai_http",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/openresponses-http.ts",
+                                                               "src/gateway/open-responses.schema.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "JSON and SSE /v1/responses golden tests match pinned item, event, tool, usage, and error contracts."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.openai.models",
+                         "title":  "OpenAI-compatible models API",
+                         "domain":  "openai_http",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/models-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "List and retrieve model endpoint tests match pinned filtering, identifiers, and errors."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.openai.embeddings",
+                         "title":  "OpenAI-compatible embeddings API",
+                         "domain":  "openai_http",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/embeddings-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Embedding request, provider policy, dimensions, usage, and error fixtures pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.openai.tools-invoke",
+                         "title":  "OpenClaw tools invoke HTTP API",
+                         "domain":  "openai_http",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/tools-invoke-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Authenticated /tools/invoke schema, policy, result, and error tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.chrome-extension-relay",
+                         "title":  "Chrome extension relay and CDP bridge",
+                         "domain":  "browser",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/browser/chrome-extension/manifest.json",
+                                                               "extensions/browser/src/browser/extension-relay/relay-server.ts",
+                                                               "extensions/browser/src/browser/bridge-server.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "MV3 pairing, relay auth, WebSocket subprotocol, CDP target, screenshot, and disconnect tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.clients.native",
+                         "title":  "Native and client applications",
+                         "domain":  "clients",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "apps",
+                                                               "ui",
+                                                               "src/tui",
+                                                               "src/cli"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Each inventoried client completes protocol-v4 connection and its platform smoke suite."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.migration.claude",
+                         "title":  "Claude migration provider",
+                         "domain":  "migration",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/migrate-claude/provider.ts",
+                                                               "docs/install/migrating-claude.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Plan/apply fixtures cover instructions, MCP servers, skills, memory, credentials, and safe config."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.migration.codex",
+                         "title":  "Codex migration provider",
+                         "domain":  "migration",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/codex/src/migration/provider.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Plan/apply fixtures cover auth, session bindings, source discovery, targets, and sidecars."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "interop.migration.hermes",
+                         "title":  "Hermes migration provider",
+                         "domain":  "migration",
+                         "tier":  "tier_2",
+                         "profile":  "client_interop",
+                         "classification":  "official_client_interop",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/migrate-hermes/provider.ts",
+                                                               "docs/install/migrating-hermes.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Plan/apply fixtures cover config, models, memory, skills, secrets, credentials, and safe exclusions."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     }
+                 ]
+}

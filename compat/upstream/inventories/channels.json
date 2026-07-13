@@ -1,0 +1,289 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "channels",
+    "classification":  "official_integration",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  29,
+                   "source_manifest":  25,
+                   "official_catalog_only":  4
+               },
+    "items":  [
+                  {
+                      "record_id":  "channel:mattermost",
+                      "id":  "mattermost",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/mattermost/openclaw.plugin.json",
+                      "plugin_id":  "mattermost",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/mattermost",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:msteams",
+                      "id":  "msteams",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/msteams/openclaw.plugin.json",
+                      "plugin_id":  "msteams",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/msteams",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:feishu",
+                      "id":  "feishu",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/feishu/openclaw.plugin.json",
+                      "plugin_id":  "feishu",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/feishu",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:sms",
+                      "id":  "sms",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/sms/openclaw.plugin.json",
+                      "plugin_id":  "sms",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/sms",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:openclaw-weixin",
+                      "id":  "openclaw-weixin",
+                      "classification":  "official_integration",
+                      "source_path":  "scripts/lib/official-external-channel-catalog.json",
+                      "package_name":  "@tencent-weixin/openclaw-weixin",
+                      "provenance":  "official_catalog_only"
+                  },
+                  {
+                      "record_id":  "channel:googlechat",
+                      "id":  "googlechat",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/googlechat/openclaw.plugin.json",
+                      "plugin_id":  "googlechat",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/googlechat",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:clickclack",
+                      "id":  "clickclack",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/clickclack/openclaw.plugin.json",
+                      "plugin_id":  "clickclack",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/clickclack",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:line",
+                      "id":  "line",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/line/openclaw.plugin.json",
+                      "plugin_id":  "line",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/line",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:zalouser",
+                      "id":  "zalouser",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/zalouser/openclaw.plugin.json",
+                      "plugin_id":  "zalouser",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/zalouser",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:zalo",
+                      "id":  "zalo",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/zalo/openclaw.plugin.json",
+                      "plugin_id":  "zalo",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/zalo",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:imessage",
+                      "id":  "imessage",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/imessage/openclaw.plugin.json",
+                      "plugin_id":  "imessage",
+                      "provenance":  "source_manifest"
+                  },
+                  {
+                      "record_id":  "channel:matrix",
+                      "id":  "matrix",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/matrix/openclaw.plugin.json",
+                      "plugin_id":  "matrix",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/matrix",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:yuanbao",
+                      "id":  "yuanbao",
+                      "classification":  "official_integration",
+                      "source_path":  "scripts/lib/official-external-channel-catalog.json",
+                      "package_name":  "openclaw-plugin-yuanbao",
+                      "provenance":  "official_catalog_only"
+                  },
+                  {
+                      "record_id":  "channel:signal",
+                      "id":  "signal",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/signal/openclaw.plugin.json",
+                      "plugin_id":  "signal",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/signal",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:qa-channel",
+                      "id":  "qa-channel",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qa-channel/openclaw.plugin.json",
+                      "plugin_id":  "qa-channel",
+                      "provenance":  "source_manifest"
+                  },
+                  {
+                      "record_id":  "channel:wecom",
+                      "id":  "wecom",
+                      "classification":  "official_integration",
+                      "source_path":  "scripts/lib/official-external-channel-catalog.json",
+                      "package_name":  "@wecom/wecom-openclaw-plugin",
+                      "provenance":  "official_catalog_only"
+                  },
+                  {
+                      "record_id":  "channel:nextcloud-talk",
+                      "id":  "nextcloud-talk",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/nextcloud-talk/openclaw.plugin.json",
+                      "plugin_id":  "nextcloud-talk",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/nextcloud-talk",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:slack",
+                      "id":  "slack",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/slack/openclaw.plugin.json",
+                      "plugin_id":  "slack",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/slack",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:discord",
+                      "id":  "discord",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/discord/openclaw.plugin.json",
+                      "plugin_id":  "discord",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/discord",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:twitch",
+                      "id":  "twitch",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/twitch/openclaw.plugin.json",
+                      "plugin_id":  "twitch",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/twitch",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:openclaw-zaloclawbot",
+                      "id":  "openclaw-zaloclawbot",
+                      "classification":  "official_integration",
+                      "source_path":  "scripts/lib/official-external-channel-catalog.json",
+                      "package_name":  "@zalo-platforms/openclaw-zaloclawbot",
+                      "provenance":  "official_catalog_only"
+                  },
+                  {
+                      "record_id":  "channel:synology-chat",
+                      "id":  "synology-chat",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/synology-chat/openclaw.plugin.json",
+                      "plugin_id":  "synology-chat",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/synology-chat",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:raft",
+                      "id":  "raft",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/raft/openclaw.plugin.json",
+                      "plugin_id":  "raft",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/raft",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:tlon",
+                      "id":  "tlon",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tlon/openclaw.plugin.json",
+                      "plugin_id":  "tlon",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/tlon",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:nostr",
+                      "id":  "nostr",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/nostr/openclaw.plugin.json",
+                      "plugin_id":  "nostr",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/nostr",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:whatsapp",
+                      "id":  "whatsapp",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/whatsapp/openclaw.plugin.json",
+                      "plugin_id":  "whatsapp",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/whatsapp",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:telegram",
+                      "id":  "telegram",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/telegram/openclaw.plugin.json",
+                      "plugin_id":  "telegram",
+                      "provenance":  "source_manifest"
+                  },
+                  {
+                      "record_id":  "channel:qqbot",
+                      "id":  "qqbot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qqbot/openclaw.plugin.json",
+                      "plugin_id":  "qqbot",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/qqbot",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  },
+                  {
+                      "record_id":  "channel:irc",
+                      "id":  "irc",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/irc/openclaw.plugin.json",
+                      "plugin_id":  "irc",
+                      "provenance":  "source_manifest",
+                      "catalog_package":  "@openclaw/irc",
+                      "catalog_source_path":  "scripts/lib/official-external-channel-catalog.json"
+                  }
+              ]
+}
