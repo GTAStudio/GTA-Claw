@@ -46,21 +46,21 @@ $LedgerSpecs = @(
         ledger_id = "gateway-core"
         classification = "gateway_core"
         expected_features = 16
-        digest = "4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d"
+        digest = "02c6f6dc32eca1e15b2ecb5d5eadc6bbc2813af58d8aeac4dadb7acecbbcfd6a"
     },
     [ordered]@{
         path = "ledgers/official-integration.json"
         ledger_id = "official-integration"
         classification = "official_integration"
         expected_features = 13
-        digest = "01ac641cdcb208343bdbafa119ac6c2089c03a6ac23064351c5dae628eba1c47"
+        digest = "59f974f413407af81929b16986b6e8622d3b52c5b857c2344349531a187e5b26"
     },
     [ordered]@{
         path = "ledgers/official-client-interop.json"
         ledger_id = "official-client-interop"
         classification = "official_client_interop"
         expected_features = 18
-        digest = "e2ba9299748d42d24f7b5d84a7a18af34a470ce260f40d5d3a20a9cddf288406"
+        digest = "c8c12a469068c7c03ac44337feebcfbda49f98108c28f862b02ea9d6479dd387"
     }
 )
 
@@ -380,7 +380,7 @@ function Get-InventoryDigest {
 
 function Get-FeatureDigest {
     param([object[]]$Features)
-    return Get-CanonicalArrayDigest $Features
+    return Get-Sha256Text (ConvertTo-CanonicalJson $Features)
 }
 
 function Test-JsonValueEqual {
