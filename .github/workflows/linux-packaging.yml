@@ -318,9 +318,11 @@ jobs:
             bash -c '
               set -euo pipefail
               for forbidden in gcc cargo rustc rpm make; do
-                ! command -v "$forbidden"
+                if command -v "$forbidden" >/dev/null 2>&1; then
+                  echo "minimal resolver image unexpectedly contains $forbidden" >&2
+                  exit 1
+                fi
               done
-              test ! -d /usr/include
               printf "%s\n" \
                 "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260701T000000Z bookworm main" \
                 > /etc/apt/sources.list
