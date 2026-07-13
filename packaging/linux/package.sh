@@ -176,19 +176,20 @@ generate_spdx() {
         }]
       }],
       files: $files,
-      relationships: [
-        {
+      relationships: (
+        [{
           spdxElementId: "SPDXRef-DOCUMENT",
           relationshipType: "DESCRIBES",
           relatedSpdxElement: "SPDXRef-Package-GTA-Claw"
-        }
-      ] + [
-        $files[] | {
-          spdxElementId: "SPDXRef-Package-GTA-Claw",
-          relationshipType: "CONTAINS",
-          relatedSpdxElement: .SPDXID
-        }
-      ]
+        }] + (
+          $files |
+          map({
+            spdxElementId: "SPDXRef-Package-GTA-Claw",
+            relationshipType: "CONTAINS",
+            relatedSpdxElement: .SPDXID
+          })
+        )
+      )
     }'
 }
 
