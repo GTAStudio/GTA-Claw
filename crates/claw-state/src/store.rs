@@ -2357,13 +2357,13 @@ fn parse_unix_lock_identity(
             reason: "database lock identity key does not match its filesystem identity",
         });
     }
-    if let Some(generation) = generation {
-        if generation.is_empty() || !file_name.ends_with(&format!("-{generation}.lock")) {
-            return Err(StateError::InvalidPath {
-                path: lock_path,
-                reason: "database lock generation does not match its canonical path",
-            });
-        }
+    if let Some(generation) = generation
+        && (generation.is_empty() || !file_name.ends_with(&format!("-{generation}.lock")))
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path,
+            reason: "database lock generation does not match its canonical path",
+        });
     }
     Ok(ParsedUnixLockIdentity {
         path: lock_path,
