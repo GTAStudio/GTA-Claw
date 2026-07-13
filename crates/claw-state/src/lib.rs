@@ -1389,7 +1389,8 @@ mod tests {
 
         let error = StateStore::open(StoreConfig::new(&alias))
             .await
-            .expect_err("dangling database symlink is rejected");
+            .err()
+            .expect("dangling database symlink is rejected");
         assert!(matches!(error, StateError::InvalidPath { .. }));
         assert!(!target.exists());
     }
@@ -1410,7 +1411,8 @@ mod tests {
 
         let error = StateStore::open(StoreConfig::new(&alias))
             .await
-            .expect_err("identity-bound lock rejects remaining hard-link name");
+            .err()
+            .expect("identity-bound lock rejects remaining hard-link name");
         assert!(matches!(error, StateError::StoreLocked { .. }));
         owner.close().await.expect("identity owner closes");
     }

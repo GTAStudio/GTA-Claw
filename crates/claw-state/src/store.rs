@@ -841,6 +841,7 @@ fn sync_parent_directory(_path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn lock_path_for(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_owned();
     path.push(".writer.lock");
@@ -855,6 +856,7 @@ fn writer_identity_path_for(database: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+#[cfg(not(unix))]
 fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
     let file = OpenOptions::new()
         .create(true)
