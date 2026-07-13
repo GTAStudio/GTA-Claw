@@ -435,23 +435,26 @@ function Assert-JsonSchema {
 
     if (Has-Property $SchemaNode "type") {
         $expectedType = [string](Get-PropertyValue $SchemaNode "type")
-        $typeMatches = switch -CaseSensitive ($expectedType) {
-            "object" { Test-JsonObject $Instance; break }
-            "array" { $Instance -is [System.Array]; break }
-            "string" { $Instance -is [string]; break }
-            "boolean" { $Instance -is [bool]; break }
-            "integer" {
-                ($Instance -is [byte]) -or ($Instance -is [int16]) -or
-                ($Instance -is [int32]) -or ($Instance -is [int64]); break
-            }
-            "number" {
-                ($Instance -is [byte]) -or ($Instance -is [int16]) -or
+        if (Test-OrdinalStringEqual $expectedType "object") {
+            $typeMatches = Test-JsonObject $Instance
+        } elseif (Test-OrdinalStringEqual $expectedType "array") {
+            $typeMatches = $Instance -is [System.Array]
+        } elseif (Test-OrdinalStringEqual $expectedType "string") {
+            $typeMatches = $Instance -is [string]
+        } elseif (Test-OrdinalStringEqual $expectedType "boolean") {
+            $typeMatches = $Instance -is [bool]
+        } elseif (Test-OrdinalStringEqual $expectedType "integer") {
+            $typeMatches = ($Instance -is [byte]) -or ($Instance -is [int16]) -or
+                ($Instance -is [int32]) -or ($Instance -is [int64])
+        } elseif (Test-OrdinalStringEqual $expectedType "number") {
+            $typeMatches = ($Instance -is [byte]) -or ($Instance -is [int16]) -or
                 ($Instance -is [int32]) -or ($Instance -is [int64]) -or
                 ($Instance -is [single]) -or ($Instance -is [double]) -or
-                ($Instance -is [decimal]); break
-            }
-            "null" { $null -eq $Instance; break }
-            default { Fail "$Path uses unsupported JSON Schema type $expectedType" }
+                ($Instance -is [decimal])
+        } elseif (Test-OrdinalStringEqual $expectedType "null") {
+            $typeMatches = $null -eq $Instance
+        } else {
+            Fail "$Path uses unsupported JSON Schema type $expectedType"
         }
         if (-not $typeMatches) {
             $actualType = if ($null -eq $Instance) { "null" } else { $Instance.GetType().FullName }
@@ -590,27 +593,39 @@ function Get-ExpectedRecordId {
         [string]$InventoryId,
         [object]$Item
     )
-    $prefix = switch ($InventoryId) {
-        "plugins" { "plugin"; break }
-        "skills" { "skill"; break }
-        "gateway-protocol" {
-            switch -CaseSensitive ([string]$Item.kind) {
-                "method" { "gateway_method"; break }
-                "event" { "gateway_event"; break }
-                "role" { "gateway_role"; break }
-                "scope" { "gateway_scope"; break }
-                default { Fail "gateway-protocol item has invalid kind '$($Item.kind)'" }
-            }
-            break
+    if (Test-OrdinalStringEqual $InventoryId "plugins") {
+        $prefix = "plugin"
+    } elseif (Test-OrdinalStringEqual $InventoryId "skills") {
+        $prefix = "skill"
+    } elseif (Test-OrdinalStringEqual $InventoryId "gateway-protocol") {
+        $kind = [string]$Item.kind
+        if (Test-OrdinalStringEqual $kind "method") {
+            $prefix = "gateway_method"
+        } elseif (Test-OrdinalStringEqual $kind "event") {
+            $prefix = "gateway_event"
+        } elseif (Test-OrdinalStringEqual $kind "role") {
+            $prefix = "gateway_role"
+        } elseif (Test-OrdinalStringEqual $kind "scope") {
+            $prefix = "gateway_scope"
+        } else {
+            Fail "gateway-protocol item has invalid kind '$kind'"
         }
-        "config-domains" { "config_domain"; break }
-        "providers" { "provider"; break }
-        "channels" { "channel"; break }
-        "http-sse-endpoints" { "http"; break }
-        "clients" { "client"; break }
-        "migrations" { "migration"; break }
-        "release-deployment" { "release_surface"; break }
-        default { Fail "unknown inventory $InventoryId" }
+    } elseif (Test-OrdinalStringEqual $InventoryId "config-domains") {
+        $prefix = "config_domain"
+    } elseif (Test-OrdinalStringEqual $InventoryId "providers") {
+        $prefix = "provider"
+    } elseif (Test-OrdinalStringEqual $InventoryId "channels") {
+        $prefix = "channel"
+    } elseif (Test-OrdinalStringEqual $InventoryId "http-sse-endpoints") {
+        $prefix = "http"
+    } elseif (Test-OrdinalStringEqual $InventoryId "clients") {
+        $prefix = "client"
+    } elseif (Test-OrdinalStringEqual $InventoryId "migrations") {
+        $prefix = "migration"
+    } elseif (Test-OrdinalStringEqual $InventoryId "release-deployment") {
+        $prefix = "release_surface"
+    } else {
+        Fail "unknown inventory $InventoryId"
     }
     return "${prefix}:$($Item.id)"
 }
@@ -631,86 +646,72 @@ function Assert-InventoryItemContract {
         }
     }
 
-    switch ($InventoryId) {
-        "plugins" {
-            if (-not (Test-OrdinalContains @("core", "official_external", "source_only_qa") ([string]$Item.delivery_class))) {
-                Fail "$Context has invalid delivery_class"
-            }
+    if (Test-OrdinalStringEqual $InventoryId "plugins") {
+        if (-not (Test-OrdinalContains @("core", "official_external", "source_only_qa") ([string]$Item.delivery_class))) {
+            Fail "$Context has invalid delivery_class"
         }
-        "skills" {
-            if (-not (Test-OrdinalContains @("MIT", "Apache-2.0") ([string]$Item.license))) {
-                Fail "$Context has invalid license"
-            }
-            if ((Test-OrdinalStringEqual ([string]$Item.id) "skill-creator") -ne
-                (Test-OrdinalStringEqual ([string]$Item.license) "Apache-2.0")) {
-                Fail "$Context has stale skill license evidence"
-            }
+    } elseif (Test-OrdinalStringEqual $InventoryId "skills") {
+        if (-not (Test-OrdinalContains @("MIT", "Apache-2.0") ([string]$Item.license))) {
+            Fail "$Context has invalid license"
         }
-        "gateway-protocol" {
-            $base = @("record_id", "id", "classification", "source_path", "kind")
-            switch -CaseSensitive ([string]$Item.kind) {
-                "method" {
-                    Assert-ExactPropertySet $Item ($base + @("scope", "advertised")) $Context
-                    if (-not (Test-OrdinalContains $AllowedOperatorScopes ([string]$Item.scope)) -or
-                        -not ($Item.advertised -is [bool])) {
-                        Fail "$Context has invalid method scope or advertised flag"
-                    }
-                }
-                "event" {
-                    Assert-ExactPropertySet $Item $base $Context
-                }
-                "role" {
-                    Assert-ExactPropertySet $Item ($base + @("protocol_class")) $Context
-                    if (-not (Test-OrdinalContains @("gateway", "closed_worker") ([string]$Item.protocol_class))) {
-                        Fail "$Context has invalid role protocol_class"
-                    }
-                }
-                "scope" {
-                    Assert-ExactPropertySet $Item $base $Context
-                }
-                default {
-                    Fail "$Context has invalid protocol kind"
-                }
-            }
+        if ((Test-OrdinalStringEqual ([string]$Item.id) "skill-creator") -ne
+            (Test-OrdinalStringEqual ([string]$Item.license) "Apache-2.0")) {
+            Fail "$Context has stale skill license evidence"
         }
-        "channels" {
-            if (-not (Test-OrdinalContains @("source_manifest", "official_catalog_only") ([string]$Item.provenance))) {
-                Fail "$Context has invalid provenance"
+    } elseif (Test-OrdinalStringEqual $InventoryId "gateway-protocol") {
+        $base = @("record_id", "id", "classification", "source_path", "kind")
+        $kind = [string]$Item.kind
+        if (Test-OrdinalStringEqual $kind "method") {
+            Assert-ExactPropertySet $Item ($base + @("scope", "advertised")) $Context
+            if (-not (Test-OrdinalContains $AllowedOperatorScopes ([string]$Item.scope)) -or
+                -not ($Item.advertised -is [bool])) {
+                Fail "$Context has invalid method scope or advertised flag"
             }
-            if ((Test-OrdinalStringEqual ([string]$Item.provenance) "source_manifest") -and
-                -not (Has-Property $Item "plugin_id")) {
-                Fail "$Context source manifest row requires plugin_id"
+        } elseif (Test-OrdinalStringEqual $kind "event") {
+            Assert-ExactPropertySet $Item $base $Context
+        } elseif (Test-OrdinalStringEqual $kind "role") {
+            Assert-ExactPropertySet $Item ($base + @("protocol_class")) $Context
+            if (-not (Test-OrdinalContains @("gateway", "closed_worker") ([string]$Item.protocol_class))) {
+                Fail "$Context has invalid role protocol_class"
             }
-            if ((Test-OrdinalStringEqual ([string]$Item.provenance) "official_catalog_only") -and
-                -not (Has-Property $Item "package_name")) {
-                Fail "$Context catalog-only row requires package_name"
-            }
+        } elseif (Test-OrdinalStringEqual $kind "scope") {
+            Assert-ExactPropertySet $Item $base $Context
+        } else {
+            Fail "$Context has invalid protocol kind"
         }
-        "http-sse-endpoints" {
-            if (-not (Test-OrdinalContains @("GET", "POST") ([string]$Item.method)) -or
-                -not (Test-OrdinalContains @("none", "optional_sse", "long_poll", "streamable_http") ([string]$Item.streaming)) -or
-                -not ([string]$Item.path).StartsWith("/")) {
-                Fail "$Context has invalid HTTP method, path, or streaming kind"
-            }
+    } elseif (Test-OrdinalStringEqual $InventoryId "channels") {
+        if (-not (Test-OrdinalContains @("source_manifest", "official_catalog_only") ([string]$Item.provenance))) {
+            Fail "$Context has invalid provenance"
         }
-        "clients" {
-            $allowedKinds = @(
-                "browser_extension", "headless_node", "native_app", "native_helper",
-                "native_sidecar", "terminal_app", "terminal_client", "web_app"
-            )
-            if (-not (Test-OrdinalContains $allowedKinds ([string]$Item.kind))) {
-                Fail "$Context has invalid client kind"
-            }
+        if ((Test-OrdinalStringEqual ([string]$Item.provenance) "source_manifest") -and
+            -not (Has-Property $Item "plugin_id")) {
+            Fail "$Context source manifest row requires plugin_id"
         }
-        "migrations" {
-            if (-not (Test-OrdinalStringEqual ([string]$Item.kind) "migration_provider")) {
-                Fail "$Context has invalid migration kind"
-            }
+        if ((Test-OrdinalStringEqual ([string]$Item.provenance) "official_catalog_only") -and
+            -not (Has-Property $Item "package_name")) {
+            Fail "$Context catalog-only row requires package_name"
         }
-        "release-deployment" {
-            if (-not (Test-OrdinalContains @("release", "installation", "deployment") ([string]$Item.kind))) {
-                Fail "$Context has invalid release/deployment kind"
-            }
+    } elseif (Test-OrdinalStringEqual $InventoryId "http-sse-endpoints") {
+        if (-not (Test-OrdinalContains @("GET", "POST") ([string]$Item.method)) -or
+            -not (Test-OrdinalContains @("none", "optional_sse", "long_poll", "streamable_http") ([string]$Item.streaming)) -or
+            -not ([string]$Item.path).StartsWith("/", [StringComparison]::Ordinal)) {
+            Fail "$Context has invalid HTTP method, path, or streaming kind"
+        }
+    } elseif (Test-OrdinalStringEqual $InventoryId "clients") {
+        $allowedKinds = @(
+            "browser_extension", "headless_node", "native_app", "native_helper",
+            "native_sidecar", "terminal_app", "terminal_client", "web_app"
+        )
+        if (-not (Test-OrdinalContains $allowedKinds ([string]$Item.kind))) {
+            Fail "$Context has invalid client kind"
+        }
+    } elseif (Test-OrdinalStringEqual $InventoryId "migrations") {
+        if (-not (Test-OrdinalStringEqual ([string]$Item.kind) "migration_provider")) {
+            Fail "$Context has invalid migration kind"
+        }
+    } elseif (Test-OrdinalStringEqual $InventoryId "release-deployment") {
+        if (-not (Test-OrdinalContains @("release", "installation", "deployment") ([string]$Item.kind))) {
+            Fail "$Context has invalid release/deployment kind"
         }
     }
 }
@@ -720,102 +721,102 @@ function Get-DerivedInventoryCounts {
         [string]$InventoryId,
         [object[]]$Items
     )
-    switch ($InventoryId) {
-        "plugins" {
-            return [ordered]@{
-                total = $Items.Count
-                core = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.delivery_class) "core"
-                }).Count
-                official_external = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.delivery_class) "official_external"
-                }).Count
-                source_only_qa = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.delivery_class) "source_only_qa"
-                }).Count
-            }
-        }
-        "skills" {
-            return [ordered]@{ total = $Items.Count; bundled = $Items.Count }
-        }
-        "gateway-protocol" {
-            $methods = @($Items | Where-Object {
-                Test-OrdinalStringEqual ([string]$_.kind) "method"
-            })
-            return [ordered]@{
-                total = $Items.Count
-                methods = $methods.Count
-                advertised_methods = @($methods | Where-Object { $_.advertised -eq $true }).Count
-                events = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.kind) "event"
-                }).Count
-                roles = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.kind) "role"
-                }).Count
-                scopes = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.kind) "scope"
-                }).Count
-                dynamic_plugin_methods = "runtime-dependent"
-            }
-        }
-        "config-domains" {
-            return [ordered]@{ total = $Items.Count }
-        }
-        "providers" {
-            return [ordered]@{
-                total = $Items.Count
-                unique = @($Items.id | Sort-Object -Unique).Count
-            }
-        }
-        "channels" {
-            return [ordered]@{
-                total = $Items.Count
-                source_manifest = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.provenance) "source_manifest"
-                }).Count
-                official_catalog_only = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.provenance) "official_catalog_only"
-                }).Count
-            }
-        }
-        "http-sse-endpoints" {
-            return [ordered]@{
-                total = $Items.Count
-                optional_sse = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.streaming) "optional_sse"
-                }).Count
-                long_poll = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.streaming) "long_poll"
-                }).Count
-                streamable_http = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.streaming) "streamable_http"
-                }).Count
-            }
-        }
-        "clients" {
-            return [ordered]@{ total = $Items.Count }
-        }
-        "migrations" {
-            return [ordered]@{ total = $Items.Count }
-        }
-        "release-deployment" {
-            return [ordered]@{
-                total = $Items.Count
-                release = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.kind) "release"
-                }).Count
-                installation = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.kind) "installation"
-                }).Count
-                deployment = @($Items | Where-Object {
-                    Test-OrdinalStringEqual ([string]$_.kind) "deployment"
-                }).Count
-            }
-        }
-        default {
-            Fail "unknown inventory $InventoryId"
+    if (Test-OrdinalStringEqual $InventoryId "plugins") {
+        return [ordered]@{
+            total = $Items.Count
+            core = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.delivery_class) "core"
+            }).Count
+            official_external = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.delivery_class) "official_external"
+            }).Count
+            source_only_qa = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.delivery_class) "source_only_qa"
+            }).Count
         }
     }
+    if (Test-OrdinalStringEqual $InventoryId "skills") {
+        return [ordered]@{ total = $Items.Count; bundled = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "gateway-protocol") {
+        $methods = @($Items | Where-Object {
+            Test-OrdinalStringEqual ([string]$_.kind) "method"
+        })
+        return [ordered]@{
+            total = $Items.Count
+            methods = $methods.Count
+            advertised_methods = @($methods | Where-Object { $_.advertised -eq $true }).Count
+            events = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "event"
+            }).Count
+            roles = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "role"
+            }).Count
+            scopes = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "scope"
+            }).Count
+            dynamic_plugin_methods = "runtime-dependent"
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "config-domains") {
+        return [ordered]@{ total = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "providers") {
+        $uniqueIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($item in $Items) {
+            [void]$uniqueIds.Add([string]$item.id)
+        }
+        return [ordered]@{
+            total = $Items.Count
+            unique = $uniqueIds.Count
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "channels") {
+        return [ordered]@{
+            total = $Items.Count
+            source_manifest = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.provenance) "source_manifest"
+            }).Count
+            official_catalog_only = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.provenance) "official_catalog_only"
+            }).Count
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "http-sse-endpoints") {
+        return [ordered]@{
+            total = $Items.Count
+            optional_sse = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.streaming) "optional_sse"
+            }).Count
+            long_poll = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.streaming) "long_poll"
+            }).Count
+            streamable_http = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.streaming) "streamable_http"
+            }).Count
+        }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "clients") {
+        return [ordered]@{ total = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "migrations") {
+        return [ordered]@{ total = $Items.Count }
+    }
+    if (Test-OrdinalStringEqual $InventoryId "release-deployment") {
+        return [ordered]@{
+            total = $Items.Count
+            release = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "release"
+            }).Count
+            installation = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "installation"
+            }).Count
+            deployment = @($Items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "deployment"
+            }).Count
+        }
+    }
+    Fail "unknown inventory $InventoryId"
 }
 
 function Assert-ManifestDeclarations {
@@ -895,7 +896,8 @@ function Assert-ManifestDeclarations {
 $actualJsonPaths = @(
     Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "*.json" | ForEach-Object {
         $relative = $_.FullName.Substring($Root.Length)
-        while ($relative.StartsWith("\") -or $relative.StartsWith("/")) {
+        while ($relative.StartsWith("\", [StringComparison]::Ordinal) -or
+            $relative.StartsWith("/", [StringComparison]::Ordinal)) {
             $relative = $relative.Substring(1)
         }
         $relative.Replace("\", "/")
@@ -1089,11 +1091,11 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         $inventoryRowCount += 1
     }
 
+    $derivedCounts = Get-DerivedInventoryCounts $inventoryId $items
+    Assert-ExactCounts $inventory.counts $derivedCounts $spec.path
     if (-not (Test-OrdinalStringEqual (Get-InventoryDigest $items @($spec.canonical_fields)) ([string]$spec.digest))) {
         Fail "$($spec.path) canonical identity/source evidence fingerprint mismatch"
     }
-    $derivedCounts = Get-DerivedInventoryCounts $inventoryId $items
-    Assert-ExactCounts $inventory.counts $derivedCounts $spec.path
     $derivedByInventory[$inventoryId] = $derivedCounts
 }
 if ($InventorySpecs.Count -ne 10 -or $inventoryRowCount -ne 717 -or $globalRecordIds.Count -ne 717) {

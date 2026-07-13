@@ -18,6 +18,16 @@ function Write-Json {
     $Value | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
+function Test-OrdinalStringEqual {
+    param(
+        [AllowNull()]
+        [string]$Left,
+        [AllowNull()]
+        [string]$Right
+    )
+    return [StringComparer]::Ordinal.Equals($Left, $Right)
+}
+
 function Invoke-Validator {
     param([string]$CaseRoot)
     $previousErrorActionPreference = $ErrorActionPreference
@@ -82,7 +92,9 @@ $cases = @(
 
             $manifestPath = Join-Path $caseRoot "manifest.json"
             $manifest = Read-Json $manifestPath
-            ($manifest.inventories | Where-Object { $_.path -eq "inventories/skills.json" }).expected_items = 50
+            ($manifest.inventories | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.path) "inventories/skills.json"
+            }).expected_items = 50
             $manifest.canonical_counts.bundled_skills = 50
             $manifest.canonical_counts.inventory_rows = 716
             Write-Json $manifestPath $manifest
@@ -393,6 +405,33 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "inventory-kind-dispatch-ordinal"
+        expected_message = "gateway-protocol item has invalid kind"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "inventories/gateway-protocol.json"
+            $inventory = Read-Json $path
+            $item = @($inventory.items | Where-Object {
+                Test-OrdinalStringEqual ([string]$_.kind) "method"
+            } | Select-Object -First 1)[0]
+            $item.kind = ([string]$item.kind) + [char]0x00AD
+            Write-Json $path $inventory
+        }
+    },
+    [ordered]@{
+        name = "provider-unique-count-ordinal"
+        expected_message = "canonical identity/source evidence fingerprint mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "inventories/providers.json"
+            $inventory = Read-Json $path
+            $ordinalAlias = ([string]$inventory.items[0].id) + [char]0x00AD
+            $inventory.items[1].id = $ordinalAlias
+            $inventory.items[1].record_id = "provider:$ordinalAlias"
+            Write-Json $path $inventory
+        }
+    },
+    [ordered]@{
         name = "schema-type"
         expected_message = "$.features must have JSON Schema type array"
         mutate = {
@@ -423,7 +462,7 @@ try {
         }
         $normalizedOutput = [regex]::Replace($result.output, "\s+", " ")
         $normalizedExpected = [regex]::Replace([string]$case.expected_message, "\s+", " ")
-        if (-not $normalizedOutput.Contains($normalizedExpected)) {
+        if ($normalizedOutput.IndexOf($normalizedExpected, [StringComparison]::Ordinal) -lt 0) {
             throw "negative tamper case '$($case.name)' failed for the wrong reason: $($result.output)"
         }
         $passed.Add([string]$case.name)
