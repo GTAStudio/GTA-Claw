@@ -1,0 +1,5 @@
+# Slint 1.17.1 with backend-winit and renderer-femtovg is expected to link only
+# Apple system frameworks and libraries. Any other dependency fails validation
+# and must be explicitly bundled in Contents/Frameworks before this file changes.
+/System/Library/Frameworks/
+/usr/lib/
