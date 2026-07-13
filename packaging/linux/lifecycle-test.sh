@@ -135,11 +135,14 @@ install_failure_dropin Unit 'RefuseManualStop=yes'
 if sudo rpm -e --nodeps gta-claw; then
   die "RPM removal swallowed an intentional stop failure"
 fi
-rpm -q gta-claw >/dev/null ||
-  die "RPM removal erased package after stop failure"
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "RPM removal unlinked daemon after stop failure"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM removal stopped daemon despite refused stop"
 remove_failure_dropin
+if ! rpm -q gta-claw >/dev/null 2>&1; then
+  sudo rpm -ivh --nodeps --replacefiles "$rpm1"
+fi
 sudo systemctl start gta-claw-daemon.service
 sudo rpm -e --nodeps gta-claw
 ! systemctl is-active --quiet gta-claw-daemon.service ||
