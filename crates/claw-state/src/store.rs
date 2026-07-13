@@ -442,12 +442,65 @@ impl StateStore {
 
     /// Checkpoints, closes all pooled connections, and releases the writer lock.
     pub async fn close(self) -> Result<CheckpointReport, StateError> {
-        let checkpoint = self.checkpoint().await?;
-        release_application_lock(&self.pool, &self.owner).await?;
+        let mut reasons = Vec::new();
+        let identity_valid = match verify_path_identity(&self.path, &self._database_file) {
+            Ok(()) => true,
+            Err(error) => {
+                reasons.push(format!("database identity unavailable: {error}"));
+                false
+            }
+        };
+        let checkpoint = if identity_valid {
+            match self.checkpoint().await {
+                Ok(report) if report.busy == 0 => Some(report),
+                Ok(report) => {
+                    reasons.push(format!(
+                        "checkpoint remained busy with {} WAL frames and {} checkpointed frames",
+                        report.log_frames, report.checkpointed_frames
+                    ));
+                    None
+                }
+                Err(error) => {
+                    reasons.push(format!("checkpoint failed: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let application_lock_released = if identity_valid {
+            match release_application_lock(&self.pool, &self.owner).await {
+                Ok(()) => true,
+                Err(error) => {
+                    reasons.push(format!("application writer release failed: {error}"));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         self.pool.close().await;
-        File::unlock(&self.lock_file)
-            .map_err(|error| file_error("release writer lock", &self.lock_path, error))?;
-        Ok(checkpoint)
+        let os_lock_released = match File::unlock(&self.lock_file) {
+            Ok(()) => true,
+            Err(error) => {
+                reasons.push(format!(
+                    "OS identity lock release failed: {}",
+                    file_error("release writer lock", &self.lock_path, error)
+                ));
+                false
+            }
+        };
+        match (checkpoint, application_lock_released, os_lock_released) {
+            (Some(report), true, true) => Ok(report),
+            (checkpoint, application_lock_released, os_lock_released) => {
+                Err(StateError::CloseDegraded {
+                    checkpoint_completed: checkpoint.is_some(),
+                    application_lock_released,
+                    os_lock_released,
+                    reason: reasons.join("; "),
+                })
+            }
+        }
     }
 }
 

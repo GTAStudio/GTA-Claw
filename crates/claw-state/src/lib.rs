@@ -663,6 +663,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_reports_busy_checkpoint_but_releases_all_ownership() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "busy-close.sqlite");
+        let store =
+            StateStore::open(StoreConfig::new(&path).with_busy_timeout(Duration::from_millis(50)))
+                .await
+                .expect("state store opens");
+        store
+            .sessions()
+            .create(&session("busy-close-session", 1))
+            .await
+            .expect("create WAL-backed row");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .busy_timeout(Duration::from_millis(50));
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open checkpoint-blocking reader");
+        reader
+            .execute("BEGIN")
+            .await
+            .expect("begin reader transaction");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish reader snapshot");
+
+        let error = tokio::time::timeout(Duration::from_secs(2), store.close())
+            .await
+            .expect("busy close completes within its bound")
+            .expect_err("busy checkpoint degrades close");
+        assert!(matches!(
+            error,
+            StateError::CloseDegraded {
+                checkpoint_completed: false,
+                application_lock_released: true,
+                os_lock_released: true,
+                ..
+            }
+        ));
+        reader
+            .execute("ROLLBACK")
+            .await
+            .expect("release reader snapshot");
+        reader.close().await.expect("reader closes");
+
+        let next = open(&path).await;
+        assert!(next.recovered_writer().is_none());
+        next.close().await.expect("next owner closes cleanly");
+    }
+
+    #[tokio::test]
     async fn migration_checksum_drift_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "checksum.sqlite");
@@ -1656,7 +1709,25 @@ mod tests {
             .err()
             .expect("identity-bound lock rejects remaining hard-link name");
         assert!(matches!(error, StateError::StoreLocked { .. }));
-        owner.close().await.expect("identity owner closes");
+        let close_error = tokio::time::timeout(Duration::from_secs(2), owner.close())
+            .await
+            .expect("degraded close completes within its bound")
+            .expect_err("vanished pathname prevents a clean checkpoint");
+        assert!(matches!(
+            close_error,
+            StateError::CloseDegraded {
+                checkpoint_completed: false,
+                application_lock_released: false,
+                os_lock_released: true,
+                ..
+            }
+        ));
+
+        let next_owner = StateStore::open(StoreConfig::new(&alias))
+            .await
+            .expect("new owner opens only after degraded close releases identity lock");
+        assert!(next_owner.recovered_writer().is_some());
+        next_owner.close().await.expect("new owner closes cleanly");
     }
 
     #[cfg(unix)]

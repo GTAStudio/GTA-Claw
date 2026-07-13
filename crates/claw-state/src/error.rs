@@ -120,6 +120,17 @@ pub enum StateError {
         /// Publication and rollback diagnostic.
         reason: String,
     },
+    /// Store shutdown completed with one or more durability or cleanup degradations.
+    CloseDegraded {
+        /// Whether the final WAL checkpoint completed.
+        checkpoint_completed: bool,
+        /// Whether the persisted application writer row was released.
+        application_lock_released: bool,
+        /// Whether the OS identity lock was explicitly released.
+        os_lock_released: bool,
+        /// Combined deterministic diagnostic.
+        reason: String,
+    },
     /// A stored backup failed validation.
     InvalidBackup {
         /// Backup path.
@@ -236,6 +247,15 @@ impl Display for StateError {
                     path.display()
                 )
             }
+            Self::CloseDegraded {
+                checkpoint_completed,
+                application_lock_released,
+                os_lock_released,
+                reason,
+            } => write!(
+                formatter,
+                "state store closed with degradation (checkpoint={checkpoint_completed}, application_lock={application_lock_released}, os_lock={os_lock_released}): {reason}"
+            ),
             Self::InvalidBackup { path, reason } => {
                 write!(formatter, "invalid backup {}: {reason}", path.display())
             }
