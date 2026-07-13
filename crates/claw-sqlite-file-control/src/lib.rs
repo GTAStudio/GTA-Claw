@@ -86,13 +86,111 @@ pub async fn install_moved_commit_guard(
     Ok(())
 }
 
+/// Installs a commit hook that also binds a Unix lock pathname to the held lock inode.
+#[cfg(unix)]
+pub async fn install_identity_commit_guard(
+    connection: &mut sqlx::SqliteConnection,
+    lock_path: &std::path::Path,
+    lock_file: &std::fs::File,
+) -> Result<(), FileControlError> {
+    let lock_file = lock_file
+        .try_clone()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let database = database.as_raw_handle();
+    let context = Box::new(IdentityCommitContext {
+        database,
+        lock_path: lock_path.to_owned(),
+        lock_file,
+    });
+    let context = Box::into_raw(context);
+    // SAFETY: SQLite assumes ownership of the boxed context and invokes the
+    // destructor exactly once on registration failure, replacement, or close.
+    let registered = unsafe {
+        libsqlite3_sys::sqlite3_set_clientdata(
+            database.as_ptr(),
+            c"gta-claw-commit-identity".as_ptr(),
+            context.cast(),
+            Some(drop_identity_commit_context),
+        )
+    };
+    if registered != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(registered));
+    }
+    // SAFETY: The client-data context remains owned by this live SQLite
+    // connection until close. Reinstalling this hook replaces only the hook,
+    // not the named client data.
+    unsafe {
+        libsqlite3_sys::sqlite3_commit_hook(
+            database.as_ptr(),
+            Some(reject_moved_or_unbound_commit),
+            context.cast(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct IdentityCommitContext {
+    database: NonNull<libsqlite3_sys::sqlite3>,
+    lock_path: std::path::PathBuf,
+    lock_file: std::fs::File,
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn drop_identity_commit_context(context: *mut std::ffi::c_void) {
+    if !context.is_null() {
+        // SAFETY: sqlite3_set_clientdata invokes this exactly once for the Box
+        // allocated by install_identity_commit_guard.
+        drop(unsafe { Box::from_raw(context.cast::<IdentityCommitContext>()) });
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn reject_moved_or_unbound_commit(context: *mut std::ffi::c_void) -> i32 {
+    let Some(context) = NonNull::new(context.cast::<IdentityCommitContext>()) else {
+        return 1;
+    };
+    // SAFETY: SQLite invokes the hook only while its client-data context and
+    // connection are live.
+    let context = unsafe { context.as_ref() };
+    let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        !database_has_moved(context.database) && unix_lock_identity_matches(context)
+    }))
+    .unwrap_or(false);
+    i32::from(!valid)
+}
+
+#[cfg(unix)]
+fn unix_lock_identity_matches(context: &IdentityCommitContext) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(held) = context.lock_file.metadata() else {
+        return false;
+    };
+    let Ok(current) = std::fs::symlink_metadata(&context.lock_path) else {
+        return false;
+    };
+    current.file_type().is_file()
+        && !current.file_type().is_symlink()
+        && current.dev() == held.dev()
+        && current.ino() == held.ino()
+}
+
 unsafe extern "C" fn reject_moved_commit(context: *mut std::ffi::c_void) -> i32 {
     let Some(database) = NonNull::new(context.cast::<libsqlite3_sys::sqlite3>()) else {
         return 1;
     };
+    i32::from(database_has_moved(database))
+}
+
+fn database_has_moved(database: NonNull<libsqlite3_sys::sqlite3>) -> bool {
     let mut moved = 0_i32;
-    // SAFETY: SQLite invokes this hook only while the connection stored in the
-    // context is live. The output pointer remains valid for this call.
+    // SAFETY: Callers hold a live SQLite connection. The output pointer remains
+    // valid for this call.
     let result = unsafe {
         libsqlite3_sys::sqlite3_file_control(
             database.as_ptr(),
@@ -101,7 +199,7 @@ unsafe extern "C" fn reject_moved_commit(context: *mut std::ffi::c_void) -> i32 
             (&raw mut moved).cast(),
         )
     };
-    i32::from(result != libsqlite3_sys::SQLITE_OK || moved != 0)
+    result != libsqlite3_sys::SQLITE_OK || moved != 0
 }
 
 /// Protects bytes with the current Windows user's DPAPI credentials.

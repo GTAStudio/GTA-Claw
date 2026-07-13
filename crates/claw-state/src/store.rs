@@ -356,7 +356,7 @@ impl StateStore {
                         })
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                     verify_sqlite_connection_identity(connection).await?;
-                    install_sqlite_commit_guard(connection).await
+                    install_store_commit_guard(connection, &lock_path, &lock_file).await
                 })
             })
             .before_acquire(move |connection, _metadata| {
@@ -512,10 +512,7 @@ impl StateStore {
         let backup_file = open_existing_file_no_follow(&backup)?;
         verify_path_identity(&backup, &backup_file)?;
         reject_hard_link(&backup, &backup_file)?;
-        let backup_snapshot = PinnedSnapshot {
-            path: backup.clone(),
-            file: backup_file,
-        };
+        let backup_snapshot = PinnedSnapshot::from_file(&backup, backup_file)?;
         let sealed_digest = validate_standalone_snapshot_source_pinned(&backup_snapshot).await?;
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
@@ -553,7 +550,7 @@ impl StateStore {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = publish_snapshot(&temporary, &pinned.file, &destination) {
+        if let Err(error) = publish_snapshot(&pinned, &destination) {
             return Err(cleanup_failed_snapshot(&temporary, error));
         }
         Ok(())
@@ -561,11 +558,17 @@ impl StateStore {
 
     /// Runs SQLite structural and referential integrity checks.
     pub async fn health(&self) -> Result<HealthReport, StateError> {
-        let mut migration_errors = migration_health_errors(&self.pool).await?;
+        self.operational_identity().verify()?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| database("begin health snapshot", error))?;
+        let mut migration_errors = migration_health_errors_connection(&mut transaction).await?;
         let persisted_owner = sqlx::query_scalar::<_, String>(
             "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| database("read health application writer", error))?;
         if persisted_owner.as_deref() != Some(self.owner.as_str()) {
@@ -573,7 +576,7 @@ impl StateStore {
                 .push("application writer ownership does not match the live store".to_owned());
         }
         let results = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *transaction)
             .await
             .map_err(|error| database("run SQLite integrity check", error))?;
         let integrity_errors = results
@@ -582,15 +585,26 @@ impl StateStore {
             .collect();
         let foreign_key_violations =
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *transaction)
                 .await
                 .map_err(|error| database("run foreign key check", error))?;
-        Ok(HealthReport {
-            application_id: sqlx::query_scalar::<_, i64>("PRAGMA application_id")
-                .fetch_one(&self.pool)
+        let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| database("read health application id", error))?;
+        let schema_version =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM claw_schema_migrations")
+                .fetch_one(&mut *transaction)
                 .await
-                .map_err(|error| database("read health application id", error))?,
-            schema_version: schema_version(&self.pool).await?,
+                .map_err(|error| database("read health schema version", error))?;
+        self.operational_identity().verify()?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database("commit health snapshot", error))?;
+        Ok(HealthReport {
+            application_id,
+            schema_version,
             supported_schema_version: LATEST_SCHEMA_VERSION,
             integrity_errors,
             foreign_key_violations,
@@ -1182,6 +1196,10 @@ fn ensure_database_artifacts_absent(database: &Path) -> Result<(), StateError> {
 struct PinnedSnapshot {
     path: PathBuf,
     file: File,
+    #[cfg(unix)]
+    parent_path: PathBuf,
+    #[cfg(unix)]
+    parent_directory: File,
 }
 
 impl PinnedSnapshot {
@@ -1189,14 +1207,51 @@ impl PinnedSnapshot {
         let file = open_existing_file_no_follow(path)?;
         verify_path_identity(path, &file)?;
         reject_hard_link(path, &file)?;
+        Self::from_file(path, file)
+    }
+
+    fn from_file(path: &Path, file: File) -> Result<Self, StateError> {
+        #[cfg(unix)]
+        let (parent_path, parent_directory) = {
+            let parent_path = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_owned();
+            let parent_directory = rustix::fs::open(
+                &parent_path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| {
+                file_error(
+                    "open pinned snapshot parent directory",
+                    &parent_path,
+                    error.into(),
+                )
+            })?;
+            verify_path_identity(&parent_path, &parent_directory)?;
+            (parent_path, parent_directory)
+        };
         Ok(Self {
             path: path.to_owned(),
             file,
+            #[cfg(unix)]
+            parent_path,
+            #[cfg(unix)]
+            parent_directory,
         })
     }
 
     fn verify(&self) -> Result<(), StateError> {
-        verify_path_identity(&self.path, &self.file)
+        verify_path_identity(&self.path, &self.file)?;
+        #[cfg(unix)]
+        verify_path_identity(&self.parent_path, &self.parent_directory)?;
+        Ok(())
     }
 
     fn sync(&self) -> Result<(), StateError> {
@@ -1345,12 +1400,16 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     })
 }
 
-fn publish_snapshot(
-    source: &Path,
-    source_file: &File,
-    destination: &Path,
-) -> Result<(), StateError> {
-    verify_path_identity(source, source_file)?;
+fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), StateError> {
+    source.verify()?;
+    let source_path = &source.path;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    let destination_directory = pin_destination_directory(destination)?;
     let reservations = reserve_destination_sidecars(destination)?;
     #[cfg(test)]
     if take_publication_failpoint(&CREATE_DESTINATION_BEFORE_PUBLICATION, destination) {
@@ -1363,16 +1422,9 @@ fn publish_snapshot(
         target_vendor = "apple",
         target_os = "redox"
     ))]
-    let published = rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        source,
-        rustix::fs::CWD,
-        destination,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from);
+    let published = publish_unix_snapshot(source, destination, &destination_directory);
     #[cfg(windows)]
-    let published = publish_windows_snapshot(source, destination);
+    let published = publish_windows_snapshot(source_path, destination);
     #[cfg(all(
         unix,
         not(any(
@@ -1408,7 +1460,7 @@ fn publish_snapshot(
         );
         let destination_owned = match path_entry_exists(destination) {
             Ok(false) => false,
-            Ok(true) => match files_share_identity(source, destination) {
+            Ok(true) => match files_share_identity(source_path, destination) {
                 Ok(owned) => owned,
                 Err(identity_error) => {
                     let reservation_cleanup = reservations.release();
@@ -1433,14 +1485,14 @@ fn publish_snapshot(
             }
         };
         return Err(cleanup_failed_publication(
-            source,
+            source_path,
             destination,
             reservations,
             primary,
             destination_owned,
         ));
     }
-    if let Err(error) = verify_path_identity(destination, source_file) {
+    if let Err(error) = verify_path_identity(destination, &source.file) {
         let reservation_cleanup = reservations.release();
         return Err(StateError::PublicationUncertain {
             path: destination.to_owned(),
@@ -1458,7 +1510,7 @@ fn publish_snapshot(
             message: "test fault injection".to_owned(),
         };
         return Err(cleanup_failed_publication(
-            source,
+            source_path,
             destination,
             reservations,
             primary,
@@ -1468,13 +1520,148 @@ fn publish_snapshot(
     if let Err(error) = reservations.release() {
         return Err(publication_uncertain_after_release(destination, error));
     }
-    if let Err(error) = sync_parent_directory(destination) {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    ))]
+    let publication_sync = sync_published_snapshot(source, destination, &destination_directory);
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    )))]
+    let publication_sync = sync_parent_directory(destination);
+    if let Err(error) = publication_sync {
         return Err(StateError::PublicationUncertain {
             path: destination.to_owned(),
             reason: format!("snapshot was published but directory sync failed: {error}"),
         });
     }
     Ok(())
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+struct PinnedDestinationDirectory {
+    path: PathBuf,
+    file: File,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn pin_destination_directory(destination: &Path) -> Result<PinnedDestinationDirectory, StateError> {
+    let path = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned();
+    let file = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| file_error("open pinned publication directory", &path, error.into()))?;
+    verify_path_identity(&path, &file)?;
+    Ok(PinnedDestinationDirectory { path, file })
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn publish_unix_snapshot(
+    source: &PinnedSnapshot,
+    destination: &Path,
+    destination_directory: &PinnedDestinationDirectory,
+) -> std::io::Result<()> {
+    verify_path_identity(&destination_directory.path, &destination_directory.file)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let source_name = source
+        .path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("snapshot source has no file name"))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("snapshot destination has no file name"))?;
+    rustix::fs::renameat_with(
+        &source.parent_directory,
+        source_name,
+        &destination_directory.file,
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn sync_published_snapshot(
+    source: &PinnedSnapshot,
+    destination: &Path,
+    destination_directory: &PinnedDestinationDirectory,
+) -> Result<(), StateError> {
+    verify_path_identity(&destination_directory.path, &destination_directory.file)?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| StateError::InvalidPath {
+            path: destination.to_owned(),
+            reason: "snapshot destination has no file name",
+        })?;
+    let published_file = rustix::fs::openat(
+        &destination_directory.file,
+        destination_name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        file_error(
+            "open published snapshot through pinned directory",
+            destination,
+            error.into(),
+        )
+    })?;
+    if !files_share_identity_from_handles_portable(&source.file, &published_file)? {
+        return Err(StateError::InvalidPath {
+            path: destination.to_owned(),
+            reason: "published snapshot identity changed before durable sync",
+        });
+    }
+    #[cfg(target_vendor = "apple")]
+    rustix::fs::fcntl_fullfsync(&published_file)
+        .map_err(|error| file_error("full sync published snapshot", destination, error.into()))?;
+    #[cfg(not(target_vendor = "apple"))]
+    published_file
+        .sync_all()
+        .map_err(|error| file_error("sync published snapshot", destination, error))?;
+    destination_directory.file.sync_all().map_err(|error| {
+        file_error(
+            "sync pinned publication directory",
+            &destination_directory.path,
+            error,
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -2499,6 +2686,26 @@ async fn install_sqlite_commit_guard(connection: &mut SqliteConnection) -> Resul
     claw_sqlite_file_control::install_moved_commit_guard(connection)
         .await
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+}
+
+#[cfg(unix)]
+async fn install_store_commit_guard(
+    connection: &mut SqliteConnection,
+    lock_path: &Path,
+    lock_file: &File,
+) -> Result<(), sqlx::Error> {
+    claw_sqlite_file_control::install_identity_commit_guard(connection, lock_path, lock_file)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+}
+
+#[cfg(not(unix))]
+async fn install_store_commit_guard(
+    _connection: &mut SqliteConnection,
+    _lock_path: &Path,
+    _lock_file: &File,
+) -> Result<(), sqlx::Error> {
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -4023,7 +4230,7 @@ async fn backup_pool(
             seal_cleanup.err().unwrap_or(error),
         ));
     }
-    match publish_snapshot(&temporary, &pinned.file, destination) {
+    match publish_snapshot(&pinned, destination) {
         Ok(()) => Ok(()),
         Err(error @ StateError::PublicationUncertain { .. }) => {
             Err(cleanup_failed_snapshot(&temporary, error))
@@ -4314,12 +4521,10 @@ async fn schema_version(pool: &SqlitePool) -> Result<i64, StateError> {
         .map_err(|error| database("read schema version", error))
 }
 
-async fn migration_health_errors(pool: &SqlitePool) -> Result<Vec<String>, StateError> {
-    let mut connection = pool
-        .acquire()
-        .await
-        .map_err(|error| database("acquire migration health connection", error))?;
-    match validate_migration_history_connection(&mut connection, true).await {
+async fn migration_health_errors_connection(
+    connection: &mut SqliteConnection,
+) -> Result<Vec<String>, StateError> {
+    match validate_migration_history_connection(connection, true).await {
         Ok(_) => Ok(Vec::new()),
         Err(
             error @ (StateError::MigrationChecksumDrift { .. }

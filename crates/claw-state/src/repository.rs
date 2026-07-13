@@ -20,6 +20,9 @@ static WRITE_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, Wri
 #[cfg(test)]
 static COMMIT_TEST_TAMPERS: LazyLock<Mutex<std::collections::HashSet<String>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static COMMIT_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
 struct WriteTestBarrier {
@@ -687,9 +690,33 @@ async fn wait_at_write_test_barrier(owner: &str) {
     }
 }
 
+#[cfg(test)]
+async fn wait_at_commit_test_barrier(owner: &str) {
+    let barrier = COMMIT_TEST_BARRIERS
+        .lock()
+        .expect("commit test barriers lock poisoned")
+        .get(owner)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        COMMIT_TEST_BARRIERS
+            .lock()
+            .expect("commit test barriers lock poisoned")
+            .remove(owner);
+    }
+}
+
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {
-    use super::{Arc, COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS, WriteTestBarrier};
+    use super::{
+        Arc, COMMIT_TEST_BARRIERS, COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS, WriteTestBarrier,
+    };
 
     pub(crate) fn set_write_barrier(
         owner: &str,
@@ -714,6 +741,24 @@ pub(crate) mod test_support {
             .lock()
             .expect("commit test tampers lock poisoned")
             .insert(owner.to_owned());
+    }
+
+    pub(crate) fn set_commit_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        COMMIT_TEST_BARRIERS
+            .lock()
+            .expect("commit test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
     }
 }
 
@@ -761,6 +806,8 @@ async fn commit_verified(
             ));
         }
     }
+    #[cfg(test)]
+    wait_at_commit_test_barrier(owner).await;
     transaction
         .commit()
         .await

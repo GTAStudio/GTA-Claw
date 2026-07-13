@@ -2523,13 +2523,13 @@ mod tests {
         let path = database_path(&directory, "active-lock-replacement.sqlite");
         let store = std::sync::Arc::new(open(&path).await);
         let owner = test_support::owner(&store).to_owned();
-        let (entered, release) = crate::repository::test_support::set_write_barrier(&owner);
+        let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
         let record = session("must-not-commit-after-lock-replacement", 1);
         let writer_store = std::sync::Arc::clone(&store);
         let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
-            .expect("repository transaction reaches the write barrier");
+            .expect("repository transaction reaches the SQLite commit hook barrier");
 
         let lock_path = unix_lock_path(&path);
         let lock_contents = fs::read(&lock_path).expect("read held lock identity");
