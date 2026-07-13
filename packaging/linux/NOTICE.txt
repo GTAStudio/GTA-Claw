@@ -1,0 +1,10 @@
+GTA Claw Linux headless packaging prototype
+
+This prototype packages the native Rust gta-claw-daemon and gta-claw-cli
+executables. It does not package the legacy JavaScript application or the
+Slint desktop application.
+
+The generated SPDX SBOM records exact executable and runtime checksums. OCI
+glibc, libm, and libgcc files come from the sealed, digest-pinned Debian Bookworm
+build sysroot. Their exact dpkg versions, SPDX license expressions, and
+upstream copyright files are included in the image and provenance.
