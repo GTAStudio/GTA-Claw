@@ -1,6 +1,8 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -14,6 +16,21 @@ use crate::{
 
 const APPLICATION_ID: i64 = 0x4754_4143;
 const LATEST_SCHEMA_VERSION: i64 = 1;
+#[cfg(test)]
+static FAIL_AFTER_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static CREATE_DESTINATION_BEFORE_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(all(test, windows))]
+static FAIL_WINDOWS_SOURCE_REMOVAL: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static MIGRATION_TEST_BARRIER: Mutex<Option<MigrationTestBarrier>> = Mutex::new(None);
+
+#[cfg(test)]
+struct MigrationTestBarrier {
+    path: PathBuf,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
 const MIGRATION_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS claw_schema_migrations (
     version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
@@ -60,6 +77,7 @@ pub struct StoreConfig {
     path: PathBuf,
     max_connections: u32,
     busy_timeout: Duration,
+    acquire_timeout: Duration,
     synchronous: SynchronousPolicy,
 }
 
@@ -69,8 +87,9 @@ impl StoreConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            max_connections: 4,
+            max_connections: 1,
             busy_timeout: Duration::from_secs(5),
+            acquire_timeout: Duration::from_secs(5),
             synchronous: SynchronousPolicy::Full,
         }
     }
@@ -86,6 +105,13 @@ impl StoreConfig {
     #[must_use]
     pub const fn with_busy_timeout(mut self, busy_timeout: Duration) -> Self {
         self.busy_timeout = busy_timeout;
+        self
+    }
+
+    /// Sets the fail-closed wait for the identity-bound connection.
+    #[must_use]
+    pub const fn with_acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
+        self.acquire_timeout = acquire_timeout;
         self
     }
 
@@ -132,6 +158,8 @@ pub struct CheckpointReport {
 /// Corruption and schema health information.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthReport {
+    /// SQLite application identifier.
+    pub application_id: i64,
     /// Applied schema version.
     pub schema_version: i64,
     /// Highest schema version understood by this binary.
@@ -148,7 +176,8 @@ impl HealthReport {
     /// Returns whether the database is structurally sound and supported.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        self.schema_version == self.supported_schema_version
+        self.application_id == APPLICATION_ID
+            && self.schema_version == self.supported_schema_version
             && self.integrity_errors.is_empty()
             && self.foreign_key_violations == 0
             && self.migration_errors.is_empty()
@@ -198,9 +227,35 @@ impl StateStore {
             .foreign_keys(true)
             .busy_timeout(config.busy_timeout)
             .synchronous(config.synchronous.sqlx());
+        let verified_path = path.clone();
+        let verified_file = Arc::new(
+            database_file
+                .try_clone()
+                .map_err(|error| file_error("clone connection identity handle", &path, error))?,
+        );
+        let acquire_path = verified_path.clone();
+        let acquire_file = Arc::clone(&verified_file);
         let pool = SqlitePoolOptions::new()
             .min_connections(1)
-            .max_connections(config.max_connections)
+            .max_connections(1)
+            .acquire_timeout(config.acquire_timeout)
+            .after_connect(move |_connection, _metadata| {
+                let path = verified_path.clone();
+                let file = Arc::clone(&verified_file);
+                Box::pin(async move {
+                    verify_path_identity(&path, &file)
+                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))
+                })
+            })
+            .before_acquire(move |_connection, _metadata| {
+                let path = acquire_path.clone();
+                let file = Arc::clone(&acquire_file);
+                Box::pin(async move {
+                    verify_path_identity(&path, &file)
+                        .map(|()| true)
+                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))
+                })
+            })
             .connect_with(options)
             .await
             .map_err(|error| database("open state database", error))?;
@@ -315,6 +370,7 @@ impl StateStore {
         verify_path_identity(&backup, &backup_file)?;
         reject_hard_link(&backup, &backup_file)?;
         validate_windows_restore_identity(&backup)?;
+        let (_source_lock_path, _source_lock) = acquire_store_lock(&backup, &backup_file)?;
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
@@ -359,6 +415,10 @@ impl StateStore {
                 .await
                 .map_err(|error| database("run foreign key check", error))?;
         Ok(HealthReport {
+            application_id: sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|error| database("read health application id", error))?,
             schema_version: schema_version(&self.pool).await?,
             supported_schema_version: LATEST_SCHEMA_VERSION,
             integrity_errors,
@@ -411,15 +471,21 @@ fn validate_config(config: &StoreConfig) -> Result<(), StateError> {
             reason: "must be valid Unicode",
         });
     }
-    if !(1..=16).contains(&config.max_connections) {
+    if config.max_connections != 1 {
         return Err(StateError::InvalidValue {
             field: "maximum connections",
-            reason: "must be between 1 and 16",
+            reason: "must be one so every SQLite connection remains identity-bound",
         });
     }
     if config.busy_timeout.is_zero() {
         return Err(StateError::InvalidValue {
             field: "busy timeout",
+            reason: "must be greater than zero",
+        });
+    }
+    if config.acquire_timeout.is_zero() {
+        return Err(StateError::InvalidValue {
+            field: "connection acquire timeout",
             reason: "must be greater than zero",
         });
     }
@@ -488,7 +554,19 @@ fn open_database_file(path: &Path) -> Result<File, StateError> {
         .map_err(|error| file_error("open state database file", path, error.into()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_database_file(path: &Path) -> Result<File, StateError> {
+    let file = open_windows_file_no_follow(path, true)?;
+    reject_windows_reparse(
+        path,
+        &file
+            .metadata()
+            .map_err(|error| file_error("inspect Windows database handle", path, error))?,
+    )?;
+    Ok(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_database_file(path: &Path) -> Result<File, StateError> {
     OpenOptions::new()
         .create(true)
@@ -497,6 +575,42 @@ fn open_database_file(path: &Path) -> Result<File, StateError> {
         .truncate(false)
         .open(path)
         .map_err(|error| file_error("open state database file", path, error))
+}
+
+#[cfg(windows)]
+fn open_windows_file_no_follow(path: &Path, create: bool) -> Result<File, StateError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .create(create)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            file_error(
+                "open Windows file without following reparse points",
+                path,
+                error,
+            )
+        })
+}
+
+#[cfg(windows)]
+fn reject_windows_reparse(path: &Path, metadata: &std::fs::Metadata) -> Result<(), StateError> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    if metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "Windows reparse-point database paths are not supported",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -546,7 +660,32 @@ fn verify_path_identity(path: &Path, file: &File) -> Result<(), StateError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_path_identity(path: &Path, file: &File) -> Result<(), StateError> {
+    let current = open_windows_file_no_follow(path, false)?;
+    reject_windows_reparse(
+        path,
+        &current
+            .metadata()
+            .map_err(|error| file_error("verify Windows database path", path, error))?,
+    )?;
+    let expected = same_file::Handle::from_file(
+        file.try_clone()
+            .map_err(|error| file_error("clone Windows identity handle", path, error))?,
+    )
+    .map_err(|error| file_error("read locked Windows file identity", path, error))?;
+    let current = same_file::Handle::from_file(current)
+        .map_err(|error| file_error("read current Windows file identity", path, error))?;
+    if expected != current {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "database path changed after its Windows identity was verified",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn verify_path_identity(path: &Path, _file: &File) -> Result<(), StateError> {
     if std::fs::symlink_metadata(path)
         .map_err(|error| file_error("verify state database path", path, error))?
@@ -572,36 +711,21 @@ fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
     .map_err(|error| file_error("open file without following links", path, error.into()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
-    if std::fs::symlink_metadata(path)
-        .map_err(|error| file_error("inspect file without following links", path, error))?
-        .file_type()
-        .is_symlink()
-    {
-        return Err(StateError::InvalidPath {
-            path: path.to_owned(),
-            reason: "symbolic-link file paths are not supported",
-        });
-    }
-    File::open(path).map_err(|error| file_error("open file without following links", path, error))
+    let file = open_windows_file_no_follow(path, false)?;
+    reject_windows_reparse(
+        path,
+        &file
+            .metadata()
+            .map_err(|error| file_error("inspect Windows file handle", path, error))?,
+    )?;
+    Ok(file)
 }
 
-fn copy_existing_file_no_follow(source: &Path, destination: &Path) -> Result<(), StateError> {
-    let mut source_file = open_existing_file_no_follow(source)?;
-    verify_path_identity(source, &source_file)?;
-    reject_hard_link(source, &source_file)?;
-    let mut destination_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)
-        .map_err(|error| file_error("create copied file", destination, error))?;
-    std::io::copy(&mut source_file, &mut destination_file)
-        .map_err(|error| file_error("copy verified file", source, error))?;
-    destination_file
-        .sync_all()
-        .map_err(|error| file_error("sync copied file", destination, error))?;
-    verify_path_identity(source, &source_file)
+#[cfg(all(not(unix), not(windows)))]
+fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
+    File::open(path).map_err(|error| file_error("open file without following links", path, error))
 }
 
 fn writer_owner() -> Result<String, StateError> {
@@ -627,11 +751,12 @@ fn snapshot_temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf,
     Ok(destination.with_file_name(format!(".{file_name}.{owner}.{purpose}-tmp")))
 }
 
-fn database_artifacts(database: &Path) -> [PathBuf; 3] {
+fn database_artifacts(database: &Path) -> [PathBuf; 4] {
     [
         database.to_owned(),
         sqlite_sidecar(database, "-wal"),
         sqlite_sidecar(database, "-shm"),
+        sqlite_sidecar(database, "-journal"),
     ]
 }
 
@@ -655,8 +780,10 @@ fn path_entry_exists(path: &Path) -> Result<bool, StateError> {
 struct SidecarReservations {
     wal_path: PathBuf,
     shm_path: PathBuf,
+    journal_path: PathBuf,
     _wal_file: File,
     _shm_file: File,
+    _journal_file: File,
 }
 
 impl SidecarReservations {
@@ -664,14 +791,26 @@ impl SidecarReservations {
         let Self {
             wal_path,
             shm_path,
+            journal_path,
             _wal_file,
             _shm_file,
+            _journal_file,
         } = self;
-        drop((_wal_file, _shm_file));
+        verify_path_identity(&wal_path, &_wal_file)?;
+        verify_path_identity(&shm_path, &_shm_file)?;
+        verify_path_identity(&journal_path, &_journal_file)?;
+        drop((_wal_file, _shm_file, _journal_file));
         std::fs::remove_file(&wal_path)
             .map_err(|error| file_error("release destination WAL reservation", &wal_path, error))?;
         std::fs::remove_file(&shm_path)
-            .map_err(|error| file_error("release destination SHM reservation", &shm_path, error))
+            .map_err(|error| file_error("release destination SHM reservation", &shm_path, error))?;
+        std::fs::remove_file(&journal_path).map_err(|error| {
+            file_error(
+                "release destination journal reservation",
+                &journal_path,
+                error,
+            )
+        })
     }
 }
 
@@ -679,6 +818,7 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     ensure_database_artifacts_absent(database)?;
     let wal_path = sqlite_sidecar(database, "-wal");
     let shm_path = sqlite_sidecar(database, "-shm");
+    let journal_path = sqlite_sidecar(database, "-journal");
     let wal_file = match OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -702,6 +842,7 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     {
         Ok(file) => file,
         Err(error) => {
+            verify_path_identity(&wal_path, &wal_file)?;
             drop(wal_file);
             std::fs::remove_file(&wal_path).map_err(|cleanup| {
                 file_error(
@@ -717,16 +858,54 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
             };
         }
     };
+    let journal_file = match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&journal_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            verify_path_identity(&wal_path, &wal_file)?;
+            verify_path_identity(&shm_path, &shm_file)?;
+            drop((wal_file, shm_file));
+            for reservation in [&wal_path, &shm_path] {
+                std::fs::remove_file(reservation).map_err(|cleanup| {
+                    file_error(
+                        "release failed destination sidecar reservation",
+                        reservation,
+                        cleanup,
+                    )
+                })?;
+            }
+            return if path_entry_exists(&journal_path)? {
+                Err(StateError::BackupDestinationExists { path: journal_path })
+            } else {
+                Err(file_error(
+                    "reserve destination journal",
+                    &journal_path,
+                    error,
+                ))
+            };
+        }
+    };
     Ok(SidecarReservations {
         wal_path,
         shm_path,
+        journal_path,
         _wal_file: wal_file,
         _shm_file: shm_file,
+        _journal_file: journal_file,
     })
 }
 
 fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError> {
     let reservations = reserve_destination_sidecars(destination)?;
+    #[cfg(test)]
+    if take_publication_failpoint(&CREATE_DESTINATION_BEFORE_PUBLICATION, destination) {
+        std::fs::write(destination, b"other publisher")
+            .map_err(|error| file_error("inject competing publication", destination, error))?;
+    }
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -757,20 +936,70 @@ fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError>
         "atomic no-replace publication is unsupported on this target",
     ));
     if let Err(error) = published {
-        reservations.release()?;
-        if path_entry_exists(destination)? {
-            return Err(StateError::BackupDestinationExists {
-                path: destination.to_owned(),
-            });
-        }
-        return Err(file_error(
+        let primary = file_error(
             "publish SQLite snapshot without replacement",
             destination,
             error,
+        );
+        let destination_owned = match path_entry_exists(destination) {
+            Ok(false) => false,
+            Ok(true) => match files_share_identity(source, destination) {
+                Ok(owned) => owned,
+                Err(identity_error) => {
+                    let reservation_cleanup = reservations.release();
+                    return Err(StateError::PublicationUncertain {
+                        path: destination.to_owned(),
+                        reason: format!(
+                            "{primary}; could not compare destination ownership: {identity_error}; reservation cleanup: {}",
+                            result_diagnostic(reservation_cleanup)
+                        ),
+                    });
+                }
+            },
+            Err(inspection_error) => {
+                let reservation_cleanup = reservations.release();
+                return Err(StateError::PublicationUncertain {
+                    path: destination.to_owned(),
+                    reason: format!(
+                        "{primary}; could not inspect destination ownership: {inspection_error}; reservation cleanup: {}",
+                        result_diagnostic(reservation_cleanup)
+                    ),
+                });
+            }
+        };
+        return Err(cleanup_failed_publication(
+            source,
+            destination,
+            reservations,
+            primary,
+            destination_owned,
         ));
     }
-    reservations.release()?;
-    sync_parent_directory(destination)
+    #[cfg(test)]
+    if take_publication_failpoint(&FAIL_AFTER_PUBLICATION, destination) {
+        let primary = StateError::FileSystem {
+            operation: "injected post-publication failure",
+            path: destination.to_owned(),
+            message: "test fault injection".to_owned(),
+        };
+        return Err(cleanup_failed_publication(
+            source,
+            destination,
+            reservations,
+            primary,
+            true,
+        ));
+    }
+    if let Err(error) = reservations.release() {
+        return Err(publication_uncertain_after_release(destination, error));
+    }
+    if let Err(error) = sync_parent_directory(destination) {
+        return Err(StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!("snapshot was published but directory sync failed: {error}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -778,7 +1007,128 @@ fn publish_windows_snapshot(source: &Path, destination: &Path) -> std::io::Resul
     prepare_windows_published_identity(source, destination)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     std::fs::hard_link(source, destination)?;
+    #[cfg(test)]
+    if take_publication_failpoint(&FAIL_WINDOWS_SOURCE_REMOVAL, destination) {
+        return Err(std::io::Error::other(
+            "injected Windows source removal failure",
+        ));
+    }
     std::fs::remove_file(source)
+}
+
+#[cfg(test)]
+fn take_publication_failpoint(failpoint: &Mutex<Option<PathBuf>>, destination: &Path) -> bool {
+    let mut configured = failpoint
+        .lock()
+        .expect("publication failpoint lock poisoned");
+    if configured.as_deref() == Some(destination) {
+        configured.take();
+        true
+    } else {
+        false
+    }
+}
+
+fn cleanup_failed_publication(
+    _source: &Path,
+    destination: &Path,
+    reservations: SidecarReservations,
+    primary: StateError,
+    destination_owned: bool,
+) -> StateError {
+    let reservation_cleanup = reservations.release();
+    if destination_owned {
+        return StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!(
+                "{primary}; snapshot publication succeeded; reservation cleanup: {}",
+                result_diagnostic(reservation_cleanup)
+            ),
+        };
+    }
+    match path_entry_exists(destination) {
+        Ok(true) => {
+            if reservation_cleanup.is_ok() {
+                StateError::BackupDestinationExists {
+                    path: destination.to_owned(),
+                }
+            } else {
+                StateError::PublicationUncertain {
+                    path: destination.to_owned(),
+                    reason: format!(
+                        "{primary}; destination belongs to another publisher; reservation cleanup: {}",
+                        result_diagnostic(reservation_cleanup)
+                    ),
+                }
+            }
+        }
+        Ok(false) if reservation_cleanup.is_ok() => primary,
+        Ok(false) => StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!(
+                "{primary}; reservation cleanup: {}",
+                result_diagnostic(reservation_cleanup)
+            ),
+        },
+        Err(error) => StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!(
+                "{primary}; destination inspection failed: {error}; reservation cleanup: {}",
+                result_diagnostic(reservation_cleanup)
+            ),
+        },
+    }
+}
+
+fn publication_uncertain_after_release(destination: &Path, primary: StateError) -> StateError {
+    let wal_exists = path_entry_exists(&sqlite_sidecar(destination, "-wal"));
+    let shm_exists = path_entry_exists(&sqlite_sidecar(destination, "-shm"));
+    let journal_exists = path_entry_exists(&sqlite_sidecar(destination, "-journal"));
+    StateError::PublicationUncertain {
+        path: destination.to_owned(),
+        reason: format!(
+            "snapshot was published but reservation cleanup failed: {primary}; WAL remains: {}; SHM remains: {}; journal remains: {}",
+            bool_result_diagnostic(wal_exists),
+            bool_result_diagnostic(shm_exists),
+            bool_result_diagnostic(journal_exists)
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn files_share_identity(left: &Path, right: &Path) -> Result<bool, StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let left_metadata = std::fs::metadata(left)
+        .map_err(|error| file_error("inspect publication source", left, error))?;
+    let right_metadata = std::fs::metadata(right)
+        .map_err(|error| file_error("inspect publication destination", right, error))?;
+    Ok(left_metadata.dev() == right_metadata.dev() && left_metadata.ino() == right_metadata.ino())
+}
+
+#[cfg(windows)]
+fn files_share_identity(left: &Path, right: &Path) -> Result<bool, StateError> {
+    same_file::is_same_file(left, right)
+        .map_err(|error| file_error("compare publication file identities", right, error))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn files_share_identity(_left: &Path, _right: &Path) -> Result<bool, StateError> {
+    Ok(false)
+}
+
+fn bool_result_diagnostic(result: Result<bool, StateError>) -> String {
+    match result {
+        Ok(value) => value.to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
+fn result_diagnostic(result: Result<(), StateError>) -> String {
+    match result {
+        Ok(()) => "ok".to_owned(),
+        Err(error) => error.to_string(),
+    }
 }
 
 #[cfg(windows)]
@@ -1074,44 +1424,38 @@ async fn inspect_database(
         return Ok(InspectedDatabase::Fresh);
     }
     verify_path_identity(path, database_file)?;
-    let temporary = copy_database_for_inspection(path, database_file)?;
-    let result = inspect_database_snapshot(&temporary, require_latest).await;
-    let cleanup = remove_snapshot_artifacts(&temporary);
-    verify_path_identity(path, database_file)?;
-    match (result, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(inspected), Ok(())) => Ok(inspected),
+    for attempt in 0..3 {
+        let temporary = inspection_temporary_path(path)?;
+        match materialize_sqlite_snapshot(path, database_file, &temporary).await {
+            Ok(()) => {
+                let result = inspect_database_snapshot(&temporary, require_latest).await;
+                let cleanup = remove_snapshot_artifacts(&temporary);
+                verify_path_identity(path, database_file)?;
+                return match (result, cleanup) {
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                    (Ok(inspected), Ok(())) => Ok(inspected),
+                };
+            }
+            Err(error) if attempt < 2 && is_transient_sidecar_change(path, &error) => {
+                remove_snapshot_artifacts(&temporary)?;
+            }
+            Err(error) => {
+                remove_snapshot_artifacts(&temporary)?;
+                return Err(error);
+            }
+        }
     }
+    unreachable!("inspection retries either return or continue")
 }
 
-fn copy_database_for_inspection(path: &Path, database_file: &File) -> Result<PathBuf, StateError> {
-    let temporary = inspection_temporary_path(path)?;
-    let mut source = database_file
-        .try_clone()
-        .map_err(|error| file_error("clone database for read-only inspection", path, error))?;
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| file_error("seek database for read-only inspection", path, error))?;
-    let mut destination = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(|error| file_error("create read-only inspection snapshot", &temporary, error))?;
-    std::io::copy(&mut source, &mut destination)
-        .map_err(|error| file_error("copy database for read-only inspection", path, error))?;
-    destination
-        .sync_all()
-        .map_err(|error| file_error("sync read-only inspection snapshot", &temporary, error))?;
-    let source_wal = sqlite_sidecar(path, "-wal");
-    let temporary_wal = sqlite_sidecar(&temporary, "-wal");
-    if path_entry_exists(&source_wal)?
-        && let Err(error) = copy_existing_file_no_follow(&source_wal, &temporary_wal)
-    {
-        remove_snapshot_artifacts(&temporary)?;
-        return Err(error);
-    }
-    Ok(temporary)
+fn is_transient_sidecar_change(database: &Path, error: &StateError) -> bool {
+    let wal = sqlite_sidecar(database, "-wal");
+    let shm = sqlite_sidecar(database, "-shm");
+    matches!(
+        error,
+        StateError::FileSystem { path, .. } if path == &wal || path == &shm
+    )
 }
 
 async fn inspect_database_snapshot(
@@ -1211,6 +1555,21 @@ async fn initialize_fresh_database(pool: &SqlitePool) -> Result<(), StateError> 
         .begin()
         .await
         .map_err(|error| database("begin state database bootstrap", error))?;
+    let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database("revalidate bootstrap application id", error))?;
+    let existing_objects = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| database("revalidate bootstrap schema emptiness", error))?;
+    if application_id != 0 || existing_objects != 0 {
+        return Err(StateError::InvalidMigrationHistory {
+            reason: "fresh database ownership or schema changed before bootstrap".to_owned(),
+        });
+    }
     sqlx::query("PRAGMA application_id = 1196704067")
         .execute(&mut *transaction)
         .await
@@ -1633,45 +1992,103 @@ fn validate_migration_rows(applied: &[sqlx::sqlite::SqliteRow]) -> Result<i64, S
 }
 
 async fn apply_migrations(pool: &SqlitePool, path: &Path) -> Result<(), StateError> {
-    let mut connection = pool
+    let mut preliminary = pool
         .acquire()
         .await
         .map_err(|error| database("acquire migration inspection connection", error))?;
-    let mut current_version = validate_migration_history_connection(&mut connection, false).await?;
-    drop(connection);
+    let preliminary_version =
+        validate_migration_history_connection(&mut preliminary, false).await?;
+    drop(preliminary);
     for migration in MIGRATIONS {
-        if migration.version <= current_version {
-            continue;
+        if migration.version > preliminary_version && migration.destructive {
+            let destination = destructive_backup_path(path, preliminary_version, migration.version);
+            ensure_destructive_backup(pool, &destination, preliminary_version).await?;
         }
-        if migration.destructive {
-            let destination = destructive_backup_path(path, current_version, migration.version);
-            ensure_destructive_backup(pool, &destination, current_version).await?;
-        }
-        let mut transaction = pool
-            .begin()
-            .await
-            .map_err(|error| database("begin schema migration", error))?;
-        sqlx::raw_sql(migration.sql)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| database("apply schema migration", error))?;
-        sqlx::query(
-            "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
-             VALUES (?, ?, ?, CAST(unixepoch('subsec') * 1000 AS INTEGER))",
-        )
-        .bind(migration.version)
-        .bind(migration.name)
-        .bind(migration_checksum(migration.sql))
-        .execute(&mut *transaction)
+    }
+
+    let mut connection = pool
+        .acquire()
         .await
-        .map_err(|error| database("record schema migration", error))?;
-        transaction
-            .commit()
+        .map_err(|error| database("acquire transactional migration connection", error))?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| database("begin immediate schema migration", error))?;
+    #[cfg(test)]
+    wait_at_migration_test_barrier(path).await;
+    let migration_result = async {
+        let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| database("revalidate migration application id", error))?;
+        if application_id != APPLICATION_ID {
+            return Err(StateError::InvalidValue {
+                field: "SQLite application id",
+                reason: "database ownership changed before migration",
+            });
+        }
+        let mut current_version =
+            validate_migration_history_connection(&mut connection, false).await?;
+        for migration in MIGRATIONS {
+            if migration.version <= current_version {
+                continue;
+            }
+
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| database("apply schema migration", error))?;
+            sqlx::query(
+                "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+                 VALUES (?, ?, ?, CAST(unixepoch('subsec') * 1000 AS INTEGER))",
+            )
+            .bind(migration.version)
+            .bind(migration.name)
+            .bind(migration_checksum(migration.sql))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| database("record schema migration", error))?;
+            current_version = migration.version;
+        }
+        validate_migration_history_connection(&mut connection, true).await?;
+        sqlx::query("COMMIT")
+            .execute(&mut *connection)
             .await
             .map_err(|error| database("commit schema migration", error))?;
-        current_version = migration.version;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = migration_result {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *connection)
+            .await
+            .map_err(|rollback| database("rollback failed schema migration", rollback))?;
+        return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+async fn wait_at_migration_test_barrier(path: &Path) {
+    let barrier = MIGRATION_TEST_BARRIER
+        .lock()
+        .expect("migration test barrier lock poisoned")
+        .as_ref()
+        .filter(|configured| configured.path == path)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        MIGRATION_TEST_BARRIER
+            .lock()
+            .expect("migration test barrier lock poisoned")
+            .take();
+    }
 }
 
 async fn ensure_destructive_backup(
@@ -1692,10 +2109,17 @@ async fn snapshot_database(
     source_file: &File,
     destination: &Path,
 ) -> Result<(), StateError> {
+    materialize_sqlite_snapshot(source, source_file, destination).await
+}
+
+async fn materialize_sqlite_snapshot(
+    source: &Path,
+    source_file: &File,
+    destination: &Path,
+) -> Result<(), StateError> {
     verify_path_identity(source, source_file)?;
     reject_hard_link(source, source_file)?;
     ensure_database_artifacts_absent(destination)?;
-    let verified_source = copy_database_for_inspection(source, source_file)?;
     let destination_text = destination
         .to_str()
         .ok_or_else(|| StateError::InvalidPath {
@@ -1703,21 +2127,57 @@ async fn snapshot_database(
             reason: "snapshot path must be valid Unicode",
         })?;
     let options = SqliteConnectOptions::new()
-        .filename(&verified_source)
+        .filename(source)
         .read_only(true)
         .create_if_missing(false)
         .foreign_keys(true);
+    let wal_path = sqlite_sidecar(source, "-wal");
+    let shm_path = sqlite_sidecar(source, "-shm");
+    let journal_path = sqlite_sidecar(source, "-journal");
+    if path_entry_exists(&journal_path)? {
+        return Err(StateError::InvalidPath {
+            path: source.to_owned(),
+            reason: "snapshot source has a rollback journal",
+        });
+    }
+    let wal_existed = path_entry_exists(&wal_path)?;
+    let shm_existed = path_entry_exists(&shm_path)?;
+    if wal_existed != shm_existed {
+        return Err(StateError::InvalidPath {
+            path: source.to_owned(),
+            reason: "snapshot source has an ambiguous WAL/SHM artifact set",
+        });
+    }
+    let source_sidecars = if wal_existed {
+        let wal_file = open_existing_file_no_follow(&wal_path)?;
+        let shm_file = open_existing_file_no_follow(&shm_path)?;
+        verify_path_identity(&wal_path, &wal_file)?;
+        verify_path_identity(&shm_path, &shm_file)?;
+        reject_hard_link(&wal_path, &wal_file)?;
+        reject_hard_link(&shm_path, &shm_file)?;
+        Some((wal_file, shm_file))
+    } else {
+        None
+    };
+    let source_digest = if wal_existed {
+        None
+    } else {
+        Some(file_digest(source_file)?)
+    };
+    let options = options.immutable(!wal_existed);
     let mut connection = match SqliteConnection::connect_with(&options).await {
         Ok(connection) => connection,
         Err(error) => {
-            remove_snapshot_artifacts(&verified_source)?;
-            return Err(invalid_backup(
-                source,
-                "open verified snapshot source",
-                error,
-            ));
+            return Err(invalid_backup(source, "open snapshot source", error));
         }
     };
+    if let Err(error) = verify_path_identity(source, source_file) {
+        connection
+            .close()
+            .await
+            .map_err(|close| invalid_backup(source, "close changed snapshot source", close))?;
+        return Err(error);
+    }
     let snapshot = sqlx::query("VACUUM main INTO ?")
         .bind(destination_text)
         .execute(&mut connection)
@@ -1733,15 +2193,67 @@ async fn snapshot_database(
         (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     };
-    let source_cleanup = remove_snapshot_artifacts(&verified_source);
     let identity = verify_path_identity(source, source_file);
-    match (result, source_cleanup, identity) {
-        (Err(error), _, _) => Err(cleanup_failed_snapshot(destination, error)),
-        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
-            Err(cleanup_failed_snapshot(destination, error))
-        }
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
+    let sidecar_identity = match &source_sidecars {
+        Some((wal_file, shm_file)) => verify_path_identity(&wal_path, wal_file)
+            .and_then(|()| verify_path_identity(&shm_path, shm_file)),
+        None => match (
+            path_entry_exists(&wal_path),
+            path_entry_exists(&shm_path),
+            file_digest(source_file),
+        ) {
+            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(_), Err(error)) => Err(error),
+            (Ok(true), _, _) | (_, Ok(true), _) => Err(StateError::InvalidPath {
+                path: source.to_owned(),
+                reason: "snapshot source gained WAL/SHM artifacts during immutable inspection",
+            }),
+            (Ok(false), Ok(false), Ok(digest)) if source_digest.as_ref() != Some(&digest) => {
+                Err(StateError::InvalidPath {
+                    path: source.to_owned(),
+                    reason: "immutable snapshot source changed during inspection",
+                })
+            }
+            (Ok(false), Ok(false), Ok(_)) => Ok(()),
+        },
+    };
+    let journal_identity = match path_entry_exists(&journal_path) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(StateError::InvalidPath {
+            path: source.to_owned(),
+            reason: "snapshot source gained a rollback journal during inspection",
+        }),
+        Err(error) => Err(error),
+    };
+    match (result, identity, sidecar_identity, journal_identity) {
+        (Err(error), _, _, _) => Err(cleanup_failed_snapshot(destination, error)),
+        (Ok(()), Err(error), _, _)
+        | (Ok(()), Ok(()), Err(error), _)
+        | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(cleanup_failed_snapshot(destination, error)),
+        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn file_digest(file: &File) -> Result<Vec<u8>, StateError> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let path = Path::new("<open database handle>");
+    let mut file = file
+        .try_clone()
+        .map_err(|error| file_error("clone database handle for digest", path, error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| file_error("seek database handle for digest", path, error))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| file_error("read database handle for digest", path, error))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().to_vec())
 }
 
 fn migration_checksum(sql: &str) -> String {
@@ -1803,7 +2315,16 @@ async fn backup_pool(
 fn cleanup_failed_snapshot(path: &Path, error: StateError) -> StateError {
     match remove_snapshot_artifacts(path) {
         Ok(()) => error,
-        Err(cleanup_error) => cleanup_error,
+        Err(cleanup_error) => match error {
+            StateError::PublicationUncertain {
+                path: destination,
+                reason,
+            } => StateError::PublicationUncertain {
+                path: destination,
+                reason: format!("{reason}; temporary cleanup failed: {cleanup_error}"),
+            },
+            _ => cleanup_error,
+        },
     }
 }
 
@@ -1960,8 +2481,9 @@ pub(crate) mod test_support {
     use sqlx::{Connection as _, Row as _, SqliteConnection, SqlitePool};
 
     use super::{
-        StateStore, copy_database_for_inspection, database, migration_checksum,
-        open_existing_file_no_follow, remove_snapshot_artifacts,
+        FAIL_AFTER_PUBLICATION, StateStore, database, inspection_temporary_path,
+        materialize_sqlite_snapshot, migration_checksum, open_existing_file_no_follow,
+        remove_snapshot_artifacts,
     };
     use crate::StateError;
 
@@ -1973,9 +2495,54 @@ pub(crate) mod test_support {
         migration_checksum(sql)
     }
 
+    pub(crate) fn fail_after_publication_once(destination: &Path) {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve publication failpoint path");
+        *FAIL_AFTER_PUBLICATION
+            .lock()
+            .expect("publication failpoint lock poisoned") = Some(destination);
+    }
+
+    pub(crate) fn create_competing_destination_once(destination: &Path) {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve publication race path");
+        *super::CREATE_DESTINATION_BEFORE_PUBLICATION
+            .lock()
+            .expect("publication race lock poisoned") = Some(destination);
+    }
+
+    pub(crate) fn set_migration_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let path = super::resolve_database_path(path).expect("resolve migration barrier path");
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *super::MIGRATION_TEST_BARRIER
+            .lock()
+            .expect("migration test barrier lock poisoned") = Some(super::MigrationTestBarrier {
+            path,
+            entered: std::sync::Arc::clone(&entered),
+            release: std::sync::Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn fail_windows_source_removal_once(destination: &Path) {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve publication failpoint path");
+        *super::FAIL_WINDOWS_SOURCE_REMOVAL
+            .lock()
+            .expect("publication failpoint lock poisoned") = Some(destination);
+    }
+
     pub(crate) async fn journal_mode(path: &Path) -> Result<String, StateError> {
         let database_file = open_existing_file_no_follow(path)?;
-        let temporary = copy_database_for_inspection(path, &database_file)?;
+        let temporary = inspection_temporary_path(path)?;
+        materialize_sqlite_snapshot(path, &database_file, &temporary).await?;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&temporary)
             .read_only(true)

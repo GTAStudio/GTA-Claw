@@ -113,6 +113,13 @@ pub enum StateError {
         /// Existing destination.
         path: PathBuf,
     },
+    /// Snapshot publication completed but rollback could not restore a clean destination.
+    PublicationUncertain {
+        /// Destination that may contain a published snapshot.
+        path: PathBuf,
+        /// Publication and rollback diagnostic.
+        reason: String,
+    },
     /// A stored backup failed validation.
     InvalidBackup {
         /// Backup path.
@@ -219,6 +226,13 @@ impl Display for StateError {
                 write!(
                     formatter,
                     "backup destination already exists: {}",
+                    path.display()
+                )
+            }
+            Self::PublicationUncertain { path, reason } => {
+                write!(
+                    formatter,
+                    "snapshot publication state is uncertain at {}: {reason}",
                     path.display()
                 )
             }

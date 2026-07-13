@@ -54,6 +54,7 @@ mod tests {
             path.to_owned(),
             sidecar(path, "-wal"),
             sidecar(path, "-shm"),
+            sidecar(path, "-journal"),
         ]
         .into_iter()
         .map(|artifact| {
@@ -121,6 +122,7 @@ mod tests {
             destination.to_owned(),
             sidecar(destination, "-wal"),
             sidecar(destination, "-shm"),
+            sidecar(destination, "-journal"),
         ] {
             assert!(
                 !artifact.exists(),
@@ -235,7 +237,7 @@ mod tests {
         let path = database_path(&directory, "状态 store.sqlite");
         let store = StateStore::open(
             StoreConfig::new(&path)
-                .with_max_connections(3)
+                .with_max_connections(1)
                 .with_busy_timeout(Duration::from_millis(275))
                 .with_synchronous(SynchronousPolicy::Full),
         )
@@ -247,7 +249,7 @@ mod tests {
         assert!(settings.foreign_keys);
         assert_eq!(settings.busy_timeout_ms, 275);
         assert_eq!(settings.synchronous, 2);
-        assert_eq!(settings.max_connections, 3);
+        assert_eq!(settings.max_connections, 1);
         let health = store.health().await.expect("health can be read");
         assert!(health.is_healthy());
         assert!(path.is_file());
@@ -286,6 +288,51 @@ mod tests {
             .expect("version-zero prefix migrates");
         assert!(store.health().await.expect("migrated health").is_healthy());
         assert!(store.recovered_writer().is_none());
+        store.close().await.expect("migrated store closes");
+    }
+
+    #[tokio::test]
+    async fn migration_transaction_excludes_external_schema_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "migration-race.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_millis(50));
+        let mut external = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create migration race database");
+        sqlx::raw_sql(
+            "PRAGMA application_id = 1196704067;
+             CREATE TABLE IF NOT EXISTS claw_schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+                applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+             ) STRICT",
+        )
+        .execute(&mut external)
+        .await
+        .expect("create version-zero migration race prefix");
+        let (entered, release) = test_support::set_migration_barrier(&path);
+        let open_path = path.clone();
+        let opener =
+            tokio::spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
+        entered.notified().await;
+
+        let drift = external
+            .execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT")
+            .await
+            .expect_err("external schema drift is excluded by BEGIN IMMEDIATE");
+        assert!(drift.as_database_error().is_some());
+        release.notify_one();
+
+        let store = opener
+            .await
+            .expect("migration task joins")
+            .expect("migration completes");
+        assert!(store.health().await.expect("migrated health").is_healthy());
+        external.close().await.expect("external writer closes");
         store.close().await.expect("migrated store closes");
     }
 
@@ -591,8 +638,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = StateStore::open(
             StoreConfig::new(database_path(&directory, "busy.sqlite"))
-                .with_max_connections(2)
-                .with_busy_timeout(Duration::from_millis(50)),
+                .with_busy_timeout(Duration::from_millis(50))
+                .with_acquire_timeout(Duration::from_millis(500)),
         )
         .await
         .expect("state store opens");
@@ -881,6 +928,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_application_id_drift() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "health-application-id.sqlite")).await;
+        sqlx::query("PRAGMA application_id = 0")
+            .execute(test_support::pool(&store))
+            .await
+            .expect("tamper application id");
+
+        let health = store.health().await.expect("application id health report");
+        assert_eq!(health.application_id, 0);
+        assert!(!health.is_healthy());
+        store.close().await.expect("drifted store closes");
+    }
+
+    #[tokio::test]
     async fn nonempty_foreign_database_is_not_claimed() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "foreign.sqlite");
@@ -959,15 +1021,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_publication_failure_reports_published_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "publication-source.sqlite");
+        let destination = database_path(&directory, "publication-destination.sqlite");
+        let source = open(&source_path).await;
+        test_support::fail_after_publication_once(&destination);
+
+        let error = source
+            .backup_to(&destination)
+            .await
+            .expect_err("injected publication failure is surfaced");
+        assert!(matches!(error, StateError::PublicationUncertain { .. }));
+        assert!(destination.exists());
+        assert!(!sidecar(&destination, "-wal").exists());
+        assert!(!sidecar(&destination, "-shm").exists());
+        assert!(!sidecar(&destination, "-journal").exists());
+        open(&destination)
+            .await
+            .close()
+            .await
+            .expect("published destination remains valid");
+        source.close().await.expect("source store closes");
+    }
+
+    #[tokio::test]
+    async fn no_replace_failure_preserves_competing_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "publication-race-source.sqlite");
+        let destination = database_path(&directory, "publication-race-destination.sqlite");
+        let source = open(&source_path).await;
+        test_support::create_competing_destination_once(&destination);
+
+        let error = source
+            .backup_to(&destination)
+            .await
+            .expect_err("competing destination wins no-replace race");
+        assert!(matches!(error, StateError::BackupDestinationExists { .. }));
+        assert_eq!(
+            fs::read(&destination).expect("read competing destination"),
+            b"other publisher"
+        );
+        assert!(!sidecar(&destination, "-wal").exists());
+        assert!(!sidecar(&destination, "-shm").exists());
+        assert!(!sidecar(&destination, "-journal").exists());
+        source.close().await.expect("source store closes");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_source_removal_failure_reports_published_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "windows-publication-source.sqlite");
+        let destination = database_path(&directory, "windows-publication-destination.sqlite");
+        let source = open(&source_path).await;
+        test_support::fail_windows_source_removal_once(&destination);
+
+        let error = source
+            .backup_to(&destination)
+            .await
+            .expect_err("injected Windows source removal failure is surfaced");
+        assert!(matches!(error, StateError::PublicationUncertain { .. }));
+        assert!(destination.exists());
+        assert!(!sidecar(&destination, "-wal").exists());
+        assert!(!sidecar(&destination, "-shm").exists());
+        assert!(!sidecar(&destination, "-journal").exists());
+        open(&destination)
+            .await
+            .close()
+            .await
+            .expect("Windows published destination remains valid");
+        source.close().await.expect("source store closes");
+    }
+
+    #[tokio::test]
     async fn restore_materializes_committed_wal_content() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "wal-source.sqlite");
         let restored_path = database_path(&directory, "wal-restored.sqlite");
         let source = open(&source_path).await;
-        let mut connection = test_support::pool(&source)
-            .acquire()
+        source.close().await.expect("seed WAL source closes");
+        let options = SqliteConnectOptions::new()
+            .filename(&source_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut connection = SqliteConnection::connect_with(&options)
             .await
-            .expect("acquire WAL writer");
+            .expect("open standalone WAL writer");
         connection
             .execute("PRAGMA wal_autocheckpoint = 0")
             .await
@@ -979,7 +1118,6 @@ mod tests {
             )
             .await
             .expect("commit row to WAL");
-        drop(connection);
         assert!(sidecar(&source_path, "-wal").exists());
 
         StateStore::restore_backup(&source_path, &restored_path)
@@ -996,7 +1134,63 @@ mod tests {
                 .is_some()
         );
         restored.close().await.expect("restored store closes");
-        source.close().await.expect("source store closes");
+        connection.close().await.expect("WAL writer closes");
+    }
+
+    #[tokio::test]
+    async fn restore_remains_consistent_during_concurrent_checkpoint() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "checkpoint-source.sqlite");
+        let restored_path = database_path(&directory, "checkpoint-restored.sqlite");
+        open(&source_path)
+            .await
+            .close()
+            .await
+            .expect("seed checkpoint source closes");
+        let options = SqliteConnectOptions::new()
+            .filename(&source_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut writer = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open checkpoint writer");
+        writer
+            .execute("PRAGMA wal_autocheckpoint = 0")
+            .await
+            .expect("disable checkpointing");
+        writer
+            .execute(
+                "WITH RECURSIVE n(value) AS (
+                    VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < 200
+                 )
+                 INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+                 SELECT printf('checkpoint-%03d', value), 'active', value, value, 1 FROM n",
+            )
+            .await
+            .expect("commit checkpoint rows to WAL");
+        let mut checkpointer = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open concurrent checkpointer");
+
+        let (restore, checkpoint) = tokio::join!(
+            StateStore::restore_backup(&source_path, &restored_path),
+            async {
+                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .execute(&mut checkpointer)
+                    .await
+            }
+        );
+        restore.expect("consistent restore completes");
+        checkpoint.expect("concurrent checkpoint completes");
+        writer.close().await.expect("checkpoint writer closes");
+        checkpointer.close().await.expect("checkpointer closes");
+
+        let restored = open(&restored_path).await;
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(test_support::pool(&restored))
+            .await
+            .expect("count checkpoint-restored rows");
+        assert_eq!(count, 200);
+        restored.close().await.expect("restored store closes");
     }
 
     #[tokio::test]
@@ -1006,10 +1200,13 @@ mod tests {
         let alias = database_path(&directory, "wal-hardlink-alias.sqlite");
         let destination = database_path(&directory, "wal-hardlink-restored.sqlite");
         let source = open(&source_path).await;
-        let mut connection = test_support::pool(&source)
-            .acquire()
+        source.close().await.expect("seed hardlink source closes");
+        let options = SqliteConnectOptions::new()
+            .filename(&source_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut connection = SqliteConnection::connect_with(&options)
             .await
-            .expect("acquire WAL writer");
+            .expect("open hardlink WAL writer");
         connection
             .execute("PRAGMA wal_autocheckpoint = 0")
             .await
@@ -1021,7 +1218,6 @@ mod tests {
             )
             .await
             .expect("commit hardlink row to WAL");
-        drop(connection);
         assert!(sidecar(&source_path, "-wal").exists());
         fs::hard_link(&source_path, &alias).expect("create WAL source hard link");
 
@@ -1031,7 +1227,10 @@ mod tests {
         assert!(matches!(error, StateError::InvalidPath { .. }));
         assert!(!destination.exists());
         fs::remove_file(alias).expect("remove rejected restore alias");
-        source.close().await.expect("WAL source closes");
+        connection
+            .close()
+            .await
+            .expect("hardlink WAL writer closes");
     }
 
     #[cfg(unix)]
@@ -1083,6 +1282,44 @@ mod tests {
             fs::read(sidecar(&destination, "-wal")).expect("read stale WAL"),
             b"stale WAL"
         );
+        source.close().await.expect("source store closes");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_source_and_destination_rollback_journals() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "journal-source.sqlite");
+        let backup_path = database_path(&directory, "journal-backup.sqlite");
+        let source_destination = database_path(&directory, "journal-source-restored.sqlite");
+        let collision_destination =
+            database_path(&directory, "journal-collision-destination.sqlite");
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+
+        fs::write(sidecar(&backup_path, "-journal"), b"hot journal")
+            .expect("create source rollback journal");
+        let error = StateStore::restore_backup(&backup_path, &source_destination)
+            .await
+            .expect_err("source rollback journal rejects restore");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(!source_destination.exists());
+        fs::remove_file(sidecar(&backup_path, "-journal")).expect("remove source rollback journal");
+
+        fs::write(
+            sidecar(&collision_destination, "-journal"),
+            b"stale journal",
+        )
+        .expect("create destination rollback journal");
+        let error = StateStore::restore_backup(&backup_path, &collision_destination)
+            .await
+            .expect_err("destination rollback journal rejects restore");
+        assert_eq!(
+            error,
+            StateError::BackupDestinationExists {
+                path: sidecar(&collision_destination, "-journal"),
+            }
+        );
+        assert!(!collision_destination.exists());
         source.close().await.expect("source store closes");
     }
 
@@ -1360,7 +1597,12 @@ mod tests {
             .await
             .err()
             .expect("hard-link alias is rejected");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(matches!(
+            error,
+            StateError::InvalidPath { .. }
+                | StateError::StoreLocked { .. }
+                | StateError::FileSystem { .. }
+        ));
         owner.close().await.expect("lock owner closes");
 
         let error = StateStore::open(StoreConfig::new(&alias))
@@ -1415,6 +1657,72 @@ mod tests {
             .expect("identity-bound lock rejects remaining hard-link name");
         assert!(matches!(error, StateError::StoreLocked { .. }));
         owner.close().await.expect("identity owner closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_path_cannot_receive_a_reconnected_pool_connection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "replacement.sqlite");
+        let detached = database_path(&directory, "replacement-detached.sqlite");
+        let first = StateStore::open(
+            StoreConfig::new(&path)
+                .with_busy_timeout(Duration::from_millis(75))
+                .with_acquire_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .expect("first store opens");
+        let connection = test_support::pool(&first)
+            .acquire()
+            .await
+            .expect("acquire sole identity-bound connection");
+        fs::rename(&path, &detached).expect("detach locked database pathname");
+        let replacement = open(&path).await;
+        drop(connection);
+
+        let record = session("must-not-cross-identity", 1);
+        let error = first
+            .sessions()
+            .create(&record)
+            .await
+            .expect_err("cached connection checkout fails closed after replacement");
+        assert!(matches!(error, StateError::Database(_)));
+        assert!(
+            replacement
+                .sessions()
+                .get(&record.id)
+                .await
+                .expect("read replacement store")
+                .is_none()
+        );
+        drop(first);
+        replacement.close().await.expect("replacement store closes");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_identity_handle_prevents_path_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "windows-identity.sqlite");
+        let detached = database_path(&directory, "windows-identity-detached.sqlite");
+        let store = open(&path).await;
+
+        let error = fs::rename(&path, &detached)
+            .expect_err("locked Windows identity cannot be renamed or replaced");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+            ) || error.raw_os_error() == Some(32)
+        );
+        assert!(
+            store
+                .health()
+                .await
+                .expect("store remains healthy")
+                .is_healthy()
+        );
+        store.close().await.expect("Windows identity store closes");
     }
 
     #[tokio::test]
