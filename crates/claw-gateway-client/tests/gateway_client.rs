@@ -1411,25 +1411,38 @@ async fn command_queue_saturation_is_explicit_backpressure() {
 
 #[tokio::test]
 async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer() {
-    const LARGE_BYTES: usize = 20 * 1024 * 1024;
-    const REJECTED_BYTES: usize = 2 * 1024 * 1024;
-    const OUTBOUND_BYTES: usize = 21 * 1024 * 1024;
-    let large = json!({"value": "x".repeat(LARGE_BYTES)});
-    let rejected = json!({"value": "y".repeat(REJECTED_BYTES)});
+    const HELD_PAYLOAD_BYTES: usize = 8 * 1024;
+    const REJECTED_PAYLOAD_BYTES: usize = 4 * 1024;
+    const HELD_ID: &str = "held";
+    const REJECTED_IDS: [&str; 2] = ["rejected-one", "rejected-two"];
+    let held_params = json!({"value": "x".repeat(HELD_PAYLOAD_BYTES)});
+    let rejected_params = json!({"value": "y".repeat(REJECTED_PAYLOAD_BYTES)});
     let method = side_effect_method();
-    let held_bytes = encoded_request_len("large-held", &method, &large);
-    let rejected_bytes = encoded_request_len("large-rejected-one", &method, &rejected);
-    assert!(held_bytes <= OUTBOUND_BYTES);
-    assert!(rejected_bytes <= OUTBOUND_BYTES);
-    assert!(
-        held_bytes + rejected_bytes > OUTBOUND_BYTES,
-        "requests must fit individually but exceed the aggregate ceiling"
-    );
+    let held_bytes = encoded_request_len(HELD_ID, &method, &held_params);
+    let rejected_bytes = REJECTED_IDS.map(|id| encoded_request_len(id, &method, &rejected_params));
+    let outbound_bytes = held_bytes
+        + rejected_bytes
+            .iter()
+            .copied()
+            .min()
+            .expect("rejected request")
+        - 1;
+    assert!(held_bytes <= outbound_bytes);
+    for (id, request_bytes) in REJECTED_IDS.into_iter().zip(rejected_bytes) {
+        assert!(
+            request_bytes <= outbound_bytes,
+            "{id} must fit the byte ceiling individually"
+        );
+        assert!(
+            held_bytes + request_bytes > outbound_bytes,
+            "held plus {id} must exceed the aggregate byte ceiling"
+        );
+    }
     let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
         complete_handshake_with_tick_interval(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES, 10_000)
             .await;
         let request = receive_request(&mut socket).await;
-        assert_eq!(request.id().as_str(), "large-held");
+        assert_eq!(request.id().as_str(), HELD_ID);
         send_response(&mut socket, request.id().as_str(), 1).await;
         wait_for_close(&mut socket).await;
     }))
@@ -1437,7 +1450,7 @@ async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer
     let mut client_config = config(gateway.url.clone());
     client_config.limits.max_in_flight_requests = 4;
     client_config.limits.command_queue_capacity = 4;
-    client_config.limits.outbound_queue_bytes = OUTBOUND_BYTES;
+    client_config.limits.outbound_queue_bytes = outbound_bytes;
     client_config.timeouts.request = Duration::from_secs(5);
     let (runtime, gate) = WriteGateRuntime::new();
     let (client, _) = GatewayClient::start_with_runtime(
@@ -1449,7 +1462,7 @@ async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer
     let scenario_runtime = Arc::clone(&runtime);
     let scenario = tokio::spawn(async move {
         scenario_client.wait_ready().await.expect("ready");
-        let held = scenario_client.request(request_id("large-held"), side_effect_method(), &large);
+        let held = scenario_client.request(request_id(HELD_ID), side_effect_method(), &held_params);
         tokio::pin!(held);
         poll_once_pending(held.as_mut(), "held aggregate request").await;
         scenario_runtime.wait_until_blocked().await;
@@ -1458,9 +1471,9 @@ async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer
             1,
             "the held request must own the single writer"
         );
-        for id in ["large-rejected-one", "large-rejected-two"] {
+        for id in REJECTED_IDS {
             let result = scenario_client
-                .request(request_id(id), side_effect_method(), &rejected)
+                .request(request_id(id), side_effect_method(), &rejected_params)
                 .await;
             assert!(
                 matches!(
@@ -1471,9 +1484,20 @@ async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer
                 ),
                 "unexpected aggregate-budget result for {id}: {result:?}"
             );
+            assert_eq!(
+                scenario_runtime.writes_entered(),
+                1,
+                "{id} must be rejected while the held request remains gated"
+            );
         }
         scenario_runtime.unblock();
-        held.await.expect("held request response");
+        let response = held.await.expect("held request response");
+        assert_eq!(response.id().as_str(), HELD_ID);
+        assert!(response.ok(), "held response must be successful");
+        let payload: serde_json::Value = Codec::authenticated()
+            .decode_opaque(response.payload().value().expect("held response payload"))
+            .expect("decode held response payload");
+        assert_eq!(payload, json!({"marker": 1}));
     });
     finish_gateway_scenario(
         "cumulative outbound byte bound",
