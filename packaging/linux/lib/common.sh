@@ -156,7 +156,7 @@ assert_nearest_existing_parent() {
 }
 
 output_identity() {
-  stat -c '%d:%i' "$1"
+  stat -Lc '%d:%i' "$1"
 }
 
 output_link_count() {
