@@ -38,7 +38,8 @@ macho_minimum_versions "$x86_binary" >"$work/x86_64.minimum-versions"
 cmp -s "$work/arm64.minimum-versions" "$work/x86_64.minimum-versions" ||
   die "deployment target parity check failed between arm64 and x86_64 slices"
 
-mkdir -p "$(dirname "$output")"
+ensure_output_directory "$(dirname "$output")"
+assert_output_file_slot "$output"
 lipo -create "$arm_binary" "$x86_binary" -output "$output"
 chmod 0755 "$output"
 lipo "$output" -verify_arch arm64 x86_64

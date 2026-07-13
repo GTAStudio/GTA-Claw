@@ -33,16 +33,14 @@ assert_output_path "$stage"
 assert_output_path "$archive"
 assert_output_path "$checksum"
 safe_reset_dir "$stage"
-assert_output_path "$archive_root"
-mkdir -p "$archive_root"
+ensure_output_directory "$archive_root"
 install -m 0755 "$binary" "$stage/$component"
 printf '%s  %s\n' "$(sha256_file "$stage/$component")" "$component" >"$stage/SHA256SUMS"
 chmod 0644 "$stage/SHA256SUMS"
 find "$stage" -exec touch -t "$NORMALIZED_MTIME" {} +
 
-assert_output_path "$archive"
-rm -f -- "$archive"
-assert_output_path "$archive"
+remove_output_file "$archive"
+assert_output_file_slot "$archive"
 (
   cd "$(dirname "$stage")"
   COPYFILE_DISABLE=1 tar \
@@ -54,6 +52,6 @@ assert_output_path "$archive"
     -cf - \
     "$(basename "$stage")"
 ) | gzip -n -9 >"$archive"
-assert_output_path "$checksum"
+assert_output_file_slot "$checksum"
 printf '%s  %s\n' "$(sha256_file "$archive")" "$(basename "$archive")" >"$checksum"
 note "created $archive"

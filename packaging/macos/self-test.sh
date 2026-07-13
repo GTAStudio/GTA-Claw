@@ -35,10 +35,22 @@ common="$MACOS_DIR/lib/common.sh"
 outside="$(mktemp -d "${TMPDIR:-/tmp}/gta-claw-output-escape.XXXXXX")"
 escape_link="$REPO_ROOT/target/gta-claw-output-link-$$"
 cleanup() {
+  local link
+  for link in "$OUTPUT_ROOT/headless" "$OUTPUT_ROOT/build" "$OUTPUT_ROOT/notarization"; do
+    [[ ! -L "$link" ]] || rm -f -- "$link"
+  done
   rm -f -- "$escape_link"
   rm -rf -- "$outside"
 }
 trap cleanup EXIT INT TERM
+
+assert_absent() {
+  [[ ! -e "$1" && ! -L "$1" ]] || die "self-test created an outside path: $1"
+}
+
+assert_sentinel() {
+  [[ "$(cat "$1")" == "outside sentinel" ]] || die "self-test modified outside bytes: $1"
+}
 
 expect_failure invalid-bundle-id env BUNDLE_ID=invalid bash -c "source '$common'"
 expect_failure invalid-version env VERSION=1.2-beta bash -c "source '$common'"
@@ -57,28 +69,112 @@ expect_failure executable-name-space env EXECUTABLE_NAME='gta claw' bash -c "sou
 expect_failure missing-tool bash -c "source '$common'; require_tool gta-claw-tool-that-does-not-exist"
 expect_failure path-traversal bash -c "source '$common'; assert_output_path '$OUTPUT_ROOT/../escape'"
 
-ln -s "$outside" "$escape_link"
+mkdir -p "$outside/output-root-existing"
+ln -s "$outside/output-root-existing" "$escape_link"
 expect_failure output-root-intermediate-symlink \
   env OUTPUT_ROOT="$escape_link/package" bash -c "source '$common'"
+assert_absent "$outside/output-root-existing/package"
 rm -f -- "$escape_link"
-ln -s "$outside/missing" "$escape_link"
+ln -s "$outside/output-root-dangling" "$escape_link"
 expect_failure output-root-dangling-symlink \
   env OUTPUT_ROOT="$escape_link/package" bash -c "source '$common'"
+assert_absent "$outside/output-root-dangling"
 rm -f -- "$escape_link"
 
 mkdir -p "$work/symlink-root"
 ln -s "$work" "$work/symlink-root/link"
 expect_failure symlink-rejection bash -c "source '$common'; reject_symlinks '$work/symlink-root'"
-ln -s "$outside" "$work/intermediate-link"
+mkdir -p "$outside/reset-existing"
+printf 'outside sentinel\n' >"$outside/reset-existing/sentinel"
+ln -s "$outside/reset-existing" "$work/intermediate-link"
 expect_failure output-path-intermediate-symlink \
   bash -c "source '$common'; assert_output_path '$work/intermediate-link/file'"
 expect_failure reset-dir-intermediate-symlink \
   bash -c "source '$common'; safe_reset_dir '$work/intermediate-link/delete'"
-ln -s "$outside/missing" "$work/dangling-link"
+assert_sentinel "$outside/reset-existing/sentinel"
+assert_absent "$outside/reset-existing/delete"
+ln -s "$outside/reset-dangling" "$work/dangling-link"
 expect_failure output-path-dangling-symlink \
   bash -c "source '$common'; assert_output_path '$work/dangling-link/file'"
 expect_failure reset-dir-dangling-symlink \
   bash -c "source '$common'; safe_reset_dir '$work/dangling-link/delete'"
+assert_absent "$outside/reset-dangling"
+
+mkdir -p "$work/reset-race" "$work/fake-bin" "$outside/reset-race-target"
+printf 'outside sentinel\n' >"$outside/reset-race-target/sentinel"
+cat >"$work/fake-bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -e
+/bin/rm "$@"
+ln -s "$RESET_RACE_TARGET" "$RESET_RACE_PATH"
+EOF
+chmod 0755 "$work/fake-bin/rm"
+expect_failure reset-recreate-race \
+  env \
+    PATH="$work/fake-bin:$PATH" \
+    RESET_RACE_PATH="$work/reset-race" \
+    RESET_RACE_TARGET="$outside/reset-race-target" \
+    bash -c "source '$common'; safe_reset_dir '$work/reset-race'"
+assert_sentinel "$outside/reset-race-target/sentinel"
+assert_absent "$outside/reset-race-target/reset-race"
+rm -f -- "$work/reset-race"
+
+manifest_root="$work/manifest-guard"
+mkdir -p "$manifest_root"
+printf 'manifest content\n' >"$manifest_root/input.txt"
+manifest="$manifest_root/SHA256SUMS"
+manifest_temp="$manifest.tmp"
+
+printf 'outside sentinel\n' >"$outside/manifest-temp-existing"
+ln -s "$outside/manifest-temp-existing" "$manifest_temp"
+expect_failure manifest-temp-symlink \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+assert_sentinel "$outside/manifest-temp-existing"
+rm -f -- "$manifest_temp"
+
+ln -s "$outside/manifest-temp-dangling" "$manifest_temp"
+expect_failure manifest-temp-dangling-symlink \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+assert_absent "$outside/manifest-temp-dangling"
+rm -f -- "$manifest_temp"
+
+printf 'stale temporary\n' >"$manifest_temp"
+expect_failure manifest-temp-regular-collision \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+[[ "$(cat "$manifest_temp")" == "stale temporary" ]] ||
+  die "manifest reservation truncated a regular collision"
+rm -f -- "$manifest_temp"
+
+mkdir "$manifest_temp"
+expect_failure manifest-temp-directory-collision \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+rmdir "$manifest_temp"
+
+printf 'outside sentinel\n' >"$outside/manifest-final-existing"
+ln -s "$outside/manifest-final-existing" "$manifest"
+expect_failure manifest-final-symlink \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+assert_sentinel "$outside/manifest-final-existing"
+rm -f -- "$manifest"
+
+ln -s "$outside/manifest-final-dangling" "$manifest"
+expect_failure manifest-final-dangling-symlink \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+assert_absent "$outside/manifest-final-dangling"
+rm -f -- "$manifest"
+
+mkdir "$manifest"
+expect_failure manifest-final-directory-collision \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+rmdir "$manifest"
+expect_success manifest-publication \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+[[ -f "$manifest" && ! -L "$manifest" ]] || die "manifest publication did not produce a regular file"
+printf 'updated manifest content\n' >"$manifest_root/input.txt"
+expect_success manifest-republication \
+  bash -c "source '$common'; write_sha256_manifest '$manifest_root' '$manifest'"
+[[ -f "$manifest" && ! -L "$manifest" && ! -e "$manifest_temp" ]] ||
+  die "manifest replacement did not atomically publish a regular file"
 
 printf 'content\n' >"$work/hash.txt"
 printf '%s  ./hash.txt\n' "$(sha256_file "$work/hash.txt")" >"$work/hash.sha256"
@@ -91,6 +187,33 @@ EOF
 xcrun clang -target arm64-apple-macos"$MINIMUM_MACOS_VERSION" "$work/hello.c" -o "$work/hello-arm64"
 xcrun clang -target x86_64-apple-macos"$MINIMUM_MACOS_VERSION" "$work/hello.c" -o "$work/hello-x86_64"
 host_arch="$(expected_lipo_arch "$(host_target)")"
+
+mkdir -p "$outside/archive-existing"
+printf 'outside sentinel\n' >"$outside/archive-existing/sentinel"
+ln -s "$outside/archive-existing" "$OUTPUT_ROOT/headless"
+expect_failure archive-intermediate-symlink \
+  "$MACOS_DIR/archive-headless.sh" "$work/hello-$host_arch" gta-claw-cli "$host_arch" "$host_arch"
+assert_sentinel "$outside/archive-existing/sentinel"
+assert_absent "$outside/archive-existing/$host_arch"
+rm -f -- "$OUTPUT_ROOT/headless"
+ln -s "$outside/archive-dangling" "$OUTPUT_ROOT/headless"
+expect_failure archive-dangling-symlink \
+  "$MACOS_DIR/archive-headless.sh" "$work/hello-$host_arch" gta-claw-cli "$host_arch" "$host_arch"
+assert_absent "$outside/archive-dangling"
+rm -f -- "$OUTPUT_ROOT/headless"
+
+mkdir -p "$outside/build-existing"
+printf 'outside sentinel\n' >"$outside/build-existing/sentinel"
+ln -s "$outside/build-existing" "$OUTPUT_ROOT/build"
+expect_failure build-intermediate-symlink "$MACOS_DIR/build.sh" native
+assert_sentinel "$outside/build-existing/sentinel"
+assert_absent "$outside/build-existing/$(host_target)"
+rm -f -- "$OUTPUT_ROOT/build"
+ln -s "$outside/build-dangling" "$OUTPUT_ROOT/build"
+expect_failure build-dangling-symlink "$MACOS_DIR/build.sh" native
+assert_absent "$outside/build-dangling"
+rm -f -- "$OUTPUT_ROOT/build"
+
 expect_failure assemble-app-name-traversal \
   env APP_NAME=../escape "$MACOS_DIR/assemble-app.sh" "$work/hello-$host_arch" "$host_arch" "$host_arch"
 expect_failure assemble-executable-name-traversal \
@@ -156,6 +279,20 @@ second_manifest="$work/second-app.sha256"
 write_sha256_manifest "$fixture_app" "$second_manifest"
 cmp -s "$first_manifest" "$second_manifest" || die "app assembly is not deterministic on rerun"
 tests=$((tests + 1))
+
+mkdir -p "$outside/notarization-existing"
+printf 'outside sentinel\n' >"$outside/notarization-existing/sentinel"
+ln -s "$outside/notarization-existing" "$OUTPUT_ROOT/notarization"
+expect_failure notarization-intermediate-symlink \
+  env NOTARY_PROFILE=self-test "$MACOS_DIR/notarize.sh" "$fixture_app"
+assert_sentinel "$outside/notarization-existing/sentinel"
+assert_absent "$outside/notarization-existing/$APP_NAME.app.zip"
+rm -f -- "$OUTPUT_ROOT/notarization"
+ln -s "$outside/notarization-dangling" "$OUTPUT_ROOT/notarization"
+expect_failure notarization-dangling-symlink \
+  env NOTARY_PROFILE=self-test "$MACOS_DIR/notarize.sh" "$fixture_app"
+assert_absent "$outside/notarization-dangling"
+rm -f -- "$OUTPUT_ROOT/notarization"
 
 "$MACOS_DIR/generate-icon.sh" "$work/icon-one.icns" >/dev/null
 "$MACOS_DIR/generate-icon.sh" "$work/icon-two.icns" >/dev/null

@@ -32,11 +32,9 @@ temporary_zip=""
 if [[ -d "$artifact" && "$artifact" == *.app ]]; then
   temporary_zip="$OUTPUT_ROOT/notarization/$(basename "$artifact").zip"
   assert_output_path "$temporary_zip"
-  assert_output_path "$(dirname "$temporary_zip")"
-  mkdir -p "$(dirname "$temporary_zip")"
-  assert_output_path "$temporary_zip"
-  rm -f -- "$temporary_zip"
-  assert_output_path "$temporary_zip"
+  ensure_output_directory "$(dirname "$temporary_zip")"
+  remove_output_file "$temporary_zip"
+  assert_output_file_slot "$temporary_zip"
   ditto -c -k --keepParent "$artifact" "$temporary_zip"
   submission="$temporary_zip"
 elif [[ "$artifact" != *.dmg && "$artifact" != *.pkg ]]; then
@@ -46,6 +44,7 @@ fi
 result_template="$OUTPUT_ROOT/notary-result.XXXXXX"
 assert_output_path "$result_template"
 result="$(mktemp "$result_template")"
+assert_output_file_slot "$result"
 cleanup() {
   rm -f -- "$result"
   if [[ -n "$temporary_zip" ]]; then

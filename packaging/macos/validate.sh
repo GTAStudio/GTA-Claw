@@ -93,8 +93,7 @@ fi
 
 manifest="$OUTPUT_ROOT/manifests/$(basename "$app" .app)-${expected_arches// /_}.sha256"
 assert_output_path "$manifest"
-assert_output_path "$(dirname "$manifest")"
-mkdir -p "$(dirname "$manifest")"
+ensure_output_directory "$(dirname "$manifest")"
 write_sha256_manifest "$app" "$manifest"
 verify_sha256_manifest "$app" "$manifest" >/dev/null
 note "validated $app"
