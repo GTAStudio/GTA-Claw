@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gta.studio/schemas/legacy/legacy-skill.schema.json",
+  "type": "object",
+  "required": ["name", "description", "parameters", "executeCode"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+    },
+    "description": { "type": "string", "minLength": 1 },
+    "parameters": { "type": ["object", "array"] },
+    "executeCode": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,430 @@
+{
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "endpoints": [
+    {
+      "endpoint_id": "root",
+      "method": "GET",
+      "path": "/",
+      "registration": "always",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "unauthenticated-no-channels",
+          "condition": "Device Flow enabled, no engine, and all channels disabled",
+          "status": 200,
+          "response": {
+            "service": "GTA-Claw",
+            "status": "ok",
+            "authenticated": false,
+            "deviceFlowEnabled": true,
+            "channels": {
+              "teams": false,
+              "telegram": false,
+              "discord": false,
+              "whatsapp": false
+            },
+            "endpoints": {
+              "health": "GET /health",
+              "deviceAuth": "GET /auth/device",
+              "chat": "POST /chat"
+            },
+            "examples": {
+              "chatCurl": "curl -X POST http://localhost:3978/chat -H \"Content-Type: application/json\" -d '{\"message\":\"hello\"}'"
+            },
+            "tips": [
+              "Authenticate first via GET /auth/device (or check logs for the user code).",
+              "No chat channels enabled. Use POST /chat directly for testing."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "health",
+      "method": "GET",
+      "path": "/health",
+      "registration": "always",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "healthy-unauthenticated",
+          "condition": "Engine is absent; health still reports status ok",
+          "status": 200,
+          "response": {
+            "status": "ok",
+            "uptime": 12,
+            "skills": 10,
+            "sessions": 0,
+            "model": "gpt-4o",
+            "authenticated": false,
+            "deviceFlowEnabled": true,
+            "channels": {
+              "teams": true,
+              "telegram": false,
+              "discord": false,
+              "whatsapp": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "device-auth",
+      "method": "GET",
+      "path": "/auth/device",
+      "registration": "always",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "already-authenticated",
+          "condition": "Engine exists",
+          "status": 200,
+          "response": {
+            "authenticated": true,
+            "message": "Already authenticated."
+          }
+        },
+        {
+          "case_id": "disabled",
+          "condition": "Engine absent and Device Flow disabled",
+          "status": 400,
+          "response": {
+            "authenticated": false,
+            "error": "Device Flow is disabled. Set DEVICE_FLOW_ENABLED=true and GITHUB_CLIENT_ID."
+          }
+        },
+        {
+          "case_id": "instructions",
+          "condition": "Engine absent and Device Flow enabled",
+          "status": 200,
+          "response": {
+            "authenticated": false,
+            "auth_instructions": "Please authorize GTA-Claw with your GitHub account:\n1. Open: https://github.com/login/device\n2. Enter code: **ABCD-EFGH**"
+          }
+        },
+        {
+          "case_id": "unexpected-error",
+          "condition": "getAuthMessage rejects unexpectedly",
+          "status": 500,
+          "response": {
+            "error": "Failed to get Device Flow instructions"
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "chat",
+      "method": "POST",
+      "path": "/chat",
+      "registration": "always",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "missing-message",
+          "condition": "message, text, and prompt are missing or trim to empty",
+          "request": {},
+          "status": 400,
+          "response": {
+            "error": "Missing 'message' field"
+          }
+        },
+        {
+          "case_id": "help-before-auth",
+          "condition": "message is /help or /start, case-insensitive, even without an engine",
+          "request": {
+            "message": "/help"
+          },
+          "status": 200,
+          "response": {
+            "reply": "GTA-Claw HTTP Chat Help\n\nUse: POST /chat with JSON body\n- message (or text/prompt): your question\n- conversation_id (optional): keep context across turns\n\nExamples:\n1) {\"message\":\"hello\"}\n2) {\"message\":\"continue\",\"conversation_id\":\"demo-1\"}\n\nAuth:\n- If not authenticated, call GET /auth/device and complete GitHub Device Flow."
+          }
+        },
+        {
+          "case_id": "unauthenticated-token-mode",
+          "condition": "Engine absent and Device Flow disabled",
+          "request": {
+            "text": "hello"
+          },
+          "status": 401,
+          "response": {
+            "error": "Not authenticated. Set GITHUB_TOKEN or enable Device Flow."
+          }
+        },
+        {
+          "case_id": "unauthenticated-device-flow",
+          "condition": "Engine absent and Device Flow enabled",
+          "request": {
+            "prompt": "hello"
+          },
+          "status": 401,
+          "response": {
+            "error": "Not authenticated",
+            "auth_instructions": "Please authorize GTA-Claw with your GitHub account:\n1. Open: https://github.com/login/device\n2. Enter code: **ABCD-EFGH**"
+          }
+        },
+        {
+          "case_id": "success",
+          "condition": "Engine exists; conversation_id takes precedence over conversationId",
+          "request": {
+            "message": "hello",
+            "conversation_id": "demo-1",
+            "conversationId": "ignored"
+          },
+          "status": 200,
+          "response": {
+            "reply": "Hello."
+          }
+        },
+        {
+          "case_id": "endpoint-error",
+          "condition": "engine.chat rejects outside its normal error-to-text handling",
+          "request": {
+            "message": "hello"
+          },
+          "status": 500,
+          "response": {
+            "error": "Internal error"
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "teams-messages",
+      "method": "POST",
+      "path": "/api/messages",
+      "registration": "teams_enabled",
+      "rate_limit": "per_ip_token_bucket",
+      "cases": [
+        {
+          "case_id": "adapter-ack",
+          "condition": "Valid Bot Framework activity accepted by botbuilder",
+          "status": 200,
+          "response": null
+        },
+        {
+          "case_id": "rate-limited",
+          "condition": "Per-IP token bucket has fewer than one token",
+          "status": 429,
+          "response": {
+            "error": "Too many requests"
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "whatsapp-verify",
+      "method": "GET",
+      "path": "/whatsapp/webhook",
+      "registration": "whatsapp_enabled",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "verified",
+          "condition": "hub.mode=subscribe, verify token matches, and challenge is nonempty",
+          "request": {
+            "query": {
+              "hub.mode": "subscribe",
+              "hub.verify_token": "fixture-token",
+              "hub.challenge": "12345"
+            }
+          },
+          "status": 200,
+          "headers": {
+            "Content-Type": "text/plain"
+          },
+          "response": "12345"
+        },
+        {
+          "case_id": "forbidden",
+          "condition": "Verification inputs do not all match",
+          "status": 403,
+          "response": {
+            "error": "Forbidden"
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "whatsapp-incoming",
+      "method": "POST",
+      "path": "/whatsapp/webhook",
+      "registration": "whatsapp_enabled",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "accepted",
+          "condition": "All text messages and replies complete",
+          "status": 200,
+          "response": {
+            "ok": true
+          }
+        },
+        {
+          "case_id": "handling-failed",
+          "condition": "Message processing or outbound send throws",
+          "status": 500,
+          "response": {
+            "error": "Webhook handling failed"
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "admin-reload",
+      "method": "POST",
+      "path": "/admin/reload",
+      "registration": "admin_token_set",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "forbidden",
+          "condition": "Bearer token does not exactly equal ADMIN_TOKEN; loopback is not exempt",
+          "status": 403,
+          "response": {
+            "error": "Forbidden"
+          }
+        },
+        {
+          "case_id": "reloaded",
+          "condition": "Role reload succeeds; per-skill failures are skipped and the resulting partial or empty skill set is installed",
+          "status": 200,
+          "response": {
+            "message": "Reloaded",
+            "skills": 10,
+            "model": "gpt-4o"
+          }
+        },
+        {
+          "case_id": "conflict",
+          "condition": "A reload is already in progress",
+          "status": 409,
+          "response": {
+            "error": "Reload already in progress"
+          }
+        },
+        {
+          "case_id": "failed",
+          "condition": "Role or executor reload fails",
+          "status": 500,
+          "response": {
+            "error": "Reload failed"
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "admin-system",
+      "method": "GET",
+      "path": "/admin/system",
+      "registration": "admin_token_set",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "forbidden",
+          "condition": "Neither exact Bearer token nor loopback source",
+          "status": 403,
+          "response": {
+            "error": "Forbidden"
+          }
+        },
+        {
+          "case_id": "system-info",
+          "condition": "Exact Bearer token or loopback source",
+          "status": 200,
+          "response": {
+            "node": {
+              "version": "v20.0.0",
+              "pid": 100,
+              "uptime_s": 12,
+              "memory_mb": {
+                "rss": 100,
+                "heapUsed": 50,
+                "heapTotal": 75
+              }
+            },
+            "os": {
+              "hostname": "fixture",
+              "platform": "linux",
+              "arch": "x64",
+              "cpus": 4,
+              "totalMemory_mb": 8192,
+              "freeMemory_mb": 4096,
+              "uptime_s": 1000,
+              "loadavg": [0.1, 0.2, 0.3]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "endpoint_id": "admin-exec",
+      "method": "POST",
+      "path": "/admin/exec",
+      "registration": "admin_token_set",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "forbidden",
+          "condition": "Neither exact Bearer token nor loopback source",
+          "status": 403,
+          "response": {
+            "error": "Forbidden"
+          }
+        },
+        {
+          "case_id": "unknown-action",
+          "condition": "Action is not in the read-only whitelist",
+          "request": {
+            "action": "rm"
+          },
+          "status": 400,
+          "response": {
+            "error": "Unknown action: rm",
+            "allowed": [
+              "uptime",
+              "disk",
+              "memory",
+              "top",
+              "docker_ps",
+              "docker_stats",
+              "docker_images",
+              "docker_logs",
+              "netstat",
+              "who",
+              "hostname",
+              "date"
+            ]
+          }
+        },
+        {
+          "case_id": "command-success",
+          "condition": "Whitelisted command exits successfully",
+          "request": {
+            "action": "uptime"
+          },
+          "status": 200,
+          "response": {
+            "action": "uptime",
+            "success": true,
+            "output": "up 1 day\n"
+          }
+        },
+        {
+          "case_id": "command-failure",
+          "condition": "Whitelisted command fails or times out; HTTP status remains 200",
+          "request": {
+            "action": "docker_logs",
+            "target": "missing-container"
+          },
+          "status": 200,
+          "response": {
+            "action": "docker_logs",
+            "success": false,
+            "error": "Command failed",
+            "stderr": "No such container"
+          }
+        }
+      ]
+    }
+  ]
+}

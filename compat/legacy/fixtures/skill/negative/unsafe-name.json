@@ -1,0 +1,6 @@
+{
+  "name": "unsafe-name",
+  "description": "Hyphens are rejected by the legacy loader.",
+  "parameters": {},
+  "executeCode": "function run() { return true; }"
+}

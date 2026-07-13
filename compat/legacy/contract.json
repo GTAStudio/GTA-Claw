@@ -1,0 +1,108 @@
+{
+  "$schema": "./schemas/legacy-contract.schema.json",
+  "contract_id": "gta-claw-legacy-p00b",
+  "contract_version": "1.0.0",
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "scope": {
+    "owned_tree": "compat/legacy",
+    "runtime_mutation": false,
+    "compatibility_target": "pure-rust-rewrite"
+  },
+  "fixed_decisions": [
+    {
+      "decision_id": "role-content-model-supported",
+      "outcome": "preserve",
+      "contract": "Remote role content, prompt alias, optional model override, and text/plain role bodies remain supported."
+    },
+    {
+      "decision_id": "safe-http-and-channel-shims",
+      "outcome": "rust_compat_shim",
+      "contract": "Existing safe HTTP endpoints and Teams, Telegram, Discord, and WhatsApp routing remain available through Rust compatibility shims."
+    },
+    {
+      "decision_id": "javascript-execution-removed",
+      "outcome": "deliberate_break",
+      "contract": "The final product never evaluates legacy executeCode JavaScript."
+    },
+    {
+      "decision_id": "legacy-skill-migration-is-explicit",
+      "outcome": "manual_rust_wasi_port",
+      "contract": "The migration command emits a signed-WASI manifest and WIT scaffold, reports recognized httpGet/httpPost/log bridge use, and exits nonzero while any JavaScript remains."
+    }
+  ],
+  "migration_command": {
+    "argv": [
+      "gta-claw",
+      "migrate",
+      "legacy",
+      "--input",
+      "<legacy-path-or-url>",
+      "--output",
+      "<directory>",
+      "--signing-key",
+      "<key-ref>"
+    ],
+    "stdout_format": "application/json",
+    "result_schema": "schemas/migration-result.schema.json",
+    "success_exit_code": 0,
+    "manual_port_required_exit_code": 2,
+    "invalid_input_exit_code": 3,
+    "internal_error_exit_code": 1,
+    "silent_success_for_remaining_javascript": false
+  },
+  "artifacts": {
+    "feature_ledger": "ledger/features.json",
+    "behavior_inventory": "ledger/behaviors.json",
+    "environment_mapping": "config/env-mapping.json",
+    "http_examples": "fixtures/http/examples.json",
+    "bundled_skill_inventory": "inventory/bundled-skills.json",
+    "source_coverage": "inventory/source-coverage.json",
+    "fixture_index": "fixtures/index.json"
+  },
+  "deliberate_breaking_changes": [
+    {
+      "break_id": "no-arbitrary-javascript",
+      "legacy_behavior": "Remote executeCode is evaluated by isolated-vm or node:vm.",
+      "rust_behavior": "No JavaScript engine is present; generated WASI/WIT scaffolds require an explicit Rust port and signature before activation.",
+      "reason": "Remove arbitrary remote code execution from the final trust boundary."
+    },
+    {
+      "break_id": "no-node-package-self-mutation",
+      "legacy_behavior": "AUTO_UPDATE may run npm update and the Copilot CLI curl installer inside the process environment.",
+      "rust_behavior": "Compatibility reports update availability; installation is limited to a separately verified signed release workflow.",
+      "reason": "A pure Rust artifact has no Node package graph and must not mutate itself through unsigned package-manager or shell pipelines."
+    }
+  ],
+  "evidence_gaps": [
+    {
+      "gap_id": "botbuilder-wire-contract",
+      "area": "teams",
+      "detail": "Exact Bot Framework authentication and wire responses are delegated to botbuilder and have no repository-owned protocol tests.",
+      "required_follow_up": "Capture sanitized Bot Framework request/response traces before replacing botbuilder."
+    },
+    {
+      "gap_id": "copilot-sdk-events",
+      "area": "engine",
+      "detail": "Copilot SDK session event shapes, reconnect behavior, and model-specific errors are external and unpinned beyond package-lock.",
+      "required_follow_up": "Record SDK contract tests against the locked dependency and representative models."
+    },
+    {
+      "gap_id": "channel-live-traces",
+      "area": "channels",
+      "detail": "No live Telegram, Discord, WhatsApp, or Teams fixtures exist in the repository.",
+      "required_follow_up": "Capture sanitized provider payloads and failure responses before removing the TypeScript runtime."
+    },
+    {
+      "gap_id": "deployment-host-matrix",
+      "area": "deployment",
+      "detail": "run.sh behavior is not tested across Docker versions, architectures, rootless mode, or non-Linux hosts.",
+      "required_follow_up": "Execute the deployment acceptance matrix on supported Linux targets."
+    },
+    {
+      "gap_id": "admin-command-platform-output",
+      "area": "admin",
+      "detail": "Whitelisted command output varies by host utilities and Docker versions.",
+      "required_follow_up": "Treat output as opaque text and add host-specific snapshots only where compatibility requires them."
+    }
+  ]
+}

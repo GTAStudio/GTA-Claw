@@ -1,0 +1,20 @@
+{
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "endpoints": [
+    {
+      "endpoint_id": "invalid",
+      "method": "GET",
+      "path": "/invalid",
+      "registration": "always",
+      "rate_limit": "none",
+      "cases": [
+        {
+          "case_id": "invalid-status",
+          "condition": "Schema-negative fixture",
+          "status": 99,
+          "response": {}
+        }
+      ]
+    }
+  ]
+}

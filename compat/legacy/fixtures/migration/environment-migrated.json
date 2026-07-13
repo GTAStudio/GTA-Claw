@@ -1,0 +1,25 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "environment",
+    "source": ".env",
+    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": [],
+  "remaining_javascript": [],
+  "artifacts": [
+    {
+      "kind": "json5_config",
+      "path": "config/imported.json5",
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": []
+}

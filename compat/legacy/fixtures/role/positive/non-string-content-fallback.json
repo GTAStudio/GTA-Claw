@@ -1,0 +1,5 @@
+{
+  "content": 7,
+  "prompt": "A non-string content field falls back to this prompt.",
+  "model": "gpt-4o"
+}

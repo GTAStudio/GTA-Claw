@@ -1,0 +1,6 @@
+{
+  "name": "null_parameters",
+  "description": "Null is not an object accepted by the loader.",
+  "parameters": null,
+  "executeCode": "function run() { return true; }"
+}
