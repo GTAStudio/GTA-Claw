@@ -313,6 +313,11 @@ jobs:
           package="${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb"
           docker run --rm \
             --cap-drop ALL \
+            --cap-add CHOWN \
+            --cap-add DAC_OVERRIDE \
+            --cap-add FOWNER \
+            --cap-add SETGID \
+            --cap-add SETUID \
             --volume "$package:/tmp/gta-claw.deb:ro" \
             debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df \
             bash -c '
