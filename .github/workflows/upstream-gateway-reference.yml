@@ -90,14 +90,24 @@ jobs:
           test "$(node -p "require('./package.json').packageManager")" = \
             "pnpm@11.2.2+sha512.36e6621fad506178936455e70247b8808ef4ec25797a9f437a93281a020484e2607f6a469a22e982987c3dbb8866e3071514ab10a4a1749e06edcd1ec118436f"
 
-      - name: Install and build pinned official Gateway
+      - name: Activate integrity-pinned pnpm
         working-directory: _upstream/openclaw
         shell: bash
         run: |
           set -euo pipefail
           corepack enable
-          test "$(pnpm --version)" = "11.2.2"
-          test "$(pnpm config get ignore-scripts)" = "true"
+          corepack install
+          pnpm_version="$(pnpm --version)"
+          ignore_scripts="$(pnpm config get ignore-scripts)"
+          printf 'pnpm=%s ignore-scripts=%s\n' "$pnpm_version" "$ignore_scripts"
+          test "$pnpm_version" = "11.2.2"
+          test "$ignore_scripts" = "true"
+
+      - name: Install and build pinned official Gateway
+        working-directory: _upstream/openclaw
+        shell: bash
+        run: |
+          set -euo pipefail
           pnpm install --frozen-lockfile --ignore-scripts
           test -d node_modules
           if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
