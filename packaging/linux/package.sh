@@ -373,7 +373,6 @@ Summary:        GTA Claw native Rust headless prototype
 License:        MIT
 URL:            https://github.com/GTAStudio/GTA-Claw
 Source0:        gta-claw-rootfs.tar
-BuildArch:      $rpm_architecture
 Requires:       glibc >= 2.31
 Requires:       libgcc
 Requires:       systemd >= 249
@@ -415,7 +414,7 @@ SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     --define "_topdir $rpm_work" \
     --define "_source_filedigest_algorithm 8" \
     --define "_binary_filedigest_algorithm 8" \
-    --target "$rpm_architecture-linux" \
+    --target "$rpm_architecture" \
     "$rpm_spec"
 mapfile -t built_rpms < <(find "$rpm_work/RPMS" -type f -name '*.rpm' -print)
 [[ "${#built_rpms[@]}" -eq 1 ]] ||
