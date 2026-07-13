@@ -560,6 +560,30 @@ pub enum ClientId {
     Probe,
 }
 
+impl ClientId {
+    /// Returns the exact closed wire identity.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WebchatUi => "webchat-ui",
+            Self::ControlUi => "openclaw-control-ui",
+            Self::Tui => "openclaw-tui",
+            Self::Webchat => "webchat",
+            Self::Cli => "cli",
+            Self::GatewayClient => "gateway-client",
+            Self::MacOs => "openclaw-macos",
+            Self::Ios => "openclaw-ios",
+            Self::WatchOs => "openclaw-watchos",
+            Self::Android => "openclaw-android",
+            Self::NodeHost => "node-host",
+            Self::Worker => "openclaw-worker",
+            Self::Test => "test",
+            Self::Fingerprint => "fingerprint",
+            Self::Probe => "openclaw-probe",
+        }
+    }
+}
+
 /// Closed coarse client mode from `client-info.ts`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -580,6 +604,23 @@ pub enum ClientMode {
     Probe,
     /// Test.
     Test,
+}
+
+impl ClientMode {
+    /// Returns the exact closed wire identity.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Webchat => "webchat",
+            Self::Cli => "cli",
+            Self::Ui => "ui",
+            Self::Backend => "backend",
+            Self::Node => "node",
+            Self::Worker => "worker",
+            Self::Probe => "probe",
+            Self::Test => "test",
+        }
+    }
 }
 
 /// Closed configured authentication mode in a snapshot.

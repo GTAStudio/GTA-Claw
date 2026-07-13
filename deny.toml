@@ -5,13 +5,19 @@ all-features = true
 ignore = []
 
 [licenses]
-allow = ["Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-3.0", "Zlib"]
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
+# fastwebsockets 0.10 uses rand 0.8 solely for RFC 6455 client masking.
+# ring 0.17 pins windows-sys 0.52 for rustls cryptography internals.
+skip = [
+  { name = "rand_core", version = "0.6.4" },
+  { name = "windows-sys", version = "0.52.0" },
+]
 
 # SQLx 0.9 still uses the previous RustCrypto stack while claw-state uses the
 # latest stable SHA-2 API. SQLx also resolves two intentional hashbrown lines.

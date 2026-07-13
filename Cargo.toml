@@ -5,6 +5,7 @@ members = [
   "crates/claw-application",
   "crates/claw-config",
   "crates/claw-domain",
+  "crates/claw-gateway-client",
   "crates/claw-platform",
   "crates/claw-protocol",
   "crates/claw-security",
@@ -17,6 +18,7 @@ resolver = "3"
 claw-application = { path = "crates/claw-application", version = "0.1.0" }
 claw-config = { path = "crates/claw-config", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
+claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
