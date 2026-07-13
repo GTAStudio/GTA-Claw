@@ -145,6 +145,30 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "source-evidence-comma-boundary"
+        expected_message = "canonical feature/source evidence fingerprint mismatch"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $feature = @($ledger.features | Where-Object {
+                @($_.upstream_source.paths).Count -gt 1
+            } | Select-Object -First 1)[0]
+            $feature.upstream_source.paths = @((@($feature.upstream_source.paths) -join ","))
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "source-evidence-official-url"
+        expected_message = "canonical feature/source evidence fingerprint mismatch"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].upstream_source |
+                Add-Member -NotePropertyName "official_url" -NotePropertyValue "https://example.com/fabricated"
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
         name = "schema-required"
         expected_message = "missing required properties [domain]"
         mutate = {
@@ -203,6 +227,51 @@ $cases = @(
             $value = $ledger.features[0].feature_id
             $ledger.features[0].PSObject.Properties.Remove("feature_id")
             $ledger.features[0] | Add-Member -NotePropertyName "FEATURE_ID" -NotePropertyValue $value
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "schema-title-key-casing"
+        expected_message = "missing required properties [title]"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $value = $ledger.features[0].title
+            $ledger.features[0].PSObject.Properties.Remove("title")
+            $ledger.features[0] | Add-Member -NotePropertyName "Title" -NotePropertyValue $value
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "schema-property-name-ordinal"
+        expected_message = "missing required properties [title]"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $value = $ledger.features[0].title
+            $ledger.features[0].PSObject.Properties.Remove("title")
+            $ledger.features[0] |
+                Add-Member -NotePropertyName ("title" + [char]0x00AD) -NotePropertyValue $value
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "schema-pattern-casing"
+        expected_message = "does not match JSON Schema pattern"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].feature_id = ([string]$ledger.features[0].feature_id).ToUpperInvariant()
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "schema-enum-ordinal"
+        expected_message = "is not in its JSON Schema enum"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].tier = "tier" + [char]0x00AD + "_1"
             Save-FirstLedger $caseRoot $ledger
         }
     },
@@ -270,7 +339,7 @@ $cases = @(
     },
     [ordered]@{
         name = "acceptance-evidence"
-        expected_message = "must start unimplemented with an empty evidence placeholder"
+        expected_message = "canonical feature/source evidence fingerprint mismatch"
         mutate = {
             param($caseRoot)
             $ledger = Get-FirstLedger $caseRoot

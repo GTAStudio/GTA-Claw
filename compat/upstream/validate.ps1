@@ -46,21 +46,21 @@ $LedgerSpecs = @(
         ledger_id = "gateway-core"
         classification = "gateway_core"
         expected_features = 16
-        digest = "c2812699bb69e3460249dab1b5333172ea5303a0308a24251ff57dbe64fd4bc7"
+        digest = "4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d"
     },
     [ordered]@{
         path = "ledgers/official-integration.json"
         ledger_id = "official-integration"
         classification = "official_integration"
         expected_features = 13
-        digest = "08babe914a79ff7425c8e45555962a6ecf9a6a6d068c51dba2de91eee14f4de1"
+        digest = "01ac641cdcb208343bdbafa119ac6c2089c03a6ac23064351c5dae628eba1c47"
     },
     [ordered]@{
         path = "ledgers/official-client-interop.json"
         ledger_id = "official-client-interop"
         classification = "official_client_interop"
         expected_features = 18
-        digest = "523ae2e4eb83e06d779d0813bc2328691ba2d6a924573b40374088a7baa4b39d"
+        digest = "e2ba9299748d42d24f7b5d84a7a18af34a470ce260f40d5d3a20a9cddf288406"
     }
 )
 
@@ -73,7 +73,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "package_name", "delivery_class")
         allowed_fields = @("record_id", "id", "classification", "source_path", "package_name", "delivery_class")
         canonical_fields = @("record_id", "id", "classification", "source_path", "package_name", "delivery_class")
-        digest = "800a64620e10f354fe49ca56bb091ce757d098eb9dbe980e50ffadc1fff823ca"
+        digest = "abc4d4b787fedf403b3e4c0b32b6a79fc275eeb0f17c805052111581602f9cf4"
     }
     "skills" = [ordered]@{
         path = "inventories/skills.json"
@@ -83,7 +83,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "license")
         allowed_fields = @("record_id", "id", "classification", "source_path", "license")
         canonical_fields = @("record_id", "id", "classification", "source_path", "license")
-        digest = "aee321c19126ce19004499b0f3628445d732886e24852cd0d0e3d1e5d5bc9a14"
+        digest = "32190e03ec446183457fba09857b0bb744b70ad46963ccbbed8ac434aad3c3cb"
     }
     "gateway-protocol" = [ordered]@{
         path = "inventories/gateway-protocol.json"
@@ -93,7 +93,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "kind")
         allowed_fields = @("record_id", "id", "classification", "source_path", "kind", "scope", "advertised", "protocol_class")
         canonical_fields = @("record_id", "id", "classification", "source_path", "kind", "scope", "advertised", "protocol_class")
-        digest = "90417a3abc9c98bf482fd4f45540d45b131f67d431304cf0c9fac700326c2e02"
+        digest = "69c16fe2d025241e21e6c1dd1a92c7586af5cbcb26f02771b3a16b5f09cff9c9"
     }
     "config-domains" = [ordered]@{
         path = "inventories/config-domains.json"
@@ -103,7 +103,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path")
         allowed_fields = @("record_id", "id", "classification", "source_path")
         canonical_fields = @("record_id", "id", "classification", "source_path")
-        digest = "fa49ef6ea826a8eb86fbb61e7dcca6cdfd321a45845819d887c76f855883c278"
+        digest = "eaf225655042192ca83f83a4b6f61e88de1ad2e06a4c3121bfc4ef3b07b4001b"
     }
     "providers" = [ordered]@{
         path = "inventories/providers.json"
@@ -113,7 +113,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "plugin_id")
         allowed_fields = @("record_id", "id", "classification", "source_path", "plugin_id")
         canonical_fields = @("record_id", "id", "classification", "source_path", "plugin_id")
-        digest = "47bf1b81f068f26b1a49b207c0c988d08fcdcb8f0a10b5be098a6cc9dc8735de"
+        digest = "97101869f0fbb0e73e78812f50f40876cf02fd1e1c3590a04a64f42dcce8eaec"
     }
     "channels" = [ordered]@{
         path = "inventories/channels.json"
@@ -123,7 +123,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "provenance")
         allowed_fields = @("record_id", "id", "classification", "source_path", "plugin_id", "package_name", "catalog_package", "catalog_source_path", "provenance")
         canonical_fields = @("record_id", "id", "classification", "source_path", "plugin_id", "package_name", "catalog_package", "catalog_source_path", "provenance")
-        digest = "e1c1d482c347b3523e9d787c677cfe376c7cd7ae461e7b6a026e93f1578b111a"
+        digest = "9004c28b17a1b5bcd4bb274078c50fa5c5890bf9d0f550c32f2462f3e8e19d50"
     }
     "http-sse-endpoints" = [ordered]@{
         path = "inventories/http-sse-endpoints.json"
@@ -133,7 +133,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "method", "path", "streaming")
         allowed_fields = @("record_id", "id", "classification", "source_path", "method", "path", "streaming")
         canonical_fields = @("record_id", "id", "classification", "source_path", "method", "path", "streaming")
-        digest = "48a5718dc84e709f95bebf39309962fd62a1b475e64c988f825e5a7d33776707"
+        digest = "b58c884627ef580c0b1f41d861711daf122c990f7926303c46e680a7463b2f16"
     }
     "clients" = [ordered]@{
         path = "inventories/clients.json"
@@ -143,7 +143,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "kind")
         allowed_fields = @("record_id", "id", "classification", "source_path", "kind")
         canonical_fields = @("record_id", "id", "classification", "source_path", "kind")
-        digest = "f9685499874467491ded7572013c45c76e37434eb0df55169ee333dc98ad26f7"
+        digest = "251782ee9aaac756595287a76c689af611a082123f6deb66160c2d8e776e98f1"
     }
     "migrations" = [ordered]@{
         path = "inventories/migrations.json"
@@ -153,7 +153,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "package_path", "kind")
         allowed_fields = @("record_id", "id", "classification", "source_path", "package_path", "kind")
         canonical_fields = @("record_id", "id", "classification", "source_path", "package_path", "kind")
-        digest = "c6033ec9f3f2709f1ca11474e5c48c27a49f65835ac6bf46ddb89850a6f82dbd"
+        digest = "8a8da66bc4d3d6d6e728b8e5b052358ee4c4c0c99093d3f8244712ae86b4d2fb"
     }
     "release-deployment" = [ordered]@{
         path = "inventories/release-deployment.json"
@@ -163,7 +163,7 @@ $InventorySpecs = [ordered]@{
         required_fields = @("record_id", "id", "classification", "source_path", "kind")
         allowed_fields = @("record_id", "id", "classification", "source_path", "kind")
         canonical_fields = @("record_id", "id", "classification", "source_path", "kind")
-        digest = "4e1e0b1a5f3dfa5e5f95c2917cc60aa5b704ddda3813ac3cb0d07157b7da7cd9"
+        digest = "b65ed03dd4e285593855043a5adb0ed79b5fdc6854cb464f339a5ee3799ae945"
     }
 }
 
@@ -216,12 +216,35 @@ function Get-PropertyNames {
     return @($Value.PSObject.Properties.Name)
 }
 
+function Test-OrdinalStringEqual {
+    param(
+        [AllowNull()]
+        [string]$Left,
+        [AllowNull()]
+        [string]$Right
+    )
+    return [StringComparer]::Ordinal.Equals($Left, $Right)
+}
+
+function Test-OrdinalContains {
+    param(
+        [string[]]$Values,
+        [string]$Expected
+    )
+    foreach ($value in $Values) {
+        if (Test-OrdinalStringEqual $value $Expected) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Has-Property {
     param(
         [object]$Value,
         [string]$Name
     )
-    return (Get-PropertyNames $Value) -ccontains $Name
+    return Test-OrdinalContains (Get-PropertyNames $Value) $Name
 }
 
 function Get-PropertyValue {
@@ -229,15 +252,27 @@ function Get-PropertyValue {
         [object]$Value,
         [string]$Name
     )
+    $found = $false
+    $result = $null
     if ($Value -is [System.Collections.IDictionary]) {
-        $result = $Value[$Name]
-    } else {
-        $property = $Value.PSObject.Properties[$Name]
-        if ($null -eq $property) {
-            $result = $null
-        } else {
-            $result = $property.Value
+        foreach ($key in $Value.Keys) {
+            if (Test-OrdinalStringEqual ([string]$key) $Name) {
+                $result = $Value[$key]
+                $found = $true
+                break
+            }
         }
+    } elseif ($null -ne $Value) {
+        foreach ($property in $Value.PSObject.Properties) {
+            if (Test-OrdinalStringEqual $property.Name $Name) {
+                $result = $property.Value
+                $found = $true
+                break
+            }
+        }
+    }
+    if (-not $found) {
+        return $null
     }
     if ($result -is [System.Array]) {
         return (, $result)
@@ -252,8 +287,8 @@ function Assert-ExactPropertySet {
         [string]$Context
     )
     $actual = @(Get-PropertyNames $Value)
-    $missing = @($Expected | Where-Object { $actual -cnotcontains $_ })
-    $unexpected = @($actual | Where-Object { $Expected -cnotcontains $_ })
+    $missing = @($Expected | Where-Object { -not (Test-OrdinalContains $actual $_) })
+    $unexpected = @($actual | Where-Object { -not (Test-OrdinalContains $Expected $_) })
     if ($missing.Count -gt 0 -or $unexpected.Count -gt 0) {
         Fail "$Context property mismatch; missing=[$($missing -join ',')], unexpected=[$($unexpected -join ',')]"
     }
@@ -266,21 +301,10 @@ function Assert-RequiredProperties {
         [string]$Context
     )
     $actual = @(Get-PropertyNames $Value)
-    $missing = @($Required | Where-Object { $actual -cnotcontains $_ })
+    $missing = @($Required | Where-Object { -not (Test-OrdinalContains $actual $_) })
     if ($missing.Count -gt 0) {
         Fail "$Context missing required properties [$($missing -join ',')]"
     }
-}
-
-function Convert-ScalarText {
-    param([object]$Value)
-    if ($null -eq $Value) {
-        return ""
-    }
-    if ($Value -is [bool]) {
-        return $Value.ToString().ToLowerInvariant()
-    }
-    return [string]$Value
 }
 
 function Get-Sha256Text {
@@ -300,45 +324,63 @@ function Get-ObjectDigest {
     return Get-Sha256Text $json
 }
 
+function ConvertTo-CanonicalJson {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+    if ($null -eq $Value) {
+        return "null"
+    }
+    if ($Value -is [System.Array]) {
+        [string[]]$elements = @($Value | ForEach-Object { ConvertTo-CanonicalJson $_ })
+        return "[" + ($elements -join ",") + "]"
+    }
+    if (Test-JsonObject $Value) {
+        [string[]]$names = @(Get-PropertyNames $Value)
+        [Array]::Sort($names, [StringComparer]::Ordinal)
+        [string[]]$members = @(
+            $names | ForEach-Object {
+                $encodedName = ConvertTo-Json -InputObject $_ -Compress
+                $encodedValue = ConvertTo-CanonicalJson (Get-PropertyValue $Value $_)
+                "${encodedName}:${encodedValue}"
+            }
+        )
+        return "{" + ($members -join ",") + "}"
+    }
+    return ConvertTo-Json -InputObject $Value -Compress
+}
+
+function Get-CanonicalArrayDigest {
+    param([object[]]$Items)
+    [string[]]$elements = @($Items | ForEach-Object { ConvertTo-CanonicalJson $_ })
+    [Array]::Sort($elements, [StringComparer]::Ordinal)
+    return Get-Sha256Text ("[" + ($elements -join ",") + "]")
+}
+
 function Get-InventoryDigest {
     param(
         [object[]]$Items,
         [string[]]$Fields
     )
-    [string[]]$lines = @(
+    [object[]]$canonicalRows = @(
         $Items | ForEach-Object {
             $row = $_
-            (($Fields | ForEach-Object {
-                "$_=$(Convert-ScalarText (Get-PropertyValue $row $_))"
-            }) -join [char]31)
+            $canonicalRow = [ordered]@{}
+            foreach ($field in $Fields) {
+                if (Has-Property $row $field) {
+                    $canonicalRow[$field] = Get-PropertyValue $row $field
+                }
+            }
+            [pscustomobject]$canonicalRow
         }
     )
-    [Array]::Sort($lines, [StringComparer]::Ordinal)
-    return Get-Sha256Text ($lines -join "`n")
+    return Get-CanonicalArrayDigest $canonicalRows
 }
 
 function Get-FeatureDigest {
     param([object[]]$Features)
-    [string[]]$lines = @(
-        $Features | ForEach-Object {
-            @(
-                [string]$_.feature_id,
-                [string]$_.title,
-                [string]$_.domain,
-                [string]$_.tier,
-                [string]$_.profile,
-                [string]$_.classification,
-                [string]$_.upstream_source.repository,
-                (@($_.upstream_source.paths) -join ","),
-                [string]$_.status,
-                [string]$_.acceptance_evidence.status,
-                [string]$_.acceptance_evidence.required,
-                (@($_.known_differences) -join ",")
-            ) -join [char]31
-        }
-    )
-    [Array]::Sort($lines, [StringComparer]::Ordinal)
-    return Get-Sha256Text ($lines -join "`n")
+    return Get-CanonicalArrayDigest $Features
 }
 
 function Test-JsonValueEqual {
@@ -346,8 +388,7 @@ function Test-JsonValueEqual {
         [object]$Left,
         [object]$Right
     )
-    return (ConvertTo-Json -InputObject $Left -Compress -Depth 50) -ceq
-        (ConvertTo-Json -InputObject $Right -Compress -Depth 50)
+    return Test-OrdinalStringEqual (ConvertTo-CanonicalJson $Left) (ConvertTo-CanonicalJson $Right)
 }
 
 function Test-JsonObject {
@@ -363,7 +404,7 @@ function Resolve-LocalSchemaReference {
         [string]$Reference,
         [object]$RootSchema
     )
-    if (-not $Reference.StartsWith("#/")) {
+    if (-not $Reference.StartsWith("#/", [StringComparison]::Ordinal)) {
         Fail "unsupported non-local JSON Schema reference $Reference"
     }
     $current = $RootSchema
@@ -394,7 +435,7 @@ function Assert-JsonSchema {
 
     if (Has-Property $SchemaNode "type") {
         $expectedType = [string](Get-PropertyValue $SchemaNode "type")
-        $typeMatches = switch ($expectedType) {
+        $typeMatches = switch -CaseSensitive ($expectedType) {
             "object" { Test-JsonObject $Instance; break }
             "array" { $Instance -is [System.Array]; break }
             "string" { $Instance -is [string]; break }
@@ -448,11 +489,11 @@ function Assert-JsonSchema {
         }
         if (Has-Property $SchemaNode "pattern") {
             $pattern = [string](Get-PropertyValue $SchemaNode "pattern")
-            if ($Instance -cnotmatch $pattern) {
+            if (-not ($Instance -cmatch $pattern)) {
                 Fail "$Path does not match JSON Schema pattern $pattern"
             }
         }
-        if ((Get-PropertyValue $SchemaNode "format") -ceq "uri") {
+        if (Test-OrdinalStringEqual ([string](Get-PropertyValue $SchemaNode "format")) "uri") {
             $uri = $null
             if ($Instance -cnotmatch "^[A-Za-z][A-Za-z0-9+.-]*:[^\s\\]*$" -or
                 -not [Uri]::IsWellFormedUriString($Instance, [UriKind]::Absolute) -or
@@ -470,7 +511,10 @@ function Assert-JsonSchema {
         $propertySchemas = Get-PropertyValue $SchemaNode "properties"
         if ((Get-PropertyValue $SchemaNode "additionalProperties") -eq $false) {
             $allowed = if ($null -eq $propertySchemas) { @() } else { @(Get-PropertyNames $propertySchemas) }
-            $unexpected = @((Get-PropertyNames $Instance) | Where-Object { $allowed -cnotcontains $_ })
+            $unexpected = @(
+                (Get-PropertyNames $Instance) |
+                    Where-Object { -not (Test-OrdinalContains $allowed $_) }
+            )
             if ($unexpected.Count -gt 0) {
                 Fail "$Path contains JSON Schema additional properties [$($unexpected -join ',')]"
             }
@@ -499,9 +543,9 @@ function Assert-JsonSchema {
             }
         }
         if ((Get-PropertyValue $SchemaNode "uniqueItems") -eq $true) {
-            $seen = New-Object System.Collections.Generic.HashSet[string]
+            $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             foreach ($item in $items) {
-                $identity = ConvertTo-Json -InputObject $item -Compress -Depth 50
+                $identity = ConvertTo-CanonicalJson $item
                 if (-not $seen.Add($identity)) {
                     Fail "$Path violates JSON Schema uniqueItems"
                 }
@@ -522,7 +566,7 @@ function Assert-RelativeSourcePath {
         [string]$Context
     )
     if ([string]::IsNullOrWhiteSpace($Path) -or
-        $Path -notmatch '^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$') {
+        -not ($Path -cmatch '^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$')) {
         Fail "$Context has invalid upstream-relative source path '$Path'"
     }
 }
@@ -905,7 +949,7 @@ if ($schema.'$schema' -ne "https://json-schema.org/draft/2020-12/schema" -or
 $manifest = $documents["manifest.json"]
 Assert-ManifestDeclarations $manifest
 
-$featureIds = New-Object System.Collections.Generic.HashSet[string]
+$featureIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $featureCount = 0
 $missingEvidenceCount = 0
 foreach ($spec in $LedgerSpecs) {
@@ -946,7 +990,7 @@ if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47 -or $missingEvidenceCount 
     Fail "fixed ledger totals must be 3 ledgers, 47 features, and 47 missing evidence placeholders"
 }
 
-$globalRecordIds = New-Object System.Collections.Generic.HashSet[string]
+$globalRecordIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $inventoryRowCount = 0
 $derivedByInventory = @{}
 foreach ($inventoryId in $InventorySpecs.Keys) {
@@ -969,7 +1013,7 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         Fail "$($spec.path) must contain exactly $($spec.expected_items) rows"
     }
 
-    $naturalIdentities = New-Object System.Collections.Generic.HashSet[string]
+    $naturalIdentities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     for ($index = 0; $index -lt $items.Count; $index += 1) {
         $item = $items[$index]
         $context = "$($spec.path).items[$index]"
@@ -992,9 +1036,11 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         if (-not $globalRecordIds.Add([string]$item.record_id)) {
             Fail "duplicate global inventory record_id $($item.record_id)"
         }
-        $naturalIdentity = (@($spec.natural_key_fields) | ForEach-Object {
-            "$_=$(Convert-ScalarText (Get-PropertyValue $item $_))"
-        }) -join [char]31
+        $naturalIdentityFields = [ordered]@{}
+        foreach ($field in @($spec.natural_key_fields)) {
+            $naturalIdentityFields[$field] = Get-PropertyValue $item $field
+        }
+        $naturalIdentity = ConvertTo-CanonicalJson ([pscustomobject]$naturalIdentityFields)
         if (-not $naturalIdentities.Add($naturalIdentity)) {
             Fail "$($spec.path) duplicate natural identity '$naturalIdentity'"
         }
