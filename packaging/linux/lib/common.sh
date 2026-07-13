@@ -301,6 +301,17 @@ initialize_output_root() {
   assert_output_root_owned
 }
 
+adopt_safe_output_root() {
+  [[ "${SAFEIO_ACTIVE:-0}" == "1" ]] ||
+    die "safe output adoption requires an inherited directory capability"
+  [[ "$OUTPUT_ROOT" == "/proc/self/fd/$SAFEIO_OUTPUT_FD" ]] ||
+    die "OUTPUT_ROOT does not match inherited safeio capability"
+  "$SAFEIO_HELPER" check "$SAFEIO_OUTPUT_FD"
+  OUTPUT_ROOT_ID="$(output_identity "$OUTPUT_ROOT")"
+  OUTPUT_LOCK_HELD=1
+  assert_output_root_owned
+}
+
 assert_output_root_owned() {
   local target
   [[ "$OUTPUT_LOCK_HELD" -eq 1 ]] || die "exclusive output lock is not held"

@@ -9,6 +9,7 @@ source "$SCRIPT_DIR/lib/build-manifest.sh"
 source "$SCRIPT_DIR/lib/oci-validation.sh"
 
 require_linux
+adopt_safe_output_root
 for tool in cpio cmp dpkg-deb jq readelf rpm rpm2cpio sha256sum stat tar; do
   require_tool "$tool"
 done
