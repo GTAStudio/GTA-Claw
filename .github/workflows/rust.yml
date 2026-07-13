@@ -55,6 +55,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -84,6 +86,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Install MSRV toolchain
         run: rustup toolchain install 1.94.0 --profile minimal
@@ -106,6 +110,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Check formatting
         run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
@@ -131,6 +137,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Assert Linux desktop graph excludes Slint
         shell: bash
@@ -160,6 +168,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Check dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
@@ -168,23 +178,34 @@ jobs:
           command: check
           manifest-path: ./Cargo.toml
 
-      - name: Audit advisories
+      - name: Audit root lockfile
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Audit Windows desktop advisories
+      - name: Audit desktop lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: desktop
+
+      - name: Test patched wayland-scanner parser
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/wayland-scanner-target
+        run: cargo test --manifest-path desktop/vendor/wayland-scanner-0.31.10/Cargo.toml --locked --lib parse::tests
+
+      - name: Check Windows desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
-          arguments: --target x86_64-pc-windows-msvc
+          arguments: --config desktop/deny.toml --target x86_64-pc-windows-msvc
           command: check
-          command-arguments: --warn unmaintained advisories
+          command-arguments: --warn unmaintained advisories licenses sources
           manifest-path: ./desktop/Cargo.toml
 
-      - name: Audit macOS desktop advisories
+      - name: Check macOS desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
-          arguments: --target aarch64-apple-darwin
+          arguments: --config desktop/deny.toml --target aarch64-apple-darwin
           command: check
-          command-arguments: --warn unmaintained advisories
+          command-arguments: --warn unmaintained advisories licenses sources
           manifest-path: ./desktop/Cargo.toml

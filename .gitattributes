@@ -5,3 +5,4 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 Cargo.lock text eol=lf
+desktop/vendor/wayland-scanner-0.31.10/** text eol=lf

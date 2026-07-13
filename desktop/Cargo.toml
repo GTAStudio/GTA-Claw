@@ -1,5 +1,6 @@
 [workspace]
 members = ["apps/gta-claw-desktop"]
+exclude = ["vendor/wayland-scanner-0.31.10"]
 resolver = "3"
 
 [workspace.package]
@@ -22,6 +23,9 @@ unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner-0.31.10" }
 
 [profile.release]
 codegen-units = 1
