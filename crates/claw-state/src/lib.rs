@@ -1070,6 +1070,8 @@ mod tests {
             .err()
             .expect("hard-link alias remains rejected after the owner closes");
         assert!(matches!(error, StateError::InvalidPath { .. }));
+        #[cfg(unix)]
+        fs::remove_file(&alias).expect("remove rejected Unix hard-link alias");
         open(&path)
             .await
             .close()
