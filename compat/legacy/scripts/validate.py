@@ -58,7 +58,7 @@ HTTP_CASE_CONTRACTS = {
         '["object",[["chat",["string"]],["deviceAuth",["string"]],'
         '["health",["string"]]]]],["examples",["object",'
         '[["chatCurl",["string"]]]]],["service",["string"]],["status",'
-        '["string"]],["tips",["array",[["string"]]]]]]',
+        '["string"]],["tips",["array",[["string"],["string"]]]]]]',
     ),
     ("GET", "/health", "healthy-unauthenticated"): (
         200,
@@ -117,13 +117,16 @@ HTTP_CASE_CONTRACTS = {
         '["integer"]],["version",["string"]]]]],["os",["object",'
         '[["arch",["string"]],["cpus",["integer"]],["freeMemory_mb",'
         '["integer"]],["hostname",["string"]],["loadavg",["array",'
-        '[["number"]]]],["platform",["string"]],["totalMemory_mb",'
+        '[["number"],["number"],["number"]]]],["platform",["string"]],'
+        '["totalMemory_mb",'
         '["integer"]],["uptime_s",["integer"]]]]]]]',
     ),
     ("POST", "/admin/exec", "forbidden"): (403, HTTP_SHAPE_ERROR),
     ("POST", "/admin/exec", "unknown-action"): (
         400,
-        '["object",[["allowed",["array",[["string"]]]],'
+        '["object",[["allowed",["array",[["string"],["string"],["string"],'
+        '["string"],["string"],["string"],["string"],["string"],["string"],'
+        '["string"],["string"],["string"]]]],'
         '["error",["string"]]]]',
     ),
     ("POST", "/admin/exec", "command-success"): (
@@ -429,17 +432,9 @@ def http_response_shape_descriptor(response):
     if isinstance(response, str):
         return ("string",)
     if isinstance(response, list):
-        item_shapes = {http_response_shape_descriptor(item) for item in response}
         return (
             "array",
-            tuple(
-                sorted(
-                    item_shapes,
-                    key=lambda shape: json.dumps(
-                        shape, ensure_ascii=True, separators=(",", ":")
-                    ),
-                )
-            ),
+            tuple(http_response_shape_descriptor(item) for item in response),
         )
     if isinstance(response, dict):
         return (
@@ -457,6 +452,47 @@ def http_response_shape(response):
         http_response_shape_descriptor(response),
         ensure_ascii=True,
         separators=(",", ":"),
+    )
+
+
+def validator_owned_http_case(http_examples, contract_key):
+    ensure(
+        contract_key in HTTP_CASE_CONTRACTS,
+        f"HTTP regression target is not validator-owned: {contract_key!r}",
+    )
+    method, path, case_id = contract_key
+    matches = [
+        (endpoint, case)
+        for endpoint in http_examples["endpoints"]
+        if endpoint["method"] == method and endpoint["path"] == path
+        for case in endpoint["cases"]
+        if case["case_id"] == case_id
+    ]
+    ensure(
+        len(matches) == 1,
+        f"HTTP regression target {contract_key!r} must occur exactly once; "
+        f"found {len(matches)}",
+    )
+    return matches[0]
+
+
+def ensure_schema_valid_http_fixture(label, http_examples, validator):
+    errors = sorted(
+        validator.iter_errors(http_examples),
+        key=lambda error: list(error.path),
+    )
+    ensure(
+        not errors,
+        f"{label} mutation is not schema-valid: {errors[0].message if errors else ''}",
+    )
+
+
+def expect_schema_valid_http_error(label, http_examples, validator, message_contains):
+    ensure_schema_valid_http_fixture(label, http_examples, validator)
+    expect_contract_error(
+        label,
+        lambda: validate_http(http_examples),
+        message_contains,
     )
 
 
@@ -720,7 +756,7 @@ def validate_migration(contract):
     )
 
 
-def run_regression_self_tests(mapping, coverage, http_examples):
+def run_http_regression_self_tests(http_examples, http_validator):
     ensure(
         http_response_shape({"a,b": 1})
         != http_response_shape({"a": 1, "b": 1}),
@@ -731,7 +767,149 @@ def run_regression_self_tests(mapping, coverage, http_examples):
         != http_response_shape({"nested": {"authenticated": "false"}}),
         "HTTP response-shape encoding loses nested value types",
     )
+    ensure(
+        http_response_shape([1, "x"]) != http_response_shape(["x", 1]),
+        "HTTP response-shape encoding loses array order",
+    )
+    ensure(
+        http_response_shape([1]) != http_response_shape([1, 1]),
+        "HTTP response-shape encoding loses array multiplicity",
+    )
+    ensure(
+        http_response_shape([[1, "x"]]) != http_response_shape([["x", 1]]),
+        "HTTP response-shape encoding loses nested array order",
+    )
+    ensure(
+        http_response_shape([[1]]) != http_response_shape([[1, 1]]),
+        "HTTP response-shape encoding loses nested array multiplicity",
+    )
 
+    root_key = ("GET", "/", "unauthenticated-no-channels")
+    already_authenticated_key = ("GET", "/auth/device", "already-authenticated")
+    disabled_key = ("GET", "/auth/device", "disabled")
+    unexpected_error_key = ("GET", "/auth/device", "unexpected-error")
+    endpoint_error_key = ("POST", "/chat", "endpoint-error")
+
+    missing_target = copy.deepcopy(http_examples)
+    missing_endpoint, missing_case = validator_owned_http_case(
+        missing_target, unexpected_error_key
+    )
+    missing_endpoint["cases"].remove(missing_case)
+    ensure_schema_valid_http_fixture(
+        "missing HTTP regression target", missing_target, http_validator
+    )
+    expect_contract_error(
+        "missing HTTP regression target",
+        lambda: validator_owned_http_case(missing_target, unexpected_error_key),
+        "must occur exactly once; found 0",
+    )
+
+    duplicate_target = copy.deepcopy(http_examples)
+    duplicate_endpoint, duplicate_source = validator_owned_http_case(
+        duplicate_target, endpoint_error_key
+    )
+    duplicate_endpoint["cases"].append(copy.deepcopy(duplicate_source))
+    ensure_schema_valid_http_fixture(
+        "duplicate HTTP regression target", duplicate_target, http_validator
+    )
+    expect_contract_error(
+        "duplicate HTTP regression target",
+        lambda: validator_owned_http_case(duplicate_target, endpoint_error_key),
+        "must occur exactly once; found 2",
+    )
+
+    invented_route = copy.deepcopy(http_examples)
+    route_endpoint, _ = validator_owned_http_case(invented_route, root_key)
+    route_endpoint["path"] = "/invented"
+    expect_schema_valid_http_error(
+        "invented documented HTTP route",
+        invented_route,
+        http_validator,
+        "HTTP route inventory mismatch",
+    )
+
+    changed_status = copy.deepcopy(http_examples)
+    _, status_case = validator_owned_http_case(changed_status, root_key)
+    status_case["status"] = 599
+    expect_schema_valid_http_error(
+        "changed HTTP case status with stable counts",
+        changed_status,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    changed_shape = copy.deepcopy(http_examples)
+    _, shape_case = validator_owned_http_case(changed_shape, root_key)
+    response = shape_case["response"]
+    ensure(
+        isinstance(response, dict)
+        and isinstance(response.get("authenticated"), bool),
+        f"HTTP regression target {root_key!r} lacks boolean authenticated response",
+    )
+    response["authenticated"] = "false"
+    expect_schema_valid_http_error(
+        "changed HTTP response shape with stable counts",
+        changed_shape,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    swapped_cases = copy.deepcopy(http_examples)
+    _, already_authenticated = validator_owned_http_case(
+        swapped_cases, already_authenticated_key
+    )
+    _, disabled = validator_owned_http_case(swapped_cases, disabled_key)
+    already_authenticated["case_id"], disabled["case_id"] = (
+        disabled["case_id"],
+        already_authenticated["case_id"],
+    )
+    expect_schema_valid_http_error(
+        "swapped HTTP cases with stable counts",
+        swapped_cases,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    missing_case_fixture = copy.deepcopy(http_examples)
+    missing_case_endpoint, missing_case = validator_owned_http_case(
+        missing_case_fixture, unexpected_error_key
+    )
+    missing_case_endpoint["cases"].remove(missing_case)
+    expect_schema_valid_http_error(
+        "missing HTTP case",
+        missing_case_fixture,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    extra_case_fixture = copy.deepcopy(http_examples)
+    extra_case_endpoint, extra_case_source = validator_owned_http_case(
+        extra_case_fixture, endpoint_error_key
+    )
+    invented_case = copy.deepcopy(extra_case_source)
+    invented_case["case_id"] = "invented-extra"
+    extra_case_endpoint["cases"].append(invented_case)
+    expect_schema_valid_http_error(
+        "extra HTTP case",
+        extra_case_fixture,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    duplicate_case_fixture = copy.deepcopy(http_examples)
+    duplicate_case_endpoint, duplicate_case_source = validator_owned_http_case(
+        duplicate_case_fixture, endpoint_error_key
+    )
+    duplicate_case_endpoint["cases"].append(copy.deepcopy(duplicate_case_source))
+    expect_schema_valid_http_error(
+        "duplicate HTTP case",
+        duplicate_case_fixture,
+        http_validator,
+        "duplicate HTTP case ID",
+    )
+
+
+def run_regression_self_tests(mapping, coverage, http_examples, schemas, registry):
     role_result = role_source_outcome(
         {
             "content_type": "application/json",
@@ -775,69 +953,19 @@ def run_regression_self_tests(mapping, coverage, http_examples):
         lambda: validate_config(duplicate_alias),
     )
 
-    invented_route = copy.deepcopy(http_examples)
-    invented_route["endpoints"][0]["path"] = "/invented"
-    expect_contract_error(
-        "invented documented HTTP route",
-        lambda: validate_http(invented_route),
-        "HTTP route inventory mismatch",
-    )
+    http_schema = schemas["http-examples.schema.json"]
+    http_validator = validator_for(http_schema)(http_schema, registry=registry)
+    run_http_regression_self_tests(http_examples, http_validator)
 
-    changed_status = copy.deepcopy(http_examples)
-    changed_status["endpoints"][0]["cases"][0]["status"] = 599
-    expect_contract_error(
-        "changed HTTP case status with stable counts",
-        lambda: validate_http(changed_status),
-        "HTTP case contract mismatch",
+    reordered_http_examples = copy.deepcopy(http_examples)
+    reordered_http_examples["endpoints"].reverse()
+    for endpoint in reordered_http_examples["endpoints"]:
+        endpoint["cases"].reverse()
+    ensure_schema_valid_http_fixture(
+        "reordered HTTP fixture", reordered_http_examples, http_validator
     )
-
-    changed_shape = copy.deepcopy(http_examples)
-    changed_shape["endpoints"][0]["cases"][0]["response"]["authenticated"] = "false"
-    expect_contract_error(
-        "changed HTTP response shape with stable counts",
-        lambda: validate_http(changed_shape),
-        "HTTP case contract mismatch",
-    )
-
-    swapped_cases = copy.deepcopy(http_examples)
-    device_cases = swapped_cases["endpoints"][2]["cases"]
-    device_cases[0]["case_id"], device_cases[1]["case_id"] = (
-        device_cases[1]["case_id"],
-        device_cases[0]["case_id"],
-    )
-    expect_contract_error(
-        "swapped HTTP cases with stable counts",
-        lambda: validate_http(swapped_cases),
-        "HTTP case contract mismatch",
-    )
-
-    missing_case = copy.deepcopy(http_examples)
-    missing_case["endpoints"][2]["cases"].pop()
-    expect_contract_error(
-        "missing HTTP case",
-        lambda: validate_http(missing_case),
-        "HTTP case contract mismatch",
-    )
-
-    extra_case = copy.deepcopy(http_examples)
-    invented_case = copy.deepcopy(extra_case["endpoints"][3]["cases"][-1])
-    invented_case["case_id"] = "invented-extra"
-    extra_case["endpoints"][3]["cases"].append(invented_case)
-    expect_contract_error(
-        "extra HTTP case",
-        lambda: validate_http(extra_case),
-        "HTTP case contract mismatch",
-    )
-
-    duplicate_case = copy.deepcopy(http_examples)
-    duplicate_case["endpoints"][3]["cases"].append(
-        copy.deepcopy(duplicate_case["endpoints"][3]["cases"][-1])
-    )
-    expect_contract_error(
-        "duplicate HTTP case",
-        lambda: validate_http(duplicate_case),
-        "duplicate HTTP case ID",
-    )
+    validate_http(reordered_http_examples)
+    run_http_regression_self_tests(reordered_http_examples, http_validator)
 
     expect_contract_error(
         "structural-only evidence range",
@@ -881,7 +1009,7 @@ def main():
         skill_count = validate_skills(schemas, registry, skills)
         role_source_count = validate_role_sources()
         validate_migration(contract)
-        run_regression_self_tests(mapping, coverage, http_examples)
+        run_regression_self_tests(mapping, coverage, http_examples, schemas, registry)
 
         result = {
             "status": "ok",
