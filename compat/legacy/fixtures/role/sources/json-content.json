@@ -1,0 +1,12 @@
+{
+  "content_type": "application/json; charset=utf-8",
+  "body": {
+    "content": "JSON role content",
+    "model": "gpt-4o"
+  },
+  "expected": {
+    "outcome": "loaded_json",
+    "content": "JSON role content",
+    "model": "gpt-4o"
+  }
+}

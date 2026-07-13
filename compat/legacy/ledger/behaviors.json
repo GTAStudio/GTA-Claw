@@ -1,0 +1,615 @@
+{
+  "$schema": "../schemas/behavior-inventory.schema.json",
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "behaviors": [
+    {
+      "behavior_id": "behavior.config.booleans",
+      "feature_id": "legacy.config.runtime",
+      "classification": "preserved",
+      "summary": "Boolean environment values accept only exact lowercase true or false; absence uses each declared default.",
+      "source": { "path": "src/config.ts", "line_start": 112, "line_end": 118 }
+    },
+    {
+      "behavior_id": "behavior.config.integers",
+      "feature_id": "legacy.config.runtime",
+      "classification": "preserved",
+      "summary": "Integer values use Number.parseInt base 10, reject non-finite results, and enforce per-setting bounds; trailing non-numeric text is therefore accepted after an integer prefix.",
+      "source": { "path": "src/config.ts", "line_start": 90, "line_end": 110 }
+    },
+    {
+      "behavior_id": "behavior.config.urls",
+      "feature_id": "legacy.config.runtime",
+      "classification": "preserved",
+      "summary": "AGENT_ROLE_URL is required and http/https-only; ENABLED_SKILLS is a trimmed comma-separated list whose nonempty entries are individually http/https-only.",
+      "source": { "path": "src/config.ts", "line_start": 61, "line_end": 88 }
+    },
+    {
+      "behavior_id": "behavior.config.domains",
+      "feature_id": "legacy.config.runtime",
+      "classification": "preserved",
+      "summary": "ALLOWED_SKILL_DOMAINS is comma-split, trimmed, lowercased, de-duplicated in insertion order, and defaults to an empty allow-all list.",
+      "source": { "path": "src/config.ts", "line_start": 125, "line_end": 136 }
+    },
+    {
+      "behavior_id": "behavior.config.channel-requirements",
+      "feature_id": "legacy.config.runtime",
+      "classification": "preserved",
+      "summary": "Enabled Teams requires both Microsoft credentials; enabled Telegram requires its token; enabled Discord requires its token; enabled WhatsApp requires verify, access, and phone-number tokens.",
+      "source": { "path": "src/config.ts", "line_start": 190, "line_end": 214 }
+    },
+    {
+      "behavior_id": "behavior.config.defaults",
+      "feature_id": "legacy.config.runtime",
+      "classification": "preserved",
+      "summary": "Runtime defaults are port 3978, info logging, 3600000 ms session TTL, 100 sessions, gpt-4o, 30000 ms skill timeout, 120000 ms SDK timeout, rate 30, localhost domain, and false auto-update/trust-proxy.",
+      "source": { "path": "src/config.ts", "line_start": 241, "line_end": 280 }
+    },
+    {
+      "behavior_id": "behavior.auth.pat-startup",
+      "feature_id": "legacy.auth.pat",
+      "classification": "preserved",
+      "summary": "A nonempty trimmed GITHUB_TOKEN activates the Copilot engine during startup; without a PAT, Device Flow must be enabled.",
+      "source": { "path": "src/index.ts", "line_start": 97, "line_end": 112 }
+    },
+    {
+      "behavior_id": "behavior.auth.engine-swap",
+      "feature_id": "legacy.auth.pat",
+      "classification": "compatibility_shim",
+      "summary": "Token activation starts and pings a replacement engine before swapping it in, then stops the previous engine; concurrent activations serialize through the current switch promise.",
+      "source": { "path": "src/index.ts", "line_start": 63, "line_end": 95 }
+    },
+    {
+      "behavior_id": "behavior.auth.device-request",
+      "feature_id": "legacy.auth.device-flow",
+      "classification": "compatibility_shim",
+      "summary": "Device Flow POSTs JSON to GitHub's device-code endpoint with scope copilot, Accept application/json, and a 15-second timeout.",
+      "source": { "path": "src/auth/deviceFlow.ts", "line_start": 47, "line_end": 76 }
+    },
+    {
+      "behavior_id": "behavior.auth.device-reuse",
+      "feature_id": "legacy.auth.device-flow",
+      "classification": "compatibility_shim",
+      "summary": "A pending unexpired user code is reused; instructions contain the verification URI and bold user code, while startup failures become a user-facing failure string rather than a rejection.",
+      "source": { "path": "src/auth/deviceFlow.ts", "line_start": 48, "line_end": 86 }
+    },
+    {
+      "behavior_id": "behavior.auth.device-poll",
+      "feature_id": "legacy.auth.device-flow",
+      "classification": "compatibility_shim",
+      "summary": "Token polling starts after GitHub's interval, retries non-OK responses and unexpected errors, adds five seconds for slow_down, and clears state for expiry or access denial.",
+      "source": { "path": "src/auth/deviceFlow.ts", "line_start": 89, "line_end": 152 }
+    },
+    {
+      "behavior_id": "behavior.auth.device-token",
+      "feature_id": "legacy.auth.device-flow",
+      "classification": "compatibility_shim",
+      "summary": "On access_token, the runtime fetches /user with Bearer auth, falls back to login unknown on any failure, clears pending state, and activates the engine.",
+      "source": { "path": "src/auth/deviceFlow.ts", "line_start": 118, "line_end": 169 }
+    },
+    {
+      "behavior_id": "behavior.role.fetch",
+      "feature_id": "legacy.role.remote",
+      "classification": "preserved",
+      "summary": "Role fetch uses a 10-second timeout, accepts JSON or text/plain, rejects non-2xx responses, enforces a 1 MiB content-length byte hint and a 1 MiB JavaScript-character body limit.",
+      "source": { "path": "src/loader/roleLoader.ts", "line_start": 36, "line_end": 62 }
+    },
+    {
+      "behavior_id": "behavior.role.json",
+      "feature_id": "legacy.role.remote",
+      "classification": "preserved",
+      "summary": "JSON role parsing is attempted for JSON content types or bodies beginning with {; a string content field takes precedence over prompt, a non-string or absent content falls back to prompt, and the selected value must be nonempty.",
+      "source": { "path": "src/loader/roleLoader.ts", "line_start": 64, "line_end": 81 }
+    },
+    {
+      "behavior_id": "behavior.role.model",
+      "feature_id": "legacy.role.remote",
+      "classification": "preserved",
+      "summary": "A string model is returned unchanged; unknown models only emit a warning and are still attempted.",
+      "source": { "path": "src/loader/roleLoader.ts", "line_start": 83, "line_end": 97 }
+    },
+    {
+      "behavior_id": "behavior.role.plain-text-fallback",
+      "feature_id": "legacy.role.remote",
+      "classification": "preserved",
+      "summary": "JSON-content-type parse or validation errors are fatal, while equivalent errors for text content fall through and use the entire raw body verbatim as a model-less system prompt.",
+      "source": { "path": "src/loader/roleLoader.ts", "line_start": 98, "line_end": 106 }
+    },
+    {
+      "behavior_id": "behavior.skill.load-validation",
+      "feature_id": "legacy.skill.remote-format",
+      "classification": "manual_port",
+      "summary": "A legacy skill must be an object with a safe identifier name, nonempty description, non-null JavaScript-object parameters value (including arrays), and nonempty executeCode string; extra fields are ignored.",
+      "source": { "path": "src/loader/skillLoader.ts", "line_start": 15, "line_end": 52 }
+    },
+    {
+      "behavior_id": "behavior.skill.load-partial",
+      "feature_id": "legacy.skill.remote-format",
+      "classification": "manual_port",
+      "summary": "Skill URLs fetch concurrently with a 10-second timeout and Accept application/json; non-2xx, parse, validation, and bodies over 524288 characters are logged and skipped independently while successful skills retain input order.",
+      "source": { "path": "src/loader/skillLoader.ts", "line_start": 54, "line_end": 105 }
+    },
+    {
+      "behavior_id": "behavior.skill.backend-selection",
+      "feature_id": "legacy.skill.execution",
+      "classification": "deliberate_break",
+      "summary": "Legacy execution prefers isolated-vm with a 128 MiB isolate and falls back to node:vm with a reduced-isolation warning when the optional module is unavailable.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 6, "line_end": 59 }
+    },
+    {
+      "behavior_id": "behavior.skill.registry",
+      "feature_id": "legacy.skill.execution",
+      "classification": "deliberate_break",
+      "summary": "Registration appends name/code pairs without duplicate rejection; execution rejects disposed executors and unknown names, and duplicate lookup resolves the first registered name.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 74, "line_end": 109 }
+    },
+    {
+      "behavior_id": "behavior.skill.domain-policy",
+      "feature_id": "legacy.skill.bridge",
+      "classification": "manual_port",
+      "summary": "An empty domain list allows all URLs; otherwise URL parsing must succeed and the lowercase hostname must equal or be a subdomain of an allowed entry.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 79, "line_end": 89 }
+    },
+    {
+      "behavior_id": "behavior.skill.http-bridges",
+      "feature_id": "legacy.skill.bridge",
+      "classification": "manual_port",
+      "summary": "httpGet and httpPost require string URLs, enforce domain policy, apply the skill timeout to fetch, and return response text without rejecting HTTP error status codes; httpPost forwards body and headers.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 111, "line_end": 143 }
+    },
+    {
+      "behavior_id": "behavior.skill.log-bridge",
+      "feature_id": "legacy.skill.bridge",
+      "classification": "manual_port",
+      "summary": "log stringifies input, truncates to 2000 characters, and writes a structured skill-tagged info event.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 144, "line_end": 147 }
+    },
+    {
+      "behavior_id": "behavior.skill.javascript-eval",
+      "feature_id": "legacy.skill.execution",
+      "classification": "deliberate_break",
+      "summary": "Legacy code is interpolated as a function and invoked with params and bridge APIs in node:vm or isolated-vm; this evaluation behavior is intentionally absent from the final product.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 150, "line_end": 248 }
+    },
+    {
+      "behavior_id": "behavior.skill.dispose",
+      "feature_id": "legacy.skill.execution",
+      "classification": "deliberate_break",
+      "summary": "Executor disposal is idempotent, marks the executor unusable, and disposes the isolate when present.",
+      "source": { "path": "src/engine/toolExecutor.ts", "line_start": 250, "line_end": 264 }
+    },
+    {
+      "behavior_id": "behavior.session.touch",
+      "feature_id": "legacy.session.lifecycle",
+      "classification": "compatibility_shim",
+      "summary": "Session get refreshes lastAccess; set records Date.now and updates existing conversation IDs without capacity eviction.",
+      "source": { "path": "src/engine/sessionManager.ts", "line_start": 23, "line_end": 50 }
+    },
+    {
+      "behavior_id": "behavior.session.lru",
+      "feature_id": "legacy.session.lifecycle",
+      "classification": "compatibility_shim",
+      "summary": "Adding a new session at or above capacity removes the entry with the smallest lastAccess timestamp before insertion.",
+      "source": { "path": "src/engine/sessionManager.ts", "line_start": 32, "line_end": 44 }
+    },
+    {
+      "behavior_id": "behavior.session.ttl",
+      "feature_id": "legacy.session.lifecycle",
+      "classification": "compatibility_shim",
+      "summary": "An unref'd 60-second timer removes entries whose idle age is strictly greater than SESSION_TTL_MS and logs only when at least one expires.",
+      "source": { "path": "src/engine/sessionManager.ts", "line_start": 14, "line_end": 20 }
+    },
+    {
+      "behavior_id": "behavior.session.clear-destroy",
+      "feature_id": "legacy.session.lifecycle",
+      "classification": "compatibility_shim",
+      "summary": "Reload clear removes all map entries but retains the cleanup timer; destroyAll also clears the timer. Legacy removal does not individually stop SDK session objects.",
+      "source": { "path": "src/engine/sessionManager.ts", "line_start": 99, "line_end": 115 }
+    },
+    {
+      "behavior_id": "behavior.engine.client-start",
+      "feature_id": "legacy.engine.chat",
+      "classification": "compatibility_shim",
+      "summary": "The Copilot client uses the selected GitHub token with autoRestart true; start must be followed by a successful ping or engine activation fails.",
+      "source": { "path": "src/engine/copilotEngine.ts", "line_start": 28, "line_end": 46 }
+    },
+    {
+      "behavior_id": "behavior.engine.session-create",
+      "feature_id": "legacy.engine.chat",
+      "classification": "compatibility_shim",
+      "summary": "A missing conversation session is created with the role model or default model, replacement system message, current tools, infinite sessions, approveAll permissions, and the conversation ID as session ID.",
+      "source": { "path": "src/engine/copilotEngine.ts", "line_start": 89, "line_end": 109 }
+    },
+    {
+      "behavior_id": "behavior.engine.tool-guard",
+      "feature_id": "legacy.engine.chat",
+      "classification": "compatibility_shim",
+      "summary": "Pre-tool hooks deny names absent from the current tool list and allow known names; post-use and session errors are logged, and session error handling returns skip.",
+      "source": { "path": "src/engine/copilotEngine.ts", "line_start": 110, "line_end": 140 }
+    },
+    {
+      "behavior_id": "behavior.engine.chat-fallbacks",
+      "feature_id": "legacy.engine.chat",
+      "classification": "compatibility_shim",
+      "summary": "sendAndWait uses SDK_REQUEST_TIMEOUT_MS; missing content returns (No response from AI), while thrown errors are logged and converted to the fixed retry apology.",
+      "source": { "path": "src/engine/copilotEngine.ts", "line_start": 146, "line_end": 155 }
+    },
+    {
+      "behavior_id": "behavior.reload.transaction",
+      "feature_id": "legacy.engine.reload",
+      "classification": "compatibility_shim",
+      "summary": "Only one reload runs at a time; role reload failure aborts, ordinary per-skill fetch/parse failures produce a fulfilled partial or empty replacement list, only a whole loadSkills rejection retains prior skills, and executor registration failure disposes only the replacement.",
+      "source": { "path": "src/index.ts", "line_start": 166, "line_end": 227 }
+    },
+    {
+      "behavior_id": "behavior.reload.sessions",
+      "feature_id": "legacy.engine.reload",
+      "classification": "compatibility_shim",
+      "summary": "Successful engine reload replaces role and tools and clears every active session so new role/tool state applies on the next message.",
+      "source": { "path": "src/engine/copilotEngine.ts", "line_start": 162, "line_end": 170 }
+    },
+    {
+      "behavior_id": "behavior.reload.inflight-session-race",
+      "feature_id": "legacy.engine.reload",
+      "classification": "compatibility_shim",
+      "summary": "Reload does not synchronize with an in-flight createSession call; a creation started with the old role/tools can finish after clear and reinsert stale session state. The Rust shim uses generation fencing to prevent this race.",
+      "source": { "path": "src/engine/copilotEngine.ts", "line_start": 89, "line_end": 166 }
+    },
+    {
+      "behavior_id": "behavior.http.root",
+      "feature_id": "legacy.http.root",
+      "classification": "compatibility_shim",
+      "summary": "GET / always returns 200 service/status/auth/channel metadata, advertises only health/device/chat endpoints, and conditionally appends authentication and no-channel tips.",
+      "source": { "path": "src/server.ts", "line_start": 171, "line_end": 201 }
+    },
+    {
+      "behavior_id": "behavior.http.health",
+      "feature_id": "legacy.http.health",
+      "classification": "compatibility_shim",
+      "summary": "GET /health always returns 200 status ok with floored process-relative uptime, current skill/session/model/auth/device-flow/channel fields, including while unauthenticated.",
+      "source": { "path": "src/server.ts", "line_start": 154, "line_end": 169 }
+    },
+    {
+      "behavior_id": "behavior.http.device-auth",
+      "feature_id": "legacy.http.device-auth",
+      "classification": "compatibility_shim",
+      "summary": "GET /auth/device returns 200 already-authenticated, 400 when disabled, 200 with auth_instructions when enabled, or 500 for an unexpected getAuthMessage rejection.",
+      "source": { "path": "src/server.ts", "line_start": 203, "line_end": 232 }
+    },
+    {
+      "behavior_id": "behavior.http.chat-input",
+      "feature_id": "legacy.http.chat",
+      "classification": "compatibility_shim",
+      "summary": "POST /chat selects the first string among message, text, and prompt, trims it, selects conversation_id before conversationId before http-<remoteAddress>, and returns 400 for empty input.",
+      "source": { "path": "src/server.ts", "line_start": 234, "line_end": 256 }
+    },
+    {
+      "behavior_id": "behavior.http.chat-help-auth",
+      "feature_id": "legacy.http.chat",
+      "classification": "compatibility_shim",
+      "summary": "/help and /start return fixed help with 200 before authentication; other unauthenticated requests return 401 with Device Flow instructions when available or a token/device-flow error otherwise.",
+      "source": { "path": "src/server.ts", "line_start": 258, "line_end": 286 }
+    },
+    {
+      "behavior_id": "behavior.http.chat-result",
+      "feature_id": "legacy.http.chat",
+      "classification": "compatibility_shim",
+      "summary": "Authenticated chat returns 200 {reply}; an unexpected engine.chat rejection returns 500 {error: Internal error}.",
+      "source": { "path": "src/server.ts", "line_start": 288, "line_end": 295 }
+    },
+    {
+      "behavior_id": "behavior.http.teams-registration",
+      "feature_id": "legacy.http.teams",
+      "classification": "compatibility_shim",
+      "summary": "POST /api/messages and its Bot Framework adapter exist only when Teams is enabled; adapter turn errors log and send a fixed generic retry message.",
+      "source": { "path": "src/server.ts", "line_start": 95, "line_end": 151 }
+    },
+    {
+      "behavior_id": "behavior.http.whatsapp-registration",
+      "feature_id": "legacy.http.whatsapp",
+      "classification": "compatibility_shim",
+      "summary": "GET and POST are registered at the configured WhatsApp path only when a handler exists.",
+      "source": { "path": "src/server.ts", "line_start": 297, "line_end": 302 }
+    },
+    {
+      "behavior_id": "behavior.http.admin-reload",
+      "feature_id": "legacy.http.admin-reload",
+      "classification": "compatibility_shim",
+      "summary": "POST /admin/reload exists only for nonempty ADMIN_TOKEN plus reloadFn, requires an exact Bearer token even from loopback, and returns 200 result, 409 concurrent reload, or 500 generic failure.",
+      "source": { "path": "src/server.ts", "line_start": 304, "line_end": 333 }
+    },
+    {
+      "behavior_id": "behavior.http.admin-auth",
+      "feature_id": "legacy.http.admin-system",
+      "classification": "compatibility_shim",
+      "summary": "System and exec routes exist only for nonempty ADMIN_TOKEN and accept either an exact Bearer token or remote address 127.0.0.1, ::1, or ::ffff:127.0.0.1.",
+      "source": { "path": "src/server.ts", "line_start": 335, "line_end": 359 }
+    },
+    {
+      "behavior_id": "behavior.http.admin-system",
+      "feature_id": "legacy.http.admin-system",
+      "classification": "compatibility_shim",
+      "summary": "GET /admin/system returns 403 when unauthorized or 200 with process version/PID/floored uptime/rounded MiB memory and host/platform/arch/CPU/memory/uptime/load average.",
+      "source": { "path": "src/server.ts", "line_start": 361, "line_end": 393 }
+    },
+    {
+      "behavior_id": "behavior.http.admin-actions",
+      "feature_id": "legacy.http.admin-exec",
+      "classification": "compatibility_shim",
+      "summary": "POST /admin/exec permits only uptime, disk, memory, top, docker_ps, docker_stats, docker_images, docker_logs, netstat, who, hostname, and date with fixed executable/argument specifications.",
+      "source": { "path": "src/server.ts", "line_start": 337, "line_end": 351 }
+    },
+    {
+      "behavior_id": "behavior.http.admin-exec-result",
+      "feature_id": "legacy.http.admin-exec",
+      "classification": "compatibility_shim",
+      "summary": "Unknown actions return 400 plus the ordered allow-list; docker_logs target strips characters outside letters, digits, underscore, hyphen, and dot; execFile has a 15-second timeout and 1 MiB buffer, and both command success and failure return HTTP 200 with bounded text fields.",
+      "source": { "path": "src/server.ts", "line_start": 395, "line_end": 444 }
+    },
+    {
+      "behavior_id": "behavior.rate-limit.bucket",
+      "feature_id": "legacy.rate-limit",
+      "classification": "compatibility_shim",
+      "summary": "The in-memory per-IP token bucket starts with max-1 after the first accepted request, refills continuously at max/60000 per millisecond, caps at max, and has no bucket eviction.",
+      "source": { "path": "src/server.ts", "line_start": 36, "line_end": 68 }
+    },
+    {
+      "behavior_id": "behavior.rate-limit.scope",
+      "feature_id": "legacy.rate-limit",
+      "classification": "compatibility_shim",
+      "summary": "Only URL strings beginning /api/messages are limited; trusted proxy mode uses the first x-forwarded-for value, otherwise socket remoteAddress, and denial returns 429 {error: Too many requests}.",
+      "source": { "path": "src/server.ts", "line_start": 118, "line_end": 140 }
+    },
+    {
+      "behavior_id": "behavior.channel.common",
+      "feature_id": "legacy.channel.common",
+      "classification": "compatibility_shim",
+      "summary": "Telegram, Discord, and WhatsApp trim incoming text, ignore empty messages, return Device Flow instructions or a fixed unconfigured string without an engine, and convert unexpected processing errors to a fixed apology.",
+      "source": { "path": "src/channels/messageProcessor.ts", "line_start": 14, "line_end": 50 }
+    },
+    {
+      "behavior_id": "behavior.channel.teams-message",
+      "feature_id": "legacy.channel.teams",
+      "classification": "compatibility_shim",
+      "summary": "Teams ignores empty text, provides an authentication hint without an engine, drops messages without conversation ID, sends a typing activity, chats by conversation ID, and sends a fixed apology if processing throws.",
+      "source": { "path": "src/bot/teamsBot.ts", "line_start": 25, "line_end": 65 }
+    },
+    {
+      "behavior_id": "behavior.channel.teams-events",
+      "feature_id": "legacy.channel.teams",
+      "classification": "compatibility_shim",
+      "summary": "New non-bot members receive a fixed greeting, and edited messages are processed as new messages.",
+      "source": { "path": "src/bot/teamsBot.ts", "line_start": 68, "line_end": 82 }
+    },
+    {
+      "behavior_id": "behavior.channel.telegram-poll",
+      "feature_id": "legacy.channel.telegram",
+      "classification": "compatibility_shim",
+      "summary": "Telegram repeatedly calls getUpdates with timeout=25, allowed_updates=[message], optional offset, and a 35-second request timeout; failures are logged and the loop waits pollIntervalMs.",
+      "source": { "path": "src/channels/telegramPolling.ts", "line_start": 57, "line_end": 110 }
+    },
+    {
+      "behavior_id": "behavior.channel.telegram-route",
+      "feature_id": "legacy.channel.telegram",
+      "classification": "compatibility_shim",
+      "summary": "Offsets advance before handling each update; non-text/blank messages are ignored, username falls back to joined first/last name then telegram-user, and conversation ID is telegram:<chat.id>.",
+      "source": { "path": "src/channels/telegramPolling.ts", "line_start": 73, "line_end": 134 }
+    },
+    {
+      "behavior_id": "behavior.channel.telegram-send",
+      "feature_id": "legacy.channel.telegram",
+      "classification": "compatibility_shim",
+      "summary": "Nonempty replies are split at 4000 characters and POSTed sequentially to sendMessage with disabled link previews and 10-second timeouts; any non-2xx throws with status.",
+      "source": { "path": "src/channels/telegramPolling.ts", "line_start": 131, "line_end": 153 }
+    },
+    {
+      "behavior_id": "behavior.channel.discord-connect",
+      "feature_id": "legacy.channel.discord",
+      "classification": "compatibility_shim",
+      "summary": "Discord opens the configured gateway, logs open/error/close, reconnects three seconds after close while running, and stop cancels timers, removes listeners, and closes the socket.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 55, "line_end": 122 }
+    },
+    {
+      "behavior_id": "behavior.channel.discord-protocol",
+      "feature_id": "legacy.channel.discord",
+      "classification": "compatibility_shim",
+      "summary": "Gateway sequence is updated from packets; HELLO starts interval heartbeats and IDENTIFY, dispatch is handled, reconnect/invalid-session closes the socket, heartbeat ACK and unknown operations are ignored.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 124, "line_end": 181 }
+    },
+    {
+      "behavior_id": "behavior.channel.discord-identify",
+      "feature_id": "legacy.channel.discord",
+      "classification": "compatibility_shim",
+      "summary": "IDENTIFY sends the bot token, configured intents, process platform, and gta-claw browser/device labels; sends are dropped unless the socket is OPEN.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 153, "line_end": 181 }
+    },
+    {
+      "behavior_id": "behavior.channel.discord-route",
+      "feature_id": "legacy.channel.discord",
+      "classification": "compatibility_shim",
+      "summary": "READY stores/logs the session ID; only nonblank non-bot MESSAGE_CREATE events are processed, with conversation ID discord:<channel_id>:<author.id> and username as userName.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 183, "line_end": 209 }
+    },
+    {
+      "behavior_id": "behavior.channel.discord-send",
+      "feature_id": "legacy.channel.discord",
+      "classification": "compatibility_shim",
+      "summary": "Replies are split at 1900 characters and POSTed sequentially to Discord v10 with Bot authorization and 10-second timeouts; non-2xx errors include status, status text, and response body.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 211, "line_end": 233 }
+    },
+    {
+      "behavior_id": "behavior.channel.discord-listener-rejections",
+      "feature_id": "legacy.channel.discord",
+      "classification": "compatibility_shim",
+      "summary": "The async gateway message listener has no local catch, so malformed JSON and rejected message processing or outbound sends can escape as listener promise rejections; the Rust shim logs and contains these failures.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 94, "line_end": 138 }
+    },
+    {
+      "behavior_id": "behavior.channel.whatsapp-verify",
+      "feature_id": "legacy.channel.whatsapp",
+      "classification": "compatibility_shim",
+      "summary": "WhatsApp verification requires subscribe mode, exact verify token, and nonempty challenge, returning the raw challenge as text/plain 200 or JSON Forbidden 403.",
+      "source": { "path": "src/channels/whatsappWebhook.ts", "line_start": 58, "line_end": 72 }
+    },
+    {
+      "behavior_id": "behavior.channel.whatsapp-incoming",
+      "feature_id": "legacy.channel.whatsapp",
+      "classification": "compatibility_shim",
+      "summary": "Webhook entries, changes, and messages are processed sequentially; only nonblank text messages run, using whatsapp:<from> as conversation ID and the sender number as userName.",
+      "source": { "path": "src/channels/whatsappWebhook.ts", "line_start": 74, "line_end": 98 }
+    },
+    {
+      "behavior_id": "behavior.channel.whatsapp-ack",
+      "feature_id": "legacy.channel.whatsapp",
+      "classification": "compatibility_shim",
+      "summary": "The webhook waits for processing and outbound sends before replying 200 {ok:true}; any error logs and returns 500 {error: Webhook handling failed}.",
+      "source": { "path": "src/channels/whatsappWebhook.ts", "line_start": 94, "line_end": 107 }
+    },
+    {
+      "behavior_id": "behavior.channel.whatsapp-send",
+      "feature_id": "legacy.channel.whatsapp",
+      "classification": "compatibility_shim",
+      "summary": "Replies are split at 3500 characters and POSTed sequentially to Graph API v20.0 with Bearer access token and 10-second timeout; non-2xx errors include status, status text, and body.",
+      "source": { "path": "src/channels/whatsappWebhook.ts", "line_start": 109, "line_end": 135 }
+    },
+    {
+      "behavior_id": "behavior.message.split",
+      "feature_id": "legacy.message.split",
+      "classification": "compatibility_shim",
+      "summary": "Text at or below the limit is unchanged; longer text prefers the last newline after half the limit, then space after 30 percent, otherwise hard-splits, and trimStart is applied only to the remaining suffix.",
+      "source": { "path": "src/utils/splitMessage.ts", "line_start": 1, "line_end": 26 }
+    },
+    {
+      "behavior_id": "behavior.message.channel-limits",
+      "feature_id": "legacy.message.split",
+      "classification": "compatibility_shim",
+      "summary": "Teams and Telegram use 4000-character chunks, Discord 1900, and WhatsApp 3500; chunks send sequentially and stop on the first send error.",
+      "source": { "path": "src/channels/discordGateway.ts", "line_start": 211, "line_end": 233 }
+    },
+    {
+      "behavior_id": "behavior.proxy.precedence",
+      "feature_id": "legacy.proxy",
+      "classification": "compatibility_shim",
+      "summary": "Proxy precedence is HTTPS_PROXY, https_proxy, HTTP_PROXY, http_proxy, ALL_PROXY, all_proxy; absence logs debug, and successful setup installs a global dispatcher with credentials redacted from the info log.",
+      "source": { "path": "src/utils/proxy.ts", "line_start": 15, "line_end": 32 }
+    },
+    {
+      "behavior_id": "behavior.proxy.invalid",
+      "feature_id": "legacy.proxy",
+      "classification": "compatibility_shim",
+      "summary": "Invalid proxy construction logs the full configured proxy alongside the error and startup continues using the existing dispatcher.",
+      "source": { "path": "src/utils/proxy.ts", "line_start": 29, "line_end": 35 }
+    },
+    {
+      "behavior_id": "behavior.logging.pino",
+      "feature_id": "legacy.logging",
+      "classification": "compatibility_shim",
+      "summary": "Pino is initialized at module load with LOG_LEVEL or info; exact NODE_ENV=development uses pino/file to stdout, otherwise default transport behavior applies.",
+      "source": { "path": "src/utils/logger.ts", "line_start": 1, "line_end": 9 }
+    },
+    {
+      "behavior_id": "behavior.updater.version-sources",
+      "feature_id": "legacy.updater",
+      "classification": "compatibility_shim",
+      "summary": "Installed SDK version reads its package JSON, latest SDK uses the npm latest endpoint, installed CLI executes --version with a five-second timeout, and latest CLI uses the GitHub releases endpoint; every probe degrades to unknown.",
+      "source": { "path": "src/updater/sdkUpdater.ts", "line_start": 14, "line_end": 71 }
+    },
+    {
+      "behavior_id": "behavior.updater.compare",
+      "feature_id": "legacy.updater",
+      "classification": "compatibility_shim",
+      "summary": "SDK and CLI probes run concurrently; updateAvailable is simple non-unknown string inequality rather than semantic-version ordering, and results/warnings are logged.",
+      "source": { "path": "src/updater/sdkUpdater.ts", "line_start": 73, "line_end": 121 }
+    },
+    {
+      "behavior_id": "behavior.updater.nonblocking",
+      "feature_id": "legacy.updater",
+      "classification": "compatibility_shim",
+      "summary": "The startup update check is launched without blocking service readiness, and top-level failure is logged as a warning.",
+      "source": { "path": "src/index.ts", "line_start": 259, "line_end": 262 }
+    },
+    {
+      "behavior_id": "behavior.updater.self-mutation",
+      "feature_id": "legacy.updater",
+      "classification": "deliberate_break",
+      "summary": "Legacy AUTO_UPDATE runs npm update for the SDK and a curl-to-shell Copilot installer on non-Windows, logs failures without throwing, and skips CLI update on Windows; these mutations are replaced by signed release handling.",
+      "source": { "path": "src/updater/sdkUpdater.ts", "line_start": 123, "line_end": 168 }
+    },
+    {
+      "behavior_id": "behavior.shutdown.signals",
+      "feature_id": "legacy.shutdown",
+      "classification": "compatibility_shim",
+      "summary": "SIGTERM and SIGINT share one shutdown promise; repeated signals log and return the same in-progress promise.",
+      "source": { "path": "src/index.ts", "line_start": 264, "line_end": 298 }
+    },
+    {
+      "behavior_id": "behavior.shutdown.order",
+      "feature_id": "legacy.shutdown",
+      "classification": "compatibility_shim",
+      "summary": "Shutdown initiates server close, stops Device Flow, awaits Telegram then Discord then engine, disposes the executor, logs clean shutdown, and exits 0; fatal startup logs and exits 1.",
+      "source": { "path": "src/index.ts", "line_start": 272, "line_end": 304 }
+    },
+    {
+      "behavior_id": "behavior.deployment.image-build",
+      "feature_id": "legacy.deployment.container",
+      "classification": "compatibility_shim",
+      "summary": "The Node 20 bookworm builder installs native build tools, runs npm install with unsafe-perm, compiles TypeScript, prunes dev dependencies, and copies dist, production node_modules, and package metadata to a Node 20 runtime.",
+      "source": { "path": "Dockerfile", "line_start": 1, "line_end": 54 }
+    },
+    {
+      "behavior_id": "behavior.deployment.image-runtime",
+      "feature_id": "legacy.deployment.container",
+      "classification": "compatibility_shim",
+      "summary": "The runtime installs curl/bash/certificates and Copilot CLI, sets no-node-snapshot and CLI path, runs as user node, exposes 3978, health-checks /health every 30 seconds with 10-second timeout and three retries, and starts dist/index.js.",
+      "source": { "path": "Dockerfile", "line_start": 35, "line_end": 68 }
+    },
+    {
+      "behavior_id": "behavior.deployment.script-config",
+      "feature_id": "legacy.deployment.script",
+      "classification": "compatibility_shim",
+      "summary": "run.sh config mode strips comments/blank lines and CR characters into mode-600 .env, requires role URL and conditional Teams credentials, validates selected booleans/URLs/rate/image/auth/channels, and deletes invalid generated env files for initial required-field failures.",
+      "source": { "path": "deploy/run.sh", "line_start": 321, "line_end": 396 }
+    },
+    {
+      "behavior_id": "behavior.deployment.script-interactive",
+      "feature_id": "legacy.deployment.script",
+      "classification": "compatibility_shim",
+      "summary": "Interactive setup defaults to Chinese, Device Flow, no channels, gpt-4o, localhost, image aizhihuxiao/gta-claw:latest, rate 30, and disabled updates/trusted proxy, then writes all runtime values to .env.",
+      "source": { "path": "deploy/run.sh", "line_start": 398, "line_end": 582 }
+    },
+    {
+      "behavior_id": "behavior.deployment.script-deploy",
+      "feature_id": "legacy.deployment.script",
+      "classification": "compatibility_shim",
+      "summary": "Deploy prefers a local image then attempts pull, otherwise pulls or builds from the local parent repo or a depth-one GitHub clone; it replaces container gta-claw, uses restart unless-stopped and .env, always maps 3978:3978, and polls container health/status up to 60 seconds.",
+      "source": { "path": "deploy/run.sh", "line_start": 584, "line_end": 657 }
+    },
+    {
+      "behavior_id": "behavior.deployment.script-operations",
+      "feature_id": "legacy.deployment.script",
+      "classification": "compatibility_shim",
+      "summary": "--update pulls or rebuilds then recreates the container; --stop force-removes it; --status shows docker state and host then container health JSON; --logs follows the last 100 lines; default auto-loads conf/gta-claw.conf or starts interactive setup.",
+      "source": { "path": "deploy/run.sh", "line_start": 659, "line_end": 793 }
+    },
+    {
+      "behavior_id": "behavior.deployment.publish",
+      "feature_id": "legacy.deployment.publish",
+      "classification": "compatibility_shim",
+      "summary": "Publishing runs on main, v* tags, or dispatch with per-ref cancellation; it requires Docker Hub username/token, validates or derives a lowercase docker.io image, emits latest/branch/tag/sha tags, diagnostically builds the builder and final amd64 image, then pushes amd64.",
+      "source": { "path": ".github/workflows/docker-publish.yml", "line_start": 1, "line_end": 107 }
+    },
+    {
+      "behavior_id": "behavior.bundled.role",
+      "feature_id": "legacy.bundled.roles",
+      "classification": "preserved",
+      "summary": "The bundled claw-steward role is a valid content/model role using claude-opus-4.6 and remains a data asset.",
+      "source": { "path": "deploy/conf/claw-steward.json", "line_start": 1, "line_end": 4 }
+    },
+    {
+      "behavior_id": "behavior.bundled.skills",
+      "feature_id": "legacy.bundled.skills",
+      "classification": "manual_port",
+      "summary": "The repository bundles ten legacy executeCode examples; each is inventoried with recognized bridges and requires a manual Rust/WASI port before activation.",
+      "source": { "path": "deploy/conf/skills/web_fetch.json", "line_start": 1, "line_end": 19 }
+    }
+  ]
+}

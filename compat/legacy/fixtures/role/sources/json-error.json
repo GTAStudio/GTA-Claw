@@ -1,0 +1,8 @@
+{
+  "content_type": "application/json",
+  "body": "{\"model\":\"gpt-4o\"}",
+  "expected": {
+    "outcome": "error",
+    "error_contains": "content"
+  }
+}

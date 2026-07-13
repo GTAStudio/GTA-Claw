@@ -1,0 +1,4 @@
+{
+  "content": "This value wins.",
+  "prompt": "This value is ignored when content is present."
+}

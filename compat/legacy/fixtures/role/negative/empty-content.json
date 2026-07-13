@@ -1,0 +1,4 @@
+{
+  "content": "",
+  "prompt": "The loader does not fall back when content is an empty string."
+}

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gta.studio/schemas/legacy/legacy-contract.schema.json",
+  "type": "object",
+  "required": [
+    "contract_id",
+    "contract_version",
+    "source_revision",
+    "scope",
+    "fixed_decisions",
+    "migration_command",
+    "artifacts",
+    "deliberate_breaking_changes",
+    "evidence_gaps"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "contract_id": { "const": "gta-claw-legacy-p00b" },
+    "contract_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "scope": {
+      "type": "object",
+      "required": ["owned_tree", "runtime_mutation", "compatibility_target"],
+      "properties": {
+        "owned_tree": { "const": "compat/legacy" },
+        "runtime_mutation": { "const": false },
+        "compatibility_target": { "const": "pure-rust-rewrite" }
+      },
+      "additionalProperties": false
+    },
+    "fixed_decisions": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["decision_id", "outcome", "contract"],
+        "properties": {
+          "decision_id": { "type": "string", "minLength": 1 },
+          "outcome": {
+            "enum": ["preserve", "rust_compat_shim", "manual_rust_wasi_port", "deliberate_break"]
+          },
+          "contract": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "migration_command": {
+      "type": "object",
+      "required": [
+        "argv",
+        "stdout_format",
+        "result_schema",
+        "success_exit_code",
+        "manual_port_required_exit_code",
+        "invalid_input_exit_code",
+        "internal_error_exit_code",
+        "silent_success_for_remaining_javascript"
+      ],
+      "properties": {
+        "argv": { "type": "array", "minItems": 4, "items": { "type": "string" } },
+        "stdout_format": { "const": "application/json" },
+        "result_schema": { "const": "schemas/migration-result.schema.json" },
+        "success_exit_code": { "const": 0 },
+        "manual_port_required_exit_code": { "type": "integer", "minimum": 1 },
+        "invalid_input_exit_code": { "type": "integer", "minimum": 1 },
+        "internal_error_exit_code": { "type": "integer", "minimum": 1 },
+        "silent_success_for_remaining_javascript": { "const": false }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object",
+      "minProperties": 6,
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "deliberate_breaking_changes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["break_id", "legacy_behavior", "rust_behavior", "reason"],
+        "properties": {
+          "break_id": { "type": "string", "minLength": 1 },
+          "legacy_behavior": { "type": "string", "minLength": 1 },
+          "rust_behavior": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "evidence_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["gap_id", "area", "detail", "required_follow_up"],
+        "properties": {
+          "gap_id": { "type": "string", "minLength": 1 },
+          "area": { "type": "string", "minLength": 1 },
+          "detail": { "type": "string", "minLength": 1 },
+          "required_follow_up": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

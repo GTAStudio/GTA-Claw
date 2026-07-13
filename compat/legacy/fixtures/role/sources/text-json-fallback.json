@@ -1,0 +1,8 @@
+{
+  "content_type": "text/plain",
+  "body": "{\"model\":\"gpt-4o\"}",
+  "expected": {
+    "outcome": "loaded_plain_text",
+    "content": "{\"model\":\"gpt-4o\"}"
+  }
+}

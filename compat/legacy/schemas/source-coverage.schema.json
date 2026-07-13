@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gta.studio/schemas/legacy/source-coverage.schema.json",
+  "type": "object",
+  "required": ["source_revision", "discovery", "audited_sources", "excluded_non_behavioral_sources"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "discovery": {
+      "type": "object",
+      "required": ["include"],
+      "properties": {
+        "include": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "audited_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "classification", "feature_ids"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "classification": { "const": "fully_classified" },
+          "feature_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "pattern": "^legacy\\.[a-z0-9_.-]+$" }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "excluded_non_behavioral_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "reason"],
+        "properties": {
+          "pattern": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

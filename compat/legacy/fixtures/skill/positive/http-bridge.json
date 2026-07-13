@@ -1,0 +1,13 @@
+{
+  "name": "lookup_status",
+  "description": "Fetch a status endpoint.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": { "type": "string" }
+    },
+    "required": ["url"]
+  },
+  "executeCode": "async function run(params, api) { api.log(params.url); return api.httpGet(params.url); }",
+  "extension_field": "ignored by the legacy loader"
+}

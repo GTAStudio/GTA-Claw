@@ -1,0 +1,241 @@
+{
+  "$schema": "../schemas/source-coverage.schema.json",
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "discovery": {
+    "include": [
+      ".dockerignore",
+      ".env.example",
+      ".github/workflows/docker-publish.yml",
+      "Dockerfile",
+      "package.json",
+      "package-lock.json",
+      "tsconfig.json",
+      "src/**/*.ts",
+      "deploy/run.sh",
+      "deploy/conf/gta-claw.conf.example",
+      "deploy/conf/claw-steward.json",
+      "deploy/conf/skills/*.json"
+    ]
+  },
+  "audited_sources": [
+    {
+      "path": ".dockerignore",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.container"]
+    },
+    {
+      "path": ".env.example",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.config.runtime"]
+    },
+    {
+      "path": ".github/workflows/docker-publish.yml",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.publish"]
+    },
+    {
+      "path": "Dockerfile",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.container", "legacy.http.health"]
+    },
+    {
+      "path": "package.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.container", "legacy.skill.execution", "legacy.engine.chat"]
+    },
+    {
+      "path": "package-lock.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.container", "legacy.skill.execution", "legacy.engine.chat"]
+    },
+    {
+      "path": "tsconfig.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.container"]
+    },
+    {
+      "path": "src/auth/deviceFlow.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.auth.device-flow"]
+    },
+    {
+      "path": "src/bot/teamsBot.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.channel.teams", "legacy.message.split"]
+    },
+    {
+      "path": "src/channels/discordGateway.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.channel.discord", "legacy.message.split"]
+    },
+    {
+      "path": "src/channels/messageProcessor.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.channel.common"]
+    },
+    {
+      "path": "src/channels/telegramPolling.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.channel.telegram", "legacy.message.split"]
+    },
+    {
+      "path": "src/channels/whatsappWebhook.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.channel.whatsapp", "legacy.http.whatsapp", "legacy.message.split"]
+    },
+    {
+      "path": "src/config.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.config.runtime", "legacy.auth.pat", "legacy.auth.device-flow"]
+    },
+    {
+      "path": "src/engine/copilotEngine.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.engine.chat", "legacy.engine.reload", "legacy.session.lifecycle"]
+    },
+    {
+      "path": "src/engine/sessionManager.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.session.lifecycle"]
+    },
+    {
+      "path": "src/engine/toolExecutor.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.skill.execution", "legacy.skill.bridge"]
+    },
+    {
+      "path": "src/index.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.engine.reload", "legacy.shutdown", "legacy.updater", "legacy.channel.common"]
+    },
+    {
+      "path": "src/loader/roleLoader.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.role.remote"]
+    },
+    {
+      "path": "src/loader/skillLoader.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.skill.remote-format"]
+    },
+    {
+      "path": "src/server.ts",
+      "classification": "fully_classified",
+      "feature_ids": [
+        "legacy.http.root",
+        "legacy.http.health",
+        "legacy.http.device-auth",
+        "legacy.http.chat",
+        "legacy.http.teams",
+        "legacy.http.whatsapp",
+        "legacy.http.admin-reload",
+        "legacy.http.admin-system",
+        "legacy.http.admin-exec",
+        "legacy.rate-limit"
+      ]
+    },
+    {
+      "path": "src/updater/sdkUpdater.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.updater"]
+    },
+    {
+      "path": "src/utils/logger.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.logging"]
+    },
+    {
+      "path": "src/utils/proxy.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.proxy"]
+    },
+    {
+      "path": "src/utils/splitMessage.ts",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.message.split"]
+    },
+    {
+      "path": "deploy/run.sh",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.script", "legacy.config.runtime"]
+    },
+    {
+      "path": "deploy/conf/gta-claw.conf.example",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.deployment.script", "legacy.config.runtime"]
+    },
+    {
+      "path": "deploy/conf/claw-steward.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.roles", "legacy.role.remote"]
+    },
+    {
+      "path": "deploy/conf/skills/github_commits.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/github_file_reader.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/github_repo_info.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/github_search.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/ip_dns_lookup.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/json_api_call.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/marp_slides.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/server_admin.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills", "legacy.http.admin-system", "legacy.http.admin-exec"]
+    },
+    {
+      "path": "deploy/conf/skills/server_health_check.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    },
+    {
+      "path": "deploy/conf/skills/web_fetch.json",
+      "classification": "fully_classified",
+      "feature_ids": ["legacy.bundled.skills"]
+    }
+  ],
+  "excluded_non_behavioral_sources": [
+    {
+      "pattern": "README.md",
+      "reason": "Documentation is not executable acceptance evidence; runtime sources are authoritative."
+    },
+    {
+      "pattern": "deploy/README.md",
+      "reason": "Documentation is not executable acceptance evidence; deploy/run.sh is authoritative."
+    },
+    {
+      "pattern": "docs/**",
+      "reason": "Plans, progress notes, and usage guides do not define runtime compatibility."
+    },
+    {
+      "pattern": ".gitignore",
+      "reason": "Repository ignore policy has no runtime or migration behavior."
+    }
+  ]
+}

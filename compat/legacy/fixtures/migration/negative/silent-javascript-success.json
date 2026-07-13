@@ -1,0 +1,19 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "legacy_skill",
+    "source": "legacy.json",
+    "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": ["httpGet"],
+  "remaining_javascript": [
+    {
+      "location": "executeCode",
+      "reason": "JavaScript remains."
+    }
+  ],
+  "artifacts": [],
+  "diagnostics": []
+}

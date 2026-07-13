@@ -1,0 +1,442 @@
+{
+  "$schema": "../schemas/feature-ledger.schema.json",
+  "source_revision": "3f2dfebcab1a1395f2445e9261b908cc4093f602",
+  "features": [
+    {
+      "feature_id": "legacy.config.runtime",
+      "domain": "configuration",
+      "source": [
+        { "path": "src/config.ts", "line_start": 52, "line_end": 307 },
+        { "path": ".env.example", "line_start": 1, "line_end": 94 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["config/env-mapping.json"],
+      "migration_decision": "preserve",
+      "known_differences": ["JSON5 becomes the canonical typed form; legacy environment variables remain an import and override surface."]
+    },
+    {
+      "feature_id": "legacy.auth.pat",
+      "domain": "authentication",
+      "source": [
+        { "path": "src/config.ts", "line_start": 141, "line_end": 188 },
+        { "path": "src/index.ts", "line_start": 63, "line_end": 103 },
+        { "path": "src/engine/copilotEngine.ts", "line_start": 28, "line_end": 38 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["config/env-mapping.json"],
+      "migration_decision": "preserve",
+      "known_differences": ["The migrated JSON5 stores only a secret reference, never the PAT value."]
+    },
+    {
+      "feature_id": "legacy.auth.device-flow",
+      "domain": "authentication",
+      "source": [
+        { "path": "src/auth/deviceFlow.ts", "line_start": 4, "line_end": 188 },
+        { "path": "src/index.ts", "line_start": 105, "line_end": 112 },
+        { "path": "src/index.ts", "line_start": 243, "line_end": 250 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Access tokens are held by the Rust credential provider; polling messages and endpoint behavior remain compatible."]
+    },
+    {
+      "feature_id": "legacy.role.remote",
+      "domain": "roles",
+      "source": [
+        { "path": "src/loader/roleLoader.ts", "line_start": 4, "line_end": 107 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": [
+        "fixtures/role/positive/content.json",
+        "fixtures/role/positive/prompt.json",
+        "fixtures/role/positive/non-string-content-fallback.json",
+        "fixtures/role/sources/plain-text.json",
+        "fixtures/role/sources/text-json-fallback.json"
+      ],
+      "migration_decision": "preserve",
+      "known_differences": ["Unknown model names remain accepted with a warning-equivalent diagnostic."]
+    },
+    {
+      "feature_id": "legacy.skill.remote-format",
+      "domain": "skills",
+      "source": [
+        { "path": "src/loader/skillLoader.ts", "line_start": 4, "line_end": 105 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": [
+        "fixtures/skill/positive/http-bridge.json",
+        "fixtures/skill/positive/array-parameters.json",
+        "fixtures/skill/negative/unsafe-name.json",
+        "fixtures/skill/negative/missing-execute-code.json"
+      ],
+      "migration_decision": "manual_rust_wasi_port",
+      "known_differences": ["The format is accepted only as migration input; it is not loadable as an executable runtime skill."]
+    },
+    {
+      "feature_id": "legacy.skill.execution",
+      "domain": "skills",
+      "source": [
+        { "path": "src/engine/toolExecutor.ts", "line_start": 6, "line_end": 265 },
+        { "path": "package.json", "line_start": 12, "line_end": 22 }
+      ],
+      "status": "current_degraded",
+      "acceptance_fixture": [
+        "fixtures/migration/manual-port-required.json",
+        "fixtures/migration/negative/silent-javascript-success.json"
+      ],
+      "migration_decision": "remove",
+      "known_differences": ["Neither isolated-vm nor node:vm is present in the final product; JavaScript is never evaluated."]
+    },
+    {
+      "feature_id": "legacy.skill.bridge",
+      "domain": "skills",
+      "source": [
+        { "path": "src/engine/toolExecutor.ts", "line_start": 79, "line_end": 248 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/migration/manual-port-required.json"],
+      "migration_decision": "manual_rust_wasi_port",
+      "known_differences": ["httpGet, httpPost, and log are recognized to generate WIT imports, but recognition never implies executable conversion."]
+    },
+    {
+      "feature_id": "legacy.session.lifecycle",
+      "domain": "sessions",
+      "source": [
+        { "path": "src/engine/sessionManager.ts", "line_start": 8, "line_end": 116 },
+        { "path": "src/engine/copilotEngine.ts", "line_start": 89, "line_end": 159 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Rust owns session destruction explicitly when TTL or LRU removes an entry; externally visible TTL and capacity semantics remain compatible."]
+    },
+    {
+      "feature_id": "legacy.engine.chat",
+      "domain": "engine",
+      "source": [
+        { "path": "src/engine/copilotEngine.ts", "line_start": 18, "line_end": 155 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Copilot SDK internals are replaced; system prompt replacement, model selection, tool allow-listing, timeouts, and user-facing fallback text remain compatible."]
+    },
+    {
+      "feature_id": "legacy.engine.reload",
+      "domain": "engine",
+      "source": [
+        { "path": "src/index.ts", "line_start": 166, "line_end": 228 },
+        { "path": "src/engine/copilotEngine.ts", "line_start": 162, "line_end": 170 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": [
+        "Legacy JavaScript skills are retained only as migration metadata; reload cannot make them executable.",
+        "The Rust shim generation-fences session creation so an in-flight legacy session cannot reappear after reload."
+      ]
+    },
+    {
+      "feature_id": "legacy.http.root",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 171, "line_end": 201 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.http.health",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 154, "line_end": 169 },
+        { "path": "Dockerfile", "line_start": 63, "line_end": 68 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["status remains ok while unauthenticated; it is a liveness/status endpoint rather than authentication readiness."]
+    },
+    {
+      "feature_id": "legacy.http.device-auth",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 203, "line_end": 232 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.http.chat",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 234, "line_end": 295 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.http.teams",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 95, "line_end": 151 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Exact botbuilder protocol behavior requires captured traces; repository-owned routing and error text are normative."]
+    },
+    {
+      "feature_id": "legacy.http.whatsapp",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 297, "line_end": 302 },
+        { "path": "src/channels/whatsappWebhook.ts", "line_start": 58, "line_end": 107 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.http.admin-reload",
+      "domain": "admin",
+      "source": [
+        { "path": "src/server.ts", "line_start": 304, "line_end": 333 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.http.admin-system",
+      "domain": "admin",
+      "source": [
+        { "path": "src/server.ts", "line_start": 353, "line_end": 393 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Node process fields are populated with Rust process equivalents while retaining the response keys for compatibility."]
+    },
+    {
+      "feature_id": "legacy.http.admin-exec",
+      "domain": "admin",
+      "source": [
+        { "path": "src/server.ts", "line_start": 335, "line_end": 444 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["The fixed read-only action allow-list remains; no arbitrary command or shell input is introduced."]
+    },
+    {
+      "feature_id": "legacy.rate-limit",
+      "domain": "http",
+      "source": [
+        { "path": "src/server.ts", "line_start": 36, "line_end": 68 },
+        { "path": "src/server.ts", "line_start": 118, "line_end": 140 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/http/examples.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.channel.common",
+      "domain": "channels",
+      "source": [
+        { "path": "src/channels/messageProcessor.ts", "line_start": 14, "line_end": 50 },
+        { "path": "src/index.ts", "line_start": 114, "line_end": 149 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.channel.teams",
+      "domain": "channels",
+      "source": [
+        { "path": "src/bot/teamsBot.ts", "line_start": 10, "line_end": 83 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Provider authentication details remain an evidence gap until Bot Framework traces are captured."]
+    },
+    {
+      "feature_id": "legacy.channel.telegram",
+      "domain": "channels",
+      "source": [
+        { "path": "src/channels/telegramPolling.ts", "line_start": 43, "line_end": 155 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.channel.discord",
+      "domain": "channels",
+      "source": [
+        { "path": "src/channels/discordGateway.ts", "line_start": 35, "line_end": 257 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": [
+        "The unused splitForDiscord helper has no runtime effect and is not carried forward.",
+        "The Rust shim catches and logs malformed gateway packets and message/send failures instead of allowing listener promise rejections to escape."
+      ]
+    },
+    {
+      "feature_id": "legacy.channel.whatsapp",
+      "domain": "channels",
+      "source": [
+        { "path": "src/channels/whatsappWebhook.ts", "line_start": 45, "line_end": 137 }
+      ],
+      "status": "current_conditional",
+      "acceptance_fixture": ["fixtures/http/examples.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.message.split",
+      "domain": "channels",
+      "source": [
+        { "path": "src/utils/splitMessage.ts", "line_start": 1, "line_end": 26 },
+        { "path": "src/bot/teamsBot.ts", "line_start": 55, "line_end": 59 },
+        { "path": "src/channels/telegramPolling.ts", "line_start": 136, "line_end": 153 },
+        { "path": "src/channels/discordGateway.ts", "line_start": 211, "line_end": 233 },
+        { "path": "src/channels/whatsappWebhook.ts", "line_start": 109, "line_end": 135 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": []
+    },
+    {
+      "feature_id": "legacy.proxy",
+      "domain": "network",
+      "source": [
+        { "path": "src/utils/proxy.ts", "line_start": 1, "line_end": 36 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["config/env-mapping.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["The Rust HTTP stack replaces undici but preserves proxy precedence, redaction, and continue-without-proxy behavior."]
+    },
+    {
+      "feature_id": "legacy.logging",
+      "domain": "observability",
+      "source": [
+        { "path": "src/utils/logger.ts", "line_start": 1, "line_end": 9 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["config/env-mapping.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Rust structured logs need not reproduce pino serialization byte-for-byte."]
+    },
+    {
+      "feature_id": "legacy.updater",
+      "domain": "updates",
+      "source": [
+        { "path": "src/updater/sdkUpdater.ts", "line_start": 9, "line_end": 168 },
+        { "path": "src/index.ts", "line_start": 259, "line_end": 262 }
+      ],
+      "status": "current_degraded",
+      "acceptance_fixture": ["contract.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Version reporting remains nonblocking; npm and curl-based self-mutation are deliberately removed."]
+    },
+    {
+      "feature_id": "legacy.shutdown",
+      "domain": "lifecycle",
+      "source": [
+        { "path": "src/index.ts", "line_start": 264, "line_end": 304 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["Rust waits for the listener to close rather than calling process.exit immediately after initiating close."]
+    },
+    {
+      "feature_id": "legacy.deployment.container",
+      "domain": "deployment",
+      "source": [
+        { "path": "Dockerfile", "line_start": 1, "line_end": 68 },
+        { "path": ".dockerignore", "line_start": 1, "line_end": 10 },
+        { "path": "package.json", "line_start": 1, "line_end": 38 },
+        { "path": "package-lock.json", "line_start": 1, "line_end": 1 },
+        { "path": "tsconfig.json", "line_start": 1, "line_end": 1 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["inventory/source-coverage.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["The final image contains a Rust binary instead of Node, npm dependencies, and isolated-vm."]
+    },
+    {
+      "feature_id": "legacy.deployment.script",
+      "domain": "deployment",
+      "source": [
+        { "path": "deploy/run.sh", "line_start": 1, "line_end": 793 },
+        { "path": "deploy/conf/gta-claw.conf.example", "line_start": 1, "line_end": 96 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["config/env-mapping.json", "ledger/behaviors.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["The legacy script always publishes host port 3978 even when PORT differs; migration reports this mismatch instead of silently preserving a broken mapping."]
+    },
+    {
+      "feature_id": "legacy.deployment.publish",
+      "domain": "deployment",
+      "source": [
+        { "path": ".github/workflows/docker-publish.yml", "line_start": 1, "line_end": 107 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["config/env-mapping.json", "inventory/source-coverage.json"],
+      "migration_decision": "rust_compat_shim",
+      "known_differences": ["CI changes are outside P00b; this entry records the current amd64 Docker Hub contract for later migration."]
+    },
+    {
+      "feature_id": "legacy.bundled.roles",
+      "domain": "inventory",
+      "source": [
+        { "path": "deploy/conf/claw-steward.json", "line_start": 1, "line_end": 4 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["fixtures/role/positive/content.json", "inventory/source-coverage.json"],
+      "migration_decision": "preserve",
+      "known_differences": ["The bundled role remains data and requires no code port."]
+    },
+    {
+      "feature_id": "legacy.bundled.skills",
+      "domain": "inventory",
+      "source": [
+        { "path": "deploy/conf/skills/github_commits.json", "line_start": 1, "line_end": 27 },
+        { "path": "deploy/conf/skills/github_file_reader.json", "line_start": 1, "line_end": 23 },
+        { "path": "deploy/conf/skills/github_repo_info.json", "line_start": 1, "line_end": 19 },
+        { "path": "deploy/conf/skills/github_search.json", "line_start": 1, "line_end": 24 },
+        { "path": "deploy/conf/skills/ip_dns_lookup.json", "line_start": 1, "line_end": 20 },
+        { "path": "deploy/conf/skills/json_api_call.json", "line_start": 1, "line_end": 28 },
+        { "path": "deploy/conf/skills/marp_slides.json", "line_start": 1, "line_end": 37 },
+        { "path": "deploy/conf/skills/server_admin.json", "line_start": 1, "line_end": 20 },
+        { "path": "deploy/conf/skills/server_health_check.json", "line_start": 1, "line_end": 16 },
+        { "path": "deploy/conf/skills/web_fetch.json", "line_start": 1, "line_end": 19 }
+      ],
+      "status": "current_supported",
+      "acceptance_fixture": ["inventory/bundled-skills.json", "fixtures/migration/manual-port-required.json"],
+      "migration_decision": "manual_rust_wasi_port",
+      "known_differences": ["All ten bundled examples require manual Rust/WASI ports; none execute JavaScript in the final product."]
+    }
+  ]
+}

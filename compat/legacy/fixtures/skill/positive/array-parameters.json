@@ -1,0 +1,6 @@
+{
+  "name": "array_parameters",
+  "description": "Arrays pass the legacy typeof object parameters check.",
+  "parameters": [],
+  "executeCode": "function run(params) { return params; }"
+}

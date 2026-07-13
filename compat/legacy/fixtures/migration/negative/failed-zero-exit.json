@@ -1,0 +1,25 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "legacy_skill",
+    "source": "legacy.json",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "status": "failed",
+  "exit_code": 0,
+  "recognized_bridges": [],
+  "remaining_javascript": [
+    {
+      "location": "executeCode",
+      "reason": "JavaScript remains after an internal failure."
+    }
+  ],
+  "artifacts": [],
+  "diagnostics": [
+    {
+      "code": "INTERNAL_ERROR",
+      "severity": "error",
+      "message": "Migration failed."
+    }
+  ]
+}
