@@ -1,0 +1,83 @@
+﻿{
+    "schema_version":  1,
+    "artifact_set":  "openclaw-upstream-compatibility-baseline",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "baseline_path":  "baseline.json",
+    "feature_schema_path":  "feature-ledger.schema.json",
+    "validation_script":  "validate.ps1",
+    "ledgers":  [
+                    {
+                        "path":  "ledgers/gateway-core.json",
+                        "classification":  "gateway_core",
+                        "expected_features":  16
+                    },
+                    {
+                        "path":  "ledgers/official-integration.json",
+                        "classification":  "official_integration",
+                        "expected_features":  13
+                    },
+                    {
+                        "path":  "ledgers/official-client-interop.json",
+                        "classification":  "official_client_interop",
+                        "expected_features":  18
+                    }
+                ],
+    "inventories":  [
+                        {
+                            "path":  "inventories/plugins.json",
+                            "expected_items":  137
+                        },
+                        {
+                            "path":  "inventories/skills.json",
+                            "expected_items":  51
+                        },
+                        {
+                            "path":  "inventories/gateway-protocol.json",
+                            "expected_items":  320
+                        },
+                        {
+                            "path":  "inventories/config-domains.json",
+                            "expected_items":  47
+                        },
+                        {
+                            "path":  "inventories/providers.json",
+                            "expected_items":  78
+                        },
+                        {
+                            "path":  "inventories/channels.json",
+                            "expected_items":  29
+                        },
+                        {
+                            "path":  "inventories/http-sse-endpoints.json",
+                            "expected_items":  18
+                        },
+                        {
+                            "path":  "inventories/clients.json",
+                            "expected_items":  10
+                        },
+                        {
+                            "path":  "inventories/migrations.json",
+                            "expected_items":  3
+                        },
+                        {
+                            "path":  "inventories/release-deployment.json",
+                            "expected_items":  24
+                        }
+                    ],
+    "canonical_counts":  {
+                             "core_plugins":  64,
+                             "official_external_plugins":  70,
+                             "source_only_qa_plugins":  3,
+                             "bundled_skills":  51,
+                             "gateway_methods":  278,
+                             "gateway_events":  33,
+                             "config_domains":  47,
+                             "providers":  78,
+                             "channels":  29
+                         },
+    "evidence_policy":  {
+                            "initial_status":  "unimplemented",
+                            "acceptance_evidence_state":  "missing",
+                            "legacy_typescript_is_not_rust_acceptance_evidence":  true
+                        }
+}

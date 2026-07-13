@@ -1,0 +1,182 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "release-deployment",
+    "classification":  "official_integration",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  24,
+                   "release":  8,
+                   "installation":  1,
+                   "deployment":  15
+               },
+    "items":  [
+                  {
+                      "record_id":  "release_surface:github-release",
+                      "id":  "github-release",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/openclaw-release-publish.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:npm-core",
+                      "id":  "npm-core",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/openclaw-npm-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:docker-image",
+                      "id":  "docker-image",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/docker-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:android",
+                      "id":  "android",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/android-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:macos",
+                      "id":  "macos",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/macos-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:windows-node",
+                      "id":  "windows-node",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/windows-node-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:plugin-npm",
+                      "id":  "plugin-npm",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/plugin-npm-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:plugin-clawhub",
+                      "id":  "plugin-clawhub",
+                      "classification":  "official_integration",
+                      "source_path":  ".github/workflows/plugin-clawhub-release.yml",
+                      "kind":  "release"
+                  },
+                  {
+                      "record_id":  "release_surface:installer",
+                      "id":  "installer",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/installer.md",
+                      "kind":  "installation"
+                  },
+                  {
+                      "record_id":  "release_surface:docker",
+                      "id":  "docker",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/docker.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:podman",
+                      "id":  "podman",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/podman.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:kubernetes",
+                      "id":  "kubernetes",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/kubernetes.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:nix",
+                      "id":  "nix",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/nix.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:fly-io",
+                      "id":  "fly-io",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/fly.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:azure",
+                      "id":  "azure",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/azure.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:gcp",
+                      "id":  "gcp",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/gcp.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:digitalocean",
+                      "id":  "digitalocean",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/digitalocean.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:hetzner",
+                      "id":  "hetzner",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/hetzner.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:oracle-cloud",
+                      "id":  "oracle-cloud",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/oracle.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:railway",
+                      "id":  "railway",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/railway.mdx",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:render",
+                      "id":  "render",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/render.mdx",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:northflank",
+                      "id":  "northflank",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/northflank.mdx",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:hostinger",
+                      "id":  "hostinger",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/hostinger.md",
+                      "kind":  "deployment"
+                  },
+                  {
+                      "record_id":  "release_surface:clawdock",
+                      "id":  "clawdock",
+                      "classification":  "official_integration",
+                      "source_path":  "docs/install/clawdock.md",
+                      "kind":  "deployment"
+                  }
+              ]
+}

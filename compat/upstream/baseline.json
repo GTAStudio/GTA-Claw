@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "openclaw/openclaw",
+    "repository_url": "https://github.com/openclaw/openclaw",
+    "branch": "main",
+    "commit_sha": "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "tree_sha": "ba3177d3dd666b702d59c4daab74f62a9f7a84fb",
+    "parent_sha": "a674ce5e0d1ab0774546086fa7b2730516eca176",
+    "commit_timestamp": "2026-07-13T03:29:58Z",
+    "commit_url": "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85",
+    "commit_signature_verified": true,
+    "package_name": "openclaw",
+    "package_version": "2026.7.2",
+    "package_manifest_path": "package.json"
+  },
+  "stable_release": {
+    "tag": "v2026.6.11",
+    "name": "openclaw 2026.6.11",
+    "tag_object_sha": "08d1bbad1bd6ee5700082e1c0f65f63f07600d1f",
+    "commit_sha": "e085fa1a3ffd32d0ea6917e1e6fb4ecbffbb77d2",
+    "published_at": "2026-06-30T16:06:39Z",
+    "release_url": "https://github.com/openclaw/openclaw/releases/tag/v2026.6.11"
+  },
+  "gateway_protocol": {
+    "current": 4,
+    "minimum_general_client": 4,
+    "minimum_authenticated_node": 3,
+    "minimum_probe": 3,
+    "compatibility_window": "Authenticated role=node and client.mode=node clients may use v3 (N-1); general clients require v4.",
+    "source_path": "packages/gateway-protocol/src/version.ts",
+    "documentation_path": "docs/gateway/protocol.md"
+  },
+  "licensing": {
+    "repository_license": "MIT",
+    "repository_license_path": "LICENSE",
+    "repository_copyright": "Copyright (c) 2026 OpenClaw Foundation",
+    "third_party_notices_path": "THIRD_PARTY_NOTICES.md",
+    "exceptions": [
+      {
+        "path": "skills/skill-creator/license.txt",
+        "license": "Apache-2.0"
+      }
+    ],
+    "content_policy": "Contracts, identifiers, paths, metadata, and evidence references only; no upstream implementation code is copied."
+  }
+}

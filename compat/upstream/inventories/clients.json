@@ -1,0 +1,81 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "clients",
+    "classification":  "official_client_interop",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  10
+               },
+    "items":  [
+                  {
+                      "record_id":  "client:cli",
+                      "id":  "cli",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/cli",
+                      "kind":  "terminal_client"
+                  },
+                  {
+                      "record_id":  "client:tui",
+                      "id":  "tui",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/tui",
+                      "kind":  "terminal_app"
+                  },
+                  {
+                      "record_id":  "client:control-ui",
+                      "id":  "control-ui",
+                      "classification":  "official_client_interop",
+                      "source_path":  "ui/src",
+                      "kind":  "web_app"
+                  },
+                  {
+                      "record_id":  "client:android",
+                      "id":  "android",
+                      "classification":  "official_client_interop",
+                      "source_path":  "apps/android",
+                      "kind":  "native_app"
+                  },
+                  {
+                      "record_id":  "client:ios",
+                      "id":  "ios",
+                      "classification":  "official_client_interop",
+                      "source_path":  "apps/ios",
+                      "kind":  "native_app"
+                  },
+                  {
+                      "record_id":  "client:macos",
+                      "id":  "macos",
+                      "classification":  "official_client_interop",
+                      "source_path":  "apps/macos",
+                      "kind":  "native_app"
+                  },
+                  {
+                      "record_id":  "client:macos-mlx-tts",
+                      "id":  "macos-mlx-tts",
+                      "classification":  "official_client_interop",
+                      "source_path":  "apps/macos-mlx-tts",
+                      "kind":  "native_sidecar"
+                  },
+                  {
+                      "record_id":  "client:swabble",
+                      "id":  "swabble",
+                      "classification":  "official_client_interop",
+                      "source_path":  "apps/swabble",
+                      "kind":  "native_helper"
+                  },
+                  {
+                      "record_id":  "client:chrome-extension",
+                      "id":  "chrome-extension",
+                      "classification":  "official_client_interop",
+                      "source_path":  "extensions/browser/chrome-extension",
+                      "kind":  "browser_extension"
+                  },
+                  {
+                      "record_id":  "client:node-host",
+                      "id":  "node-host",
+                      "classification":  "official_client_interop",
+                      "source_path":  "src/node-host",
+                      "kind":  "headless_node"
+                  }
+              ]
+}
