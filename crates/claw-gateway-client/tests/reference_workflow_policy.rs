@@ -26,8 +26,8 @@ fn reference_workflow_disables_credentials_and_network_lifecycle_downloads() {
         "COREPACK_ENABLE_DOWNLOAD_PROMPT: \"0\"",
         "corepack install",
         "npm_config_ignore_scripts: \"true\"",
-        "pnpm install --frozen-lockfile --ignore-scripts",
-        "pnpm config get ignore-scripts",
+        "pnpm --config.ignore-scripts=true install --frozen-lockfile --ignore-scripts",
+        "pnpm --config.ignore-scripts=true build",
         "matrix-sdk-crypto-nodejs",
         "unverified Matrix native lifecycle artifact was downloaded",
     ] {

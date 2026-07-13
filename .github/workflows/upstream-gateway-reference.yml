@@ -98,24 +98,23 @@ jobs:
           corepack enable
           corepack install
           pnpm_version="$(pnpm --version)"
-          ignore_scripts="$(pnpm config get ignore-scripts)"
-          printf 'pnpm=%s ignore-scripts=%s\n' "$pnpm_version" "$ignore_scripts"
+          printf 'pnpm=%s ignore-scripts=%s\n' "$pnpm_version" "$npm_config_ignore_scripts"
           test "$pnpm_version" = "11.2.2"
-          test "$ignore_scripts" = "true"
+          test "$npm_config_ignore_scripts" = "true"
 
       - name: Install and build pinned official Gateway
         working-directory: _upstream/openclaw
         shell: bash
         run: |
           set -euo pipefail
-          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm --config.ignore-scripts=true install --frozen-lockfile --ignore-scripts
           test -d node_modules
           if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
             -type f -name '*.node' -print -quit 2>/dev/null | grep -q .; then
             echo "unverified Matrix native lifecycle artifact was downloaded"
             exit 1
           fi
-          pnpm build
+          pnpm --config.ignore-scripts=true build
           if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
             -type f -name '*.node' -print -quit 2>/dev/null | grep -q .; then
             echo "build introduced an unverified Matrix native artifact"
