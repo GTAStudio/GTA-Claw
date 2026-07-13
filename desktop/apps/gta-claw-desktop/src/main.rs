@@ -287,10 +287,13 @@ fn main() {
 
 #[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 mod tests {
+    #[cfg(target_os = "windows")]
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::onboarding::{OnboardingModel, OnboardingPhase};
+    use crate::onboarding::OnboardingModel;
+    #[cfg(target_os = "windows")]
+    use crate::onboarding::OnboardingPhase;
 
     #[cfg(target_os = "macos")]
     type GeneratedContract = fn(&AppWindow, ControllerSender, Rc<RefCell<VisualPreferencesState>>);
