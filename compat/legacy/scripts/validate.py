@@ -44,62 +44,105 @@ AUDITED_SOURCE_CATEGORY_TOTALS = {
 }
 HTTP_ENDPOINT_COUNT = 10
 HTTP_CASE_COUNT = 28
+DUPLICATE_ALIAS_MAPPING_IDENTITY = (
+    "DEVICE_FLOW_ENABLED",
+    "runtime",
+    "auth.github.device.enabled",
+)
 # Audited from the pinned TypeScript sources; never populate this from examples.json.
+HTTP_SHAPE_NULL = '["null"]'
+HTTP_SHAPE_STRING = '["string"]'
+HTTP_SHAPE_ERROR = '["object",[["error",["string"]]]]'
+HTTP_SHAPE_REPLY = '["object",[["reply",["string"]]]]'
 HTTP_CASE_CONTRACTS = {
     ("GET", "/", "unauthenticated-no-channels"): (
         200,
-        "object:authenticated,channels,deviceFlowEnabled,endpoints,examples,service,status,tips",
+        '["object",[["authenticated",["bool"]],["channels",["object",'
+        '[["discord",["bool"]],["teams",["bool"]],["telegram",["bool"]],'
+        '["whatsapp",["bool"]]]]],["deviceFlowEnabled",["bool"]],["endpoints",'
+        '["object",[["chat",["string"]],["deviceAuth",["string"]],'
+        '["health",["string"]]]]],["examples",["object",'
+        '[["chatCurl",["string"]]]]],["service",["string"]],["status",'
+        '["string"]],["tips",["array",[["string"],["string"]]]]]]',
     ),
     ("GET", "/health", "healthy-unauthenticated"): (
         200,
-        "object:authenticated,channels,deviceFlowEnabled,model,sessions,skills,status,uptime",
+        '["object",[["authenticated",["bool"]],["channels",["object",'
+        '[["discord",["bool"]],["teams",["bool"]],["telegram",["bool"]],'
+        '["whatsapp",["bool"]]]]],["deviceFlowEnabled",["bool"]],["model",'
+        '["string"]],["sessions",["integer"]],["skills",["integer"]],'
+        '["status",["string"]],["uptime",["integer"]]]]',
     ),
     ("GET", "/auth/device", "already-authenticated"): (
         200,
-        "object:authenticated,message",
+        '["object",[["authenticated",["bool"]],["message",["string"]]]]',
     ),
-    ("GET", "/auth/device", "disabled"): (400, "object:authenticated,error"),
+    ("GET", "/auth/device", "disabled"): (
+        400,
+        '["object",[["authenticated",["bool"]],["error",["string"]]]]',
+    ),
     ("GET", "/auth/device", "instructions"): (
         200,
-        "object:auth_instructions,authenticated",
+        '["object",[["auth_instructions",["string"]],'
+        '["authenticated",["bool"]]]]',
     ),
-    ("GET", "/auth/device", "unexpected-error"): (500, "object:error"),
-    ("POST", "/chat", "missing-message"): (400, "object:error"),
-    ("POST", "/chat", "help-before-auth"): (200, "object:reply"),
-    ("POST", "/chat", "unauthenticated-token-mode"): (401, "object:error"),
+    ("GET", "/auth/device", "unexpected-error"): (500, HTTP_SHAPE_ERROR),
+    ("POST", "/chat", "missing-message"): (400, HTTP_SHAPE_ERROR),
+    ("POST", "/chat", "help-before-auth"): (200, HTTP_SHAPE_REPLY),
+    ("POST", "/chat", "unauthenticated-token-mode"): (401, HTTP_SHAPE_ERROR),
     ("POST", "/chat", "unauthenticated-device-flow"): (
         401,
-        "object:auth_instructions,error",
+        '["object",[["auth_instructions",["string"]],["error",["string"]]]]',
     ),
-    ("POST", "/chat", "success"): (200, "object:reply"),
-    ("POST", "/chat", "endpoint-error"): (500, "object:error"),
-    ("POST", "/api/messages", "adapter-ack"): (200, "null"),
-    ("POST", "/api/messages", "rate-limited"): (429, "object:error"),
-    ("GET", "/whatsapp/webhook", "verified"): (200, "string"),
-    ("GET", "/whatsapp/webhook", "forbidden"): (403, "object:error"),
-    ("POST", "/whatsapp/webhook", "accepted"): (200, "object:ok"),
-    ("POST", "/whatsapp/webhook", "handling-failed"): (500, "object:error"),
-    ("POST", "/admin/reload", "forbidden"): (403, "object:error"),
+    ("POST", "/chat", "success"): (200, HTTP_SHAPE_REPLY),
+    ("POST", "/chat", "endpoint-error"): (500, HTTP_SHAPE_ERROR),
+    ("POST", "/api/messages", "adapter-ack"): (200, HTTP_SHAPE_NULL),
+    ("POST", "/api/messages", "rate-limited"): (429, HTTP_SHAPE_ERROR),
+    ("GET", "/whatsapp/webhook", "verified"): (200, HTTP_SHAPE_STRING),
+    ("GET", "/whatsapp/webhook", "forbidden"): (403, HTTP_SHAPE_ERROR),
+    ("POST", "/whatsapp/webhook", "accepted"): (
+        200,
+        '["object",[["ok",["bool"]]]]',
+    ),
+    ("POST", "/whatsapp/webhook", "handling-failed"): (500, HTTP_SHAPE_ERROR),
+    ("POST", "/admin/reload", "forbidden"): (403, HTTP_SHAPE_ERROR),
     ("POST", "/admin/reload", "reloaded"): (
         200,
-        "object:message,model,skills",
+        '["object",[["message",["string"]],["model",["string"]],'
+        '["skills",["integer"]]]]',
     ),
-    ("POST", "/admin/reload", "conflict"): (409, "object:error"),
-    ("POST", "/admin/reload", "failed"): (500, "object:error"),
-    ("GET", "/admin/system", "forbidden"): (403, "object:error"),
-    ("GET", "/admin/system", "system-info"): (200, "object:node,os"),
-    ("POST", "/admin/exec", "forbidden"): (403, "object:error"),
+    ("POST", "/admin/reload", "conflict"): (409, HTTP_SHAPE_ERROR),
+    ("POST", "/admin/reload", "failed"): (500, HTTP_SHAPE_ERROR),
+    ("GET", "/admin/system", "forbidden"): (403, HTTP_SHAPE_ERROR),
+    ("GET", "/admin/system", "system-info"): (
+        200,
+        '["object",[["node",["object",[["memory_mb",["object",'
+        '[["heapTotal",["integer"]],["heapUsed",["integer"]],'
+        '["rss",["integer"]]]]],["pid",["integer"]],["uptime_s",'
+        '["integer"]],["version",["string"]]]]],["os",["object",'
+        '[["arch",["string"]],["cpus",["integer"]],["freeMemory_mb",'
+        '["integer"]],["hostname",["string"]],["loadavg",["array",'
+        '[["number"],["number"],["number"]]]],["platform",["string"]],'
+        '["totalMemory_mb",'
+        '["integer"]],["uptime_s",["integer"]]]]]]]',
+    ),
+    ("POST", "/admin/exec", "forbidden"): (403, HTTP_SHAPE_ERROR),
     ("POST", "/admin/exec", "unknown-action"): (
         400,
-        "object:allowed,error",
+        '["object",[["allowed",["array",[["string"],["string"],["string"],'
+        '["string"],["string"],["string"],["string"],["string"],["string"],'
+        '["string"],["string"],["string"]]]],'
+        '["error",["string"]]]]',
     ),
     ("POST", "/admin/exec", "command-success"): (
         200,
-        "object:action,output,success",
+        '["object",[["action",["string"]],["output",["string"]],'
+        '["success",["bool"]]]]',
     ),
     ("POST", "/admin/exec", "command-failure"): (
         200,
-        "object:action,error,stderr,success",
+        '["object",[["action",["string"]],["error",["string"]],'
+        '["stderr",["string"]],["success",["bool"]]]]',
     ),
 }
 
@@ -382,16 +425,104 @@ def validate_config(mapping):
     return len(mappings), len(runtime_actual)
 
 
-def http_response_shape(response):
+def validator_owned_mapping(mapping, identity):
+    ensure(
+        identity == DUPLICATE_ALIAS_MAPPING_IDENTITY,
+        f"config regression target is not validator-owned: {identity!r}",
+    )
+    matches = [
+        entry
+        for entry in mapping["mappings"]
+        if (
+            entry["legacy_env"],
+            entry["scope"],
+            entry["target_json5_key"],
+        )
+        == identity
+    ]
+    ensure(
+        len(matches) == 1,
+        f"config regression target {identity!r} must occur exactly once; "
+        f"found {len(matches)}",
+    )
+    return next(iter(matches))
+
+
+def http_response_shape_descriptor(response):
     if response is None:
-        return "null"
+        return ("null",)
+    if isinstance(response, bool):
+        return ("bool",)
+    if isinstance(response, int):
+        return ("integer",)
+    if isinstance(response, float):
+        return ("number",)
     if isinstance(response, str):
-        return "string"
-    if isinstance(response, dict):
-        return "object:" + ",".join(sorted(response))
+        return ("string",)
     if isinstance(response, list):
-        return "array"
-    return type(response).__name__
+        return (
+            "array",
+            tuple(http_response_shape_descriptor(item) for item in response),
+        )
+    if isinstance(response, dict):
+        return (
+            "object",
+            tuple(
+                (key, http_response_shape_descriptor(response[key]))
+                for key in sorted(response)
+            ),
+        )
+    raise ContractError(f"unsupported JSON response type: {type(response).__name__}")
+
+
+def http_response_shape(response):
+    return json.dumps(
+        http_response_shape_descriptor(response),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def validator_owned_http_case(http_examples, contract_key):
+    ensure(
+        contract_key in HTTP_CASE_CONTRACTS,
+        f"HTTP regression target is not validator-owned: {contract_key!r}",
+    )
+    method, path, case_id = contract_key
+    matches = [
+        (endpoint, case)
+        for endpoint in http_examples["endpoints"]
+        if endpoint["method"] == method and endpoint["path"] == path
+        for case in endpoint["cases"]
+        if case["case_id"] == case_id
+    ]
+    ensure(
+        len(matches) == 1,
+        f"HTTP regression target {contract_key!r} must occur exactly once; "
+        f"found {len(matches)}",
+    )
+    return next(iter(matches))
+
+
+def ensure_schema_valid_fixture(label, instance, validator):
+    errors = sorted(
+        validator.iter_errors(instance),
+        key=lambda error: list(error.path),
+    )
+    ensure(
+        not errors,
+        f"{label} mutation is not schema-valid: "
+        f"{next(iter(errors)).message if errors else ''}",
+    )
+
+
+def expect_schema_valid_http_error(label, http_examples, validator, message_contains):
+    ensure_schema_valid_fixture(label, http_examples, validator)
+    expect_contract_error(
+        label,
+        lambda: validate_http(http_examples),
+        message_contains,
+    )
 
 
 def validate_http(http_examples):
@@ -455,10 +586,6 @@ def validate_http(http_examples):
             )
     unique(case_ids, "HTTP case ID")
     unique((key for key, _ in documented_cases), "HTTP method/path/case ID")
-    ensure(
-        len(case_ids) == HTTP_CASE_COUNT,
-        f"expected {HTTP_CASE_COUNT} HTTP cases, found {len(case_ids)}",
-    )
     actual_contracts = dict(documented_cases)
     missing = set(HTTP_CASE_CONTRACTS) - set(actual_contracts)
     extra = set(actual_contracts) - set(HTTP_CASE_CONTRACTS)
@@ -474,6 +601,10 @@ def validate_http(http_examples):
         not missing and not extra and not changed,
         "HTTP case contract mismatch: "
         f"missing={sorted(missing)}, extra={sorted(extra)}, changed={changed}",
+    )
+    ensure(
+        len(case_ids) == HTTP_CASE_COUNT,
+        f"expected {HTTP_CASE_COUNT} HTTP cases, found {len(case_ids)}",
     )
     return len(endpoints), len(case_ids)
 
@@ -654,7 +785,208 @@ def validate_migration(contract):
     )
 
 
-def run_regression_self_tests(mapping, coverage, http_examples):
+def run_mapping_regression_self_tests(mapping, mapping_validator):
+    missing_target = copy.deepcopy(mapping)
+    missing_mapping = validator_owned_mapping(
+        missing_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+    )
+    missing_target["mappings"].remove(missing_mapping)
+    ensure_schema_valid_fixture(
+        "missing config regression target", missing_target, mapping_validator
+    )
+    expect_contract_error(
+        "missing config regression target",
+        lambda: validator_owned_mapping(
+            missing_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+        ),
+        "must occur exactly once; found 0",
+    )
+
+    duplicate_target = copy.deepcopy(mapping)
+    duplicate_mapping = validator_owned_mapping(
+        duplicate_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+    )
+    duplicate_target["mappings"].append(copy.deepcopy(duplicate_mapping))
+    ensure_schema_valid_fixture(
+        "duplicate config regression target", duplicate_target, mapping_validator
+    )
+    expect_contract_error(
+        "duplicate config regression target",
+        lambda: validator_owned_mapping(
+            duplicate_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+        ),
+        "must occur exactly once; found 2",
+    )
+
+    duplicate_alias = copy.deepcopy(mapping)
+    alias_target = validator_owned_mapping(
+        duplicate_alias, DUPLICATE_ALIAS_MAPPING_IDENTITY
+    )
+    alias_target["aliases"] = ["GITHUB_TOKEN"]
+    ensure_schema_valid_fixture(
+        "runtime alias mapped to multiple targets", duplicate_alias, mapping_validator
+    )
+    expect_contract_error(
+        "runtime alias mapped to multiple targets",
+        lambda: validate_config(duplicate_alias),
+        "duplicate runtime environment name or alias",
+    )
+
+
+def run_http_regression_self_tests(http_examples, http_validator):
+    ensure(
+        http_response_shape({"a,b": 1})
+        != http_response_shape({"a": 1, "b": 1}),
+        "HTTP response-shape encoding loses object key boundaries",
+    )
+    ensure(
+        http_response_shape({"nested": {"authenticated": False}})
+        != http_response_shape({"nested": {"authenticated": "false"}}),
+        "HTTP response-shape encoding loses nested value types",
+    )
+    ensure(
+        http_response_shape([1, "x"]) != http_response_shape(["x", 1]),
+        "HTTP response-shape encoding loses array order",
+    )
+    ensure(
+        http_response_shape([1]) != http_response_shape([1, 1]),
+        "HTTP response-shape encoding loses array multiplicity",
+    )
+    ensure(
+        http_response_shape([[1, "x"]]) != http_response_shape([["x", 1]]),
+        "HTTP response-shape encoding loses nested array order",
+    )
+    ensure(
+        http_response_shape([[1]]) != http_response_shape([[1, 1]]),
+        "HTTP response-shape encoding loses nested array multiplicity",
+    )
+
+    root_key = ("GET", "/", "unauthenticated-no-channels")
+    already_authenticated_key = ("GET", "/auth/device", "already-authenticated")
+    disabled_key = ("GET", "/auth/device", "disabled")
+    unexpected_error_key = ("GET", "/auth/device", "unexpected-error")
+    endpoint_error_key = ("POST", "/chat", "endpoint-error")
+
+    missing_target = copy.deepcopy(http_examples)
+    missing_endpoint, missing_case = validator_owned_http_case(
+        missing_target, unexpected_error_key
+    )
+    missing_endpoint["cases"].remove(missing_case)
+    ensure_schema_valid_fixture(
+        "missing HTTP regression target", missing_target, http_validator
+    )
+    expect_contract_error(
+        "missing HTTP regression target",
+        lambda: validator_owned_http_case(missing_target, unexpected_error_key),
+        "must occur exactly once; found 0",
+    )
+
+    duplicate_target = copy.deepcopy(http_examples)
+    duplicate_endpoint, duplicate_source = validator_owned_http_case(
+        duplicate_target, endpoint_error_key
+    )
+    duplicate_endpoint["cases"].append(copy.deepcopy(duplicate_source))
+    ensure_schema_valid_fixture(
+        "duplicate HTTP regression target", duplicate_target, http_validator
+    )
+    expect_contract_error(
+        "duplicate HTTP regression target",
+        lambda: validator_owned_http_case(duplicate_target, endpoint_error_key),
+        "must occur exactly once; found 2",
+    )
+
+    invented_route = copy.deepcopy(http_examples)
+    route_endpoint, _ = validator_owned_http_case(invented_route, root_key)
+    route_endpoint["path"] = "/invented"
+    expect_schema_valid_http_error(
+        "invented documented HTTP route",
+        invented_route,
+        http_validator,
+        "HTTP route inventory mismatch",
+    )
+
+    changed_status = copy.deepcopy(http_examples)
+    _, status_case = validator_owned_http_case(changed_status, root_key)
+    status_case["status"] = 599
+    expect_schema_valid_http_error(
+        "changed HTTP case status with stable counts",
+        changed_status,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    changed_shape = copy.deepcopy(http_examples)
+    _, shape_case = validator_owned_http_case(changed_shape, root_key)
+    response = shape_case["response"]
+    ensure(
+        isinstance(response, dict)
+        and isinstance(response.get("authenticated"), bool),
+        f"HTTP regression target {root_key!r} lacks boolean authenticated response",
+    )
+    response["authenticated"] = "false"
+    expect_schema_valid_http_error(
+        "changed HTTP response shape with stable counts",
+        changed_shape,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    swapped_cases = copy.deepcopy(http_examples)
+    _, already_authenticated = validator_owned_http_case(
+        swapped_cases, already_authenticated_key
+    )
+    _, disabled = validator_owned_http_case(swapped_cases, disabled_key)
+    already_authenticated["case_id"], disabled["case_id"] = (
+        disabled["case_id"],
+        already_authenticated["case_id"],
+    )
+    expect_schema_valid_http_error(
+        "swapped HTTP cases with stable counts",
+        swapped_cases,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    missing_case_fixture = copy.deepcopy(http_examples)
+    missing_case_endpoint, missing_case = validator_owned_http_case(
+        missing_case_fixture, unexpected_error_key
+    )
+    missing_case_endpoint["cases"].remove(missing_case)
+    expect_schema_valid_http_error(
+        "missing HTTP case",
+        missing_case_fixture,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    extra_case_fixture = copy.deepcopy(http_examples)
+    extra_case_endpoint, extra_case_source = validator_owned_http_case(
+        extra_case_fixture, endpoint_error_key
+    )
+    invented_case = copy.deepcopy(extra_case_source)
+    invented_case["case_id"] = "invented-extra"
+    extra_case_endpoint["cases"].append(invented_case)
+    expect_schema_valid_http_error(
+        "extra HTTP case",
+        extra_case_fixture,
+        http_validator,
+        "HTTP case contract mismatch",
+    )
+
+    duplicate_case_fixture = copy.deepcopy(http_examples)
+    duplicate_case_endpoint, duplicate_case_source = validator_owned_http_case(
+        duplicate_case_fixture, endpoint_error_key
+    )
+    duplicate_case_endpoint["cases"].append(copy.deepcopy(duplicate_case_source))
+    expect_schema_valid_http_error(
+        "duplicate HTTP case",
+        duplicate_case_fixture,
+        http_validator,
+        "duplicate HTTP case ID",
+    )
+
+
+def run_regression_self_tests(mapping, coverage, http_examples, schemas, registry):
     role_result = role_source_outcome(
         {
             "content_type": "application/json",
@@ -691,28 +1023,33 @@ def run_regression_self_tests(mapping, coverage, http_examples):
         lambda: validate_coverage_definition(reduced_coverage),
     )
 
-    duplicate_alias = copy.deepcopy(mapping)
-    duplicate_alias["mappings"][1]["aliases"] = ["GITHUB_TOKEN"]
-    expect_contract_error(
-        "runtime alias mapped to multiple targets",
-        lambda: validate_config(duplicate_alias),
+    mapping_schema = schemas["config-mapping.schema.json"]
+    mapping_validator = validator_for(mapping_schema)(
+        mapping_schema, registry=registry
     )
+    run_mapping_regression_self_tests(mapping, mapping_validator)
 
-    invented_route = copy.deepcopy(http_examples)
-    invented_route["endpoints"][0]["path"] = "/invented"
-    expect_contract_error(
-        "invented documented HTTP route",
-        lambda: validate_http(invented_route),
-        "HTTP route inventory mismatch",
+    reordered_mapping = copy.deepcopy(mapping)
+    reordered_mapping["mappings"].reverse()
+    ensure_schema_valid_fixture(
+        "reordered config mapping", reordered_mapping, mapping_validator
     )
+    validate_config(reordered_mapping)
+    run_mapping_regression_self_tests(reordered_mapping, mapping_validator)
 
-    changed_status = copy.deepcopy(http_examples)
-    changed_status["endpoints"][0]["cases"][0]["status"] = 599
-    expect_contract_error(
-        "changed HTTP case status with stable counts",
-        lambda: validate_http(changed_status),
-        "HTTP case contract mismatch",
+    http_schema = schemas["http-examples.schema.json"]
+    http_validator = validator_for(http_schema)(http_schema, registry=registry)
+    run_http_regression_self_tests(http_examples, http_validator)
+
+    reordered_http_examples = copy.deepcopy(http_examples)
+    reordered_http_examples["endpoints"].reverse()
+    for endpoint in reordered_http_examples["endpoints"]:
+        endpoint["cases"].reverse()
+    ensure_schema_valid_fixture(
+        "reordered HTTP fixture", reordered_http_examples, http_validator
     )
+    validate_http(reordered_http_examples)
+    run_http_regression_self_tests(reordered_http_examples, http_validator)
 
     expect_contract_error(
         "structural-only evidence range",
@@ -756,7 +1093,7 @@ def main():
         skill_count = validate_skills(schemas, registry, skills)
         role_source_count = validate_role_sources()
         validate_migration(contract)
-        run_regression_self_tests(mapping, coverage, http_examples)
+        run_regression_self_tests(mapping, coverage, http_examples, schemas, registry)
 
         result = {
             "status": "ok",
