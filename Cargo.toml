@@ -3,6 +3,7 @@ members = [
   "apps/gta-claw-cli",
   "apps/gta-claw-daemon",
   "crates/claw-application",
+  "crates/claw-config",
   "crates/claw-domain",
   "crates/claw-platform",
   "crates/claw-protocol",
@@ -13,6 +14,7 @@ resolver = "3"
 
 [workspace.dependencies]
 claw-application = { path = "crates/claw-application", version = "0.1.0" }
+claw-config = { path = "crates/claw-config", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
