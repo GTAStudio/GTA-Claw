@@ -25,6 +25,19 @@ fn accepts_only_the_externally_pinned_source() {
 
     assert_eq!(inventory.baseline_sha, EXPECTED_BASELINE_SHA);
     assert_eq!(inventory.items.len(), 320);
+
+    let mut lf = Vec::with_capacity(SOURCE.len());
+    let mut index = 0;
+    while index < SOURCE.len() {
+        if SOURCE.get(index..index + 2) == Some(b"\r\n") {
+            lf.push(b'\n');
+            index += 2;
+        } else {
+            lf.push(SOURCE[index]);
+            index += 1;
+        }
+    }
+    validate_registry_bytes(&lf).expect("LF checkout must preserve the same external pin");
 }
 
 #[test]

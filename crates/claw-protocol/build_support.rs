@@ -1,5 +1,6 @@
 //! Build-time validation for the externally pinned Gateway registry source.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write as _;
@@ -14,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const EXPECTED_BASELINE_SHA: &str = "b43e832fcc8000ed7287c7accc54e381db607f85";
 pub(crate) const EXPECTED_SOURCE_SHA256: &str =
-    "2a0e35188702c97077ab5bd7a28f802507ff29ebcb2e5b8561342d863ecb09a1";
+    "0ca2cf58f1a924095c1fee0af5765b61871b35d590dfb2932d459c4ca8a71996";
 pub(crate) const EXPECTED_CANONICAL_SHA256: &str =
     "69c16fe2d025241e21e6c1dd1a92c7586af5cbcb26f02771b3a16b5f09cff9c9";
 pub(crate) const EXPECTED_TOTAL: usize = 320;
@@ -69,7 +70,8 @@ pub(crate) fn load_and_validate_registry(path: &Path) -> Result<Inventory, Regis
 }
 
 pub(crate) fn validate_registry_bytes(source: &[u8]) -> Result<Inventory, RegistrySourceError> {
-    let source_digest = sha256_hex(source);
+    let normalized_source = normalize_line_endings(source);
+    let source_digest = sha256_hex(&normalized_source);
     if source_digest != EXPECTED_SOURCE_SHA256 {
         return Err(RegistrySourceError::SourceDigest {
             expected: EXPECTED_SOURCE_SHA256,
@@ -77,7 +79,9 @@ pub(crate) fn validate_registry_bytes(source: &[u8]) -> Result<Inventory, Regist
         });
     }
 
-    let source = source.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(source);
+    let source = normalized_source
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(&normalized_source);
     let inventory: Inventory = serde_json::from_slice(source).map_err(RegistrySourceError::Json)?;
     validate_contract(&inventory)?;
 
@@ -89,6 +93,24 @@ pub(crate) fn validate_registry_bytes(source: &[u8]) -> Result<Inventory, Regist
         });
     }
     Ok(inventory)
+}
+
+fn normalize_line_endings(source: &[u8]) -> Cow<'_, [u8]> {
+    if !source.windows(2).any(|pair| pair == b"\r\n") {
+        return Cow::Borrowed(source);
+    }
+    let mut normalized = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source.get(index..index + 2) == Some(b"\r\n") {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(source[index]);
+            index += 1;
+        }
+    }
+    Cow::Owned(normalized)
 }
 
 fn validate_contract(inventory: &Inventory) -> Result<(), RegistrySourceError> {
