@@ -7,7 +7,8 @@
     "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "endpoints": {
       "type": "array",
-      "minItems": 9,
+      "minItems": 10,
+      "maxItems": 10,
       "items": {
         "type": "object",
         "required": [

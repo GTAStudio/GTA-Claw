@@ -17,7 +17,7 @@
       "properties": {
         "outcome": { "enum": ["loaded_json", "loaded_plain_text", "error"] },
         "content": { "type": "string" },
-        "model": { "type": "string" },
+        "model": { "type": ["string", "null"] },
         "error_contains": { "type": "string" }
       },
       "additionalProperties": false

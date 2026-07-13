@@ -1,0 +1,14 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "legacy_skill",
+    "source": "legacy.json",
+    "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": [],
+  "remaining_javascript": [],
+  "artifacts": [],
+  "diagnostics": []
+}

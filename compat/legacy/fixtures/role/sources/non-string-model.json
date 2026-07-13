@@ -1,0 +1,14 @@
+{
+  "content_type": "application/json",
+  "body": {
+    "content": "Use the default model.",
+    "model": {
+      "unexpected": true
+    }
+  },
+  "expected": {
+    "outcome": "loaded_json",
+    "content": "Use the default model.",
+    "model": null
+  }
+}

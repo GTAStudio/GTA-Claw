@@ -24,7 +24,9 @@
       },
       "additionalProperties": false
     },
-    "status": { "enum": ["migrated", "manual_port_required", "invalid_input", "failed"] },
+    "status": {
+      "enum": ["migrated", "manual_port_required", "invalid_input", "failed"]
+    },
     "exit_code": { "type": "integer", "minimum": 0 },
     "recognized_bridges": {
       "type": "array",
@@ -45,18 +47,21 @@
     },
     "artifacts": {
       "type": "array",
+      "uniqueItems": true,
       "items": {
         "type": "object",
         "required": ["kind", "path", "sha256", "signature"],
         "properties": {
-          "kind": { "enum": ["wasi_manifest", "wit_scaffold", "role", "json5_config"] },
+          "kind": {
+            "enum": ["wasi_manifest", "wit_scaffold", "role", "json5_config"]
+          },
           "path": { "type": "string", "minLength": 1 },
           "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "signature": {
             "type": "object",
             "required": ["algorithm", "key_id", "value"],
             "properties": {
-              "algorithm": { "enum": ["ed25519"] },
+              "algorithm": { "const": "ed25519" },
               "key_id": { "type": "string", "minLength": 1 },
               "value": { "type": "string", "minLength": 1 }
             },
@@ -92,33 +97,7 @@
     },
     {
       "if": { "properties": { "status": { "const": "manual_port_required" } } },
-      "then": {
-        "properties": {
-          "exit_code": { "const": 2 },
-          "remaining_javascript": { "minItems": 1 },
-          "artifacts": {
-            "minItems": 2,
-            "allOf": [
-              {
-                "contains": {
-                  "type": "object",
-                  "required": ["kind"],
-                  "properties": { "kind": { "const": "wasi_manifest" } }
-                },
-                "minContains": 1
-              },
-              {
-                "contains": {
-                  "type": "object",
-                  "required": ["kind"],
-                  "properties": { "kind": { "const": "wit_scaffold" } }
-                },
-                "minContains": 1
-              }
-            ]
-          }
-        }
-      }
+      "then": { "properties": { "exit_code": { "const": 2 } } }
     },
     {
       "if": { "properties": { "status": { "const": "invalid_input" } } },
@@ -130,10 +109,172 @@
     },
     {
       "if": {
-        "required": ["remaining_javascript"],
         "properties": { "remaining_javascript": { "minItems": 1 } }
       },
       "then": { "properties": { "exit_code": { "not": { "const": 0 } } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "input": {
+            "properties": { "kind": { "const": "role" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": { "enum": ["migrated", "invalid_input", "failed"] },
+          "recognized_bridges": { "maxItems": 0 },
+          "remaining_javascript": { "maxItems": 0 },
+          "artifacts": {
+            "items": {
+              "properties": { "kind": { "const": "role" } }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "status": { "const": "migrated" } } },
+            "then": {
+              "properties": { "artifacts": { "minItems": 1, "maxItems": 1 } }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": { "enum": ["invalid_input", "failed"] }
+              }
+            },
+            "then": { "properties": { "artifacts": { "maxItems": 0 } } }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "input": {
+            "properties": { "kind": { "const": "environment" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": { "enum": ["migrated", "invalid_input", "failed"] },
+          "recognized_bridges": { "maxItems": 0 },
+          "remaining_javascript": { "maxItems": 0 },
+          "artifacts": {
+            "items": {
+              "properties": { "kind": { "const": "json5_config" } }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "status": { "const": "migrated" } } },
+            "then": {
+              "properties": { "artifacts": { "minItems": 1, "maxItems": 1 } }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": { "enum": ["invalid_input", "failed"] }
+              }
+            },
+            "then": { "properties": { "artifacts": { "maxItems": 0 } } }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "input": {
+            "properties": { "kind": { "const": "legacy_skill" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "artifacts": {
+            "items": {
+              "properties": {
+                "kind": { "enum": ["wasi_manifest", "wit_scaffold"] }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": { "enum": ["migrated", "manual_port_required"] }
+              }
+            },
+            "then": {
+              "properties": {
+                "artifacts": {
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "allOf": [
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": { "const": "wasi_manifest" }
+                        }
+                      },
+                      "minContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": { "const": "wit_scaffold" }
+                        }
+                      },
+                      "minContains": 1
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": { "const": "manual_port_required" }
+              }
+            },
+            "then": {
+              "properties": {
+                "remaining_javascript": { "minItems": 1 }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": { "enum": ["invalid_input", "failed"] }
+              }
+            },
+            "then": {
+              "properties": {
+                "artifacts": { "maxItems": 0 }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "status": { "const": "invalid_input" } }
+            },
+            "then": {
+              "properties": {
+                "remaining_javascript": { "maxItems": 0 }
+              }
+            }
+          }
+        ]
+      }
     }
   ],
   "additionalProperties": false

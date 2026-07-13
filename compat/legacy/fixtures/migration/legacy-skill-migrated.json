@@ -1,0 +1,41 @@
+{
+  "contract_version": "1.0.0",
+  "input": {
+    "kind": "legacy_skill",
+    "source": "deploy/conf/skills/web_fetch.json",
+    "sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "status": "migrated",
+  "exit_code": 0,
+  "recognized_bridges": ["httpGet", "log"],
+  "remaining_javascript": [],
+  "artifacts": [
+    {
+      "kind": "wasi_manifest",
+      "path": "web_fetch/manifest.json",
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    },
+    {
+      "kind": "wit_scaffold",
+      "path": "web_fetch/world.wit",
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "signature": {
+        "algorithm": "ed25519",
+        "key_id": "fixture-key",
+        "value": "fixture-signature"
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "RUST_PORT_VERIFIED",
+      "severity": "info",
+      "message": "The signed Rust/WASI replacement contains no remaining JavaScript."
+    }
+  ]
+}

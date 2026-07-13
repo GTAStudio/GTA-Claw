@@ -51,11 +51,13 @@
         "fixtures/role/positive/content.json",
         "fixtures/role/positive/prompt.json",
         "fixtures/role/positive/non-string-content-fallback.json",
+        "fixtures/role/positive/non-string-model.json",
         "fixtures/role/sources/plain-text.json",
+        "fixtures/role/sources/non-string-model.json",
         "fixtures/role/sources/text-json-fallback.json"
       ],
       "migration_decision": "preserve",
-      "known_differences": ["Unknown model names remain accepted with a warning-equivalent diagnostic."]
+      "known_differences": ["Unknown string model names remain accepted with a warning-equivalent diagnostic; non-string model values are ignored."]
     },
     {
       "feature_id": "legacy.skill.remote-format",
@@ -376,8 +378,8 @@
         { "path": "Dockerfile", "line_start": 1, "line_end": 68 },
         { "path": ".dockerignore", "line_start": 1, "line_end": 10 },
         { "path": "package.json", "line_start": 1, "line_end": 38 },
-        { "path": "package-lock.json", "line_start": 1, "line_end": 1 },
-        { "path": "tsconfig.json", "line_start": 1, "line_end": 1 }
+        { "path": "package-lock.json", "line_start": 1, "line_end": 31 },
+        { "path": "tsconfig.json", "line_start": 1, "line_end": 18 }
       ],
       "status": "current_supported",
       "acceptance_fixture": ["inventory/source-coverage.json", "ledger/behaviors.json"],

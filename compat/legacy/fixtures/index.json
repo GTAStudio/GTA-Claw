@@ -61,6 +61,11 @@
       "expected": "valid"
     },
     {
+      "path": "fixtures/role/positive/non-string-model.json",
+      "schema": "schemas/role.schema.json",
+      "expected": "valid"
+    },
+    {
       "path": "fixtures/role/negative/missing-content.json",
       "schema": "schemas/role.schema.json",
       "expected": "invalid"
@@ -77,6 +82,11 @@
     },
     {
       "path": "fixtures/role/sources/json-content.json",
+      "schema": "schemas/role-source.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/role/sources/non-string-model.json",
       "schema": "schemas/role-source.schema.json",
       "expected": "valid"
     },
@@ -131,6 +141,16 @@
       "expected": "valid"
     },
     {
+      "path": "fixtures/migration/legacy-skill-migrated.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "valid"
+    },
+    {
+      "path": "fixtures/migration/environment-migrated.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "valid"
+    },
+    {
       "path": "fixtures/migration/negative/silent-javascript-success.json",
       "schema": "schemas/migration-result.schema.json",
       "expected": "invalid"
@@ -142,6 +162,21 @@
     },
     {
       "path": "fixtures/migration/negative/manual-role-artifacts.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/legacy-skill-missing-port-evidence.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/role-javascript-evidence.json",
+      "schema": "schemas/migration-result.schema.json",
+      "expected": "invalid"
+    },
+    {
+      "path": "fixtures/migration/negative/environment-wasi-artifact.json",
       "schema": "schemas/migration-result.schema.json",
       "expected": "invalid"
     }

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
+import copy
 import glob
 import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -18,6 +20,30 @@ except ImportError as exc:
 
 BASE = Path(__file__).resolve().parents[1]
 REPO = BASE.parents[1]
+DISCOVERY_PATTERNS = (
+    ".dockerignore",
+    ".env.example",
+    ".github/workflows/docker-publish.yml",
+    "Dockerfile",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "src/**/*.ts",
+    "deploy/run.sh",
+    "deploy/conf/gta-claw.conf.example",
+    "deploy/conf/claw-steward.json",
+    "deploy/conf/skills/*.json",
+)
+AUDITED_SOURCE_COUNT = 38
+AUDITED_SOURCE_CATEGORY_TOTALS = {
+    "root": 6,
+    "ci": 1,
+    "typescript": 18,
+    "deployment": 3,
+    "bundled_skills": 10,
+}
+HTTP_ENDPOINT_COUNT = 10
+HTTP_CASE_COUNT = 28
 
 
 class ContractError(Exception):
@@ -40,6 +66,14 @@ def ensure(condition: bool, message: str):
 def unique(values, label: str):
     values = list(values)
     ensure(len(values) == len(set(values)), f"duplicate {label}")
+
+
+def expect_contract_error(label: str, operation):
+    try:
+        operation()
+    except ContractError:
+        return
+    raise ContractError(f"regression self-test did not reject {label}")
 
 
 def run_git(*args: str, check: bool = True):
@@ -132,11 +166,65 @@ def validate_source_reference(reference, covered_paths):
     ensure(path_text in covered_paths, f"uncovered source reference: {path_text}")
     path = REPO / path_text
     ensure(path.is_file(), f"missing source file: {path_text}")
-    line_count = len(path.read_text(encoding="utf-8").splitlines())
+    lines = path.read_text(encoding="utf-8").splitlines()
+    line_count = len(lines)
     start = reference["line_start"]
     end = reference["line_end"]
     ensure(start <= end, f"invalid source range {path_text}:{start}-{end}")
     ensure(end <= line_count, f"source range exceeds {path_text} line count {line_count}")
+    meaningful = any(
+        re.search(r"[A-Za-z0-9]", stripped)
+        and not stripped.startswith(("//", "#", "/*", "*", "*/"))
+        for stripped in (line.strip() for line in lines[start - 1:end])
+    )
+    ensure(meaningful, f"source range has no meaningful content: {path_text}:{start}-{end}")
+
+
+def source_category(path: str):
+    if path.startswith("deploy/conf/skills/"):
+        return "bundled_skills"
+    if path.startswith("src/"):
+        return "typescript"
+    if path.startswith("deploy/"):
+        return "deployment"
+    if path.startswith(".github/"):
+        return "ci"
+    return "root"
+
+
+def validate_coverage_definition(coverage):
+    include = coverage["discovery"]["include"]
+    ensure(
+        include == list(DISCOVERY_PATTERNS),
+        "source discovery rules differ from the canonical validator rules",
+    )
+
+    audited = coverage["audited_sources"]
+    ensure(
+        len(audited) == AUDITED_SOURCE_COUNT,
+        f"expected {AUDITED_SOURCE_COUNT} audited sources, found {len(audited)}",
+    )
+    category_totals = Counter(source_category(entry["path"]) for entry in audited)
+    ensure(
+        dict(category_totals) == AUDITED_SOURCE_CATEGORY_TOTALS,
+        "audited source category totals mismatch: "
+        f"expected={AUDITED_SOURCE_CATEGORY_TOTALS}, actual={dict(category_totals)}",
+    )
+
+    discovered = set()
+    for pattern in DISCOVERY_PATTERNS:
+        for match in glob.glob(str(REPO / pattern), recursive=True):
+            path = Path(match)
+            if path.is_file():
+                discovered.add(path.relative_to(REPO).as_posix())
+    covered_paths = {entry["path"] for entry in audited}
+    ensure(
+        discovered == covered_paths,
+        "source coverage mismatch: "
+        f"missing={sorted(discovered - covered_paths)}, "
+        f"extra={sorted(covered_paths - discovered)}",
+    )
+    return audited, covered_paths
 
 
 def validate_ledger(contract, ledger, behaviors, coverage):
@@ -145,22 +233,8 @@ def validate_ledger(contract, ledger, behaviors, coverage):
     unique(feature_ids, "feature_id")
     feature_set = set(feature_ids)
 
-    audited = coverage["audited_sources"]
-    covered_paths = {entry["path"] for entry in audited}
+    audited, covered_paths = validate_coverage_definition(coverage)
     unique((entry["path"] for entry in audited), "audited source path")
-
-    discovered = set()
-    for pattern in coverage["discovery"]["include"]:
-        for match in glob.glob(str(REPO / pattern), recursive=True):
-            path = Path(match)
-            if path.is_file():
-                discovered.add(path.relative_to(REPO).as_posix())
-    ensure(
-        discovered == covered_paths,
-        "source coverage mismatch: "
-        f"missing={sorted(discovered - covered_paths)}, "
-        f"extra={sorted(covered_paths - discovered)}",
-    )
 
     revision = contract["source_revision"]
     for entry in audited:
@@ -229,11 +303,13 @@ def validate_config(mapping):
     legacy_names = [entry["legacy_env"] for entry in mappings]
     unique(legacy_names, "legacy environment mapping")
 
-    runtime_declared = set()
+    runtime_names = []
     for entry in mappings:
         if entry["scope"] == "runtime":
-            runtime_declared.add(entry["legacy_env"])
-            runtime_declared.update(entry.get("aliases", []))
+            runtime_names.append(entry["legacy_env"])
+            runtime_names.extend(entry.get("aliases", []))
+    unique(runtime_names, "runtime environment name or alias")
+    runtime_declared = set(runtime_names)
     runtime_actual = extract_runtime_env()
     ensure(
         runtime_actual == runtime_declared,
@@ -258,14 +334,34 @@ def validate_http(http_examples):
             r'server\.(get|post)\("([^"]+)"', server_text
         )
     }
+    config_text = (REPO / "src" / "config.ts").read_text(encoding="utf-8")
+    webhook_match = re.search(
+        r'WHATSAPP_WEBHOOK_PATH\s*=\s*.*?\|\|\s*"([^"]+)"',
+        config_text,
+        re.DOTALL,
+    )
+    ensure(webhook_match is not None, "cannot derive the default WhatsApp webhook path")
+    dynamic_methods = {
+        method.upper()
+        for method in re.findall(r"server\.(get|post)\(path,", server_text)
+    }
+    ensure(
+        dynamic_methods == {"GET", "POST"},
+        f"unexpected dynamic WhatsApp route methods: {sorted(dynamic_methods)}",
+    )
+    source_routes = literal_routes | {
+        (method, webhook_match.group(1)) for method in dynamic_methods
+    }
     documented = set(pairs)
     ensure(
-        literal_routes <= documented,
-        f"undocumented literal routes: {sorted(literal_routes - documented)}",
+        documented == source_routes,
+        "HTTP route inventory mismatch: "
+        f"undocumented={sorted(source_routes - documented)}, "
+        f"invented={sorted(documented - source_routes)}",
     )
     ensure(
-        {("GET", "/whatsapp/webhook"), ("POST", "/whatsapp/webhook")} <= documented,
-        "default WhatsApp GET/POST routes are not documented",
+        len(endpoints) == HTTP_ENDPOINT_COUNT,
+        f"expected {HTTP_ENDPOINT_COUNT} HTTP endpoints, found {len(endpoints)}",
     )
     case_ids = []
     for endpoint in endpoints:
@@ -274,6 +370,10 @@ def validate_http(http_examples):
             f"{endpoint['endpoint_id']}:{case['case_id']}" for case in endpoint["cases"]
         )
     unique(case_ids, "HTTP case ID")
+    ensure(
+        len(case_ids) == HTTP_CASE_COUNT,
+        f"expected {HTTP_CASE_COUNT} HTTP cases, found {len(case_ids)}",
+    )
     return len(endpoints), len(case_ids)
 
 
@@ -357,6 +457,58 @@ def validate_role_sources():
     return count
 
 
+def validate_migration_result_semantics(result):
+    kind = result["input"]["kind"]
+    status = result["status"]
+    exit_code = result["exit_code"]
+    remaining = result["remaining_javascript"]
+    artifacts = result["artifacts"]
+    artifact_kinds = [artifact["kind"] for artifact in artifacts]
+
+    expected_exit_codes = {
+        "migrated": 0,
+        "manual_port_required": 2,
+        "invalid_input": 3,
+        "failed": 1,
+    }
+    ensure(
+        exit_code == expected_exit_codes[status],
+        f"{status} migration must exit {expected_exit_codes[status]}",
+    )
+    ensure(not remaining or exit_code != 0, "remaining JavaScript must exit nonzero")
+
+    if kind == "role":
+        ensure(status in {"migrated", "invalid_input", "failed"},
+               "role migration has an invalid status")
+        ensure(not remaining, "role migration cannot report remaining JavaScript")
+        ensure(not result["recognized_bridges"], "role migration cannot report bridges")
+        expected = ["role"] if status == "migrated" else []
+        ensure(artifact_kinds == expected, "role migration artifact mismatch")
+    elif kind == "environment":
+        ensure(status in {"migrated", "invalid_input", "failed"},
+               "environment migration has an invalid status")
+        ensure(not remaining, "environment migration cannot report remaining JavaScript")
+        ensure(not result["recognized_bridges"],
+               "environment migration cannot report bridges")
+        expected = ["json5_config"] if status == "migrated" else []
+        ensure(artifact_kinds == expected, "environment migration artifact mismatch")
+    else:
+        ensure(kind == "legacy_skill", f"unknown migration input kind: {kind}")
+        if status in {"migrated", "manual_port_required"}:
+            ensure(
+                sorted(artifact_kinds) == ["wasi_manifest", "wit_scaffold"],
+                "legacy skill migration lacks WASI manifest or WIT scaffold",
+            )
+        else:
+            ensure(not artifacts, "failed or invalid legacy skill emitted artifacts")
+        if status == "migrated":
+            ensure(exit_code == 0 and not remaining,
+                   "migrated legacy skill is not fully replaced")
+        elif status == "manual_port_required":
+            ensure(exit_code == 2 and remaining,
+                   "manual legacy skill port lacks remaining-JavaScript evidence")
+
+
 def validate_migration(contract):
     ensure(
         contract["migration_command"]["silent_success_for_remaining_javascript"] is False,
@@ -376,6 +528,21 @@ def validate_migration(contract):
         "contract gap_id",
     )
     ensure("javascript-execution-removed" in decision_ids, "missing JavaScript removal decision")
+    positive_results = [
+        load_json(path)
+        for path in sorted((BASE / "fixtures" / "migration").glob("*.json"))
+    ]
+    for result in positive_results:
+        validate_migration_result_semantics(result)
+        if result["input"]["kind"] == "legacy_skill":
+            source_path = REPO / result["input"]["source"]
+            ensure(source_path.is_file(), f"missing legacy skill input: {source_path}")
+            source = load_json(source_path)
+            ensure(
+                isinstance(source.get("executeCode"), str),
+                f"legacy skill input lacks executeCode: {source_path}",
+            )
+
     manual = load_json(BASE / "fixtures" / "migration" / "manual-port-required.json")
     ensure(manual["status"] == "manual_port_required" and manual["exit_code"] == 2,
            "manual migration fixture must exit 2")
@@ -383,6 +550,66 @@ def validate_migration(contract):
     ensure(
         {"wasi_manifest", "wit_scaffold"} <= artifact_kinds,
         "manual migration fixture lacks manifest or WIT scaffold",
+    )
+
+
+def run_regression_self_tests(mapping, coverage, http_examples):
+    role_result = role_source_outcome(
+        {
+            "content_type": "application/json",
+            "body": {"content": "role", "model": 7},
+        }
+    )
+    ensure(
+        role_result == {"outcome": "loaded_json", "content": "role", "model": None},
+        "non-string role model was not ignored",
+    )
+
+    unsafe_success = {
+        "input": {"kind": "legacy_skill"},
+        "status": "migrated",
+        "exit_code": 0,
+        "recognized_bridges": [],
+        "remaining_javascript": [],
+        "artifacts": [],
+    }
+    expect_contract_error(
+        "legacy skill success without port evidence",
+        lambda: validate_migration_result_semantics(unsafe_success),
+    )
+
+    reduced_coverage = copy.deepcopy(coverage)
+    reduced_coverage["discovery"]["include"].remove(".env.example")
+    reduced_coverage["audited_sources"] = [
+        entry
+        for entry in reduced_coverage["audited_sources"]
+        if entry["path"] != ".env.example"
+    ]
+    expect_contract_error(
+        "coordinated .env.example coverage deletion",
+        lambda: validate_coverage_definition(reduced_coverage),
+    )
+
+    duplicate_alias = copy.deepcopy(mapping)
+    duplicate_alias["mappings"][1]["aliases"] = ["GITHUB_TOKEN"]
+    expect_contract_error(
+        "runtime alias mapped to multiple targets",
+        lambda: validate_config(duplicate_alias),
+    )
+
+    invented_route = copy.deepcopy(http_examples)
+    invented_route["endpoints"][0]["path"] = "/invented"
+    expect_contract_error(
+        "invented documented HTTP route",
+        lambda: validate_http(invented_route),
+    )
+
+    expect_contract_error(
+        "structural-only evidence range",
+        lambda: validate_source_reference(
+            {"path": "package-lock.json", "line_start": 1, "line_end": 1},
+            {"package-lock.json"},
+        ),
     )
 
 
@@ -419,6 +646,7 @@ def main():
         skill_count = validate_skills(schemas, registry, skills)
         role_source_count = validate_role_sources()
         validate_migration(contract)
+        run_regression_self_tests(mapping, coverage, http_examples)
 
         result = {
             "status": "ok",
