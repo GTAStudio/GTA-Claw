@@ -12,15 +12,6 @@ repository = "https://github.com/GTAStudio/GTA-Claw"
 [workspace.dependencies]
 claw-application = { path = "../crates/claw-application", version = "0.1.0" }
 claw-platform = { path = "../crates/claw-platform", version = "0.1.0" }
-slint = { version = "=1.17.1", default-features = false, features = [
-  "accessibility",
-  "backend-winit",
-  "compat-1-2",
-  "renderer-femtovg",
-  "renderer-software",
-  "std",
-] }
-slint-build = { version = "=1.17.1" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use claw_domain::{DomainError, Message, SessionId};
+use claw_domain::{DomainError, SessionId};
 
 /// The protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -71,11 +71,6 @@ pub enum ServerEvent {
         /// The native runtime identity.
         runtime: RuntimeDescriptor,
     },
-    /// Confirms that a domain message crossed the application boundary.
-    MessageAccepted {
-        /// The validated message.
-        message: Message,
-    },
 }
 
 impl Display for ServerEvent {
@@ -85,14 +80,6 @@ impl Display for ServerEvent {
                 write!(formatter, "ready protocol={protocol_version}")
             }
             Self::Healthy { runtime } => write!(formatter, "healthy runtime={runtime}"),
-            Self::MessageAccepted { message } => {
-                write!(
-                    formatter,
-                    "accepted session={} bytes={}",
-                    message.session_id(),
-                    message.content().len()
-                )
-            }
         }
     }
 }

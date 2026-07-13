@@ -1,6 +1,8 @@
 //! Headless GTA Claw use cases and the ports required to execute them.
 
-use claw_domain::{DomainError, Message, MessageRole};
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+
 use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEvent};
 
 /// Supplies native runtime identity without coupling the application to an OS.
@@ -42,25 +44,39 @@ where
     }
 
     /// Executes one typed command.
-    pub fn handle(&self, command: ClientCommand) -> Result<ServerEvent, DomainError> {
+    pub fn handle(&self, command: ClientCommand) -> Result<ServerEvent, ApplicationError> {
         match command {
             ClientCommand::Health => Ok(self.health()),
-            ClientCommand::Submit {
-                session_id,
-                content,
-            } => {
-                let message = Message::new(session_id, MessageRole::User, content)?;
-                Ok(ServerEvent::MessageAccepted { message })
-            }
+            ClientCommand::Submit { .. } => Err(ApplicationError::Unsupported(
+                "message transport is not configured",
+            )),
         }
     }
 }
 
+/// A use case that cannot be completed by the configured application ports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationError {
+    /// The required adapter has not been implemented or configured.
+    Unsupported(&'static str),
+}
+
+impl Display for ApplicationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(reason) => write!(formatter, "unsupported operation: {reason}"),
+        }
+    }
+}
+
+impl Error for ApplicationError {}
+
 #[cfg(test)]
 mod tests {
+    use claw_domain::SessionId;
     use claw_protocol::{ClientCommand, RuntimeDescriptor, ServerEvent};
 
-    use super::{Application, SystemProbe};
+    use super::{Application, ApplicationError, SystemProbe};
 
     #[derive(Debug)]
     struct TestSystemProbe;
@@ -95,6 +111,24 @@ mod tests {
             ServerEvent::Ready {
                 protocol_version: 1
             }
+        );
+    }
+
+    #[test]
+    fn submit_is_rejected_without_a_message_transport() {
+        let application = Application::new(TestSystemProbe);
+        let command = ClientCommand::Submit {
+            session_id: SessionId::new("session-7").expect("valid session id"),
+            content: "hello".to_owned(),
+        };
+
+        let error = application
+            .handle(command)
+            .expect_err("submit must fail without a transport");
+
+        assert_eq!(
+            error,
+            ApplicationError::Unsupported("message transport is not configured")
         );
     }
 }

@@ -1,6 +1,7 @@
 //! Command-line adapter for the headless GTA Claw application.
 
 use std::io::{self, Write};
+use std::process::ExitCode;
 
 use claw_application::Application;
 use claw_platform::NativeSystemProbe;
@@ -19,8 +20,14 @@ where
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run(std::env::args().skip(1), io::stdout().lock())
+fn main() -> ExitCode {
+    match run(std::env::args().skip(1), io::stdout().lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
@@ -38,14 +45,16 @@ mod tests {
     }
 
     #[test]
-    fn send_command_reports_validated_message() {
+    fn send_command_is_rejected_without_a_transport() {
         let mut output = Vec::new();
 
-        run(["send", "session-9", "hello"], &mut output).expect("send command succeeds");
+        let error = run(["send", "session-9", "hello"], &mut output)
+            .expect_err("send must fail without a transport");
 
         assert_eq!(
-            String::from_utf8(output).expect("output is UTF-8"),
-            "accepted session=session-9 bytes=5\n"
+            error.to_string(),
+            "unsupported operation: message transport is not configured"
         );
+        assert!(output.is_empty());
     }
 }
