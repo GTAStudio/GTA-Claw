@@ -1553,6 +1553,23 @@ fn publication_uncertain_after_release(destination: &Path, primary: StateError) 
     }
 }
 
+#[cfg(unix)]
+fn files_share_identity_from_handles_portable(
+    left: &File,
+    right: &File,
+) -> Result<bool, StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let left = left
+        .metadata()
+        .map_err(|error| file_error("inspect first pinned file identity", Path::new("."), error))?;
+    let right = right.metadata().map_err(|error| {
+        file_error("inspect second pinned file identity", Path::new("."), error)
+    })?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
 fn files_share_identity_from_handles_portable(
     left: &File,
     right: &File,
@@ -1568,6 +1585,14 @@ fn files_share_identity_from_handles_portable(
             file_error("capture second pinned file identity", Path::new("."), error)
         })?;
     Ok(left == right)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn files_share_identity_from_handles_portable(
+    _left: &File,
+    _right: &File,
+) -> Result<bool, StateError> {
+    Ok(false)
 }
 
 #[cfg(unix)]
