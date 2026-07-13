@@ -1282,6 +1282,7 @@ fn sync_parent_directory(_path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn lock_path_for(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_owned();
     path.push(".writer.lock");
