@@ -44,6 +44,11 @@ AUDITED_SOURCE_CATEGORY_TOTALS = {
 }
 HTTP_ENDPOINT_COUNT = 10
 HTTP_CASE_COUNT = 28
+DUPLICATE_ALIAS_MAPPING_IDENTITY = (
+    "DEVICE_FLOW_ENABLED",
+    "runtime",
+    "auth.github.device.enabled",
+)
 # Audited from the pinned TypeScript sources; never populate this from examples.json.
 HTTP_SHAPE_NULL = '["null"]'
 HTTP_SHAPE_STRING = '["string"]'
@@ -420,6 +425,29 @@ def validate_config(mapping):
     return len(mappings), len(runtime_actual)
 
 
+def validator_owned_mapping(mapping, identity):
+    ensure(
+        identity == DUPLICATE_ALIAS_MAPPING_IDENTITY,
+        f"config regression target is not validator-owned: {identity!r}",
+    )
+    matches = [
+        entry
+        for entry in mapping["mappings"]
+        if (
+            entry["legacy_env"],
+            entry["scope"],
+            entry["target_json5_key"],
+        )
+        == identity
+    ]
+    ensure(
+        len(matches) == 1,
+        f"config regression target {identity!r} must occur exactly once; "
+        f"found {len(matches)}",
+    )
+    return next(iter(matches))
+
+
 def http_response_shape_descriptor(response):
     if response is None:
         return ("null",)
@@ -473,22 +501,23 @@ def validator_owned_http_case(http_examples, contract_key):
         f"HTTP regression target {contract_key!r} must occur exactly once; "
         f"found {len(matches)}",
     )
-    return matches[0]
+    return next(iter(matches))
 
 
-def ensure_schema_valid_http_fixture(label, http_examples, validator):
+def ensure_schema_valid_fixture(label, instance, validator):
     errors = sorted(
-        validator.iter_errors(http_examples),
+        validator.iter_errors(instance),
         key=lambda error: list(error.path),
     )
     ensure(
         not errors,
-        f"{label} mutation is not schema-valid: {errors[0].message if errors else ''}",
+        f"{label} mutation is not schema-valid: "
+        f"{next(iter(errors)).message if errors else ''}",
     )
 
 
 def expect_schema_valid_http_error(label, http_examples, validator, message_contains):
-    ensure_schema_valid_http_fixture(label, http_examples, validator)
+    ensure_schema_valid_fixture(label, http_examples, validator)
     expect_contract_error(
         label,
         lambda: validate_http(http_examples),
@@ -756,6 +785,54 @@ def validate_migration(contract):
     )
 
 
+def run_mapping_regression_self_tests(mapping, mapping_validator):
+    missing_target = copy.deepcopy(mapping)
+    missing_mapping = validator_owned_mapping(
+        missing_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+    )
+    missing_target["mappings"].remove(missing_mapping)
+    ensure_schema_valid_fixture(
+        "missing config regression target", missing_target, mapping_validator
+    )
+    expect_contract_error(
+        "missing config regression target",
+        lambda: validator_owned_mapping(
+            missing_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+        ),
+        "must occur exactly once; found 0",
+    )
+
+    duplicate_target = copy.deepcopy(mapping)
+    duplicate_mapping = validator_owned_mapping(
+        duplicate_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+    )
+    duplicate_target["mappings"].append(copy.deepcopy(duplicate_mapping))
+    ensure_schema_valid_fixture(
+        "duplicate config regression target", duplicate_target, mapping_validator
+    )
+    expect_contract_error(
+        "duplicate config regression target",
+        lambda: validator_owned_mapping(
+            duplicate_target, DUPLICATE_ALIAS_MAPPING_IDENTITY
+        ),
+        "must occur exactly once; found 2",
+    )
+
+    duplicate_alias = copy.deepcopy(mapping)
+    alias_target = validator_owned_mapping(
+        duplicate_alias, DUPLICATE_ALIAS_MAPPING_IDENTITY
+    )
+    alias_target["aliases"] = ["GITHUB_TOKEN"]
+    ensure_schema_valid_fixture(
+        "runtime alias mapped to multiple targets", duplicate_alias, mapping_validator
+    )
+    expect_contract_error(
+        "runtime alias mapped to multiple targets",
+        lambda: validate_config(duplicate_alias),
+        "duplicate runtime environment name or alias",
+    )
+
+
 def run_http_regression_self_tests(http_examples, http_validator):
     ensure(
         http_response_shape({"a,b": 1})
@@ -795,7 +872,7 @@ def run_http_regression_self_tests(http_examples, http_validator):
         missing_target, unexpected_error_key
     )
     missing_endpoint["cases"].remove(missing_case)
-    ensure_schema_valid_http_fixture(
+    ensure_schema_valid_fixture(
         "missing HTTP regression target", missing_target, http_validator
     )
     expect_contract_error(
@@ -809,7 +886,7 @@ def run_http_regression_self_tests(http_examples, http_validator):
         duplicate_target, endpoint_error_key
     )
     duplicate_endpoint["cases"].append(copy.deepcopy(duplicate_source))
-    ensure_schema_valid_http_fixture(
+    ensure_schema_valid_fixture(
         "duplicate HTTP regression target", duplicate_target, http_validator
     )
     expect_contract_error(
@@ -946,12 +1023,19 @@ def run_regression_self_tests(mapping, coverage, http_examples, schemas, registr
         lambda: validate_coverage_definition(reduced_coverage),
     )
 
-    duplicate_alias = copy.deepcopy(mapping)
-    duplicate_alias["mappings"][1]["aliases"] = ["GITHUB_TOKEN"]
-    expect_contract_error(
-        "runtime alias mapped to multiple targets",
-        lambda: validate_config(duplicate_alias),
+    mapping_schema = schemas["config-mapping.schema.json"]
+    mapping_validator = validator_for(mapping_schema)(
+        mapping_schema, registry=registry
     )
+    run_mapping_regression_self_tests(mapping, mapping_validator)
+
+    reordered_mapping = copy.deepcopy(mapping)
+    reordered_mapping["mappings"].reverse()
+    ensure_schema_valid_fixture(
+        "reordered config mapping", reordered_mapping, mapping_validator
+    )
+    validate_config(reordered_mapping)
+    run_mapping_regression_self_tests(reordered_mapping, mapping_validator)
 
     http_schema = schemas["http-examples.schema.json"]
     http_validator = validator_for(http_schema)(http_schema, registry=registry)
@@ -961,7 +1045,7 @@ def run_regression_self_tests(mapping, coverage, http_examples, schemas, registr
     reordered_http_examples["endpoints"].reverse()
     for endpoint in reordered_http_examples["endpoints"]:
         endpoint["cases"].reverse()
-    ensure_schema_valid_http_fixture(
+    ensure_schema_valid_fixture(
         "reordered HTTP fixture", reordered_http_examples, http_validator
     )
     validate_http(reordered_http_examples)
