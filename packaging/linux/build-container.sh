@@ -59,6 +59,9 @@ docker run --rm \
   --env "BUILD_RECIPE_SHA256=$recipe_sha" \
   --env "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
   --env "RUSTFLAGS=-Dwarnings" \
+  --env GIT_CONFIG_COUNT=1 \
+  --env GIT_CONFIG_KEY_0=safe.directory \
+  --env GIT_CONFIG_VALUE_0=/workspace \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \

@@ -50,6 +50,9 @@ docker run --rm \
   --cap-add FOWNER \
   --security-opt no-new-privileges \
   --env "PACKAGE_RELEASE=$LINUX_PACKAGE_RELEASE" \
+  --env GIT_CONFIG_COUNT=1 \
+  --env GIT_CONFIG_KEY_0=safe.directory \
+  --env GIT_CONFIG_VALUE_0=/workspace \
   --env "PACKAGING_IMAGE_ID=$packaging_image_id" \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \

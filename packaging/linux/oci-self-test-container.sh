@@ -47,6 +47,9 @@ docker run --rm \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
   --env "PACKAGING_IMAGE_ID=$packaging_image_id" \
+  --env GIT_CONFIG_COUNT=1 \
+  --env GIT_CONFIG_KEY_0=safe.directory \
+  --env GIT_CONFIG_VALUE_0=/workspace \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/workspace/target" \
   --workdir /workspace \
