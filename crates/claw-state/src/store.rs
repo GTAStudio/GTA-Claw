@@ -18,6 +18,7 @@ use crate::{
 
 const APPLICATION_ID: i64 = 0x4754_4143;
 const LATEST_SCHEMA_VERSION: i64 = 1;
+const SNAPSHOT_PROVENANCE_OWNER: &str = "gta-claw-standalone-snapshot-v1";
 #[cfg(unix)]
 const UNIX_LOCK_IDENTITY_XATTR: &str = "user.gta-claw.writer-lock-path";
 #[cfg(test)]
@@ -445,13 +446,17 @@ impl StateStore {
         let backup_file = open_existing_file_no_follow(&backup)?;
         verify_path_identity(&backup, &backup_file)?;
         reject_hard_link(&backup, &backup_file)?;
-        validate_windows_restore_identity(&backup)?;
+        validate_standalone_snapshot_source(&backup).await?;
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
         ensure_database_artifacts_absent(&destination)?;
         let temporary = snapshot_temporary_path(&destination, "restore")?;
         snapshot_database(&backup, &backup_file, &temporary).await?;
+        if let Err(error) = validate_standalone_snapshot_source(&temporary).await {
+            remove_snapshot_artifacts(&temporary)?;
+            return Err(error);
+        }
         if let Err(error) = clear_backup_writer_lock(&temporary).await {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
@@ -2127,42 +2132,6 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
         .map_err(|error| file_error("release writer identity lock", &identity_path, error))
 }
 
-#[cfg(not(windows))]
-fn validate_windows_restore_identity(_database: &Path) -> Result<(), StateError> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn validate_windows_restore_identity(database: &Path) -> Result<(), StateError> {
-    use std::io::Read as _;
-
-    const PREFIX: &str = "gta-claw-writer-v1\n";
-
-    let identity_path = writer_identity_path_for(database);
-    let mut identity_file = OpenOptions::new()
-        .read(true)
-        .open(&identity_path)
-        .map_err(|error| file_error("open restore source identity", &identity_path, error))?;
-    let mut identity = String::new();
-    identity_file
-        .read_to_string(&mut identity)
-        .map_err(|error| file_error("read restore source identity", &identity_path, error))?;
-    let stored = identity
-        .strip_prefix(PREFIX)
-        .filter(|stored| !stored.is_empty())
-        .ok_or_else(|| StateError::InvalidPath {
-            path: database.to_owned(),
-            reason: "restore source identity metadata has an unsupported format",
-        })?;
-    if Path::new(stored) != database {
-        return Err(StateError::InvalidPath {
-            path: database.to_owned(),
-            reason: "hard-linked restore source aliases are not supported",
-        });
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InspectedDatabase {
     Fresh,
@@ -2856,6 +2825,7 @@ async fn ensure_destructive_backup(
     expected_version: i64,
 ) -> Result<(), StateError> {
     if path_entry_exists(destination)? {
+        validate_standalone_snapshot_source(destination).await?;
         return validate_backup(destination, Some(expected_version))
             .await
             .map(|_| ());
@@ -3153,7 +3123,8 @@ async fn backup_pool(
         return Err(cleanup_failed_snapshot(&temporary, error));
     }
     let result = async {
-        clear_backup_writer_lock(&temporary).await?;
+        mark_backup_provenance(&temporary).await?;
+        validate_standalone_snapshot_source(&temporary).await?;
         validate_backup(&temporary, Some(expected_version))
             .await
             .map(|_| ())?;
@@ -3185,6 +3156,88 @@ fn cleanup_failed_snapshot(path: &Path, error: StateError) -> StateError {
             _ => cleanup_error,
         },
     }
+}
+
+async fn mark_backup_provenance(path: &Path) -> Result<(), StateError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .foreign_keys(true);
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| invalid_backup(path, "open backup for provenance", error))?;
+    let result = async {
+        sqlx::query("DELETE FROM claw_writer_lock")
+            .execute(&mut connection)
+            .await
+            .map_err(|error| invalid_backup(path, "clear backup writer owner", error))?;
+        sqlx::query(
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, ?, 0)",
+        )
+        .bind(SNAPSHOT_PROVENANCE_OWNER)
+        .execute(&mut connection)
+        .await
+        .map_err(|error| invalid_backup(path, "mark backup provenance", error))?;
+        Ok(())
+    }
+    .await;
+    let close = connection
+        .close()
+        .await
+        .map_err(|error| invalid_backup(path, "close provenance-marked backup", error));
+    match (result, close) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn validate_standalone_snapshot_source(path: &Path) -> Result<(), StateError> {
+    for sidecar in [
+        sqlite_sidecar(path, "-wal"),
+        sqlite_sidecar(path, "-shm"),
+        sqlite_sidecar(path, "-journal"),
+    ] {
+        if path_entry_exists(&sidecar)? {
+            return Err(StateError::InvalidBackup {
+                path: path.to_owned(),
+                reason: format!(
+                    "standalone snapshot source has sidecar {}",
+                    sidecar.display()
+                ),
+            });
+        }
+    }
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .immutable(true);
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| invalid_backup(path, "open standalone snapshot provenance", error))?;
+    let provenance = sqlx::query_scalar::<_, String>(
+        "SELECT owner FROM claw_writer_lock
+         WHERE singleton = 1 AND acquired_at_ms = 0",
+    )
+    .fetch_optional(&mut connection)
+    .await
+    .map_err(|error| invalid_backup(path, "read standalone snapshot provenance", error));
+    let close = connection
+        .close()
+        .await
+        .map_err(|error| invalid_backup(path, "close standalone snapshot provenance", error));
+    let provenance = match (provenance, close) {
+        (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+        (Ok(provenance), Ok(())) => provenance,
+    };
+    if provenance.as_deref() != Some(SNAPSHOT_PROVENANCE_OWNER) {
+        return Err(StateError::InvalidBackup {
+            path: path.to_owned(),
+            reason: "restore source is not a verified standalone snapshot".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 async fn clear_backup_writer_lock(path: &Path) -> Result<(), StateError> {

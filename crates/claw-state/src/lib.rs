@@ -1420,9 +1420,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_materializes_committed_wal_content() {
+    async fn backup_materializes_committed_wal_content() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "wal-source.sqlite");
+        let backup_path = database_path(&directory, "wal-backup.sqlite");
         let restored_path = database_path(&directory, "wal-restored.sqlite");
         let source = open(&source_path).await;
         source.close().await.expect("seed WAL source closes");
@@ -1445,9 +1446,15 @@ mod tests {
             .expect("commit row to WAL");
         assert!(sidecar(&source_path, "-wal").exists());
 
-        StateStore::restore_backup(&source_path, &restored_path)
+        let managed = open(&source_path).await;
+        managed
+            .backup_to(&backup_path)
             .await
-            .expect("restore live WAL database");
+            .expect("backup includes committed WAL content");
+        managed.close().await.expect("managed WAL source closes");
+        StateStore::restore_backup(&backup_path, &restored_path)
+            .await
+            .expect("restore standalone WAL backup");
         let restored = open(&restored_path).await;
         let id = SessionId::new("wal-session").expect("valid test session");
         assert!(
@@ -1466,6 +1473,7 @@ mod tests {
     async fn restore_remains_consistent_during_concurrent_checkpoint() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "checkpoint-source.sqlite");
+        let backup_path = database_path(&directory, "checkpoint-backup.sqlite");
         let restored_path = database_path(&directory, "checkpoint-restored.sqlite");
         open(&source_path)
             .await
@@ -1495,19 +1503,21 @@ mod tests {
         let mut checkpointer = SqliteConnection::connect_with(&options)
             .await
             .expect("open concurrent checkpointer");
+        let managed = open(&source_path).await;
 
-        let (restore, checkpoint) = tokio::join!(
-            StateStore::restore_backup(&source_path, &restored_path),
-            async {
-                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                    .execute(&mut checkpointer)
-                    .await
-            }
-        );
-        restore.expect("consistent restore completes");
+        let (backup, checkpoint) = tokio::join!(managed.backup_to(&backup_path), async {
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&mut checkpointer)
+                .await
+        });
+        backup.expect("consistent backup completes");
         checkpoint.expect("concurrent checkpoint completes");
+        managed.close().await.expect("managed source closes");
         writer.close().await.expect("checkpoint writer closes");
         checkpointer.close().await.expect("checkpointer closes");
+        StateStore::restore_backup(&backup_path, &restored_path)
+            .await
+            .expect("restore checkpoint-raced backup");
 
         let restored = open(&restored_path).await;
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
@@ -1518,8 +1528,11 @@ mod tests {
         restored.close().await.expect("restored store closes");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn restore_rejects_hardlink_alias_with_committed_wal() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "wal-hardlink-source.sqlite");
         let alias = database_path(&directory, "wal-hardlink-alias.sqlite");
@@ -1532,10 +1545,21 @@ mod tests {
         let mut connection = SqliteConnection::connect_with(&options)
             .await
             .expect("open hardlink WAL writer");
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open hardlink WAL reader");
         connection
             .execute("PRAGMA wal_autocheckpoint = 0")
             .await
             .expect("disable automatic checkpoint");
+        reader
+            .execute("BEGIN")
+            .await
+            .expect("begin reader snapshot");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish reader snapshot");
         connection
             .execute(
                 "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
@@ -1545,13 +1569,45 @@ mod tests {
             .expect("commit hardlink row to WAL");
         assert!(sidecar(&source_path, "-wal").exists());
         fs::hard_link(&source_path, &alias).expect("create WAL source hard link");
+        fs::remove_file(&source_path).expect("unlink original WAL database main file");
+        assert_eq!(
+            fs::metadata(&alias)
+                .expect("inspect alias link count")
+                .nlink(),
+            1
+        );
+
+        let alias_options = SqliteConnectOptions::new()
+            .filename(&alias)
+            .read_only(true)
+            .immutable(true);
+        let mut alias_connection = SqliteConnection::connect_with(&alias_options)
+            .await
+            .expect("open detached alias without original sidecars");
+        let alias_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE id = ?")
+            .bind("hardlink-wal-session")
+            .fetch_one(&mut alias_connection)
+            .await
+            .expect("read stale detached alias");
+        assert_eq!(
+            alias_rows, 0,
+            "detached alias must demonstrably miss WAL row"
+        );
+        alias_connection
+            .close()
+            .await
+            .expect("close detached alias");
 
         let error = StateStore::restore_backup(&alias, &destination)
             .await
-            .expect_err("hard-linked restore source is rejected");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+            .expect_err("detached WAL alias without snapshot provenance is rejected");
+        assert!(matches!(error, StateError::InvalidBackup { .. }));
         assert!(!destination.exists());
-        fs::remove_file(alias).expect("remove rejected restore alias");
+        reader
+            .execute("ROLLBACK")
+            .await
+            .expect("release reader snapshot");
+        reader.close().await.expect("close WAL reader");
         connection
             .close()
             .await
@@ -1626,7 +1682,7 @@ mod tests {
         let error = StateStore::restore_backup(&backup_path, &source_destination)
             .await
             .expect_err("source rollback journal rejects restore");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(matches!(error, StateError::InvalidBackup { .. }));
         assert!(!source_destination.exists());
         fs::remove_file(sidecar(&backup_path, "-journal")).expect("remove source rollback journal");
 
@@ -1768,9 +1824,7 @@ mod tests {
         for (name, sql) in cases {
             let variant = database_path(&directory, &format!("{name}.sqlite"));
             let destination = database_path(&directory, &format!("{name}-restored.sqlite"));
-            StateStore::restore_backup(&base_backup, &variant)
-                .await
-                .expect("materialize backup variant");
+            fs::copy(&base_backup, &variant).expect("copy backup variant");
             execute_direct(&variant, sql).await;
             assert_restore_rejected(&variant, &destination).await;
         }
@@ -1778,18 +1832,14 @@ mod tests {
             let variant = database_path(&directory, &format!("restore-{name}.sqlite"));
             let destination =
                 database_path(&directory, &format!("restore-{name}-destination.sqlite"));
-            StateStore::restore_backup(&base_backup, &variant)
-                .await
-                .expect("materialize schema drift backup");
+            fs::copy(&base_backup, &variant).expect("copy schema drift backup");
             execute_direct(&variant, sql).await;
             assert_restore_rejected(&variant, &destination).await;
         }
 
         let corrupt = database_path(&directory, "corrupt.sqlite");
         let corrupt_destination = database_path(&directory, "corrupt-restored.sqlite");
-        StateStore::restore_backup(&base_backup, &corrupt)
-            .await
-            .expect("materialize corrupt variant");
+        fs::copy(&base_backup, &corrupt).expect("copy corrupt variant");
         let length = fs::metadata(&corrupt).expect("corrupt metadata").len();
         OpenOptions::new()
             .write(true)
