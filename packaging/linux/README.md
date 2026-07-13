@@ -34,11 +34,15 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
 Builds run in the digest-pinned Rust 1.97.0 Bookworm image using the immutable
 Debian `20260701T000000Z` snapshot and glibc ceiling 2.36. Each sealed build
 manifest binds the clean Git commit/tree, Dockerfile digest, toolchain, target,
-profile, flags, exact dpkg runtime packages, and binary hashes. GNU tar receives
-sorted names, the Git commit timestamp, root uid/gid, stable PAX options, and
-fixed modes; gzip receives `-n`. CI performs two complete builds and package
-runs in distinct Cargo/output roots under input umasks 000 and 002, then
-compares every final artifact byte.
+profile, flags, exact dpkg runtime packages, license providers, and binary
+hashes. The builder signs that manifest with an ephemeral Ed25519 key; packaging
+accepts only the public-key fingerprint returned out of band by the builder.
+GNU tar receives sorted names, the Git commit timestamp, root uid/gid, stable
+PAX options, and fixed modes; gzip receives `-n`. Native package tools run in
+independent instances of the same pinned image and record exact dpkg/rpm/tar/
+gzip/jq/Python/cpio versions. CI performs two complete builds and package runs
+in distinct Cargo/output roots under input umasks 000 and 002, then compares
+every final artifact byte.
 
 ## Filesystem and upgrade contract
 
@@ -54,10 +58,12 @@ programs, units, and unmodified configuration according to the native package
 manager. Native packages deliberately do not own `/var/lib/gta-claw`,
 `/var/cache/gta-claw`, `/var/log/gta-claw`, or `/run/gta-claw`: systemd creates
 the private/persistent or ephemeral paths declared by the unit. Fresh installs
-stay disabled and stopped; active upgrades use `try-restart`, inactive upgrades
-remain inactive, final removal stops/disables before executable unlink, and
-post-transaction hooks reload systemd. No hook executes network or dynamic
-code.
+stay disabled and stopped; active upgrades restart, inactive upgrades remain
+inactive, final removal stops/disables before executable unlink, and
+post-transaction hooks reload systemd. Stop/restart errors propagate. The RPM
+upgrade path carries active state through `/run` and uses a critical old-package
+`%preun` postcondition because RPM treats `%post` errors as warnings. No hook
+executes network or dynamic code.
 
 ## systemd boundary
 
@@ -86,20 +92,25 @@ deferred until the Rust boundary supports `CREDENTIALS_DIRECTORY`.
 
 ## Output and release safety
 
-Every Cargo and packaging output must be a new absolute path below the
-repository's real mode-0700, current-user-owned `target` directory. The scripts
-reject traversal, unsafe environment-controlled
-components, existing outputs, every intermediate or final symlink (including
-dangling links), hard links in staged/output trees, special files, and
-non-regular collisions. Cargo may hard-link its final executable to a hashed
-build artifact; that trusted input is copied into a fresh inode while its
-source inode and before/after SHA-256 are revalidated. Output and lock roots are
-explicitly mode 0700 regardless of caller umask. Files are opened once with
-exclusive no-clobber semantics and written through that held descriptor;
-publication revalidates its inode before an atomic no-clobber rename. A
-deterministic replacement regression proves writes do not follow a path swapped
-to a symlink after reservation. Shell path APIs still require exclusive
-same-user ownership of the private roots.
+Every Cargo and packaging root is a safe single component below `target`.
+`safeio.py` opens the repository/target/output with no-follow directory FDs,
+uses fail-closed `openat2` resolution for files, anchored `mkdirat` traversal,
+and no-replace link publication. Container bind sources are root-owned host
+mounts created from held directory FDs. During a build/package transaction the
+target is temporarily root-owned mode 0700, excluding host peers; identities
+and ownership are restored only after recursive no-link checks. Existing,
+dangling, intermediate and final links, hard links, special files, traversal,
+or non-regular collisions fail closed. Deterministic ancestor- and final-path
+swap regressions prove outside sentinels are never created or modified.
+
+ELF validation uses a bounded binary parser rather than human `readelf` output:
+it checks ELF64 structure, PIE type, exact PT_INTERP bytes, canonical
+DT_NEEDED, no RPATH/RUNPATH, loader-used DT_VERNEED entries, section agreement,
+and the GLIBC ceiling. OCI validation rejects duplicate JSON keys/numbers,
+duplicate archive members, links/devices/FIFOs/whiteouts, and bounded
+compressed/expanded/member/file sizes before extraction. Published rootfs
+contents and application/runtime hashes are compared to the independently
+authenticated build manifest, not image-local declarations.
 
 `release.sh` fails unless release mode, an annotated semantic tag, and the full
 matching commit are supplied. It then still fails because production signing
@@ -113,21 +124,26 @@ On Ubuntu with Docker plus the declared native package tools, run:
 
 ```sh
 export CARGO_TARGET_DIR="$PWD/target/linux-x86-build"
-build_manifest="$(./packaging/linux/build-container.sh x86_64)"
+build_result="$(./packaging/linux/build-container.sh x86_64)"
+build_manifest="${build_result%%|*}"
+build_key_sha="${build_result##*|}"
 OUTPUT_ROOT="$PWD/target/linux-x86-run1" \
-  ./packaging/linux/package.sh x86_64 "$build_manifest"
+  ./packaging/linux/package-container.sh \
+    x86_64 "$build_manifest" "$build_key_sha"
 ./packaging/linux/self-test.sh
 ```
 
 The dedicated workflow performs root formatting, checks, Clippy, tests, MSRV,
 deny, audit, metadata proof, pinned-Bookworm x86_64 execution and Debian
 installation, real arm64 Rust cross-build, PIE/interpreter/RPATH/versioned-symbol
-checks, real Ubuntu systemd DEB/RPM install-start-upgrade-remove flows,
-published-byte OCI descriptor/DiffID/layer inspection, fully resealed malicious
-OCI mutations, deterministic reruns, checksums, license-aware SPDX/provenance,
-and negative path/release/build-manifest tests. Arm64 is a build and
-package/image layout proof only; no native or emulated arm64 runtime success is
-claimed.
+checks, a fresh minimal snapshot-pinned Bookworm resolver install, real Ubuntu
+systemd DEB/RPM install-start-upgrade-remove and forced-failure flows,
+published-byte OCI descriptor/DiffID/layer inspection, strict duplicate/
+resource limits, fully resealed extra-executable/application/runtime mutations,
+deterministic reruns, complete provider-attributed license materials,
+license-aware SPDX/provenance, and negative path/release/forged-build tests.
+Arm64 is a build and package/image layout proof only; no native or emulated
+arm64 runtime success is claimed.
 
 ## Explicit non-claims
 
