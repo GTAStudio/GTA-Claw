@@ -45,61 +45,96 @@ AUDITED_SOURCE_CATEGORY_TOTALS = {
 HTTP_ENDPOINT_COUNT = 10
 HTTP_CASE_COUNT = 28
 # Audited from the pinned TypeScript sources; never populate this from examples.json.
+HTTP_SHAPE_NULL = '["null"]'
+HTTP_SHAPE_STRING = '["string"]'
+HTTP_SHAPE_ERROR = '["object",[["error",["string"]]]]'
+HTTP_SHAPE_REPLY = '["object",[["reply",["string"]]]]'
 HTTP_CASE_CONTRACTS = {
     ("GET", "/", "unauthenticated-no-channels"): (
         200,
-        "object:authenticated,channels,deviceFlowEnabled,endpoints,examples,service,status,tips",
+        '["object",[["authenticated",["bool"]],["channels",["object",'
+        '[["discord",["bool"]],["teams",["bool"]],["telegram",["bool"]],'
+        '["whatsapp",["bool"]]]]],["deviceFlowEnabled",["bool"]],["endpoints",'
+        '["object",[["chat",["string"]],["deviceAuth",["string"]],'
+        '["health",["string"]]]]],["examples",["object",'
+        '[["chatCurl",["string"]]]]],["service",["string"]],["status",'
+        '["string"]],["tips",["array",[["string"]]]]]]',
     ),
     ("GET", "/health", "healthy-unauthenticated"): (
         200,
-        "object:authenticated,channels,deviceFlowEnabled,model,sessions,skills,status,uptime",
+        '["object",[["authenticated",["bool"]],["channels",["object",'
+        '[["discord",["bool"]],["teams",["bool"]],["telegram",["bool"]],'
+        '["whatsapp",["bool"]]]]],["deviceFlowEnabled",["bool"]],["model",'
+        '["string"]],["sessions",["integer"]],["skills",["integer"]],'
+        '["status",["string"]],["uptime",["integer"]]]]',
     ),
     ("GET", "/auth/device", "already-authenticated"): (
         200,
-        "object:authenticated,message",
+        '["object",[["authenticated",["bool"]],["message",["string"]]]]',
     ),
-    ("GET", "/auth/device", "disabled"): (400, "object:authenticated,error"),
+    ("GET", "/auth/device", "disabled"): (
+        400,
+        '["object",[["authenticated",["bool"]],["error",["string"]]]]',
+    ),
     ("GET", "/auth/device", "instructions"): (
         200,
-        "object:auth_instructions,authenticated",
+        '["object",[["auth_instructions",["string"]],'
+        '["authenticated",["bool"]]]]',
     ),
-    ("GET", "/auth/device", "unexpected-error"): (500, "object:error"),
-    ("POST", "/chat", "missing-message"): (400, "object:error"),
-    ("POST", "/chat", "help-before-auth"): (200, "object:reply"),
-    ("POST", "/chat", "unauthenticated-token-mode"): (401, "object:error"),
+    ("GET", "/auth/device", "unexpected-error"): (500, HTTP_SHAPE_ERROR),
+    ("POST", "/chat", "missing-message"): (400, HTTP_SHAPE_ERROR),
+    ("POST", "/chat", "help-before-auth"): (200, HTTP_SHAPE_REPLY),
+    ("POST", "/chat", "unauthenticated-token-mode"): (401, HTTP_SHAPE_ERROR),
     ("POST", "/chat", "unauthenticated-device-flow"): (
         401,
-        "object:auth_instructions,error",
+        '["object",[["auth_instructions",["string"]],["error",["string"]]]]',
     ),
-    ("POST", "/chat", "success"): (200, "object:reply"),
-    ("POST", "/chat", "endpoint-error"): (500, "object:error"),
-    ("POST", "/api/messages", "adapter-ack"): (200, "null"),
-    ("POST", "/api/messages", "rate-limited"): (429, "object:error"),
-    ("GET", "/whatsapp/webhook", "verified"): (200, "string"),
-    ("GET", "/whatsapp/webhook", "forbidden"): (403, "object:error"),
-    ("POST", "/whatsapp/webhook", "accepted"): (200, "object:ok"),
-    ("POST", "/whatsapp/webhook", "handling-failed"): (500, "object:error"),
-    ("POST", "/admin/reload", "forbidden"): (403, "object:error"),
+    ("POST", "/chat", "success"): (200, HTTP_SHAPE_REPLY),
+    ("POST", "/chat", "endpoint-error"): (500, HTTP_SHAPE_ERROR),
+    ("POST", "/api/messages", "adapter-ack"): (200, HTTP_SHAPE_NULL),
+    ("POST", "/api/messages", "rate-limited"): (429, HTTP_SHAPE_ERROR),
+    ("GET", "/whatsapp/webhook", "verified"): (200, HTTP_SHAPE_STRING),
+    ("GET", "/whatsapp/webhook", "forbidden"): (403, HTTP_SHAPE_ERROR),
+    ("POST", "/whatsapp/webhook", "accepted"): (
+        200,
+        '["object",[["ok",["bool"]]]]',
+    ),
+    ("POST", "/whatsapp/webhook", "handling-failed"): (500, HTTP_SHAPE_ERROR),
+    ("POST", "/admin/reload", "forbidden"): (403, HTTP_SHAPE_ERROR),
     ("POST", "/admin/reload", "reloaded"): (
         200,
-        "object:message,model,skills",
+        '["object",[["message",["string"]],["model",["string"]],'
+        '["skills",["integer"]]]]',
     ),
-    ("POST", "/admin/reload", "conflict"): (409, "object:error"),
-    ("POST", "/admin/reload", "failed"): (500, "object:error"),
-    ("GET", "/admin/system", "forbidden"): (403, "object:error"),
-    ("GET", "/admin/system", "system-info"): (200, "object:node,os"),
-    ("POST", "/admin/exec", "forbidden"): (403, "object:error"),
+    ("POST", "/admin/reload", "conflict"): (409, HTTP_SHAPE_ERROR),
+    ("POST", "/admin/reload", "failed"): (500, HTTP_SHAPE_ERROR),
+    ("GET", "/admin/system", "forbidden"): (403, HTTP_SHAPE_ERROR),
+    ("GET", "/admin/system", "system-info"): (
+        200,
+        '["object",[["node",["object",[["memory_mb",["object",'
+        '[["heapTotal",["integer"]],["heapUsed",["integer"]],'
+        '["rss",["integer"]]]]],["pid",["integer"]],["uptime_s",'
+        '["integer"]],["version",["string"]]]]],["os",["object",'
+        '[["arch",["string"]],["cpus",["integer"]],["freeMemory_mb",'
+        '["integer"]],["hostname",["string"]],["loadavg",["array",'
+        '[["number"]]]],["platform",["string"]],["totalMemory_mb",'
+        '["integer"]],["uptime_s",["integer"]]]]]]]',
+    ),
+    ("POST", "/admin/exec", "forbidden"): (403, HTTP_SHAPE_ERROR),
     ("POST", "/admin/exec", "unknown-action"): (
         400,
-        "object:allowed,error",
+        '["object",[["allowed",["array",[["string"]]]],'
+        '["error",["string"]]]]',
     ),
     ("POST", "/admin/exec", "command-success"): (
         200,
-        "object:action,output,success",
+        '["object",[["action",["string"]],["output",["string"]],'
+        '["success",["bool"]]]]',
     ),
     ("POST", "/admin/exec", "command-failure"): (
         200,
-        "object:action,error,stderr,success",
+        '["object",[["action",["string"]],["error",["string"]],'
+        '["stderr",["string"]],["success",["bool"]]]]',
     ),
 }
 
@@ -382,16 +417,47 @@ def validate_config(mapping):
     return len(mappings), len(runtime_actual)
 
 
-def http_response_shape(response):
+def http_response_shape_descriptor(response):
     if response is None:
-        return "null"
+        return ("null",)
+    if isinstance(response, bool):
+        return ("bool",)
+    if isinstance(response, int):
+        return ("integer",)
+    if isinstance(response, float):
+        return ("number",)
     if isinstance(response, str):
-        return "string"
-    if isinstance(response, dict):
-        return "object:" + ",".join(sorted(response))
+        return ("string",)
     if isinstance(response, list):
-        return "array"
-    return type(response).__name__
+        item_shapes = {http_response_shape_descriptor(item) for item in response}
+        return (
+            "array",
+            tuple(
+                sorted(
+                    item_shapes,
+                    key=lambda shape: json.dumps(
+                        shape, ensure_ascii=True, separators=(",", ":")
+                    ),
+                )
+            ),
+        )
+    if isinstance(response, dict):
+        return (
+            "object",
+            tuple(
+                (key, http_response_shape_descriptor(response[key]))
+                for key in sorted(response)
+            ),
+        )
+    raise ContractError(f"unsupported JSON response type: {type(response).__name__}")
+
+
+def http_response_shape(response):
+    return json.dumps(
+        http_response_shape_descriptor(response),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 def validate_http(http_examples):
@@ -455,10 +521,6 @@ def validate_http(http_examples):
             )
     unique(case_ids, "HTTP case ID")
     unique((key for key, _ in documented_cases), "HTTP method/path/case ID")
-    ensure(
-        len(case_ids) == HTTP_CASE_COUNT,
-        f"expected {HTTP_CASE_COUNT} HTTP cases, found {len(case_ids)}",
-    )
     actual_contracts = dict(documented_cases)
     missing = set(HTTP_CASE_CONTRACTS) - set(actual_contracts)
     extra = set(actual_contracts) - set(HTTP_CASE_CONTRACTS)
@@ -474,6 +536,10 @@ def validate_http(http_examples):
         not missing and not extra and not changed,
         "HTTP case contract mismatch: "
         f"missing={sorted(missing)}, extra={sorted(extra)}, changed={changed}",
+    )
+    ensure(
+        len(case_ids) == HTTP_CASE_COUNT,
+        f"expected {HTTP_CASE_COUNT} HTTP cases, found {len(case_ids)}",
     )
     return len(endpoints), len(case_ids)
 
@@ -655,6 +721,17 @@ def validate_migration(contract):
 
 
 def run_regression_self_tests(mapping, coverage, http_examples):
+    ensure(
+        http_response_shape({"a,b": 1})
+        != http_response_shape({"a": 1, "b": 1}),
+        "HTTP response-shape encoding loses object key boundaries",
+    )
+    ensure(
+        http_response_shape({"nested": {"authenticated": False}})
+        != http_response_shape({"nested": {"authenticated": "false"}}),
+        "HTTP response-shape encoding loses nested value types",
+    )
+
     role_result = role_source_outcome(
         {
             "content_type": "application/json",
@@ -712,6 +789,54 @@ def run_regression_self_tests(mapping, coverage, http_examples):
         "changed HTTP case status with stable counts",
         lambda: validate_http(changed_status),
         "HTTP case contract mismatch",
+    )
+
+    changed_shape = copy.deepcopy(http_examples)
+    changed_shape["endpoints"][0]["cases"][0]["response"]["authenticated"] = "false"
+    expect_contract_error(
+        "changed HTTP response shape with stable counts",
+        lambda: validate_http(changed_shape),
+        "HTTP case contract mismatch",
+    )
+
+    swapped_cases = copy.deepcopy(http_examples)
+    device_cases = swapped_cases["endpoints"][2]["cases"]
+    device_cases[0]["case_id"], device_cases[1]["case_id"] = (
+        device_cases[1]["case_id"],
+        device_cases[0]["case_id"],
+    )
+    expect_contract_error(
+        "swapped HTTP cases with stable counts",
+        lambda: validate_http(swapped_cases),
+        "HTTP case contract mismatch",
+    )
+
+    missing_case = copy.deepcopy(http_examples)
+    missing_case["endpoints"][2]["cases"].pop()
+    expect_contract_error(
+        "missing HTTP case",
+        lambda: validate_http(missing_case),
+        "HTTP case contract mismatch",
+    )
+
+    extra_case = copy.deepcopy(http_examples)
+    invented_case = copy.deepcopy(extra_case["endpoints"][3]["cases"][-1])
+    invented_case["case_id"] = "invented-extra"
+    extra_case["endpoints"][3]["cases"].append(invented_case)
+    expect_contract_error(
+        "extra HTTP case",
+        lambda: validate_http(extra_case),
+        "HTTP case contract mismatch",
+    )
+
+    duplicate_case = copy.deepcopy(http_examples)
+    duplicate_case["endpoints"][3]["cases"].append(
+        copy.deepcopy(duplicate_case["endpoints"][3]["cases"][-1])
+    )
+    expect_contract_error(
+        "duplicate HTTP case",
+        lambda: validate_http(duplicate_case),
+        "duplicate HTTP case ID",
     )
 
     expect_contract_error(
