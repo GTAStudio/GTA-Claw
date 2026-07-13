@@ -41,7 +41,7 @@ cmp -s "$work/arm64.minimum-versions" "$work/x86_64.minimum-versions" ||
 mkdir -p "$(dirname "$output")"
 lipo -create "$arm_binary" "$x86_binary" -output "$output"
 chmod 0755 "$output"
-lipo -verify_arch arm64 x86_64 "$output"
+lipo "$output" -verify_arch arm64 x86_64
 assert_binary_arches "$output" "arm64 x86_64"
 assert_macho_minimum_version "$output"
 note "created universal2 binary $output"

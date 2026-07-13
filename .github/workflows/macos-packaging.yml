@@ -196,7 +196,7 @@ jobs:
           set -euo pipefail
           app="target/macos-package/apps/universal2/GTA Claw.app"
           ./packaging/macos/validate.sh "$app" "arm64 x86_64" adhoc
-          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/gta-claw-desktop"
+          lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64 x86_64
           (
             cd target/macos-package/distribution
             shasum -a 256 -c SHA256SUMS
