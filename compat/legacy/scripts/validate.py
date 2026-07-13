@@ -44,6 +44,64 @@ AUDITED_SOURCE_CATEGORY_TOTALS = {
 }
 HTTP_ENDPOINT_COUNT = 10
 HTTP_CASE_COUNT = 28
+# Audited from the pinned TypeScript sources; never populate this from examples.json.
+HTTP_CASE_CONTRACTS = {
+    ("GET", "/", "unauthenticated-no-channels"): (
+        200,
+        "object:authenticated,channels,deviceFlowEnabled,endpoints,examples,service,status,tips",
+    ),
+    ("GET", "/health", "healthy-unauthenticated"): (
+        200,
+        "object:authenticated,channels,deviceFlowEnabled,model,sessions,skills,status,uptime",
+    ),
+    ("GET", "/auth/device", "already-authenticated"): (
+        200,
+        "object:authenticated,message",
+    ),
+    ("GET", "/auth/device", "disabled"): (400, "object:authenticated,error"),
+    ("GET", "/auth/device", "instructions"): (
+        200,
+        "object:auth_instructions,authenticated",
+    ),
+    ("GET", "/auth/device", "unexpected-error"): (500, "object:error"),
+    ("POST", "/chat", "missing-message"): (400, "object:error"),
+    ("POST", "/chat", "help-before-auth"): (200, "object:reply"),
+    ("POST", "/chat", "unauthenticated-token-mode"): (401, "object:error"),
+    ("POST", "/chat", "unauthenticated-device-flow"): (
+        401,
+        "object:auth_instructions,error",
+    ),
+    ("POST", "/chat", "success"): (200, "object:reply"),
+    ("POST", "/chat", "endpoint-error"): (500, "object:error"),
+    ("POST", "/api/messages", "adapter-ack"): (200, "null"),
+    ("POST", "/api/messages", "rate-limited"): (429, "object:error"),
+    ("GET", "/whatsapp/webhook", "verified"): (200, "string"),
+    ("GET", "/whatsapp/webhook", "forbidden"): (403, "object:error"),
+    ("POST", "/whatsapp/webhook", "accepted"): (200, "object:ok"),
+    ("POST", "/whatsapp/webhook", "handling-failed"): (500, "object:error"),
+    ("POST", "/admin/reload", "forbidden"): (403, "object:error"),
+    ("POST", "/admin/reload", "reloaded"): (
+        200,
+        "object:message,model,skills",
+    ),
+    ("POST", "/admin/reload", "conflict"): (409, "object:error"),
+    ("POST", "/admin/reload", "failed"): (500, "object:error"),
+    ("GET", "/admin/system", "forbidden"): (403, "object:error"),
+    ("GET", "/admin/system", "system-info"): (200, "object:node,os"),
+    ("POST", "/admin/exec", "forbidden"): (403, "object:error"),
+    ("POST", "/admin/exec", "unknown-action"): (
+        400,
+        "object:allowed,error",
+    ),
+    ("POST", "/admin/exec", "command-success"): (
+        200,
+        "object:action,output,success",
+    ),
+    ("POST", "/admin/exec", "command-failure"): (
+        200,
+        "object:action,error,stderr,success",
+    ),
+}
 
 
 class ContractError(Exception):
@@ -68,10 +126,14 @@ def unique(values, label: str):
     ensure(len(values) == len(set(values)), f"duplicate {label}")
 
 
-def expect_contract_error(label: str, operation):
+def expect_contract_error(label: str, operation, message_contains: str = None):
     try:
         operation()
-    except ContractError:
+    except ContractError as exc:
+        ensure(
+            message_contains is None or message_contains in str(exc),
+            f"{label} failed for the wrong reason: {exc}",
+        )
         return
     raise ContractError(f"regression self-test did not reject {label}")
 
@@ -320,6 +382,18 @@ def validate_config(mapping):
     return len(mappings), len(runtime_actual)
 
 
+def http_response_shape(response):
+    if response is None:
+        return "null"
+    if isinstance(response, str):
+        return "string"
+    if isinstance(response, dict):
+        return "object:" + ",".join(sorted(response))
+    if isinstance(response, list):
+        return "array"
+    return type(response).__name__
+
+
 def validate_http(http_examples):
     endpoints = http_examples["endpoints"]
     endpoint_ids = [endpoint["endpoint_id"] for endpoint in endpoints]
@@ -363,16 +437,43 @@ def validate_http(http_examples):
         len(endpoints) == HTTP_ENDPOINT_COUNT,
         f"expected {HTTP_ENDPOINT_COUNT} HTTP endpoints, found {len(endpoints)}",
     )
+    ensure(
+        len(HTTP_CASE_CONTRACTS) == HTTP_CASE_COUNT,
+        "validator-owned HTTP case contract count is inconsistent",
+    )
     case_ids = []
+    documented_cases = []
     for endpoint in endpoints:
         ensure(endpoint["cases"], f"endpoint has no examples: {endpoint['endpoint_id']}")
-        case_ids.extend(
-            f"{endpoint['endpoint_id']}:{case['case_id']}" for case in endpoint["cases"]
-        )
+        for case in endpoint["cases"]:
+            case_ids.append(f"{endpoint['endpoint_id']}:{case['case_id']}")
+            documented_cases.append(
+                (
+                    (endpoint["method"], endpoint["path"], case["case_id"]),
+                    (case["status"], http_response_shape(case["response"])),
+                )
+            )
     unique(case_ids, "HTTP case ID")
+    unique((key for key, _ in documented_cases), "HTTP method/path/case ID")
     ensure(
         len(case_ids) == HTTP_CASE_COUNT,
         f"expected {HTTP_CASE_COUNT} HTTP cases, found {len(case_ids)}",
+    )
+    actual_contracts = dict(documented_cases)
+    missing = set(HTTP_CASE_CONTRACTS) - set(actual_contracts)
+    extra = set(actual_contracts) - set(HTTP_CASE_CONTRACTS)
+    changed = {
+        key: {
+            "expected": HTTP_CASE_CONTRACTS[key],
+            "actual": actual_contracts[key],
+        }
+        for key in set(HTTP_CASE_CONTRACTS) & set(actual_contracts)
+        if HTTP_CASE_CONTRACTS[key] != actual_contracts[key]
+    }
+    ensure(
+        not missing and not extra and not changed,
+        "HTTP case contract mismatch: "
+        f"missing={sorted(missing)}, extra={sorted(extra)}, changed={changed}",
     )
     return len(endpoints), len(case_ids)
 
@@ -602,6 +703,15 @@ def run_regression_self_tests(mapping, coverage, http_examples):
     expect_contract_error(
         "invented documented HTTP route",
         lambda: validate_http(invented_route),
+        "HTTP route inventory mismatch",
+    )
+
+    changed_status = copy.deepcopy(http_examples)
+    changed_status["endpoints"][0]["cases"][0]["status"] = 599
+    expect_contract_error(
+        "changed HTTP case status with stable counts",
+        lambda: validate_http(changed_status),
+        "HTTP case contract mismatch",
     )
 
     expect_contract_error(
