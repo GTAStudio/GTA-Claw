@@ -414,7 +414,9 @@ open_output_file() {
       "$SAFEIO_HELPER" write "$SAFEIO_OUTPUT_FD" "${path#"$OUTPUT_ROOT/"}" "$mode"
     }
     OPEN_OUTPUT_READ_FD="${SAFEIO_WRITER[0]}"
-    OPEN_OUTPUT_FD="${SAFEIO_WRITER[1]}"
+    local coproc_write_fd="${SAFEIO_WRITER[1]}"
+    exec {OPEN_OUTPUT_FD}>&"$coproc_write_fd"
+    eval "exec $coproc_write_fd>&-"
     OPEN_OUTPUT_PID="$SAFEIO_WRITER_PID"
     OPEN_OUTPUT_PATH="$path"
     local ready
