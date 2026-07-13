@@ -93,6 +93,36 @@ fn rejects_malformed_and_invalid_values_with_paths() {
 }
 
 #[test]
+fn enforces_standards_based_url_policy() {
+    for (url, expected) in [
+        ("http://@", "empty host"),
+        ("http://[::1", "invalid IPv6 address"),
+        ("http://user@example.test/role", "userinfo is not allowed"),
+        (
+            "https://example.test/role#fragment",
+            "fragment is not allowed",
+        ),
+        (
+            "http://example.test:0/role",
+            "port must be from 1 through 65535",
+        ),
+    ] {
+        let source = VALID.replace("https://roles.example.test/default.json", url);
+        let error = parse_json5(&source, "url.json5").expect_err("URL must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} for {url:?}, got {error}"
+        );
+    }
+
+    let ipv6 = VALID.replace(
+        "https://roles.example.test/default.json",
+        "http://[::1]/role",
+    );
+    parse_json5(&ipv6, "ipv6.json5").expect("valid IPv6 host");
+}
+
+#[test]
 fn rejects_plaintext_secrets() {
     let source = VALID.replace("env:GITHUB_TOKEN", "plaintext-token");
     let error = parse_json5(&source, "secret.json5").expect_err("plaintext must fail");
@@ -125,10 +155,98 @@ fn atomic_file_round_trip_is_cross_platform() {
     let path = directory.path().join("config.json5");
     let config = parse_json5(VALID, "test.json5").expect("valid JSON5");
     std::fs::write(&path, "old contents").expect("seed existing destination");
+    #[cfg(windows)]
+    let creation_time = {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::metadata(&path)
+            .expect("old destination metadata")
+            .creation_time()
+    };
 
     write_file(&path, &config).expect("atomic write");
 
     assert_eq!(load_file(path).expect("load written file"), config);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(directory.path().join("config.json5"))
+                .expect("replacement metadata")
+                .creation_time(),
+            creation_time,
+            "ReplaceFileW must preserve destination creation metadata"
+        );
+    }
+}
+
+#[test]
+fn atomic_first_write_creates_a_valid_file_without_warnings() {
+    let directory = common::TestDirectory::create();
+    let path = directory.path().join("first-write.json5");
+    let config = parse_json5(VALID, "test.json5").expect("valid JSON5");
+
+    let outcome = write_file(&path, &config).expect("atomic first write");
+
+    assert!(outcome.warnings.is_empty());
+    assert_eq!(load_file(path).expect("load first write"), config);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlink_destination_and_parent() {
+    use std::os::unix::fs::symlink;
+
+    let directory = common::TestDirectory::create();
+    let real = directory.path().join("real.json5");
+    let link = directory.path().join("link.json5");
+    std::fs::write(&real, "old").expect("write real file");
+    symlink(&real, &link).expect("create destination symlink");
+    let config = parse_json5(VALID, "test.json5").expect("valid JSON5");
+    let error = write_file(&link, &config).expect_err("symlink destination must fail");
+    assert!(error.to_string().contains("must not be a symlink"));
+    assert_eq!(std::fs::read_to_string(&real).expect("real file"), "old");
+
+    let real_parent = directory.path().join("real-parent");
+    let linked_parent = directory.path().join("linked-parent");
+    std::fs::create_dir(&real_parent).expect("create real parent");
+    symlink(&real_parent, &linked_parent).expect("create parent symlink");
+    let error = write_file(linked_parent.join("config.json5"), &config)
+        .expect_err("symlink parent must fail");
+    assert!(error.to_string().contains("parent chain"));
+}
+
+#[cfg(windows)]
+#[test]
+fn rejects_reparse_destination_and_parent_when_symlink_privilege_is_available() {
+    use std::io::ErrorKind;
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let directory = common::TestDirectory::create();
+    let real = directory.path().join("real.json5");
+    let link = directory.path().join("link.json5");
+    std::fs::write(&real, "old").expect("write real file");
+    match symlink_file(&real, &link) {
+        Ok(()) => {}
+        Err(error)
+            if error.kind() == ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314) =>
+        {
+            return;
+        }
+        Err(error) => panic!("create destination symlink: {error}"),
+    }
+    let config = parse_json5(VALID, "test.json5").expect("valid JSON5");
+    let error = write_file(&link, &config).expect_err("reparse destination must fail");
+    assert!(error.to_string().contains("reparse point"));
+    assert_eq!(std::fs::read_to_string(&real).expect("real file"), "old");
+
+    let real_parent = directory.path().join("real-parent");
+    let linked_parent = directory.path().join("linked-parent");
+    std::fs::create_dir(&real_parent).expect("create real parent");
+    symlink_dir(&real_parent, &linked_parent).expect("create parent symlink");
+    let error = write_file(linked_parent.join("config.json5"), &config)
+        .expect_err("reparse parent must fail");
+    assert!(error.to_string().contains("parent chain"));
 }
 
 #[test]

@@ -16,7 +16,7 @@ mod wire;
 use serde::de::IgnoredAny;
 
 pub use error::ConfigError;
-pub use io::{load_file, write_file};
+pub use io::{WriteOutcome, WriteWarning, load_file, write_file};
 pub use migration::{
     ManualMapping, MigrationDiagnostic, MigrationError, MigrationResult, migrate_legacy_environment,
 };

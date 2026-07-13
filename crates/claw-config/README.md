@@ -31,5 +31,24 @@ CI, and Copilot CLI rows produce ordered `ManualRequired` diagnostics:
 - `DOCKERHUB_IMAGE`
 
 The mapping table is generated and validated from the frozen JSON artifact by
-`build.rs`; Rust code does not maintain a second list of canonical names,
-aliases, targets, or secret classifications.
+`build.rs`. The package-contained `data/env-mapping.json` is the canonical
+crate input so `cargo package` verification is independent of the repository
+layout. Normal workspace builds compare the complete typed record, including
+defaults, conversions, validation, requirements, aliases, targets, and known
+quirks, against `compat/legacy/config/env-mapping.json` and fail on any drift.
+The generated Rust table embeds every behavioral field so contract changes are
+visible to code review; executable conversion remains an explicitly tested,
+typed Rust implementation rather than an interpreted rule engine.
+
+Atomic writes require a trusted configuration directory. Existing destination
+and parent symlinks/reparse points are rejected, but path-based replacement
+cannot eliminate every rename race in a directory writable by an attacker.
+Unix flushes the temporary file and directory around atomic rename. When a
+Windows destination already exists, the writer flushes the temporary file and
+uses `ReplaceFileW` with a recovery backup, preserving destination ACLs and
+filesystem metadata. A first write has no destination metadata to preserve and
+uses a same-directory rename. Windows does not document a supported
+directory-handle flush equivalent, so final directory entry durability across
+sudden power loss is not claimed. Post-publication cleanup/durability problems
+are returned as `WriteOutcome` warnings rather than falsely reporting that the
+atomic replacement failed.

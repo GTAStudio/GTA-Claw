@@ -52,6 +52,16 @@ fn migrates_supported_aliases_types_and_legacy_integer_prefixes() {
 }
 
 #[test]
+fn preserves_legacy_unvalidated_discord_gateway_value() {
+    let mut environment = minimum_environment();
+    environment.push(("DISCORD_GATEWAY_URL", "legacy-gateway-value"));
+
+    let result = migrate_legacy_environment(environment).expect("legacy gateway is copied");
+    let output = to_json5(&result.config).expect("serialize migration");
+    assert!(output.contains("legacy-gateway-value"));
+}
+
+#[test]
 fn detects_alias_conflicts_before_deduplication() {
     let mut environment = minimum_environment();
     environment.extend([

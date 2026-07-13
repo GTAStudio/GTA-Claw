@@ -19,6 +19,11 @@ pub(crate) struct LegacyMappingContract {
     scope: &'static str,
     target: &'static str,
     secret: bool,
+    _default_json: &'static str,
+    _conversion: &'static str,
+    _validation: &'static str,
+    _required_when: &'static str,
+    _known_legacy_quirk: Option<&'static str>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/legacy_mappings.rs"));

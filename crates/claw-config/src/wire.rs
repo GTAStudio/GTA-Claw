@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::ConfigError;
 use crate::model::{
@@ -288,14 +289,18 @@ impl EnvelopeWire {
             );
         }
 
-        require_http_url(&self.core.role.source_url, "core.role.source_url")?;
+        require_url(
+            &self.core.role.source_url,
+            "core.role.source_url",
+            &["http", "https"],
+        )?;
         validate_range(
             self.core.channels.telegram.poll_interval_ms,
             500,
             60_000,
             "core.channels.telegram.poll_interval_ms",
         )?;
-        if self.core.channels.discord.gateway_url.trim().is_empty() {
+        if self.core.channels.discord.gateway_url.is_empty() {
             return validation("core.channels.discord.gateway_url", "must not be empty");
         }
         if self.core.channels.discord.gateway_intents == 0 {
@@ -338,9 +343,10 @@ impl EnvelopeWire {
             );
         }
         for (index, source_url) in self.core.legacy.skills.source_urls.iter().enumerate() {
-            require_http_url(
+            require_url(
                 source_url,
                 &format!("core.legacy.skills.source_urls[{index}]"),
+                &["http", "https"],
             )?;
         }
 
@@ -612,25 +618,28 @@ fn nonempty_optional(value: Option<String>, path: &str) -> Result<Option<String>
     }
 }
 
-fn require_http_url(value: &str, path: &str) -> Result<(), ConfigError> {
-    if value
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return validation(path, "must be an absolute HTTP(S) URL");
+fn require_url(value: &str, path: &str, schemes: &[&str]) -> Result<(), ConfigError> {
+    let url = Url::parse(value).map_err(|error| ConfigError::Validation {
+        path: path.to_owned(),
+        message: format!("must be a valid absolute URL: {error}"),
+    })?;
+    if !schemes.contains(&url.scheme()) {
+        return validation(
+            path,
+            &format!("scheme must be one of {}", schemes.join(", ")),
+        );
     }
-    let authority_and_path = value
-        .strip_prefix("http://")
-        .or_else(|| value.strip_prefix("https://"));
-    let Some(authority_and_path) = authority_and_path else {
-        return validation(path, "must be an absolute HTTP(S) URL");
-    };
-    let authority = authority_and_path
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    if authority.is_empty() || authority.starts_with(':') || authority.ends_with(':') {
-        return validation(path, "must be an absolute HTTP(S) URL");
+    if url.host_str().is_none_or(str::is_empty) {
+        return validation(path, "host must not be empty");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return validation(path, "userinfo is not allowed");
+    }
+    if url.fragment().is_some() {
+        return validation(path, "fragment is not allowed");
+    }
+    if url.port() == Some(0) {
+        return validation(path, "port must be from 1 through 65535");
     }
     Ok(())
 }
