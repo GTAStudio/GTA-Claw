@@ -25,7 +25,7 @@ fn reference_workflow_disables_credentials_and_network_lifecycle_downloads() {
         "Verify checkout credential isolation",
         "COREPACK_ENABLE_DOWNLOAD_PROMPT: \"0\"",
         "corepack install",
-        "NPM_CONFIG_IGNORE_SCRIPTS: \"true\"",
+        "npm_config_ignore_scripts: \"true\"",
         "pnpm install --frozen-lockfile --ignore-scripts",
         "pnpm config get ignore-scripts",
         "matrix-sdk-crypto-nodejs",

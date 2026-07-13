@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 45
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-      NPM_CONFIG_IGNORE_SCRIPTS: "true"
+      npm_config_ignore_scripts: "true"
     steps:
       - name: Checkout GTA Claw
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
