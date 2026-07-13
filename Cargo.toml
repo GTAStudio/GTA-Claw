@@ -18,6 +18,7 @@ claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
 serde_path_to_error = "=0.1.20"
+sha2 = "=0.10.9"
 
 [workspace.package]
 version = "0.1.0"

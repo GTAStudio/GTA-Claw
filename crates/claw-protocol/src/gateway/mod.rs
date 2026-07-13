@@ -4,6 +4,8 @@
 //! `openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85`.
 //! Registry membership describes wire compatibility and authorization metadata;
 //! it does not claim that any of the 278 core method behaviors are implemented.
+//! This crate is workspace-only: its build verifies the frozen registry input
+//! under `compat/upstream` and intentionally fails when that input is absent.
 
 mod authorization;
 mod codec;

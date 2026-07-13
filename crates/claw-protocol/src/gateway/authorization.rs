@@ -60,9 +60,17 @@ pub fn authorize(
             static_required.as_slice()
         }
         MethodScope::Dynamic => {
-            resolved_dynamic_scopes.ok_or_else(|| AuthorizationError::UnresolvedDynamicScope {
-                method: method.identity().to_owned(),
-            })?
+            let scopes = resolved_dynamic_scopes.ok_or_else(|| {
+                AuthorizationError::UnresolvedDynamicScope {
+                    method: method.identity().to_owned(),
+                }
+            })?;
+            if scopes.is_empty() {
+                return Err(AuthorizationError::EmptyDynamicScope {
+                    method: method.identity().to_owned(),
+                });
+            }
+            scopes
         }
         MethodScope::Node => unreachable!("node methods returned after the role check"),
     };
@@ -116,6 +124,11 @@ pub enum AuthorizationError {
         /// Exact method identity.
         method: String,
     },
+    /// A dynamic resolver returned no required scopes.
+    EmptyDynamicScope {
+        /// Exact method identity.
+        method: String,
+    },
     /// The caller lacks the required operator scope.
     MissingScope {
         /// Exact method identity.
@@ -141,6 +154,12 @@ impl Display for AuthorizationError {
             ),
             Self::UnresolvedDynamicScope { method } => {
                 write!(formatter, "dynamic scope for `{method}` was not resolved")
+            }
+            Self::EmptyDynamicScope { method } => {
+                write!(
+                    formatter,
+                    "dynamic scope for `{method}` resolved to an empty set"
+                )
             }
             Self::MissingScope { method, required } => {
                 write!(formatter, "`{method}` requires {}", required.as_str())

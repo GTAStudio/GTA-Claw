@@ -50,8 +50,13 @@ fn connect_json(min: u64, max: u64, mode: &str, role: Option<&str>) -> String {
     let id = match mode {
         "node" => "node-host",
         "probe" => "openclaw-probe",
+        "worker" => "openclaw-worker",
         _ => "cli",
     };
+    connect_identity_json(min, max, id, mode, role)
+}
+
+fn connect_identity_json(min: u64, max: u64, id: &str, mode: &str, role: Option<&str>) -> String {
     let role = role.map_or_else(String::new, |role| format!(r#","role":"{role}""#));
     let device = if mode == "node" {
         r#","device":{"id":"node-1","publicKey":"cHVi","signature":"c2ln","signedAt":1737264000000,"nonce":"nonce-1"}"#
@@ -387,7 +392,10 @@ fn encodes_strict_frames_and_enforces_outbound_cap() {
         Frame::Request(_)
     ));
 
-    let huge = format!(r#""{}""#, "x".repeat(PREAUTH_MAX_FRAME_BYTES));
+    let huge = format!(
+        r#""{}""#,
+        "x".repeat(PREAUTH_MAX_FRAME_BYTES.saturating_mul(16))
+    );
     let opaque: OpaqueJson = serde_json::from_str(&huge).expect("opaque JSON");
     let health = resolve_core_method("health").expect("health method");
     let frame = Frame::Request(RequestFrame::new(
@@ -443,6 +451,9 @@ fn admits_only_authenticated_v3_node_and_probe() {
     .expect("authenticated node");
     node.prepare_hello(hello(Role::Node, &[]))
         .expect("legacy hello still v4");
+    node.mark_hello_sent().expect("node hello sent");
+    node.mark_ready().expect("node ready");
+    assert_eq!(node.state(), NegotiationState::Ready);
 
     let mut probe = drive_to_authentication(3, 3, "probe", None);
     assert_eq!(
@@ -456,6 +467,12 @@ fn admits_only_authenticated_v3_node_and_probe() {
             device_proof: DeviceProofDecision::NotRequired,
         })
         .expect("authenticated probe");
+    probe
+        .prepare_hello(hello(Role::Operator, &[OperatorScope::Read]))
+        .expect("legacy probe hello remains v4");
+    probe.mark_hello_sent().expect("probe hello sent");
+    probe.mark_ready().expect("probe ready");
+    assert_eq!(probe.state(), NegotiationState::Ready);
 
     let mut rejected = drive_to_authentication(3, 3, "cli", Some("operator"));
     assert!(matches!(
@@ -470,6 +487,85 @@ fn admits_only_authenticated_v3_node_and_probe() {
         Err(NegotiationError::Rejected(rejection))
             if rejection.code() == ConnectErrorDetailCode::ProtocolMismatch
     ));
+}
+
+#[test]
+fn rejects_cross_role_probe_and_inverted_ranges() {
+    // Review regressions around the exact N-1 predicates at
+    // `message-handler.ts#L912-L952`.
+    for mut negotiation in [
+        drive_to_authentication(3, 3, "probe", Some("node")),
+        drive_to_authentication(4, 3, "probe", None),
+    ] {
+        assert!(matches!(
+            negotiation.check_protocol(),
+            Err(NegotiationError::Rejected(rejection))
+                if rejection.code() == ConnectErrorDetailCode::ProtocolMismatch
+        ));
+    }
+
+    let mut explicit_operator = drive_to_authentication(3, 3, "probe", Some("operator"));
+    assert_eq!(
+        explicit_operator
+            .check_protocol()
+            .expect("explicit operator probe"),
+        CompatibilityMode::LegacyProbe
+    );
+    explicit_operator
+        .apply_authentication(AuthenticationDecision::Accepted {
+            role: Role::Operator,
+            scopes: vec![],
+            device_proof: DeviceProofDecision::NotRequired,
+        })
+        .expect("operator probe authenticated");
+    explicit_operator
+        .prepare_hello(hello(Role::Operator, &[]))
+        .expect("probe hello");
+    explicit_operator.mark_hello_sent().expect("hello sent");
+    explicit_operator.mark_ready().expect("ready");
+    assert_eq!(explicit_operator.state(), NegotiationState::Ready);
+}
+
+#[test]
+fn rejects_every_worker_identity_signal_before_negotiation() {
+    // Closed worker identity: `packages/gateway-protocol/src/client-info.ts#L15-L52`
+    // and `docs/gateway/protocol.md` at PINNED_SHA.
+    for json in [
+        connect_identity_json(3, 3, "cli", "cli", Some("worker")),
+        connect_identity_json(3, 3, "openclaw-worker", "cli", Some("operator")),
+        connect_identity_json(3, 3, "cli", "worker", Some("operator")),
+        connect_identity_json(3, 3, "openclaw-worker", "worker", None),
+    ] {
+        let mut negotiation = Negotiation::challenge_sent(challenge());
+        negotiation
+            .receive_first(
+                decode(&json).expect("schema-valid worker signal"),
+                &preauth(),
+            )
+            .expect("receive worker connect");
+        assert!(matches!(
+            negotiation.check_protocol(),
+            Err(NegotiationError::Rejected(rejection))
+                if rejection.code() == ConnectErrorDetailCode::AuthUnauthorized
+        ));
+        assert_eq!(negotiation.state(), NegotiationState::Rejected);
+    }
+
+    let mut case_variant = drive_to_authentication(4, 4, "cli", Some("Worker"));
+    assert!(matches!(
+        case_variant.check_protocol(),
+        Err(NegotiationError::Rejected(rejection))
+            if rejection.code() == ConnectErrorDetailCode::AuthUnauthorized
+    ));
+    for json in [
+        connect_identity_json(4, 4, "Openclaw-worker", "cli", None),
+        connect_identity_json(4, 4, "cli", "Worker", None),
+    ] {
+        let Frame::Request(request) = decode(&json).expect("valid outer envelope") else {
+            panic!("expected request");
+        };
+        assert!(preauth().decode_connect(&request).is_err());
+    }
 }
 
 #[test]
@@ -701,16 +797,11 @@ fn authorizes_every_closed_operator_scope() {
         );
     }
 
-    let policy = ValidationPolicy::for_phase(TransportPhase::Authenticated);
-    let mut plugins = DynamicPluginRegistry::new();
-    plugins
-        .register("plugin.talkSecrets", MethodScope::Dynamic, &policy)
-        .expect("register dynamic method");
     assert!(
         authorize_named(
             Role::Operator,
-            "plugin.talkSecrets",
-            PluginLookup::Allow(&plugins),
+            "plugins.sessionAction",
+            PluginLookup::Deny,
             &[OperatorScope::TalkSecrets],
             Some(&[OperatorScope::TalkSecrets]),
         )
@@ -724,39 +815,56 @@ fn requires_explicit_dynamic_scope_and_keeps_plugins_distinct() {
     let policy = ValidationPolicy::for_phase(TransportPhase::Authenticated);
     let mut plugins = DynamicPluginRegistry::new();
     plugins
-        .register(" plugin.echo ", MethodScope::Dynamic, &policy)
+        .register(" plugin.echo ", Some(OperatorScope::Read), &policy)
         .expect("register");
     assert!(matches!(
-        plugins.register("plugin.echo", MethodScope::Dynamic, &policy),
+        plugins.register("plugin.echo", Some(OperatorScope::Read), &policy),
         Err(RegistryError::DuplicatePluginMethod(_))
     ));
     assert!(matches!(
-        plugins.register(
-            "health",
-            MethodScope::Operator(OperatorScope::Read),
-            &policy
-        ),
+        plugins.register("health", Some(OperatorScope::Read), &policy),
         Err(RegistryError::CoreMethodShadow(_))
     ));
 
     let method =
         resolve_gateway_method("plugin.echo", PluginLookup::Allow(&plugins)).expect("plugin");
     assert!(matches!(method, GatewayMethod::DynamicPlugin(_)));
-    assert!(matches!(
-        authorize_named(
-            Role::Operator,
-            "plugin.echo",
-            PluginLookup::Allow(&plugins),
-            &[OperatorScope::Admin],
-            None
-        ),
-        Err(AuthorizationError::UnresolvedDynamicScope { .. })
-    ));
     assert!(
         authorize_named(
             Role::Operator,
             "plugin.echo",
             PluginLookup::Allow(&plugins),
+            &[OperatorScope::Read],
+            None
+        )
+        .is_ok()
+    );
+
+    assert!(matches!(
+        authorize_named(
+            Role::Operator,
+            "plugins.sessionAction",
+            PluginLookup::Deny,
+            &[OperatorScope::Write],
+            None
+        ),
+        Err(AuthorizationError::UnresolvedDynamicScope { .. })
+    ));
+    assert!(matches!(
+        authorize_named(
+            Role::Operator,
+            "plugins.sessionAction",
+            PluginLookup::Deny,
+            &[OperatorScope::Write],
+            Some(&[])
+        ),
+        Err(AuthorizationError::EmptyDynamicScope { .. })
+    ));
+    assert!(
+        authorize_named(
+            Role::Operator,
+            "plugins.sessionAction",
+            PluginLookup::Deny,
             &[OperatorScope::Write],
             Some(&[OperatorScope::Read, OperatorScope::Write])
         )
@@ -765,8 +873,8 @@ fn requires_explicit_dynamic_scope_and_keeps_plugins_distinct() {
     assert!(matches!(
         authorize_named(
             Role::Operator,
-            "plugin.echo",
-            PluginLookup::Allow(&plugins),
+            "plugins.sessionAction",
+            PluginLookup::Deny,
             &[OperatorScope::Write],
             Some(&[OperatorScope::Write, OperatorScope::Approvals])
         ),
@@ -794,6 +902,71 @@ fn requires_explicit_dynamic_scope_and_keeps_plugins_distinct() {
         preauth().decode(br#"{"type":"req","id":"1","method":"plugin.echo"}"#),
         Err(CodecError::UnknownMethod(_))
     ));
+}
+
+#[test]
+fn enforces_plugin_reserved_namespaces_and_scope_metadata() {
+    // `src/shared/gateway-method-policy.ts#L2-L42` and
+    // `src/gateway/methods/registry.ts#L22-L137`.
+    let policy = ValidationPolicy::for_phase(TransportPhase::Authenticated);
+    let mut plugins = DynamicPluginRegistry::new();
+    for name in [
+        "config.pluginOnly",
+        "exec.approvals.pluginOnly",
+        "wizard.pluginOnly",
+        "update.pluginOnly",
+    ] {
+        let method = plugins
+            .register(name, Some(OperatorScope::Read), &policy)
+            .expect("reserved plugin registration");
+        assert_eq!(method.scope(), OperatorScope::Admin);
+    }
+    for name in [
+        "config.pluginOnly",
+        "exec.approvals.pluginOnly",
+        "wizard.pluginOnly",
+        "update.pluginOnly",
+    ] {
+        assert!(matches!(
+            authorize_named(
+                Role::Operator,
+                name,
+                PluginLookup::Allow(&plugins),
+                &[OperatorScope::Read],
+                None
+            ),
+            Err(AuthorizationError::MissingScope {
+                required: OperatorScope::Admin,
+                ..
+            })
+        ));
+        assert!(
+            authorize_named(
+                Role::Operator,
+                name,
+                PluginLookup::Allow(&plugins),
+                &[OperatorScope::Admin],
+                None
+            )
+            .is_ok()
+        );
+    }
+    let legacy = plugins
+        .register("plugin.legacy", None, &policy)
+        .expect("legacy metadata defaults");
+    assert_eq!(legacy.scope(), OperatorScope::Admin);
+
+    for scope in ["", "node", "dynamic", "Operator.Read"] {
+        assert!(matches!(
+            plugins.register_declared(format!("plugin.invalid.{scope}"), Some(scope), &policy),
+            Err(RegistryError::InvalidPluginScope(actual)) if actual == scope
+        ));
+    }
+    assert!(
+        plugins
+            .register_declared("plugin.declared", Some("operator.approvals"), &policy)
+            .is_ok()
+    );
 }
 
 #[derive(Deserialize)]

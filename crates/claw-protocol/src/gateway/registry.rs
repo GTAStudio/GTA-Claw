@@ -199,14 +199,17 @@ pub fn resolve_core_event(name: &str) -> Option<&'static CoreEvent> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DynamicPluginMethod {
     name: String,
-    scope: MethodScope,
+    scope: OperatorScope,
 }
 
 impl DynamicPluginMethod {
-    /// Constructs a plugin method after trimming and enforcing the explicit name policy.
+    /// Constructs a plugin method after enforcing name and operator-scope policy.
+    ///
+    /// Missing legacy metadata defaults to admin. Reserved upstream namespaces
+    /// are always coerced to admin and can never be weakened by a plugin.
     pub fn new(
         raw_name: impl Into<String>,
-        scope: MethodScope,
+        scope: Option<OperatorScope>,
         policy: &ValidationPolicy,
     ) -> Result<Self, RegistryError> {
         let raw_name = raw_name.into();
@@ -223,6 +226,11 @@ impl DynamicPluginMethod {
         if resolve_core_method(name).is_some() {
             return Err(RegistryError::CoreMethodShadow(name.to_owned()));
         }
+        let scope = if is_reserved_admin_plugin_method(name) {
+            OperatorScope::Admin
+        } else {
+            scope.unwrap_or(OperatorScope::Admin)
+        };
         Ok(Self {
             name: name.to_owned(),
             scope,
@@ -237,9 +245,15 @@ impl DynamicPluginMethod {
 
     /// Returns this plugin method's explicit authorization classification.
     #[must_use]
-    pub const fn scope(&self) -> MethodScope {
+    pub const fn scope(&self) -> OperatorScope {
         self.scope
     }
+}
+
+fn is_reserved_admin_plugin_method(name: &str) -> bool {
+    ["exec.approvals.", "config.", "wizard.", "update."]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// An exact-identity registry for explicitly opted-in runtime plugin methods.
@@ -261,7 +275,7 @@ impl DynamicPluginRegistry {
     pub fn register(
         &mut self,
         raw_name: impl Into<String>,
-        scope: MethodScope,
+        scope: Option<OperatorScope>,
         policy: &ValidationPolicy,
     ) -> Result<&DynamicPluginMethod, RegistryError> {
         let method = DynamicPluginMethod::new(raw_name, scope, policy)?;
@@ -276,6 +290,26 @@ impl DynamicPluginRegistry {
             .methods
             .get(&name)
             .expect("method was inserted under the same exact key"))
+    }
+
+    /// Parses untrusted plugin scope metadata through the closed operator set.
+    ///
+    /// Omitted legacy metadata defaults to admin. Empty, node, dynamic, unknown,
+    /// or incorrectly cased scope strings are rejected.
+    pub fn register_declared(
+        &mut self,
+        raw_name: impl Into<String>,
+        declared_scope: Option<&str>,
+        policy: &ValidationPolicy,
+    ) -> Result<&DynamicPluginMethod, RegistryError> {
+        let scope = match declared_scope {
+            None => None,
+            Some(scope) => Some(
+                OperatorScope::from_identity(scope)
+                    .ok_or_else(|| RegistryError::InvalidPluginScope(scope.to_owned()))?,
+            ),
+        };
+        self.register(raw_name, scope, policy)
     }
 
     /// Resolves a registered plugin method using exact ordinal UTF-8 comparison.
@@ -316,7 +350,7 @@ impl<'a> GatewayMethod<'a> {
     pub const fn scope(self) -> MethodScope {
         match self {
             Self::Core(method) => method.scope(),
-            Self::DynamicPlugin(method) => method.scope(),
+            Self::DynamicPlugin(method) => MethodScope::Operator(method.scope()),
         }
     }
 
@@ -371,6 +405,8 @@ pub enum RegistryError {
     CoreMethodShadow(String),
     /// A plugin method duplicates another runtime registration.
     DuplicatePluginMethod(String),
+    /// Plugin metadata named a non-operator, empty, unknown, or incorrectly cased scope.
+    InvalidPluginScope(String),
     /// No core or explicitly opted-in plugin method has this exact identity.
     UnknownMethod(String),
 }
@@ -390,6 +426,9 @@ impl Display for RegistryError {
             }
             Self::DuplicatePluginMethod(name) => {
                 write!(formatter, "duplicate plugin method `{name}`")
+            }
+            Self::InvalidPluginScope(scope) => {
+                write!(formatter, "invalid plugin operator scope `{scope}`")
             }
             Self::UnknownMethod(name) => write!(formatter, "unknown gateway method `{name}`"),
         }

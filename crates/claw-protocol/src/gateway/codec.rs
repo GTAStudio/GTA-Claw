@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::io::{self, Write};
 use std::rc::Rc;
 
 use serde::Deserializer;
@@ -145,8 +146,18 @@ impl Codec {
         frame
             .validate(&self.policy)
             .map_err(CodecError::from_validation)?;
-        let encoded = serde_json::to_vec(frame).map_err(CodecError::Encode)?;
-        self.check_size(encoded.len())?;
+        let limit = self.phase.max_frame_bytes();
+        let mut writer = BoundedWriter::new(limit);
+        let serialization = serde_json::to_writer(&mut writer, frame);
+        if let Some(actual) = writer.exceeded_at {
+            return Err(CodecError::FrameTooLarge {
+                phase: self.phase,
+                actual,
+                limit,
+            });
+        }
+        serialization.map_err(CodecError::Encode)?;
+        let encoded = writer.into_bytes();
         preflight_json(&encoded, &self.policy)?;
         Ok(encoded)
     }
@@ -254,6 +265,43 @@ impl Codec {
         } else {
             Ok(())
         }
+    }
+}
+
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded_at: Option<usize>,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+            exceeded_at: None,
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if buffer.len() > remaining {
+            self.bytes.extend_from_slice(&buffer[..remaining]);
+            self.exceeded_at = Some(self.limit.saturating_add(1));
+            return Err(io::Error::other("serialized frame exceeds byte cap"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -823,5 +871,24 @@ impl Error for CodecError {
             Self::Encode(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::BoundedWriter;
+
+    #[test]
+    fn bounded_writer_never_buffers_past_limit() {
+        let mut writer = BoundedWriter::new(64);
+        let error = writer
+            .write_all(&vec![b'x'; 1024 * 1024])
+            .expect_err("oversized write must stop");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(writer.bytes.len(), 64);
+        assert_eq!(writer.exceeded_at, Some(65));
     }
 }

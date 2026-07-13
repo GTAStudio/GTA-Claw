@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    ClientMode, Codec, CodecError, ConnectChallenge, ConnectParams, Frame,
+    ClientId, ClientMode, Codec, CodecError, ConnectChallenge, ConnectParams, Frame,
     GATEWAY_PROTOCOL_VERSION, HelloOk, MIN_GENERAL_PROTOCOL_VERSION, MIN_NODE_PROTOCOL_VERSION,
     MIN_PROBE_PROTOCOL_VERSION, Name, OperatorScope, RequestId, Role, TransportPhase,
 };
@@ -534,12 +534,31 @@ impl Negotiation {
             .ok_or(NegotiationError::MissingReducerData("connect params"))?;
         let min = params.min_protocol.get();
         let max = params.max_protocol.get();
+        let role_identity = params.role.as_ref().map(Name::as_str);
+        if role_identity == Some("worker")
+            || params.client.id == ClientId::Worker
+            || params.client.mode == ClientMode::Worker
+        {
+            return self.reject(HandshakeRejection::new(
+                ConnectErrorDetailCode::AuthUnauthorized,
+                "worker identity must use the closed worker protocol",
+            ));
+        }
+        if min > max {
+            return self.reject(HandshakeRejection::new(
+                ConnectErrorDetailCode::ProtocolMismatch,
+                format!("invalid protocol range {min}..={max}"),
+            ));
+        }
         let supports_current =
             max >= GATEWAY_PROTOCOL_VERSION.get() && min <= MIN_GENERAL_PROTOCOL_VERSION.get();
-        let requests_node = params.role.as_ref().map(Name::as_str) == Some("node");
+        let requests_node = role_identity == Some("node");
+        let requests_operator = role_identity.is_none() || role_identity == Some("operator");
         let compatibility = if supports_current {
             CompatibilityMode::Current
-        } else if params.client.mode == ClientMode::Probe
+        } else if requests_operator
+            && params.client.id == ClientId::Probe
+            && params.client.mode == ClientMode::Probe
             && max >= MIN_PROBE_PROTOCOL_VERSION.get()
             && min <= GATEWAY_PROTOCOL_VERSION.get()
         {
@@ -650,11 +669,25 @@ impl Negotiation {
                 "device proof was verified without supplied device identity",
             ));
         }
-        if self.compatibility == Some(CompatibilityMode::LegacyNode) && role != Role::Node {
-            return self.reject(HandshakeRejection::new(
-                ConnectErrorDetailCode::AuthUnauthorized,
-                "legacy node window requires node authentication",
-            ));
+        match self.compatibility {
+            Some(CompatibilityMode::LegacyProbe) if role != Role::Operator => {
+                return self.reject(HandshakeRejection::new(
+                    ConnectErrorDetailCode::AuthUnauthorized,
+                    "legacy probe window requires operator probe authentication",
+                ));
+            }
+            Some(CompatibilityMode::LegacyNode) if role != Role::Node => {
+                return self.reject(HandshakeRejection::new(
+                    ConnectErrorDetailCode::AuthUnauthorized,
+                    "legacy node window requires node authentication",
+                ));
+            }
+            Some(
+                CompatibilityMode::Current
+                | CompatibilityMode::LegacyProbe
+                | CompatibilityMode::LegacyNode,
+            ) => {}
+            None => return Err(NegotiationError::MissingReducerData("compatibility")),
         }
         self.authenticated_role = Some(role);
         self.authenticated_scopes = scopes;

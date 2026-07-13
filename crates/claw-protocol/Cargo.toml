@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 build = "build.rs"
+publish = false
 
 [dependencies]
 claw-domain.workspace = true
@@ -17,6 +18,10 @@ serde_path_to_error.workspace = true
 [build-dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
 
 [lints]
 workspace = true
