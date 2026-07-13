@@ -1,0 +1,9 @@
+GTA Claw Linux headless packaging prototype
+
+This prototype packages the native Rust gta-claw-daemon and gta-claw-cli
+executables. It does not package the legacy JavaScript application or the
+Slint desktop application.
+
+The generated SPDX SBOM records the exact packaged executable checksums.
+Runtime libraries in the OCI image remain under their respective upstream
+licenses and are copied from the Ubuntu runner's target sysroot.

@@ -1,0 +1,3 @@
+# Exact ELF DT_NEEDED entries allowed in packaged executables and OCI payloads.
+libc.so.6
+libgcc_s.so.1
