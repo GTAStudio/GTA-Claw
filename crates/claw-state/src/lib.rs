@@ -2883,6 +2883,49 @@ mod tests {
             .expect("detached database closes");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_boundary_logical_identity_drift_rolls_back_every_change() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "commit-logical-drift.sqlite");
+        let store = open(&path).await;
+        let owner = test_support::owner(&store).to_owned();
+        crate::repository::test_support::set_commit_tamper(&owner);
+        let record = session("must-rollback-logical-drift", 1);
+        let error = store
+            .sessions()
+            .create(&record)
+            .await
+            .expect_err("commit-boundary logical drift is rejected");
+        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert!(
+            store
+                .sessions()
+                .get(&record.id)
+                .await
+                .expect("read rolled-back session")
+                .is_none()
+        );
+        assert!(
+            store
+                .health()
+                .await
+                .expect("health after logical rollback")
+                .is_healthy()
+        );
+        let rogue_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'table' AND name = 'commit_boundary_rogue'
+             )",
+        )
+        .fetch_one(test_support::pool(&store))
+        .await
+        .expect("inspect rolled-back rogue schema");
+        assert!(!rogue_exists);
+        store.close().await.expect("logical drift store closes");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_identity_handle_prevents_path_replacement() {

@@ -17,6 +17,9 @@ const APPLICATION_ID: i64 = 0x4754_4143;
 #[cfg(test)]
 static WRITE_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static COMMIT_TEST_TAMPERS: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 struct WriteTestBarrier {
@@ -686,7 +689,7 @@ async fn wait_at_write_test_barrier(owner: &str) {
 
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {
-    use super::{Arc, WRITE_TEST_BARRIERS, WriteTestBarrier};
+    use super::{Arc, COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS, WriteTestBarrier};
 
     pub(crate) fn set_write_barrier(
         owner: &str,
@@ -705,6 +708,13 @@ pub(crate) mod test_support {
             );
         (entered, release)
     }
+
+    pub(crate) fn set_commit_tamper(owner: &str) {
+        COMMIT_TEST_TAMPERS
+            .lock()
+            .expect("commit test tampers lock poisoned")
+            .insert(owner.to_owned());
+    }
 }
 
 async fn commit_verified(
@@ -713,6 +723,8 @@ async fn commit_verified(
     identity: OperationalIdentity<'_>,
     operation: &'static str,
 ) -> Result<(), StateError> {
+    #[cfg(test)]
+    apply_commit_test_tamper(&mut transaction, owner).await?;
     let persisted_owner =
         sqlx::query_scalar::<_, String>("SELECT owner FROM claw_writer_lock WHERE singleton = 1")
             .fetch_optional(&mut *transaction)
@@ -753,6 +765,30 @@ async fn commit_verified(
         .commit()
         .await
         .map_err(|error| database(operation, error))
+}
+
+#[cfg(test)]
+async fn apply_commit_test_tamper(
+    transaction: &mut Transaction<'_, Sqlite>,
+    owner: &str,
+) -> Result<(), StateError> {
+    let tamper = COMMIT_TEST_TAMPERS
+        .lock()
+        .expect("commit test tampers lock poisoned")
+        .remove(owner);
+    if tamper {
+        sqlx::raw_sql(
+            "UPDATE claw_writer_lock
+             SET owner = 'commit-boundary-attacker'
+             WHERE singleton = 1;
+             PRAGMA application_id = 0;
+             CREATE TABLE commit_boundary_rogue(value TEXT) STRICT;",
+        )
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| database("apply commit-boundary test tamper", error))?;
+    }
+    Ok(())
 }
 
 async fn insert_device(
