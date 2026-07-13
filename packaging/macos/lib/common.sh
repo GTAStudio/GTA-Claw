@@ -234,6 +234,14 @@ remove_output_file() {
   [[ ! -e "$path" && ! -L "$path" ]] || die "failed to remove output file: $path"
 }
 
+output_file_identity() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    stat -f '%d:%i' "$1"
+  else
+    stat -c '%d:%i' "$1"
+  fi
+}
+
 safe_reset_dir() {
   local path="$1"
   local target
@@ -268,6 +276,7 @@ write_sha256_manifest() {
   local output_relative=""
   local temporary_relative=""
   local restore_noclobber=0
+  local reserved_identity
   if [[ "$root" == "$OUTPUT_ROOT/"* ]]; then
     assert_output_path "$root"
   fi
@@ -291,18 +300,20 @@ write_sha256_manifest() {
     die "failed to reserve temporary manifest: $temporary"
   fi
   [[ "$restore_noclobber" -eq 0 ]] || set +o noclobber
+  reserved_identity="$(output_file_identity "$temporary")"
   while IFS= read -r relative; do
     [[ "$relative" != "$output_relative" && "$relative" != "$temporary_relative" ]] || continue
     printf '%s  %s\n' "$(sha256_file "$root/$relative")" "$relative" >&9
   done < <(cd "$root" && find . -type f -print | LC_ALL=C sort)
   assert_output_file_slot "$output"
   assert_output_file_slot "$temporary"
-  [[ "$temporary" -ef /dev/fd/9 ]] ||
+  [[ "$(output_file_identity "$temporary")" == "$reserved_identity" ]] ||
     die "temporary manifest changed before publication: $temporary"
   # The exclusive OUTPUT_ROOT contract closes the remaining validation-to-rename shell race.
   mv "$temporary" "$output"
   assert_output_file_slot "$output"
-  [[ "$output" -ef /dev/fd/9 ]] || die "published manifest is not the reserved file: $output"
+  [[ "$(output_file_identity "$output")" == "$reserved_identity" ]] ||
+    die "published manifest is not the reserved file: $output"
   exec 9>&-
 }
 
