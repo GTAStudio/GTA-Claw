@@ -2662,10 +2662,13 @@ mod tests {
             .health()
             .await
             .expect_err("cached checkout detects xattr replacement");
+        let canonical_path = fs::canonicalize(path.parent().expect("database path has a parent"))
+            .expect("canonicalize database parent")
+            .join(path.file_name().expect("database path has a file name"));
         assert_eq!(
             error,
             StateError::InvalidPath {
-                path: path.clone(),
+                path: canonical_path,
                 reason: "database lock identity changed while open",
             }
         );
