@@ -170,21 +170,21 @@ mod tests {
         wire_callbacks,
     };
 
-    #[test]
-    fn component_contracts_and_callbacks_use_stable_generated_apis() {
-        let adapter = Rc::new(RefCell::new(UiAdapter::native()));
-        let window = AppWindow::new().expect("component construction must succeed");
-        super::apply_snapshot(&window, &adapter.borrow().snapshot());
-        wire_callbacks(&window, Rc::clone(&adapter));
+    #[cfg(target_os = "macos")]
+    type GeneratedContract = fn(&AppWindow, Rc<RefCell<UiAdapter>>);
+
+    fn exercise_generated_contracts(window: &AppWindow, adapter: Rc<RefCell<UiAdapter>>) {
+        super::apply_snapshot(window, &adapter.borrow().snapshot());
+        wire_callbacks(window, Rc::clone(&adapter));
 
         window.set_layout_width(1_180.0);
-        super::sync_viewport(&window);
+        super::sync_viewport(window);
         assert_eq!(window.get_pane_mode(), PaneMode::ThreePane);
         window.set_layout_width(1_179.0);
-        super::sync_viewport(&window);
+        super::sync_viewport(window);
         assert_eq!(window.get_pane_mode(), PaneMode::OverlayInspector);
         window.set_layout_width(839.0);
-        super::sync_viewport(&window);
+        super::sync_viewport(window);
         assert_eq!(window.get_pane_mode(), PaneMode::SinglePane);
 
         let regular_success = window.global::<DesignTokens>().get_success();
@@ -215,8 +215,40 @@ mod tests {
         window.invoke_inspector_toggle_requested();
         assert!(!window.get_navigation_drawer_open());
         assert!(window.get_inspector_open());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn component_contracts_and_callbacks_use_stable_generated_apis() {
+        let adapter = Rc::new(RefCell::new(UiAdapter::native()));
+        let window = AppWindow::new().expect("component construction must succeed");
+        exercise_generated_contracts(&window, Rc::clone(&adapter));
 
         drop(window);
         assert_eq!(Rc::strong_count(&adapter), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_component_contracts_compile_without_worker_thread_window_creation() {
+        let contract: GeneratedContract = exercise_generated_contracts;
+        assert_eq!(
+            std::mem::size_of_val(&contract),
+            std::mem::size_of::<GeneratedContract>()
+        );
+    }
+
+    #[test]
+    fn modal_sheet_contract_keeps_pointer_and_focus_guards() {
+        let primitives = include_str!("../ui/modules/primitives.slint");
+        let shell = include_str!("../ui/modules/shell.slint");
+
+        assert!(primitives.contains("sheet-pointer-guard := TouchArea"));
+        assert!(primitives.contains("before-focus-boundary := FocusScope"));
+        assert!(primitives.contains("after-focus-boundary := FocusScope"));
+        assert!(primitives.contains("footer-close-button := SecondaryButton"));
+        assert!(shell.contains("enabled: !root.navigation-drawer-open && !root.inspector-open"));
+        assert!(shell.contains("navigation-toggle-button.restore-focus()"));
+        assert!(shell.contains("inspector-toggle-button.restore-focus()"));
     }
 }

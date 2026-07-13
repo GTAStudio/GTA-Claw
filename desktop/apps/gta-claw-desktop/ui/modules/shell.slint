@@ -19,6 +19,42 @@ export enum PaneMode {
     single-pane,
 }
 
+component ShellToolbarButton inherits Rectangle {
+    in property <bool> shown: true;
+    in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <string> glyph;
+    in property <string> accessible-name;
+    callback clicked;
+
+    public function restore-focus() {
+        if (root.shown && root.enabled) {
+            button.focus();
+        }
+    }
+
+    min-width: root.shown ? Metrics.control-medium : 0px;
+    preferred-width: root.shown ? Metrics.control-medium : 0px;
+    max-width: root.shown ? Metrics.control-medium : 0px;
+    min-height: Metrics.control-medium;
+    max-height: Metrics.control-medium;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    clip: true;
+    background: transparent;
+
+    button := ToolbarIconButton {
+        opacity: root.shown ? 1 : 0;
+        glyph: root.glyph;
+        accessible-name: root.accessible-name;
+        enabled: root.shown && root.enabled;
+        checkable: root.checkable;
+        checked: root.checked;
+        clicked => { root.clicked(); }
+    }
+}
+
 component NavigationPane {
     in property <string> status-text;
     in property <string> status-label;
@@ -400,6 +436,18 @@ export component ApplicationShell {
     callback navigation-toggle-requested;
     callback inspector-toggle-requested;
 
+    changed navigation-drawer-open => {
+        if (!root.navigation-drawer-open && root.pane-mode != PaneMode.three-pane) {
+            navigation-toggle-button.restore-focus();
+        }
+    }
+
+    changed inspector-open => {
+        if (!root.inspector-open && root.pane-mode != PaneMode.three-pane) {
+            inspector-toggle-button.restore-focus();
+        }
+    }
+
     min-width: 0px;
     preferred-width: 0px;
     max-width: 100000px;
@@ -431,7 +479,8 @@ export component ApplicationShell {
                 spacing: Metrics.space-3;
                 alignment: center;
 
-                if (root.pane-mode != PaneMode.three-pane) : ToolbarIconButton {
+                navigation-toggle-button := ShellToolbarButton {
+                    shown: root.pane-mode != PaneMode.three-pane;
                     glyph: "M";
                     accessible-name: root.navigation-drawer-open ? "Close navigation" : "Open navigation";
                     checkable: true;
@@ -464,7 +513,8 @@ export component ApplicationShell {
                             clicked => { root.refresh-requested(); }
                         }
 
-                        if (root.pane-mode != PaneMode.three-pane) : ToolbarIconButton {
+                        inspector-toggle-button := ShellToolbarButton {
+                            shown: root.pane-mode != PaneMode.three-pane;
                             glyph: "I";
                             accessible-name: root.inspector-open ? "Close inspector" : "Open inspector";
                             checkable: true;

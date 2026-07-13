@@ -585,6 +585,7 @@ export component ModalSheetShell {
     accessible-label: root.title;
 
     dialog-focus := FocusScope {
+        focus-on-tab-navigation: false;
         init => { close-button.focus(); }
         key-pressed(event) => {
             if (event.text == Key.Escape) {
@@ -592,6 +593,17 @@ export component ModalSheetShell {
                 return accept;
             }
             return reject;
+        }
+
+        before-focus-boundary := FocusScope {
+            width: 0px;
+            height: 0px;
+            focus-on-click: false;
+            focus-gained(reason) => {
+                if (reason == FocusReason.tab-navigation) {
+                    footer-close-button.focus();
+                }
+            }
         }
 
         Rectangle {
@@ -602,34 +614,58 @@ export component ModalSheetShell {
             drop-shadow-color: #00000040;
             drop-shadow-blur: 24px;
             drop-shadow-offset-y: 8px;
+        }
 
-            VerticalLayout {
-                padding: Metrics.space-4;
-                spacing: Metrics.space-4;
+        sheet-pointer-guard := TouchArea {
+            clicked => { }
+        }
 
-                HorizontalLayout {
-                    alignment: center;
+        VerticalLayout {
+            padding: Metrics.space-4;
+            spacing: Metrics.space-4;
 
-                    Text {
-                        text: root.title;
-                        color: DesignTokens.text-primary;
-                        font-size: Metrics.type-title;
-                        font-weight: 750;
-                        vertical-alignment: center;
-                        accessible-role: none;
-                    }
+            HorizontalLayout {
+                alignment: center;
 
-                    Rectangle { horizontal-stretch: 1; }
-
-                    close-button := ToolbarIconButton {
-                        glyph: "X";
-                        accessible-name: root.dismiss-label;
-                        clicked => { root.dismiss-requested(); }
-                    }
+                Text {
+                    text: root.title;
+                    color: DesignTokens.text-primary;
+                    font-size: Metrics.type-title;
+                    font-weight: 750;
+                    vertical-alignment: center;
+                    accessible-role: none;
                 }
 
-                Divider { }
-                @children
+                Rectangle { horizontal-stretch: 1; }
+
+                close-button := ToolbarIconButton {
+                    glyph: "X";
+                    accessible-name: root.dismiss-label;
+                    clicked => { root.dismiss-requested(); }
+                }
+            }
+
+            Divider { }
+            @children
+
+            HorizontalLayout {
+                alignment: end;
+
+                footer-close-button := SecondaryButton {
+                    text: root.dismiss-label;
+                    clicked => { root.dismiss-requested(); }
+                }
+            }
+        }
+
+        after-focus-boundary := FocusScope {
+            width: 0px;
+            height: 0px;
+            focus-on-click: false;
+            focus-gained(reason) => {
+                if (reason == FocusReason.tab-navigation) {
+                    close-button.focus();
+                }
             }
         }
     }
