@@ -36,6 +36,12 @@ build_target() {
   local arch
   local encoded_rustflags
   arch="$(expected_lipo_arch "$target")"
+  assert_output_path "$cargo_target_dir"
+  assert_output_path "$cargo_target_dir/root"
+  assert_output_path "$cargo_target_dir/desktop"
+  if [[ -d "$cargo_target_dir" ]]; then
+    reject_symlinks "$cargo_target_dir"
+  fi
   encoded_rustflags="${CARGO_ENCODED_RUSTFLAGS:-}"
   if [[ -n "$encoded_rustflags" ]]; then
     encoded_rustflags+=$'\x1f'
@@ -45,6 +51,10 @@ build_target() {
   rustup target add "$target"
 
   note "building root headless workspace for $target"
+  assert_output_path "$cargo_target_dir/root"
+  if [[ -d "$cargo_target_dir" ]]; then
+    reject_symlinks "$cargo_target_dir"
+  fi
   MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS_VERSION" \
     CARGO_ENCODED_RUSTFLAGS="$encoded_rustflags" \
     CARGO_TARGET_DIR="$cargo_target_dir/root" \
@@ -57,6 +67,10 @@ build_target() {
       --package gta-claw-daemon
 
   note "building desktop workspace for $target"
+  assert_output_path "$cargo_target_dir/desktop"
+  if [[ -d "$cargo_target_dir" ]]; then
+    reject_symlinks "$cargo_target_dir"
+  fi
   MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS_VERSION" \
     CARGO_ENCODED_RUSTFLAGS="$encoded_rustflags" \
     CARGO_TARGET_DIR="$cargo_target_dir/desktop" \

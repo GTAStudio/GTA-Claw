@@ -27,7 +27,7 @@ for destination in "$release_root" "$stage" "$archive"; do
   assert_output_path "$destination"
 done
 safe_reset_dir "$release_root"
-mkdir -p "$stage"
+ensure_output_directory "$stage"
 assert_output_path "$stage/$APP_NAME.app"
 ditto "$app" "$stage/$APP_NAME.app"
 reject_symlinks "$stage"
@@ -43,6 +43,7 @@ plutil -lint "$metadata" >/dev/null
 
 write_sha256_manifest "$stage" "$stage/SHA256SUMS"
 find "$stage" -exec touch -t "$NORMALIZED_MTIME" {} +
+assert_output_file_slot "$archive"
 (
   cd "$(dirname "$stage")"
   COPYFILE_DISABLE=1 tar \

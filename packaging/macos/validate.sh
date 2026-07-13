@@ -62,8 +62,12 @@ if macho_dependencies "$binary" | grep -Ei '(^|/)libnode|javascriptcore' >/dev/n
 fi
 
 codesign --verify --deep --strict --verbose=2 "$app"
-actual_entitlements="$(mktemp "$OUTPUT_ROOT/actual-entitlements.XXXXXX")"
-expected_entitlements="$(mktemp "$OUTPUT_ROOT/expected-entitlements.XXXXXX")"
+actual_entitlements_template="$OUTPUT_ROOT/actual-entitlements.XXXXXX"
+expected_entitlements_template="$OUTPUT_ROOT/expected-entitlements.XXXXXX"
+assert_output_path "$actual_entitlements_template"
+assert_output_path "$expected_entitlements_template"
+actual_entitlements="$(mktemp "$actual_entitlements_template")"
+expected_entitlements="$(mktemp "$expected_entitlements_template")"
 trap 'rm -f -- "$actual_entitlements" "$expected_entitlements"' EXIT
 codesign -d --entitlements - --xml "$app" >"$actual_entitlements" 2>/dev/null
 plutil -convert xml1 "$actual_entitlements"
@@ -88,7 +92,8 @@ else
 fi
 
 manifest="$OUTPUT_ROOT/manifests/$(basename "$app" .app)-${expected_arches// /_}.sha256"
-mkdir -p "$(dirname "$manifest")"
+assert_output_path "$manifest"
+ensure_output_directory "$(dirname "$manifest")"
 write_sha256_manifest "$app" "$manifest"
 verify_sha256_manifest "$app" "$manifest" >/dev/null
 note "validated $app"

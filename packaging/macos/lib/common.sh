@@ -207,6 +207,41 @@ assert_output_path() {
   fi
 }
 
+assert_output_file_slot() {
+  local path="$1"
+  assert_output_path "$path"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] ||
+      die "output file path collides with a non-regular object: $path"
+  fi
+}
+
+ensure_output_directory() {
+  local path="$1"
+  assert_output_path "$path"
+  [[ ! -e "$path" || -d "$path" ]] ||
+    die "output directory path collides with a non-directory object: $path"
+  mkdir -p "$path"
+  assert_output_path "$path"
+  [[ -d "$path" && ! -L "$path" ]] || die "failed to create a real output directory: $path"
+}
+
+remove_output_file() {
+  local path="$1"
+  assert_output_file_slot "$path"
+  rm -f -- "$path"
+  assert_output_path "$path"
+  [[ ! -e "$path" && ! -L "$path" ]] || die "failed to remove output file: $path"
+}
+
+output_file_identity() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    stat -f '%d:%i' "$1"
+  else
+    stat -c '%d:%i' "$1"
+  fi
+}
+
 safe_reset_dir() {
   local path="$1"
   local target
@@ -217,8 +252,9 @@ safe_reset_dir() {
   assert_nearest_existing_parent "$target" "$path"
   [[ ! -L "$path" ]] || die "refusing to delete a symlink: $path"
   rm -rf -- "$path"
-  mkdir -p "$path"
+  # Shell path APIs cannot hold the validated parent open; callers must exclusively own OUTPUT_ROOT.
   assert_output_path "$path"
+  ensure_output_directory "$path"
 }
 
 reject_symlinks() {
@@ -239,25 +275,46 @@ write_sha256_manifest() {
   local temporary="$output.tmp"
   local output_relative=""
   local temporary_relative=""
+  local restore_noclobber=0
+  local reserved_identity
   if [[ "$root" == "$OUTPUT_ROOT/"* ]]; then
     assert_output_path "$root"
   fi
-  if [[ "$output" == "$OUTPUT_ROOT/"* ]]; then
-    assert_output_path "$output"
-  fi
+  assert_output_file_slot "$output"
+  assert_output_path "$temporary"
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] ||
+    die "temporary manifest path already exists: $temporary"
   if [[ "$output" == "$root/"* ]]; then
     output_relative="./${output#"$root/"}"
     temporary_relative="$output_relative.tmp"
   fi
-  : >"$temporary"
+  case "$-" in
+    *C*) ;;
+    *)
+      set -o noclobber
+      restore_noclobber=1
+      ;;
+  esac
+  if ! exec 9>"$temporary"; then
+    [[ "$restore_noclobber" -eq 0 ]] || set +o noclobber
+    die "failed to reserve temporary manifest: $temporary"
+  fi
+  [[ "$restore_noclobber" -eq 0 ]] || set +o noclobber
+  reserved_identity="$(output_file_identity "$temporary")"
   while IFS= read -r relative; do
     [[ "$relative" != "$output_relative" && "$relative" != "$temporary_relative" ]] || continue
-    printf '%s  %s\n' "$(sha256_file "$root/$relative")" "$relative" >>"$temporary"
+    printf '%s  %s\n' "$(sha256_file "$root/$relative")" "$relative" >&9
   done < <(cd "$root" && find . -type f -print | LC_ALL=C sort)
-  if [[ "$output" == "$OUTPUT_ROOT/"* ]]; then
-    assert_output_path "$output"
-  fi
+  assert_output_file_slot "$output"
+  assert_output_file_slot "$temporary"
+  [[ "$(output_file_identity "$temporary")" == "$reserved_identity" ]] ||
+    die "temporary manifest changed before publication: $temporary"
+  # The exclusive OUTPUT_ROOT contract closes the remaining validation-to-rename shell race.
   mv "$temporary" "$output"
+  assert_output_file_slot "$output"
+  [[ "$(output_file_identity "$output")" == "$reserved_identity" ]] ||
+    die "published manifest is not the reserved file: $output"
+  exec 9>&-
 }
 
 verify_sha256_manifest() {

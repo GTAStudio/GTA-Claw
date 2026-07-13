@@ -17,22 +17,24 @@ expected_arches="${3//,/ }"
 validate_safe_component "$arch_label" ARCH_LABEL
 app_parent="$OUTPUT_ROOT/apps/$arch_label"
 app="$app_parent/$APP_NAME.app"
+macos_dir="$app/Contents/MacOS"
 executable="$app/Contents/MacOS/$EXECUTABLE_NAME"
 resources="$app/Contents/Resources"
-assert_output_path "$app_parent"
-assert_output_path "$app"
-assert_output_path "$executable"
-assert_output_path "$resources"
-safe_reset_dir "$app_parent"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-assert_output_path "$executable"
-assert_output_path "$resources"
-
-install -m 0755 "$binary" "$executable"
-install -m 0644 "$MACOS_DIR/Info.plist.in" "$app/Contents/Info.plist"
-"$MACOS_DIR/generate-icon.sh" "$app/Contents/Resources/GTAClaw.icns"
-
 plist="$app/Contents/Info.plist"
+icon="$resources/GTAClaw.icns"
+for destination in "$app_parent" "$app" "$macos_dir" "$executable" "$resources" "$plist" "$icon"; do
+  assert_output_path "$destination"
+done
+safe_reset_dir "$app_parent"
+ensure_output_directory "$macos_dir"
+ensure_output_directory "$resources"
+assert_output_path "$executable"
+install -m 0755 "$binary" "$executable"
+assert_output_path "$plist"
+install -m 0644 "$MACOS_DIR/Info.plist.in" "$plist"
+assert_output_path "$icon"
+"$MACOS_DIR/generate-icon.sh" "$icon"
+
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXECUTABLE_NAME" "$plist"
@@ -47,7 +49,7 @@ plutil -lint "$plist" >/dev/null
 
 find "$app" -type d -exec chmod 0755 {} +
 find "$app" -type f ! -path '*/Contents/MacOS/*' -exec chmod 0644 {} +
-touch -t "$NORMALIZED_MTIME" "$plist" "$app/Contents/Resources/GTAClaw.icns"
+touch -t "$NORMALIZED_MTIME" "$plist" "$icon"
 
 "$MACOS_DIR/sign.sh" adhoc "$app"
 "$MACOS_DIR/validate.sh" "$app" "$expected_arches" adhoc

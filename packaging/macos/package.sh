@@ -59,6 +59,7 @@ write_sha256_manifest "$dmg_stage" "$distribution/dmg-content.sha256"
 verify_sha256_manifest "$dmg_stage" "$distribution/dmg-content.sha256" >/dev/null
 
 dmg="$distribution/gta-claw-$VERSION-macos.dmg"
+assert_output_file_slot "$dmg"
 hdiutil create \
   -srcfolder "$dmg_stage" \
   -volname "$APP_NAME $VERSION" \
@@ -69,10 +70,11 @@ hdiutil create \
 hdiutil verify "$dmg" >/dev/null
 
 component_pkg="$package_work/gta-claw-component.pkg"
-mkdir -p "$package_root/Applications"
+ensure_output_directory "$package_root/Applications"
 assert_output_path "$package_app"
 ditto "$app" "$package_app"
 reject_symlinks "$package_root"
+assert_output_file_slot "$component_pkg"
 pkgbuild \
   --root "$package_root" \
   --install-location / \
@@ -82,6 +84,7 @@ pkgbuild \
   "$component_pkg"
 
 pkg="$distribution/gta-claw-$VERSION-macos.pkg"
+assert_output_file_slot "$pkg"
 if [[ "$mode" == "release" ]]; then
   product_args=(--package "$component_pkg" --sign "$DEVELOPER_ID_INSTALLER")
   if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
