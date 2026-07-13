@@ -159,10 +159,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-sqlite-file-control"
+version = "0.1.0"
+dependencies = [
+ "libsqlite3-sys",
+ "sqlx",
+]
+
+[[package]]
 name = "claw-state"
 version = "0.1.0"
 dependencies = [
  "claw-domain",
+ "claw-sqlite-file-control",
  "rustix",
  "same-file",
  "sha2 0.11.0",

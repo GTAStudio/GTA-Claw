@@ -110,6 +110,53 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    fn set_unix_lock_identity(database: &Path, lock_path: &Path) {
+        use std::os::unix::fs::MetadataExt as _;
+        use xattr::FileExt as _;
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(database)
+            .expect("open database for lock identity");
+        let metadata = file.metadata().expect("read database identity");
+        let encoded = format!(
+            "v1\n{}\n{}\n{}",
+            metadata.dev(),
+            metadata.ino(),
+            lock_path.display()
+        );
+        file.set_xattr("user.gta-claw.writer-lock-path", encoded.as_bytes())
+            .expect("set database lock identity");
+    }
+
+    #[cfg(unix)]
+    fn unix_lock_path(database: &Path) -> PathBuf {
+        use xattr::FileExt as _;
+
+        let file = fs::File::open(database).expect("open database lock identity");
+        let value = file
+            .get_xattr("user.gta-claw.writer-lock-path")
+            .expect("read database lock identity")
+            .expect("database lock identity exists");
+        let value = String::from_utf8(value).expect("lock identity is UTF-8");
+        PathBuf::from(
+            value
+                .splitn(4, '\n')
+                .nth(3)
+                .expect("lock identity contains path"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn unix_lock_file_name(database: &Path, token: &str) -> String {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(database).expect("read database identity");
+        format!("dev-{}-ino-{}-{token}.lock", metadata.dev(), metadata.ino())
+    }
+
     async fn assert_restore_rejected(source: &Path, destination: &Path) {
         let error = StateStore::restore_backup(source, destination)
             .await
@@ -193,6 +240,37 @@ mod tests {
             SessionId::new(id).expect("test session id is valid"),
             timestamp(created_at),
         )
+    }
+
+    #[cfg(unix)]
+    fn assert_child_open_rejected(database: &Path, ready: &Path, home: &Path) {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("tests::child_process_writer")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("HOME", home)
+            .env("CLAW_STATE_CHILD_DATABASE", database)
+            .env("CLAW_STATE_CHILD_READY", ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn rejected-open child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("inspect rejected-open child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop blocked rejected-open child");
+                child.wait().expect("reap blocked rejected-open child");
+                panic!("rejected child open did not finish within five seconds");
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(!status.success());
+        assert!(!ready.exists());
     }
 
     fn device(id: &str, created_at: i64) -> DeviceRecord {
@@ -1792,6 +1870,281 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn private_lock_artifact_attacks_fail_closed() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let symlink_db = database_path(&directory, "symlink-root.sqlite");
+        fs::File::create(&symlink_db).expect("create symlink-root database");
+        let real_root = directory.path().join("real-lock-root");
+        fs::create_dir(&real_root).expect("create real lock root");
+        fs::set_permissions(&real_root, fs::Permissions::from_mode(0o700))
+            .expect("secure real lock root");
+        let linked_root = directory.path().join("linked-lock-root");
+        symlink(&real_root, &linked_root).expect("create lock-root symlink");
+        set_unix_lock_identity(
+            &symlink_db,
+            &linked_root.join(unix_lock_file_name(&symlink_db, "test")),
+        );
+        let error = StateStore::open(StoreConfig::new(&symlink_db))
+            .await
+            .err()
+            .expect("symlink lock root is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+
+        let permissive_db = database_path(&directory, "permissive-root.sqlite");
+        fs::File::create(&permissive_db).expect("create permissive-root database");
+        let permissive_root = directory.path().join("permissive-lock-root");
+        fs::create_dir(&permissive_root).expect("create permissive lock root");
+        fs::set_permissions(&permissive_root, fs::Permissions::from_mode(0o755))
+            .expect("make lock root permissive");
+        set_unix_lock_identity(
+            &permissive_db,
+            &permissive_root.join(unix_lock_file_name(&permissive_db, "test")),
+        );
+        let error = StateStore::open(StoreConfig::new(&permissive_db))
+            .await
+            .err()
+            .expect("permissive lock root is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+
+        let hardlink_db = database_path(&directory, "hardlink-lock.sqlite");
+        fs::File::create(&hardlink_db).expect("create hardlink-lock database");
+        let metadata = fs::metadata(&hardlink_db).expect("read hardlink DB identity");
+        use std::os::unix::fs::MetadataExt as _;
+        let hardlink_root = directory.path().join("hardlink-lock-root");
+        fs::create_dir(&hardlink_root).expect("create hardlink lock root");
+        fs::set_permissions(&hardlink_root, fs::Permissions::from_mode(0o700))
+            .expect("secure hardlink lock root");
+        let lock_path = hardlink_root.join(format!(
+            "dev-{}-ino-{}-test.lock",
+            metadata.dev(),
+            metadata.ino()
+        ));
+        fs::write(&lock_path, b"placeholder").expect("create lock file");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .expect("secure lock file");
+        fs::hard_link(&lock_path, hardlink_root.join("second-link")).expect("hardlink lock file");
+        set_unix_lock_identity(&hardlink_db, &lock_path);
+        let error = StateStore::open(StoreConfig::new(&hardlink_db))
+            .await
+            .err()
+            .expect("hardlinked lock file is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+
+        let stale_db = database_path(&directory, "stale-lock-entry.sqlite");
+        fs::File::create(&stale_db).expect("create stale-lock database");
+        let stale_root = directory.path().join("stale-lock-root");
+        fs::create_dir(&stale_root).expect("create stale lock root");
+        fs::set_permissions(&stale_root, fs::Permissions::from_mode(0o700))
+            .expect("secure stale lock root");
+        let stale_lock = stale_root.join(unix_lock_file_name(&stale_db, "test"));
+        fs::write(&stale_lock, b"wrong identity").expect("create stale lock entry");
+        fs::set_permissions(&stale_lock, fs::Permissions::from_mode(0o600))
+            .expect("secure stale lock entry");
+        set_unix_lock_identity(&stale_db, &stale_lock);
+        let error = StateStore::open(StoreConfig::new(&stale_db))
+            .await
+            .err()
+            .expect("stale lock contents are rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_private_lock_namespace_attacks_are_rejected_in_child_processes() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let symlink_home = directory.path().join("symlink-home");
+        let symlink_target = directory.path().join("symlink-state-target");
+        fs::create_dir(&symlink_home).expect("create symlink test home");
+        fs::create_dir(&symlink_target).expect("create symlink state target");
+        symlink(&symlink_target, symlink_home.join(".gta-claw"))
+            .expect("replace private state directory with symlink");
+        let symlink_db = database_path(&directory, "canonical-symlink.sqlite");
+        fs::File::create(&symlink_db).expect("create canonical symlink DB");
+        assert_child_open_rejected(
+            &symlink_db,
+            &database_path(&directory, "canonical-symlink.ready"),
+            &symlink_home,
+        );
+
+        let permissive_home = directory.path().join("permissive-home");
+        let permissive_state = permissive_home.join(".gta-claw");
+        fs::create_dir(&permissive_home).expect("create permissive test home");
+        fs::create_dir(&permissive_state).expect("create permissive state directory");
+        fs::set_permissions(&permissive_state, fs::Permissions::from_mode(0o755))
+            .expect("make state directory permissive");
+        let permissive_db = database_path(&directory, "canonical-permissive.sqlite");
+        fs::File::create(&permissive_db).expect("create canonical permissive DB");
+        assert_child_open_rejected(
+            &permissive_db,
+            &database_path(&directory, "canonical-permissive.ready"),
+            &permissive_home,
+        );
+
+        for (name, hardlink) in [("hardlink", true), ("stale", false)] {
+            let home = directory.path().join(format!("{name}-home"));
+            let state = home.join(".gta-claw");
+            let locks = state.join("locks");
+            fs::create_dir(&home).expect("create artifact test home");
+            fs::create_dir(&state).expect("create artifact state directory");
+            fs::create_dir(&locks).expect("create artifact lock directory");
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+                .expect("secure artifact state directory");
+            fs::set_permissions(&locks, fs::Permissions::from_mode(0o700))
+                .expect("secure artifact lock directory");
+            let database = database_path(&directory, &format!("canonical-{name}.sqlite"));
+            fs::File::create(&database).expect("create artifact database");
+            let metadata = fs::metadata(&database).expect("read artifact DB identity");
+            let lock_path = locks.join(format!(
+                "dev-{}-ino-{}-test.lock",
+                metadata.dev(),
+                metadata.ino()
+            ));
+            fs::write(&lock_path, b"stale identity").expect("create artifact lock file");
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .expect("secure artifact lock file");
+            if hardlink {
+                fs::hard_link(&lock_path, locks.join("second-link"))
+                    .expect("hardlink canonical lock file");
+            }
+            set_unix_lock_identity(&database, &lock_path);
+            assert_child_open_rejected(
+                &database,
+                &database_path(&directory, &format!("canonical-{name}.ready")),
+                &home,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_lock_file_replacement_forces_fail_closed_shutdown() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "lock-replacement.sqlite");
+        let store = open(&path).await;
+        let lock_path = unix_lock_path(&path);
+        fs::remove_file(&lock_path).expect("unlink live lock path");
+        fs::write(&lock_path, b"replacement").expect("replace live lock file");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .expect("secure replacement lock");
+
+        let error = store
+            .health()
+            .await
+            .expect_err("cached checkout fails closed");
+        assert!(matches!(error, StateError::Database(_)));
+        let close_error = tokio::time::timeout(Duration::from_secs(2), store.close())
+            .await
+            .expect("replacement-degraded close remains bounded")
+            .expect_err("replacement prevents clean close");
+        assert!(matches!(
+            close_error,
+            StateError::CloseDegraded {
+                checkpoint_completed: false,
+                application_lock_released: false,
+                os_lock_released: true,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_xattr_replacement_forces_fail_closed_shutdown() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "xattr-replacement.sqlite");
+        let store = open(&path).await;
+        let original_lock = unix_lock_path(&path);
+        let metadata = fs::metadata(&path).expect("read database identity");
+        let replacement_lock = original_lock
+            .parent()
+            .expect("lock has parent")
+            .join(format!(
+                "dev-{}-ino-{}-replacement.lock",
+                metadata.dev(),
+                metadata.ino()
+            ));
+        let replacement_identity = format!(
+            "v1\n{}\n{}\n{}",
+            metadata.dev(),
+            metadata.ino(),
+            replacement_lock.display()
+        );
+        fs::write(&replacement_lock, replacement_identity.as_bytes())
+            .expect("create replacement identity lock");
+        fs::set_permissions(&replacement_lock, fs::Permissions::from_mode(0o600))
+            .expect("secure replacement identity lock");
+        let database_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open database for xattr replacement");
+        database_file
+            .set_xattr(
+                "user.gta-claw.writer-lock-path",
+                replacement_identity.as_bytes(),
+            )
+            .expect("replace database lock xattr");
+
+        let error = store
+            .health()
+            .await
+            .expect_err("cached checkout detects xattr replacement");
+        assert!(matches!(error, StateError::Database(_)));
+        let close_error = tokio::time::timeout(Duration::from_secs(2), store.close())
+            .await
+            .expect("xattr-degraded close remains bounded")
+            .expect_err("xattr replacement prevents clean close");
+        assert!(matches!(
+            close_error,
+            StateError::CloseDegraded {
+                checkpoint_completed: false,
+                application_lock_released: false,
+                os_lock_released: true,
+                ..
+            }
+        ));
+
+        let recovered = open(&path).await;
+        assert!(recovered.recovered_writer().is_some());
+        recovered.close().await.expect("replacement owner closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_database_missing_lock_identity_fails_closed() {
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "missing-lock-identity.sqlite");
+        open(&path).await.close().await.expect("seed store closes");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open seeded database");
+        file.remove_xattr("user.gta-claw.writer-lock-path")
+            .expect("remove database lock identity");
+
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("existing database does not recreate missing identity");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn identity_lock_survives_hardlink_and_original_unlink() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "identity-source.sqlite");
@@ -1868,6 +2221,37 @@ mod tests {
         );
         drop(first);
         replacement.close().await.expect("replacement store closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_handle_detects_path_swap_and_swap_back() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "sqlite-handle.sqlite");
+        let detached = database_path(&directory, "sqlite-handle-detached.sqlite");
+        let replacement_path = database_path(&directory, "sqlite-handle-replacement.sqlite");
+        open(&path)
+            .await
+            .close()
+            .await
+            .expect("seed locked database closes");
+        open(&replacement_path)
+            .await
+            .close()
+            .await
+            .expect("seed replacement database closes");
+        let options = SqliteConnectOptions::new().filename(&path);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open direct SQLite handle");
+
+        fs::rename(&path, &detached).expect("detach opened SQLite file");
+        fs::rename(&replacement_path, &path).expect("replace original pathname");
+        assert!(
+            !test_support::sqlite_identity_is_valid(&mut connection).await,
+            "SQLite VFS must report the opened file was moved"
+        );
+        connection.close().await.expect("direct handle closes");
     }
 
     #[cfg(windows)]

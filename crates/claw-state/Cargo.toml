@@ -13,6 +13,7 @@ sha2.workspace = true
 sqlx.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+claw-sqlite-file-control.workspace = true
 rustix.workspace = true
 xattr.workspace = true
 
