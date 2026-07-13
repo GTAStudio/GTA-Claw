@@ -134,7 +134,7 @@ $cases = @(
         }
     },
     [ordered]@{
-        name = "source-evidence"
+        name = "evidence-source-path-tamper"
         expected_message = "canonical identity/source"
         mutate = {
             param($caseRoot)
@@ -145,7 +145,7 @@ $cases = @(
         }
     },
     [ordered]@{
-        name = "source-evidence-comma-boundary"
+        name = "evidence-path-boundary-regrouping"
         expected_message = "canonical feature/source evidence fingerprint mismatch"
         mutate = {
             param($caseRoot)
@@ -158,13 +158,13 @@ $cases = @(
         }
     },
     [ordered]@{
-        name = "source-evidence-official-url"
+        name = "evidence-valid-url-tamper"
         expected_message = "canonical feature/source evidence fingerprint mismatch"
         mutate = {
             param($caseRoot)
             $ledger = Get-FirstLedger $caseRoot
             $ledger.features[0].upstream_source |
-                Add-Member -NotePropertyName "official_url" -NotePropertyValue "https://example.com/fabricated"
+                Add-Member -NotePropertyName "official_url" -NotePropertyValue "https://example.invalid/fabricated"
             Save-FirstLedger $caseRoot $ledger
         }
     },
