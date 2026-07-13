@@ -83,6 +83,7 @@ pub struct StoreConfig {
     max_connections: u32,
     busy_timeout: Duration,
     acquire_timeout: Duration,
+    close_timeout: Duration,
     synchronous: SynchronousPolicy,
 }
 
@@ -95,6 +96,7 @@ impl StoreConfig {
             max_connections: 1,
             busy_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
+            close_timeout: Duration::from_millis(500),
             synchronous: SynchronousPolicy::Full,
         }
     }
@@ -117,6 +119,13 @@ impl StoreConfig {
     #[must_use]
     pub const fn with_acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
         self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Sets the maximum graceful pool-drain wait during close.
+    #[must_use]
+    pub const fn with_close_timeout(mut self, close_timeout: Duration) -> Self {
+        self.close_timeout = close_timeout;
         self
     }
 
@@ -210,6 +219,7 @@ pub struct StateStore {
     _process_identity: ProcessIdentityGuard,
     _database_file: File,
     max_connections: u32,
+    close_timeout: Duration,
 }
 
 #[cfg(unix)]
@@ -368,6 +378,7 @@ impl StateStore {
             _process_identity: process_identity,
             _database_file: database_file,
             max_connections: config.max_connections,
+            close_timeout: config.close_timeout,
         })
     }
 
@@ -571,7 +582,15 @@ impl StateStore {
         } else {
             false
         };
-        self.pool.close().await;
+        let pool_closed = tokio::time::timeout(self.close_timeout, self.pool.close())
+            .await
+            .is_ok();
+        if !pool_closed {
+            reasons.push(format!(
+                "pool drain exceeded {} ms after closing new checkouts",
+                self.close_timeout.as_millis()
+            ));
+        }
         let os_lock_released = match File::unlock(&self.lock_file) {
             Ok(()) => true,
             Err(error) => {
@@ -582,9 +601,14 @@ impl StateStore {
                 false
             }
         };
-        match (checkpoint, application_lock_released, os_lock_released) {
-            (Some(report), true, true) => Ok(report),
-            (checkpoint, application_lock_released, os_lock_released) => {
+        match (
+            checkpoint,
+            application_lock_released,
+            os_lock_released,
+            pool_closed,
+        ) {
+            (Some(report), true, true, true) => Ok(report),
+            (checkpoint, application_lock_released, os_lock_released, _) => {
                 Err(StateError::CloseDegraded {
                     checkpoint_completed: checkpoint.is_some(),
                     application_lock_released,
@@ -647,6 +671,12 @@ fn validate_config(config: &StoreConfig) -> Result<(), StateError> {
     if config.acquire_timeout.is_zero() {
         return Err(StateError::InvalidValue {
             field: "connection acquire timeout",
+            reason: "must be greater than zero",
+        });
+    }
+    if config.close_timeout.is_zero() {
+        return Err(StateError::InvalidValue {
+            field: "close timeout",
             reason: "must be greater than zero",
         });
     }
