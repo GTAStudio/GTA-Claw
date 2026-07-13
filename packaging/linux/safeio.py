@@ -217,6 +217,9 @@ def command_run_create(arguments: list[str]) -> int:
             {"SAFEIO_TARGET_FD": target_fd, "SAFEIO_OUTPUT_FD": output_fd},
             {
                 "SAFEIO_OUTPUT_COMPONENT": component,
+                "SAFEIO_OUTPUT_REALPATH": os.path.abspath(
+                    os.path.join("target", component)
+                ),
                 "OUTPUT_ROOT": f"/proc/self/fd/{output_fd}",
             },
         )
@@ -259,6 +262,9 @@ def command_run_package(arguments: list[str]) -> int:
                 "BUILD_MANIFEST": f"/proc/self/fd/{build_fd}/build-manifest.json",
                 "SAFEIO_BUILD_COMPONENT": build_component,
                 "SAFEIO_OUTPUT_COMPONENT": output_component,
+                "SAFEIO_OUTPUT_REALPATH": os.path.abspath(
+                    os.path.join("target", output_component)
+                ),
                 "OUTPUT_ROOT": f"/proc/self/fd/{output_fd}",
             },
         )

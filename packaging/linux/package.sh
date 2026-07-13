@@ -480,7 +480,8 @@ chmod 0640 "$deb_root/etc/gta-claw/gta-claw.env"
 chmod 0600 "$deb_root/etc/gta-claw/credentials/daemon.conf"
 deb_artifact="$ARTIFACT_DIR/${LINUX_PACKAGE_NAME}_${VERSION}-${LINUX_PACKAGE_RELEASE}_${deb_architecture}.deb"
 deb_temporary="$deb_artifact.tmp"
-open_output_file "$deb_temporary" 0644
+assert_new_output_file "$deb_temporary"
+deb_temporary_real="$SAFEIO_OUTPUT_REALPATH/${deb_temporary#"$OUTPUT_ROOT/"}"
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
   dpkg-deb \
     --root-owner-group \
@@ -488,9 +489,9 @@ SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     -z9 \
     --build \
     "$deb_root" \
-    "/proc/$BASHPID/fd/$OPEN_OUTPUT_FD"
-finish_output_file
+    "$deb_temporary_real"
 assert_regular_unaliased "$deb_temporary" "Debian package temporary"
+chmod 0644 "$deb_temporary"
 touch --date="@$SOURCE_DATE_EPOCH" "$deb_temporary"
 publish_output_file "$deb_temporary" "$deb_artifact"
 
