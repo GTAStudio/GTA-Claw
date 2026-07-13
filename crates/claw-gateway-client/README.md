@@ -29,7 +29,7 @@ strict codec decision, and `claw-security` for device identity and signing.
 - Credentials are secrecy wrappers and never appear in client `Debug`, errors,
   state, events, or tracing.
 
-The local suite has 27 active client checks: 23 real in-process WebSocket
+The local suite has 28 active client checks: 24 real in-process WebSocket
 scenarios, three configuration/redaction regressions, and deterministic
 injected clock/jitter coverage. One ignored live contract test is run only by
 the isolated upstream workflow.

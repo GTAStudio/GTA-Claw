@@ -168,6 +168,58 @@ async fn authenticates_correlates_concurrent_requests_handles_fragments_and_shut
 }
 
 #[tokio::test]
+async fn accepts_closed_effective_scopes_reported_by_server_hello() {
+    let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+        send_challenge(&mut socket).await;
+        let (request, params) = receive_connect(&mut socket).await;
+        support::verify_connect_proof(&params);
+        send_json(
+            &mut socket,
+            json!({
+                "type": "res",
+                "id": request.id().as_str(),
+                "ok": true,
+                "payload": {
+                    "type": "hello-ok",
+                    "protocol": 4,
+                    "server": {"version": "test-gateway", "connId": "effective-scopes"},
+                    "features": {"methods": ["health"], "events": ["tick"]},
+                    "snapshot": {
+                        "presence": [],
+                        "health": {},
+                        "stateVersion": {"presence": 0, "health": 0},
+                        "uptimeMs": 1
+                    },
+                    "auth": {
+                        "role": "operator",
+                        "scopes": ["operator.admin", "operator.read"]
+                    },
+                    "policy": {
+                        "maxPayload": AUTHENTICATED_MAX_FRAME_BYTES,
+                        "maxBufferedBytes": AUTHENTICATED_MAX_FRAME_BYTES,
+                        "tickIntervalMs": 1000
+                    }
+                }
+            }),
+        )
+        .await;
+        wait_for_close(&mut socket).await;
+    }))
+    .await;
+    let (client, _) = GatewayClient::start(config(gateway.url.clone())).expect("start");
+    let info = client
+        .wait_ready()
+        .await
+        .expect("effective scopes accepted");
+    assert_eq!(
+        info.scopes.as_ref(),
+        ["operator.admin".to_owned(), "operator.read".to_owned()]
+    );
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+}
+
+#[tokio::test]
 async fn admits_only_the_p02a_v3_node_and_probe_windows() {
     async fn connect_legacy(mut config: GatewayClientConfig) {
         let gateway = TestGateway::spawn(handler(|mut socket, _| async move {

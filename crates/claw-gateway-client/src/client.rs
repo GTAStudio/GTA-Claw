@@ -9,8 +9,8 @@ use claw_protocol::gateway::{
     ConnectErrorDetailCode, ConnectParams, ConnectRecoveryNextStep, CoreErrorCode, DeviceProof,
     DevicePublicKey as WirePublicKey, DeviceSignature as WireSignature, EventSequenceError,
     EventSequenceTracker, Frame, GATEWAY_PROTOCOL_VERSION, GatewayMethodName, Name,
-    NonNegativeInteger, OpaqueJson, PREAUTH_MAX_FRAME_BYTES, RequestId, ResponseFrame,
-    resolve_core_method,
+    NonNegativeInteger, OpaqueJson, OperatorScope, PREAUTH_MAX_FRAME_BYTES, RequestId,
+    ResponseFrame, resolve_core_method,
 };
 use claw_security::identity::GatewayDeviceSigningInput;
 use secrecy::{ExposeSecret, SecretString};
@@ -534,23 +534,20 @@ async fn authenticate(
             },
         ));
     }
-    let expected_role = config.role.as_str();
-    let expected_scopes = config
-        .scopes
-        .iter()
-        .map(|scope| scope.as_str())
-        .collect::<Vec<_>>();
-    if hello.auth.role.as_str() != expected_role
-        || hello
-            .auth
-            .scopes
-            .iter()
-            .map(Name::as_str)
-            .ne(expected_scopes.iter().copied())
-    {
+    if hello.auth.role.as_str() != config.role.as_str() {
         return Err(GatewayClientError::Protocol(
             ProtocolFailure::HelloAuthenticationMismatch,
         ));
+    }
+    let mut effective_scope_identities = HashSet::new();
+    for scope in &hello.auth.scopes {
+        if OperatorScope::from_identity(scope.as_str()).is_none()
+            || !effective_scope_identities.insert(scope.as_str())
+        {
+            return Err(GatewayClientError::Protocol(
+                ProtocolFailure::HelloAuthenticationMismatch,
+            ));
+        }
     }
     let server_max = usize::try_from(hello.policy.max_payload.get()).unwrap_or(usize::MAX);
     let max_payload_bytes = server_max.min(AUTHENTICATED_MAX_FRAME_BYTES);
