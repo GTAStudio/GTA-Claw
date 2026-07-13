@@ -4552,9 +4552,9 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::verify_sqlite_connection_identity;
     use super::{
-        FAIL_AFTER_PUBLICATION, StateStore, database, inspection_temporary_path,
-        materialize_sqlite_snapshot, migration_checksum, open_existing_file_no_follow,
-        remove_snapshot_artifacts,
+        FAIL_AFTER_PUBLICATION, PinnedSnapshot, StateStore, create_trusted_backup_seal, database,
+        inspection_temporary_path, materialize_sqlite_snapshot, migration_checksum,
+        open_existing_file_no_follow, remove_snapshot_artifacts,
     };
     use crate::StateError;
 
@@ -4582,6 +4582,70 @@ pub(crate) mod test_support {
         *FAIL_AFTER_PUBLICATION
             .lock()
             .expect("publication failpoint lock poisoned") = Some(destination);
+    }
+
+    pub(crate) fn reseal_backup_fixture(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve backup fixture path");
+        #[cfg(unix)]
+        {
+            use xattr::FileExt as _;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open Unix backup fixture for resealing");
+            if file
+                .get_xattr(super::UNIX_BACKUP_SEAL_XATTR)
+                .expect("inspect prior Unix backup seal index")
+                .is_some()
+            {
+                file.remove_xattr(super::UNIX_BACKUP_SEAL_XATTR)
+                    .expect("remove prior Unix backup seal index");
+            }
+        }
+        #[cfg(windows)]
+        {
+            let seal_path = super::windows_backup_seal_path(&path);
+            match std::fs::remove_file(&seal_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove prior Windows backup seal: {error}"),
+            }
+        }
+        let snapshot = PinnedSnapshot::open(&path).expect("pin backup fixture for resealing");
+        create_trusted_backup_seal(&snapshot).expect("create trusted backup fixture seal");
+    }
+
+    pub(crate) fn remove_backup_fixture_seal(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve sealed fixture path");
+        #[cfg(unix)]
+        {
+            use xattr::FileExt as _;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open Unix backup fixture for seal cleanup");
+            let seal_id = file
+                .get_xattr(super::UNIX_BACKUP_SEAL_XATTR)
+                .expect("read Unix backup fixture seal")
+                .expect("Unix backup fixture seal exists");
+            file.remove_xattr(super::UNIX_BACKUP_SEAL_XATTR)
+                .expect("remove Unix backup fixture seal index");
+            let seal_id =
+                std::str::from_utf8(&seal_id).expect("Unix backup fixture seal id is UTF-8");
+            let seal_path = super::default_private_lock_root()
+                .expect("resolve private seal root")
+                .join(format!("backup-seal-{seal_id}.record"));
+            std::fs::remove_file(&seal_path).expect("remove Unix backup fixture seal record");
+            super::sync_parent_directory(&seal_path)
+                .expect("sync removed Unix backup fixture seal");
+        }
+        #[cfg(windows)]
+        std::fs::remove_file(super::windows_backup_seal_path(&path))
+            .expect("remove Windows backup fixture seal");
     }
 
     pub(crate) fn create_competing_destination_once(destination: &Path) {

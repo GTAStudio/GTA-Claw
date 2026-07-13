@@ -1988,7 +1988,9 @@ mod tests {
             let destination = database_path(&directory, &format!("{name}-restored.sqlite"));
             fs::copy(&base_backup, &variant).expect("copy backup variant");
             execute_direct(&variant, sql).await;
+            test_support::reseal_backup_fixture(&variant);
             assert_restore_rejected(&variant, &destination).await;
+            test_support::remove_backup_fixture_seal(&variant);
         }
         for (name, sql) in schema_drift_cases() {
             let variant = database_path(&directory, &format!("restore-{name}.sqlite"));
@@ -1996,7 +1998,9 @@ mod tests {
                 database_path(&directory, &format!("restore-{name}-destination.sqlite"));
             fs::copy(&base_backup, &variant).expect("copy schema drift backup");
             execute_direct(&variant, sql).await;
+            test_support::reseal_backup_fixture(&variant);
             assert_restore_rejected(&variant, &destination).await;
+            test_support::remove_backup_fixture_seal(&variant);
         }
 
         let corrupt = database_path(&directory, "corrupt.sqlite");
@@ -2009,7 +2013,9 @@ mod tests {
             .expect("open corrupt variant")
             .set_len(length / 2)
             .expect("truncate corrupt variant");
+        test_support::reseal_backup_fixture(&corrupt);
         assert_restore_rejected(&corrupt, &corrupt_destination).await;
+        test_support::remove_backup_fixture_seal(&corrupt);
     }
 
     #[tokio::test]
@@ -2498,7 +2504,13 @@ mod tests {
             .health()
             .await
             .expect_err("cached checkout fails closed");
-        assert!(matches!(error, StateError::Database(_)));
+        assert_eq!(
+            error,
+            StateError::InvalidPath {
+                path: lock_path,
+                reason: "database path changed after its identity was verified",
+            }
+        );
         let close_error = tokio::time::timeout(Duration::from_secs(2), store.close())
             .await
             .expect("replacement-degraded close remains bounded")
@@ -2650,7 +2662,13 @@ mod tests {
             .health()
             .await
             .expect_err("cached checkout detects xattr replacement");
-        assert!(matches!(error, StateError::Database(_)));
+        assert_eq!(
+            error,
+            StateError::InvalidPath {
+                path: path.clone(),
+                reason: "database lock identity changed while open",
+            }
+        );
         let close_error = tokio::time::timeout(Duration::from_secs(2), store.close())
             .await
             .expect("xattr-degraded close remains bounded")
