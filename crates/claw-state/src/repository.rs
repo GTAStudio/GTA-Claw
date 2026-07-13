@@ -1,7 +1,7 @@
 use claw_domain::SessionId;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::error::database;
 use crate::model::{finish_page, invalid_stored, validate_text};
@@ -13,11 +13,11 @@ use crate::{
 };
 
 #[cfg(test)]
-static WRITE_TEST_BARRIER: Mutex<Option<WriteTestBarrier>> = Mutex::new(None);
+static WRITE_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
 struct WriteTestBarrier {
-    owner: String,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -627,11 +627,10 @@ async fn begin_verified_write<'pool>(
 
 #[cfg(test)]
 async fn wait_at_write_test_barrier(owner: &str) {
-    let barrier = WRITE_TEST_BARRIER
+    let barrier = WRITE_TEST_BARRIERS
         .lock()
-        .expect("write test barrier lock poisoned")
-        .as_ref()
-        .filter(|configured| configured.owner == owner)
+        .expect("write test barriers lock poisoned")
+        .get(owner)
         .map(|configured| {
             (
                 Arc::clone(&configured.entered),
@@ -641,10 +640,10 @@ async fn wait_at_write_test_barrier(owner: &str) {
     if let Some((entered, release)) = barrier {
         entered.notify_one();
         release.notified().await;
-        WRITE_TEST_BARRIER
+        WRITE_TEST_BARRIERS
             .lock()
-            .expect("write test barrier lock poisoned")
-            .take();
+            .expect("write test barriers lock poisoned")
+            .remove(owner);
     }
 }
 
@@ -657,13 +656,16 @@ pub(crate) mod test_support {
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *WRITE_TEST_BARRIER
+        WRITE_TEST_BARRIERS
             .lock()
-            .expect("write test barrier lock poisoned") = Some(WriteTestBarrier {
-            owner: owner.to_owned(),
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        });
+            .expect("write test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
         (entered, release)
     }
 }
