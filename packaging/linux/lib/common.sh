@@ -358,9 +358,11 @@ ensure_output_directory() {
   local current="$OUTPUT_ROOT"
   assert_output_path "$path"
   if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
-    if [[ "$path" != "$OUTPUT_ROOT" ]]; then
-      "$SAFEIO_HELPER" mkdirs "$SAFEIO_OUTPUT_FD" "${path#"$OUTPUT_ROOT/"}"
+    if [[ "$path" == "$OUTPUT_ROOT" ]]; then
+      "$SAFEIO_HELPER" check "$SAFEIO_OUTPUT_FD"
+      return
     fi
+    "$SAFEIO_HELPER" mkdirs "$SAFEIO_OUTPUT_FD" "${path#"$OUTPUT_ROOT/"}"
     [[ -d "$path" && ! -L "$path" ]] || die "failed to create directory: $path"
     return
   fi
