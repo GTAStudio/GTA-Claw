@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::ptr::NonNull;
 /// Failure returned by SQLite while inspecting its open main database file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileControlError {
@@ -62,4 +63,43 @@ pub async fn main_database_has_moved(
     } else {
         Err(FileControlError::SQLite(result))
     }
+}
+
+/// Installs a commit hook that rolls back if SQLite's main file was moved.
+pub async fn install_moved_commit_guard(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<(), FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let database = database.as_raw_handle();
+    // SAFETY: SQLx's locked handle is live for registration. SQLite stores the
+    // connection pointer as callback context and removes the hook on close.
+    unsafe {
+        libsqlite3_sys::sqlite3_commit_hook(
+            database.as_ptr(),
+            Some(reject_moved_commit),
+            database.as_ptr().cast(),
+        );
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn reject_moved_commit(context: *mut std::ffi::c_void) -> i32 {
+    let Some(database) = NonNull::new(context.cast::<libsqlite3_sys::sqlite3>()) else {
+        return 1;
+    };
+    let mut moved = 0_i32;
+    // SAFETY: SQLite invokes this hook only while the connection stored in the
+    // context is live. The output pointer remains valid for this call.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_file_control(
+            database.as_ptr(),
+            c"main".as_ptr(),
+            libsqlite3_sys::SQLITE_FCNTL_HAS_MOVED,
+            (&raw mut moved).cast(),
+        )
+    };
+    i32::from(result != libsqlite3_sys::SQLITE_OK || moved != 0)
 }

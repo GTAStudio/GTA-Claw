@@ -27,7 +27,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs::{self, OpenOptions};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -38,6 +38,57 @@ mod tests {
 
     use super::*;
     use crate::store::test_support;
+
+    struct ChildGuard {
+        child: Option<Child>,
+    }
+
+    impl ChildGuard {
+        fn new(child: Child) -> Self {
+            Self { child: Some(child) }
+        }
+
+        fn child_mut(&mut self) -> &mut Child {
+            self.child.as_mut().expect("child guard still owns process")
+        }
+
+        #[cfg(unix)]
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            self.child_mut().try_wait()
+        }
+
+        #[cfg(unix)]
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.child_mut().kill()
+        }
+
+        #[cfg(unix)]
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            self.child
+                .take()
+                .expect("child guard still owns process")
+                .wait()
+        }
+
+        fn kill_and_wait(mut self) -> std::io::Result<ExitStatus> {
+            let mut child = self.child.take().expect("child guard still owns process");
+            let kill = child.kill();
+            let wait = child.wait();
+            match (kill, wait) {
+                (_, Ok(status)) => Ok(status),
+                (Ok(()), Err(error)) | (Err(error), Err(_)) => Err(error),
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     fn database_path(directory: &TempDir, name: &str) -> PathBuf {
         directory.path().join(name)
@@ -245,7 +296,7 @@ mod tests {
     #[cfg(unix)]
     fn assert_child_open_rejected(database: &Path, ready: &Path, home: &Path) {
         let executable = std::env::current_exe().expect("current test executable");
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg("--exact")
             .arg("tests::child_process_writer")
             .arg("--nocapture")
@@ -257,6 +308,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn rejected-open child");
+        let mut child = ChildGuard::new(child);
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = child.try_wait().expect("inspect rejected-open child") {
@@ -394,29 +446,64 @@ mod tests {
         .expect("create version-zero migration race prefix");
         let (entered, release) = test_support::set_migration_barrier(&path);
         let open_path = path.clone();
-        let opener =
+        let mut opener =
             tokio::spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
         if tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .is_err()
         {
+            release.notify_waiters();
             opener.abort();
-            panic!("state opener did not enter the migration transaction within two seconds");
+            let join = opener.await;
+            let diagnostic = match join {
+                Ok(Ok(_)) => "opener completed without entering barrier".to_owned(),
+                Ok(Err(error)) => format!("opener failed: {error}"),
+                Err(error) => format!("opener task ended: {error}"),
+            };
+            external
+                .close()
+                .await
+                .expect("close external writer after opener failure");
+            panic!(
+                "state opener did not enter the migration transaction within two seconds: {diagnostic}"
+            );
         }
 
-        let drift = external
-            .execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT")
-            .await
-            .expect_err("external schema drift is excluded by BEGIN IMMEDIATE");
-        assert!(drift.as_database_error().is_some());
+        let drift = tokio::time::timeout(
+            Duration::from_secs(2),
+            external.execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT"),
+        )
+        .await;
         release.notify_one();
-
-        let store = opener
-            .await
+        let opener_result = tokio::time::timeout(Duration::from_secs(2), &mut opener).await;
+        if opener_result.is_err() {
+            opener.abort();
+            let _ = opener.await;
+        }
+        let drift = match drift {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => {
+                external
+                    .close()
+                    .await
+                    .expect("close external writer after unexpected success");
+                panic!("external schema drift unexpectedly succeeded");
+            }
+            Err(_) => {
+                external
+                    .close()
+                    .await
+                    .expect("close timed-out external writer");
+                panic!("external schema write exceeded two seconds");
+            }
+        };
+        assert!(drift.as_database_error().is_some());
+        external.close().await.expect("external writer closes");
+        let store = opener_result
+            .expect("migration task finishes within two seconds")
             .expect("migration task joins")
             .expect("migration completes");
         assert!(store.health().await.expect("migrated health").is_healthy());
-        external.close().await.expect("external writer closes");
         store.close().await.expect("migrated store closes");
     }
 
@@ -580,6 +667,75 @@ mod tests {
                 expected_version: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn repository_writes_reject_logical_database_identity_drift() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let application_path = database_path(&directory, "application-drift.sqlite");
+        let application_store = open(&application_path).await;
+        execute_direct(&application_path, "PRAGMA application_id = 0").await;
+        let application_record = session("application-drift", 1);
+        let error = application_store
+            .sessions()
+            .create(&application_record)
+            .await
+            .expect_err("application-id drift rejects repository write");
+        assert!(matches!(
+            error,
+            StateError::InvalidValue {
+                field: "SQLite application id",
+                ..
+            }
+        ));
+        assert!(
+            application_store
+                .sessions()
+                .get(&application_record.id)
+                .await
+                .expect("read rejected application-drift record")
+                .is_none()
+        );
+        application_store
+            .close()
+            .await
+            .expect("application-drift store releases ownership");
+
+        let owner_path = database_path(&directory, "owner-drift.sqlite");
+        let owner_store = open(&owner_path).await;
+        execute_direct(
+            &owner_path,
+            "UPDATE claw_writer_lock SET owner = 'external-owner' WHERE singleton = 1",
+        )
+        .await;
+        let owner_record = session("owner-drift", 1);
+        let error = owner_store
+            .sessions()
+            .create(&owner_record)
+            .await
+            .expect_err("owner drift rejects repository write");
+        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert!(
+            owner_store
+                .sessions()
+                .get(&owner_record.id)
+                .await
+                .expect("read rejected owner-drift record")
+                .is_none()
+        );
+        let close = owner_store
+            .close()
+            .await
+            .expect_err("owner drift is reported during close");
+        assert!(matches!(
+            close,
+            StateError::CloseDegraded {
+                application_lock_released: false,
+                os_lock_released: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1716,13 +1872,41 @@ mod tests {
         thread::sleep(Duration::from_secs(60));
     }
 
+    #[test]
+    fn child_process_first_open() {
+        let (Some(path), Some(ready), Some(result)) = (
+            std::env::var_os("CLAW_STATE_CHILD_DATABASE"),
+            std::env::var_os("CLAW_STATE_CHILD_READY"),
+            std::env::var_os("CLAW_STATE_CHILD_RESULT"),
+        ) else {
+            return;
+        };
+        let ready = PathBuf::from(ready);
+        let result = PathBuf::from(result);
+        let runtime = tokio::runtime::Runtime::new().expect("child Tokio runtime");
+        match runtime.block_on(StateStore::open(StoreConfig::new(PathBuf::from(path)))) {
+            Ok(_store) => {
+                fs::write(&result, b"opened").expect("record successful first open");
+                fs::write(ready, b"ready").expect("signal first-open readiness");
+                thread::sleep(Duration::from_secs(60));
+            }
+            Err(StateError::StoreLocked { .. }) => {
+                fs::write(result, b"locked").expect("record expected lock rejection");
+            }
+            Err(error) => {
+                fs::write(result, format!("unexpected:{error:?}"))
+                    .expect("record unexpected first-open failure");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn killed_writer_is_recovered_but_live_writer_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "crashed-writer.sqlite");
         let ready = database_path(&directory, "child.ready");
         let executable = std::env::current_exe().expect("current test executable");
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg("--exact")
             .arg("tests::child_process_writer")
             .arg("--nocapture")
@@ -1733,19 +1917,25 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn writer child");
+        let mut child = ChildGuard::new(child);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
-        assert!(ready.exists(), "writer child did not become ready");
+        if !ready.exists() {
+            let status = child
+                .child_mut()
+                .try_wait()
+                .expect("inspect writer child readiness");
+            panic!("writer child did not become ready; exit status: {status:?}");
+        }
 
         let live_error = StateStore::open(StoreConfig::new(&path))
             .await
             .err()
             .expect("live writer is rejected");
         assert!(matches!(live_error, StateError::StoreLocked { .. }));
-        child.kill().expect("kill writer child");
-        child.wait().expect("reap writer child");
+        child.kill_and_wait().expect("kill and reap writer child");
 
         let recovered = StateStore::open(StoreConfig::new(&path))
             .await
@@ -1759,59 +1949,65 @@ mod tests {
     fn concurrent_first_open_has_exactly_one_writer() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "first-open.sqlite");
-        fs::File::create(&path).expect("precreate empty database inode");
         let ready_a = database_path(&directory, "first-a.ready");
         let ready_b = database_path(&directory, "first-b.ready");
+        let result_a = database_path(&directory, "first-a.result");
+        let result_b = database_path(&directory, "first-b.result");
         let executable = std::env::current_exe().expect("current test executable");
-        let spawn = |ready: &Path| {
-            Command::new(&executable)
+        let spawn = |ready: &Path, result: &Path| {
+            let child = Command::new(&executable)
                 .arg("--exact")
-                .arg("tests::child_process_writer")
+                .arg("tests::child_process_first_open")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
                 .env("CLAW_STATE_CHILD_DATABASE", &path)
                 .env("CLAW_STATE_CHILD_READY", ready)
+                .env("CLAW_STATE_CHILD_RESULT", result)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn first-open contender")
+                .expect("spawn first-open contender");
+            ChildGuard::new(child)
         };
-        let mut child_a = spawn(&ready_a);
-        let mut child_b = spawn(&ready_b);
+        let mut child_a = spawn(&ready_a, &result_a);
+        let mut child_b = spawn(&ready_b, &result_b);
         let deadline = Instant::now() + Duration::from_secs(10);
-        let (winner_is_a, loser_status) = loop {
-            let a_ready = ready_a.exists();
-            let b_ready = ready_b.exists();
-            if a_ready && b_ready {
-                let _ = child_a.kill();
-                let _ = child_b.kill();
-                let _ = child_a.wait();
-                let _ = child_b.wait();
-                panic!("both first-open contenders acquired the same database identity");
+        while (!result_a.exists() || !result_b.exists()) && Instant::now() < deadline {
+            if ready_a.exists() && ready_b.exists() {
+                break;
             }
-            let a_status = child_a.try_wait().expect("inspect first contender");
-            let b_status = child_b.try_wait().expect("inspect second contender");
-            if a_ready && let Some(status) = b_status {
-                break (true, status);
-            }
-            if b_ready && let Some(status) = a_status {
-                break (false, status);
+            thread::sleep(Duration::from_millis(25));
+        }
+        let result_a_text = fs::read_to_string(&result_a).unwrap_or_else(|_| "missing".to_owned());
+        let result_b_text = fs::read_to_string(&result_b).unwrap_or_else(|_| "missing".to_owned());
+        let mut outcomes = [result_a_text.as_str(), result_b_text.as_str()];
+        outcomes.sort_unstable();
+        if outcomes != ["locked", "opened"] {
+            let _ = child_a.kill();
+            let _ = child_b.kill();
+            let _ = child_a.wait();
+            let _ = child_b.wait();
+            panic!("unexpected first-open outcomes: {outcomes:?}");
+        }
+        let (winner, loser) = if result_a_text == "opened" {
+            (&mut child_a, &mut child_b)
+        } else {
+            (&mut child_b, &mut child_a)
+        };
+        let loser_status = loop {
+            if let Some(status) = loser.try_wait().expect("inspect losing contender") {
+                break status;
             }
             if Instant::now() >= deadline {
-                let _ = child_a.kill();
-                let _ = child_b.kill();
-                let _ = child_a.wait();
-                let _ = child_b.wait();
-                panic!("first-open contenders did not resolve within ten seconds");
+                let _ = winner.kill();
+                let _ = loser.kill();
+                let _ = winner.wait();
+                let _ = loser.wait();
+                panic!("losing first-open contender did not exit within ten seconds");
             }
             thread::sleep(Duration::from_millis(25));
         };
-        assert!(!loser_status.success());
-        let winner = if winner_is_a {
-            &mut child_a
-        } else {
-            &mut child_b
-        };
+        assert!(loser_status.success());
         winner.kill().expect("stop winning contender");
         winner.wait().expect("reap winning contender");
     }
@@ -2252,6 +2448,85 @@ mod tests {
             "SQLite VFS must report the opened file was moved"
         );
         connection.close().await.expect("direct handle closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_repository_transaction_fails_closed_on_database_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "active-write.sqlite");
+        let detached = database_path(&directory, "active-write-detached.sqlite");
+        let store = std::sync::Arc::new(open(&path).await);
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_write_barrier(&owner);
+        let record = session("must-not-commit-after-replacement", 1);
+        let record_id = record.id.clone();
+        let writer_store = std::sync::Arc::clone(&store);
+        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("repository write reaches verified transaction within two seconds");
+
+        fs::rename(&path, &detached).expect("detach active database");
+        for suffix in ["-wal", "-shm"] {
+            let source = sidecar(&path, suffix);
+            if source.exists() {
+                fs::rename(&source, sidecar(&detached, suffix))
+                    .expect("move active database sidecar");
+            }
+        }
+        let replacement = open(&path).await;
+        release.notify_one();
+        let write_result = match tokio::time::timeout(Duration::from_secs(2), &mut writer).await {
+            Ok(join) => join.expect("repository write task joins"),
+            Err(_) => {
+                writer.abort();
+                let _ = writer.await;
+                panic!("repository write exceeded two seconds");
+            }
+        };
+        assert!(
+            write_result.is_err(),
+            "repository write must not report success after path replacement"
+        );
+        assert!(
+            replacement
+                .sessions()
+                .get(&record_id)
+                .await
+                .expect("read replacement database")
+                .is_none()
+        );
+        replacement.close().await.expect("replacement closes");
+
+        let store = match std::sync::Arc::try_unwrap(store) {
+            Ok(store) => store,
+            Err(_) => panic!("writer task retained the state store"),
+        };
+        let close = store
+            .close()
+            .await
+            .expect_err("detached path degrades original close");
+        assert!(matches!(
+            close,
+            StateError::CloseDegraded {
+                os_lock_released: true,
+                ..
+            }
+        ));
+        let detached_store = open(&detached).await;
+        assert!(
+            detached_store
+                .sessions()
+                .get(&record_id)
+                .await
+                .expect("read detached database")
+                .is_none()
+        );
+        detached_store
+            .close()
+            .await
+            .expect("detached database closes");
     }
 
     #[cfg(windows)]

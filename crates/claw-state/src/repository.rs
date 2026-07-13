@@ -1,5 +1,7 @@
 use claw_domain::SessionId;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use crate::error::database;
 use crate::model::{finish_page, invalid_stored, validate_text};
@@ -9,24 +11,32 @@ use crate::{
     TaskStatus, TimestampMs,
 };
 
+#[cfg(test)]
+static WRITE_TEST_BARRIER: Mutex<Option<WriteTestBarrier>> = Mutex::new(None);
+
+#[cfg(test)]
+struct WriteTestBarrier {
+    owner: String,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 /// Transactional access to durable sessions.
 pub struct SessionRepository<'store> {
     pool: &'store SqlitePool,
+    owner: &'store str,
 }
 
 impl<'store> SessionRepository<'store> {
-    pub(crate) const fn new(pool: &'store SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'store SqlitePool, owner: &'store str) -> Self {
+        Self { pool, owner }
     }
 
     /// Creates one session.
     pub async fn create(&self, record: &SessionRecord) -> Result<(), StateError> {
         validate_new_session(record)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| database("begin session create", error))?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin session create").await?;
         sqlx::query(
             "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
              VALUES (?, ?, ?, ?, ?)",
@@ -39,10 +49,7 @@ impl<'store> SessionRepository<'store> {
         .execute(&mut *transaction)
         .await
         .map_err(|error| create_error(error, "session", record.id.as_str(), None))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database("commit session create", error))?;
+        commit_verified(transaction, "commit session create").await?;
         Ok(())
     }
 
@@ -112,6 +119,8 @@ impl<'store> SessionRepository<'store> {
             });
         }
         validate_update_time(current.updated_at, updated_at)?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin session update").await?;
         let row = sqlx::query(
             "UPDATE sessions
              SET status = ?, updated_at_ms = ?, version = version + 1
@@ -122,38 +131,36 @@ impl<'store> SessionRepository<'store> {
         .bind(updated_at.get())
         .bind(id.as_str())
         .bind(expected_version)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| database("update session", error))?;
-        row.map(session_from_row)
+        let record = row
+            .map(session_from_row)
             .transpose()?
-            .ok_or_else(|| conflict("session", id.as_str(), expected_version))
+            .ok_or_else(|| conflict("session", id.as_str(), expected_version))?;
+        commit_verified(transaction, "commit session update").await?;
+        Ok(record)
     }
 }
 
 /// Transactional access to durable devices.
 pub struct DeviceRepository<'store> {
     pool: &'store SqlitePool,
+    owner: &'store str,
 }
 
 impl<'store> DeviceRepository<'store> {
-    pub(crate) const fn new(pool: &'store SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'store SqlitePool, owner: &'store str) -> Self {
+        Self { pool, owner }
     }
 
     /// Creates one device.
     pub async fn create(&self, record: &DeviceRecord) -> Result<(), StateError> {
         validate_new_device(record)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| database("begin device create", error))?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin device create").await?;
         insert_device(&mut transaction, record).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database("commit device create", error))?;
+        commit_verified(transaction, "commit device create").await?;
         Ok(())
     }
 
@@ -171,17 +178,15 @@ impl<'store> DeviceRepository<'store> {
                 reason: "must match the device created in the transaction",
             });
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| database("begin device and authentication create", error))?;
+        let mut transaction = begin_verified_write(
+            self.pool,
+            self.owner,
+            "begin device and authentication create",
+        )
+        .await?;
         insert_device(&mut transaction, device).await?;
         insert_authentication(&mut transaction, authentication).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database("commit device and authentication create", error))?;
+        commit_verified(transaction, "commit device and authentication create").await?;
         Ok(())
     }
 
@@ -242,6 +247,8 @@ impl<'store> DeviceRepository<'store> {
             return Err(conflict("device", id.as_str(), expected_version));
         }
         validate_update_time(current.updated_at, updated_at)?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin device rename").await?;
         let row = sqlx::query(
             "UPDATE devices
              SET display_name = ?, updated_at_ms = ?, version = version + 1
@@ -252,38 +259,36 @@ impl<'store> DeviceRepository<'store> {
         .bind(updated_at.get())
         .bind(id.as_str())
         .bind(expected_version)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| database("rename device", error))?;
-        row.map(device_from_row)
+        let record = row
+            .map(device_from_row)
             .transpose()?
-            .ok_or_else(|| conflict("device", id.as_str(), expected_version))
+            .ok_or_else(|| conflict("device", id.as_str(), expected_version))?;
+        commit_verified(transaction, "commit device rename").await?;
+        Ok(record)
     }
 }
 
 /// Transactional access to provider authentication records.
 pub struct AuthenticationRepository<'store> {
     pool: &'store SqlitePool,
+    owner: &'store str,
 }
 
 impl<'store> AuthenticationRepository<'store> {
-    pub(crate) const fn new(pool: &'store SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'store SqlitePool, owner: &'store str) -> Self {
+        Self { pool, owner }
     }
 
     /// Creates one authentication.
     pub async fn create(&self, record: &AuthenticationRecord) -> Result<(), StateError> {
         validate_new_authentication(record)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| database("begin authentication create", error))?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin authentication create").await?;
         insert_authentication(&mut transaction, record).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database("commit authentication create", error))?;
+        commit_verified(transaction, "commit authentication create").await?;
         Ok(())
     }
 
@@ -372,6 +377,8 @@ impl<'store> AuthenticationRepository<'store> {
             });
         }
         validate_update_time(current.updated_at, updated_at)?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin authentication update").await?;
         let row = sqlx::query(
             "UPDATE authentication_records
              SET status = ?, subject = ?, updated_at_ms = ?, version = version + 1
@@ -384,38 +391,36 @@ impl<'store> AuthenticationRepository<'store> {
         .bind(updated_at.get())
         .bind(id.as_str())
         .bind(expected_version)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| database("update authentication", error))?;
-        row.map(authentication_from_row)
+        let record = row
+            .map(authentication_from_row)
             .transpose()?
-            .ok_or_else(|| conflict("authentication", id.as_str(), expected_version))
+            .ok_or_else(|| conflict("authentication", id.as_str(), expected_version))?;
+        commit_verified(transaction, "commit authentication update").await?;
+        Ok(record)
     }
 }
 
 /// Transactional access to durable tasks.
 pub struct TaskRepository<'store> {
     pool: &'store SqlitePool,
+    owner: &'store str,
 }
 
 impl<'store> TaskRepository<'store> {
-    pub(crate) const fn new(pool: &'store SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'store SqlitePool, owner: &'store str) -> Self {
+        Self { pool, owner }
     }
 
     /// Creates one task.
     pub async fn create(&self, record: &TaskRecord) -> Result<(), StateError> {
         validate_new_task(record)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| database("begin task create", error))?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin task create").await?;
         insert_task(&mut transaction, record).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| database("commit task create", error))
+        commit_verified(transaction, "commit task create").await
     }
 
     /// Reads one task.
@@ -495,6 +500,8 @@ impl<'store> TaskRepository<'store> {
             });
         }
         validate_update_time(current.updated_at, updated_at)?;
+        let mut transaction =
+            begin_verified_write(self.pool, self.owner, "begin task update").await?;
         let row = sqlx::query(
             "UPDATE tasks
              SET status = ?, updated_at_ms = ?, version = version + 1
@@ -506,13 +513,127 @@ impl<'store> TaskRepository<'store> {
         .bind(updated_at.get())
         .bind(id.as_str())
         .bind(expected_version)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| database("update task", error))?;
-        row.map(task_from_row)
+        let record = row
+            .map(task_from_row)
             .transpose()?
-            .ok_or_else(|| conflict("task", id.as_str(), expected_version))
+            .ok_or_else(|| conflict("task", id.as_str(), expected_version))?;
+        commit_verified(transaction, "commit task update").await?;
+        Ok(record)
     }
+}
+
+async fn begin_verified_write<'pool>(
+    pool: &'pool SqlitePool,
+    owner: &str,
+    operation: &'static str,
+) -> Result<Transaction<'pool, Sqlite>, StateError> {
+    const APPLICATION_ID: i64 = 0x4754_4143;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| database(operation, error))?;
+    let ownership = sqlx::query(
+        "UPDATE claw_writer_lock
+         SET owner = owner
+         WHERE singleton = 1 AND owner = ?",
+    )
+    .bind(owner)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| database("lock and verify application writer", error))?;
+    if ownership.rows_affected() != 1 {
+        return Err(StateError::InvalidMigrationHistory {
+            reason: "application writer ownership changed before repository write".to_owned(),
+        });
+    }
+    let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database("verify repository application id", error))?;
+    if application_id != APPLICATION_ID {
+        return Err(StateError::InvalidValue {
+            field: "SQLite application id",
+            reason: "database ownership changed before repository write",
+        });
+    }
+    #[cfg(test)]
+    wait_at_write_test_barrier(owner).await;
+    Ok(transaction)
+}
+
+#[cfg(test)]
+async fn wait_at_write_test_barrier(owner: &str) {
+    let barrier = WRITE_TEST_BARRIER
+        .lock()
+        .expect("write test barrier lock poisoned")
+        .as_ref()
+        .filter(|configured| configured.owner == owner)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        WRITE_TEST_BARRIER
+            .lock()
+            .expect("write test barrier lock poisoned")
+            .take();
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use super::{Arc, WRITE_TEST_BARRIER, WriteTestBarrier};
+
+    pub(crate) fn set_write_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *WRITE_TEST_BARRIER
+            .lock()
+            .expect("write test barrier lock poisoned") = Some(WriteTestBarrier {
+            owner: owner.to_owned(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+}
+
+async fn commit_verified(
+    transaction: Transaction<'_, Sqlite>,
+    operation: &'static str,
+) -> Result<(), StateError> {
+    #[cfg(unix)]
+    let mut transaction = transaction;
+    #[cfg(not(unix))]
+    let transaction = transaction;
+    #[cfg(unix)]
+    {
+        let moved = claw_sqlite_file_control::main_database_has_moved(&mut transaction)
+            .await
+            .map_err(|error| database(operation, sqlx::Error::Protocol(error.to_string())))?;
+        if moved {
+            return Err(database(
+                operation,
+                sqlx::Error::Protocol(
+                    "SQLite main database identity changed before commit".to_owned(),
+                ),
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| database(operation, error))
 }
 
 async fn insert_device(

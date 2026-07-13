@@ -304,7 +304,8 @@ impl StateStore {
                             )
                         })
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                    verify_sqlite_connection_identity(connection).await
+                    verify_sqlite_connection_identity(connection).await?;
+                    install_sqlite_commit_guard(connection).await
                 })
             })
             .before_acquire(move |connection, _metadata| {
@@ -384,25 +385,25 @@ impl StateStore {
     /// Returns the session repository.
     #[must_use]
     pub fn sessions(&self) -> SessionRepository<'_> {
-        SessionRepository::new(&self.pool)
+        SessionRepository::new(&self.pool, &self.owner)
     }
 
     /// Returns the device repository.
     #[must_use]
     pub fn devices(&self) -> DeviceRepository<'_> {
-        DeviceRepository::new(&self.pool)
+        DeviceRepository::new(&self.pool, &self.owner)
     }
 
     /// Returns the authentication repository.
     #[must_use]
     pub fn authentications(&self) -> AuthenticationRepository<'_> {
-        AuthenticationRepository::new(&self.pool)
+        AuthenticationRepository::new(&self.pool, &self.owner)
     }
 
     /// Returns the task repository.
     #[must_use]
     pub fn tasks(&self) -> TaskRepository<'_> {
-        TaskRepository::new(&self.pool)
+        TaskRepository::new(&self.pool, &self.owner)
     }
 
     /// Reads the effective connection and durability settings.
@@ -894,6 +895,22 @@ fn writer_owner() -> Result<String, StateError> {
     Ok(format!("process-{}-{timestamp}", std::process::id()))
 }
 
+#[cfg(unix)]
+fn snapshot_temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf, StateError> {
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| StateError::InvalidPath {
+            path: destination.to_owned(),
+            reason: "snapshot destination must include a file name",
+        })?
+        .to_string_lossy();
+    Ok(
+        default_private_lock_root()?
+            .join(format!(".{file_name}.{}.{purpose}-tmp", writer_owner()?)),
+    )
+}
+
+#[cfg(not(unix))]
 fn snapshot_temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf, StateError> {
     let owner = writer_owner()?;
     let file_name = destination
@@ -1091,6 +1108,20 @@ fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError>
         "atomic no-replace publication is unsupported on this target",
     ));
     if let Err(error) = published {
+        #[cfg(unix)]
+        let primary = if error.raw_os_error() == Some(18) {
+            StateError::InvalidPath {
+                path: destination.to_owned(),
+                reason: "cross-filesystem snapshot publication is not supported",
+            }
+        } else {
+            file_error(
+                "publish SQLite snapshot without replacement",
+                destination,
+                error,
+            )
+        };
+        #[cfg(not(unix))]
         let primary = file_error(
             "publish SQLite snapshot without replacement",
             destination,
@@ -1923,6 +1954,20 @@ async fn verify_sqlite_connection_identity(
     } else {
         Ok(())
     }
+}
+
+#[cfg(unix)]
+async fn install_sqlite_commit_guard(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    claw_sqlite_file_control::install_moved_commit_guard(connection)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+}
+
+#[cfg(not(unix))]
+async fn install_sqlite_commit_guard(
+    _connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -3305,6 +3350,11 @@ pub(crate) mod test_support {
 
     pub(crate) fn pool(store: &StateStore) -> &SqlitePool {
         &store.pool
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn owner(store: &StateStore) -> &str {
+        &store.owner
     }
 
     pub(crate) fn checksum(sql: &str) -> String {
