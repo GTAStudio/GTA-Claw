@@ -34,6 +34,10 @@ on:
         description: Numeric X.Y.Z release version (defaults to Cargo workspace version)
         required: false
         type: string
+      release_commit:
+        description: Full immutable commit SHA selected by the release tag
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -71,6 +75,7 @@ jobs:
             echo "JavaScript package/runtime command found in macOS packaging automation"
             exit 1
           fi
+          ./packaging/macos/workflow-self-test.sh
 
       - name: Preserve Linux desktop rejection
         shell: bash
@@ -173,6 +178,10 @@ jobs:
     name: Universal2 assembly and containers
     needs: source-policy
     runs-on: macos-15
+    outputs:
+      release-payload-sha256: ${{ steps.release-input.outputs.sha256 }}
+      release-artifact-id: ${{ steps.release-upload.outputs.artifact-id }}
+      release-artifact-digest: ${{ steps.release-upload.outputs.artifact-digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -202,6 +211,32 @@ jobs:
             shasum -a 256 -c SHA256SUMS
           )
 
+      - name: Prepare immutable release input
+        if: github.event_name == 'workflow_dispatch' && inputs.release == true
+        id: release-input
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload_sha256="$(
+            ./packaging/macos/prepare-release-input.sh \
+              "$GITHUB_WORKSPACE/target/macos-package/apps/universal2/GTA Claw.app" \
+              "$GITHUB_SHA" \
+              "$GITHUB_REF"
+          )"
+          test "${#payload_sha256}" -eq 64
+          echo "sha256=$payload_sha256" >>"$GITHUB_OUTPUT"
+
+      - name: Upload immutable release input
+        if: github.event_name == 'workflow_dispatch' && inputs.release == true
+        id: release-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-release-input-${{ github.sha }}
+          path: target/macos-package/release-input/gta-claw-*-release-input.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
       - name: Upload ephemeral universal prototype artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -222,107 +257,468 @@ jobs:
     steps:
       - run: echo "Release mode was not requested; no signing, notarization, publication, or release upload occurred."
 
+  release-policy:
+    name: Validate immutable release ref
+    if: github.event_name == 'workflow_dispatch' && inputs.release == true
+    needs: source-policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release-sha: ${{ steps.policy.outputs.release-sha }}
+      release-ref: ${{ steps.policy.outputs.release-ref }}
+      version: ${{ steps.policy.outputs.version }}
+    steps:
+      - name: Checkout candidate commit without secrets
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce protected main and semantic tag policy
+        id: policy
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$DEFAULT_BRANCH" = "main" || {
+            echo "Release policy requires main as the protected default branch" >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Release mode requires a semantic vX.Y.Z tag, not $GITHUB_REF" >&2
+            exit 1
+          }
+          test "${GITHUB_REF_TYPE:-}" = "tag" || {
+            echo "Release mode rejects non-tag workflow_dispatch refs" >&2
+            exit 1
+          }
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "release_commit must be a full lowercase commit SHA" >&2
+            exit 1
+          }
+
+          tag_commit="$(git rev-parse "$GITHUB_REF^{commit}")"
+          tag_object="$(git rev-parse "$GITHUB_REF")"
+          test "$(git cat-file -t "$GITHUB_REF")" = "tag" || {
+            echo "Release mode requires an annotated, protected tag" >&2
+            exit 1
+          }
+          test "$tag_commit" = "$GITHUB_SHA" || {
+            echo "Tag commit does not match the workflow commit" >&2
+            exit 1
+          }
+          test "$RELEASE_COMMIT" = "$GITHUB_SHA" || {
+            echo "release_commit does not match the immutable workflow commit" >&2
+            exit 1
+          }
+
+          remote_tag_object="$(
+            git ls-remote --exit-code origin "$GITHUB_REF" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          test "$remote_tag_object" = "$tag_object" || {
+            echo "Remote tag changed after workflow dispatch" >&2
+            exit 1
+          }
+          git fetch --no-tags origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH" || {
+            echo "Release commit is not reachable from protected main" >&2
+            exit 1
+          }
+
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(
+            awk '
+              /^\[workspace\.package\]$/ { in_package = 1; next }
+              /^\[/ { in_package = 0 }
+              in_package && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ' Cargo.toml
+          )"
+          test "$version" = "$cargo_version" || {
+            echo "Tag version $version does not match Cargo version $cargo_version" >&2
+            exit 1
+          }
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            test "$REQUESTED_VERSION" = "$version" || {
+              echo "Requested version does not match the release tag" >&2
+              exit 1
+            }
+          fi
+          echo "release-sha=$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+          echo "release-ref=$GITHUB_REF" >>"$GITHUB_OUTPUT"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
   protected-release-contract:
     name: Protected signing and notarization contract
     if: github.event_name == 'workflow_dispatch' && inputs.release == true
     needs:
       - native
       - universal
+      - release-policy
     runs-on: macos-15
     environment: macos-release
-    env:
-      VERSION: ${{ inputs.version }}
-      DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
-      DEVELOPER_ID_INSTALLER: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER }}
-      APP_CERTIFICATE_P12: ${{ secrets.MACOS_APP_CERTIFICATE_P12 }}
-      APP_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_APP_CERTIFICATE_PASSWORD }}
-      INSTALLER_CERTIFICATE_P12: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12 }}
-      INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
-      ASC_KEY_P8: ${{ secrets.MACOS_ASC_KEY_P8 }}
-      ASC_KEY_ID: ${{ secrets.MACOS_ASC_KEY_ID }}
-      ASC_ISSUER_ID: ${{ secrets.MACOS_ASC_ISSUER_ID }}
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download exact secret-free release input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.universal.outputs.release-artifact-id }}
+          path: ${{ runner.temp }}/gta-claw-release-download
 
-      - name: Build unsigned universal2 inputs
+      - name: Verify artifact digest, metadata, and unsigned app
         shell: bash
-        run: ./packaging/macos/build.sh universal2
+        env:
+          EXPECTED_ARTIFACT_ID: ${{ needs.universal.outputs.release-artifact-id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.universal.outputs.release-artifact-digest }}
+          EXPECTED_PAYLOAD_SHA256: ${{ needs.universal.outputs.release-payload-sha256 }}
+          EXPECTED_RELEASE_REF: ${{ needs.release-policy.outputs.release-ref }}
+          EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
+          EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EXPECTED_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_PAYLOAD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          artifact_metadata="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$EXPECTED_ARTIFACT_ID")"
+          test "$(jq -r '.name' <<<"$artifact_metadata")" = \
+            "macos-release-input-$EXPECTED_RELEASE_SHA"
+          test "$(jq -r '.expired' <<<"$artifact_metadata")" = "false"
+          test "$(jq -r '.workflow_run.id' <<<"$artifact_metadata")" = "$GITHUB_RUN_ID"
+          test "$(jq -r '.digest' <<<"$artifact_metadata")" = \
+            "sha256:$EXPECTED_ARTIFACT_DIGEST"
+          payload="$RUNNER_TEMP/gta-claw-release-download/gta-claw-$EXPECTED_VERSION-release-input.tar.gz"
+          test -f "$payload" -a ! -L "$payload"
+          test "$(shasum -a 256 "$payload" | awk '{ print $1 }')" = "$EXPECTED_PAYLOAD_SHA256"
 
-      - name: Sign, notarize, staple, and validate without publishing
+          listing="$RUNNER_TEMP/gta-claw-release-listing"
+          tar -tzf "$payload" >"$listing"
+          if grep -E '(^/|(^|/)\.\.(/|$)|\\)' "$listing"; then
+            echo "Release input contains an unsafe archive path" >&2
+            exit 1
+          fi
+          if tar -tvzf "$payload" | awk '$1 ~ /^[lh]/ { found = 1 } END { exit !found }'; then
+            echo "Release input contains a link entry" >&2
+            exit 1
+          fi
+
+          state="$RUNNER_TEMP/gta-claw-release"
+          test ! -L "$state"
+          rm -rf -- "$state"
+          mkdir -m 0700 "$state"
+          tar -xzf "$payload" -C "$state"
+          root="$state/release-input"
+          test -d "$root" -a ! -L "$root"
+          test -z "$(find "$root" -type l -print -quit)"
+          actual_top="$(
+            find "$root" -mindepth 1 -maxdepth 1 -exec basename {} \; |
+              LC_ALL=C sort
+          )"
+          expected_top="$(printf '%s\n' 'GTA Claw.app' SHA256SUMS release-metadata.plist | LC_ALL=C sort)"
+          test "$actual_top" = "$expected_top"
+          (cd "$root" && shasum -a 256 -c SHA256SUMS)
+
+          metadata="$root/release-metadata.plist"
+          plutil -lint "$metadata" >/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SourceSHA' "$metadata")" = "$EXPECTED_RELEASE_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SourceRef' "$metadata")" = "$EXPECTED_RELEASE_REF"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Version' "$metadata")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :BundleIdentifier' "$metadata")" = "com.gtastudio.gta-claw"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumSystemVersion' "$metadata")" = "14.0"
+
+          app="$root/GTA Claw.app"
+          plist="$app/Contents/Info.plist"
+          binary="$app/Contents/MacOS/gta-claw-desktop"
+          test -f "$binary" -a -x "$binary" -a ! -L "$binary"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = "com.gtastudio.gta-claw"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = "14.0"
+          lipo "$binary" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvvv "$app" 2>&1 | grep -F 'Signature=adhoc' >/dev/null
+          if otool -L "$binary" |
+            tail -n +2 |
+            sed -E 's/^[[:space:]]*//; /:$/d; s/[[:space:]]+\(compatibility version.*$//' |
+            grep -Ev '^(/System/Library/Frameworks/|/usr/lib/)'; then
+            echo "Release app contains a non-system dynamic dependency" >&2
+            exit 1
+          fi
+          if otool -l "$binary" |
+            awk '$1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+                 in_rpath && $1 == "path" { print $2; in_rpath = 0 }' |
+            grep -Ev '^(@executable_path/\.\./Frameworks|@loader_path/\.\./Frameworks)$'; then
+            echo "Release app contains an unexpected rpath" >&2
+            exit 1
+          fi
+          if find "$app" -type f \( \
+            -iname 'node' -o -iname 'npm' -o -iname 'bun' -o -iname 'pnpm' -o \
+            -iname '*.js' -o -iname '*.mjs' -o -iname '*.cjs' -o -iname '*.node' \
+          \) -print -quit | grep .; then
+            echo "Release app contains a JavaScript runtime artifact" >&2
+            exit 1
+          fi
+
+      - name: Import application identity and sign app
         shell: bash
+        env:
+          APP_CERTIFICATE_P12: ${{ secrets.MACOS_APP_CERTIFICATE_P12 }}
+          APP_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_APP_CERTIFICATE_PASSWORD }}
+          DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for variable in APP_CERTIFICATE_P12 APP_CERTIFICATE_PASSWORD DEVELOPER_ID_APPLICATION; do
+            test -n "${!variable:-}" || {
+              echo "Protected application-signing secret is missing: $variable" >&2
+              exit 1
+            }
+          done
+          [[ "$DEVELOPER_ID_APPLICATION" == "Developer ID Application:"* ]]
+
+          state="$RUNNER_TEMP/gta-claw-release"
+          keychain="$state/signing.keychain-db"
+          password_file="$state/keychain-password"
+          app_p12="$state/app.p12"
+          trap 'rm -f -- "$app_p12"' EXIT INT TERM
+          openssl rand -hex 32 >"$password_file"
+          keychain_password="$(cat "$password_file")"
+          printf '%s' "$APP_CERTIFICATE_P12" | base64 -D >"$app_p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security list-keychains -d user -s \
+            "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          security import "$app_p12" \
+            -k "$keychain" -P "$APP_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security find-identity -p codesigning -v "$keychain" |
+            grep -F "\"$DEVELOPER_ID_APPLICATION\"" >/dev/null
+
+          entitlements="$state/release.entitlements"
+          cat >"$entitlements" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict/>
+          </plist>
+          EOF
+          plutil -lint "$entitlements" >/dev/null
+          app="$state/release-input/GTA Claw.app"
+          if [[ -d "$app/Contents/Frameworks" ]]; then
+            while IFS= read -r code; do
+              codesign --force --options runtime --timestamp \
+                --sign "$DEVELOPER_ID_APPLICATION" "$code"
+            done < <(find "$app/Contents/Frameworks" -type f \( -name '*.dylib' -o -perm -111 \) -print)
+          fi
+          codesign --force --options runtime --timestamp \
+            --entitlements "$entitlements" \
+            --identifier com.gtastudio.gta-claw \
+            --sign "$DEVELOPER_ID_APPLICATION" \
+            "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          details="$(codesign -dvvv "$app" 2>&1)"
+          requirement="$(codesign -d -r- "$app" 2>&1)"
+          grep -F 'Authority=Developer ID Application:' <<<"$details" >/dev/null
+          grep -F 'Timestamp=' <<<"$details" >/dev/null
+          grep -E 'flags=.*runtime' <<<"$details" >/dev/null
+          grep -F 'identifier "com.gtastudio.gta-claw"' <<<"$requirement" >/dev/null
+
+      - name: Notarize and staple signed app
+        shell: bash
+        env:
+          ASC_KEY_P8: ${{ secrets.MACOS_ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.MACOS_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.MACOS_ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for variable in ASC_KEY_P8 ASC_KEY_ID ASC_ISSUER_ID; do
+            test -n "${!variable:-}" || {
+              echo "Protected notarization secret is missing: $variable" >&2
+              exit 1
+            }
+          done
+          state="$RUNNER_TEMP/gta-claw-release"
+          key="$state/AuthKey.p8"
+          archive="$state/GTA-Claw.app.zip"
+          result="$state/app-notary-result.json"
+          trap 'rm -f -- "$key" "$archive" "$result"' EXIT INT TERM
+          printf '%s' "$ASC_KEY_P8" >"$key"
+          app="$state/release-input/GTA Claw.app"
+          ditto -c -k --keepParent "$app" "$archive"
+          xcrun notarytool submit "$archive" \
+            --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --output-format json >"$result"
+          status="$(plutil -extract status raw -o - "$result")"
+          request_id="$(plutil -extract id raw -o - "$result")"
+          if [[ "$status" != "Accepted" ]]; then
+            xcrun notarytool log "$request_id" \
+              --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+            echo "Application notarization was not accepted" >&2
+            exit 1
+          fi
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+      - name: Import installer identity and sign DMG and PKG
+        shell: bash
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+          DEVELOPER_ID_INSTALLER: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER }}
+          INSTALLER_CERTIFICATE_P12: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12 }}
+          INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           umask 077
           for variable in \
             DEVELOPER_ID_APPLICATION DEVELOPER_ID_INSTALLER \
-            APP_CERTIFICATE_P12 APP_CERTIFICATE_PASSWORD \
-            INSTALLER_CERTIFICATE_P12 INSTALLER_CERTIFICATE_PASSWORD \
-            ASC_KEY_P8 ASC_KEY_ID ASC_ISSUER_ID; do
+            INSTALLER_CERTIFICATE_P12 INSTALLER_CERTIFICATE_PASSWORD; do
             test -n "${!variable:-}" || {
-              echo "Release mode requires protected secret: $variable" >&2
+              echo "Protected container-signing secret is missing: $variable" >&2
               exit 1
             }
           done
+          [[ "$DEVELOPER_ID_APPLICATION" == "Developer ID Application:"* ]]
+          [[ "$DEVELOPER_ID_INSTALLER" == "Developer ID Installer:"* ]]
 
-          temporary="$(mktemp -d "$RUNNER_TEMP/gta-claw-release.XXXXXX")"
-          keychain="$temporary/signing.keychain-db"
-          keychain_password="$(openssl rand -hex 32)"
-          profile="gta-claw-notary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          cleanup() {
-            status=$?
-            trap - EXIT INT TERM HUP
-            set +e
-            security list-keychains -d user -s \
-              "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1
-            security delete-keychain "$keychain" >/dev/null 2>&1
-            rm -rf -- "$temporary"
-            exit "$status"
-          }
-          trap cleanup EXIT INT TERM HUP
-
-          printf '%s' "$APP_CERTIFICATE_P12" | base64 -D >"$temporary/app.p12"
-          printf '%s' "$INSTALLER_CERTIFICATE_P12" | base64 -D >"$temporary/installer.p12"
-          printf '%s' "$ASC_KEY_P8" >"$temporary/AuthKey.p8"
-
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
+          state="$RUNNER_TEMP/gta-claw-release"
+          keychain="$state/signing.keychain-db"
+          keychain_password="$(cat "$state/keychain-password")"
+          installer_p12="$state/installer.p12"
+          trap 'rm -f -- "$installer_p12"' EXIT INT TERM
+          printf '%s' "$INSTALLER_CERTIFICATE_P12" | base64 -D >"$installer_p12"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          security list-keychains -d user -s "$keychain"
-          security import "$temporary/app.p12" \
-            -k "$keychain" -P "$APP_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security import "$temporary/installer.p12" \
+          security import "$installer_p12" \
             -k "$keychain" -P "$INSTALLER_CERTIFICATE_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/productbuild
           security set-key-partition-list \
             -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security find-identity -v "$keychain" |
+            grep -F "\"$DEVELOPER_ID_INSTALLER\"" >/dev/null
 
-          xcrun notarytool store-credentials "$profile" \
-            --key "$temporary/AuthKey.p8" \
-            --key-id "$ASC_KEY_ID" \
-            --issuer "$ASC_ISSUER_ID" \
+          app="$state/release-input/GTA Claw.app"
+          distribution="$state/distribution"
+          dmg_stage="$state/dmg-stage"
+          package_root="$state/package-root"
+          mkdir -m 0700 "$distribution" "$dmg_stage" "$package_root"
+          mkdir -m 0755 "$package_root/Applications"
+          ditto "$app" "$dmg_stage/GTA Claw.app"
+          ditto "$app" "$package_root/Applications/GTA Claw.app"
+          test -z "$(find "$dmg_stage" "$package_root" -type l -print -quit)"
+
+          dmg="$distribution/gta-claw-${{ needs.release-policy.outputs.version }}-macos.dmg"
+          hdiutil create \
+            -srcfolder "$dmg_stage" \
+            -volname "GTA Claw ${{ needs.release-policy.outputs.version }}" \
+            -fs HFS+ -format UDZO -ov "$dmg"
+          hdiutil verify "$dmg" >/dev/null
+
+          component_pkg="$state/gta-claw-component.pkg"
+          pkgbuild \
+            --root "$package_root" \
+            --install-location / \
+            --identifier com.gtastudio.gta-claw.pkg.component \
+            --version "${{ needs.release-policy.outputs.version }}" \
+            --ownership recommended \
+            "$component_pkg"
+          pkg="$distribution/gta-claw-${{ needs.release-policy.outputs.version }}-macos.pkg"
+          productbuild \
+            --package "$component_pkg" \
+            --sign "$DEVELOPER_ID_INSTALLER" \
             --keychain "$keychain" \
-            --validate
+            "$pkg"
+          codesign --force \
+            --sign "$DEVELOPER_ID_APPLICATION" \
+            --timestamp \
+            --identifier com.gtastudio.gta-claw.dmg \
+            "$dmg"
+          codesign --verify --verbose=2 "$dmg"
+          pkgutil --check-signature "$pkg" |
+            grep -F 'Developer ID Installer:' >/dev/null
 
-          app="$GITHUB_WORKSPACE/target/macos-package/apps/universal2/GTA Claw.app"
-          source ./packaging/macos/lib/common.sh
-          export VERSION BUILD_VERSION
-          export SIGNING_KEYCHAIN="$keychain"
-          export NOTARY_PROFILE="$profile"
-          export NOTARY_KEYCHAIN="$keychain"
-          ./packaging/macos/sign.sh release "$app"
-          ./packaging/macos/validate.sh "$app" "arm64 x86_64" release
-          ./packaging/macos/notarize.sh "$app"
-          ./packaging/macos/package.sh release "$app"
-          ./packaging/macos/notarize.sh \
-            "$GITHUB_WORKSPACE/target/macos-package/distribution/gta-claw-$VERSION-macos.dmg"
-          ./packaging/macos/notarize.sh \
-            "$GITHUB_WORKSPACE/target/macos-package/distribution/gta-claw-$VERSION-macos.pkg"
+      - name: Notarize and staple DMG and PKG
+        shell: bash
+        env:
+          ASC_KEY_P8: ${{ secrets.MACOS_ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.MACOS_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.MACOS_ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for variable in ASC_KEY_P8 ASC_KEY_ID ASC_ISSUER_ID; do
+            test -n "${!variable:-}" || {
+              echo "Protected notarization secret is missing: $variable" >&2
+              exit 1
+            }
+          done
+          state="$RUNNER_TEMP/gta-claw-release"
+          key="$state/AuthKey.p8"
+          trap 'rm -f -- "$key" "$state"/*-notary-result.json' EXIT INT TERM
+          printf '%s' "$ASC_KEY_P8" >"$key"
+          for artifact in "$state"/distribution/*.{dmg,pkg}; do
+            result="$state/$(basename "$artifact")-notary-result.json"
+            xcrun notarytool submit "$artifact" \
+              --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+              --wait --output-format json >"$result"
+            status="$(plutil -extract status raw -o - "$result")"
+            request_id="$(plutil -extract id raw -o - "$result")"
+            if [[ "$status" != "Accepted" ]]; then
+              xcrun notarytool log "$request_id" \
+                --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+              echo "Container notarization was not accepted: $artifact" >&2
+              exit 1
+            fi
+            xcrun stapler staple "$artifact"
+            xcrun stapler validate "$artifact"
+          done
+
+      - name: Validate protected release outputs without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/gta-claw-release"
+          app="$state/release-input/GTA Claw.app"
+          distribution="$state/distribution"
+          lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=4 "$app"
           xcrun stapler validate "$app"
-          xcrun stapler validate target/macos-package/distribution/*.dmg
-          xcrun stapler validate target/macos-package/distribution/*.pkg
-          (
-            cd target/macos-package/distribution
-            shasum -a 256 -c SHA256SUMS
-          )
+          codesign --verify --verbose=2 "$distribution"/*.dmg
+          pkgutil --check-signature "$distribution"/*.pkg |
+            grep -F 'Developer ID Installer:' >/dev/null
+          xcrun stapler validate "$distribution"/*.dmg
+          xcrun stapler validate "$distribution"/*.pkg
+          (cd "$distribution" && shasum -a 256 * >SHA256SUMS)
           echo "Protected release contract passed. Artifacts are intentionally not uploaded or published."
+
+      - name: Always remove temporary keychain and credentials
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          state="$RUNNER_TEMP/gta-claw-release"
+          keychain="$state/signing.keychain-db"
+          security list-keychains -d user -s \
+            "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1
+          if [[ -f "$keychain" && ! -L "$keychain" ]]; then
+            security delete-keychain "$keychain" >/dev/null 2>&1
+          fi
+          rm -rf -- "$RUNNER_TEMP/gta-claw-release-download"
+          rm -rf -- "$state"

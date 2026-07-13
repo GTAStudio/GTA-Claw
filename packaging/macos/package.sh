@@ -41,11 +41,19 @@ fi
 distribution="$OUTPUT_ROOT/distribution"
 dmg_stage="$OUTPUT_ROOT/staging/dmg"
 package_work="$OUTPUT_ROOT/staging/pkg"
+staged_app="$dmg_stage/$APP_NAME.app"
+package_root="$package_work/root"
+package_app="$package_root/Applications/$APP_NAME.app"
+for destination in \
+  "$distribution" "$dmg_stage" "$package_work" "$staged_app" "$package_root" "$package_app"; do
+  assert_output_path "$destination"
+done
 safe_reset_dir "$distribution"
 safe_reset_dir "$dmg_stage"
 safe_reset_dir "$package_work"
 
-ditto "$app" "$dmg_stage/$APP_NAME.app"
+assert_output_path "$staged_app"
+ditto "$app" "$staged_app"
 reject_symlinks "$dmg_stage"
 write_sha256_manifest "$dmg_stage" "$distribution/dmg-content.sha256"
 verify_sha256_manifest "$dmg_stage" "$distribution/dmg-content.sha256" >/dev/null
@@ -61,9 +69,9 @@ hdiutil create \
 hdiutil verify "$dmg" >/dev/null
 
 component_pkg="$package_work/gta-claw-component.pkg"
-package_root="$package_work/root"
 mkdir -p "$package_root/Applications"
-ditto "$app" "$package_root/Applications/$APP_NAME.app"
+assert_output_path "$package_app"
+ditto "$app" "$package_app"
 reject_symlinks "$package_root"
 pkgbuild \
   --root "$package_root" \

@@ -32,16 +32,43 @@ expect_success() {
 work="$OUTPUT_ROOT/self-test"
 safe_reset_dir "$work"
 common="$MACOS_DIR/lib/common.sh"
+outside="$(mktemp -d "${TMPDIR:-/tmp}/gta-claw-output-escape.XXXXXX")"
+escape_link="$REPO_ROOT/target/gta-claw-output-link-$$"
+cleanup() {
+  rm -f -- "$escape_link"
+  rm -rf -- "$outside"
+}
+trap cleanup EXIT INT TERM
 
 expect_failure invalid-bundle-id env BUNDLE_ID=invalid bash -c "source '$common'"
 expect_failure invalid-version env VERSION=1.2-beta bash -c "source '$common'"
 expect_failure invalid-build-version env BUILD_VERSION=1.beta bash -c "source '$common'"
+expect_failure app-name-traversal env APP_NAME=../escape bash -c "source '$common'"
+expect_failure app-name-absolute env APP_NAME=/tmp/escape bash -c "source '$common'"
+expect_failure app-name-slash env APP_NAME=GTA/Claw bash -c "source '$common'"
+expect_failure app-name-backslash env APP_NAME='GTA\Claw' bash -c "source '$common'"
+expect_failure app-name-control env APP_NAME=$'GTA\nClaw' bash -c "source '$common'"
+expect_failure app-name-leading-dot env APP_NAME=.GTA bash -c "source '$common'"
+expect_failure executable-name-traversal env EXECUTABLE_NAME=../escape bash -c "source '$common'"
+expect_failure executable-name-absolute env EXECUTABLE_NAME=/tmp/escape bash -c "source '$common'"
+expect_failure executable-name-slash env EXECUTABLE_NAME=gta/claw bash -c "source '$common'"
+expect_failure executable-name-backslash env EXECUTABLE_NAME='gta\claw' bash -c "source '$common'"
+expect_failure executable-name-space env EXECUTABLE_NAME='gta claw' bash -c "source '$common'"
 expect_failure missing-tool bash -c "source '$common'; require_tool gta-claw-tool-that-does-not-exist"
 expect_failure path-traversal bash -c "source '$common'; assert_output_path '$OUTPUT_ROOT/../escape'"
+
+ln -s "$outside" "$escape_link"
+expect_failure output-root-intermediate-symlink \
+  env OUTPUT_ROOT="$escape_link/package" bash -c "source '$common'"
 
 mkdir -p "$work/symlink-root"
 ln -s "$work" "$work/symlink-root/link"
 expect_failure symlink-rejection bash -c "source '$common'; reject_symlinks '$work/symlink-root'"
+ln -s "$outside" "$work/intermediate-link"
+expect_failure output-path-intermediate-symlink \
+  bash -c "source '$common'; assert_output_path '$work/intermediate-link/file'"
+expect_failure reset-dir-intermediate-symlink \
+  bash -c "source '$common'; safe_reset_dir '$work/intermediate-link/delete'"
 
 printf 'content\n' >"$work/hash.txt"
 printf '%s  ./hash.txt\n' "$(sha256_file "$work/hash.txt")" >"$work/hash.sha256"

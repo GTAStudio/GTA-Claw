@@ -23,6 +23,8 @@ if [[ -z "${VERSION:-}" ]]; then
 fi
 : "${BUILD_VERSION:=$VERSION}"
 
+validate_safe_component "$APP_NAME" APP_NAME
+validate_safe_component "$EXECUTABLE_NAME" EXECUTABLE_NAME
 validate_bundle_id "$BUNDLE_ID"
 validate_release_version "$VERSION"
 validate_build_version "$BUILD_VERSION"

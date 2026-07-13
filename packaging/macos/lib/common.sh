@@ -49,49 +49,174 @@ validate_macos_version() {
   }' || die "minimum macOS version must be 14.0 or newer: $1"
 }
 
-assert_output_root() {
-  [[ "$OUTPUT_ROOT" == /* ]] || die "OUTPUT_ROOT must be absolute: $OUTPUT_ROOT"
-  [[ "$OUTPUT_ROOT" != *$'\n'* ]] || die "OUTPUT_ROOT contains a newline"
-  [[ "$OUTPUT_ROOT" != *"/../"* && "$OUTPUT_ROOT" != */.. ]] ||
-    die "OUTPUT_ROOT must not contain parent traversal"
-  case "$OUTPUT_ROOT/" in
-    "$REPO_ROOT/target/"*) ;;
-    *) die "OUTPUT_ROOT must remain below $REPO_ROOT/target" ;;
+validate_safe_component() {
+  local value="$1"
+  local kind="$2"
+  [[ -n "$value" && "${#value}" -le 64 ]] ||
+    die "$kind must contain 1 to 64 characters"
+  [[ "$value" != *"/"* && "$value" != *"\\"* ]] ||
+    die "$kind must be a single path component"
+  [[ "$value" != "." && "$value" != ".." && "$value" != *".."* ]] ||
+    die "$kind contains an ambiguous dot sequence"
+  if LC_ALL=C grep -q '[[:cntrl:]]' <<<"$value"; then
+    die "$kind contains a control character"
+  fi
+  case "$kind" in
+    APP_NAME)
+      [[ "$value" =~ ^[A-Za-z0-9]([[:space:]A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] ||
+        die "APP_NAME must start and end with an alphanumeric character"
+      ;;
+    EXECUTABLE_NAME)
+      [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] ||
+        die "EXECUTABLE_NAME must be an unspaced executable name"
+      ;;
+    *)
+      [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] ||
+        die "$kind must be an unspaced path component"
+      ;;
   esac
-  if [[ -L "$REPO_ROOT/target" ]]; then
+}
+
+validate_absolute_path_components() {
+  local path="$1"
+  local label="$2"
+  local remaining
+  local component
+  [[ "$path" == /* ]] || die "$label must be absolute: $path"
+  [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] ||
+    die "$label contains a control character"
+  [[ "$path" != *"//"* ]] || die "$label contains an empty path component"
+  remaining="${path#/}"
+  while [[ -n "$remaining" ]]; do
+    component="${remaining%%/*}"
+    if [[ "$remaining" == */* ]]; then
+      remaining="${remaining#*/}"
+    else
+      remaining=""
+    fi
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] ||
+      die "$label contains an ambiguous path component: $path"
+  done
+}
+
+canonical_target_root() {
+  local target="$REPO_ROOT/target"
+  local repository
+  repository="$(cd "$REPO_ROOT" && pwd -P)"
+  [[ "$repository" == "$REPO_ROOT" ]] || die "repository root changed during validation"
+  if [[ -L "$target" ]]; then
     die "repository target directory must not be a symlink"
   fi
-  if [[ -e "$OUTPUT_ROOT" && -L "$OUTPUT_ROOT" ]]; then
-    die "OUTPUT_ROOT must not be a symlink: $OUTPUT_ROOT"
+  if [[ ! -e "$target" ]]; then
+    mkdir -- "$target"
   fi
+  [[ -d "$target" && ! -L "$target" ]] || die "repository target path is not a directory"
+  local canonical
+  canonical="$(cd "$target" && pwd -P)"
+  [[ "$canonical" == "$target" ]] || die "repository target directory resolves outside the repository"
+  printf '%s\n' "$canonical"
+}
+
+assert_no_symlink_components() {
+  local boundary="$1"
+  local path="$2"
+  local relative
+  local component
+  local current="$boundary"
+  local canonical
+  [[ "$path" == "$boundary" || "$path" == "$boundary/"* ]] ||
+    die "path escapes canonical target boundary: $path"
+  relative="${path#"$boundary"}"
+  relative="${relative#/}"
+  while [[ -n "$relative" ]]; do
+    component="${relative%%/*}"
+    if [[ "$relative" == */* ]]; then
+      relative="${relative#*/}"
+    else
+      relative=""
+    fi
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] ||
+      die "path contains an ambiguous component: $path"
+    current="$current/$component"
+    [[ ! -L "$current" ]] || die "path contains a symlink component: $current"
+    if [[ -e "$current" ]]; then
+      if [[ -d "$current" ]]; then
+        canonical="$(cd "$current" && pwd -P)"
+        [[ "$canonical" == "$current" ]] || die "path component resolves outside target: $current"
+      elif [[ -n "$relative" ]]; then
+        die "non-directory path component blocks output path: $current"
+      fi
+    fi
+  done
+}
+
+assert_nearest_existing_parent() {
+  local boundary="$1"
+  local path="$2"
+  local candidate
+  local canonical
+  candidate="$(dirname "$path")"
+  while [[ ! -e "$candidate" && ! -L "$candidate" ]]; do
+    [[ "$candidate" != "/" ]] || die "no existing parent found for $path"
+    candidate="$(dirname "$candidate")"
+  done
+  [[ -d "$candidate" && ! -L "$candidate" ]] ||
+    die "nearest existing parent is not a real directory: $candidate"
+  canonical="$(cd "$candidate" && pwd -P)"
+  case "$canonical/" in
+    "$boundary/"*) ;;
+    *) die "nearest existing parent resolves outside canonical target: $canonical" ;;
+  esac
+}
+
+assert_output_root() {
+  local target
+  local canonical
+  validate_absolute_path_components "$OUTPUT_ROOT" "OUTPUT_ROOT"
+  target="$(canonical_target_root)"
+  case "$OUTPUT_ROOT/" in
+    "$target/"*) ;;
+    *) die "OUTPUT_ROOT must remain below canonical target directory $target" ;;
+  esac
+  assert_no_symlink_components "$target" "$OUTPUT_ROOT"
+  assert_nearest_existing_parent "$target" "$OUTPUT_ROOT"
   mkdir -p "$OUTPUT_ROOT"
+  assert_no_symlink_components "$target" "$OUTPUT_ROOT"
+  canonical="$(cd "$OUTPUT_ROOT" && pwd -P)"
+  [[ "$canonical" == "$OUTPUT_ROOT" ]] || die "OUTPUT_ROOT resolves outside canonical target"
 }
 
 assert_output_path() {
   local path="$1"
-  local ancestor
+  local target
+  local canonical_parent
   assert_output_root
+  validate_absolute_path_components "$path" "output path"
   [[ "$path" == "$OUTPUT_ROOT/"* ]] || die "path escapes OUTPUT_ROOT: $path"
-  [[ "$path" != *$'\n'* ]] || die "path contains a newline: $path"
-  [[ "$path" != *"/../"* && "$path" != */.. ]] || die "path contains parent traversal: $path"
-  if [[ -e "$path" && -L "$path" ]]; then
-    die "output path must not be a symlink: $path"
+  target="$(canonical_target_root)"
+  assert_no_symlink_components "$target" "$path"
+  assert_nearest_existing_parent "$target" "$path"
+  canonical_parent="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P || true)"
+  if [[ -n "$canonical_parent" ]]; then
+    case "$canonical_parent/" in
+      "$OUTPUT_ROOT/"*) ;;
+      *) die "existing output parent resolves outside OUTPUT_ROOT: $canonical_parent" ;;
+    esac
   fi
-  ancestor="$(dirname "$path")"
-  while [[ "$ancestor" == "$OUTPUT_ROOT"* && "$ancestor" != "$OUTPUT_ROOT" ]]; do
-    if [[ -e "$ancestor" && -L "$ancestor" ]]; then
-      die "output path has a symlinked parent: $ancestor"
-    fi
-    ancestor="$(dirname "$ancestor")"
-  done
 }
 
 safe_reset_dir() {
   local path="$1"
+  local target
   assert_output_path "$path"
   [[ "$path" != "$OUTPUT_ROOT" ]] || die "refusing to reset OUTPUT_ROOT itself"
+  target="$(canonical_target_root)"
+  assert_no_symlink_components "$target" "$path"
+  assert_nearest_existing_parent "$target" "$path"
+  [[ ! -L "$path" ]] || die "refusing to delete a symlink: $path"
   rm -rf -- "$path"
   mkdir -p "$path"
+  assert_output_path "$path"
 }
 
 reject_symlinks() {
@@ -112,6 +237,12 @@ write_sha256_manifest() {
   local temporary="$output.tmp"
   local output_relative=""
   local temporary_relative=""
+  if [[ "$root" == "$OUTPUT_ROOT/"* ]]; then
+    assert_output_path "$root"
+  fi
+  if [[ "$output" == "$OUTPUT_ROOT/"* ]]; then
+    assert_output_path "$output"
+  fi
   if [[ "$output" == "$root/"* ]]; then
     output_relative="./${output#"$root/"}"
     temporary_relative="$output_relative.tmp"
@@ -121,6 +252,9 @@ write_sha256_manifest() {
     [[ "$relative" != "$output_relative" && "$relative" != "$temporary_relative" ]] || continue
     printf '%s  %s\n' "$(sha256_file "$root/$relative")" "$relative" >>"$temporary"
   done < <(cd "$root" && find . -type f -print | LC_ALL=C sort)
+  if [[ "$output" == "$OUTPUT_ROOT/"* ]]; then
+    assert_output_path "$output"
+  fi
   mv "$temporary" "$output"
 }
 
