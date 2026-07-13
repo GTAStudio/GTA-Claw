@@ -95,6 +95,31 @@ fn hosted_supply_chain_policy_audits_both_lockfiles_fail_closed() {
         workflow.contains("CARGO_TARGET_DIR: ${{ runner.temp }}/wayland-scanner-target"),
         "focused vendor tests must not write build outputs into the verified source tree"
     );
+    assert_eq!(
+        workflow
+            .matches(
+                "command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources",
+            )
+            .count(),
+        2,
+        "both target policies must pass the config after the cargo-deny check subcommand"
+    );
+    for arguments in [
+        "arguments: --target x86_64-pc-windows-msvc",
+        "arguments: --target aarch64-apple-darwin",
+    ] {
+        assert_eq!(
+            workflow.matches(arguments).count(),
+            1,
+            "missing exact desktop policy target: {arguments}"
+        );
+    }
+    for line in workflow.lines().map(str::trim) {
+        assert!(
+            !line.starts_with("arguments:") || !line.contains("--config"),
+            "cargo-deny 0.19.8 rejects top-level --config: {line}"
+        );
+    }
     assert!(
         !workflow.contains("\n          ignore:"),
         "hosted audits must not ignore advisories"

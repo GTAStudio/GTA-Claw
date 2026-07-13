@@ -197,15 +197,15 @@ jobs:
       - name: Check Windows desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
-          arguments: --config desktop/deny.toml --target x86_64-pc-windows-msvc
+          arguments: --target x86_64-pc-windows-msvc
           command: check
-          command-arguments: --warn unmaintained advisories licenses sources
+          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
           manifest-path: ./desktop/Cargo.toml
 
       - name: Check macOS desktop dependency policy
         uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
         with:
-          arguments: --config desktop/deny.toml --target aarch64-apple-darwin
+          arguments: --target aarch64-apple-darwin
           command: check
-          command-arguments: --warn unmaintained advisories licenses sources
+          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
           manifest-path: ./desktop/Cargo.toml
