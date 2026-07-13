@@ -371,10 +371,8 @@ mod tests {
         let identity = DeviceIdentity::generate(&mut rng);
         let public = identity.public_key();
         let device_id = identity.device_id();
-        let mut nonce = [0_u8; 16];
-        let mut challenge = [0_u8; 32];
-        rng.fill_bytes(&mut nonce);
-        rng.fill_bytes(&mut challenge);
+        let nonce: [u8; 16] = std::array::from_fn(|_| rng.next_u32().to_le_bytes()[0]);
+        let mut challenge: [u8; 32] = std::array::from_fn(|_| rng.next_u32().to_le_bytes()[0]);
         let signature = identity.sign_handshake(input(&device_id, &nonce, &challenge));
 
         public
@@ -393,8 +391,7 @@ mod tests {
         let identity = DeviceIdentity::generate(&mut rng);
         let public = identity.public_key();
         let device_id = identity.device_id();
-        let mut combined = [0_u8; 3];
-        rng.fill_bytes(&mut combined);
+        let combined: [u8; 3] = std::array::from_fn(|_| rng.next_u32().to_le_bytes()[0]);
         let (nonce, challenge) = combined.split_at(2);
         let signature = identity.sign_handshake(input(&device_id, nonce, challenge));
 
