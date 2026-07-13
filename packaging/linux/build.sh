@@ -45,8 +45,8 @@ effective_umask="${effective_umask: -3}"
   die "effective build umask does not match BUILD_INPUT_UMASK"
 git -C "$REPO_ROOT" diff --quiet
 git -C "$REPO_ROOT" diff --cached --quiet
-[[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]] ||
-  die "source worktree must be clean"
+source_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
+[[ -z "$source_status" ]] || die "source worktree must be clean: $source_status"
 source_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 source_tree="$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$source_tree" =~ ^[0-9a-f]{40}$ ]] ||

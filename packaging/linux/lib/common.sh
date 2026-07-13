@@ -340,8 +340,8 @@ open_output_file() {
   fi
   [[ "$restore_noclobber" -eq 0 ]] || set +o noclobber
   OPEN_OUTPUT_PATH="$path"
-  OPEN_OUTPUT_ID="$(stat -Lc '%d:%i' "/proc/$$/fd/$OPEN_OUTPUT_FD")"
-  chmod "$mode" "/proc/$$/fd/$OPEN_OUTPUT_FD"
+  OPEN_OUTPUT_ID="$(stat -Lc '%d:%i' "/proc/$BASHPID/fd/$OPEN_OUTPUT_FD")"
+  chmod "$mode" "/proc/$BASHPID/fd/$OPEN_OUTPUT_FD"
   assert_regular_unaliased "$path" "reserved output"
   [[ "$(output_identity "$path")" == "$OPEN_OUTPUT_ID" ]] ||
     die "reserved output path does not identify its open file: $path"
@@ -351,7 +351,7 @@ finish_output_file() {
   local path="$OPEN_OUTPUT_PATH"
   local descriptor
   [[ -n "$OPEN_OUTPUT_FD" && -n "$path" ]] || die "no output file is open"
-  descriptor="/proc/$$/fd/$OPEN_OUTPUT_FD"
+  descriptor="/proc/$BASHPID/fd/$OPEN_OUTPUT_FD"
   [[ "$(stat -Lc '%d:%i' "$descriptor")" == "$OPEN_OUTPUT_ID" ]] ||
     die "open output descriptor identity changed: $path"
   if [[ ! -f "$path" || -L "$path" || "$(output_identity "$path")" != "$OPEN_OUTPUT_ID" ]]; then

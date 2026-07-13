@@ -22,6 +22,7 @@ verify_build_manifest() {
   local target_path
   local mode
   local expected_runtime_set
+  local source_status
 
   require_tool git
   require_tool jq
@@ -77,8 +78,8 @@ verify_build_manifest() {
 
   git -C "$REPO_ROOT" diff --quiet
   git -C "$REPO_ROOT" diff --cached --quiet
-  [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]] ||
-    die "current source worktree is dirty"
+  source_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
+  [[ -z "$source_status" ]] || die "current source worktree is dirty: $source_status"
   BUILD_SOURCE_SHA="$(jq -er '.source.commit' "$manifest")"
   BUILD_SOURCE_TREE="$(jq -er '.source.tree' "$manifest")"
   [[ "$BUILD_SOURCE_SHA" == "$(git -C "$REPO_ROOT" rev-parse HEAD)" ]] ||
