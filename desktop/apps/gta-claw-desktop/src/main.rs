@@ -43,6 +43,7 @@ fn apply_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
     apply_visual_preferences(window, snapshot.preferences());
     window.set_navigation_drawer_open(snapshot.navigation_drawer_open());
     window.set_inspector_open(snapshot.inspector_open());
+    window.set_inspector_backdrop_active(snapshot.inspector_backdrop_active());
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -186,6 +187,22 @@ mod tests {
         window.set_layout_width(839.0);
         super::sync_viewport(window);
         assert_eq!(window.get_pane_mode(), PaneMode::SinglePane);
+        window.invoke_inspector_toggle_requested();
+        assert!(window.get_inspector_backdrop_active());
+        window.invoke_inspector_toggle_requested();
+        assert!(!window.get_inspector_backdrop_active());
+
+        window.set_layout_width(1_179.0);
+        super::sync_viewport(window);
+        window.invoke_inspector_toggle_requested();
+        assert!(window.get_inspector_backdrop_active());
+        window.invoke_inspector_toggle_requested();
+        assert!(!window.get_inspector_backdrop_active());
+
+        window.set_layout_width(1_180.0);
+        super::sync_viewport(window);
+        window.invoke_inspector_toggle_requested();
+        assert!(!window.get_inspector_backdrop_active());
 
         let regular_success = window.global::<DesignTokens>().get_success();
         window
@@ -210,6 +227,8 @@ mod tests {
             window.global::<DesignTokens>().get_success()
         );
 
+        window.set_layout_width(839.0);
+        super::sync_viewport(window);
         window.invoke_navigation_toggle_requested();
         assert!(window.get_navigation_drawer_open());
         window.invoke_inspector_toggle_requested();
@@ -250,5 +269,6 @@ mod tests {
         assert!(shell.contains("enabled: !root.navigation-drawer-open && !root.inspector-open"));
         assert!(shell.contains("navigation-toggle-button.restore-focus()"));
         assert!(shell.contains("inspector-toggle-button.restore-focus()"));
+        assert!(shell.contains("if (root.inspector-backdrop-active) : Rectangle"));
     }
 }

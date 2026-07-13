@@ -21,6 +21,7 @@ export component AppWindow inherits Window {
     in-out property <bool> reduced-motion <=> VisualPreferences.reduced-motion;
     in-out property <float> density-scale <=> VisualPreferences.density-scale;
     in property <PaneMode> pane-mode: PaneMode.three-pane;
+    in property <bool> inspector-backdrop-active: false;
 
     callback refresh-requested();
     callback navigation-toggle-requested();
@@ -42,6 +43,7 @@ export component AppWindow inherits Window {
         pane-mode: root.pane-mode;
         navigation-drawer-open: root.navigation-drawer-open;
         inspector-open: root.inspector-open;
+        inspector-backdrop-active: root.inspector-backdrop-active;
         refresh-requested => { root.refresh-requested(); }
         navigation-toggle-requested => { root.navigation-toggle-requested(); }
         inspector-toggle-requested => { root.inspector-toggle-requested(); }

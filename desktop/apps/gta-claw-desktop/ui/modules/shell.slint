@@ -312,9 +312,10 @@ export component PaneHost {
     in property <PaneMode> pane-mode: PaneMode.three-pane;
     in property <bool> navigation-drawer-open: false;
     in property <bool> inspector-open: false;
+    in property <bool> inspector-backdrop-active: false;
     out property <bool> navigation-pane-visible: root.pane-mode == PaneMode.three-pane;
     out property <bool> inspector-pane-visible: root.pane-mode == PaneMode.three-pane
-        || (root.pane-mode == PaneMode.overlay-inspector && root.inspector-open);
+        || root.inspector-backdrop-active;
 
     callback refresh-requested;
     callback navigation-dismiss-requested;
@@ -396,10 +397,10 @@ export component PaneHost {
         }
     }
 
-    if (root.pane-mode != PaneMode.three-pane && root.inspector-open) : Rectangle {
+    if (root.inspector-backdrop-active) : Rectangle {
         background: root.pane-mode == PaneMode.single-pane ? #00000055 : transparent;
 
-        if (root.pane-mode == PaneMode.single-pane) : TouchArea {
+        TouchArea {
             clicked => { root.inspector-dismiss-requested(); }
         }
 
@@ -431,6 +432,7 @@ export component ApplicationShell {
     in property <PaneMode> pane-mode: PaneMode.three-pane;
     in property <bool> navigation-drawer-open: false;
     in property <bool> inspector-open: false;
+    in property <bool> inspector-backdrop-active: false;
 
     callback refresh-requested;
     callback navigation-toggle-requested;
@@ -536,6 +538,7 @@ export component ApplicationShell {
             pane-mode: root.pane-mode;
             navigation-drawer-open: root.navigation-drawer-open;
             inspector-open: root.inspector-open;
+            inspector-backdrop-active: root.inspector-backdrop-active;
 
             refresh-requested => { root.refresh-requested(); }
             navigation-dismiss-requested => { root.navigation-toggle-requested(); }

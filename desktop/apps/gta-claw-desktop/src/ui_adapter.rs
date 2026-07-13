@@ -42,15 +42,19 @@ impl UiAdapter {
         match request {
             UiRequest::Refresh => {}
             UiRequest::ToggleNavigation => {
-                self.navigation_drawer_open = !self.navigation_drawer_open;
-                if self.navigation_drawer_open {
-                    self.inspector_open = false;
+                if self.pane_mode != UiPaneMode::ThreePane {
+                    self.navigation_drawer_open = !self.navigation_drawer_open;
+                    if self.navigation_drawer_open {
+                        self.inspector_open = false;
+                    }
                 }
             }
             UiRequest::ToggleInspector => {
-                self.inspector_open = !self.inspector_open;
-                if self.inspector_open {
-                    self.navigation_drawer_open = false;
+                if self.pane_mode != UiPaneMode::ThreePane {
+                    self.inspector_open = !self.inspector_open;
+                    if self.inspector_open {
+                        self.navigation_drawer_open = false;
+                    }
                 }
             }
             UiRequest::SetTheme(theme) => {
@@ -253,6 +257,10 @@ impl UiSnapshot {
     pub(crate) fn inspector_open(&self) -> bool {
         self.inspector_open
     }
+
+    pub(crate) fn inspector_backdrop_active(&self) -> bool {
+        self.pane_mode != UiPaneMode::ThreePane && self.inspector_open
+    }
 }
 
 #[cfg(test)]
@@ -336,8 +344,27 @@ mod tests {
     }
 
     #[test]
+    fn inspector_backdrop_covers_both_overlay_modes_but_not_docked_mode() {
+        let mut adapter = UiAdapter::native();
+
+        for width in [1_179, 839] {
+            adapter.handle_request(UiRequest::SetViewportWidth(width));
+            adapter.handle_request(UiRequest::ToggleInspector);
+            assert!(adapter.snapshot().inspector_backdrop_active());
+            adapter.handle_request(UiRequest::ToggleInspector);
+            assert!(!adapter.snapshot().inspector_backdrop_active());
+        }
+
+        adapter.handle_request(UiRequest::SetViewportWidth(1_180));
+        adapter.handle_request(UiRequest::ToggleInspector);
+        assert!(!adapter.snapshot().inspector_open());
+        assert!(!adapter.snapshot().inspector_backdrop_active());
+    }
+
+    #[test]
     fn drawer_requests_keep_overlays_mutually_exclusive() {
         let mut adapter = UiAdapter::native();
+        adapter.handle_request(UiRequest::SetViewportWidth(900));
 
         adapter.handle_request(UiRequest::ToggleNavigation);
         assert!(adapter.snapshot().navigation_drawer_open());
