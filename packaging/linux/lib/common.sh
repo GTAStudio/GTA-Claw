@@ -627,7 +627,13 @@ verify_sha256_manifest() {
   [[ "$manifest" == "$root/"* ]] || die "checksum manifest must be inside verified root"
   manifest_relative="./${manifest#"$root/"}"
   declared="$(
-    awk '{ sub(/^[0-9a-f]{64}  /, ""); print }' "$manifest" |
+    awk '
+      length($0) >= 67 && substr($0, 65, 2) == "  " {
+        print substr($0, 67)
+        next
+      }
+      { exit 1 }
+    ' "$manifest" |
       LC_ALL=C sort
   )"
   actual="$(
