@@ -1,7 +1,7 @@
 //! Headless GTA Claw command-line adapter and bounded Gateway diagnostic.
 
 use std::collections::BTreeSet;
-use std::convert::Infallible;
+use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::future::Future;
@@ -744,52 +744,70 @@ fn is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
 
 fn generate_ephemeral_identity() -> Result<DeviceIdentity, DiagnosticFailure> {
     let random = SystemRandom::new();
-    let mut bytes = Zeroizing::new([0_u8; 32]);
-    random.fill(bytes.as_mut()).map_err(|_| {
+    generate_ephemeral_identity_with(&random)
+}
+
+fn generate_ephemeral_identity_with<R>(random: &R) -> Result<DeviceIdentity, DiagnosticFailure>
+where
+    R: RandomFill,
+{
+    let mut rng = IdentityRandom(random);
+    DeviceIdentity::try_generate(&mut rng).map_err(|_| {
         DiagnosticFailure::internal("randomness_error", "secure randomness is unavailable")
-    })?;
-    let mut rng = OneShotRandom { bytes, offset: 0 };
-    let identity = DeviceIdentity::generate(&mut rng);
-    debug_assert_eq!(rng.offset, rng.bytes.len());
-    Ok(identity)
+    })
 }
 
-struct OneShotRandom {
-    bytes: Zeroizing<[u8; 32]>,
-    offset: usize,
+trait RandomFill {
+    type Error: Error;
+
+    fn fill(&self, destination: &mut [u8]) -> Result<(), Self::Error>;
 }
 
-impl TryRng for OneShotRandom {
-    type Error = Infallible;
+impl RandomFill for SystemRandom {
+    type Error = SystemRandomError;
+
+    fn fill(&self, destination: &mut [u8]) -> Result<(), Self::Error> {
+        SecureRandom::fill(self, destination).map_err(|_| SystemRandomError)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SystemRandomError;
+
+impl std::fmt::Display for SystemRandomError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("system random fill failed")
+    }
+}
+
+impl Error for SystemRandomError {}
+
+struct IdentityRandom<'a, R>(&'a R);
+
+impl<R> TryRng for IdentityRandom<'_, R>
+where
+    R: RandomFill,
+{
+    type Error = R::Error;
 
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut bytes = [0_u8; 4];
-        self.try_fill_bytes(&mut bytes)?;
+        self.0.fill(&mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
     }
 
     fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut bytes = [0_u8; 8];
-        self.try_fill_bytes(&mut bytes)?;
+        self.0.fill(&mut bytes)?;
         Ok(u64::from_le_bytes(bytes))
     }
 
     fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
-        let end = self
-            .offset
-            .checked_add(destination.len())
-            .expect("Ed25519 random request length cannot overflow");
-        assert!(
-            end <= self.bytes.len(),
-            "Ed25519 identity generation exceeded its 32-byte random seed"
-        );
-        destination.copy_from_slice(&self.bytes[self.offset..end]);
-        self.offset = end;
-        Ok(())
+        self.0.fill(destination)
     }
 }
 
-impl TryCryptoRng for OneShotRandom {}
+impl<R> TryCryptoRng for IdentityRandom<'_, R> where R: RandomFill {}
 
 struct SafeConnectionInfo {
     protocol: u64,
@@ -1222,7 +1240,45 @@ impl RenderedResult {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::fmt::{self, Display, Formatter};
+
     use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TestFillError;
+
+    impl Display for TestFillError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str("injected random fill failure")
+        }
+    }
+
+    impl Error for TestFillError {}
+
+    struct FailingFill;
+
+    impl RandomFill for FailingFill {
+        type Error = TestFillError;
+
+        fn fill(&self, _destination: &mut [u8]) -> Result<(), Self::Error> {
+            Err(TestFillError)
+        }
+    }
+
+    struct DeterministicFill {
+        calls: Cell<usize>,
+    }
+
+    impl RandomFill for DeterministicFill {
+        type Error = TestFillError;
+
+        fn fill(&self, destination: &mut [u8]) -> Result<(), Self::Error> {
+            self.calls.set(self.calls.get() + 1);
+            destination.fill(0x5a);
+            Ok(())
+        }
+    }
 
     #[test]
     fn parser_requires_explicit_identity_and_never_accepts_inline_tokens() {
@@ -1306,5 +1362,33 @@ mod tests {
         assert!(validate_safe_output_text("网关-v4").is_ok());
         assert!(validate_safe_output_text("gateway\nforged").is_err());
         assert!(validate_safe_output_text(&"x".repeat(MAX_OUTPUT_TEXT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn identity_random_propagates_every_fill_failure_without_fallback() {
+        let source = FailingFill;
+        let mut rng = IdentityRandom(&source);
+        assert_eq!(rng.try_next_u32(), Err(TestFillError));
+        assert_eq!(rng.try_next_u64(), Err(TestFillError));
+        assert_eq!(rng.try_fill_bytes(&mut [0_u8; 32]), Err(TestFillError));
+
+        let failure =
+            generate_ephemeral_identity_with(&source).expect_err("fill failure must propagate");
+        assert_eq!(failure.category.code(), 8);
+        assert_eq!(failure.status, "randomness_error");
+        assert_eq!(failure.message, "secure randomness is unavailable");
+    }
+
+    #[test]
+    fn identity_generation_uses_one_complete_private_fill() {
+        let source = DeterministicFill {
+            calls: Cell::new(0),
+        };
+        let identity = match generate_ephemeral_identity_with(&source) {
+            Ok(identity) => identity,
+            Err(_) => panic!("deterministic fill must succeed"),
+        };
+        assert_eq!(source.calls.get(), 1);
+        assert_ne!(identity.device_id().as_bytes(), &[0_u8; 32]);
     }
 }
