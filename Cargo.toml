@@ -25,6 +25,7 @@ claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-sqlite-file-control = { path = "crates/claw-sqlite-file-control", version = "0.1.0" }
 claw-state = { path = "crates/claw-state", version = "0.1.0" }
+getrandom = "=0.2.17"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 same-file = "1.0.6"
 serde = { version = "=1.0.228", features = ["derive"] }

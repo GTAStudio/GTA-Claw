@@ -173,6 +173,7 @@ version = "0.1.0"
 dependencies = [
  "claw-domain",
  "claw-sqlite-file-control",
+ "getrandom 0.2.17",
  "rustix",
  "same-file",
  "sha2 0.11.0",

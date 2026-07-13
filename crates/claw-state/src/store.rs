@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(unix)]
 use std::sync::{LazyLock, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -109,7 +109,7 @@ impl StoreConfig {
             max_connections: 1,
             busy_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
-            close_timeout: Duration::from_millis(500),
+            close_timeout: Duration::from_secs(1),
             synchronous: SynchronousPolicy::Full,
         }
     }
@@ -1137,14 +1137,16 @@ fn open_existing_file_no_follow_writable(path: &Path) -> Result<File, StateError
 }
 
 fn writer_owner() -> Result<String, StateError> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| StateError::InvalidValue {
-            field: "system clock",
-            reason: "must not precede the Unix epoch",
-        })?
-        .as_nanos();
-    Ok(format!("process-{}-{timestamp}", std::process::id()))
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|_| StateError::InvalidValue {
+        field: "OS random source",
+        reason: "failed to generate a writer identity nonce",
+    })?;
+    Ok(format!(
+        "process-{}-{}",
+        std::process::id(),
+        hex_encode(&nonce)
+    ))
 }
 
 #[cfg(unix)]
