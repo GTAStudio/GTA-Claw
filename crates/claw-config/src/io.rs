@@ -446,11 +446,13 @@ mod windows_replace {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+    use std::fmt::{self, Display, Formatter};
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::atomic_write_bytes;
+    use super::{ConfigError, atomic_write_bytes};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -462,11 +464,21 @@ mod tests {
         std::fs::write(&path, "old").expect("write old file");
 
         let error = atomic_write_bytes(&path, b"new", || {
-            Err(io::Error::other("injected precommit failure"))
+            Err(io::Error::other(InjectedPrecommitFailure))
         })
+        .map_err(|source| ConfigError::io(&path, source))
         .expect_err("write must fail");
 
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let ConfigError::Io { source, .. } = error else {
+            panic!("expected typed I/O failure: {error}");
+        };
+        assert!(
+            source
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<InjectedPrecommitFailure>())
+                .is_some(),
+            "failure must originate from the injected precommit stage: {source}"
+        );
         assert_eq!(std::fs::read_to_string(path).expect("read old file"), "old");
         let entries = std::fs::read_dir(&directory)
             .expect("read temporary directory")
@@ -519,8 +531,19 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&directory).expect("create temporary directory");
-        directory
+        std::fs::canonicalize(directory).expect("canonicalize temporary directory")
     }
+
+    #[derive(Debug)]
+    struct InjectedPrecommitFailure;
+
+    impl Display for InjectedPrecommitFailure {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            formatter.write_str("injected precommit failure")
+        }
+    }
+
+    impl Error for InjectedPrecommitFailure {}
 
     struct Cleanup(PathBuf);
 
