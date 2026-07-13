@@ -58,6 +58,8 @@ validate_safe_component() {
     die "$kind must be a single path component"
   [[ "$value" != "." && "$value" != ".." && "$value" != *".."* ]] ||
     die "$kind contains an ambiguous dot sequence"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] ||
+    die "$kind contains a control character"
   if LC_ALL=C grep -q '[[:cntrl:]]' <<<"$value"; then
     die "$kind contains a control character"
   fi
