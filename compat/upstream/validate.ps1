@@ -633,12 +633,12 @@ function Assert-InventoryItemContract {
 
     switch ($InventoryId) {
         "plugins" {
-            if (@("core", "official_external", "source_only_qa") -cnotcontains [string]$Item.delivery_class) {
+            if (-not (Test-OrdinalContains @("core", "official_external", "source_only_qa") ([string]$Item.delivery_class))) {
                 Fail "$Context has invalid delivery_class"
             }
         }
         "skills" {
-            if (@("MIT", "Apache-2.0") -cnotcontains [string]$Item.license) {
+            if (-not (Test-OrdinalContains @("MIT", "Apache-2.0") ([string]$Item.license))) {
                 Fail "$Context has invalid license"
             }
             if (($Item.id -ceq "skill-creator") -ne ($Item.license -ceq "Apache-2.0")) {
@@ -650,7 +650,7 @@ function Assert-InventoryItemContract {
             switch -CaseSensitive ([string]$Item.kind) {
                 "method" {
                     Assert-ExactPropertySet $Item ($base + @("scope", "advertised")) $Context
-                    if ($AllowedOperatorScopes -cnotcontains [string]$Item.scope -or
+                    if (-not (Test-OrdinalContains $AllowedOperatorScopes ([string]$Item.scope)) -or
                         -not ($Item.advertised -is [bool])) {
                         Fail "$Context has invalid method scope or advertised flag"
                     }
@@ -660,7 +660,7 @@ function Assert-InventoryItemContract {
                 }
                 "role" {
                     Assert-ExactPropertySet $Item ($base + @("protocol_class")) $Context
-                    if (@("gateway", "closed_worker") -cnotcontains [string]$Item.protocol_class) {
+                    if (-not (Test-OrdinalContains @("gateway", "closed_worker") ([string]$Item.protocol_class))) {
                         Fail "$Context has invalid role protocol_class"
                     }
                 }
@@ -673,7 +673,7 @@ function Assert-InventoryItemContract {
             }
         }
         "channels" {
-            if (@("source_manifest", "official_catalog_only") -cnotcontains [string]$Item.provenance) {
+            if (-not (Test-OrdinalContains @("source_manifest", "official_catalog_only") ([string]$Item.provenance))) {
                 Fail "$Context has invalid provenance"
             }
             if ($Item.provenance -ceq "source_manifest" -and -not (Has-Property $Item "plugin_id")) {
@@ -684,8 +684,8 @@ function Assert-InventoryItemContract {
             }
         }
         "http-sse-endpoints" {
-            if (@("GET", "POST") -cnotcontains [string]$Item.method -or
-                @("none", "optional_sse", "long_poll", "streamable_http") -cnotcontains [string]$Item.streaming -or
+            if (-not (Test-OrdinalContains @("GET", "POST") ([string]$Item.method)) -or
+                -not (Test-OrdinalContains @("none", "optional_sse", "long_poll", "streamable_http") ([string]$Item.streaming)) -or
                 -not ([string]$Item.path).StartsWith("/")) {
                 Fail "$Context has invalid HTTP method, path, or streaming kind"
             }
@@ -695,7 +695,7 @@ function Assert-InventoryItemContract {
                 "browser_extension", "headless_node", "native_app", "native_helper",
                 "native_sidecar", "terminal_app", "terminal_client", "web_app"
             )
-            if ($allowedKinds -cnotcontains [string]$Item.kind) {
+            if (-not (Test-OrdinalContains $allowedKinds ([string]$Item.kind))) {
                 Fail "$Context has invalid client kind"
             }
         }
@@ -705,7 +705,7 @@ function Assert-InventoryItemContract {
             }
         }
         "release-deployment" {
-            if (@("release", "installation", "deployment") -cnotcontains [string]$Item.kind) {
+            if (-not (Test-OrdinalContains @("release", "installation", "deployment") ([string]$Item.kind))) {
                 Fail "$Context has invalid release/deployment kind"
             }
         }
@@ -864,8 +864,8 @@ $actualJsonPaths = @(
         $relative.Replace("\", "/")
     }
 )
-$missingJsonFiles = @($ExpectedJsonPaths | Where-Object { $actualJsonPaths -cnotcontains $_ })
-$unexpectedJsonFiles = @($actualJsonPaths | Where-Object { $ExpectedJsonPaths -cnotcontains $_ })
+$missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
+$unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
 if ($actualJsonPaths.Count -ne 16 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
@@ -1018,7 +1018,10 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         $item = $items[$index]
         $context = "$($spec.path).items[$index]"
         Assert-RequiredProperties $item @($spec.required_fields) $context
-        $unexpectedFields = @((Get-PropertyNames $item) | Where-Object { @($spec.allowed_fields) -cnotcontains $_ })
+        $unexpectedFields = @(
+            (Get-PropertyNames $item) |
+                Where-Object { -not (Test-OrdinalContains @($spec.allowed_fields) $_) }
+        )
         if ($unexpectedFields.Count -gt 0) {
             Fail "$context contains unsupported fields [$($unexpectedFields -join ',')]"
         }
@@ -1027,7 +1030,7 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
                 Fail "$context has empty required field $field"
             }
         }
-        if ($AllowedClassifications -cnotcontains [string]$item.classification) {
+        if (-not (Test-OrdinalContains $AllowedClassifications ([string]$item.classification))) {
             Fail "$context is unclassified"
         }
         if ($inventoryId -cne "http-sse-endpoints" -and $item.classification -cne $spec.classification) {

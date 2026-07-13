@@ -359,6 +359,18 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "inventory-property-name-ordinal"
+        expected_message = "contains unsupported fields [source_path"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "inventories/clients.json"
+            $inventory = Read-Json $path
+            $inventory.items[0] |
+                Add-Member -NotePropertyName ("source_path" + [char]0x00AD) -NotePropertyValue "src/ordinal"
+            Write-Json $path $inventory
+        }
+    },
+    [ordered]@{
         name = "schema-type"
         expected_message = "$.features must have JSON Schema type array"
         mutate = {
