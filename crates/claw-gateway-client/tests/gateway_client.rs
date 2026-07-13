@@ -30,9 +30,10 @@ use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 use url::Url;
 
 use support::{
-    TestGateway, complete_handshake, handler, raw_stalled_server, receive_connect, receive_request,
-    send_challenge, send_connect_error, send_connect_error_details, send_hello_with_device_token,
-    send_hello_with_tick_interval, send_json, send_raw_text, send_response, wait_for_close,
+    TestGateway, complete_handshake, complete_handshake_with_tick_interval, handler,
+    raw_stalled_server, receive_connect, receive_request, send_challenge, send_connect_error,
+    send_connect_error_details, send_hello_with_device_token, send_hello_with_tick_interval,
+    send_json, send_raw_text, send_response, wait_for_close,
 };
 
 fn identity() -> Arc<DeviceIdentity> {
@@ -1320,7 +1321,8 @@ async fn command_queue_saturation_is_explicit_backpressure() {
 async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer() {
     const LARGE_BYTES: usize = 20 * 1024 * 1024;
     let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
-        complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+        complete_handshake_with_tick_interval(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES, 10_000)
+            .await;
         let request = receive_request(&mut socket).await;
         assert_eq!(request.id().as_str(), "large-held");
         send_response(&mut socket, request.id().as_str(), 1).await;

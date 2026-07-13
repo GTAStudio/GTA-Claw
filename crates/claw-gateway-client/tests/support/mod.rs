@@ -338,20 +338,20 @@ pub(crate) async fn complete_handshake(
     socket: &mut TestSocket,
     max_payload: usize,
 ) -> (RequestFrame, ConnectParams) {
+    complete_handshake_with_tick_interval(socket, max_payload, 1000).await
+}
+
+pub(crate) async fn complete_handshake_with_tick_interval(
+    socket: &mut TestSocket,
+    max_payload: usize,
+    tick_interval_ms: u64,
+) -> (RequestFrame, ConnectParams) {
     send_challenge(socket).await;
     let (request, params) = receive_connect(socket).await;
     verify_connect_proof(&params);
-    send_hello(socket, request.id(), &params, max_payload).await;
+    send_hello_with_tick_interval(socket, request.id(), &params, max_payload, tick_interval_ms)
+        .await;
     (request, params)
-}
-
-pub(crate) async fn send_hello(
-    socket: &mut TestSocket,
-    id: &RequestId,
-    params: &ConnectParams,
-    max_payload: usize,
-) {
-    send_hello_with_policy(socket, id, params, max_payload, None, 1000).await;
 }
 
 pub(crate) async fn send_hello_with_device_token(
