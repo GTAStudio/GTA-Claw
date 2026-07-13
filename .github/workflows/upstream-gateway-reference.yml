@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
       NPM_CONFIG_IGNORE_SCRIPTS: "true"
     steps:
       - name: Checkout GTA Claw

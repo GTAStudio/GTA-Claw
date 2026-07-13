@@ -23,6 +23,7 @@ fn reference_workflow_disables_credentials_and_network_lifecycle_downloads() {
     for required in [
         "permissions:\n  contents: read",
         "Verify checkout credential isolation",
+        "COREPACK_ENABLE_DOWNLOAD_PROMPT: \"0\"",
         "NPM_CONFIG_IGNORE_SCRIPTS: \"true\"",
         "pnpm install --frozen-lockfile --ignore-scripts",
         "pnpm config get ignore-scripts",
