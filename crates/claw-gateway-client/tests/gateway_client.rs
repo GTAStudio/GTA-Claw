@@ -1494,10 +1494,16 @@ async fn cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer
         let response = held.await.expect("held request response");
         assert_eq!(response.id().as_str(), HELD_ID);
         assert!(response.ok(), "held response must be successful");
+        assert!(response.error().is_none(), "held request returned an error");
         let payload: serde_json::Value = Codec::authenticated()
             .decode_opaque(response.payload().value().expect("held response payload"))
             .expect("decode held response payload");
         assert_eq!(payload, json!({"marker": 1}));
+        assert_eq!(
+            scenario_runtime.writes_entered(),
+            1,
+            "rejected requests must never reach the application writer"
+        );
     });
     finish_gateway_scenario(
         "cumulative outbound byte bound",
