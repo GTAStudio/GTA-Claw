@@ -199,6 +199,13 @@ impl TestGateway {
     }
 }
 
+impl Drop for TestGateway {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.tasks.close();
+    }
+}
+
 pub(crate) async fn raw_stalled_server() -> (Url, CancellationToken, TaskTracker) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");

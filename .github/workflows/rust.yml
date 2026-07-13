@@ -91,6 +91,30 @@ jobs:
       - name: Check workspace at MSRV
         run: cargo +1.94.0 check --workspace --all-targets --locked
 
+  gateway-stress:
+    name: Gateway synchronization stress (macOS Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Repeat deterministic Gateway regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in $(seq 1 100); do
+            echo "Gateway synchronization iteration ${iteration}/100"
+            cargo test --locked --package claw-gateway-client \
+              --test gateway_client \
+              cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer \
+              -- --exact
+            cargo test --locked --package claw-gateway-client \
+              --test gateway_client \
+              expired_queued_side_effect_is_never_transmitted_and_releases_budgets \
+              -- --exact
+          done
+
   desktop:
     name: Desktop (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
