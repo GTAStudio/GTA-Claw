@@ -32,6 +32,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use claw_application::ApplicationError;
+
     use super::run;
 
     #[test]
@@ -52,8 +54,10 @@ mod tests {
             .expect_err("send must fail without a transport");
 
         assert_eq!(
-            error.to_string(),
-            "unsupported operation: message transport is not configured"
+            error.downcast_ref::<ApplicationError>(),
+            Some(&ApplicationError::Unsupported(
+                "message transport is not configured"
+            ))
         );
         assert!(output.is_empty());
     }

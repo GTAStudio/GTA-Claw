@@ -1,5 +1,6 @@
 //! Process-level checks for daemon lifecycle modes.
 
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -17,13 +18,21 @@ impl Drop for ChildGuard {
 fn normal_mode_remains_running_until_terminated() {
     let child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("daemon process starts");
     let mut child = ChildGuard(child);
+    let stdout = child.0.stdout.take().expect("daemon stdout is piped");
+    let mut reader = BufReader::new(stdout);
+    let mut readiness = String::new();
 
-    thread::sleep(Duration::from_millis(500));
+    reader
+        .read_line(&mut readiness)
+        .expect("daemon readiness is readable");
+    assert_eq!(readiness, "ready protocol=1\n");
+
+    thread::sleep(Duration::from_millis(100));
 
     assert!(
         child
