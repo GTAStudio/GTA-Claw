@@ -1,0 +1,558 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "providers",
+    "classification":  "official_integration",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  78,
+                   "unique":  78
+               },
+    "items":  [
+                  {
+                      "record_id":  "provider:qianfan",
+                      "id":  "qianfan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qianfan/openclaw.plugin.json",
+                      "plugin_id":  "qianfan"
+                  },
+                  {
+                      "record_id":  "provider:qwen",
+                      "id":  "qwen",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:opencode-go",
+                      "id":  "opencode-go",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/opencode-go/openclaw.plugin.json",
+                      "plugin_id":  "opencode-go"
+                  },
+                  {
+                      "record_id":  "provider:openrouter",
+                      "id":  "openrouter",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/openrouter/openclaw.plugin.json",
+                      "plugin_id":  "openrouter"
+                  },
+                  {
+                      "record_id":  "provider:qwencloud",
+                      "id":  "qwencloud",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:qwen-oauth",
+                      "id":  "qwen-oauth",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:qwen-portal",
+                      "id":  "qwen-portal",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:modelstudio",
+                      "id":  "modelstudio",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:dashscope",
+                      "id":  "dashscope",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:opencode",
+                      "id":  "opencode",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/opencode/openclaw.plugin.json",
+                      "plugin_id":  "opencode"
+                  },
+                  {
+                      "record_id":  "provider:novita",
+                      "id":  "novita",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/novita/openclaw.plugin.json",
+                      "plugin_id":  "novita"
+                  },
+                  {
+                      "record_id":  "provider:novita-ai",
+                      "id":  "novita-ai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/novita/openclaw.plugin.json",
+                      "plugin_id":  "novita"
+                  },
+                  {
+                      "record_id":  "provider:mistral",
+                      "id":  "mistral",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/mistral/openclaw.plugin.json",
+                      "plugin_id":  "mistral"
+                  },
+                  {
+                      "record_id":  "provider:moonshot",
+                      "id":  "moonshot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/moonshot/openclaw.plugin.json",
+                      "plugin_id":  "moonshot"
+                  },
+                  {
+                      "record_id":  "provider:novitaai",
+                      "id":  "novitaai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/novita/openclaw.plugin.json",
+                      "plugin_id":  "novita"
+                  },
+                  {
+                      "record_id":  "provider:ollama-cloud",
+                      "id":  "ollama-cloud",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/ollama/openclaw.plugin.json",
+                      "plugin_id":  "ollama"
+                  },
+                  {
+                      "record_id":  "provider:openai",
+                      "id":  "openai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/openai/openclaw.plugin.json",
+                      "plugin_id":  "openai"
+                  },
+                  {
+                      "record_id":  "provider:nvidia",
+                      "id":  "nvidia",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/nvidia/openclaw.plugin.json",
+                      "plugin_id":  "nvidia"
+                  },
+                  {
+                      "record_id":  "provider:ollama",
+                      "id":  "ollama",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/ollama/openclaw.plugin.json",
+                      "plugin_id":  "ollama"
+                  },
+                  {
+                      "record_id":  "provider:qwen-cli",
+                      "id":  "qwen-cli",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:volcengine",
+                      "id":  "volcengine",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/volcengine/openclaw.plugin.json",
+                      "plugin_id":  "volcengine"
+                  },
+                  {
+                      "record_id":  "provider:volcengine-plan",
+                      "id":  "volcengine-plan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/volcengine/openclaw.plugin.json",
+                      "plugin_id":  "volcengine"
+                  },
+                  {
+                      "record_id":  "provider:vercel-ai-gateway",
+                      "id":  "vercel-ai-gateway",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vercel-ai-gateway/openclaw.plugin.json",
+                      "plugin_id":  "vercel-ai-gateway"
+                  },
+                  {
+                      "record_id":  "provider:vllm",
+                      "id":  "vllm",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vllm/openclaw.plugin.json",
+                      "plugin_id":  "vllm"
+                  },
+                  {
+                      "record_id":  "provider:vydra",
+                      "id":  "vydra",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/vydra/openclaw.plugin.json",
+                      "plugin_id":  "vydra"
+                  },
+                  {
+                      "record_id":  "provider:xiaomi-token-plan",
+                      "id":  "xiaomi-token-plan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/xiaomi/openclaw.plugin.json",
+                      "plugin_id":  "xiaomi"
+                  },
+                  {
+                      "record_id":  "provider:zai",
+                      "id":  "zai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/zai/openclaw.plugin.json",
+                      "plugin_id":  "zai"
+                  },
+                  {
+                      "record_id":  "provider:xai",
+                      "id":  "xai",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/xai/openclaw.plugin.json",
+                      "plugin_id":  "xai"
+                  },
+                  {
+                      "record_id":  "provider:xiaomi",
+                      "id":  "xiaomi",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/xiaomi/openclaw.plugin.json",
+                      "plugin_id":  "xiaomi"
+                  },
+                  {
+                      "record_id":  "provider:venice",
+                      "id":  "venice",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/venice/openclaw.plugin.json",
+                      "plugin_id":  "venice"
+                  },
+                  {
+                      "record_id":  "provider:sglang",
+                      "id":  "sglang",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/sglang/openclaw.plugin.json",
+                      "plugin_id":  "sglang"
+                  },
+                  {
+                      "record_id":  "provider:stepfun",
+                      "id":  "stepfun",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/stepfun/openclaw.plugin.json",
+                      "plugin_id":  "stepfun"
+                  },
+                  {
+                      "record_id":  "provider:qwen-token-plan",
+                      "id":  "qwen-token-plan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:bailian-token-plan",
+                      "id":  "bailian-token-plan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/qwen/openclaw.plugin.json",
+                      "plugin_id":  "qwen"
+                  },
+                  {
+                      "record_id":  "provider:stepfun-plan",
+                      "id":  "stepfun-plan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/stepfun/openclaw.plugin.json",
+                      "plugin_id":  "stepfun"
+                  },
+                  {
+                      "record_id":  "provider:tencent-tokenplan",
+                      "id":  "tencent-tokenplan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tencent/openclaw.plugin.json",
+                      "plugin_id":  "tencent"
+                  },
+                  {
+                      "record_id":  "provider:together",
+                      "id":  "together",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/together/openclaw.plugin.json",
+                      "plugin_id":  "together"
+                  },
+                  {
+                      "record_id":  "provider:synthetic",
+                      "id":  "synthetic",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/synthetic/openclaw.plugin.json",
+                      "plugin_id":  "synthetic"
+                  },
+                  {
+                      "record_id":  "provider:tencent-tokenhub",
+                      "id":  "tencent-tokenhub",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/tencent/openclaw.plugin.json",
+                      "plugin_id":  "tencent"
+                  },
+                  {
+                      "record_id":  "provider:cohere",
+                      "id":  "cohere",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/cohere/openclaw.plugin.json",
+                      "plugin_id":  "cohere"
+                  },
+                  {
+                      "record_id":  "provider:comfy",
+                      "id":  "comfy",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/comfy/openclaw.plugin.json",
+                      "plugin_id":  "comfy"
+                  },
+                  {
+                      "record_id":  "provider:cloudflare-ai-gateway",
+                      "id":  "cloudflare-ai-gateway",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/cloudflare-ai-gateway/openclaw.plugin.json",
+                      "plugin_id":  "cloudflare-ai-gateway"
+                  },
+                  {
+                      "record_id":  "provider:codex",
+                      "id":  "codex",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/codex/openclaw.plugin.json",
+                      "plugin_id":  "codex"
+                  },
+                  {
+                      "record_id":  "provider:copilot-proxy",
+                      "id":  "copilot-proxy",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/copilot-proxy/openclaw.plugin.json",
+                      "plugin_id":  "copilot-proxy"
+                  },
+                  {
+                      "record_id":  "provider:fal",
+                      "id":  "fal",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/fal/openclaw.plugin.json",
+                      "plugin_id":  "fal"
+                  },
+                  {
+                      "record_id":  "provider:featherless",
+                      "id":  "featherless",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/featherless/openclaw.plugin.json",
+                      "plugin_id":  "featherless"
+                  },
+                  {
+                      "record_id":  "provider:deepinfra",
+                      "id":  "deepinfra",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/deepinfra/openclaw.plugin.json",
+                      "plugin_id":  "deepinfra"
+                  },
+                  {
+                      "record_id":  "provider:deepseek",
+                      "id":  "deepseek",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/deepseek/openclaw.plugin.json",
+                      "plugin_id":  "deepseek"
+                  },
+                  {
+                      "record_id":  "provider:clawrouter",
+                      "id":  "clawrouter",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/clawrouter/openclaw.plugin.json",
+                      "plugin_id":  "clawrouter"
+                  },
+                  {
+                      "record_id":  "provider:anthropic",
+                      "id":  "anthropic",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/anthropic/openclaw.plugin.json",
+                      "plugin_id":  "anthropic"
+                  },
+                  {
+                      "record_id":  "provider:anthropic-vertex",
+                      "id":  "anthropic-vertex",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/anthropic-vertex/openclaw.plugin.json",
+                      "plugin_id":  "anthropic-vertex"
+                  },
+                  {
+                      "record_id":  "provider:amazon-bedrock",
+                      "id":  "amazon-bedrock",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/amazon-bedrock/openclaw.plugin.json",
+                      "plugin_id":  "amazon-bedrock"
+                  },
+                  {
+                      "record_id":  "provider:amazon-bedrock-mantle",
+                      "id":  "amazon-bedrock-mantle",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/amazon-bedrock-mantle/openclaw.plugin.json",
+                      "plugin_id":  "amazon-bedrock-mantle"
+                  },
+                  {
+                      "record_id":  "provider:arcee",
+                      "id":  "arcee",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/arcee/openclaw.plugin.json",
+                      "plugin_id":  "arcee"
+                  },
+                  {
+                      "record_id":  "provider:cerebras",
+                      "id":  "cerebras",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/cerebras/openclaw.plugin.json",
+                      "plugin_id":  "cerebras"
+                  },
+                  {
+                      "record_id":  "provider:chutes",
+                      "id":  "chutes",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/chutes/openclaw.plugin.json",
+                      "plugin_id":  "chutes"
+                  },
+                  {
+                      "record_id":  "provider:byteplus",
+                      "id":  "byteplus",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/byteplus/openclaw.plugin.json",
+                      "plugin_id":  "byteplus"
+                  },
+                  {
+                      "record_id":  "provider:byteplus-plan",
+                      "id":  "byteplus-plan",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/byteplus/openclaw.plugin.json",
+                      "plugin_id":  "byteplus"
+                  },
+                  {
+                      "record_id":  "provider:fireworks",
+                      "id":  "fireworks",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/fireworks/openclaw.plugin.json",
+                      "plugin_id":  "fireworks"
+                  },
+                  {
+                      "record_id":  "provider:litellm",
+                      "id":  "litellm",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/litellm/openclaw.plugin.json",
+                      "plugin_id":  "litellm"
+                  },
+                  {
+                      "record_id":  "provider:lmstudio",
+                      "id":  "lmstudio",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/lmstudio/openclaw.plugin.json",
+                      "plugin_id":  "lmstudio"
+                  },
+                  {
+                      "record_id":  "provider:kimi",
+                      "id":  "kimi",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/kimi-coding/openclaw.plugin.json",
+                      "plugin_id":  "kimi"
+                  },
+                  {
+                      "record_id":  "provider:kimi-coding",
+                      "id":  "kimi-coding",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/kimi-coding/openclaw.plugin.json",
+                      "plugin_id":  "kimi"
+                  },
+                  {
+                      "record_id":  "provider:longcat",
+                      "id":  "longcat",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/longcat/openclaw.plugin.json",
+                      "plugin_id":  "longcat"
+                  },
+                  {
+                      "record_id":  "provider:minimax",
+                      "id":  "minimax",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/minimax/openclaw.plugin.json",
+                      "plugin_id":  "minimax"
+                  },
+                  {
+                      "record_id":  "provider:minimax-portal",
+                      "id":  "minimax-portal",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/minimax/openclaw.plugin.json",
+                      "plugin_id":  "minimax"
+                  },
+                  {
+                      "record_id":  "provider:meta",
+                      "id":  "meta",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/meta/openclaw.plugin.json",
+                      "plugin_id":  "meta"
+                  },
+                  {
+                      "record_id":  "provider:microsoft-foundry",
+                      "id":  "microsoft-foundry",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/microsoft-foundry/openclaw.plugin.json",
+                      "plugin_id":  "microsoft-foundry"
+                  },
+                  {
+                      "record_id":  "provider:kilocode",
+                      "id":  "kilocode",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/kilocode/openclaw.plugin.json",
+                      "plugin_id":  "kilocode"
+                  },
+                  {
+                      "record_id":  "provider:gmi-cloud",
+                      "id":  "gmi-cloud",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/gmi/openclaw.plugin.json",
+                      "plugin_id":  "gmi"
+                  },
+                  {
+                      "record_id":  "provider:gmicloud",
+                      "id":  "gmicloud",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/gmi/openclaw.plugin.json",
+                      "plugin_id":  "gmi"
+                  },
+                  {
+                      "record_id":  "provider:github-copilot",
+                      "id":  "github-copilot",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/github-copilot/openclaw.plugin.json",
+                      "plugin_id":  "github-copilot"
+                  },
+                  {
+                      "record_id":  "provider:gmi",
+                      "id":  "gmi",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/gmi/openclaw.plugin.json",
+                      "plugin_id":  "gmi"
+                  },
+                  {
+                      "record_id":  "provider:google",
+                      "id":  "google",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/google/openclaw.plugin.json",
+                      "plugin_id":  "google"
+                  },
+                  {
+                      "record_id":  "provider:groq",
+                      "id":  "groq",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/groq/openclaw.plugin.json",
+                      "plugin_id":  "groq"
+                  },
+                  {
+                      "record_id":  "provider:huggingface",
+                      "id":  "huggingface",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/huggingface/openclaw.plugin.json",
+                      "plugin_id":  "huggingface"
+                  },
+                  {
+                      "record_id":  "provider:google-gemini-cli",
+                      "id":  "google-gemini-cli",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/google/openclaw.plugin.json",
+                      "plugin_id":  "google"
+                  },
+                  {
+                      "record_id":  "provider:google-vertex",
+                      "id":  "google-vertex",
+                      "classification":  "official_integration",
+                      "source_path":  "extensions/google/openclaw.plugin.json",
+                      "plugin_id":  "google"
+                  }
+              ]
+}

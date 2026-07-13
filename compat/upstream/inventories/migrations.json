@@ -1,0 +1,35 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "migrations",
+    "classification":  "official_client_interop",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  3
+               },
+    "items":  [
+                  {
+                      "record_id":  "migration:claude",
+                      "id":  "claude",
+                      "classification":  "official_client_interop",
+                      "source_path":  "extensions/migrate-claude/provider.ts",
+                      "package_path":  "extensions/migrate-claude",
+                      "kind":  "migration_provider"
+                  },
+                  {
+                      "record_id":  "migration:codex",
+                      "id":  "codex",
+                      "classification":  "official_client_interop",
+                      "source_path":  "extensions/codex/src/migration/provider.ts",
+                      "package_path":  "extensions/codex",
+                      "kind":  "migration_provider"
+                  },
+                  {
+                      "record_id":  "migration:hermes",
+                      "id":  "hermes",
+                      "classification":  "official_client_interop",
+                      "source_path":  "extensions/migrate-hermes/provider.ts",
+                      "package_path":  "extensions/migrate-hermes",
+                      "kind":  "migration_provider"
+                  }
+              ]
+}

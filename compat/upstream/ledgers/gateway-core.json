@@ -1,0 +1,439 @@
+﻿{
+    "schema_version":  1,
+    "ledger_id":  "gateway-core",
+    "classification":  "gateway_core",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "features":  [
+                     {
+                         "feature_id":  "gateway.protocol.v4",
+                         "title":  "Gateway protocol v4",
+                         "domain":  "gateway.protocol",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "packages/gateway-protocol/src/version.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "A Rust protocol constant test proves v4 negotiation and rejects unsupported general-client versions."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.protocol.node-v3-window",
+                         "title":  "Gateway node N-1 protocol window",
+                         "domain":  "gateway.protocol",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "packages/gateway-protocol/src/version.ts",
+                                                               "docs/gateway/protocol.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Handshake tests prove authenticated node-mode v3 acceptance while general clients remain v4-only."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.protocol.frames-handshake",
+                         "title":  "Gateway frames and handshake",
+                         "domain":  "gateway.protocol",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "packages/gateway-protocol/src/schema/frames.ts",
+                                                               "docs/gateway/protocol.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Golden-frame tests cover connect.challenge, connect, hello-ok, req, res, event, limits, and error cases."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.protocol.methods",
+                         "title":  "Gateway method catalog",
+                         "domain":  "gateway.protocol",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/methods/core-descriptors.ts",
+                                                               "src/gateway/server-methods-list.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Generated Rust catalog matches every pinned core method name, scope, and advertised flag."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.protocol.events",
+                         "title":  "Gateway event catalog",
+                         "domain":  "gateway.protocol",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/server-methods-list.ts",
+                                                               "src/gateway/events.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Generated Rust event catalog and event-envelope tests match all pinned events."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.auth.roles-scopes",
+                         "title":  "Gateway roles and operator scopes",
+                         "domain":  "gateway.authorization",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/role-policy.ts",
+                                                               "src/gateway/operator-scopes.ts",
+                                                               "docs/gateway/protocol.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Authorization matrix tests cover operator, node, worker, and all six closed operator scopes."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.http.probes",
+                         "title":  "Gateway liveness and readiness HTTP probes",
+                         "domain":  "gateway.http",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/server-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "HTTP tests prove /health, /healthz, /ready, and /readyz status and draining behavior."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.http.watch-node",
+                         "title":  "Watch-node HTTP transport",
+                         "domain":  "gateway.http",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/gateway/watch-node-http.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Transport tests cover challenge, connect, disconnect, long poll, result, authentication, and queue limits."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.config.domains",
+                         "title":  "Top-level configuration domains",
+                         "domain":  "configuration",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/config/types.openclaw.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Rust config fixtures deserialize every pinned top-level domain and reject unknown contract-breaking shapes."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.context-engine.spi",
+                         "title":  "Context-engine SPI",
+                         "domain":  "context_engine",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "src/context-engine/types.ts",
+                                                               "docs/concepts/context-engine.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "A Rust SPI conformance harness proves bootstrap, ingest, assemble, maintain, and compact lifecycle behavior."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.commands.directives",
+                         "title":  "Commands and directives",
+                         "domain":  "commands",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/tools/slash-commands.md",
+                                                               "src/auto-reply/reply/directives.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Command registry and directive parsing golden tests match pinned aliases, authorization, and inline behavior."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.goals.durable",
+                         "title":  "Durable session goals",
+                         "domain":  "goals",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/tools/goal.md",
+                                                               "src/config/sessions/goals.ts",
+                                                               "src/agents/tools/goal-tools.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Restart, compaction, command, model-tool, budget, and status transition tests prove durable goal behavior."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.crestodian",
+                         "title":  "Crestodian setup and rescue",
+                         "domain":  "crestodian",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "docs/cli/crestodian.md",
+                                                               "src/crestodian/crestodian.ts",
+                                                               "src/config/types.crestodian.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Ring-zero tool, typed mutation, rescue grammar, owner-DM, and restart acceptance tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.admin.http-rpc",
+                         "title":  "Admin HTTP RPC",
+                         "domain":  "administration",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "extensions/admin-http-rpc/index.ts",
+                                                               "extensions/admin-http-rpc/src/handler.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Authenticated POST /api/v1/admin/rpc dispatch tests prove method policy and error mapping."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.suspend.cooperative",
+                         "title":  "Cooperative host suspension",
+                         "domain":  "administration",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "packages/gateway-protocol/src/schema/gateway-suspend.ts",
+                                                               "src/gateway/server-methods.ts"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Prepare, busy, lease expiry, status, resume, and draining integration tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     },
+                     {
+                         "feature_id":  "gateway.worker.closed-protocol",
+                         "title":  "Closed worker protocol",
+                         "domain":  "gateway.worker",
+                         "tier":  "tier_1",
+                         "profile":  "core_gateway",
+                         "classification":  "gateway_core",
+                         "upstream_source":  {
+                                                 "repository":  "openclaw/openclaw",
+                                                 "paths":  [
+                                                               "packages/gateway-protocol/src/schema/worker-admission.ts",
+                                                               "docs/gateway/protocol.md"
+                                                           ]
+                                             },
+                         "status":  "unimplemented",
+                         "acceptance_evidence":  {
+                                                     "status":  "missing",
+                                                     "artifacts":  [
+
+                                                                   ],
+                                                     "required":  "Admission, fencing, expiry, RPC allowlist, replay, and payload-limit tests pass."
+                                                 },
+                         "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+                         "known_differences":  [
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+                                               ]
+                     }
+                 ]
+}

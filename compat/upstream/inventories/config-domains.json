@@ -1,0 +1,293 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "config-domains",
+    "classification":  "gateway_core",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  47
+               },
+    "items":  [
+                  {
+                      "record_id":  "config_domain:$schema",
+                      "id":  "$schema",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:meta",
+                      "id":  "meta",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:auth",
+                      "id":  "auth",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:accessGroups",
+                      "id":  "accessGroups",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:acp",
+                      "id":  "acp",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:env",
+                      "id":  "env",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:wizard",
+                      "id":  "wizard",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:diagnostics",
+                      "id":  "diagnostics",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:logging",
+                      "id":  "logging",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:audit",
+                      "id":  "audit",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:security",
+                      "id":  "security",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:cli",
+                      "id":  "cli",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:crestodian",
+                      "id":  "crestodian",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:update",
+                      "id":  "update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:browser",
+                      "id":  "browser",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:ui",
+                      "id":  "ui",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:tui",
+                      "id":  "tui",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:secrets",
+                      "id":  "secrets",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:marketplaces",
+                      "id":  "marketplaces",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:skills",
+                      "id":  "skills",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:plugins",
+                      "id":  "plugins",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:surfaces",
+                      "id":  "surfaces",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:models",
+                      "id":  "models",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:nodeHost",
+                      "id":  "nodeHost",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:agents",
+                      "id":  "agents",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:tools",
+                      "id":  "tools",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:bindings",
+                      "id":  "bindings",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:broadcast",
+                      "id":  "broadcast",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:audio",
+                      "id":  "audio",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:media",
+                      "id":  "media",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:messages",
+                      "id":  "messages",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:commands",
+                      "id":  "commands",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:approvals",
+                      "id":  "approvals",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:session",
+                      "id":  "session",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:web",
+                      "id":  "web",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:channels",
+                      "id":  "channels",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:cron",
+                      "id":  "cron",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:transcripts",
+                      "id":  "transcripts",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:commitments",
+                      "id":  "commitments",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:hooks",
+                      "id":  "hooks",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:discovery",
+                      "id":  "discovery",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:talk",
+                      "id":  "talk",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:gateway",
+                      "id":  "gateway",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:cloudWorkers",
+                      "id":  "cloudWorkers",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:memory",
+                      "id":  "memory",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:mcp",
+                      "id":  "mcp",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  },
+                  {
+                      "record_id":  "config_domain:proxy",
+                      "id":  "proxy",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/config/types.openclaw.ts"
+                  }
+              ]
+}

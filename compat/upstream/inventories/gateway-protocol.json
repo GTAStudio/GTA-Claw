@@ -1,0 +1,2816 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "gateway-protocol",
+    "classification":  "gateway_core",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  320,
+                   "methods":  278,
+                   "advertised_methods":  258,
+                   "events":  33,
+                   "roles":  3,
+                   "scopes":  6,
+                   "dynamic_plugin_methods":  "runtime-dependent"
+               },
+    "items":  [
+                  {
+                      "record_id":  "gateway_method:health",
+                      "id":  "health",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:diagnostics.stability",
+                      "id":  "diagnostics.stability",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.status",
+                      "id":  "doctor.memory.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.dreamDiary",
+                      "id":  "doctor.memory.dreamDiary",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.backfillDreamDiary",
+                      "id":  "doctor.memory.backfillDreamDiary",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.resetDreamDiary",
+                      "id":  "doctor.memory.resetDreamDiary",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.resetGroundedShortTerm",
+                      "id":  "doctor.memory.resetGroundedShortTerm",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.repairDreamingArtifacts",
+                      "id":  "doctor.memory.repairDreamingArtifacts",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.dedupeDreamDiary",
+                      "id":  "doctor.memory.dedupeDreamDiary",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:doctor.memory.remHarness",
+                      "id":  "doctor.memory.remHarness",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:logs.tail",
+                      "id":  "logs.tail",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:channels.status",
+                      "id":  "channels.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:channels.start",
+                      "id":  "channels.start",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:channels.stop",
+                      "id":  "channels.stop",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:channels.logout",
+                      "id":  "channels.logout",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:status",
+                      "id":  "status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:usage.status",
+                      "id":  "usage.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:usage.cost",
+                      "id":  "usage.cost",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.status",
+                      "id":  "tts.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.providers",
+                      "id":  "tts.providers",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.personas",
+                      "id":  "tts.personas",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.enable",
+                      "id":  "tts.enable",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.disable",
+                      "id":  "tts.disable",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.convert",
+                      "id":  "tts.convert",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.setProvider",
+                      "id":  "tts.setProvider",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.setPersona",
+                      "id":  "tts.setPersona",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:config.get",
+                      "id":  "config.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:config.set",
+                      "id":  "config.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:config.apply",
+                      "id":  "config.apply",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:config.patch",
+                      "id":  "config.patch",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:config.schema",
+                      "id":  "config.schema",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:config.schema.lookup",
+                      "id":  "config.schema.lookup",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approvals.get",
+                      "id":  "exec.approvals.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approvals.set",
+                      "id":  "exec.approvals.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approvals.node.get",
+                      "id":  "exec.approvals.node.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approvals.node.set",
+                      "id":  "exec.approvals.node.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approval.get",
+                      "id":  "exec.approval.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approval.list",
+                      "id":  "exec.approval.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approval.request",
+                      "id":  "exec.approval.request",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approval.waitDecision",
+                      "id":  "exec.approval.waitDecision",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:exec.approval.resolve",
+                      "id":  "exec.approval.resolve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugin.approval.list",
+                      "id":  "plugin.approval.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugin.approval.request",
+                      "id":  "plugin.approval.request",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugin.approval.waitDecision",
+                      "id":  "plugin.approval.waitDecision",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugin.approval.resolve",
+                      "id":  "plugin.approval.resolve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.uiDescriptors",
+                      "id":  "plugins.uiDescriptors",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.sessionAction",
+                      "id":  "plugins.sessionAction",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "dynamic",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:crestodian.chat",
+                      "id":  "crestodian.chat",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:crestodian.setup.detect",
+                      "id":  "crestodian.setup.detect",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:crestodian.setup.activate",
+                      "id":  "crestodian.setup.activate",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:crestodian.setup.auth.start",
+                      "id":  "crestodian.setup.auth.start",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:wizard.start",
+                      "id":  "wizard.start",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:wizard.next",
+                      "id":  "wizard.next",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:wizard.cancel",
+                      "id":  "wizard.cancel",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:wizard.status",
+                      "id":  "wizard.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.catalog",
+                      "id":  "talk.catalog",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.config",
+                      "id":  "talk.config",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.client.create",
+                      "id":  "talk.client.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.client.toolCall",
+                      "id":  "talk.client.toolCall",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.client.steer",
+                      "id":  "talk.client.steer",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.create",
+                      "id":  "talk.session.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.join",
+                      "id":  "talk.session.join",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.appendAudio",
+                      "id":  "talk.session.appendAudio",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.startTurn",
+                      "id":  "talk.session.startTurn",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.endTurn",
+                      "id":  "talk.session.endTurn",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.cancelTurn",
+                      "id":  "talk.session.cancelTurn",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.cancelOutput",
+                      "id":  "talk.session.cancelOutput",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.submitToolResult",
+                      "id":  "talk.session.submitToolResult",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.steer",
+                      "id":  "talk.session.steer",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.session.close",
+                      "id":  "talk.session.close",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.speak",
+                      "id":  "talk.speak",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:talk.mode",
+                      "id":  "talk.mode",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:commands.list",
+                      "id":  "commands.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:models.list",
+                      "id":  "models.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:models.authStatus",
+                      "id":  "models.authStatus",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:models.authLogout",
+                      "id":  "models.authLogout",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tools.catalog",
+                      "id":  "tools.catalog",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tools.effective",
+                      "id":  "tools.effective",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tools.invoke",
+                      "id":  "tools.invoke",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:mcp.app.view",
+                      "id":  "mcp.app.view",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:mcp.app.listTools",
+                      "id":  "mcp.app.listTools",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:mcp.app.listResources",
+                      "id":  "mcp.app.listResources",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:mcp.app.listResourceTemplates",
+                      "id":  "mcp.app.listResourceTemplates",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:mcp.app.readResource",
+                      "id":  "mcp.app.readResource",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:mcp.app.callTool",
+                      "id":  "mcp.app.callTool",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:audit.list",
+                      "id":  "audit.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:audit.activity.list",
+                      "id":  "audit.activity.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tasks.list",
+                      "id":  "tasks.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tasks.get",
+                      "id":  "tasks.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tasks.cancel",
+                      "id":  "tasks.cancel",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:taskSuggestions.list",
+                      "id":  "taskSuggestions.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:taskSuggestions.create",
+                      "id":  "taskSuggestions.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:taskSuggestions.accept",
+                      "id":  "taskSuggestions.accept",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:taskSuggestions.dismiss",
+                      "id":  "taskSuggestions.dismiss",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:environments.list",
+                      "id":  "environments.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:environments.status",
+                      "id":  "environments.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:worktrees.list",
+                      "id":  "worktrees.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:worktrees.branches",
+                      "id":  "worktrees.branches",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:fs.listDir",
+                      "id":  "fs.listDir",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:worktrees.create",
+                      "id":  "worktrees.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:worktrees.remove",
+                      "id":  "worktrees.remove",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:worktrees.restore",
+                      "id":  "worktrees.restore",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:worktrees.gc",
+                      "id":  "worktrees.gc",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.list",
+                      "id":  "agents.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.create",
+                      "id":  "agents.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.update",
+                      "id":  "agents.update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.delete",
+                      "id":  "agents.delete",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.files.list",
+                      "id":  "agents.files.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.files.get",
+                      "id":  "agents.files.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.files.set",
+                      "id":  "agents.files.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.files.list",
+                      "id":  "sessions.files.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.files.get",
+                      "id":  "sessions.files.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.files.set",
+                      "id":  "sessions.files.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:artifacts.list",
+                      "id":  "artifacts.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:artifacts.get",
+                      "id":  "artifacts.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:artifacts.download",
+                      "id":  "artifacts.download",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.status",
+                      "id":  "skills.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.search",
+                      "id":  "skills.search",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.detail",
+                      "id":  "skills.detail",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.securityVerdicts",
+                      "id":  "skills.securityVerdicts",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.skillCard",
+                      "id":  "skills.skillCard",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.bins",
+                      "id":  "skills.bins",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.upload.begin",
+                      "id":  "skills.upload.begin",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.upload.chunk",
+                      "id":  "skills.upload.chunk",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.upload.commit",
+                      "id":  "skills.upload.commit",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.install",
+                      "id":  "skills.install",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.update",
+                      "id":  "skills.update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.curator.status",
+                      "id":  "skills.curator.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.curator.pin",
+                      "id":  "skills.curator.pin",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.curator.unpin",
+                      "id":  "skills.curator.unpin",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.curator.restore",
+                      "id":  "skills.curator.restore",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.list",
+                      "id":  "skills.proposals.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.inspect",
+                      "id":  "skills.proposals.inspect",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.create",
+                      "id":  "skills.proposals.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.update",
+                      "id":  "skills.proposals.update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.revise",
+                      "id":  "skills.proposals.revise",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.requestRevision",
+                      "id":  "skills.proposals.requestRevision",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.apply",
+                      "id":  "skills.proposals.apply",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.reject",
+                      "id":  "skills.proposals.reject",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:skills.proposals.quarantine",
+                      "id":  "skills.proposals.quarantine",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:update.status",
+                      "id":  "update.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:update.run",
+                      "id":  "update.run",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:voicewake.get",
+                      "id":  "voicewake.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:voicewake.set",
+                      "id":  "voicewake.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:secrets.reload",
+                      "id":  "secrets.reload",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:secrets.resolve",
+                      "id":  "secrets.resolve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:voicewake.routing.get",
+                      "id":  "voicewake.routing.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:voicewake.routing.set",
+                      "id":  "voicewake.routing.set",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.list",
+                      "id":  "sessions.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.subscribe",
+                      "id":  "sessions.subscribe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.unsubscribe",
+                      "id":  "sessions.unsubscribe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.messages.subscribe",
+                      "id":  "sessions.messages.subscribe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.messages.unsubscribe",
+                      "id":  "sessions.messages.unsubscribe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.preview",
+                      "id":  "sessions.preview",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.describe",
+                      "id":  "sessions.describe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.compaction.list",
+                      "id":  "sessions.compaction.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.compaction.get",
+                      "id":  "sessions.compaction.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.compaction.branch",
+                      "id":  "sessions.compaction.branch",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.compaction.restore",
+                      "id":  "sessions.compaction.restore",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.create",
+                      "id":  "sessions.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "dynamic",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.send",
+                      "id":  "sessions.send",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.abort",
+                      "id":  "sessions.abort",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.patch",
+                      "id":  "sessions.patch",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "dynamic",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.pluginPatch",
+                      "id":  "sessions.pluginPatch",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.cleanup",
+                      "id":  "sessions.cleanup",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.reset",
+                      "id":  "sessions.reset",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.delete",
+                      "id":  "sessions.delete",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "dynamic",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.compact",
+                      "id":  "sessions.compact",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.groups.list",
+                      "id":  "sessions.groups.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.groups.put",
+                      "id":  "sessions.groups.put",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.groups.rename",
+                      "id":  "sessions.groups.rename",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.groups.delete",
+                      "id":  "sessions.groups.delete",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:last-heartbeat",
+                      "id":  "last-heartbeat",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:set-heartbeats",
+                      "id":  "set-heartbeats",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:wake",
+                      "id":  "wake",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pair.list",
+                      "id":  "node.pair.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pair.approve",
+                      "id":  "node.pair.approve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pair.reject",
+                      "id":  "node.pair.reject",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pair.remove",
+                      "id":  "node.pair.remove",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.pair.list",
+                      "id":  "device.pair.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.pair.approve",
+                      "id":  "device.pair.approve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.pair.reject",
+                      "id":  "device.pair.reject",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.pair.remove",
+                      "id":  "device.pair.remove",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.pair.rename",
+                      "id":  "device.pair.rename",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.token.rotate",
+                      "id":  "device.token.rotate",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.token.revoke",
+                      "id":  "device.token.revoke",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:device.pair.setupCode",
+                      "id":  "device.pair.setupCode",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:node.rename",
+                      "id":  "node.rename",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.pairing",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.list",
+                      "id":  "node.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.describe",
+                      "id":  "node.describe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pluginSurface.refresh",
+                      "id":  "node.pluginSurface.refresh",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pluginTools.update",
+                      "id":  "node.pluginTools.update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.skills.update",
+                      "id":  "node.skills.update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pending.drain",
+                      "id":  "node.pending.drain",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pending.enqueue",
+                      "id":  "node.pending.enqueue",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.invoke",
+                      "id":  "node.invoke",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pending.pull",
+                      "id":  "node.pending.pull",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.pending.ack",
+                      "id":  "node.pending.ack",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.invoke.result",
+                      "id":  "node.invoke.result",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:node.event",
+                      "id":  "node.event",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "node",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.get",
+                      "id":  "cron.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.list",
+                      "id":  "cron.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.status",
+                      "id":  "cron.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.add",
+                      "id":  "cron.add",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.update",
+                      "id":  "cron.update",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.remove",
+                      "id":  "cron.remove",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.run",
+                      "id":  "cron.run",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:cron.runs",
+                      "id":  "cron.runs",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:gateway.identity.get",
+                      "id":  "gateway.identity.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:gateway.restart.preflight",
+                      "id":  "gateway.restart.preflight",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:gateway.restart.request",
+                      "id":  "gateway.restart.request",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:system-presence",
+                      "id":  "system-presence",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:system-event",
+                      "id":  "system-event",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:message.action",
+                      "id":  "message.action",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:send",
+                      "id":  "send",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agent",
+                      "id":  "agent",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agent.identity.get",
+                      "id":  "agent.identity.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agent.wait",
+                      "id":  "agent.wait",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.history",
+                      "id":  "chat.history",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.startup",
+                      "id":  "chat.startup",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.metadata",
+                      "id":  "chat.metadata",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.message.get",
+                      "id":  "chat.message.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.abort",
+                      "id":  "chat.abort",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.send",
+                      "id":  "chat.send",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.open",
+                      "id":  "terminal.open",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.input",
+                      "id":  "terminal.input",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.resize",
+                      "id":  "terminal.resize",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.close",
+                      "id":  "terminal.close",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:assistant.media.get",
+                      "id":  "assistant.media.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.get",
+                      "id":  "sessions.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.resolve",
+                      "id":  "sessions.resolve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.usage",
+                      "id":  "sessions.usage",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.usage.timeseries",
+                      "id":  "sessions.usage.timeseries",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.usage.logs",
+                      "id":  "sessions.usage.logs",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:poll",
+                      "id":  "poll",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.steer",
+                      "id":  "sessions.steer",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:push.test",
+                      "id":  "push.test",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:attach.grant",
+                      "id":  "attach.grant",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:attach.revoke",
+                      "id":  "attach.revoke",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:push.web.vapidPublicKey",
+                      "id":  "push.web.vapidPublicKey",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:push.web.subscribe",
+                      "id":  "push.web.subscribe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:push.web.unsubscribe",
+                      "id":  "push.web.unsubscribe",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:push.web.test",
+                      "id":  "push.web.test",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:config.openFile",
+                      "id":  "config.openFile",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:connect",
+                      "id":  "connect",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.inject",
+                      "id":  "chat.inject",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:nativeHook.invoke",
+                      "id":  "nativeHook.invoke",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:web.login.start",
+                      "id":  "web.login.start",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:web.login.wait",
+                      "id":  "web.login.wait",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  false
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.attach",
+                      "id":  "terminal.attach",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.list",
+                      "id":  "terminal.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:terminal.text",
+                      "id":  "terminal.text",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:controlUi.githubPreview",
+                      "id":  "controlUi.githubPreview",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:system.info",
+                      "id":  "system.info",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.workspace.list",
+                      "id":  "agents.workspace.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:agents.workspace.get",
+                      "id":  "agents.workspace.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:tts.speak",
+                      "id":  "tts.speak",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.list",
+                      "id":  "plugins.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.search",
+                      "id":  "plugins.search",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.install",
+                      "id":  "plugins.install",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.setEnabled",
+                      "id":  "plugins.setEnabled",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:plugins.uninstall",
+                      "id":  "plugins.uninstall",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:controlUi.sessionPullRequests",
+                      "id":  "controlUi.sessionPullRequests",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:gateway.suspend.prepare",
+                      "id":  "gateway.suspend.prepare",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:gateway.suspend.status",
+                      "id":  "gateway.suspend.status",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:gateway.suspend.resume",
+                      "id":  "gateway.suspend.resume",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:chat.toolTitles",
+                      "id":  "chat.toolTitles",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.diff",
+                      "id":  "sessions.diff",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:crestodian.setup.verify",
+                      "id":  "crestodian.setup.verify",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:environments.create",
+                      "id":  "environments.create",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:environments.destroy",
+                      "id":  "environments.destroy",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.admin",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.catalog.list",
+                      "id":  "sessions.catalog.list",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.catalog.read",
+                      "id":  "sessions.catalog.read",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.catalog.continue",
+                      "id":  "sessions.catalog.continue",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.catalog.archive",
+                      "id":  "sessions.catalog.archive",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.write",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:approval.get",
+                      "id":  "approval.get",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:approval.resolve",
+                      "id":  "approval.resolve",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.approvals",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_method:sessions.search",
+                      "id":  "sessions.search",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/methods/core-descriptors.ts",
+                      "kind":  "method",
+                      "scope":  "operator.read",
+                      "advertised":  true
+                  },
+                  {
+                      "record_id":  "gateway_event:connect.challenge",
+                      "id":  "connect.challenge",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:agent",
+                      "id":  "agent",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:chat",
+                      "id":  "chat",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:session.approval",
+                      "id":  "session.approval",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:session.message",
+                      "id":  "session.message",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:session.operation",
+                      "id":  "session.operation",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:session.tool",
+                      "id":  "session.tool",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:sessions.changed",
+                      "id":  "sessions.changed",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:presence",
+                      "id":  "presence",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:tick",
+                      "id":  "tick",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:talk.mode",
+                      "id":  "talk.mode",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:talk.event",
+                      "id":  "talk.event",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:shutdown",
+                      "id":  "shutdown",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:health",
+                      "id":  "health",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:heartbeat",
+                      "id":  "heartbeat",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:cron",
+                      "id":  "cron",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:task",
+                      "id":  "task",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:task.suggestion",
+                      "id":  "task.suggestion",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:node.pair.requested",
+                      "id":  "node.pair.requested",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:node.pair.resolved",
+                      "id":  "node.pair.resolved",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:node.presence",
+                      "id":  "node.presence",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:node.invoke.request",
+                      "id":  "node.invoke.request",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:device.pair.requested",
+                      "id":  "device.pair.requested",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:device.pair.resolved",
+                      "id":  "device.pair.resolved",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:voicewake.changed",
+                      "id":  "voicewake.changed",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:voicewake.routing.changed",
+                      "id":  "voicewake.routing.changed",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:exec.approval.requested",
+                      "id":  "exec.approval.requested",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:exec.approval.resolved",
+                      "id":  "exec.approval.resolved",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:plugin.approval.requested",
+                      "id":  "plugin.approval.requested",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:plugin.approval.resolved",
+                      "id":  "plugin.approval.resolved",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:terminal.data",
+                      "id":  "terminal.data",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:terminal.exit",
+                      "id":  "terminal.exit",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/server-methods-list.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_event:update.available",
+                      "id":  "update.available",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/events.ts",
+                      "kind":  "event"
+                  },
+                  {
+                      "record_id":  "gateway_role:operator",
+                      "id":  "operator",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/role-policy.ts",
+                      "kind":  "role",
+                      "protocol_class":  "gateway"
+                  },
+                  {
+                      "record_id":  "gateway_role:node",
+                      "id":  "node",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/role-policy.ts",
+                      "kind":  "role",
+                      "protocol_class":  "gateway"
+                  },
+                  {
+                      "record_id":  "gateway_role:worker",
+                      "id":  "worker",
+                      "classification":  "gateway_core",
+                      "source_path":  "docs/gateway/protocol.md",
+                      "kind":  "role",
+                      "protocol_class":  "closed_worker"
+                  },
+                  {
+                      "record_id":  "gateway_scope:operator.admin",
+                      "id":  "operator.admin",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/operator-scopes.ts",
+                      "kind":  "scope"
+                  },
+                  {
+                      "record_id":  "gateway_scope:operator.read",
+                      "id":  "operator.read",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/operator-scopes.ts",
+                      "kind":  "scope"
+                  },
+                  {
+                      "record_id":  "gateway_scope:operator.write",
+                      "id":  "operator.write",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/operator-scopes.ts",
+                      "kind":  "scope"
+                  },
+                  {
+                      "record_id":  "gateway_scope:operator.approvals",
+                      "id":  "operator.approvals",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/operator-scopes.ts",
+                      "kind":  "scope"
+                  },
+                  {
+                      "record_id":  "gateway_scope:operator.pairing",
+                      "id":  "operator.pairing",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/operator-scopes.ts",
+                      "kind":  "scope"
+                  },
+                  {
+                      "record_id":  "gateway_scope:operator.talk.secrets",
+                      "id":  "operator.talk.secrets",
+                      "classification":  "gateway_core",
+                      "source_path":  "src/gateway/operator-scopes.ts",
+                      "kind":  "scope"
+                  }
+              ]
+}

@@ -1,0 +1,369 @@
+﻿{
+    "schema_version":  1,
+    "inventory_id":  "skills",
+    "classification":  "official_integration",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "counts":  {
+                   "total":  51,
+                   "bundled":  51
+               },
+    "items":  [
+                  {
+                      "record_id":  "skill:1password",
+                      "id":  "1password",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/1password/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:apple-notes",
+                      "id":  "apple-notes",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/apple-notes/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:apple-reminders",
+                      "id":  "apple-reminders",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/apple-reminders/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:bear-notes",
+                      "id":  "bear-notes",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/bear-notes/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:blogwatcher",
+                      "id":  "blogwatcher",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/blogwatcher/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:blucli",
+                      "id":  "blucli",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/blucli/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:camsnap",
+                      "id":  "camsnap",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/camsnap/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:clawhub",
+                      "id":  "clawhub",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/clawhub/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:coding-agent",
+                      "id":  "coding-agent",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/coding-agent/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:diagram-maker",
+                      "id":  "diagram-maker",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/diagram-maker/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:eightctl",
+                      "id":  "eightctl",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/eightctl/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:gemini",
+                      "id":  "gemini",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/gemini/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:gh-issues",
+                      "id":  "gh-issues",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/gh-issues/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:gifgrep",
+                      "id":  "gifgrep",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/gifgrep/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:github",
+                      "id":  "github",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/github/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:gog",
+                      "id":  "gog",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/gog/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:goplaces",
+                      "id":  "goplaces",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/goplaces/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:healthcheck",
+                      "id":  "healthcheck",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/healthcheck/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:himalaya",
+                      "id":  "himalaya",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/himalaya/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:mcporter",
+                      "id":  "mcporter",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/mcporter/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:meme-maker",
+                      "id":  "meme-maker",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/meme-maker/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:model-usage",
+                      "id":  "model-usage",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/model-usage/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:nano-pdf",
+                      "id":  "nano-pdf",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/nano-pdf/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:node-connect",
+                      "id":  "node-connect",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/node-connect/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:node-inspect-debugger",
+                      "id":  "node-inspect-debugger",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/node-inspect-debugger/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:notion",
+                      "id":  "notion",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/notion/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:obsidian",
+                      "id":  "obsidian",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/obsidian/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:openai-whisper",
+                      "id":  "openai-whisper",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/openai-whisper/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:openai-whisper-api",
+                      "id":  "openai-whisper-api",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/openai-whisper-api/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:openhue",
+                      "id":  "openhue",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/openhue/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:oracle",
+                      "id":  "oracle",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/oracle/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:ordercli",
+                      "id":  "ordercli",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/ordercli/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:peekaboo",
+                      "id":  "peekaboo",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/peekaboo/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:python-debugpy",
+                      "id":  "python-debugpy",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/python-debugpy/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:sag",
+                      "id":  "sag",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/sag/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:session-logs",
+                      "id":  "session-logs",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/session-logs/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:sherpa-onnx-tts",
+                      "id":  "sherpa-onnx-tts",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/sherpa-onnx-tts/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:skill-creator",
+                      "id":  "skill-creator",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/skill-creator/SKILL.md",
+                      "license":  "Apache-2.0"
+                  },
+                  {
+                      "record_id":  "skill:songsee",
+                      "id":  "songsee",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/songsee/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:sonoscli",
+                      "id":  "sonoscli",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/sonoscli/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:spike",
+                      "id":  "spike",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/spike/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:spotify-player",
+                      "id":  "spotify-player",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/spotify-player/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:summarize",
+                      "id":  "summarize",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/summarize/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:taskflow",
+                      "id":  "taskflow",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/taskflow/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:taskflow-inbox-triage",
+                      "id":  "taskflow-inbox-triage",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/taskflow-inbox-triage/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:things-mac",
+                      "id":  "things-mac",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/things-mac/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:tmux",
+                      "id":  "tmux",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/tmux/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:trello",
+                      "id":  "trello",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/trello/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:video-frames",
+                      "id":  "video-frames",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/video-frames/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:weather",
+                      "id":  "weather",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/weather/SKILL.md",
+                      "license":  "MIT"
+                  },
+                  {
+                      "record_id":  "skill:xurl",
+                      "id":  "xurl",
+                      "classification":  "official_integration",
+                      "source_path":  "skills/xurl/SKILL.md",
+                      "license":  "MIT"
+                  }
+              ]
+}
