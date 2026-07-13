@@ -221,7 +221,7 @@ function Has-Property {
         [object]$Value,
         [string]$Name
     )
-    return (Get-PropertyNames $Value) -contains $Name
+    return (Get-PropertyNames $Value) -ccontains $Name
 }
 
 function Get-PropertyValue {
@@ -252,37 +252,11 @@ function Assert-ExactPropertySet {
         [string]$Context
     )
     $actual = @(Get-PropertyNames $Value)
-    $missing = @($Expected | Where-Object { $actual -notcontains $_ })
-    $unexpected = @($actual | Where-Object { $Expected -notcontains $_ })
+    $missing = @($Expected | Where-Object { $actual -cnotcontains $_ })
+    $unexpected = @($actual | Where-Object { $Expected -cnotcontains $_ })
     if ($missing.Count -gt 0 -or $unexpected.Count -gt 0) {
         Fail "$Context property mismatch; missing=[$($missing -join ',')], unexpected=[$($unexpected -join ',')]"
     }
-    Assert-ExactProperties $entry[0] @("path", "classification", "expected_features") @("path", "classification", "expected_features") "manifest ledger '$($contract.Path)'"
-}
-foreach ($contract in $InventoryContracts) {
-    $entry = @($manifest.inventories | Where-Object { $_.path -ceq $contract.Path })
-    if ($entry.Count -ne 1 -or [int]$entry[0].expected_items -ne $contract.Items) {
-        Fail "manifest inventory contract mismatch for '$($contract.Path)'"
-    }
-    Assert-ExactProperties $entry[0] @("path", "expected_items") @("path", "expected_items") "manifest inventory '$($contract.Path)'"
-}
-$expectedCanonicalCounts = [ordered]@{
-    core_plugins = 64
-    official_external_plugins = 70
-    source_only_qa_plugins = 3
-    bundled_skills = 51
-    gateway_methods = 278
-    gateway_events = 33
-    config_domains = 47
-    providers = 78
-    channels = 29
-}
-Assert-HashtableEquals $manifest.canonical_counts $expectedCanonicalCounts "manifest.canonical_counts"
-Assert-ExactProperties $manifest.evidence_policy @("initial_status", "acceptance_evidence_state", "legacy_typescript_is_not_rust_acceptance_evidence") @("initial_status", "acceptance_evidence_state", "legacy_typescript_is_not_rust_acceptance_evidence") "manifest.evidence_policy"
-if ($manifest.evidence_policy.initial_status -cne "unimplemented" -or
-    $manifest.evidence_policy.acceptance_evidence_state -cne "missing" -or
-    $manifest.evidence_policy.legacy_typescript_is_not_rust_acceptance_evidence -ne $true) {
-    Fail "manifest evidence policy mismatch"
 }
 
 function Assert-RequiredProperties {
@@ -292,7 +266,7 @@ function Assert-RequiredProperties {
         [string]$Context
     )
     $actual = @(Get-PropertyNames $Value)
-    $missing = @($Required | Where-Object { $actual -notcontains $_ })
+    $missing = @($Required | Where-Object { $actual -cnotcontains $_ })
     if ($missing.Count -gt 0) {
         Fail "$Context missing required properties [$($missing -join ',')]"
     }
@@ -474,13 +448,15 @@ function Assert-JsonSchema {
         }
         if (Has-Property $SchemaNode "pattern") {
             $pattern = [string](Get-PropertyValue $SchemaNode "pattern")
-            if ($Instance -notmatch $pattern) {
+            if ($Instance -cnotmatch $pattern) {
                 Fail "$Path does not match JSON Schema pattern $pattern"
             }
         }
-        if ((Get-PropertyValue $SchemaNode "format") -eq "uri") {
+        if ((Get-PropertyValue $SchemaNode "format") -ceq "uri") {
             $uri = $null
-            if (-not [Uri]::TryCreate($Instance, [UriKind]::Absolute, [ref]$uri)) {
+            if ($Instance -cnotmatch "^[A-Za-z][A-Za-z0-9+.-]*:[^\s\\]*$" -or
+                -not [Uri]::IsWellFormedUriString($Instance, [UriKind]::Absolute) -or
+                -not [Uri]::TryCreate($Instance, [UriKind]::Absolute, [ref]$uri)) {
                 Fail "$Path is not an absolute URI"
             }
         }
@@ -494,7 +470,7 @@ function Assert-JsonSchema {
         $propertySchemas = Get-PropertyValue $SchemaNode "properties"
         if ((Get-PropertyValue $SchemaNode "additionalProperties") -eq $false) {
             $allowed = if ($null -eq $propertySchemas) { @() } else { @(Get-PropertyNames $propertySchemas) }
-            $unexpected = @((Get-PropertyNames $Instance) | Where-Object { $allowed -notcontains $_ })
+            $unexpected = @((Get-PropertyNames $Instance) | Where-Object { $allowed -cnotcontains $_ })
             if ($unexpected.Count -gt 0) {
                 Fail "$Path contains JSON Schema additional properties [$($unexpected -join ',')]"
             }
@@ -574,7 +550,7 @@ function Get-ExpectedRecordId {
         "plugins" { "plugin"; break }
         "skills" { "skill"; break }
         "gateway-protocol" {
-            switch ([string]$Item.kind) {
+            switch -CaseSensitive ([string]$Item.kind) {
                 "method" { "gateway_method"; break }
                 "event" { "gateway_event"; break }
                 "role" { "gateway_role"; break }
@@ -601,7 +577,7 @@ function Assert-InventoryItemContract {
         [object]$Item,
         [string]$Context
     )
-    if ([string]$Item.record_id -ne (Get-ExpectedRecordId $InventoryId $Item)) {
+    if ([string]$Item.record_id -cne (Get-ExpectedRecordId $InventoryId $Item)) {
         Fail "$Context record_id does not match its natural id"
     }
     Assert-RelativeSourcePath ([string]$Item.source_path) "$Context.source_path"
@@ -613,24 +589,24 @@ function Assert-InventoryItemContract {
 
     switch ($InventoryId) {
         "plugins" {
-            if (@("core", "official_external", "source_only_qa") -notcontains [string]$Item.delivery_class) {
+            if (@("core", "official_external", "source_only_qa") -cnotcontains [string]$Item.delivery_class) {
                 Fail "$Context has invalid delivery_class"
             }
         }
         "skills" {
-            if (@("MIT", "Apache-2.0") -notcontains [string]$Item.license) {
+            if (@("MIT", "Apache-2.0") -cnotcontains [string]$Item.license) {
                 Fail "$Context has invalid license"
             }
-            if (($Item.id -eq "skill-creator") -ne ($Item.license -eq "Apache-2.0")) {
+            if (($Item.id -ceq "skill-creator") -ne ($Item.license -ceq "Apache-2.0")) {
                 Fail "$Context has stale skill license evidence"
             }
         }
         "gateway-protocol" {
             $base = @("record_id", "id", "classification", "source_path", "kind")
-            switch ([string]$Item.kind) {
+            switch -CaseSensitive ([string]$Item.kind) {
                 "method" {
                     Assert-ExactPropertySet $Item ($base + @("scope", "advertised")) $Context
-                    if ($AllowedOperatorScopes -notcontains [string]$Item.scope -or
+                    if ($AllowedOperatorScopes -cnotcontains [string]$Item.scope -or
                         -not ($Item.advertised -is [bool])) {
                         Fail "$Context has invalid method scope or advertised flag"
                     }
@@ -640,7 +616,7 @@ function Assert-InventoryItemContract {
                 }
                 "role" {
                     Assert-ExactPropertySet $Item ($base + @("protocol_class")) $Context
-                    if (@("gateway", "closed_worker") -notcontains [string]$Item.protocol_class) {
+                    if (@("gateway", "closed_worker") -cnotcontains [string]$Item.protocol_class) {
                         Fail "$Context has invalid role protocol_class"
                     }
                 }
@@ -653,19 +629,19 @@ function Assert-InventoryItemContract {
             }
         }
         "channels" {
-            if (@("source_manifest", "official_catalog_only") -notcontains [string]$Item.provenance) {
+            if (@("source_manifest", "official_catalog_only") -cnotcontains [string]$Item.provenance) {
                 Fail "$Context has invalid provenance"
             }
-            if ($Item.provenance -eq "source_manifest" -and -not (Has-Property $Item "plugin_id")) {
+            if ($Item.provenance -ceq "source_manifest" -and -not (Has-Property $Item "plugin_id")) {
                 Fail "$Context source manifest row requires plugin_id"
             }
-            if ($Item.provenance -eq "official_catalog_only" -and -not (Has-Property $Item "package_name")) {
+            if ($Item.provenance -ceq "official_catalog_only" -and -not (Has-Property $Item "package_name")) {
                 Fail "$Context catalog-only row requires package_name"
             }
         }
         "http-sse-endpoints" {
-            if (@("GET", "POST") -notcontains [string]$Item.method -or
-                @("none", "optional_sse", "long_poll", "streamable_http") -notcontains [string]$Item.streaming -or
+            if (@("GET", "POST") -cnotcontains [string]$Item.method -or
+                @("none", "optional_sse", "long_poll", "streamable_http") -cnotcontains [string]$Item.streaming -or
                 -not ([string]$Item.path).StartsWith("/")) {
                 Fail "$Context has invalid HTTP method, path, or streaming kind"
             }
@@ -675,17 +651,17 @@ function Assert-InventoryItemContract {
                 "browser_extension", "headless_node", "native_app", "native_helper",
                 "native_sidecar", "terminal_app", "terminal_client", "web_app"
             )
-            if ($allowedKinds -notcontains [string]$Item.kind) {
+            if ($allowedKinds -cnotcontains [string]$Item.kind) {
                 Fail "$Context has invalid client kind"
             }
         }
         "migrations" {
-            if ($Item.kind -ne "migration_provider") {
+            if ($Item.kind -cne "migration_provider") {
                 Fail "$Context has invalid migration kind"
             }
         }
         "release-deployment" {
-            if (@("release", "installation", "deployment") -notcontains [string]$Item.kind) {
+            if (@("release", "installation", "deployment") -cnotcontains [string]$Item.kind) {
                 Fail "$Context has invalid release/deployment kind"
             }
         }
@@ -701,23 +677,23 @@ function Get-DerivedInventoryCounts {
         "plugins" {
             return [ordered]@{
                 total = $Items.Count
-                core = @($Items | Where-Object { $_.delivery_class -eq "core" }).Count
-                official_external = @($Items | Where-Object { $_.delivery_class -eq "official_external" }).Count
-                source_only_qa = @($Items | Where-Object { $_.delivery_class -eq "source_only_qa" }).Count
+                core = @($Items | Where-Object { $_.delivery_class -ceq "core" }).Count
+                official_external = @($Items | Where-Object { $_.delivery_class -ceq "official_external" }).Count
+                source_only_qa = @($Items | Where-Object { $_.delivery_class -ceq "source_only_qa" }).Count
             }
         }
         "skills" {
             return [ordered]@{ total = $Items.Count; bundled = $Items.Count }
         }
         "gateway-protocol" {
-            $methods = @($Items | Where-Object { $_.kind -eq "method" })
+            $methods = @($Items | Where-Object { $_.kind -ceq "method" })
             return [ordered]@{
                 total = $Items.Count
                 methods = $methods.Count
                 advertised_methods = @($methods | Where-Object { $_.advertised -eq $true }).Count
-                events = @($Items | Where-Object { $_.kind -eq "event" }).Count
-                roles = @($Items | Where-Object { $_.kind -eq "role" }).Count
-                scopes = @($Items | Where-Object { $_.kind -eq "scope" }).Count
+                events = @($Items | Where-Object { $_.kind -ceq "event" }).Count
+                roles = @($Items | Where-Object { $_.kind -ceq "role" }).Count
+                scopes = @($Items | Where-Object { $_.kind -ceq "scope" }).Count
                 dynamic_plugin_methods = "runtime-dependent"
             }
         }
@@ -733,16 +709,16 @@ function Get-DerivedInventoryCounts {
         "channels" {
             return [ordered]@{
                 total = $Items.Count
-                source_manifest = @($Items | Where-Object { $_.provenance -eq "source_manifest" }).Count
-                official_catalog_only = @($Items | Where-Object { $_.provenance -eq "official_catalog_only" }).Count
+                source_manifest = @($Items | Where-Object { $_.provenance -ceq "source_manifest" }).Count
+                official_catalog_only = @($Items | Where-Object { $_.provenance -ceq "official_catalog_only" }).Count
             }
         }
         "http-sse-endpoints" {
             return [ordered]@{
                 total = $Items.Count
-                optional_sse = @($Items | Where-Object { $_.streaming -eq "optional_sse" }).Count
-                long_poll = @($Items | Where-Object { $_.streaming -eq "long_poll" }).Count
-                streamable_http = @($Items | Where-Object { $_.streaming -eq "streamable_http" }).Count
+                optional_sse = @($Items | Where-Object { $_.streaming -ceq "optional_sse" }).Count
+                long_poll = @($Items | Where-Object { $_.streaming -ceq "long_poll" }).Count
+                streamable_http = @($Items | Where-Object { $_.streaming -ceq "streamable_http" }).Count
             }
         }
         "clients" {
@@ -754,9 +730,9 @@ function Get-DerivedInventoryCounts {
         "release-deployment" {
             return [ordered]@{
                 total = $Items.Count
-                release = @($Items | Where-Object { $_.kind -eq "release" }).Count
-                installation = @($Items | Where-Object { $_.kind -eq "installation" }).Count
-                deployment = @($Items | Where-Object { $_.kind -eq "deployment" }).Count
+                release = @($Items | Where-Object { $_.kind -ceq "release" }).Count
+                installation = @($Items | Where-Object { $_.kind -ceq "installation" }).Count
+                deployment = @($Items | Where-Object { $_.kind -ceq "deployment" }).Count
             }
         }
         default {
@@ -781,12 +757,12 @@ function Assert-ManifestDeclarations {
         "evidence_policy"
     ) "manifest"
     if ($Manifest.schema_version -ne 1 -or
-        $Manifest.artifact_set -ne "openclaw-upstream-compatibility-baseline" -or
-        $Manifest.baseline_sha -ne $ExpectedSha -or
-        $Manifest.baseline_path -ne "baseline.json" -or
-        $Manifest.feature_schema_path -ne "feature-ledger.schema.json" -or
-        $Manifest.validation_script -ne "validate.ps1" -or
-        $Manifest.validation_self_test -ne "validate-self-test.ps1") {
+        $Manifest.artifact_set -cne "openclaw-upstream-compatibility-baseline" -or
+        $Manifest.baseline_sha -cne $ExpectedSha -or
+        $Manifest.baseline_path -cne "baseline.json" -or
+        $Manifest.feature_schema_path -cne "feature-ledger.schema.json" -or
+        $Manifest.validation_script -cne "validate.ps1" -or
+        $Manifest.validation_self_test -cne "validate-self-test.ps1") {
         Fail "manifest fixed metadata mismatch"
     }
 
@@ -795,12 +771,12 @@ function Assert-ManifestDeclarations {
         Fail "manifest must declare exactly 3 ledgers"
     }
     foreach ($spec in $LedgerSpecs) {
-        $matches = @($ledgerDeclarations | Where-Object { $_.path -eq $spec.path })
+        $matches = @($ledgerDeclarations | Where-Object { $_.path -ceq $spec.path })
         if ($matches.Count -ne 1) {
             Fail "manifest must declare ledger $($spec.path) exactly once"
         }
         Assert-ExactPropertySet $matches[0] @("path", "classification", "expected_features") "manifest.$($spec.path)"
-        if ($matches[0].classification -ne $spec.classification -or
+        if ($matches[0].classification -cne $spec.classification -or
             [int]$matches[0].expected_features -ne [int]$spec.expected_features) {
             Fail "manifest ledger declaration drift for $($spec.path)"
         }
@@ -812,7 +788,7 @@ function Assert-ManifestDeclarations {
     }
     foreach ($inventoryId in $InventorySpecs.Keys) {
         $spec = $InventorySpecs[$inventoryId]
-        $matches = @($inventoryDeclarations | Where-Object { $_.path -eq $spec.path })
+        $matches = @($inventoryDeclarations | Where-Object { $_.path -ceq $spec.path })
         if ($matches.Count -ne 1) {
             Fail "manifest must declare inventory $($spec.path) exactly once"
         }
@@ -828,8 +804,8 @@ function Assert-ManifestDeclarations {
         "acceptance_evidence_state",
         "legacy_typescript_is_not_rust_acceptance_evidence"
     ) "manifest.evidence_policy"
-    if ($Manifest.evidence_policy.initial_status -ne "unimplemented" -or
-        $Manifest.evidence_policy.acceptance_evidence_state -ne "missing" -or
+    if ($Manifest.evidence_policy.initial_status -cne "unimplemented" -or
+        $Manifest.evidence_policy.acceptance_evidence_state -cne "missing" -or
         $Manifest.evidence_policy.legacy_typescript_is_not_rust_acceptance_evidence -ne $true) {
         Fail "manifest evidence policy mismatch"
     }
@@ -844,8 +820,8 @@ $actualJsonPaths = @(
         $relative.Replace("\", "/")
     }
 )
-$missingJsonFiles = @($ExpectedJsonPaths | Where-Object { $actualJsonPaths -notcontains $_ })
-$unexpectedJsonFiles = @($actualJsonPaths | Where-Object { $ExpectedJsonPaths -notcontains $_ })
+$missingJsonFiles = @($ExpectedJsonPaths | Where-Object { $actualJsonPaths -cnotcontains $_ })
+$unexpectedJsonFiles = @($actualJsonPaths | Where-Object { $ExpectedJsonPaths -cnotcontains $_ })
 if ($actualJsonPaths.Count -ne 16 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
@@ -865,18 +841,18 @@ Assert-ExactPropertySet $baseline.upstream @(
     "package_version", "package_manifest_path"
 ) "baseline.upstream"
 if ($baseline.schema_version -ne 1 -or
-    $baseline.upstream.repository -ne "openclaw/openclaw" -or
-    $baseline.upstream.repository_url -ne "https://github.com/openclaw/openclaw" -or
-    $baseline.upstream.branch -ne "main" -or
-    $baseline.upstream.commit_sha -ne $ExpectedSha -or
-    $baseline.upstream.tree_sha -ne "ba3177d3dd666b702d59c4daab74f62a9f7a84fb" -or
-    $baseline.upstream.parent_sha -ne "a674ce5e0d1ab0774546086fa7b2730516eca176" -or
-    $baseline.upstream.commit_timestamp -ne "2026-07-13T03:29:58Z" -or
-    $baseline.upstream.commit_url -ne "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85" -or
+    $baseline.upstream.repository -cne "openclaw/openclaw" -or
+    $baseline.upstream.repository_url -cne "https://github.com/openclaw/openclaw" -or
+    $baseline.upstream.branch -cne "main" -or
+    $baseline.upstream.commit_sha -cne $ExpectedSha -or
+    $baseline.upstream.tree_sha -cne "ba3177d3dd666b702d59c4daab74f62a9f7a84fb" -or
+    $baseline.upstream.parent_sha -cne "a674ce5e0d1ab0774546086fa7b2730516eca176" -or
+    $baseline.upstream.commit_timestamp -cne "2026-07-13T03:29:58Z" -or
+    $baseline.upstream.commit_url -cne "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85" -or
     $baseline.upstream.commit_signature_verified -ne $true -or
-    $baseline.upstream.package_name -ne "openclaw" -or
-    $baseline.upstream.package_version -ne "2026.7.2" -or
-    $baseline.upstream.package_manifest_path -ne "package.json") {
+    $baseline.upstream.package_name -cne "openclaw" -or
+    $baseline.upstream.package_version -cne "2026.7.2" -or
+    $baseline.upstream.package_manifest_path -cne "package.json") {
     Fail "baseline upstream provenance mismatch"
 }
 Assert-ExactPropertySet $baseline.stable_release @(
@@ -935,9 +911,9 @@ $missingEvidenceCount = 0
 foreach ($spec in $LedgerSpecs) {
     $ledger = $documents[$spec.path]
     Assert-JsonSchema $ledger $schema $schema '$'
-    if ($ledger.ledger_id -ne $spec.ledger_id -or
-        $ledger.classification -ne $spec.classification -or
-        $ledger.baseline_sha -ne $ExpectedSha) {
+    if ($ledger.ledger_id -cne $spec.ledger_id -or
+        $ledger.classification -cne $spec.classification -or
+        $ledger.baseline_sha -cne $ExpectedSha) {
         Fail "$($spec.path) fixed ledger metadata mismatch"
     }
     $features = @($ledger.features)
@@ -952,15 +928,15 @@ foreach ($spec in $LedgerSpecs) {
         if (-not $featureIds.Add([string]$feature.feature_id)) {
             Fail "duplicate feature_id '$($feature.feature_id)'"
         }
-        if ($feature.classification -ne $ledger.classification) {
+        if ($feature.classification -cne $ledger.classification) {
             Fail "$($feature.feature_id) classification does not match its ledger"
         }
-        if ($feature.status -ne "unimplemented" -or
-            $feature.acceptance_evidence.status -ne "missing" -or
+        if ($feature.status -cne "unimplemented" -or
+            $feature.acceptance_evidence.status -cne "missing" -or
             @($feature.acceptance_evidence.artifacts).Count -ne 0) {
             Fail "$($feature.feature_id) must start unimplemented with an empty evidence placeholder"
         }
-        if ($feature.last_verified_sha -ne $ExpectedSha) {
+        if ($feature.last_verified_sha -cne $ExpectedSha) {
             Fail "$($feature.feature_id) last_verified_sha mismatch"
         }
         $missingEvidenceCount += 1
@@ -980,9 +956,9 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         "schema_version", "inventory_id", "classification", "baseline_sha", "counts", "items"
     ) $spec.path
     if ($inventory.schema_version -ne 1 -or
-        $inventory.inventory_id -ne $inventoryId -or
-        $inventory.classification -ne $spec.classification -or
-        $inventory.baseline_sha -ne $ExpectedSha) {
+        $inventory.inventory_id -cne $inventoryId -or
+        $inventory.classification -cne $spec.classification -or
+        $inventory.baseline_sha -cne $ExpectedSha) {
         Fail "$($spec.path) fixed inventory metadata mismatch"
     }
     if (-not ($inventory.items -is [System.Array])) {
@@ -998,7 +974,7 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
         $item = $items[$index]
         $context = "$($spec.path).items[$index]"
         Assert-RequiredProperties $item @($spec.required_fields) $context
-        $unexpectedFields = @((Get-PropertyNames $item) | Where-Object { @($spec.allowed_fields) -notcontains $_ })
+        $unexpectedFields = @((Get-PropertyNames $item) | Where-Object { @($spec.allowed_fields) -cnotcontains $_ })
         if ($unexpectedFields.Count -gt 0) {
             Fail "$context contains unsupported fields [$($unexpectedFields -join ',')]"
         }
@@ -1007,10 +983,10 @@ foreach ($inventoryId in $InventorySpecs.Keys) {
                 Fail "$context has empty required field $field"
             }
         }
-        if ($AllowedClassifications -notcontains [string]$item.classification) {
+        if ($AllowedClassifications -cnotcontains [string]$item.classification) {
             Fail "$context is unclassified"
         }
-        if ($inventoryId -ne "http-sse-endpoints" -and $item.classification -ne $spec.classification) {
+        if ($inventoryId -cne "http-sse-endpoints" -and $item.classification -cne $spec.classification) {
             Fail "$context classification differs from its inventory"
         }
         if (-not $globalRecordIds.Add([string]$item.record_id)) {
@@ -1064,13 +1040,6 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
     if ($derivedCanonicalCounts[$key] -ne $ExpectedCanonicalCounts[$key]) {
         Fail "derived canonical count $key must be $($ExpectedCanonicalCounts[$key]), got $($derivedCanonicalCounts[$key])"
     }
-    $derivedCounts = Get-InventoryDerivedCounts $contract.InventoryId $items
-    Assert-HashtableEquals ([pscustomobject]$derivedCounts) $contract.Counts "$($contract.Path).derived_counts"
-    Assert-HashtableEquals $inventory.counts $derivedCounts "$($contract.Path).counts"
-    $derivedByInventory[$contract.InventoryId] = $derivedCounts
-}
-if ($inventoryTotal -ne 717 -or $recordIds.Count -ne 717) {
-    Fail "fixed inventory total must be 717 unique rows, got $inventoryTotal rows and $($recordIds.Count) record IDs"
 }
 
 [ordered]@{

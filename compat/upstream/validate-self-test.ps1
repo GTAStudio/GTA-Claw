@@ -102,6 +102,16 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "fixed-ledger-row-total"
+        expected_message = "ledgers/gateway-core.json must contain exactly 16 features"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features = @($ledger.features | Select-Object -First 15)
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
         name = "declared-subtotal"
         expected_message = "inventories/plugins.json count 'total' must be '137'"
         mutate = {
@@ -185,6 +195,18 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "schema-property-name-casing"
+        expected_message = "missing required properties [feature_id]"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $value = $ledger.features[0].feature_id
+            $ledger.features[0].PSObject.Properties.Remove("feature_id")
+            $ledger.features[0] | Add-Member -NotePropertyName "FEATURE_ID" -NotePropertyValue $value
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
         name = "schema-unique-items"
         expected_message = "violates JSON Schema uniqueItems"
         mutate = {
@@ -233,6 +255,38 @@ $cases = @(
             $ledger.features[0].upstream_source |
                 Add-Member -NotePropertyName "official_url" -NotePropertyValue "not a uri"
             Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "schema-windows-path-is-not-uri"
+        expected_message = "is not an absolute URI"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].upstream_source |
+                Add-Member -NotePropertyName "official_url" -NotePropertyValue "C:\not-a-uri"
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "acceptance-evidence"
+        expected_message = "must start unimplemented with an empty evidence placeholder"
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].acceptance_evidence.artifacts = @("unverified-result.txt")
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "inventory-enum-casing"
+        expected_message = "has invalid client kind"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "inventories/clients.json"
+            $inventory = Read-Json $path
+            $inventory.items[0].kind = ([string]$inventory.items[0].kind).ToUpperInvariant()
+            Write-Json $path $inventory
         }
     },
     [ordered]@{
