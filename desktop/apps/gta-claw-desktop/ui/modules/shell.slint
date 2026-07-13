@@ -1,0 +1,548 @@
+import {
+    Card,
+    ComposerShell,
+    Divider,
+    EmptyStatePanel,
+    ModalSheetShell,
+    NavigationItem,
+    PrimaryButton,
+    SecondaryButton,
+    StatusBadge,
+    Toolbar,
+    ToolbarIconButton,
+} from "./primitives.slint";
+import { DesignTokens, Metrics, StatusKind } from "./tokens.slint";
+
+export enum PaneMode {
+    three-pane,
+    overlay-inspector,
+    single-pane,
+}
+
+component ShellToolbarButton inherits Rectangle {
+    in property <bool> shown: true;
+    in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <string> glyph;
+    in property <string> accessible-name;
+    callback clicked;
+
+    public function restore-focus() {
+        if (root.shown && root.enabled) {
+            button.focus();
+        }
+    }
+
+    min-width: root.shown ? Metrics.control-medium : 0px;
+    preferred-width: root.shown ? Metrics.control-medium : 0px;
+    max-width: root.shown ? Metrics.control-medium : 0px;
+    min-height: Metrics.control-medium;
+    max-height: Metrics.control-medium;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    clip: true;
+    background: transparent;
+
+    button := ToolbarIconButton {
+        opacity: root.shown ? 1 : 0;
+        glyph: root.glyph;
+        accessible-name: root.accessible-name;
+        enabled: root.shown && root.enabled;
+        checkable: root.checkable;
+        checked: root.checked;
+        clicked => { root.clicked(); }
+    }
+}
+
+component NavigationPane {
+    in property <string> status-text;
+    in property <string> status-label;
+    in property <string> status-icon;
+    in property <StatusKind> status-kind;
+
+    accessible-role: navigation;
+    accessible-label: "Primary navigation";
+
+    Rectangle {
+        background: DesignTokens.surface-pane;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+
+        VerticalLayout {
+            padding: Metrics.space-4;
+            spacing: Metrics.space-3;
+
+            HorizontalLayout {
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                Rectangle {
+                    width: Metrics.control-large;
+                    height: Metrics.control-large;
+                    horizontal-stretch: 0;
+                    background: DesignTokens.accent;
+                    border-radius: Metrics.radius-large;
+
+                    Text {
+                        text: "GC";
+                        color: DesignTokens.accent-on;
+                        font-size: Metrics.type-small;
+                        font-weight: 850;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    Text {
+                        text: "GTA Claw";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-body;
+                        font-weight: 800;
+                        accessible-role: none;
+                    }
+
+                    Text {
+                        text: "Native workspace";
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        accessible-role: none;
+                    }
+                }
+            }
+
+            Divider { }
+
+            NavigationItem {
+                glyph: "H";
+                text: "Home";
+                detail: "Workspace overview";
+                selected: true;
+            }
+
+            NavigationItem {
+                glyph: "W";
+                text: "Workspaces";
+                detail: "Saved environments";
+            }
+
+            NavigationItem {
+                glyph: "A";
+                text: "Activity";
+                detail: "Recent changes";
+            }
+
+            NavigationItem {
+                glyph: "S";
+                text: "Settings";
+                detail: "Desktop preferences";
+            }
+
+            Rectangle { vertical-stretch: 1; }
+            Divider { }
+
+            StatusBadge {
+                kind: root.status-kind;
+                text: root.status-text;
+                semantic-label: root.status-label;
+                icon-text: root.status-icon;
+            }
+        }
+    }
+}
+
+component ContentPane {
+    in property <string> status-text;
+    in property <string> status-label;
+    in property <string> status-icon;
+    in property <StatusKind> status-kind;
+    in property <bool> enabled: true;
+    callback refresh-requested;
+
+    accessible-role: main;
+    accessible-label: "Workspace content";
+
+    Rectangle {
+        background: DesignTokens.surface-app;
+
+        VerticalLayout {
+            padding: Metrics.space-6;
+            spacing: Metrics.space-4;
+
+            HorizontalLayout {
+                spacing: Metrics.space-4;
+                alignment: center;
+
+                VerticalLayout {
+                    spacing: Metrics.space-1;
+
+                    Text {
+                        text: "Workspace";
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        font-weight: 700;
+                        accessible-role: none;
+                    }
+
+                    Text {
+                        text: "Ready when you are";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-display;
+                        font-weight: 800;
+                        accessible-role: none;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                StatusBadge {
+                    kind: root.status-kind;
+                    text: root.status-text;
+                    semantic-label: root.status-label;
+                    icon-text: root.status-icon;
+                }
+            }
+
+            EmptyStatePanel {
+                glyph: "G";
+                title: "Start from a clear workspace";
+                detail: "Future sessions and tools will appear here. This foundation currently shows placeholder content only.";
+                action-label: "Refresh status";
+                enabled: root.enabled;
+                vertical-stretch: 1;
+                action-requested => { root.refresh-requested(); }
+            }
+
+            ComposerShell {
+                accessible-name: "Placeholder message composer";
+                placeholder: "Composer behavior arrives in a later phase";
+                submit-label: "Send";
+                enabled: false;
+            }
+        }
+    }
+}
+
+component InspectorPane {
+    in property <string> status-text;
+    in property <string> status-label;
+    in property <string> status-icon;
+    in property <StatusKind> status-kind;
+
+    accessible-role: complementary;
+    accessible-label: "Workspace inspector";
+
+    Rectangle {
+        background: DesignTokens.surface-pane;
+        border-width: 1px;
+        border-color: DesignTokens.border-default;
+
+        VerticalLayout {
+            padding: Metrics.space-4;
+            spacing: Metrics.space-4;
+
+            Text {
+                text: "Workspace details";
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-title;
+                font-weight: 780;
+                accessible-role: none;
+            }
+
+            Card {
+                accessible-name: "Runtime status";
+
+                Text {
+                    text: "Runtime status";
+                    color: DesignTokens.text-secondary;
+                    font-size: Metrics.type-caption;
+                    font-weight: 700;
+                    accessible-role: none;
+                }
+
+                StatusBadge {
+                    kind: root.status-kind;
+                    text: root.status-text;
+                    semantic-label: root.status-label;
+                    icon-text: root.status-icon;
+                }
+            }
+
+            Card {
+                accessible-name: "Foundation summary";
+
+                Text {
+                    text: "Foundation";
+                    color: DesignTokens.text-secondary;
+                    font-size: Metrics.type-caption;
+                    font-weight: 700;
+                    accessible-role: none;
+                }
+
+                Text {
+                    text: "Tokens, accessible controls, and responsive panes are active.";
+                    color: DesignTokens.text-primary;
+                    font-size: Metrics.type-small;
+                    wrap: word-wrap;
+                    accessible-role: none;
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+
+            SecondaryButton {
+                text: "Inspector action";
+                accessible-name: "Placeholder inspector action";
+                enabled: false;
+            }
+        }
+    }
+}
+
+export component PaneHost {
+    in property <length> available-width;
+    in property <string> status-text: "Starting";
+    in property <string> status-label: "Status";
+    in property <string> status-icon: "-";
+    in property <StatusKind> status-kind: StatusKind.neutral;
+    in property <PaneMode> pane-mode: PaneMode.three-pane;
+    in property <bool> navigation-drawer-open: false;
+    in property <bool> inspector-open: false;
+    in property <bool> inspector-backdrop-active: false;
+    out property <bool> navigation-pane-visible: root.pane-mode == PaneMode.three-pane;
+    out property <bool> inspector-pane-visible: root.pane-mode == PaneMode.three-pane
+        || root.inspector-backdrop-active;
+
+    callback refresh-requested;
+    callback navigation-dismiss-requested;
+    callback inspector-dismiss-requested;
+
+    min-width: 0px;
+    preferred-width: 0px;
+    max-width: 100000px;
+    min-height: 0px;
+    preferred-height: 0px;
+    max-height: 100000px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    accessible-role: region;
+    accessible-label: root.pane-mode == PaneMode.three-pane
+        ? "Three pane workspace"
+        : (root.pane-mode == PaneMode.overlay-inspector ? "Workspace with overlay inspector" : "Single pane workspace");
+
+    if (root.pane-mode == PaneMode.three-pane) : HorizontalLayout {
+        spacing: 0px;
+
+        NavigationPane {
+            width: 264px;
+            status-text: root.status-text;
+            status-label: root.status-label;
+            status-icon: root.status-icon;
+            status-kind: root.status-kind;
+        }
+
+        ContentPane {
+            horizontal-stretch: 1;
+            status-text: root.status-text;
+            status-label: root.status-label;
+            status-icon: root.status-icon;
+            status-kind: root.status-kind;
+            refresh-requested => { root.refresh-requested(); }
+        }
+
+        InspectorPane {
+            width: 320px;
+            status-text: root.status-text;
+            status-label: root.status-label;
+            status-icon: root.status-icon;
+            status-kind: root.status-kind;
+        }
+    }
+
+    if (root.pane-mode != PaneMode.three-pane) : ContentPane {
+        status-text: root.status-text;
+        status-label: root.status-label;
+        status-icon: root.status-icon;
+        status-kind: root.status-kind;
+        enabled: !root.navigation-drawer-open && !root.inspector-open;
+        refresh-requested => { root.refresh-requested(); }
+    }
+
+    if (root.pane-mode != PaneMode.three-pane && root.navigation-drawer-open) : Rectangle {
+        background: #00000055;
+
+        TouchArea {
+            clicked => { root.navigation-dismiss-requested(); }
+        }
+
+        ModalSheetShell {
+            x: Metrics.space-3;
+            y: Metrics.space-3;
+            width: min(360px, parent.width - 2 * Metrics.space-3);
+            height: parent.height - 2 * Metrics.space-3;
+            title: "Navigation";
+            dismiss-label: "Close navigation";
+            dismiss-requested => { root.navigation-dismiss-requested(); }
+
+            NavigationPane {
+                status-text: root.status-text;
+                status-label: root.status-label;
+                status-icon: root.status-icon;
+                status-kind: root.status-kind;
+            }
+        }
+    }
+
+    if (root.inspector-backdrop-active) : Rectangle {
+        background: root.pane-mode == PaneMode.single-pane ? #00000055 : transparent;
+
+        TouchArea {
+            clicked => { root.inspector-dismiss-requested(); }
+        }
+
+        ModalSheetShell {
+            x: max(Metrics.space-3, parent.width - self.width - Metrics.space-3);
+            y: Metrics.space-3;
+            width: min(380px, parent.width - 2 * Metrics.space-3);
+            height: parent.height - 2 * Metrics.space-3;
+            title: "Inspector";
+            dismiss-label: "Close inspector";
+            dismiss-requested => { root.inspector-dismiss-requested(); }
+
+            InspectorPane {
+                status-text: root.status-text;
+                status-label: root.status-label;
+                status-icon: root.status-icon;
+                status-kind: root.status-kind;
+            }
+        }
+    }
+}
+
+export component ApplicationShell {
+    in property <length> available-width;
+    in property <string> status-text: "Starting";
+    in property <string> status-label: "Status";
+    in property <string> status-icon: "-";
+    in property <StatusKind> status-kind: StatusKind.neutral;
+    in property <PaneMode> pane-mode: PaneMode.three-pane;
+    in property <bool> navigation-drawer-open: false;
+    in property <bool> inspector-open: false;
+    in property <bool> inspector-backdrop-active: false;
+
+    callback refresh-requested;
+    callback navigation-toggle-requested;
+    callback inspector-toggle-requested;
+
+    changed navigation-drawer-open => {
+        if (!root.navigation-drawer-open && root.pane-mode != PaneMode.three-pane) {
+            navigation-toggle-button.restore-focus();
+        }
+    }
+
+    changed inspector-open => {
+        if (!root.inspector-open && root.pane-mode != PaneMode.three-pane) {
+            inspector-toggle-button.restore-focus();
+        }
+    }
+
+    min-width: 0px;
+    preferred-width: 0px;
+    max-width: 100000px;
+    min-height: 0px;
+    preferred-height: 0px;
+    max-height: 100000px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    accessible-role: region;
+    accessible-label: "GTA Claw application shell";
+
+    Rectangle {
+        background: DesignTokens.surface-app;
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 64px;
+            vertical-stretch: 0;
+            background: DesignTokens.surface-pane;
+            border-width: 1px;
+            border-color: DesignTokens.border-default;
+
+            HorizontalLayout {
+                padding-left: Metrics.space-4;
+                padding-right: Metrics.space-4;
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                navigation-toggle-button := ShellToolbarButton {
+                    shown: root.pane-mode != PaneMode.three-pane;
+                    glyph: "M";
+                    accessible-name: root.navigation-drawer-open ? "Close navigation" : "Open navigation";
+                    checkable: true;
+                    checked: root.navigation-drawer-open;
+                    clicked => { root.navigation-toggle-requested(); }
+                }
+
+                Text {
+                    text: "GTA Claw";
+                    color: DesignTokens.text-primary;
+                    font-size: Metrics.type-title;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Toolbar {
+                    width: toolbar-content.min-width;
+                    accessible-name: "Workspace controls";
+
+                    toolbar-content := HorizontalLayout {
+                        spacing: Metrics.space-1;
+
+                        ToolbarIconButton {
+                            glyph: "R";
+                            accessible-name: "Refresh runtime status";
+                            enabled: !root.navigation-drawer-open && !root.inspector-open;
+                            clicked => { root.refresh-requested(); }
+                        }
+
+                        inspector-toggle-button := ShellToolbarButton {
+                            shown: root.pane-mode != PaneMode.three-pane;
+                            glyph: "I";
+                            accessible-name: root.inspector-open ? "Close inspector" : "Open inspector";
+                            checkable: true;
+                            checked: root.inspector-open;
+                            clicked => { root.inspector-toggle-requested(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        pane-host := PaneHost {
+            vertical-stretch: 1;
+            available-width: root.available-width;
+            status-text: root.status-text;
+            status-label: root.status-label;
+            status-icon: root.status-icon;
+            status-kind: root.status-kind;
+            pane-mode: root.pane-mode;
+            navigation-drawer-open: root.navigation-drawer-open;
+            inspector-open: root.inspector-open;
+            inspector-backdrop-active: root.inspector-backdrop-active;
+
+            refresh-requested => { root.refresh-requested(); }
+            navigation-dismiss-requested => { root.navigation-toggle-requested(); }
+            inspector-dismiss-requested => { root.inspector-toggle-requested(); }
+        }
+    }
+}
