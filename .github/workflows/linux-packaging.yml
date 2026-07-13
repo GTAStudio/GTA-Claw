@@ -218,10 +218,12 @@ jobs:
           second_daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$second_manifest")"
           cmp -s "$(dirname "$first_manifest")/$first_cli" "$(dirname "$second_manifest")/$second_cli"
           cmp -s "$(dirname "$first_manifest")/$first_daemon" "$(dirname "$second_manifest")/$second_daemon"
-          echo "first-manifest=$first_manifest" >>"$GITHUB_OUTPUT"
-          echo "first-key-sha=$first_key_sha" >>"$GITHUB_OUTPUT"
-          echo "second-manifest=$second_manifest" >>"$GITHUB_OUTPUT"
-          echo "second-key-sha=$second_key_sha" >>"$GITHUB_OUTPUT"
+          {
+            echo "first-manifest=$first_manifest"
+            echo "first-key-sha=$first_key_sha"
+            echo "second-manifest=$second_manifest"
+            echo "second-key-sha=$second_key_sha"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Execute binaries on the pinned oldest supported environment
         shell: bash
@@ -424,10 +426,12 @@ jobs:
             readelf -h "$root/$cli" | grep -F 'AArch64'
             readelf -h "$root/$daemon" | grep -F 'AArch64'
           done
-          echo "first-manifest=$first_manifest" >>"$GITHUB_OUTPUT"
-          echo "first-key-sha=$first_key_sha" >>"$GITHUB_OUTPUT"
-          echo "second-manifest=$second_manifest" >>"$GITHUB_OUTPUT"
-          echo "second-key-sha=$second_key_sha" >>"$GITHUB_OUTPUT"
+          {
+            echo "first-manifest=$first_manifest"
+            echo "first-key-sha=$first_key_sha"
+            echo "second-manifest=$second_manifest"
+            echo "second-key-sha=$second_key_sha"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Package twice and prove deterministic arm64 layouts
         shell: bash
