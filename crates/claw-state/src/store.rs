@@ -1479,7 +1479,14 @@ async fn inspect_database(
     verify_path_identity(path, database_file)?;
     for attempt in 0..3 {
         let temporary = inspection_temporary_path(path)?;
-        match materialize_sqlite_snapshot(path, database_file, &temporary).await {
+        match materialize_sqlite_snapshot(
+            path,
+            database_file,
+            &temporary,
+            SnapshotProvenance::LiveDatabase,
+        )
+        .await
+        {
             Ok(()) => {
                 let result = inspect_database_snapshot(&temporary, require_latest).await;
                 let cleanup = remove_snapshot_artifacts(&temporary);
@@ -2162,13 +2169,26 @@ async fn snapshot_database(
     source_file: &File,
     destination: &Path,
 ) -> Result<(), StateError> {
-    materialize_sqlite_snapshot(source, source_file, destination).await
+    materialize_sqlite_snapshot(
+        source,
+        source_file,
+        destination,
+        SnapshotProvenance::StandaloneBackup,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotProvenance {
+    LiveDatabase,
+    StandaloneBackup,
 }
 
 async fn materialize_sqlite_snapshot(
     source: &Path,
     source_file: &File,
     destination: &Path,
+    provenance: SnapshotProvenance,
 ) -> Result<(), StateError> {
     verify_path_identity(source, source_file)?;
     reject_hard_link(source, source_file)?;
@@ -2199,6 +2219,15 @@ async fn materialize_sqlite_snapshot(
         return Err(StateError::InvalidPath {
             path: source.to_owned(),
             reason: "snapshot source has an ambiguous WAL/SHM artifact set",
+        });
+    }
+    if !wal_existed
+        && provenance == SnapshotProvenance::StandaloneBackup
+        && database_header_uses_wal(source_file)?
+    {
+        return Err(StateError::InvalidPath {
+            path: source.to_owned(),
+            reason: "standalone backup is WAL-mode but has no matching WAL/SHM artifacts",
         });
     }
     let source_sidecars = if wal_existed {
@@ -2254,19 +2283,31 @@ async fn materialize_sqlite_snapshot(
             path_entry_exists(&wal_path),
             path_entry_exists(&shm_path),
             file_digest(source_file),
+            database_header_uses_wal(source_file),
         ) {
-            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(_), Err(error)) => Err(error),
-            (Ok(true), _, _) | (_, Ok(true), _) => Err(StateError::InvalidPath {
+            (Err(error), _, _, _)
+            | (Ok(_), Err(error), _, _)
+            | (Ok(_), Ok(_), Err(error), _)
+            | (Ok(_), Ok(_), Ok(_), Err(error)) => Err(error),
+            (Ok(true), _, _, _) | (_, Ok(true), _, _) => Err(StateError::InvalidPath {
                 path: source.to_owned(),
                 reason: "snapshot source gained WAL/SHM artifacts during immutable inspection",
             }),
-            (Ok(false), Ok(false), Ok(digest)) if source_digest.as_ref() != Some(&digest) => {
+            (Ok(false), Ok(false), Ok(digest), _) if source_digest.as_ref() != Some(&digest) => {
                 Err(StateError::InvalidPath {
                     path: source.to_owned(),
                     reason: "immutable snapshot source changed during inspection",
                 })
             }
-            (Ok(false), Ok(false), Ok(_)) => Ok(()),
+            (Ok(false), Ok(false), Ok(_), Ok(true))
+                if provenance == SnapshotProvenance::StandaloneBackup =>
+            {
+                Err(StateError::InvalidPath {
+                    path: source.to_owned(),
+                    reason: "standalone backup entered WAL mode during inspection",
+                })
+            }
+            (Ok(false), Ok(false), Ok(_), Ok(_)) => Ok(()),
         },
     };
     let journal_identity = match path_entry_exists(&journal_path) {
@@ -2284,6 +2325,32 @@ async fn materialize_sqlite_snapshot(
         | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(cleanup_failed_snapshot(destination, error)),
         (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn database_header_uses_wal(file: &File) -> Result<bool, StateError> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    const HEADER_LENGTH: usize = 20;
+    const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+    let path = Path::new("<open database handle>");
+
+    if file
+        .metadata()
+        .map_err(|error| file_error("inspect snapshot source header", path, error))?
+        .len()
+        < HEADER_LENGTH as u64
+    {
+        return Ok(false);
+    }
+    let mut file = file
+        .try_clone()
+        .map_err(|error| file_error("clone snapshot source handle", path, error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| file_error("seek snapshot source header", path, error))?;
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)
+        .map_err(|error| file_error("read snapshot source header", path, error))?;
+    Ok(&header[..SQLITE_HEADER.len()] == SQLITE_HEADER && header[19] == 2)
 }
 
 fn file_digest(file: &File) -> Result<Vec<u8>, StateError> {
@@ -2595,7 +2662,13 @@ pub(crate) mod test_support {
     pub(crate) async fn journal_mode(path: &Path) -> Result<String, StateError> {
         let database_file = open_existing_file_no_follow(path)?;
         let temporary = inspection_temporary_path(path)?;
-        materialize_sqlite_snapshot(path, &database_file, &temporary).await?;
+        materialize_sqlite_snapshot(
+            path,
+            &database_file,
+            &temporary,
+            super::SnapshotProvenance::LiveDatabase,
+        )
+        .await?;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&temporary)
             .read_only(true)

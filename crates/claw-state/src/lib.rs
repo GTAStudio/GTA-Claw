@@ -1288,6 +1288,104 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn restore_rejects_detached_wal_after_hardlink_and_original_unlink() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "detached-wal-source.sqlite");
+        let alias = database_path(&directory, "detached-wal-alias.sqlite");
+        let destination = database_path(&directory, "detached-wal-restored.sqlite");
+        open(&source_path)
+            .await
+            .close()
+            .await
+            .expect("seed detached WAL source closes");
+        let options = SqliteConnectOptions::new()
+            .filename(&source_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut writer = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open detached WAL writer");
+        writer
+            .execute("PRAGMA wal_autocheckpoint = 0")
+            .await
+            .expect("disable automatic checkpoint");
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open checkpoint-blocking reader");
+        reader
+            .execute("BEGIN")
+            .await
+            .expect("begin checkpoint-blocking snapshot");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+                .fetch_one(&mut reader)
+                .await
+                .expect("establish pre-write reader snapshot"),
+            0
+        );
+        writer
+            .execute(
+                "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+                 VALUES ('detached-wal-session', 'active', 1, 1, 1)",
+            )
+            .await
+            .expect("commit row to detached WAL");
+        writer.close().await.expect("detached WAL writer closes");
+        assert!(sidecar(&source_path, "-wal").exists());
+        fs::hard_link(&source_path, &alias).expect("create detached WAL hard link");
+        fs::remove_file(&source_path).expect("unlink original detached WAL main file");
+
+        let immutable_options = SqliteConnectOptions::new()
+            .filename(&alias)
+            .read_only(true)
+            .immutable(true);
+        let mut immutable = SqliteConnection::connect_with(&immutable_options)
+            .await
+            .expect("open detached main file without original-path WAL");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'detached-wal-session'"
+            )
+            .fetch_one(&mut immutable)
+            .await
+            .expect("read stale detached main file"),
+            0
+        );
+        immutable
+            .close()
+            .await
+            .expect("detached main inspection closes");
+
+        let error = StateStore::restore_backup(&alias, &destination)
+            .await
+            .expect_err("restore rejects a WAL-mode main file detached from its sidecars");
+        assert_eq!(
+            error,
+            StateError::InvalidPath {
+                path: alias.clone(),
+                reason: "standalone backup is WAL-mode but has no matching WAL/SHM artifacts",
+            }
+        );
+        for artifact in [
+            destination.clone(),
+            sidecar(&destination, "-wal"),
+            sidecar(&destination, "-shm"),
+            sidecar(&destination, "-journal"),
+        ] {
+            assert!(
+                !artifact.exists(),
+                "detached WAL rejection left artifact {}",
+                artifact.display()
+            );
+        }
+        reader
+            .execute("ROLLBACK")
+            .await
+            .expect("release detached WAL reader snapshot");
+        reader.close().await.expect("detached WAL reader closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn restore_rejects_symlinked_source_wal() {
         use std::os::unix::fs::symlink;
 
