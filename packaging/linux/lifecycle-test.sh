@@ -140,9 +140,12 @@ fi
 systemctl is-active --quiet gta-claw-daemon.service ||
   die "RPM removal stopped daemon despite refused stop"
 remove_failure_dropin
-if ! rpm -q gta-claw >/dev/null 2>&1; then
-  sudo rpm -ivh --nodeps --replacefiles "$rpm1"
-fi
+sudo rpm -Uvh \
+  --nodeps \
+  --oldpackage \
+  --replacefiles \
+  --replacepkgs \
+  "$rpm1"
 sudo systemctl start gta-claw-daemon.service
 sudo rpm -e --nodeps gta-claw
 ! systemctl is-active --quiet gta-claw-daemon.service ||
