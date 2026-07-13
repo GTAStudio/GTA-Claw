@@ -55,6 +55,10 @@ name = "claw-protocol"
 version = "0.1.0"
 dependencies = [
  "claw-domain",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
 ]
 
 [[package]]
