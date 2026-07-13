@@ -68,6 +68,8 @@ printf 'hard link input\n' >"$work/hardlink-a"
 ln "$work/hardlink-a" "$work/hardlink-b"
 expect_failure hardlink-input \
   bash -c "source '$common'; assert_regular_unaliased '$work/hardlink-a' input"
+expect_success verified-hardlink-ingestion \
+  copy_verified_input "$work/hardlink-a" "$work/hardlink-copy" 0644
 
 printf 'temporary\n' >"$work/publish.tmp"
 printf 'collision\n' >"$work/publish.final"

@@ -247,10 +247,16 @@ assert_new_output_file() {
     die "output file collision: $path"
 }
 
-assert_regular_unaliased() {
+assert_regular_file() {
   local path="$1"
   local label="$2"
   [[ -f "$path" && ! -L "$path" ]] || die "$label is not a regular file: $path"
+}
+
+assert_regular_unaliased() {
+  local path="$1"
+  local label="$2"
+  assert_regular_file "$path" "$label"
   [[ "$(output_link_count "$path")" -eq 1 ]] ||
     die "$label has multiple hard links: $path"
 }
@@ -276,6 +282,28 @@ copy_regular_input() {
   ensure_output_directory "$(dirname "$destination")"
   install -m "$mode" -- "$source" "$destination"
   assert_regular_unaliased "$destination" "copied output"
+}
+
+copy_verified_input() {
+  local source="$1"
+  local destination="$2"
+  local mode="$3"
+  local source_identity
+  local source_sha
+  assert_regular_file "$source" "trusted input"
+  source_identity="$(output_identity "$source")"
+  source_sha="$(sha256_file "$source")"
+  assert_new_output_file "$destination"
+  ensure_output_directory "$(dirname "$destination")"
+  install -m "$mode" -- "$source" "$destination"
+  assert_regular_file "$source" "trusted input after copy"
+  [[ "$(output_identity "$source")" == "$source_identity" ]] ||
+    die "trusted input identity changed during copy: $source"
+  [[ "$(sha256_file "$source")" == "$source_sha" ]] ||
+    die "trusted input content changed during copy: $source"
+  assert_regular_unaliased "$destination" "copied output"
+  [[ "$(sha256_file "$destination")" == "$source_sha" ]] ||
+    die "copied output differs from trusted input: $destination"
 }
 
 publish_output_file() {
@@ -414,7 +442,7 @@ validate_elf_arch() {
   local binary="$1"
   local arch="$2"
   local machine
-  assert_regular_unaliased "$binary" "ELF binary"
+  assert_regular_file "$binary" "ELF binary"
   machine="$(readelf -h "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')"
   case "$arch:$machine" in
     "x86_64:Advanced Micro Devices X86-64" | "arm64:AArch64") ;;

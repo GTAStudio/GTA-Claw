@@ -206,8 +206,8 @@ stage_documentation() {
 archive_stage="$WORK_DIR/archive/$base_name"
 ensure_output_directory "$archive_stage/bin"
 ensure_output_directory "$archive_stage/share/doc/gta-claw"
-copy_regular_input "$daemon_binary" "$archive_stage/bin/$LINUX_DAEMON_NAME" 0755
-copy_regular_input "$cli_binary" "$archive_stage/bin/$LINUX_CLI_NAME" 0755
+copy_verified_input "$daemon_binary" "$archive_stage/bin/$LINUX_DAEMON_NAME" 0755
+copy_verified_input "$cli_binary" "$archive_stage/bin/$LINUX_CLI_NAME" 0755
 stage_documentation "$archive_stage/share/doc/gta-claw"
 generate_provenance \
   "$archive_stage" \
@@ -230,8 +230,8 @@ ensure_output_directory "$rootfs/var/lib/gta-claw"
 ensure_output_directory "$rootfs/var/cache/gta-claw"
 ensure_output_directory "$rootfs/var/log/gta-claw"
 ensure_output_directory "$rootfs/run/gta-claw"
-copy_regular_input "$cli_binary" "$rootfs/usr/bin/$LINUX_CLI_NAME" 0755
-copy_regular_input \
+copy_verified_input "$cli_binary" "$rootfs/usr/bin/$LINUX_CLI_NAME" 0755
+copy_verified_input \
   "$daemon_binary" \
   "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME" \
   0755
@@ -429,7 +429,7 @@ copy_runtime_library() {
   local source="$1"
   local destination="$2"
   source="$(realpath -e "$source")"
-  copy_regular_input "$source" "$destination" 0755
+  copy_verified_input "$source" "$destination" 0755
 }
 
 copy_x86_runtime() {
@@ -525,8 +525,8 @@ ensure_output_directory "$oci_rootfs/var/lib/gta-claw"
 ensure_output_directory "$oci_rootfs/var/cache/gta-claw"
 ensure_output_directory "$oci_rootfs/var/log/gta-claw"
 ensure_output_directory "$oci_rootfs/run/gta-claw"
-copy_regular_input "$cli_binary" "$oci_rootfs/usr/bin/$LINUX_CLI_NAME" 0755
-copy_regular_input \
+copy_verified_input "$cli_binary" "$oci_rootfs/usr/bin/$LINUX_CLI_NAME" 0755
+copy_verified_input \
   "$daemon_binary" \
   "$oci_rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME" \
   0755

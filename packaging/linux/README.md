@@ -83,12 +83,15 @@ deferred until the Rust boundary supports `CREDENTIALS_DIRECTORY`.
 Every packaging output must be a new absolute path below the repository's real
 `target` directory. The scripts reject traversal, unsafe environment-controlled
 components, existing outputs, every intermediate or final symlink (including
-dangling links), hard-linked files, special files, and non-regular collisions.
-An adjacent directory lock and inode checks establish exclusive output
-ownership. Publication revalidates the reserved file identity after an atomic
-no-clobber rename. Shell path APIs cannot make a hostile process race-free, so
-the contract explicitly requires exclusive ownership and never claims that
-preflight checks alone close a TOCTOU race.
+dangling links), hard links in staged/output trees, special files, and
+non-regular collisions. Cargo may hard-link its final executable to a hashed
+build artifact; that trusted input is copied into a fresh inode while its
+source inode and before/after SHA-256 are revalidated. An adjacent directory
+lock and inode checks establish exclusive output ownership. Publication
+revalidates the reserved file identity after an atomic no-clobber rename.
+Shell path APIs cannot make a hostile process race-free, so the contract
+explicitly requires exclusive ownership of both the Cargo target and package
+output roots and never claims that preflight checks alone close a TOCTOU race.
 
 `release.sh` fails unless release mode, an annotated semantic tag, and the full
 matching commit are supplied. It then still fails because production signing
