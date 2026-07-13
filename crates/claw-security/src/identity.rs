@@ -4,9 +4,9 @@ use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter, Write as _};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use rand_core::CryptoRng;
+use rand_core::{CryptoRng, TryCryptoRng};
 use secrecy::{ExposeSecret, SecretString};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, digest::common::Generate};
 use zeroize::Zeroizing;
 
 use crate::authorization::{ClientClass, Role, Scope, ScopeSet};
@@ -382,13 +382,22 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
+    /// Tries to generate an identity using a fallible cryptographic RNG.
+    pub fn try_generate<R>(rng: &mut R) -> Result<Self, R::Error>
+    where
+        R: TryCryptoRng + ?Sized,
+    {
+        SigningKey::try_generate_from_rng(rng).map(|signing_key| Self { signing_key })
+    }
+
     /// Generates an identity using a caller-supplied cryptographic RNG.
     pub fn generate<R>(rng: &mut R) -> Self
     where
         R: CryptoRng + ?Sized,
     {
-        Self {
-            signing_key: SigningKey::generate(rng),
+        match Self::try_generate(rng) {
+            Ok(identity) => identity,
+            Err(error) => match error {},
         }
     }
 

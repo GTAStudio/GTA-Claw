@@ -29,10 +29,20 @@ static CREATE_DESTINATION_BEFORE_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::ne
 static FAIL_WINDOWS_SOURCE_REMOVAL: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static MIGRATION_TEST_BARRIER: Mutex<Option<MigrationTestBarrier>> = Mutex::new(None);
+#[cfg(test)]
+static SNAPSHOT_TEST_BARRIER: Mutex<Option<SnapshotTestBarrier>> = Mutex::new(None);
 
 #[cfg(test)]
 struct MigrationTestBarrier {
     path: PathBuf,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+struct SnapshotTestBarrier {
+    destination: PathBuf,
+    temporary: Arc<Mutex<Option<PathBuf>>>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -222,6 +232,31 @@ pub struct StateStore {
     close_timeout: Duration,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OperationalIdentity<'store> {
+    database_path: &'store Path,
+    database_file: &'store File,
+    lock_path: &'store Path,
+    lock_file: &'store File,
+    lock_identity: Option<&'store [u8]>,
+}
+
+impl OperationalIdentity<'_> {
+    pub(crate) fn verify(self) -> Result<(), StateError> {
+        verify_path_identity(self.database_path, self.database_file)
+            .and_then(|()| verify_path_identity(self.lock_path, self.lock_file))
+            .and_then(|()| {
+                verify_store_lock_binding(
+                    self.database_path,
+                    self.database_file,
+                    self.lock_path,
+                    self.lock_file,
+                    self.lock_identity,
+                )
+            })
+    }
+}
+
 #[cfg(unix)]
 static PROCESS_IDENTITIES: LazyLock<StdMutex<std::collections::HashSet<(u64, u64)>>> =
     LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
@@ -263,7 +298,8 @@ impl StateStore {
         let (lock_path, lock_file, process_identity) =
             acquire_store_lock(&path, &database_file, allow_identity_initialization)?;
         drop(creation_lock);
-        let lock_identity = capture_store_lock_identity(&path, &database_file, &lock_path)?;
+        let lock_identity =
+            capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?;
         let owner = writer_owner()?;
         verify_path_identity(&path, &database_file)?;
         let locked_state = inspect_database(&path, &database_file, false).await?;
@@ -311,6 +347,7 @@ impl StateStore {
                                 &path,
                                 &file,
                                 &lock_path,
+                                &lock_file,
                                 lock_identity.as_deref(),
                             )
                         })
@@ -333,6 +370,7 @@ impl StateStore {
                                 &path,
                                 &file,
                                 &lock_path,
+                                &lock_file,
                                 lock_identity.as_deref(),
                             )
                         })
@@ -397,25 +435,35 @@ impl StateStore {
     /// Returns the session repository.
     #[must_use]
     pub fn sessions(&self) -> SessionRepository<'_> {
-        SessionRepository::new(&self.pool, &self.owner)
+        SessionRepository::new(&self.pool, &self.owner, self.operational_identity())
     }
 
     /// Returns the device repository.
     #[must_use]
     pub fn devices(&self) -> DeviceRepository<'_> {
-        DeviceRepository::new(&self.pool, &self.owner)
+        DeviceRepository::new(&self.pool, &self.owner, self.operational_identity())
     }
 
     /// Returns the authentication repository.
     #[must_use]
     pub fn authentications(&self) -> AuthenticationRepository<'_> {
-        AuthenticationRepository::new(&self.pool, &self.owner)
+        AuthenticationRepository::new(&self.pool, &self.owner, self.operational_identity())
     }
 
     /// Returns the task repository.
     #[must_use]
     pub fn tasks(&self) -> TaskRepository<'_> {
-        TaskRepository::new(&self.pool, &self.owner)
+        TaskRepository::new(&self.pool, &self.owner, self.operational_identity())
+    }
+
+    fn operational_identity(&self) -> OperationalIdentity<'_> {
+        OperationalIdentity {
+            database_path: &self.path,
+            database_file: &self._database_file,
+            lock_path: &self.lock_path,
+            lock_file: &self.lock_file,
+            lock_identity: self.lock_identity.as_deref(),
+        }
     }
 
     /// Reads the effective connection and durability settings.
@@ -464,31 +512,31 @@ impl StateStore {
         ensure_database_artifacts_absent(&destination)?;
         let temporary = snapshot_temporary_path(&destination, "restore")?;
         snapshot_database(&backup, &backup_file, &temporary).await?;
-        if let Err(error) = validate_standalone_snapshot_source(&temporary).await {
+        let pinned = match PinnedSnapshot::open(&temporary) {
+            Ok(pinned) => pinned,
+            Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
+        };
+        if let Err(error) = validate_standalone_snapshot_source_pinned(&pinned).await {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = clear_backup_writer_lock(&temporary).await {
+        if let Err(error) = clear_backup_writer_lock(&pinned).await {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = validate_backup(&temporary, None).await {
+        if let Err(error) = validate_backup_pinned(&pinned, None).await {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = initialize_restored_store_identity(&temporary) {
+        if let Err(error) = initialize_restored_store_identity(&temporary, &pinned.file) {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = OpenOptions::new()
-            .write(true)
-            .open(&temporary)
-            .and_then(|file| file.sync_all())
-        {
+        if let Err(error) = pinned.sync() {
             remove_snapshot_artifacts(&temporary)?;
-            return Err(file_error("sync restored snapshot", &temporary, error));
+            return Err(error);
         }
-        if let Err(error) = publish_snapshot(&temporary, &destination) {
+        if let Err(error) = publish_snapshot(&temporary, &pinned.file, &destination) {
             return Err(cleanup_failed_snapshot(&temporary, error));
         }
         Ok(())
@@ -496,6 +544,17 @@ impl StateStore {
 
     /// Runs SQLite structural and referential integrity checks.
     pub async fn health(&self) -> Result<HealthReport, StateError> {
+        let mut migration_errors = migration_health_errors(&self.pool).await?;
+        let persisted_owner = sqlx::query_scalar::<_, String>(
+            "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database("read health application writer", error))?;
+        if persisted_owner.as_deref() != Some(self.owner.as_str()) {
+            migration_errors
+                .push("application writer ownership does not match the live store".to_owned());
+        }
         let results = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
             .fetch_all(&self.pool)
             .await
@@ -518,7 +577,7 @@ impl StateStore {
             supported_schema_version: LATEST_SCHEMA_VERSION,
             integrity_errors,
             foreign_key_violations,
-            migration_errors: migration_health_errors(&self.pool).await?,
+            migration_errors,
         })
     }
 
@@ -545,6 +604,7 @@ impl StateStore {
                     &self.path,
                     &self._database_file,
                     &self.lock_path,
+                    &self.lock_file,
                     self.lock_identity.as_deref(),
                 )
             }) {
@@ -700,8 +760,14 @@ impl StateStore {
 }
 
 #[cfg(unix)]
-fn initialize_restored_store_identity(path: &Path) -> Result<(), StateError> {
+fn initialize_restored_store_identity(path: &Path, expected_file: &File) -> Result<(), StateError> {
     let file = open_database_file(path)?;
+    if !files_share_identity_from_handles_portable(expected_file, &file)? {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "restored snapshot changed before identity initialization",
+        });
+    }
     verify_path_identity(path, &file)?;
     let (_lock_path, lock_file, process_identity) = acquire_store_lock(path, &file, true)?;
     File::unlock(&lock_file)
@@ -711,7 +777,10 @@ fn initialize_restored_store_identity(path: &Path) -> Result<(), StateError> {
 }
 
 #[cfg(not(unix))]
-fn initialize_restored_store_identity(_path: &Path) -> Result<(), StateError> {
+fn initialize_restored_store_identity(
+    _path: &Path,
+    _expected_file: &File,
+) -> Result<(), StateError> {
     Ok(())
 }
 
@@ -998,6 +1067,44 @@ fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
     File::open(path).map_err(|error| file_error("open file without following links", path, error))
 }
 
+#[cfg(unix)]
+fn open_existing_file_no_follow_writable(path: &Path) -> Result<File, StateError> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        file_error(
+            "open writable file without following links",
+            path,
+            error.into(),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn open_existing_file_no_follow_writable(path: &Path) -> Result<File, StateError> {
+    let file = open_windows_file_no_follow(path, false, true)?;
+    reject_windows_reparse(
+        path,
+        &file
+            .metadata()
+            .map_err(|error| file_error("inspect writable Windows file handle", path, error))?,
+    )?;
+    Ok(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_existing_file_no_follow_writable(path: &Path) -> Result<File, StateError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| file_error("open writable file without following links", path, error))
+}
+
 fn writer_owner() -> Result<String, StateError> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1053,6 +1160,42 @@ fn ensure_database_artifacts_absent(database: &Path) -> Result<(), StateError> {
         }
     }
     Ok(())
+}
+
+struct PinnedSnapshot {
+    path: PathBuf,
+    file: File,
+}
+
+impl PinnedSnapshot {
+    fn open(path: &Path) -> Result<Self, StateError> {
+        let file = open_existing_file_no_follow(path)?;
+        verify_path_identity(path, &file)?;
+        reject_hard_link(path, &file)?;
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+        })
+    }
+
+    fn verify(&self) -> Result<(), StateError> {
+        verify_path_identity(&self.path, &self.file)
+    }
+
+    fn sync(&self) -> Result<(), StateError> {
+        self.verify()?;
+        let writable = open_existing_file_no_follow_writable(&self.path)?;
+        if !files_share_identity_from_handles_portable(&self.file, &writable)? {
+            return Err(StateError::InvalidPath {
+                path: self.path.clone(),
+                reason: "snapshot changed before durable sync",
+            });
+        }
+        writable
+            .sync_all()
+            .map_err(|error| file_error("sync pinned SQLite snapshot", &self.path, error))?;
+        self.verify()
+    }
 }
 
 fn path_entry_exists(path: &Path) -> Result<bool, StateError> {
@@ -1185,7 +1328,12 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     })
 }
 
-fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError> {
+fn publish_snapshot(
+    source: &Path,
+    source_file: &File,
+    destination: &Path,
+) -> Result<(), StateError> {
+    verify_path_identity(source, source_file)?;
     let reservations = reserve_destination_sidecars(destination)?;
     #[cfg(test)]
     if take_publication_failpoint(&CREATE_DESTINATION_BEFORE_PUBLICATION, destination) {
@@ -1274,6 +1422,16 @@ fn publish_snapshot(source: &Path, destination: &Path) -> Result<(), StateError>
             primary,
             destination_owned,
         ));
+    }
+    if let Err(error) = verify_path_identity(destination, source_file) {
+        let reservation_cleanup = reservations.release();
+        return Err(StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!(
+                "destination no longer names the pinned published snapshot: {error}; the competing entry was not removed; reservation cleanup: {}",
+                result_diagnostic(reservation_cleanup)
+            ),
+        });
     }
     #[cfg(test)]
     if take_publication_failpoint(&FAIL_AFTER_PUBLICATION, destination) {
@@ -1395,6 +1553,23 @@ fn publication_uncertain_after_release(destination: &Path, primary: StateError) 
     }
 }
 
+fn files_share_identity_from_handles_portable(
+    left: &File,
+    right: &File,
+) -> Result<bool, StateError> {
+    let left = left
+        .try_clone()
+        .and_then(same_file::Handle::from_file)
+        .map_err(|error| file_error("capture first pinned file identity", Path::new("."), error))?;
+    let right = right
+        .try_clone()
+        .and_then(same_file::Handle::from_file)
+        .map_err(|error| {
+            file_error("capture second pinned file identity", Path::new("."), error)
+        })?;
+    Ok(left == right)
+}
+
 #[cfg(unix)]
 fn files_share_identity(left: &Path, right: &Path) -> Result<bool, StateError> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1488,13 +1663,21 @@ fn sync_parent_directory(path: &Path) -> Result<(), StateError> {
 
 #[cfg(target_vendor = "apple")]
 fn sync_parent_directory(path: &Path) -> Result<(), StateError> {
-    if !path_entry_exists(path)? {
-        return Ok(());
+    if path_entry_exists(path)? {
+        let file = File::open(path)
+            .map_err(|error| file_error("open file for Apple full sync", path, error))?;
+        rustix::fs::fcntl_fullfsync(&file)
+            .map_err(|error| file_error("full sync file on Apple", path, error.into()))?;
     }
-    let file = File::open(path)
-        .map_err(|error| file_error("open file for Apple full sync", path, error))?;
-    rustix::fs::fcntl_fullfsync(&file)
-        .map_err(|error| file_error("full sync file on Apple", path, error.into()))
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent)
+        .map_err(|error| file_error("open directory for Apple full sync", parent, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| file_error("sync directory metadata on Apple", parent, error))
 }
 
 #[cfg(not(unix))]
@@ -1709,6 +1892,29 @@ fn initialize_or_validate_lock_contents(
 }
 
 #[cfg(unix)]
+fn read_lock_contents(path: &Path, file: &mut File) -> Result<String, StateError> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| file_error("seek writer-lock contents", path, error))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| file_error("read writer-lock contents", path, error))?;
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn replace_lock_contents(path: &Path, file: &mut File, contents: &str) -> Result<(), StateError> {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| file.write_all(contents.as_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| file_error("upgrade writer-lock identity", path, error))
+}
+
+#[cfg(unix)]
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -1793,20 +1999,81 @@ fn acquire_unix_identity_lock(
     identity: (u64, u64),
     allow_identity_initialization: bool,
 ) -> Result<(PathBuf, File), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
     use xattr::FileExt as _;
 
     if let Some(value) = database_file
         .get_xattr(UNIX_LOCK_IDENTITY_XATTR)
         .map_err(|error| file_error("read database lock identity", path, error))?
     {
-        let lock_path = parse_unix_lock_identity(path, &value, identity)?;
+        let parsed = parse_unix_lock_identity(path, &value, identity)?;
+        let legacy_identity = parsed.lock_identity.is_none();
+        let lock_path = parsed.path;
         let mut lock_file = open_private_lock_file(&lock_path, PrivateLockOpen::Existing)?;
+        validate_persisted_lock_file_identity(path, &lock_file, parsed.lock_identity)?;
         acquire_private_lock(&lock_path, &lock_file)?;
         let contents = std::str::from_utf8(&value).map_err(|_| StateError::InvalidPath {
             path: path.to_owned(),
             reason: "database lock identity is not valid UTF-8",
         })?;
-        initialize_or_validate_lock_contents(&lock_path, &mut lock_file, contents, false)?;
+        let lock_contents = read_lock_contents(&lock_path, &mut lock_file)?;
+        if lock_contents != contents {
+            let lock_value = parse_unix_lock_identity(path, lock_contents.as_bytes(), identity)?;
+            if parsed.lock_identity.is_some()
+                && lock_value.lock_identity.is_none()
+                && lock_value.path == lock_path
+            {
+                replace_lock_contents(&lock_path, &mut lock_file, contents)?;
+            } else {
+                return Err(StateError::InvalidPath {
+                    path: lock_path,
+                    reason: "writer-lock contents do not match the database identity",
+                });
+            }
+        }
+        if legacy_identity {
+            let lock_metadata = lock_file.metadata().map_err(|error| {
+                file_error("capture legacy writer-lock identity", &lock_path, error)
+            })?;
+            let file_name = lock_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: lock_path.clone(),
+                    reason: "legacy writer-lock file name is invalid",
+                })?;
+            let prefix = format!("dev-{}-ino-{}-", identity.0, identity.1);
+            let generation = file_name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".lock"))
+                .filter(|generation| !generation.is_empty())
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: lock_path.clone(),
+                    reason: "legacy writer-lock generation is invalid",
+                })?;
+            let lock_path_text = lock_path.to_str().ok_or_else(|| StateError::InvalidPath {
+                path: lock_path.clone(),
+                reason: "legacy writer-lock path is not valid Unicode",
+            })?;
+            let upgraded = format!(
+                "v2\n{}\n{}\n{}\n{}\n{generation}\n{lock_path_text}",
+                identity.0,
+                identity.1,
+                lock_metadata.dev(),
+                lock_metadata.ino()
+            );
+            rustix::fs::fsetxattr(
+                database_file,
+                UNIX_LOCK_IDENTITY_XATTR,
+                upgraded.as_bytes(),
+                rustix::fs::XattrFlags::REPLACE,
+            )
+            .map_err(|error| file_error("upgrade database lock identity", path, error.into()))?;
+            database_file
+                .sync_all()
+                .map_err(|error| file_error("sync upgraded database lock identity", path, error))?;
+            replace_lock_contents(&lock_path, &mut lock_file, &upgraded)?;
+        }
         return Ok((lock_path, lock_file));
     }
     if !allow_identity_initialization {
@@ -1825,10 +2092,51 @@ fn acquire_unix_identity_lock(
         path: lock_path.clone(),
         reason: "database lock identity must be valid Unicode",
     })?;
-    let encoded = format!("v1\n{}\n{}\n{lock_path_text}", identity.0, identity.1);
-    let mut lock_file = open_private_lock_file(&lock_path, PrivateLockOpen::CreateNew)?;
-    acquire_private_lock(&lock_path, &lock_file)?;
-    initialize_or_validate_lock_contents(&lock_path, &mut lock_file, &encoded, true)?;
+    let lock_temporary = lock_path.with_file_name(format!(".lock-publish-{}", writer_owner()?));
+    let mut lock_file = open_private_lock_file(&lock_temporary, PrivateLockOpen::CreateNew)?;
+    acquire_private_lock(&lock_temporary, &lock_file)?;
+    let lock_metadata = lock_file
+        .metadata()
+        .map_err(|error| file_error("capture new writer-lock identity", &lock_temporary, error))?;
+    let encoded = format!(
+        "v2\n{}\n{}\n{}\n{}\n{token}\n{lock_path_text}",
+        identity.0,
+        identity.1,
+        lock_metadata.dev(),
+        lock_metadata.ino()
+    );
+    initialize_or_validate_lock_contents(&lock_temporary, &mut lock_file, &encoded, true)?;
+    if let Err(error) = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &lock_temporary,
+        rustix::fs::CWD,
+        &lock_path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        let primary = file_error(
+            "publish persistent writer-lock inode",
+            &lock_path,
+            error.into(),
+        );
+        verify_path_identity(&lock_temporary, &lock_file)?;
+        File::unlock(&lock_file).map_err(|unlock| {
+            file_error(
+                "release failed temporary writer lock",
+                &lock_temporary,
+                unlock,
+            )
+        })?;
+        drop(lock_file);
+        std::fs::remove_file(&lock_temporary).map_err(|cleanup| {
+            file_error(
+                "remove failed temporary writer lock",
+                &lock_temporary,
+                cleanup,
+            )
+        })?;
+        return Err(primary);
+    }
+    verify_path_identity(&lock_path, &lock_file)?;
     sync_parent_directory(&lock_path)?;
     match rustix::fs::fsetxattr(
         database_file,
@@ -1856,12 +2164,14 @@ fn acquire_unix_identity_lock(
             Ok((lock_path, lock_file))
         }
         Err(rustix::io::Errno::EXIST) => {
+            verify_path_identity(&lock_path, &lock_file)?;
             File::unlock(&lock_file).map_err(|error| {
                 file_error("release unpublished writer lock", &lock_path, error)
             })?;
             drop(lock_file);
-            std::fs::remove_file(&lock_path)
-                .map_err(|error| file_error("remove unpublished writer lock", &lock_path, error))?;
+            std::fs::remove_file(&lock_path).map_err(|error| {
+                file_error("remove unreferenced writer lock", &lock_path, error)
+            })?;
             sync_parent_directory(&lock_path)?;
             let winner = database_file
                 .get_xattr(UNIX_LOCK_IDENTITY_XATTR)
@@ -1870,8 +2180,10 @@ fn acquire_unix_identity_lock(
                     path: path.to_owned(),
                     reason: "database lock identity disappeared during initialization",
                 })?;
-            let winner_path = parse_unix_lock_identity(path, &winner, identity)?;
+            let parsed = parse_unix_lock_identity(path, &winner, identity)?;
+            let winner_path = parsed.path;
             let mut winner_file = open_private_lock_file(&winner_path, PrivateLockOpen::Existing)?;
+            validate_persisted_lock_file_identity(path, &winner_file, parsed.lock_identity)?;
             acquire_private_lock(&winner_path, &winner_file)?;
             let winner_contents =
                 std::str::from_utf8(&winner).map_err(|_| StateError::InvalidPath {
@@ -1888,12 +2200,17 @@ fn acquire_unix_identity_lock(
         }
         Err(error) => {
             let primary = file_error("persist database lock identity", path, error.into());
+            verify_path_identity(&lock_path, &lock_file)?;
             File::unlock(&lock_file).map_err(|unlock| {
                 file_error("release failed unpublished writer lock", &lock_path, unlock)
             })?;
             drop(lock_file);
             std::fs::remove_file(&lock_path).map_err(|cleanup| {
-                file_error("remove failed unpublished writer lock", &lock_path, cleanup)
+                file_error(
+                    "remove failed unreferenced writer lock",
+                    &lock_path,
+                    cleanup,
+                )
             })?;
             sync_parent_directory(&lock_path)?;
             Err(primary)
@@ -1915,30 +2232,50 @@ fn acquire_private_lock(path: &Path, file: &File) -> Result<(), StateError> {
 }
 
 #[cfg(unix)]
+struct ParsedUnixLockIdentity {
+    path: PathBuf,
+    lock_identity: Option<(u64, u64)>,
+}
+
+#[cfg(unix)]
 fn parse_unix_lock_identity(
     database_path: &Path,
     value: &[u8],
     expected_identity: (u64, u64),
-) -> Result<PathBuf, StateError> {
+) -> Result<ParsedUnixLockIdentity, StateError> {
     let stored = std::str::from_utf8(value).map_err(|_| StateError::InvalidPath {
         path: database_path.to_owned(),
         reason: "database lock identity is not valid UTF-8",
     })?;
-    let mut parts = stored.splitn(4, '\n');
+    let mut parts = stored.split('\n');
     let version = parts.next();
     let device = parts.next().and_then(|value| value.parse::<u64>().ok());
     let inode = parts.next().and_then(|value| value.parse::<u64>().ok());
-    let stored_path = parts.next();
+    let (lock_identity, generation, stored_path) = match version {
+        Some("v1") => (None, None, parts.next()),
+        Some("v2") => {
+            let lock_device = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let lock_inode = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let generation = parts.next();
+            (lock_device.zip(lock_inode), generation, parts.next())
+        }
+        _ => {
+            return Err(StateError::InvalidPath {
+                path: database_path.to_owned(),
+                reason: "database lock identity version is unsupported",
+            });
+        }
+    };
     let (Some(device), Some(inode), Some(stored_path)) = (device, inode, stored_path) else {
         return Err(StateError::InvalidPath {
             path: database_path.to_owned(),
             reason: "database lock identity has an unsupported format",
         });
     };
-    if version != Some("v1") {
+    if parts.next().is_some() {
         return Err(StateError::InvalidPath {
             path: database_path.to_owned(),
-            reason: "database lock identity version is unsupported",
+            reason: "database lock identity has trailing fields",
         });
     }
     if (device, inode) != expected_identity {
@@ -1979,7 +2316,41 @@ fn parse_unix_lock_identity(
             reason: "database lock identity key does not match its filesystem identity",
         });
     }
-    Ok(lock_path)
+    if let Some(generation) = generation {
+        if generation.is_empty() || !file_name.ends_with(&format!("-{generation}.lock")) {
+            return Err(StateError::InvalidPath {
+                path: lock_path,
+                reason: "database lock generation does not match its canonical path",
+            });
+        }
+    }
+    Ok(ParsedUnixLockIdentity {
+        path: lock_path,
+        lock_identity,
+    })
+}
+
+#[cfg(unix)]
+fn validate_persisted_lock_file_identity(
+    database_path: &Path,
+    lock_file: &File,
+    expected: Option<(u64, u64)>,
+) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let metadata = lock_file
+        .metadata()
+        .map_err(|error| file_error("verify writer-lock inode identity", database_path, error))?;
+    if (metadata.dev(), metadata.ino()) != expected {
+        return Err(StateError::InvalidPath {
+            path: database_path.to_owned(),
+            reason: "persistent writer-lock inode was replaced",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1987,6 +2358,7 @@ fn capture_store_lock_identity(
     database_path: &Path,
     database_file: &File,
     lock_path: &Path,
+    lock_file: &File,
 ) -> Result<Option<Vec<u8>>, StateError> {
     use std::os::unix::fs::MetadataExt as _;
     use xattr::FileExt as _;
@@ -2001,14 +2373,14 @@ fn capture_store_lock_identity(
             path: database_path.to_owned(),
             reason: "database lock identity is missing after lock acquisition",
         })?;
-    if parse_unix_lock_identity(database_path, &value, (metadata.dev(), metadata.ino()))?
-        != lock_path
-    {
+    let parsed = parse_unix_lock_identity(database_path, &value, (metadata.dev(), metadata.ino()))?;
+    if parsed.path != lock_path {
         return Err(StateError::InvalidPath {
             path: database_path.to_owned(),
             reason: "database lock identity does not name the held lock",
         });
     }
+    validate_persisted_lock_file_identity(database_path, lock_file, parsed.lock_identity)?;
     Ok(Some(value))
 }
 
@@ -2017,6 +2389,7 @@ fn capture_store_lock_identity(
     _database_path: &Path,
     _database_file: &File,
     _lock_path: &Path,
+    _lock_file: &File,
 ) -> Result<Option<Vec<u8>>, StateError> {
     Ok(None)
 }
@@ -2026,6 +2399,7 @@ fn verify_store_lock_binding(
     database_path: &Path,
     database_file: &File,
     lock_path: &Path,
+    lock_file: &File,
     expected: Option<&[u8]>,
 ) -> Result<(), StateError> {
     use std::os::unix::fs::MetadataExt as _;
@@ -2051,14 +2425,15 @@ fn verify_store_lock_binding(
     let metadata = database_file
         .metadata()
         .map_err(|error| file_error("verify database lock identity", database_path, error))?;
-    if parse_unix_lock_identity(database_path, &current, (metadata.dev(), metadata.ino()))?
-        != lock_path
-    {
+    let parsed =
+        parse_unix_lock_identity(database_path, &current, (metadata.dev(), metadata.ino()))?;
+    if parsed.path != lock_path {
         return Err(StateError::InvalidPath {
             path: database_path.to_owned(),
             reason: "database lock identity no longer names the held lock",
         });
     }
+    validate_persisted_lock_file_identity(database_path, lock_file, parsed.lock_identity)?;
     Ok(())
 }
 
@@ -2104,6 +2479,7 @@ fn verify_store_lock_binding(
     _database_path: &Path,
     _database_file: &File,
     _lock_path: &Path,
+    _lock_file: &File,
     _expected: Option<&[u8]>,
 ) -> Result<(), StateError> {
     Ok(())
@@ -2541,6 +2917,7 @@ async fn validate_migration_history_connection(
             reason: "migration table is missing".to_owned(),
         });
     }
+
     let applied = sqlx::query(
         "SELECT version, name, checksum
          FROM claw_schema_migrations
@@ -2559,6 +2936,14 @@ async fn validate_migration_history_connection(
         });
     }
     Ok(current_version)
+}
+
+pub(crate) async fn validate_operational_schema(
+    connection: &mut SqliteConnection,
+) -> Result<(), StateError> {
+    validate_migration_history_connection(connection, true)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2922,6 +3307,33 @@ async fn wait_at_migration_test_barrier(path: &Path) {
     }
 }
 
+#[cfg(test)]
+async fn wait_at_snapshot_test_barrier(destination: &Path, temporary: &Path) {
+    let barrier = SNAPSHOT_TEST_BARRIER
+        .lock()
+        .expect("snapshot test barrier lock poisoned")
+        .as_ref()
+        .filter(|configured| configured.destination == destination)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.temporary),
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((published_temporary, entered, release)) = barrier {
+        *published_temporary
+            .lock()
+            .expect("snapshot temporary path lock poisoned") = Some(temporary.to_owned());
+        entered.notify_one();
+        release.notified().await;
+        SNAPSHOT_TEST_BARRIER
+            .lock()
+            .expect("snapshot test barrier lock poisoned")
+            .take();
+    }
+}
+
 async fn ensure_destructive_backup(
     pool: &SqlitePool,
     destination: &Path,
@@ -3225,19 +3637,21 @@ async fn backup_pool(
     {
         return Err(cleanup_failed_snapshot(&temporary, error));
     }
+    let pinned = match PinnedSnapshot::open(&temporary) {
+        Ok(pinned) => pinned,
+        Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
+    };
+    #[cfg(test)]
+    wait_at_snapshot_test_barrier(destination, &temporary).await;
     let result = async {
-        mark_backup_provenance(&temporary).await?;
-        validate_standalone_snapshot_source(&temporary).await?;
-        validate_backup(&temporary, Some(expected_version))
+        mark_backup_provenance(&pinned).await?;
+        validate_standalone_snapshot_source_pinned(&pinned).await?;
+        validate_backup_pinned(&pinned, Some(expected_version))
             .await
             .map(|_| ())?;
-        initialize_restored_store_identity(&temporary)?;
-        OpenOptions::new()
-            .write(true)
-            .open(&temporary)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| file_error("sync SQLite backup", &temporary, error))?;
-        publish_snapshot(&temporary, destination)
+        initialize_restored_store_identity(&temporary, &pinned.file)?;
+        pinned.sync()?;
+        publish_snapshot(&temporary, &pinned.file, destination)
     }
     .await;
     match result {
@@ -3262,7 +3676,9 @@ fn cleanup_failed_snapshot(path: &Path, error: StateError) -> StateError {
     }
 }
 
-async fn mark_backup_provenance(path: &Path) -> Result<(), StateError> {
+async fn mark_backup_provenance(snapshot: &PinnedSnapshot) -> Result<(), StateError> {
+    let path = &snapshot.path;
+    snapshot.verify()?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -3270,6 +3686,10 @@ async fn mark_backup_provenance(path: &Path) -> Result<(), StateError> {
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| invalid_backup(path, "open backup for provenance", error))?;
+    snapshot.verify()?;
+    install_sqlite_commit_guard(&mut connection)
+        .await
+        .map_err(|error| invalid_backup(path, "guard backup provenance commit", error))?;
     let result = async {
         sqlx::query("DELETE FROM claw_writer_lock")
             .execute(&mut connection)
@@ -3292,11 +3712,20 @@ async fn mark_backup_provenance(path: &Path) -> Result<(), StateError> {
         .map_err(|error| invalid_backup(path, "close provenance-marked backup", error));
     match (result, close) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => snapshot.verify(),
     }
 }
 
 async fn validate_standalone_snapshot_source(path: &Path) -> Result<(), StateError> {
+    let snapshot = PinnedSnapshot::open(path)?;
+    validate_standalone_snapshot_source_pinned(&snapshot).await
+}
+
+async fn validate_standalone_snapshot_source_pinned(
+    snapshot: &PinnedSnapshot,
+) -> Result<(), StateError> {
+    let path = &snapshot.path;
+    snapshot.verify()?;
     for sidecar in [
         sqlite_sidecar(path, "-wal"),
         sqlite_sidecar(path, "-shm"),
@@ -3357,10 +3786,12 @@ async fn validate_standalone_snapshot_source(path: &Path) -> Result<(), StateErr
             reason: "restore source is not a verified standalone snapshot".to_owned(),
         });
     }
-    Ok(())
+    snapshot.verify()
 }
 
-async fn clear_backup_writer_lock(path: &Path) -> Result<(), StateError> {
+async fn clear_backup_writer_lock(snapshot: &PinnedSnapshot) -> Result<(), StateError> {
+    let path = &snapshot.path;
+    snapshot.verify()?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -3368,6 +3799,10 @@ async fn clear_backup_writer_lock(path: &Path) -> Result<(), StateError> {
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| invalid_backup(path, "open backup for lock cleanup", error))?;
+    snapshot.verify()?;
+    install_sqlite_commit_guard(&mut connection)
+        .await
+        .map_err(|error| invalid_backup(path, "guard backup lock cleanup", error))?;
     sqlx::query("DELETE FROM claw_writer_lock")
         .execute(&mut connection)
         .await
@@ -3375,10 +3810,21 @@ async fn clear_backup_writer_lock(path: &Path) -> Result<(), StateError> {
     connection
         .close()
         .await
-        .map_err(|error| invalid_backup(path, "close cleaned backup", error))
+        .map_err(|error| invalid_backup(path, "close cleaned backup", error))?;
+    snapshot.verify()
 }
 
 async fn validate_backup(path: &Path, expected_version: Option<i64>) -> Result<i64, StateError> {
+    let snapshot = PinnedSnapshot::open(path)?;
+    validate_backup_pinned(&snapshot, expected_version).await
+}
+
+async fn validate_backup_pinned(
+    snapshot: &PinnedSnapshot,
+    expected_version: Option<i64>,
+) -> Result<i64, StateError> {
+    let path = &snapshot.path;
+    snapshot.verify()?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)
@@ -3398,7 +3844,10 @@ async fn validate_backup(path: &Path, expected_version: Option<i64>) -> Result<i
     match (result, close) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(version), Ok(())) => Ok(version),
+        (Ok(version), Ok(())) => {
+            snapshot.verify()?;
+            Ok(version)
+        }
     }
 }
 
@@ -3567,6 +4016,30 @@ pub(crate) mod test_support {
             release: std::sync::Arc::clone(&release),
         });
         (entered, release)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_snapshot_barrier(
+        destination: &Path,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve snapshot barrier path");
+        let temporary = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *super::SNAPSHOT_TEST_BARRIER
+            .lock()
+            .expect("snapshot test barrier lock poisoned") = Some(super::SnapshotTestBarrier {
+            destination,
+            temporary: std::sync::Arc::clone(&temporary),
+            entered: std::sync::Arc::clone(&entered),
+            release: std::sync::Arc::clone(&release),
+        });
+        (temporary, entered, release)
     }
 
     #[cfg(windows)]

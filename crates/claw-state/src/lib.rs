@@ -192,12 +192,14 @@ mod tests {
             .expect("read database lock identity")
             .expect("database lock identity exists");
         let value = String::from_utf8(value).expect("lock identity is UTF-8");
-        PathBuf::from(
-            value
-                .splitn(4, '\n')
-                .nth(3)
-                .expect("lock identity contains path"),
-        )
+        let fields = value.lines().collect::<Vec<_>>();
+        let path = match fields.first().copied() {
+            Some("v1") => fields.get(3),
+            Some("v2") => fields.get(6),
+            version => panic!("unsupported test lock identity version: {version:?}"),
+        }
+        .expect("lock identity contains path");
+        PathBuf::from(path)
     }
 
     #[cfg(unix)]
@@ -391,6 +393,8 @@ mod tests {
 
     #[tokio::test]
     async fn migration_transaction_excludes_external_schema_writer() {
+        const OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "migration-race.sqlite");
         let options = SqliteConnectOptions::new()
@@ -414,65 +418,86 @@ mod tests {
         .expect("create version-zero migration race prefix");
         let (entered, release) = test_support::set_migration_barrier(&path);
         let open_path = path.clone();
-        let mut opener =
-            tokio::spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
-        if tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .is_err()
-        {
-            release.notify_waiters();
-            opener.abort();
-            let join = opener.await;
-            let diagnostic = match join {
-                Ok(Ok(_)) => "opener completed without entering barrier".to_owned(),
-                Ok(Err(error)) => format!("opener failed: {error}"),
-                Err(error) => format!("opener task ended: {error}"),
-            };
+        let mut opener = Some(tokio::spawn(async move {
+            StateStore::open(StoreConfig::new(open_path)).await
+        }));
+        let deadline = tokio::time::Instant::now() + OVERALL_TIMEOUT;
+        let choreography = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                () = entered.notified() => {}
+                result = opener.as_mut().expect("migration opener exists") => {
+                    opener = None;
+                    let diagnostic = match result {
+                        Ok(Ok(store)) => {
+                            let close = store.close().await;
+                            format!("opener succeeded early; close result: {close:?}")
+                        }
+                        Ok(Err(error)) => format!("opener failed early: {error}"),
+                        Err(error) => format!("opener task failed early: {error}"),
+                    };
+                    return Err(diagnostic);
+                }
+            }
+            let drift = external
+                .execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT")
+                .await;
+            release.notify_one();
+            let store = opener
+                .take()
+                .expect("migration opener remains after barrier")
+                .await
+                .map_err(|error| format!("migration opener task failed: {error}"))?
+                .map_err(|error| format!("migration opener failed: {error}"))?;
+            let drift = drift
+                .expect_err("external schema drift must be rejected by the migration transaction");
+            if drift.as_database_error().is_none() {
+                return Err(format!(
+                    "schema drift returned a non-database error: {drift}"
+                ));
+            }
             external
                 .close()
                 .await
-                .expect("close external writer after opener failure");
-            panic!(
-                "state opener did not enter the migration transaction within two seconds: {diagnostic}"
-            );
-        }
-
-        let drift = tokio::time::timeout(
-            Duration::from_secs(2),
-            external.execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT"),
-        )
+                .map_err(|error| format!("close external writer: {error}"))?;
+            if !store
+                .health()
+                .await
+                .map_err(|error| format!("inspect migrated health: {error}"))?
+                .is_healthy()
+            {
+                return Err("migrated store reported unhealthy".to_owned());
+            }
+            store
+                .close()
+                .await
+                .map_err(|error| format!("close migrated store: {error}"))?;
+            Ok::<(), String>(())
+        })
         .await;
         release.notify_one();
-        let opener_result = tokio::time::timeout(Duration::from_secs(2), &mut opener).await;
-        if opener_result.is_err() {
-            opener.abort();
-            let _ = opener.await;
-        }
-        let drift = match drift {
-            Ok(Err(error)) => error,
-            Ok(Ok(_)) => {
-                external
-                    .close()
-                    .await
-                    .expect("close external writer after unexpected success");
-                panic!("external schema drift unexpectedly succeeded");
-            }
+        match choreography {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("{error}"),
             Err(_) => {
-                external
-                    .close()
-                    .await
-                    .expect("close timed-out external writer");
-                panic!("external schema write exceeded two seconds");
+                let diagnostic = match opener.take() {
+                    Some(opener) => {
+                        opener.abort();
+                        match opener.await {
+                            Ok(Ok(store)) => {
+                                let close = store.close().await;
+                                format!("opener unexpectedly completed; close result: {close:?}")
+                            }
+                            Ok(Err(error)) => {
+                                format!("opener failed while timing out: {error}")
+                            }
+                            Err(error) => format!("opener task stopped: {error}"),
+                        }
+                    }
+                    None => "opener was already joined before a later stage timed out".to_owned(),
+                };
+                panic!("migration race exceeded the single five-second deadline; {diagnostic}");
             }
-        };
-        assert!(drift.as_database_error().is_some());
-        external.close().await.expect("external writer closes");
-        let store = opener_result
-            .expect("migration task finishes within two seconds")
-            .expect("migration task joins")
-            .expect("migration completes");
-        assert!(store.health().await.expect("migrated health").is_healthy());
-        store.close().await.expect("migrated store closes");
+        }
     }
 
     #[tokio::test]
@@ -677,6 +702,17 @@ mod tests {
             "UPDATE claw_writer_lock SET owner = 'external-owner' WHERE singleton = 1",
         )
         .await;
+        let owner_health = owner_store
+            .health()
+            .await
+            .expect("inspect owner drift health");
+        assert!(!owner_health.is_healthy());
+        assert!(
+            owner_health
+                .migration_errors
+                .iter()
+                .any(|error| error.contains("application writer ownership"))
+        );
         let owner_record = session("owner-drift", 1);
         let error = owner_store
             .sessions()
@@ -1325,7 +1361,10 @@ mod tests {
             .backup_to(&destination)
             .await
             .expect_err("injected publication failure is surfaced");
-        assert!(matches!(error, StateError::PublicationUncertain { .. }));
+        assert!(
+            matches!(error, StateError::PublicationUncertain { .. }),
+            "unexpected publication failure: {error:?}"
+        );
         assert!(destination.exists());
         assert!(!sidecar(&destination, "-wal").exists());
         assert!(!sidecar(&destination, "-shm").exists());
@@ -1336,6 +1375,76 @@ mod tests {
             .await
             .expect("published destination remains valid");
         source.close().await.expect("source store closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn substituted_backup_temporary_never_mutates_victim() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "substitution-source.sqlite");
+        let victim_path = database_path(&directory, "substitution-victim.sqlite");
+        let destination = database_path(&directory, "substitution-destination.sqlite");
+        let source = std::sync::Arc::new(open(&source_path).await);
+        let victim = open(&victim_path).await;
+        let victim_record = session("victim-session", 1);
+        victim
+            .sessions()
+            .create(&victim_record)
+            .await
+            .expect("seed victim data");
+        let owner_before = sqlx::query_scalar::<_, String>(
+            "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
+        )
+        .fetch_one(test_support::pool(&victim))
+        .await
+        .expect("read victim owner");
+
+        let (temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
+        let backup_source = std::sync::Arc::clone(&source);
+        let backup_destination = destination.clone();
+        let mut backup =
+            tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("backup reaches pinned temporary barrier");
+        let temporary = temporary
+            .lock()
+            .expect("snapshot temporary path lock poisoned")
+            .clone()
+            .expect("snapshot temporary path published");
+        fs::remove_file(&temporary).expect("unlink pinned backup temporary");
+        fs::hard_link(&victim_path, &temporary).expect("substitute victim hard link");
+        release.notify_one();
+
+        let backup_result = match tokio::time::timeout(Duration::from_secs(2), &mut backup).await {
+            Ok(join) => join.expect("backup substitution task joins"),
+            Err(_) => {
+                backup.abort();
+                let _ = backup.await;
+                panic!("backup substitution regression exceeded two seconds");
+            }
+        };
+        assert!(backup_result.is_err());
+        assert!(!destination.exists());
+        let owner_after = sqlx::query_scalar::<_, String>(
+            "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
+        )
+        .fetch_one(test_support::pool(&victim))
+        .await
+        .expect("reread victim owner");
+        assert_eq!(owner_after, owner_before);
+        assert_eq!(
+            victim
+                .sessions()
+                .get(&victim_record.id)
+                .await
+                .expect("read untouched victim data"),
+            Some(victim_record)
+        );
+        victim.close().await.expect("victim closes");
+        let source = std::sync::Arc::try_unwrap(source)
+            .unwrap_or_else(|_| panic!("backup task retained source"));
+        source.close().await.expect("source closes");
     }
 
     #[tokio::test]
@@ -1874,6 +1983,47 @@ mod tests {
         recovered.close().await.expect("recovered store closes");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_lock_identity_upgrades_to_inode_bound_v2() {
+        use std::os::unix::fs::MetadataExt as _;
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "legacy-lock-upgrade.sqlite");
+        open(&path).await.close().await.expect("seed store closes");
+        let lock_path = unix_lock_path(&path);
+        let metadata = fs::metadata(&path).expect("inspect legacy database identity");
+        let legacy = format!(
+            "v1\n{}\n{}\n{}",
+            metadata.dev(),
+            metadata.ino(),
+            lock_path.display()
+        );
+        fs::write(&lock_path, &legacy).expect("write legacy lock header");
+        let database_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open legacy database identity");
+        database_file
+            .set_xattr("user.gta-claw.writer-lock-path", legacy.as_bytes())
+            .expect("write legacy database identity");
+        database_file.sync_all().expect("sync legacy identity");
+
+        let upgraded = open(&path).await;
+        let value = database_file
+            .get_xattr("user.gta-claw.writer-lock-path")
+            .expect("read upgraded identity")
+            .expect("upgraded identity exists");
+        assert!(value.starts_with(b"v2\n"));
+        assert_eq!(
+            fs::read(&lock_path).expect("read upgraded lock header"),
+            value
+        );
+        upgraded.close().await.expect("upgraded store closes");
+    }
+
     #[test]
     fn child_process_writer() {
         let Some(path) = std::env::var_os("CLAW_STATE_CHILD_DATABASE") else {
@@ -1910,6 +2060,9 @@ mod tests {
             }
             Err(StateError::StoreLocked { .. }) => {
                 fs::write(result, b"locked").expect("record expected lock rejection");
+            }
+            Err(StateError::InvalidPath { .. }) => {
+                fs::write(result, b"identity-rejected").expect("record identity-bound rejection");
             }
             Err(error) => {
                 fs::write(result, format!("unexpected:{error:?}"))
@@ -2197,6 +2350,97 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_write_and_second_process_reject_replaced_lock_inode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "active-lock-replacement.sqlite");
+        let store = std::sync::Arc::new(open(&path).await);
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_write_barrier(&owner);
+        let record = session("must-not-commit-after-lock-replacement", 1);
+        let writer_store = std::sync::Arc::clone(&store);
+        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("repository transaction reaches the write barrier");
+
+        let lock_path = unix_lock_path(&path);
+        let lock_contents = fs::read(&lock_path).expect("read held lock identity");
+        fs::remove_file(&lock_path).expect("unlink held lock inode");
+        fs::write(&lock_path, lock_contents).expect("replace lock inode with matching bytes");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .expect("secure replacement lock inode");
+
+        let child_ready = database_path(&directory, "replacement-child.ready");
+        let child_result = database_path(&directory, "replacement-child.result");
+        let executable = std::env::current_exe().expect("current test executable");
+        let child = Command::new(executable)
+            .arg("--exact")
+            .arg("tests::child_process_first_open")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("CLAW_STATE_CHILD_DATABASE", &path)
+            .env("CLAW_STATE_CHILD_READY", &child_ready)
+            .env("CLAW_STATE_CHILD_RESULT", &child_result)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn replacement-lock contender");
+        let mut child = ChildGuard::new(child);
+        let child_outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(result) = fs::read_to_string(&child_result) {
+                    break result;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second process reports a bounded outcome");
+        assert_eq!(child_outcome, "identity-rejected");
+        let child_status = child.wait().expect("reap replacement-lock contender");
+        assert!(child_status.success());
+
+        release.notify_one();
+        let write_result = match tokio::time::timeout(Duration::from_secs(2), &mut writer).await {
+            Ok(join) => join.expect("active repository task joins"),
+            Err(_) => {
+                writer.abort();
+                let _ = writer.await;
+                panic!("active repository write exceeded two seconds");
+            }
+        };
+        assert!(
+            write_result.is_err(),
+            "active write must roll back after lock inode replacement"
+        );
+
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("writer retained the state store"));
+        assert!(matches!(
+            store.close().await,
+            Err(StateError::CloseDegraded {
+                os_lock_released: true,
+                ..
+            })
+        ));
+        let options = SqliteConnectOptions::new().filename(&path);
+        let mut direct = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open database after degraded close");
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sessions WHERE id = 'must-not-commit-after-lock-replacement'",
+        )
+        .fetch_one(&mut direct)
+        .await
+        .expect("count rolled-back lock replacement row");
+        assert_eq!(rows, 0);
+        direct.close().await.expect("close direct verifier");
     }
 
     #[cfg(unix)]
