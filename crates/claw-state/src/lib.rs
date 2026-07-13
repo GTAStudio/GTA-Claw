@@ -2405,6 +2405,83 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn canonical_private_lock_entries_reject_alias_and_stale_attacks() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = test_support::private_lock_root();
+        let token = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current test time")
+                .as_nanos()
+        );
+        for attack in ["symlink", "hardlink", "stale"] {
+            let database = database_path(&directory, &format!("canonical-{attack}.sqlite"));
+            fs::File::create(&database).expect("create canonical attack database");
+            let metadata = fs::metadata(&database).expect("read canonical attack identity");
+            let lock_path = root.join(format!(
+                "dev-{}-ino-{}-{token}-{attack}.lock",
+                metadata.dev(),
+                metadata.ino()
+            ));
+            let encoded = format!(
+                "v1\n{}\n{}\n{}",
+                metadata.dev(),
+                metadata.ino(),
+                lock_path.display()
+            );
+            let mut cleanup = vec![lock_path.clone()];
+            match attack {
+                "symlink" => {
+                    let target = directory.path().join("canonical-symlink-target");
+                    fs::write(&target, b"target must remain untouched")
+                        .expect("create symlink target");
+                    symlink(&target, &lock_path).expect("create canonical lock symlink");
+                }
+                "hardlink" => {
+                    fs::write(&lock_path, &encoded).expect("create canonical lock");
+                    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                        .expect("secure canonical lock");
+                    let alias = root.join(format!("canonical-lock-alias-{token}"));
+                    fs::hard_link(&lock_path, &alias).expect("hardlink canonical lock");
+                    cleanup.push(alias);
+                }
+                "stale" => {
+                    fs::write(&lock_path, b"wrong identity").expect("create stale canonical lock");
+                    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                        .expect("secure stale canonical lock");
+                }
+                _ => unreachable!("fixed attack inventory"),
+            }
+            let database_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&database)
+                .expect("open canonical attack database");
+            database_file
+                .set_xattr("user.gta-claw.writer-lock-path", encoded.as_bytes())
+                .expect("set canonical attack identity");
+
+            let error = StateStore::open(StoreConfig::new(&database))
+                .await
+                .err()
+                .expect("canonical private lock attack is rejected");
+            assert!(matches!(
+                error,
+                StateError::InvalidPath { .. } | StateError::FileSystem { .. }
+            ));
+            for artifact in cleanup {
+                fs::remove_file(artifact).expect("remove unreferenced test lock artifact");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn live_lock_file_replacement_forces_fail_closed_shutdown() {
         use std::os::unix::fs::PermissionsExt as _;
 

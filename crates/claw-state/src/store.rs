@@ -4362,6 +4362,11 @@ pub(crate) mod test_support {
         &store.owner
     }
 
+    #[cfg(unix)]
+    pub(crate) fn private_lock_root() -> std::path::PathBuf {
+        super::default_private_lock_root().expect("resolve canonical private lock root")
+    }
+
     pub(crate) fn checksum(sql: &str) -> String {
         migration_checksum(sql)
     }
