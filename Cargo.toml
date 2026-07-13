@@ -6,6 +6,7 @@ members = [
   "crates/claw-domain",
   "crates/claw-platform",
   "crates/claw-protocol",
+  "crates/claw-security",
 ]
 exclude = ["desktop"]
 resolver = "3"
@@ -15,6 +16,7 @@ claw-application = { path = "crates/claw-application", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
+claw-security = { path = "crates/claw-security", version = "0.1.0" }
 
 [workspace.package]
 version = "0.1.0"
