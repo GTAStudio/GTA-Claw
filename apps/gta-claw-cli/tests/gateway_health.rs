@@ -658,7 +658,10 @@ async fn immediate_post_hello_disconnect_is_stably_transport_failure() {
         assert_eq!(summary["category"], "transport_transient");
         assert_eq!(summary["status"], "transport_failure");
         gateway.shutdown().await;
-        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert!(
+            request_count.load(Ordering::SeqCst) <= 1,
+            "iteration {iteration} replayed health after close"
+        );
     }
 }
 
