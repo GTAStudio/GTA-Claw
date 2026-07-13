@@ -5,6 +5,7 @@
     "baseline_path":  "baseline.json",
     "feature_schema_path":  "feature-ledger.schema.json",
     "validation_script":  "validate.ps1",
+    "validation_self_test":  "validate-self-test.ps1",
     "ledgers":  [
                     {
                         "path":  "ledgers/gateway-core.json",
@@ -65,15 +66,27 @@
                         }
                     ],
     "canonical_counts":  {
+                             "artifact_json_files":  16,
+                             "ledgers":  3,
+                             "feature_rows":  47,
+                             "inventory_files":  10,
+                             "inventory_rows":  717,
                              "core_plugins":  64,
                              "official_external_plugins":  70,
                              "source_only_qa_plugins":  3,
                              "bundled_skills":  51,
                              "gateway_methods":  278,
+                             "gateway_advertised_methods":  258,
                              "gateway_events":  33,
+                             "gateway_roles":  3,
+                             "gateway_scopes":  6,
                              "config_domains":  47,
                              "providers":  78,
-                             "channels":  29
+                             "channels":  29,
+                             "http_sse_endpoints":  18,
+                             "client_surfaces":  10,
+                             "migration_providers":  3,
+                             "release_deployment_surfaces":  24
                          },
     "evidence_policy":  {
                             "initial_status":  "unimplemented",
