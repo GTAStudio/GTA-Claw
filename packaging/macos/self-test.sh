@@ -61,6 +61,7 @@ expect_failure wrong-slice \
 expect_failure missing-slice \
   "$MACOS_DIR/merge-universal.sh" "$work/hello-arm64" "$work/missing-x86_64" "$work/missing-universal"
 assert_binary_arches "$work/hello-universal" "arm64 x86_64"
+assert_binary_arches "$work/hello-universal" "x86_64 arm64"
 tests=$((tests + 1))
 
 expect_success archive-first \

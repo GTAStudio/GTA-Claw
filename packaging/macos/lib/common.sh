@@ -149,7 +149,14 @@ assert_binary_arches() {
   [[ -f "$binary" && ! -L "$binary" ]] || die "missing regular Mach-O file: $binary"
   local actual
   actual="$(lipo -archs "$binary" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
-  expected="$(printf '%s\n' $expected | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+  expected="$(
+    printf '%s\n' "$expected" |
+      tr ' ' '\n' |
+      sed '/^$/d' |
+      LC_ALL=C sort |
+      tr '\n' ' ' |
+      sed 's/ $//'
+  )"
   [[ "$actual" == "$expected" ]] ||
     die "architecture mismatch for $binary (expected '$expected', found '$actual')"
 }
