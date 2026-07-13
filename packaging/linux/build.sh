@@ -148,28 +148,12 @@ libgcc_copyright="$(realpath -e "$libgcc_copyright")"
 lgpl_source="$(realpath -e /usr/share/common-licenses/LGPL-2.1)"
 gpl2_source="$(realpath -e /usr/share/common-licenses/GPL-2)"
 gpl3_source="$(realpath -e /usr/share/common-licenses/GPL-3)"
-runtime_exception_source="$(
-  find -L /usr/share/doc -type f \
-    \( -name 'COPYING.RUNTIME' -o -name 'COPYING.RUNTIME.gz' \) \
-    -print |
-    LC_ALL=C sort |
-    head -1
-)"
-[[ -n "$runtime_exception_source" ]] ||
-  die "GCC Runtime Library Exception text is not installed"
-runtime_exception_source="$(realpath -e "$runtime_exception_source")"
 
 copy_verified_input "$libc_copyright" "$runtime_root/licenses/libc6.copyright" 0644
 copy_verified_input "$lgpl_source" "$runtime_root/licenses/LGPL-2.1" 0644
 copy_verified_input "$gpl2_source" "$runtime_root/licenses/GPL-2" 0644
 copy_verified_input "$libgcc_copyright" "$runtime_root/licenses/libgcc-s1.copyright" 0644
 copy_verified_input "$gpl3_source" "$runtime_root/licenses/GPL-3" 0644
-copy_verified_input \
-  "$runtime_exception_source" \
-  "$runtime_root/licenses/GCC-RUNTIME-LIBRARY-EXCEPTION-3.1$(
-    [[ "$runtime_exception_source" == *.gz ]] && printf '.gz'
-  )" \
-  0644
 
 libc_version="$(dpkg-query -W -f='${Version}' "$libc_package")"
 libc_arch="$(dpkg-query -W -f='${Architecture}' "$libc_package")"
@@ -214,12 +198,6 @@ license_material_json() {
     }'
 }
 
-exception_suffix=""
-exception_encoding="identity"
-if [[ "$runtime_exception_source" == *.gz ]]; then
-  exception_suffix=".gz"
-  exception_encoding="gzip"
-fi
 libc_materials="$(
   {
     license_material_json libc6 copyright "$libc_copyright" \
@@ -236,11 +214,6 @@ libgcc_materials="$(
       runtime/licenses/libgcc-s1.copyright /usr/share/licenses/libgcc-s1/copyright identity
     license_material_json libgcc-s1 GPL-3 "$gpl3_source" \
       runtime/licenses/GPL-3 /usr/share/licenses/libgcc-s1/GPL-3 identity
-    license_material_json libgcc-s1 GCC-RUNTIME-LIBRARY-EXCEPTION-3.1 \
-      "$runtime_exception_source" \
-      "runtime/licenses/GCC-RUNTIME-LIBRARY-EXCEPTION-3.1$exception_suffix" \
-      "/usr/share/licenses/libgcc-s1/GCC-RUNTIME-LIBRARY-EXCEPTION-3.1$exception_suffix" \
-      "$exception_encoding"
   } | jq -s .
 )"
 

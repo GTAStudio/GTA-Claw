@@ -233,7 +233,9 @@ verify_build_manifest() {
         .[0].licenseExpression == $license and
         (.[0].version | length > 0) and
         (.[0].architecture | length > 0) and
-        (.[0].licenseMaterials | length == 3)
+        (.[0].licenseMaterials | length == (
+          if $id == "libc6" then 3 else 2 end
+        ))
       ' "$BUILD_RUNTIME_MANIFEST" >/dev/null ||
       die "runtime package metadata is invalid: $package_id"
     case "$package_id" in
@@ -251,14 +253,6 @@ verify_build_manifest() {
       ' "$BUILD_RUNTIME_MANIFEST" |
         LC_ALL=C sort
     )"
-    if [[ "$package_id" == "libgcc-s1" ]]; then
-      grep -Eq '^GCC-RUNTIME-LIBRARY-EXCEPTION-3\.1	/usr/share/licenses/libgcc-s1/GCC-RUNTIME-LIBRARY-EXCEPTION-3\.1(\.gz)?$' \
-        <<<"$actual_material_set" ||
-        die "libgcc runtime exception material is missing"
-      actual_material_set="$(
-        grep -v '^GCC-RUNTIME-LIBRARY-EXCEPTION-3\.1	' <<<"$actual_material_set"
-      )"
-    fi
     [[ "$actual_material_set" == "$(LC_ALL=C sort <<<"$expected_material_set")" ]] ||
       die "runtime license material set is invalid: $package_id"
   done
@@ -287,6 +281,10 @@ verify_build_manifest() {
     assert_regular_unaliased "$runtime_file" "runtime license material"
     [[ "$(sha256_file "$runtime_file")" == "$material_sha" ]] ||
       die "runtime license material digest mismatch: $material_name"
+    if [[ "$package_id" == "libgcc-s1" && "$material_name" == "copyright" ]]; then
+      grep -F 'GCC RUNTIME LIBRARY EXCEPTION' "$runtime_file" >/dev/null ||
+        die "libgcc copyright file lacks the complete runtime exception text"
+    fi
   done < <(
     jq -r '
       .packages[].licenseMaterials[] |
