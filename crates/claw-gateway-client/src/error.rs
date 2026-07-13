@@ -171,7 +171,7 @@ pub enum ProtocolFailure {
     /// Fragment sequence violated RFC 6455.
     InvalidFragmentation,
     /// WebSocket framing violated RFC 6455.
-    WebSocketProtocol,
+    WebSocketProtocol(&'static str),
     /// Server sent a request to this client transport.
     UnexpectedServerRequest,
     /// Encoded request exceeds the server-advertised payload policy.
@@ -220,8 +220,11 @@ impl Display for ProtocolFailure {
             Self::InvalidFragmentation => {
                 formatter.write_str("Gateway WebSocket fragmentation is invalid")
             }
-            Self::WebSocketProtocol => {
-                formatter.write_str("Gateway WebSocket framing violated RFC 6455")
+            Self::WebSocketProtocol(category) => {
+                write!(
+                    formatter,
+                    "Gateway WebSocket framing violated RFC 6455 ({category})"
+                )
             }
             Self::UnexpectedServerRequest => {
                 formatter.write_str("Gateway server sent an unexpected request frame")

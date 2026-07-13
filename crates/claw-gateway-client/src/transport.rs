@@ -350,7 +350,36 @@ fn map_read_error(error: WebSocketError, limit: usize) -> WireFailure {
             WireFailure::Transport(TransportFailure::Closed)
         }
         WebSocketError::IoError(_) => WireFailure::Transport(TransportFailure::Read),
-        _ => WireFailure::Protocol(ProtocolFailure::WebSocketProtocol),
+        WebSocketError::InvalidFragment => {
+            WireFailure::Protocol(ProtocolFailure::WebSocketProtocol("invalid fragment"))
+        }
+        WebSocketError::InvalidUTF8 => {
+            WireFailure::Protocol(ProtocolFailure::WebSocketProtocol("invalid UTF-8"))
+        }
+        WebSocketError::InvalidContinuationFrame => WireFailure::Protocol(
+            ProtocolFailure::WebSocketProtocol("invalid continuation frame"),
+        ),
+        WebSocketError::InvalidCloseFrame => {
+            WireFailure::Protocol(ProtocolFailure::WebSocketProtocol("invalid close frame"))
+        }
+        WebSocketError::InvalidCloseCode => {
+            WireFailure::Protocol(ProtocolFailure::WebSocketProtocol("invalid close code"))
+        }
+        WebSocketError::ReservedBitsNotZero => WireFailure::Protocol(
+            ProtocolFailure::WebSocketProtocol("reserved bits are not zero"),
+        ),
+        WebSocketError::ControlFrameFragmented => WireFailure::Protocol(
+            ProtocolFailure::WebSocketProtocol("fragmented control frame"),
+        ),
+        WebSocketError::PingFrameTooLarge => {
+            WireFailure::Protocol(ProtocolFailure::WebSocketProtocol("oversized ping frame"))
+        }
+        WebSocketError::InvalidValue => {
+            WireFailure::Protocol(ProtocolFailure::WebSocketProtocol("invalid opcode"))
+        }
+        _ => WireFailure::Protocol(ProtocolFailure::WebSocketProtocol(
+            "unexpected framing failure",
+        )),
     }
 }
 

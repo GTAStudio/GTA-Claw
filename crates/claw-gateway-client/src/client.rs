@@ -142,7 +142,7 @@ impl GatewayClient {
                 }
                 ConnectionState::ProtocolFailed => {
                     return Err(GatewayClientError::Protocol(
-                        ProtocolFailure::WebSocketProtocol,
+                        ProtocolFailure::WebSocketProtocol("terminal protocol failure"),
                     ));
                 }
                 ConnectionState::ReconnectExhausted => {
