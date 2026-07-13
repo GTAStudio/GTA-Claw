@@ -23,8 +23,8 @@ create_anchored_mounts() {
   sudo mkdir -m 0700 \
     "$ANCHORED_MOUNT_ROOT/repository" \
     "$ANCHORED_MOUNT_ROOT/target"
-  sudo mount --bind "$repository_fd_path" "$ANCHORED_MOUNT_ROOT/repository"
-  sudo mount --bind "$target_fd_path" "$ANCHORED_MOUNT_ROOT/target"
+  sudo mount --bind "$repository_fd_path/" "$ANCHORED_MOUNT_ROOT/repository"
+  sudo mount --bind "$target_fd_path/" "$ANCHORED_MOUNT_ROOT/target"
   mountpoint -q "$ANCHORED_MOUNT_ROOT/repository" ||
     die "failed to create anchored repository mount"
   mountpoint -q "$ANCHORED_MOUNT_ROOT/target" ||
