@@ -21,6 +21,9 @@ const LATEST_SCHEMA_VERSION: i64 = 1;
 const SNAPSHOT_PROVENANCE_OWNER: &str = "gta-claw-standalone-snapshot-v1";
 #[cfg(unix)]
 const UNIX_LOCK_IDENTITY_XATTR: &str = "user.gta-claw.writer-lock-path";
+#[cfg(unix)]
+const UNIX_BACKUP_SEAL_XATTR: &str = "user.gta-claw.backup-seal-id";
+const BACKUP_SEAL_MAGIC: &str = "gta-claw-backup-seal-v1";
 #[cfg(test)]
 static FAIL_AFTER_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
@@ -487,7 +490,8 @@ impl StateStore {
         })
     }
 
-    /// Creates a same-version, transactionally consistent standalone snapshot.
+    /// Creates a same-version, transactionally consistent snapshot sealed to
+    /// the current machine and service identity.
     pub async fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), StateError> {
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
@@ -496,7 +500,10 @@ impl StateStore {
         backup_pool(&self.pool, &destination, expected_version).await
     }
 
-    /// Restores a validated standalone backup to a destination that does not yet exist.
+    /// Restores a locally sealed backup to a destination that does not yet exist.
+    ///
+    /// Copying a backup to another machine or service identity is intentionally
+    /// unsupported and returns [`StateError::BackupNotPortable`].
     pub async fn restore_backup(
         backup: impl AsRef<Path>,
         destination: impl AsRef<Path>,
@@ -505,18 +512,28 @@ impl StateStore {
         let backup_file = open_existing_file_no_follow(&backup)?;
         verify_path_identity(&backup, &backup_file)?;
         reject_hard_link(&backup, &backup_file)?;
-        validate_standalone_snapshot_source(&backup).await?;
+        let backup_snapshot = PinnedSnapshot {
+            path: backup.clone(),
+            file: backup_file,
+        };
+        let sealed_digest = validate_standalone_snapshot_source_pinned(&backup_snapshot).await?;
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
         ensure_database_artifacts_absent(&destination)?;
         let temporary = snapshot_temporary_path(&destination, "restore")?;
-        snapshot_database(&backup, &backup_file, &temporary).await?;
+        snapshot_database(
+            &backup,
+            &backup_snapshot.file,
+            &temporary,
+            Some(&sealed_digest),
+        )
+        .await?;
         let pinned = match PinnedSnapshot::open(&temporary) {
             Ok(pinned) => pinned,
             Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
         };
-        if let Err(error) = validate_standalone_snapshot_source_pinned(&pinned).await {
+        if let Err(error) = validate_snapshot_marker_pinned(&pinned).await {
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
@@ -1939,7 +1956,6 @@ fn replace_lock_contents(path: &Path, file: &mut File, contents: &str) -> Result
         .map_err(|error| file_error("upgrade writer-lock identity", path, error))
 }
 
-#[cfg(unix)]
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -2672,7 +2688,7 @@ async fn inspect_database(
     verify_path_identity(path, database_file)?;
     for attempt in 0..3 {
         let temporary = inspection_temporary_path(path)?;
-        match materialize_sqlite_snapshot(path, database_file, &temporary).await {
+        match materialize_sqlite_snapshot(path, database_file, &temporary, None).await {
             Ok(()) => {
                 let result = inspect_database_snapshot(&temporary, require_latest).await;
                 let cleanup = remove_snapshot_artifacts(&temporary);
@@ -3377,17 +3393,27 @@ async fn snapshot_database(
     source: &Path,
     source_file: &File,
     destination: &Path,
+    expected_digest: Option<&[u8]>,
 ) -> Result<(), StateError> {
-    materialize_sqlite_snapshot(source, source_file, destination).await
+    materialize_sqlite_snapshot(source, source_file, destination, expected_digest).await
 }
 
 async fn materialize_sqlite_snapshot(
     source: &Path,
     source_file: &File,
     destination: &Path,
+    expected_digest: Option<&[u8]>,
 ) -> Result<(), StateError> {
     verify_path_identity(source, source_file)?;
     reject_hard_link(source, source_file)?;
+    if let Some(expected_digest) = expected_digest
+        && file_digest(source_file)? != expected_digest
+    {
+        return Err(StateError::InvalidBackup {
+            path: source.to_owned(),
+            reason: "sealed snapshot bytes changed before materialization".to_owned(),
+        });
+    }
     ensure_database_artifacts_absent(destination)?;
     let destination_text = destination
         .to_str()
@@ -3423,6 +3449,7 @@ async fn materialize_sqlite_snapshot(
             source_file,
             destination,
             [&wal_path, &shm_path, &journal_path],
+            expected_digest,
         )
         .await;
     }
@@ -3498,10 +3525,19 @@ async fn materialize_pinned_main_snapshot(
     source_file: &File,
     destination: &Path,
     sidecars: [&Path; 3],
+    expected_digest: Option<&[u8]>,
 ) -> Result<(), StateError> {
     use std::io::{Seek as _, SeekFrom};
 
     let before = file_digest(source_file)?;
+    if let Some(expected_digest) = expected_digest
+        && before != expected_digest
+    {
+        return Err(StateError::InvalidBackup {
+            path: source.to_owned(),
+            reason: "sealed snapshot bytes changed before pinned copy".to_owned(),
+        });
+    }
     let pinned_copy = pinned_copy_temporary_path(destination)?;
     ensure_database_artifacts_absent(&pinned_copy)?;
     let mut input = source_file
@@ -3520,10 +3556,19 @@ async fn materialize_pinned_main_snapshot(
         .map_err(|error| file_error("copy pinned snapshot source", source, error))?;
     drop((input, output));
     let source_validation = verify_path_identity(source, source_file).and_then(|()| {
-        if file_digest(source_file)? != before {
+        let after = file_digest(source_file)?;
+        if after != before {
             return Err(StateError::InvalidPath {
                 path: source.to_owned(),
                 reason: "snapshot source changed while copying its pinned handle",
+            });
+        }
+        if let Some(expected_digest) = expected_digest
+            && after != expected_digest
+        {
+            return Err(StateError::InvalidBackup {
+                path: source.to_owned(),
+                reason: "sealed snapshot bytes changed during pinned copy".to_owned(),
             });
         }
         for sidecar in sidecars {
@@ -3642,6 +3687,293 @@ fn destructive_backup_path(path: &Path, from: i64, to: i64) -> PathBuf {
     PathBuf::from(backup)
 }
 
+#[cfg(unix)]
+fn trusted_backup_manifest(snapshot: &PinnedSnapshot) -> Result<String, StateError> {
+    trusted_backup_manifest_for_digest(snapshot, &file_digest(&snapshot.file)?)
+}
+
+#[cfg(unix)]
+fn trusted_backup_manifest_for_digest(
+    snapshot: &PinnedSnapshot,
+    digest: &[u8],
+) -> Result<String, StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = snapshot
+        .file
+        .metadata()
+        .map_err(|error| file_error("inspect sealed backup identity", &snapshot.path, error))?;
+    Ok(format!(
+        "{BACKUP_SEAL_MAGIC}\nunix:{}:{}\n{}",
+        metadata.dev(),
+        metadata.ino(),
+        hex_encode(digest)
+    ))
+}
+
+#[cfg(windows)]
+fn trusted_backup_manifest(snapshot: &PinnedSnapshot) -> Result<String, StateError> {
+    trusted_backup_manifest_for_digest(snapshot, &file_digest(&snapshot.file)?)
+}
+
+#[cfg(windows)]
+fn trusted_backup_manifest_for_digest(
+    snapshot: &PinnedSnapshot,
+    digest: &[u8],
+) -> Result<String, StateError> {
+    let identity =
+        claw_sqlite_file_control::windows_file_identity(&snapshot.file).map_err(|error| {
+            StateError::InvalidBackup {
+                path: snapshot.path.clone(),
+                reason: format!("capture Windows backup identity: {error}"),
+            }
+        })?;
+    Ok(format!(
+        "{BACKUP_SEAL_MAGIC}\nwindows:{}\n{}",
+        hex_encode(&identity),
+        hex_encode(digest)
+    ))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn trusted_backup_manifest(snapshot: &PinnedSnapshot) -> Result<String, StateError> {
+    Err(StateError::BackupNotPortable {
+        path: snapshot.path.clone(),
+        reason: "this platform has no authenticated backup-seal provider",
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn trusted_backup_manifest_for_digest(
+    snapshot: &PinnedSnapshot,
+    _digest: &[u8],
+) -> Result<String, StateError> {
+    Err(StateError::BackupNotPortable {
+        path: snapshot.path.clone(),
+        reason: "this platform has no authenticated backup-seal provider",
+    })
+}
+
+struct TrustedBackupSeal {
+    #[cfg(unix)]
+    path: PathBuf,
+    #[cfg(unix)]
+    file: File,
+}
+
+impl TrustedBackupSeal {
+    fn cleanup(self) -> Result<(), StateError> {
+        #[cfg(unix)]
+        {
+            verify_path_identity(&self.path, &self.file)?;
+            drop(self.file);
+            std::fs::remove_file(&self.path).map_err(|error| {
+                file_error("remove unused trusted backup seal", &self.path, error)
+            })?;
+            sync_parent_directory(&self.path)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn create_trusted_backup_seal(snapshot: &PinnedSnapshot) -> Result<TrustedBackupSeal, StateError> {
+    use xattr::FileExt as _;
+
+    snapshot.verify()?;
+    let seal_id = writer_owner()?;
+    let seal_path = default_private_lock_root()?.join(format!("backup-seal-{seal_id}.record"));
+    let temporary = seal_path.with_file_name(format!(".backup-seal-publish-{}", writer_owner()?));
+    let mut record = open_private_lock_file(&temporary, PrivateLockOpen::CreateNew)?;
+    let manifest = trusted_backup_manifest(snapshot)?;
+    initialize_or_validate_lock_contents(&temporary, &mut record, &manifest, true)?;
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &temporary,
+        rustix::fs::CWD,
+        &seal_path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        file_error(
+            "publish trusted backup seal",
+            &seal_path,
+            std::io::Error::from(error),
+        )
+    })?;
+    verify_path_identity(&seal_path, &record)?;
+    sync_parent_directory(&seal_path)?;
+
+    let writable = open_existing_file_no_follow_writable(&snapshot.path)?;
+    if !files_share_identity_from_handles_portable(&snapshot.file, &writable)? {
+        return Err(StateError::InvalidBackup {
+            path: snapshot.path.clone(),
+            reason: "snapshot changed before trusted seal attachment".to_owned(),
+        });
+    }
+    if let Err(error) = writable.set_xattr(UNIX_BACKUP_SEAL_XATTR, seal_id.as_bytes()) {
+        verify_path_identity(&seal_path, &record)?;
+        drop(record);
+        std::fs::remove_file(&seal_path)
+            .map_err(|cleanup| file_error("remove unattached backup seal", &seal_path, cleanup))?;
+        sync_parent_directory(&seal_path)?;
+        return Err(file_error(
+            "attach trusted backup seal index",
+            &snapshot.path,
+            error,
+        ));
+    }
+    writable
+        .sync_all()
+        .map_err(|error| file_error("sync trusted backup seal index", &snapshot.path, error))?;
+    snapshot.verify()?;
+    Ok(TrustedBackupSeal {
+        path: seal_path,
+        file: record,
+    })
+}
+
+#[cfg(windows)]
+fn windows_backup_seal_path(path: &Path) -> PathBuf {
+    let mut seal = path.as_os_str().to_owned();
+    seal.push(":gta-claw-backup-seal");
+    PathBuf::from(seal)
+}
+
+#[cfg(windows)]
+fn create_trusted_backup_seal(snapshot: &PinnedSnapshot) -> Result<TrustedBackupSeal, StateError> {
+    use std::io::Write as _;
+
+    snapshot.verify()?;
+    let protected = claw_sqlite_file_control::protect_for_current_windows_user(
+        trusted_backup_manifest(snapshot)?.as_bytes(),
+    )
+    .map_err(|error| StateError::InvalidBackup {
+        path: snapshot.path.clone(),
+        reason: format!("protect Windows backup seal: {error}"),
+    })?;
+    let seal_path = windows_backup_seal_path(&snapshot.path);
+    let mut seal = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&seal_path)
+        .map_err(|error| file_error("create protected Windows backup seal", &seal_path, error))?;
+    seal.write_all(&protected)
+        .and_then(|()| seal.sync_all())
+        .map_err(|error| file_error("persist protected Windows backup seal", &seal_path, error))?;
+    snapshot.verify()?;
+    Ok(TrustedBackupSeal {})
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn create_trusted_backup_seal(snapshot: &PinnedSnapshot) -> Result<TrustedBackupSeal, StateError> {
+    Err(StateError::BackupNotPortable {
+        path: snapshot.path.clone(),
+        reason: "this platform has no authenticated backup-seal provider",
+    })
+}
+
+#[cfg(unix)]
+fn validate_trusted_backup_seal(snapshot: &PinnedSnapshot) -> Result<Vec<u8>, StateError> {
+    use xattr::FileExt as _;
+
+    snapshot.verify()?;
+    let seal_id = snapshot
+        .file
+        .get_xattr(UNIX_BACKUP_SEAL_XATTR)
+        .map_err(|error| file_error("read trusted backup seal index", &snapshot.path, error))?
+        .ok_or_else(|| StateError::BackupNotPortable {
+            path: snapshot.path.clone(),
+            reason: "no local trusted seal is attached",
+        })?;
+    let seal_id = std::str::from_utf8(&seal_id)
+        .ok()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .ok_or_else(|| StateError::InvalidBackup {
+            path: snapshot.path.clone(),
+            reason: "trusted backup seal index has an invalid format".to_owned(),
+        })?;
+    let seal_path = default_private_lock_root()?.join(format!("backup-seal-{seal_id}.record"));
+    let mut record =
+        open_private_lock_file(&seal_path, PrivateLockOpen::Existing).map_err(|_| {
+            StateError::BackupNotPortable {
+                path: snapshot.path.clone(),
+                reason: "the local trusted seal record is unavailable",
+            }
+        })?;
+    let actual = read_lock_contents(&seal_path, &mut record)?;
+    let authenticated_digest = file_digest(&snapshot.file)?;
+    let expected = trusted_backup_manifest_for_digest(snapshot, &authenticated_digest)?;
+    verify_path_identity(&seal_path, &record)?;
+    snapshot.verify()?;
+    if actual != expected {
+        return Err(StateError::InvalidBackup {
+            path: snapshot.path.clone(),
+            reason: "trusted backup seal does not match the pinned snapshot identity and digest"
+                .to_owned(),
+        });
+    }
+    Ok(authenticated_digest)
+}
+
+#[cfg(windows)]
+fn validate_trusted_backup_seal(snapshot: &PinnedSnapshot) -> Result<Vec<u8>, StateError> {
+    use std::io::Read as _;
+
+    snapshot.verify()?;
+    let seal_path = windows_backup_seal_path(&snapshot.path);
+    let mut seal = File::open(&seal_path).map_err(|_| StateError::BackupNotPortable {
+        path: snapshot.path.clone(),
+        reason: "no current-user protected backup seal is attached",
+    })?;
+    let length = seal
+        .metadata()
+        .map_err(|error| file_error("inspect protected Windows backup seal", &seal_path, error))?
+        .len();
+    if length == 0 || length > 16 * 1024 {
+        return Err(StateError::InvalidBackup {
+            path: snapshot.path.clone(),
+            reason: "protected Windows backup seal has an invalid size".to_owned(),
+        });
+    }
+    let mut protected = Vec::with_capacity(length as usize);
+    seal.read_to_end(&mut protected)
+        .map_err(|error| file_error("read protected Windows backup seal", &seal_path, error))?;
+    let actual =
+        claw_sqlite_file_control::unprotect_for_current_windows_user(&protected).map_err(|_| {
+            StateError::BackupNotPortable {
+                path: snapshot.path.clone(),
+                reason: "backup seal belongs to a different Windows user or machine",
+            }
+        })?;
+    let authenticated_digest = file_digest(&snapshot.file)?;
+    let expected = trusted_backup_manifest_for_digest(snapshot, &authenticated_digest)?;
+    snapshot.verify()?;
+    if actual != expected.as_bytes() {
+        return Err(StateError::InvalidBackup {
+            path: snapshot.path.clone(),
+            reason: "protected backup seal does not match the pinned snapshot identity and digest"
+                .to_owned(),
+        });
+    }
+    Ok(authenticated_digest)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_trusted_backup_seal(snapshot: &PinnedSnapshot) -> Result<Vec<u8>, StateError> {
+    Err(StateError::BackupNotPortable {
+        path: snapshot.path.clone(),
+        reason: "this platform has no authenticated backup-seal provider",
+    })
+}
+
 async fn backup_pool(
     pool: &SqlitePool,
     destination: &Path,
@@ -3668,20 +4000,41 @@ async fn backup_pool(
     };
     #[cfg(test)]
     wait_at_snapshot_test_barrier(destination, &temporary).await;
-    let result = async {
+    let preparation = async {
         mark_backup_provenance(&pinned).await?;
-        validate_standalone_snapshot_source_pinned(&pinned).await?;
+        validate_snapshot_marker_pinned(&pinned).await?;
         validate_backup_pinned(&pinned, Some(expected_version))
             .await
             .map(|_| ())?;
-        initialize_restored_store_identity(&temporary, &pinned.file)?;
-        pinned.sync()?;
-        publish_snapshot(&temporary, &pinned.file, destination)
+        initialize_restored_store_identity(&temporary, &pinned.file)
     }
     .await;
-    match result {
+    if let Err(error) = preparation {
+        return Err(cleanup_failed_snapshot(&temporary, error));
+    }
+    let seal = match create_trusted_backup_seal(&pinned) {
+        Ok(seal) => seal,
+        Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
+    };
+    if let Err(error) = pinned.sync() {
+        let seal_cleanup = seal.cleanup();
+        return Err(cleanup_failed_snapshot(
+            &temporary,
+            seal_cleanup.err().unwrap_or(error),
+        ));
+    }
+    match publish_snapshot(&temporary, &pinned.file, destination) {
         Ok(()) => Ok(()),
-        Err(error) => Err(cleanup_failed_snapshot(&temporary, error)),
+        Err(error @ StateError::PublicationUncertain { .. }) => {
+            Err(cleanup_failed_snapshot(&temporary, error))
+        }
+        Err(error) => {
+            let seal_cleanup = seal.cleanup();
+            Err(cleanup_failed_snapshot(
+                &temporary,
+                seal_cleanup.err().unwrap_or(error),
+            ))
+        }
     }
 }
 
@@ -3741,14 +4094,19 @@ async fn mark_backup_provenance(snapshot: &PinnedSnapshot) -> Result<(), StateEr
     }
 }
 
-async fn validate_standalone_snapshot_source(path: &Path) -> Result<(), StateError> {
+async fn validate_standalone_snapshot_source(path: &Path) -> Result<Vec<u8>, StateError> {
     let snapshot = PinnedSnapshot::open(path)?;
     validate_standalone_snapshot_source_pinned(&snapshot).await
 }
 
 async fn validate_standalone_snapshot_source_pinned(
     snapshot: &PinnedSnapshot,
-) -> Result<(), StateError> {
+) -> Result<Vec<u8>, StateError> {
+    validate_snapshot_marker_pinned(snapshot).await?;
+    validate_trusted_backup_seal(snapshot)
+}
+
+async fn validate_snapshot_marker_pinned(snapshot: &PinnedSnapshot) -> Result<(), StateError> {
     let path = &snapshot.path;
     snapshot.verify()?;
     for sidecar in [
@@ -4079,7 +4437,7 @@ pub(crate) mod test_support {
     pub(crate) async fn journal_mode(path: &Path) -> Result<String, StateError> {
         let database_file = open_existing_file_no_follow(path)?;
         let temporary = inspection_temporary_path(path)?;
-        materialize_sqlite_snapshot(path, &database_file, &temporary).await?;
+        materialize_sqlite_snapshot(path, &database_file, &temporary, None).await?;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&temporary)
             .read_only(true)

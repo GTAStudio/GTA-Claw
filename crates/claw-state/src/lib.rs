@@ -1605,6 +1605,91 @@ mod tests {
         restored.close().await.expect("restored store closes");
     }
 
+    #[tokio::test]
+    async fn forged_or_copied_snapshot_markers_lack_trusted_provenance() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let managed_path = database_path(&directory, "managed-marker.sqlite");
+        let forged_destination = database_path(&directory, "forged-destination.sqlite");
+        open(&managed_path)
+            .await
+            .close()
+            .await
+            .expect("managed store closes");
+        execute_direct(
+            &managed_path,
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'gta-claw-standalone-snapshot-v1', 0)",
+        )
+        .await;
+        let forged = StateStore::restore_backup(&managed_path, &forged_destination)
+            .await
+            .expect_err("self-attested managed database is rejected");
+        assert!(matches!(forged, StateError::BackupNotPortable { .. }));
+        assert!(!forged_destination.exists());
+
+        let source_path = database_path(&directory, "sealed-source.sqlite");
+        let backup_path = database_path(&directory, "sealed-backup.sqlite");
+        let copied_path = database_path(&directory, "copied-backup.sqlite");
+        let copied_destination = database_path(&directory, "copied-destination.sqlite");
+        let source = open(&source_path).await;
+        source
+            .backup_to(&backup_path)
+            .await
+            .expect("create genuinely sealed backup");
+        fs::copy(&backup_path, &copied_path).expect("copy sealed backup bytes");
+
+        #[cfg(unix)]
+        {
+            use xattr::FileExt as _;
+
+            let source_file = fs::File::open(&backup_path).expect("open source backup seal");
+            let seal_id = source_file
+                .get_xattr("user.gta-claw.backup-seal-id")
+                .expect("read source backup seal")
+                .expect("source backup seal exists");
+            let copied_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&copied_path)
+                .expect("open copied backup");
+            copied_file
+                .set_xattr("user.gta-claw.backup-seal-id", &seal_id)
+                .expect("copy untrusted seal index");
+        }
+        #[cfg(windows)]
+        {
+            let seal_path = |path: &Path| {
+                let mut seal = path.as_os_str().to_owned();
+                seal.push(":gta-claw-backup-seal");
+                PathBuf::from(seal)
+            };
+            let protected =
+                fs::read(seal_path(&backup_path)).expect("read protected source backup seal");
+            fs::write(seal_path(&copied_path), protected)
+                .expect("copy protected seal to a different file identity");
+        }
+
+        let copied = StateStore::restore_backup(&copied_path, &copied_destination)
+            .await
+            .expect_err("copied marker and seal cannot authenticate a new inode");
+        assert!(matches!(copied, StateError::InvalidBackup { .. }));
+        assert!(!copied_destination.exists());
+
+        let tampered_destination = database_path(&directory, "tampered-destination.sqlite");
+        execute_direct(
+            &backup_path,
+            "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+             VALUES ('post-seal-tamper', 'active', 1, 1, 1)",
+        )
+        .await;
+        let tampered = StateStore::restore_backup(&backup_path, &tampered_destination)
+            .await
+            .expect_err("schema-valid post-seal mutation is rejected");
+        assert!(matches!(tampered, StateError::InvalidBackup { .. }));
+        assert!(!tampered_destination.exists());
+        source.close().await.expect("source closes");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn restore_rejects_hardlink_alias_with_committed_wal() {

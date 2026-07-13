@@ -11,6 +11,9 @@ repository.workspace = true
 libsqlite3-sys = "0.37.0"
 sqlx.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "allow"

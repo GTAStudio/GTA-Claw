@@ -33,7 +33,11 @@ serde_path_to_error = "=0.1.20"
 sha2 = "=0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+] }
 xattr = "1.6.1"
 uzers = "0.12.2"
 

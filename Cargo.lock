@@ -164,6 +164,7 @@ version = "0.1.0"
 dependencies = [
  "libsqlite3-sys",
  "sqlx",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

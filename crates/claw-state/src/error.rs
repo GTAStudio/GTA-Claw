@@ -138,6 +138,13 @@ pub enum StateError {
         /// Stable diagnostic.
         reason: String,
     },
+    /// The backup is not sealed for this machine and service identity.
+    BackupNotPortable {
+        /// Backup path.
+        path: PathBuf,
+        /// Stable fail-closed diagnostic.
+        reason: &'static str,
+    },
     /// A durable record already exists.
     AlreadyExists {
         /// Record kind.
@@ -259,6 +266,11 @@ impl Display for StateError {
             Self::InvalidBackup { path, reason } => {
                 write!(formatter, "invalid backup {}: {reason}", path.display())
             }
+            Self::BackupNotPortable { path, reason } => write!(
+                formatter,
+                "backup {} is not portable to this machine identity: {reason}",
+                path.display()
+            ),
             Self::AlreadyExists { entity, id } => write!(formatter, "{entity} {id} already exists"),
             Self::NotFound { entity, id } => write!(formatter, "{entity} {id} was not found"),
             Self::ForeignKeyViolation { entity, id } => {

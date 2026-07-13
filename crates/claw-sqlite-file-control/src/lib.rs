@@ -103,3 +103,122 @@ unsafe extern "C" fn reject_moved_commit(context: *mut std::ffi::c_void) -> i32 
     };
     i32::from(result != libsqlite3_sys::SQLITE_OK || moved != 0)
 }
+
+/// Protects bytes with the current Windows user's DPAPI credentials.
+#[cfg(windows)]
+pub fn protect_for_current_windows_user(data: &[u8]) -> Result<Vec<u8>, FileControlError> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
+    };
+
+    let input_length = u32::try_from(data.len())
+        .map_err(|_| FileControlError::Handle("DPAPI input is too large".to_owned()))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_length,
+        pbData: data.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: The input slice remains live for the call. DPAPI initializes the
+    // output blob on success; its LocalAlloc buffer is copied and freed below.
+    let protected = unsafe {
+        CryptProtectData(
+            &raw const input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &raw mut output,
+        )
+    };
+    if protected == 0 {
+        return Err(FileControlError::Handle(format!(
+            "DPAPI protection failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: DPAPI returned a valid buffer of cbData bytes on success.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    // SAFETY: DPAPI allocates the output with LocalAlloc.
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(bytes)
+}
+
+/// Unprotects bytes with the current Windows user's DPAPI credentials.
+#[cfg(windows)]
+pub fn unprotect_for_current_windows_user(data: &[u8]) -> Result<Vec<u8>, FileControlError> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
+    };
+
+    let input_length = u32::try_from(data.len())
+        .map_err(|_| FileControlError::Handle("DPAPI input is too large".to_owned()))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_length,
+        pbData: data.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: The input slice remains live for the call. DPAPI initializes the
+    // output blob on success; its LocalAlloc buffer is copied and freed below.
+    let unprotected = unsafe {
+        CryptUnprotectData(
+            &raw const input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &raw mut output,
+        )
+    };
+    if unprotected == 0 {
+        return Err(FileControlError::Handle(format!(
+            "DPAPI unprotection failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: DPAPI returned a valid buffer of cbData bytes on success.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    // SAFETY: DPAPI allocates the output with LocalAlloc.
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(bytes)
+}
+
+/// Returns the Windows volume serial and 128-bit file identifier.
+#[cfg(windows)]
+pub fn windows_file_identity(file: &std::fs::File) -> Result<[u8; 24], FileControlError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: The file handle is live, and the output points to a correctly
+    // sized FILE_ID_INFO for the requested information class.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut information).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).expect("FILE_ID_INFO size fits u32"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(FileControlError::Handle(format!(
+            "Windows file identity query failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut identity = [0_u8; 24];
+    identity[..8].copy_from_slice(&information.VolumeSerialNumber.to_le_bytes());
+    identity[8..].copy_from_slice(&information.FileId.Identifier);
+    Ok(identity)
+}
