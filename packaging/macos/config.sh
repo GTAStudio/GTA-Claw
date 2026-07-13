@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+: "${APP_NAME:=GTA Claw}"
+: "${EXECUTABLE_NAME:=gta-claw-desktop}"
+: "${BUNDLE_ID:=com.gtastudio.gta-claw}"
+: "${MINIMUM_MACOS_VERSION:=14.0}"
+: "${APP_CATEGORY:=public.app-category.developer-tools}"
+: "${APP_COPYRIGHT:=Copyright 2026 GTAStudio. Licensed under MIT.}"
+: "${NORMALIZED_MTIME:=200001010000}"
+
+if [[ -z "${VERSION:-}" ]]; then
+  VERSION="$(
+    awk '
+      /^\[workspace\.package\]$/ { in_package = 1; next }
+      /^\[/ { in_package = 0 }
+      in_package && $1 == "version" {
+        gsub(/"/, "", $3)
+        print $3
+        exit
+      }
+    ' "$REPO_ROOT/Cargo.toml"
+  )"
+fi
+: "${BUILD_VERSION:=$VERSION}"
+
+validate_bundle_id "$BUNDLE_ID"
+validate_release_version "$VERSION"
+validate_build_version "$BUILD_VERSION"
+validate_macos_version "$MINIMUM_MACOS_VERSION"
+
+readonly APP_NAME EXECUTABLE_NAME BUNDLE_ID MINIMUM_MACOS_VERSION
+readonly APP_CATEGORY APP_COPYRIGHT NORMALIZED_MTIME VERSION BUILD_VERSION
