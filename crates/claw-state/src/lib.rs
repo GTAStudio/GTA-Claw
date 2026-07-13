@@ -1079,6 +1079,38 @@ mod tests {
         source.close().await.expect("source store closes");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_accepts_read_only_standalone_backup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "read-only-source.sqlite");
+        let backup_directory = directory.path().join("read-only-backup");
+        fs::create_dir(&backup_directory).expect("create read-only backup directory");
+        let backup_path = backup_directory.join("backup.sqlite");
+        let destination = database_path(&directory, "read-only-restored.sqlite");
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+        source.close().await.expect("source store closes");
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o444))
+            .expect("make backup read-only");
+        fs::set_permissions(&backup_directory, fs::Permissions::from_mode(0o555))
+            .expect("make backup directory read-only");
+
+        StateStore::restore_backup(&backup_path, &destination)
+            .await
+            .expect("restore does not mutate read-only source");
+        open(&destination)
+            .await
+            .close()
+            .await
+            .expect("restored store closes");
+
+        fs::set_permissions(&backup_directory, fs::Permissions::from_mode(0o755))
+            .expect("restore backup directory permissions for cleanup");
+    }
+
     #[tokio::test]
     async fn post_publication_failure_reports_published_destination() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1642,6 +1674,68 @@ mod tests {
             .expect("killed writer is recovered");
         assert!(recovered.recovered_writer().is_some());
         recovered.close().await.expect("recovered store closes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_first_open_has_exactly_one_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "first-open.sqlite");
+        fs::File::create(&path).expect("precreate empty database inode");
+        let ready_a = database_path(&directory, "first-a.ready");
+        let ready_b = database_path(&directory, "first-b.ready");
+        let executable = std::env::current_exe().expect("current test executable");
+        let spawn = |ready: &Path| {
+            Command::new(&executable)
+                .arg("--exact")
+                .arg("tests::child_process_writer")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env("CLAW_STATE_CHILD_DATABASE", &path)
+                .env("CLAW_STATE_CHILD_READY", ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn first-open contender")
+        };
+        let mut child_a = spawn(&ready_a);
+        let mut child_b = spawn(&ready_b);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (winner_is_a, loser_status) = loop {
+            let a_ready = ready_a.exists();
+            let b_ready = ready_b.exists();
+            if a_ready && b_ready {
+                let _ = child_a.kill();
+                let _ = child_b.kill();
+                let _ = child_a.wait();
+                let _ = child_b.wait();
+                panic!("both first-open contenders acquired the same database identity");
+            }
+            let a_status = child_a.try_wait().expect("inspect first contender");
+            let b_status = child_b.try_wait().expect("inspect second contender");
+            if a_ready && let Some(status) = b_status {
+                break (true, status);
+            }
+            if b_ready && let Some(status) = a_status {
+                break (false, status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child_a.kill();
+                let _ = child_b.kill();
+                let _ = child_a.wait();
+                let _ = child_b.wait();
+                panic!("first-open contenders did not resolve within ten seconds");
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(!loser_status.success());
+        let winner = if winner_is_a {
+            &mut child_a
+        } else {
+            &mut child_b
+        };
+        winner.kill().expect("stop winning contender");
+        winner.wait().expect("reap winning contender");
     }
 
     #[tokio::test]
