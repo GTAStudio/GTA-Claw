@@ -1,0 +1,33 @@
+[package]
+name = "claw-gateway-client"
+description = "Bounded pure-Rust OpenClaw Gateway WebSocket client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+base64 = "=0.22.1"
+claw-protocol.workspace = true
+claw-security.workspace = true
+fastwebsockets = { version = "=0.10.0", default-features = false, features = ["unstable-split"] }
+httparse = "=1.10.1"
+ring = "=0.17.14"
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
+secrecy = "=0.10.3"
+serde.workspace = true
+sha1 = "=0.11.0"
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+url = "=2.5.8"
+
+[dev-dependencies]
+rand_chacha = "=0.10.0"
+serde_json.workspace = true
+
+[lints]
+workspace = true

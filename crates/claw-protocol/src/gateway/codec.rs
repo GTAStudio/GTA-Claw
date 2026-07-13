@@ -5,8 +5,8 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Write};
 use std::rc::Rc;
 
-use serde::Deserializer;
 use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::{Deserializer, Serialize};
 
 use super::frame::{
     ConnectChallenge, ConnectParams, EventSequence, EventWire, FrameValidationError, HelloOk,
@@ -17,6 +17,15 @@ use super::{
     DynamicPluginRegistry, EventFrame, Frame, FrameKind, RequestFrame, RequestId, ResponseFrame,
     TransportPhase, ValidationPolicy,
 };
+
+#[derive(Serialize)]
+struct SerializableRequest<'a, T: ?Sized> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: &'a RequestId,
+    method: &'a super::GatewayMethodName,
+    params: &'a T,
+}
 
 /// Transport-independent strict JSON codec for Gateway frames and handshake DTOs.
 #[derive(Clone, Debug)]
@@ -146,9 +155,41 @@ impl Codec {
         frame
             .validate(&self.policy)
             .map_err(CodecError::from_validation)?;
+        self.encode_bounded(frame)
+    }
+
+    /// Encodes a typed request with caller-supplied serializable parameters.
+    ///
+    /// Serialization writes directly into the phase-bounded writer, so a
+    /// parameter source that would exceed the transport cap cannot force a full
+    /// oversized intermediate allocation.
+    pub fn encode_request<T>(
+        &self,
+        id: &RequestId,
+        method: &super::GatewayMethodName,
+        params: &T,
+    ) -> Result<Vec<u8>, CodecError>
+    where
+        T: Serialize + ?Sized,
+    {
+        RequestFrame::new(id.clone(), method.clone(), OpaqueField::Omitted)
+            .validate(&self.policy)
+            .map_err(CodecError::from_validation)?;
+        self.encode_bounded(&SerializableRequest {
+            kind: "req",
+            id,
+            method,
+            params,
+        })
+    }
+
+    fn encode_bounded<T>(&self, value: &T) -> Result<Vec<u8>, CodecError>
+    where
+        T: Serialize + ?Sized,
+    {
         let limit = self.phase.max_frame_bytes();
         let mut writer = BoundedWriter::new(limit);
-        let serialization = serde_json::to_writer(&mut writer, frame);
+        let serialization = serde_json::to_writer(&mut writer, value);
         if let Some(actual) = writer.exceeded_at {
             return Err(CodecError::FrameTooLarge {
                 phase: self.phase,
