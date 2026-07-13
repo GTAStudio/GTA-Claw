@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -201,8 +203,30 @@ pub struct StateStore {
     recovered_writer: Option<RecoveredWriterLock>,
     pool: SqlitePool,
     lock_file: File,
+    _process_identity: ProcessIdentityGuard,
     _database_file: File,
     max_connections: u32,
+}
+
+#[cfg(unix)]
+static PROCESS_IDENTITIES: LazyLock<StdMutex<std::collections::HashSet<(u64, u64)>>> =
+    LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+struct ProcessIdentityGuard {
+    #[cfg(unix)]
+    identity: Option<(u64, u64)>,
+}
+
+impl Drop for ProcessIdentityGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(identity) = self.identity.take() {
+            PROCESS_IDENTITIES
+                .lock()
+                .expect("process identity registry lock poisoned")
+                .remove(&identity);
+        }
+    }
 }
 
 impl StateStore {
@@ -215,7 +239,7 @@ impl StateStore {
         reject_hard_link(&path, &database_file)?;
         inspect_database(&path, &database_file, false).await?;
         prepare_windows_database_identity(&path)?;
-        let (lock_path, lock_file) = acquire_store_lock(&path, &database_file)?;
+        let (lock_path, lock_file, process_identity) = acquire_store_lock(&path, &database_file)?;
         let owner = writer_owner()?;
         verify_path_identity(&path, &database_file)?;
         let locked_state = inspect_database(&path, &database_file, false).await?;
@@ -244,6 +268,7 @@ impl StateStore {
                 let file = Arc::clone(&verified_file);
                 Box::pin(async move {
                     verify_path_identity(&path, &file)
+                        .and_then(|()| assert_store_lock(&path, &file))
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))
                 })
             })
@@ -252,6 +277,7 @@ impl StateStore {
                 let file = Arc::clone(&acquire_file);
                 Box::pin(async move {
                     verify_path_identity(&path, &file)
+                        .and_then(|()| assert_store_lock(&path, &file))
                         .map(|()| true)
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))
                 })
@@ -289,6 +315,7 @@ impl StateStore {
             recovered_writer,
             pool,
             lock_file,
+            _process_identity: process_identity,
             _database_file: database_file,
             max_connections: config.max_connections,
         })
@@ -370,7 +397,8 @@ impl StateStore {
         verify_path_identity(&backup, &backup_file)?;
         reject_hard_link(&backup, &backup_file)?;
         validate_windows_restore_identity(&backup)?;
-        let (_source_lock_path, _source_lock) = acquire_store_lock(&backup, &backup_file)?;
+        let (_source_lock_path, _source_lock, _source_process_identity) =
+            acquire_store_lock(&backup, &backup_file)?;
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
@@ -480,7 +508,7 @@ impl StateStore {
             false
         };
         self.pool.close().await;
-        let os_lock_released = match File::unlock(&self.lock_file) {
+        let os_lock_released = match release_store_lock(&self.lock_file) {
             Ok(()) => true,
             Err(error) => {
                 reasons.push(format!(
@@ -1280,25 +1308,90 @@ fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
 }
 
 #[cfg(unix)]
-fn acquire_store_lock(path: &Path, database_file: &File) -> Result<(PathBuf, File), StateError> {
+fn acquire_store_lock(
+    path: &Path,
+    database_file: &File,
+) -> Result<(PathBuf, File, ProcessIdentityGuard), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = database_file
+        .metadata()
+        .map_err(|error| file_error("inspect database lock identity", path, error))?;
+    let identity = (metadata.dev(), metadata.ino());
+    if !PROCESS_IDENTITIES
+        .lock()
+        .expect("process identity registry lock poisoned")
+        .insert(identity)
+    {
+        return Err(StateError::StoreLocked {
+            path: path.to_owned(),
+        });
+    }
+    let guard = ProcessIdentityGuard {
+        identity: Some(identity),
+    };
     let lock_file = database_file
         .try_clone()
         .map_err(|error| file_error("clone database identity handle", path, error))?;
-    match lock_file.try_lock() {
-        Ok(()) => Ok((path.to_owned(), lock_file)),
-        Err(std::fs::TryLockError::WouldBlock) => Err(StateError::StoreLocked {
-            path: path.to_owned(),
-        }),
-        Err(std::fs::TryLockError::Error(error)) => {
-            Err(file_error("acquire database identity lock", path, error))
+    assert_store_lock(path, &lock_file)?;
+    Ok((path.to_owned(), lock_file, guard))
+}
+
+#[cfg(not(unix))]
+fn acquire_store_lock(
+    path: &Path,
+    _database_file: &File,
+) -> Result<(PathBuf, File, ProcessIdentityGuard), StateError> {
+    let lock_path = lock_path_for(path);
+    acquire_writer_lock(&lock_path).map(|file| (lock_path, file, ProcessIdentityGuard {}))
+}
+
+#[cfg(unix)]
+fn assert_store_lock(path: &Path, file: &File) -> Result<(), StateError> {
+    let lock = nix::libc::flock {
+        l_type: nix::libc::F_WRLCK as _,
+        l_whence: nix::libc::SEEK_SET as _,
+        l_start: 0,
+        l_len: 1,
+        l_pid: 0,
+    };
+    match nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_SETLK(&lock)) {
+        Ok(_) => Ok(()),
+        Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => {
+            Err(StateError::StoreLocked {
+                path: path.to_owned(),
+            })
         }
+        Err(error) => Err(file_error(
+            "acquire database identity byte lock",
+            path,
+            std::io::Error::from_raw_os_error(error as i32),
+        )),
     }
 }
 
 #[cfg(not(unix))]
-fn acquire_store_lock(path: &Path, _database_file: &File) -> Result<(PathBuf, File), StateError> {
-    let lock_path = lock_path_for(path);
-    acquire_writer_lock(&lock_path).map(|file| (lock_path, file))
+fn assert_store_lock(_path: &Path, _file: &File) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn release_store_lock(file: &File) -> std::io::Result<()> {
+    let lock = nix::libc::flock {
+        l_type: nix::libc::F_UNLCK as _,
+        l_whence: nix::libc::SEEK_SET as _,
+        l_start: 0,
+        l_len: 1,
+        l_pid: 0,
+    };
+    nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_SETLK(&lock))
+        .map(|_| ())
+        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(not(unix))]
+fn release_store_lock(file: &File) -> std::io::Result<()> {
+    File::unlock(file)
 }
 
 #[cfg(not(windows))]

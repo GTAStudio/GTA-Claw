@@ -318,7 +318,13 @@ mod tests {
         let open_path = path.clone();
         let opener =
             tokio::spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
-        entered.notified().await;
+        if tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .is_err()
+        {
+            opener.abort();
+            panic!("state opener did not enter the migration transaction within two seconds");
+        }
 
         let drift = external
             .execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT")
