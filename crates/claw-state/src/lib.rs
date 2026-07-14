@@ -740,12 +740,15 @@ mod tests {
             .await
             .expect("open reaches transactional migration barrier");
         opener.abort();
-        assert!(
-            opener
-                .await
-                .expect_err("cancelled opener task")
-                .is_cancelled()
-        );
+        let cancellation = match opener.await {
+            Err(error) => error,
+            Ok(Ok(store)) => {
+                let close = store.close().await;
+                panic!("cancelled opener returned a store; close result: {close:?}");
+            }
+            Ok(Err(error)) => panic!("cancelled opener returned an error: {error}"),
+        };
+        assert!(cancellation.is_cancelled());
         test_support::clear_migration_barrier(&path);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1964,7 +1967,7 @@ mod tests {
         let (temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
         let backup_source = std::sync::Arc::clone(&source);
         let backup_destination = destination.clone();
-        let backup =
+        let mut backup =
             tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -2026,7 +2029,7 @@ mod tests {
         let (_temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
         let backup_source = std::sync::Arc::clone(&source);
         let backup_destination = destination.clone();
-        let backup =
+        let mut backup =
             tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
