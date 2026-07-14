@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::num::NonZeroU64;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -213,6 +215,8 @@ pub enum ProtocolFailure {
     DuplicateRequest(RequestId),
     /// Event continuity was lost and state must be rebuilt.
     ResyncRequired(ResyncRequired),
+    /// The process-local connection epoch counter was exhausted.
+    ConnectionEpochExhausted,
 }
 
 impl Display for ProtocolFailure {
@@ -269,6 +273,9 @@ impl Display for ProtocolFailure {
             }
             Self::DuplicateRequest(id) => write!(formatter, "duplicate Gateway request id `{id}`"),
             Self::ResyncRequired(reason) => Display::fmt(reason, formatter),
+            Self::ConnectionEpochExhausted => {
+                formatter.write_str("Gateway local connection epoch exhausted")
+            }
         }
     }
 }
@@ -293,6 +300,7 @@ impl ProtocolFailure {
             Self::DuplicateResponse(_) => "duplicate response identifier",
             Self::DuplicateRequest(_) => "duplicate request identifier",
             Self::ResyncRequired(_) => "resync required",
+            Self::ConnectionEpochExhausted => "connection epoch exhausted",
         }
     }
 }
@@ -357,6 +365,11 @@ pub enum GatewayClientError {
     Cancelled,
     /// Pending request was failed on disconnect and was not replayed.
     DisconnectedNotReplayed,
+    /// The request was bound to a connection lifecycle that is no longer current.
+    ConnectionChanged {
+        /// Epoch observed and explicitly bound by the caller.
+        expected: ConnectionEpoch,
+    },
     /// Request exceeded its caller timeout.
     RequestTimedOut(RequestId),
     /// Bounded shutdown did not complete.
@@ -370,9 +383,10 @@ impl GatewayClientError {
     #[must_use]
     pub const fn class(&self) -> FailureClass {
         match self {
-            Self::Transport(_) | Self::DisconnectedNotReplayed | Self::ReconnectExhausted => {
-                FailureClass::TransientTransport
-            }
+            Self::Transport(_)
+            | Self::DisconnectedNotReplayed
+            | Self::ConnectionChanged { .. }
+            | Self::ReconnectExhausted => FailureClass::TransientTransport,
             Self::Authentication(_) => FailureClass::Authentication,
             Self::Protocol(_) => FailureClass::Protocol,
             Self::Configuration(_) => FailureClass::PermanentConfiguration,
@@ -398,6 +412,11 @@ impl Display for GatewayClientError {
             Self::DisconnectedNotReplayed => {
                 formatter.write_str("Gateway request cancelled on disconnect and not replayed")
             }
+            Self::ConnectionChanged { expected } => write!(
+                formatter,
+                "Gateway connection changed from local epoch {}",
+                expected.get()
+            ),
             Self::RequestTimedOut(id) => write!(formatter, "Gateway request `{id}` timed out"),
             Self::ShutdownTimedOut => formatter.write_str("Gateway client shutdown timed out"),
             Self::ReconnectExhausted => formatter.write_str("Gateway reconnect attempts exhausted"),
@@ -443,6 +462,42 @@ pub struct ConnectionInfo {
     pub advertised_event_count: usize,
     /// Effective inbound/outbound payload cap for this connection.
     pub max_payload_bytes: usize,
+}
+
+/// Process-local identity of one authenticated connection lifecycle.
+///
+/// Epochs are allocated monotonically by the client and are never derived from
+/// the peer-provided connection identifier or serialized on the wire.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectionEpoch(NonZeroU64);
+
+impl ConnectionEpoch {
+    pub(crate) const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the monotonically allocated process-local value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Authenticated connection snapshot safe to bind requests against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyConnection {
+    /// Process-local lifecycle identity.
+    pub epoch: ConnectionEpoch,
+    /// Validated, non-secret server hello summary.
+    pub info: ConnectionInfo,
+}
+
+impl Deref for ReadyConnection {
+    type Target = ConnectionInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.info
+    }
 }
 
 /// One secret device credential issued by a successful Gateway hello.
@@ -515,7 +570,7 @@ pub enum ConnectionState {
     /// Challenge/connect/hello authentication is in progress.
     Authenticating,
     /// Connection is authenticated and accepting requests.
-    Ready(ConnectionInfo),
+    Ready(ReadyConnection),
     /// Waiting before a caller-authorized transient retry.
     Reconnecting {
         /// One-based retry attempt.
