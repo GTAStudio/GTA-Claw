@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use claw_application::Application;
 use claw_gateway_client::{
-    AuthenticationFailure, ClientMetadata, ClientTimeouts, ConfigurationError, ConnectionInfo,
-    ConnectionState, GatewayClient, GatewayClientConfig, GatewayClientError, GatewayCredential,
-    ProtocolFailure, ReconnectPolicy, TransportFailure,
+    AuthenticationFailure, AuthorizationExpectation, ClientMetadata, ClientTimeouts,
+    ConfigurationError, ConnectionEpoch, ConnectionInfo, ConnectionState, GatewayClient,
+    GatewayClientConfig, GatewayClientError, GatewayCredential, ProtocolFailure, ReconnectPolicy,
+    TransportFailure,
 };
 use claw_platform::NativeSystemProbe;
 use claw_protocol::gateway::{
@@ -586,6 +587,7 @@ async fn run_gateway(
     config.credential = credential;
     config.role = Role::Operator;
     config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
+    config.authorization_expectation = AuthorizationExpectation::ExactRequested;
     config.client = ClientMetadata {
         id: ClientId::Probe,
         display_name: Some(Name::new("GTA Claw Gateway diagnostic", 64).expect("static name")),
@@ -642,9 +644,9 @@ async fn run_gateway(
 }
 
 async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
-    let info = match client.wait_ready().await {
-        Ok(info) => match SafeConnectionInfo::try_from(info) {
-            Ok(info) => info,
+    let (epoch, info) = match client.wait_ready().await {
+        Ok(ready) => match SafeConnectionInfo::try_from(ready.info) {
+            Ok(info) => (ready.epoch, info),
             Err(failure) => return DiagnosticAttempt::failure(failure),
         },
         Err(error) => {
@@ -656,7 +658,7 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
     let method = GatewayMethodName::Core(
         resolve_core_method("health").expect("P02a registry contains health"),
     );
-    let response = match request_health(client, request_id, method).await {
+    let response = match request_health(client, epoch, request_id, method).await {
         Ok(response) => response,
         Err(failure) => return DiagnosticAttempt::with_info(failure, info),
     };
@@ -710,12 +712,16 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
 
 async fn request_health(
     client: &GatewayClient,
+    epoch: ConnectionEpoch,
     request_id: RequestId,
     method: GatewayMethodName,
 ) -> Result<ResponseFrame, DiagnosticFailure> {
     let params = EmptyParams {};
     race_operation_against_state(client.subscribe_state(), || async {
-        match client.request(request_id, method, &params).await {
+        match client
+            .request_for_epoch(epoch, request_id, method, &params)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(error) => Err(classify_request_error(client, &error).await),
         }
@@ -759,6 +765,7 @@ async fn classify_request_error(
     if !matches!(
         error,
         GatewayClientError::DisconnectedNotReplayed
+            | GatewayClientError::ConnectionChanged { .. }
             | GatewayClientError::NotReady
             | GatewayClientError::Cancelled
             | GatewayClientError::RequestTimedOut(_)
@@ -1195,6 +1202,7 @@ fn map_client_error(error: &GatewayClientError) -> DiagnosticFailure {
         }
         GatewayClientError::Transport(_)
         | GatewayClientError::DisconnectedNotReplayed
+        | GatewayClientError::ConnectionChanged { .. }
         | GatewayClientError::ReconnectExhausted => DiagnosticFailure {
             category: ExitCategory::TransportTransient,
             status: "transport_failure",

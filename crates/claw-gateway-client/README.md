@@ -16,6 +16,11 @@ strict codec decision, and `claw-security` for device identity and signing.
 - Compression is not offered and any negotiated extension is rejected.
 - Request IDs are typed, unique per connection, exactly correlated, and retained
   for a bounded per-connection identifier budget without unsafe eviction.
+- Every authenticated lifecycle receives a monotonic process-local
+  `ConnectionEpoch` unrelated to the untrusted server `connId`. Each lifecycle
+  owns its bounded command sender and correlation map.
+- `AuthorizationExpectation::ExactRequested` rejects a hello before Ready unless
+  its effective role and scope set exactly match the configured request.
 - Event gaps, duplicates, regressions, and bounded queue saturation enter a typed
   resync-required terminal state.
 - Every command/event queue, cumulative outbound/event byte budget, serialization
@@ -33,8 +38,21 @@ strict codec decision, and `claw-security` for device identity and signing.
 - Credentials are secrecy wrappers and never appear in client `Debug`, errors,
   state, events, or tracing.
 
-The local suite has 39 active client/policy checks: 37 integration and
-regression cases, deterministic injected clock/jitter coverage, and a static
+## Epoch-bound requests
+
+`wait_ready` returns a `ReadyConnection` containing the validated hello and its
+local epoch. Callers that must not cross a reconnect boundary should retain that
+epoch and use `request_for_epoch` or `request_with_timeout_for_epoch`. A changed
+or disconnected lifecycle returns `GatewayClientError::ConnectionChanged`; the
+request is never routed to the replacement connection or replayed.
+
+The convenient `request` methods atomically capture the current lifecycle and
+remain connection-bound. Set `authorization_expectation` to
+`AuthorizationExpectation::ExactRequested` when the effective hello
+authorization is part of the caller's security contract.
+
+The local suite includes authenticated integration and regression cases,
+deterministic injected clock/jitter/barrier coverage, and a static
 reference-workflow policy test. One ignored live contract test is run only by
 the isolated upstream workflow.
 

@@ -27,6 +27,16 @@ pub enum GatewayCredential {
     DeviceToken(SecretString),
 }
 
+/// How strictly a successful hello must match the requested authorization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AuthorizationExpectation {
+    /// Preserve generic Gateway behavior: require the requested role and accept any closed scopes.
+    #[default]
+    RequestedRole,
+    /// Require the effective hello role and scope set to equal the request exactly.
+    ExactRequested,
+}
+
 impl Debug for GatewayCredential {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -175,6 +185,8 @@ pub struct GatewayClientConfig {
     pub role: Role,
     /// Requested closed operator scopes.
     pub scopes: ScopeSet,
+    /// Validation applied to the effective authorization returned by hello.
+    pub authorization_expectation: AuthorizationExpectation,
     /// Lowest protocol accepted by the caller.
     pub min_protocol: ProtocolVersion,
     /// Highest protocol accepted by the caller.
@@ -207,6 +219,7 @@ impl GatewayClientConfig {
             credential: GatewayCredential::None,
             role: Role::Operator,
             scopes: ScopeSet::EMPTY,
+            authorization_expectation: AuthorizationExpectation::RequestedRole,
             min_protocol: GATEWAY_PROTOCOL_VERSION,
             max_protocol: GATEWAY_PROTOCOL_VERSION,
             client: ClientMetadata::default(),
@@ -296,6 +309,7 @@ impl Debug for GatewayClientConfig {
             .field("credential", &self.credential)
             .field("role", &self.role)
             .field("scopes", &self.scopes)
+            .field("authorization_expectation", &self.authorization_expectation)
             .field("min_protocol", &self.min_protocol)
             .field("max_protocol", &self.max_protocol)
             .field("client", &self.client)
