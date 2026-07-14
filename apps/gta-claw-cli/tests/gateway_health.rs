@@ -16,7 +16,7 @@ use claw_protocol::gateway::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use support::{
     TestGateway, handler, receive_connect, receive_request, send_challenge, send_connect_error,
@@ -42,7 +42,7 @@ enum GatewayBehavior {
     MalformedResponse,
     OversizedResponse,
     ImmediateClose {
-        close_sent: Arc<Notify>,
+        close_flushed: watch::Sender<bool>,
     },
     HelloClaims {
         role: &'static str,
@@ -106,13 +106,13 @@ async fn spawn_gateway(behavior: GatewayBehavior, request_count: Arc<AtomicUsize
             if matches!(behavior, GatewayBehavior::HelloProtocol(_)) {
                 return;
             }
-            if let GatewayBehavior::ImmediateClose { close_sent } = &behavior {
+            if let GatewayBehavior::ImmediateClose { close_flushed } = &behavior {
                 socket
                     .write_frame(fastwebsockets::Frame::close(1000, b"diagnostic close"))
                     .await
                     .expect("send immediate close");
                 socket.flush().await.expect("flush immediate close");
-                close_sent.notify_waiters();
+                close_flushed.send_replace(true);
                 count_requests_until_close(&mut socket, &request_count).await;
                 return;
             }
@@ -626,38 +626,34 @@ async fn no_token_is_explicit_and_wrong_token_is_rejected_by_the_server() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn immediate_post_hello_disconnect_is_stably_transport_failure() {
     for iteration in 0..100 {
-        let close_sent = Arc::new(Notify::new());
+        let (close_flushed, mut close_flushed_rx) = watch::channel(false);
         let request_count = Arc::new(AtomicUsize::new(0));
         let gateway = spawn_gateway(
-            GatewayBehavior::ImmediateClose {
-                close_sent: Arc::clone(&close_sent),
-            },
+            GatewayBehavior::ImmediateClose { close_flushed },
             Arc::clone(&request_count),
         )
         .await;
-        let close_notification = close_sent.notified();
-        tokio::pin!(close_notification);
         let token_input = format!("{TOKEN}\n");
-        let running = run_cli(gateway_arguments(gateway.url.as_str()), Some(&token_input));
-        tokio::pin!(running);
-        tokio::select! {
-            biased;
-            () = &mut close_notification => {}
-            output = &mut running => {
-                panic!(
-                    "iteration {iteration} exited before server close barrier: status={} stdout={} stderr={}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        let output = running.await;
+        let close_proof = async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                close_flushed_rx.wait_for(|flushed| *flushed),
+            )
+            .await
+            .map(|result| result.map(|_| ()))
+        };
+        let (output, close_proof) = tokio::join!(
+            run_cli(gateway_arguments(gateway.url.as_str()), Some(&token_input)),
+            close_proof
+        );
+        gateway.shutdown().await;
+        close_proof
+            .unwrap_or_else(|_| panic!("iteration {iteration} timed out before close flush"))
+            .unwrap_or_else(|_| panic!("iteration {iteration} lost close-flush publisher"));
         assert_eq!(output.status.code(), Some(3));
         let summary = parse_json(&output);
         assert_eq!(summary["category"], "transport_transient");
         assert_eq!(summary["status"], "transport_failure");
-        gateway.shutdown().await;
         assert!(
             request_count.load(Ordering::SeqCst) <= 1,
             "iteration {iteration} replayed health after close"
