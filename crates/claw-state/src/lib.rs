@@ -971,6 +971,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_connection_close_failures_never_report_clean_shutdown() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (name, timeout, reason) in [
+            (
+                "error",
+                false,
+                "final connection close failed: injected test failure",
+            ),
+            (
+                "timeout",
+                true,
+                "final connection close exceeded close deadline",
+            ),
+        ] {
+            let path = database_path(&directory, &format!("final-close-{name}.sqlite"));
+            let store = open(&path).await;
+            test_support::fail_final_connection_close_once(&path, timeout);
+            assert_eq!(
+                store
+                    .close()
+                    .await
+                    .expect_err("unobserved final connection close degrades shutdown"),
+                StateError::CloseDegraded {
+                    checkpoint_completed: true,
+                    application_lock_released: true,
+                    final_connection_closed: false,
+                    pool_closed: false,
+                    os_lock_released: true,
+                    reason: reason.to_owned(),
+                }
+            );
+            let reopened = open(&path).await;
+            assert!(reopened.recovered_writer().is_none());
+            reopened
+                .close()
+                .await
+                .expect("degraded store reopens cleanly");
+        }
+
+        let clean_path = database_path(&directory, "final-close-clean.sqlite");
+        open(&clean_path)
+            .await
+            .close()
+            .await
+            .expect("observed final connection close remains clean");
+    }
+
+    #[tokio::test]
     async fn migration_checksum_drift_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "checksum.sqlite");

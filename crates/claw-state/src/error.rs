@@ -126,6 +126,10 @@ pub enum StateError {
         checkpoint_completed: bool,
         /// Whether the persisted application writer row was released.
         application_lock_released: bool,
+        /// Whether shutdown observed the final maintenance connection close.
+        final_connection_closed: bool,
+        /// Whether final-connection closure and complete pool drain were both observed.
+        pool_closed: bool,
         /// Whether the OS identity lock was explicitly released.
         os_lock_released: bool,
         /// Combined deterministic diagnostic.
@@ -257,11 +261,13 @@ impl Display for StateError {
             Self::CloseDegraded {
                 checkpoint_completed,
                 application_lock_released,
+                final_connection_closed,
+                pool_closed,
                 os_lock_released,
                 reason,
             } => write!(
                 formatter,
-                "state store closed with degradation (checkpoint={checkpoint_completed}, application_lock={application_lock_released}, os_lock={os_lock_released}): {reason}"
+                "state store closed with degradation (checkpoint={checkpoint_completed}, application_lock={application_lock_released}, final_connection={final_connection_closed}, pool={pool_closed}, os_lock={os_lock_released}): {reason}"
             ),
             Self::InvalidBackup { path, reason } => {
                 write!(formatter, "invalid backup {}: {reason}", path.display())

@@ -34,6 +34,10 @@ static FAIL_WINDOWS_SOURCE_REMOVAL: Mutex<Option<PathBuf>> = Mutex::new(None);
 static MIGRATION_TEST_BARRIER: Mutex<Option<MigrationTestBarrier>> = Mutex::new(None);
 #[cfg(test)]
 static SNAPSHOT_TEST_BARRIER: Mutex<Option<SnapshotTestBarrier>> = Mutex::new(None);
+#[cfg(test)]
+static FINAL_CONNECTION_CLOSE_FAILURES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, FinalConnectionCloseFailure>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
 struct MigrationTestBarrier {
@@ -48,6 +52,13 @@ struct SnapshotTestBarrier {
     temporary: Arc<Mutex<Option<PathBuf>>>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum FinalConnectionCloseFailure {
+    Error,
+    Timeout,
 }
 const MIGRATION_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS claw_schema_migrations (
@@ -746,27 +757,29 @@ impl StateStore {
         } else {
             false
         };
-        if let Some(connection) = connection.take() {
-            match tokio::time::timeout_at(deadline, connection.close()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => reasons.push(format!(
-                    "final connection close failed: {}",
-                    database("close final state connection", error)
-                )),
-                Err(_) => reasons.push("final connection close exceeded close deadline".to_owned()),
+        let final_connection_closed = if let Some(connection) = connection.take() {
+            match close_final_connection(connection, deadline, &self.path).await {
+                Ok(()) => true,
+                Err(reason) => {
+                    reasons.push(reason);
+                    false
+                }
             }
-        }
+        } else {
+            false
+        };
 
-        let pool_closed = pool_closed_immediately
+        let pool_drain_completed = pool_closed_immediately
             || tokio::time::timeout_at(deadline, close_future)
                 .await
                 .is_ok();
-        if !pool_closed {
+        if !pool_drain_completed {
             reasons.push(format!(
                 "pool drain exceeded the single {} ms close deadline",
                 self.close_timeout.as_millis()
             ));
         }
+        let pool_closed = final_connection_closed && pool_drain_completed;
         let os_lock_released = match File::unlock(&self.lock_file) {
             Ok(()) => true,
             Err(error) => {
@@ -780,19 +793,57 @@ impl StateStore {
         match (
             checkpoint,
             application_lock_released,
+            final_connection_closed,
             os_lock_released,
             pool_closed,
         ) {
-            (Some(report), true, true, true) => Ok(report),
-            (checkpoint, application_lock_released, os_lock_released, _) => {
-                Err(StateError::CloseDegraded {
-                    checkpoint_completed: checkpoint.is_some(),
-                    application_lock_released,
-                    os_lock_released,
-                    reason: reasons.join("; "),
-                })
-            }
+            (Some(report), true, true, true, true) => Ok(report),
+            (
+                checkpoint,
+                application_lock_released,
+                final_connection_closed,
+                os_lock_released,
+                pool_closed,
+            ) => Err(StateError::CloseDegraded {
+                checkpoint_completed: checkpoint.is_some(),
+                application_lock_released,
+                final_connection_closed,
+                pool_closed,
+                os_lock_released,
+                reason: reasons.join("; "),
+            }),
         }
+    }
+}
+
+async fn close_final_connection(
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    deadline: tokio::time::Instant,
+    _path: &Path,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(failure) = FINAL_CONNECTION_CLOSE_FAILURES
+        .lock()
+        .expect("final connection close failures lock poisoned")
+        .remove(_path)
+    {
+        drop(connection);
+        return Err(match failure {
+            FinalConnectionCloseFailure::Error => {
+                "final connection close failed: injected test failure".to_owned()
+            }
+            FinalConnectionCloseFailure::Timeout => {
+                "final connection close exceeded close deadline".to_owned()
+            }
+        });
+    }
+    match tokio::time::timeout_at(deadline, connection.close()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!(
+            "final connection close failed: {}",
+            database("close final state connection", error)
+        )),
+        Err(_) => Err("final connection close exceeded close deadline".to_owned()),
     }
 }
 
@@ -4590,6 +4641,22 @@ pub(crate) mod test_support {
         *FAIL_AFTER_PUBLICATION
             .lock()
             .expect("publication failpoint lock poisoned") = Some(destination);
+    }
+
+    pub(crate) fn fail_final_connection_close_once(path: &Path, timeout: bool) {
+        let path = super::resolve_database_path(path)
+            .expect("resolve final connection close failure path");
+        super::FINAL_CONNECTION_CLOSE_FAILURES
+            .lock()
+            .expect("final connection close failures lock poisoned")
+            .insert(
+                path,
+                if timeout {
+                    super::FinalConnectionCloseFailure::Timeout
+                } else {
+                    super::FinalConnectionCloseFailure::Error
+                },
+            );
     }
 
     pub(crate) fn reseal_backup_fixture(path: &Path) {
