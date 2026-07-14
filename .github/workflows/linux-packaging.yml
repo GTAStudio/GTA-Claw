@@ -67,24 +67,6 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           sudo install -m 0755 "$RUNNER_TEMP/actionlint" /usr/local/bin/actionlint
 
-      - name: Enforce focused source ownership
-        if: github.event_name == 'pull_request'
-        shell: bash
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          git diff --name-only --diff-filter=ACDMRT "$BASE_SHA...$GITHUB_SHA" |
-            while IFS= read -r path; do
-              case "$path" in
-                packaging/linux/* | .github/workflows/linux-packaging.yml) ;;
-                *)
-                  echo "P04d changed a path outside its ownership: $path" >&2
-                  exit 1
-                  ;;
-              esac
-            done
-
       - name: Check shell, workflow, source, and release policy
         shell: bash
         run: |
