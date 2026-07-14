@@ -16,12 +16,17 @@ expected = "Audit desktop lockfile must not set working-directory"
 [[case]]
 name = "cargo-audit-install-latest"
 mutation = "cargo-audit-install-latest"
-expected = "cargo-audit install command is not exact"
+expected = "Bootstrap verified Rust security tools script hash changed"
 
 [[case]]
 name = "windows-arm64-deny-missing"
 mutation = "windows-arm64-deny-missing"
-expected = "desktop deny targets do not match the supported target set"
+expected = "missing Check Windows ARM64 desktop dependency policy step"
+
+[[case]]
+name = "supply-checkout-action-substitution"
+mutation = "supply-checkout-action-substitution"
+expected = "supply-chain checkout action or inputs changed"
 
 [[case]]
 name = "job-checks-write"
@@ -37,6 +42,66 @@ expected = "job supply-chain permissions must be a read-only mapping"
 name = "negative-desktop-path"
 mutation = "negative-desktop-path"
 expected = "pull_request paths must exactly match the ordered dependency policy inputs"
+
+[[case]]
+name = "supply-job-disabled"
+mutation = "supply-job-disabled"
+expected = "supply-chain job must not set if"
+
+[[case]]
+name = "supply-job-env-shadow"
+mutation = "supply-job-env-shadow"
+expected = "supply-chain job must not set env"
+
+[[case]]
+name = "supply-unknown-shadow-step"
+mutation = "supply-unknown-shadow-step"
+expected = "supply-chain ordered steps changed"
+
+[[case]]
+name = "bootstrap-wrapper-env"
+mutation = "bootstrap-wrapper-env"
+expected = "verified tool bootstrap environment changed"
+
+[[case]]
+name = "native-matrix-runner-collapse"
+mutation = "native-matrix-runner-collapse"
+expected = "native macOS matrix must cover exact ARM64 and Intel runners"
+
+[[case]]
+name = "source-policy-disabled"
+mutation = "source-policy-disabled"
+expected = "macOS source-policy job must not set if"
+
+[[case]]
+name = "native-arch-assertion-removed"
+mutation = "native-arch-assertion-removed"
+expected = "native macOS architecture assertion or test command changed"
+
+[[case]]
+name = "native-format-replaced"
+mutation = "native-format-replaced"
+expected = "Format both Cargo workspaces script hash changed"
+
+[[case]]
+name = "native-arch-shell-added"
+mutation = "native-arch-shell-added"
+expected = "Test both Cargo workspaces natively step schema changed"
+
+[[case]]
+name = "native-workflow-env-shadow"
+mutation = "native-workflow-env-shadow"
+expected = "macOS workflow inherited environment changed"
+
+[[case]]
+name = "native-matrix-extra-key"
+mutation = "native-matrix-extra-key"
+expected = "native macOS matrix row schema changed"
+
+[[case]]
+name = "deny-no-locked"
+mutation = "deny-no-locked"
+expected = "Check Windows x64 desktop dependency policy command is not exact"
 
 [[case]]
 name = "deny-advisory-ignore"
@@ -62,3 +127,23 @@ expected = "desktop deny license allow-list changed"
 name = "deny-graph-exclude"
 mutation = "deny-graph-exclude"
 expected = "desktop deny graph policy keys changed"
+
+[[case]]
+name = "root-deny-license-widening"
+mutation = "root-deny-license-widening"
+expected = "root deny license policy changed"
+
+[[case]]
+name = "root-deny-inline-exception"
+mutation = "root-deny-inline-exception"
+expected = "root deny license policy changed"
+
+[[case]]
+name = "root-deny-source-widening"
+mutation = "root-deny-source-widening"
+expected = "root deny source policy changed"
+
+[[case]]
+name = "root-deny-ban-skip"
+mutation = "root-deny-ban-skip"
+expected = "root deny bans policy changed"

@@ -1,62 +1,54 @@
 //! Structured policy checks for the isolated desktop dependency graph.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
+use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
-const CARGO_DENY_ACTION: &str =
-    "EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87";
 const CARGO_AUDIT_VERSION: &str = "0.22.2";
 const CARGO_AUDIT_CRATE_SHA256: &str =
     "700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a";
-const DENY_COMMAND_ARGUMENTS: &str =
-    "--config desktop/deny.toml --warn unmaintained advisories licenses sources";
-const INSTALL_CARGO_AUDIT_SCRIPT: &str = r#"set -euo pipefail
-cargo info "cargo-audit@${CARGO_AUDIT_VERSION}" --quiet
-mapfile -t archives < <(
-  find "${CARGO_HOME:-$HOME/.cargo}/registry/cache" \
-    -type f -name "cargo-audit-${CARGO_AUDIT_VERSION}.crate"
-)
-test "${#archives[@]}" -gt 0
-for archive in "${archives[@]}"; do
-  printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$archive" |
-    sha256sum --check -
-done
-cargo install cargo-audit --version "=${CARGO_AUDIT_VERSION}" --locked --force
-test "$(cargo audit --version)" = "cargo-audit-audit ${CARGO_AUDIT_VERSION}"
-"#;
-const AUDIT_EXIT_POLICY_SCRIPT: &str = r#"set -euo pipefail
-for event_name in pull_request push; do
-  export GITHUB_EVENT_NAME="$event_name"
-  if [[ "$event_name" == "pull_request" ]]; then
-    export GITHUB_HEAD_REF="audit-policy-fixture"
-  else
-    unset GITHUB_HEAD_REF
-  fi
-
-  warning_output="$(
-    cargo audit --no-fetch \
-      --file .github/fixtures/cargo-audit/unmaintained/Cargo.lock 2>&1
-  )"
-  printf '%s\n' "$warning_output"
-  grep -F "RUSTSEC-2025-0141" <<<"$warning_output"
-
-  set +e
-  vulnerable_output="$(
-    cargo audit --no-fetch \
-      --file .github/fixtures/cargo-audit/vulnerable/Cargo.lock 2>&1
-  )"
-  vulnerable_status=$?
-  set -e
-  printf '%s\n' "$vulnerable_output"
-  test "$vulnerable_status" -ne 0
-  grep -F "RUSTSEC-2026-0194" <<<"$vulnerable_output"
-  grep -F "RUSTSEC-2026-0195" <<<"$vulnerable_output"
-done
-"#;
+const CARGO_DENY_VERSION: &str = "0.19.8";
+const CARGO_DENY_ARCHIVE_SHA256: &str =
+    "70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f";
+const BOOTSTRAP_SCRIPT_SHA256: &str =
+    "9318742e5473d235750a4c43297402babcbf8114e819dce5fb8838d1e1868653";
+const AUDIT_EXIT_SCRIPT_SHA256: &str =
+    "36b83e225e3849976c16b0e98f1269d24dfcdf89bc984f8914251dd3776f0a43";
+const DENY_FIXTURE_SCRIPT_SHA256: &str =
+    "c03d1a213671dfb73836adb8594978e39225ef45ea7c2f8d638d3dc35993e127";
+const MACOS_RECORD_SCRIPT_SHA256: &str =
+    "5d7c2eb2241919d19612f161b0bc35b9bf7e13c90205b1d44140c42922e2a513";
+const MACOS_FORMAT_SCRIPT_SHA256: &str =
+    "fd19669dd4face53ea143acb053afa5338657adfec97062bfb2371730367a631";
+const MACOS_CHECK_SCRIPT_SHA256: &str =
+    "3f37cbd23204a0e0ef83ab76f4bbd5390825eb41184d9bd4f571dce196da59c8";
+const MACOS_CLIPPY_SCRIPT_SHA256: &str =
+    "e23592c7931ce01185ab6260a14d3ae5a2414b22ff0221cc92174d486732a9ef";
+const MACOS_TEST_SCRIPT_SHA256: &str =
+    "3590a27ce767f332c4bfb5dfd34b959f2466e8b52642295590df1f9a228a7034";
+const MACOS_BUILD_SCRIPT_SHA256: &str =
+    "e34abe22fd87e8032c969a208ef418af014923ea36bb81f5ae90405e1817babc";
+const MACOS_SELF_TEST_SCRIPT_SHA256: &str =
+    "27d2be31ba5aa3ca97a37a715160d51724e22f660e90b418c96c02506b23fd8c";
+const MACOS_SCAN_SCRIPT_SHA256: &str =
+    "68f70456ef8bb868de33837ddc4f7f1db1e444bb56e7adff4eadf239cc5c964f";
+const MACOS_SOURCE_SHELL_SCRIPT_SHA256: &str =
+    "890ca42f80b5901969f5f2457a601624a7657c4ac33730ffbd48fa018db92823";
+const MACOS_SOURCE_LINUX_SCRIPT_SHA256: &str =
+    "ea0a1b4c38f9cd511907bc2129f0078c29303dd1823752dfe464e8a5e6888ca8";
+const DENY_EXCEPTION_PATHS: [&str; 6] = [
+    "deny.exceptions.toml",
+    ".deny.exceptions.toml",
+    ".cargo/deny.exceptions.toml",
+    "desktop/deny.exceptions.toml",
+    "desktop/.deny.exceptions.toml",
+    "desktop/.cargo/deny.exceptions.toml",
+];
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -70,6 +62,15 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
+fn sha256_text(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    encoded
+}
+
 fn parse_yaml(path: &Path) -> YamlValue {
     serde_yaml_ng::from_str(&read(path))
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
@@ -77,6 +78,14 @@ fn parse_yaml(path: &Path) -> YamlValue {
 
 fn parse_toml(path: &Path) -> TomlValue {
     toml::from_str(&read(path)).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
+fn deny_exception_files(root: &Path) -> Vec<String> {
+    DENY_EXCEPTION_PATHS
+        .iter()
+        .filter(|relative| root.join(relative).is_file())
+        .map(|relative| (*relative).to_owned())
+        .collect()
 }
 
 fn yaml_key(key: &str) -> YamlValue {
@@ -183,6 +192,25 @@ fn yaml_string_list(value: Option<&YamlValue>) -> Option<Vec<String>> {
         .collect::<Option<_>>()
 }
 
+fn yaml_string_map(value: Option<&YamlValue>) -> Option<BTreeMap<String, String>> {
+    yaml_mapping(value?)?
+        .iter()
+        .map(|(key, value)| {
+            Some((
+                yaml_string(Some(key))?.to_owned(),
+                yaml_string(Some(value))?.to_owned(),
+            ))
+        })
+        .collect::<Option<_>>()
+}
+
+fn yaml_mapping_keys(value: Option<&YamlValue>) -> Option<BTreeSet<String>> {
+    yaml_mapping(value?)?
+        .keys()
+        .map(|key| yaml_string(Some(key)).map(str::to_owned))
+        .collect::<Option<_>>()
+}
+
 fn toml_string_set(value: Option<&TomlValue>) -> Option<BTreeSet<String>> {
     value
         .and_then(TomlValue::as_array)?
@@ -281,7 +309,8 @@ fn validate_workflow_paths(workflow: &YamlValue, errors: &mut Vec<String>) {
         "desktop/**",
         "Cargo.lock",
         "Cargo.toml",
-        "deny.toml",
+        ".deny*.toml",
+        "deny*.toml",
         "rust-toolchain.toml",
         "rustfmt.toml",
     ]
@@ -370,94 +399,206 @@ fn validate_exact_run_step(
     }
 }
 
-fn validate_install_step(workflow: &YamlValue, errors: &mut Vec<String>) {
-    let name = "Install pinned cargo-audit";
-    let Some(step) = step_by_name(workflow, "supply-chain", name) else {
-        errors.push(format!("missing {name} step"));
-        return;
-    };
-    validate_critical_step(step, name, errors);
-    if yaml_string(yaml_get(step, "shell")) != Some("bash")
-        || yaml_string(yaml_get(step, "run")) != Some(INSTALL_CARGO_AUDIT_SCRIPT)
-    {
-        errors.push("cargo-audit install command is not exact".to_owned());
-    }
-    let env = yaml_get(step, "env").unwrap_or(&YamlValue::Null);
-    if yaml_string(yaml_get(env, "CARGO_AUDIT_VERSION")) != Some(CARGO_AUDIT_VERSION)
-        || yaml_string(yaml_get(env, "CARGO_AUDIT_CRATE_SHA256")) != Some(CARGO_AUDIT_CRATE_SHA256)
-    {
-        errors.push("cargo-audit version and crate checksum must be exact".to_owned());
+fn validate_step_keys(step: &YamlValue, label: &str, expected: &[&str], errors: &mut Vec<String>) {
+    if yaml_mapping_keys(Some(step)) != Some(expected_set(expected)) {
+        errors.push(format!("{label} step schema changed"));
     }
 }
 
-fn validate_audit_exit_step(workflow: &YamlValue, errors: &mut Vec<String>) {
-    let name = "Test cargo-audit exit policy";
-    let Some(step) = step_by_name(workflow, "supply-chain", name) else {
-        errors.push(format!("missing {name} step"));
-        return;
-    };
-    validate_critical_step(step, name, errors);
-    if yaml_string(yaml_get(step, "shell")) != Some("bash")
-        || yaml_string(yaml_get(step, "run")) != Some(AUDIT_EXIT_POLICY_SCRIPT)
-    {
-        errors.push("cargo-audit push/PR exit fixture command is not exact".to_owned());
+fn validate_script_hash(step: &YamlValue, label: &str, expected: &str, errors: &mut Vec<String>) {
+    let actual = yaml_string(yaml_get(step, "run"))
+        .map(sha256_text)
+        .unwrap_or_default();
+    if actual != expected {
+        errors.push(format!("{label} script hash changed: {actual}"));
     }
 }
 
-fn validate_deny_steps(workflow: &YamlValue, errors: &mut Vec<String>) {
-    let supported = expected_set(&[
-        "aarch64-apple-darwin",
-        "aarch64-pc-windows-msvc",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-    ]);
-    let expected_names = BTreeMap::from([
-        (
-            "aarch64-apple-darwin",
-            "Check macOS ARM64 desktop dependency policy",
-        ),
-        (
-            "aarch64-pc-windows-msvc",
-            "Check Windows ARM64 desktop dependency policy",
-        ),
-        (
-            "x86_64-apple-darwin",
-            "Check macOS Intel desktop dependency policy",
-        ),
-        (
-            "x86_64-pc-windows-msvc",
-            "Check Windows x64 desktop dependency policy",
-        ),
-    ]);
-    let mut actual = BTreeSet::new();
-    for step in job_steps(workflow, "supply-chain").into_iter().flatten() {
-        if yaml_string(yaml_get(step, "uses")) != Some(CARGO_DENY_ACTION) {
-            continue;
-        }
-        let with = yaml_get(step, "with").unwrap_or(&YamlValue::Null);
-        if yaml_string(yaml_get(with, "manifest-path")) != Some("./desktop/Cargo.toml") {
-            continue;
-        }
-        let label = yaml_string(yaml_get(step, "name")).unwrap_or("desktop deny step");
-        validate_critical_step(step, label, errors);
-        let arguments = yaml_string(yaml_get(with, "arguments")).unwrap_or_default();
-        let target = arguments.strip_prefix("--target ").unwrap_or_default();
-        actual.insert(target.to_owned());
-        if yaml_string(yaml_get(with, "command")) != Some("check")
-            || yaml_string(yaml_get(with, "command-arguments")) != Some(DENY_COMMAND_ARGUMENTS)
-        {
-            errors.push(format!(
-                "{label} must run the exact fail-closed deny checks"
-            ));
-        }
-        if expected_names.get(target).copied() != Some(label) {
-            errors.push(format!("unexpected deny step name for {target}: {label}"));
+fn validate_supply_chain_job(workflow: &YamlValue, errors: &mut Vec<String>) {
+    let Some(job) = yaml_get(workflow, "jobs").and_then(|jobs| yaml_get(jobs, "supply-chain"))
+    else {
+        errors.push("missing supply-chain job".to_owned());
+        return;
+    };
+    if yaml_mapping_keys(Some(job)) != Some(expected_set(&["name", "runs-on", "steps"])) {
+        errors.push("supply-chain job schema changed".to_owned());
+    }
+    if yaml_string(yaml_get(job, "runs-on")) != Some("ubuntu-latest") {
+        errors.push("supply-chain job runner must be ubuntu-latest".to_owned());
+    }
+    for forbidden in ["if", "continue-on-error", "defaults", "env", "permissions"] {
+        if yaml_get(job, forbidden).is_some() {
+            errors.push(format!("supply-chain job must not set {forbidden}"));
         }
     }
-    if actual != supported {
+
+    let expected_names = [
+        "Checkout",
+        "Bootstrap verified Rust security tools",
+        "Audit root lockfile",
+        "Audit desktop lockfile",
+        "Test cargo-audit exit policy",
+        "Test cargo-deny lock and exception policy",
+        "Check root dependency policy",
+        "Check Windows x64 desktop dependency policy",
+        "Check Windows ARM64 desktop dependency policy",
+        "Check macOS Intel desktop dependency policy",
+        "Check macOS ARM64 desktop dependency policy",
+        "Validate supply-chain policy",
+    ];
+    let actual_names = job_steps(workflow, "supply-chain")
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            yaml_string(yaml_get(step, "name"))
+                .unwrap_or("<unnamed>")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if actual_names
+        != expected_names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    {
         errors.push(format!(
-            "desktop deny targets do not match the supported target set: {actual:?}"
+            "supply-chain ordered steps changed: {actual_names:?}"
         ));
+    }
+    let Some(steps) = job_steps(workflow, "supply-chain") else {
+        return;
+    };
+    for step in steps {
+        let label = yaml_string(yaml_get(step, "name")).unwrap_or("<unnamed>");
+        validate_critical_step(step, label, errors);
+        if yaml_get(step, "working-directory").is_some() {
+            errors.push(format!("{label} must not set working-directory"));
+        }
+    }
+
+    if let Some(step) = step_by_name(workflow, "supply-chain", "Checkout") {
+        validate_step_keys(step, "Checkout", &["name", "uses", "with"], errors);
+        if yaml_string(yaml_get(step, "uses"))
+            != Some("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
+            || yaml_mapping_keys(yaml_get(step, "with"))
+                != Some(expected_set(&["persist-credentials"]))
+            || yaml_bool(yaml_get(
+                yaml_get(step, "with").unwrap_or(&YamlValue::Null),
+                "persist-credentials",
+            )) != Some(false)
+        {
+            errors.push("supply-chain checkout action or inputs changed".to_owned());
+        }
+    }
+
+    let bootstrap_name = "Bootstrap verified Rust security tools";
+    if let Some(step) = step_by_name(workflow, "supply-chain", bootstrap_name) {
+        validate_step_keys(
+            step,
+            bootstrap_name,
+            &["name", "shell", "env", "run"],
+            errors,
+        );
+        if yaml_string(yaml_get(step, "shell")) != Some("bash") {
+            errors.push("verified tool bootstrap shell must be bash".to_owned());
+        }
+        let expected_env = BTreeMap::from([
+            (
+                "CARGO_AUDIT_CRATE_SHA256".to_owned(),
+                CARGO_AUDIT_CRATE_SHA256.to_owned(),
+            ),
+            (
+                "CARGO_AUDIT_VERSION".to_owned(),
+                CARGO_AUDIT_VERSION.to_owned(),
+            ),
+            (
+                "CARGO_DENY_ARCHIVE_SHA256".to_owned(),
+                CARGO_DENY_ARCHIVE_SHA256.to_owned(),
+            ),
+            (
+                "CARGO_DENY_VERSION".to_owned(),
+                CARGO_DENY_VERSION.to_owned(),
+            ),
+        ]);
+        if yaml_string_map(yaml_get(step, "env")) != Some(expected_env) {
+            errors.push("verified tool bootstrap environment changed".to_owned());
+        }
+        validate_script_hash(step, bootstrap_name, BOOTSTRAP_SCRIPT_SHA256, errors);
+    }
+
+    let exact_runs = [
+        (
+            "Validate supply-chain policy",
+            "cargo test --locked --package claw-security --test desktop_supply_chain_policy",
+        ),
+        (
+            "Check root dependency policy",
+            "\"$CARGO_DENY_RUNNER\" --manifest-path \"$GITHUB_WORKSPACE/Cargo.toml\" --locked --all-features check --config \"$GITHUB_WORKSPACE/deny.toml\"",
+        ),
+        (
+            "Audit root lockfile",
+            "\"$CARGO_AUDIT_BIN\" audit --file Cargo.lock",
+        ),
+        (
+            "Audit desktop lockfile",
+            "\"$CARGO_AUDIT_BIN\" audit --file desktop/Cargo.lock --no-fetch",
+        ),
+    ];
+    for (name, run) in exact_runs {
+        validate_exact_run_step(workflow, name, run, errors);
+        if let Some(step) = step_by_name(workflow, "supply-chain", name) {
+            validate_step_keys(step, name, &["name", "run"], errors);
+            if yaml_get(step, "env").is_some() {
+                errors.push(format!("{name} must not override tool paths"));
+            }
+        }
+    }
+
+    for (name, hash) in [
+        ("Test cargo-audit exit policy", AUDIT_EXIT_SCRIPT_SHA256),
+        (
+            "Test cargo-deny lock and exception policy",
+            DENY_FIXTURE_SCRIPT_SHA256,
+        ),
+    ] {
+        if let Some(step) = step_by_name(workflow, "supply-chain", name) {
+            validate_step_keys(step, name, &["name", "shell", "run"], errors);
+            if yaml_string(yaml_get(step, "shell")) != Some("bash") {
+                errors.push(format!("{name} shell must be bash"));
+            }
+            validate_script_hash(step, name, hash, errors);
+        }
+    }
+
+    let deny_targets = [
+        (
+            "Check Windows x64 desktop dependency policy",
+            "x86_64-pc-windows-msvc",
+        ),
+        (
+            "Check Windows ARM64 desktop dependency policy",
+            "aarch64-pc-windows-msvc",
+        ),
+        (
+            "Check macOS Intel desktop dependency policy",
+            "x86_64-apple-darwin",
+        ),
+        (
+            "Check macOS ARM64 desktop dependency policy",
+            "aarch64-apple-darwin",
+        ),
+    ];
+    for (name, target) in deny_targets {
+        let expected = format!(
+            "\"$CARGO_DENY_RUNNER\" --manifest-path \"$GITHUB_WORKSPACE/desktop/Cargo.toml\" --locked --target {target} check --config \"$GITHUB_WORKSPACE/desktop/deny.toml\" --warn unmaintained advisories licenses sources"
+        );
+        validate_exact_run_step(workflow, name, &expected, errors);
+        if let Some(step) = step_by_name(workflow, "supply-chain", name) {
+            validate_step_keys(step, name, &["name", "run"], errors);
+            if !expected.contains("--locked --target") {
+                errors.push(format!("{name} must lock the target graph"));
+            }
+        }
     }
 }
 
@@ -466,27 +607,12 @@ fn validate_rust_workflow(workflow: &YamlValue) -> Vec<String> {
     validate_permissions(workflow, &mut errors);
     validate_workflow_paths(workflow, &mut errors);
     validate_action_pins(workflow, &mut errors);
-    validate_exact_run_step(
-        workflow,
-        "Validate supply-chain policy",
-        "cargo test --locked --package claw-security --test desktop_supply_chain_policy",
-        &mut errors,
-    );
-    validate_install_step(workflow, &mut errors);
-    validate_exact_run_step(
-        workflow,
-        "Audit root lockfile",
-        "cargo audit --file Cargo.lock",
-        &mut errors,
-    );
-    validate_exact_run_step(
-        workflow,
-        "Audit desktop lockfile",
-        "cargo audit --file desktop/Cargo.lock --no-fetch",
-        &mut errors,
-    );
-    validate_audit_exit_step(workflow, &mut errors);
-    validate_deny_steps(workflow, &mut errors);
+    for forbidden in ["defaults", "env"] {
+        if yaml_get(workflow, forbidden).is_some() {
+            errors.push(format!("rust workflow must not set top-level {forbidden}"));
+        }
+    }
+    validate_supply_chain_job(workflow, &mut errors);
     errors
 }
 
@@ -494,22 +620,139 @@ fn validate_macos_workflow(workflow: &YamlValue) -> Vec<String> {
     let mut errors = Vec::new();
     validate_permissions(workflow, &mut errors);
     validate_action_pins(workflow, &mut errors);
+    if yaml_get(workflow, "defaults").is_some() {
+        errors.push("macOS workflow must not set top-level defaults".to_owned());
+    }
+    let expected_env = BTreeMap::from([
+        ("CARGO_TERM_COLOR".to_owned(), "always".to_owned()),
+        ("MACOSX_DEPLOYMENT_TARGET".to_owned(), "14.0".to_owned()),
+        ("RUSTFLAGS".to_owned(), "-Dwarnings".to_owned()),
+    ]);
+    if yaml_string_map(yaml_get(workflow, "env")) != Some(expected_env) {
+        errors.push("macOS workflow inherited environment changed".to_owned());
+    }
 
-    let matrix_include = yaml_sequence(yaml_get(
-        yaml_get(
-            yaml_get(
-                yaml_get(workflow, "jobs")
-                    .and_then(|jobs| yaml_get(jobs, "native"))
-                    .unwrap_or(&YamlValue::Null),
-                "strategy",
-            )
-            .unwrap_or(&YamlValue::Null),
-            "matrix",
-        )
-        .unwrap_or(&YamlValue::Null),
-        "include",
-    ));
-    let actual_matrix = matrix_include
+    let Some(source_policy) =
+        yaml_get(workflow, "jobs").and_then(|jobs| yaml_get(jobs, "source-policy"))
+    else {
+        errors.push("missing macOS source-policy job".to_owned());
+        return errors;
+    };
+    if yaml_mapping_keys(Some(source_policy)) != Some(expected_set(&["name", "runs-on", "steps"]))
+        || yaml_string(yaml_get(source_policy, "name")) != Some("Source policy and Linux rejection")
+        || yaml_string(yaml_get(source_policy, "runs-on")) != Some("ubuntu-latest")
+    {
+        errors.push("macOS source-policy job schema or runner changed".to_owned());
+    }
+    for forbidden in [
+        "if",
+        "continue-on-error",
+        "defaults",
+        "env",
+        "permissions",
+        "strategy",
+        "needs",
+    ] {
+        if yaml_get(source_policy, forbidden).is_some() {
+            errors.push(format!("macOS source-policy job must not set {forbidden}"));
+        }
+    }
+    let source_names = job_steps(workflow, "source-policy")
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            yaml_string(yaml_get(step, "name"))
+                .unwrap_or("<unnamed>")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if source_names
+        != [
+            "Checkout",
+            "Check shell syntax and forbidden committed artifacts",
+            "Preserve Linux desktop rejection",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    {
+        errors.push(format!(
+            "macOS source-policy ordered steps changed: {source_names:?}"
+        ));
+    }
+    if let Some(step) = step_by_name(workflow, "source-policy", "Checkout") {
+        validate_step_keys(
+            step,
+            "source-policy Checkout",
+            &["name", "uses", "with"],
+            &mut errors,
+        );
+        if yaml_string(yaml_get(step, "uses"))
+            != Some("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
+            || yaml_mapping_keys(yaml_get(step, "with"))
+                != Some(expected_set(&["persist-credentials"]))
+            || yaml_bool(yaml_get(
+                yaml_get(step, "with").unwrap_or(&YamlValue::Null),
+                "persist-credentials",
+            )) != Some(false)
+        {
+            errors.push("macOS source-policy checkout action or inputs changed".to_owned());
+        }
+    }
+    for (name, hash) in [
+        (
+            "Check shell syntax and forbidden committed artifacts",
+            MACOS_SOURCE_SHELL_SCRIPT_SHA256,
+        ),
+        (
+            "Preserve Linux desktop rejection",
+            MACOS_SOURCE_LINUX_SCRIPT_SHA256,
+        ),
+    ] {
+        let Some(step) = step_by_name(workflow, "source-policy", name) else {
+            continue;
+        };
+        validate_step_keys(step, name, &["name", "shell", "run"], &mut errors);
+        validate_critical_step(step, name, &mut errors);
+        if yaml_string(yaml_get(step, "shell")) != Some("bash")
+            || yaml_get(step, "env").is_some()
+            || yaml_get(step, "working-directory").is_some()
+        {
+            errors.push(format!("{name} source-policy controls changed"));
+        }
+        validate_script_hash(step, name, hash, &mut errors);
+    }
+
+    let Some(native) = yaml_get(workflow, "jobs").and_then(|jobs| yaml_get(jobs, "native")) else {
+        return vec!["missing native macOS job".to_owned()];
+    };
+    if yaml_mapping_keys(Some(native))
+        != Some(expected_set(&[
+            "name", "needs", "strategy", "runs-on", "steps",
+        ]))
+    {
+        errors.push("native macOS job schema changed".to_owned());
+    }
+    if yaml_string(yaml_get(native, "runs-on")) != Some("${{ matrix.runner }}")
+        || yaml_string(yaml_get(native, "needs")) != Some("source-policy")
+    {
+        errors.push("native macOS runner or dependency changed".to_owned());
+    }
+    for forbidden in ["if", "continue-on-error", "defaults", "env", "permissions"] {
+        if yaml_get(native, forbidden).is_some() {
+            errors.push(format!("native macOS job must not set {forbidden}"));
+        }
+    }
+    let strategy = yaml_get(native, "strategy").unwrap_or(&YamlValue::Null);
+    if yaml_mapping_keys(Some(strategy)) != Some(expected_set(&["fail-fast", "matrix"]))
+        || yaml_bool(yaml_get(strategy, "fail-fast")) != Some(false)
+    {
+        errors.push("native macOS strategy must be exact and fail-fast false".to_owned());
+    }
+    let matrix = yaml_get(strategy, "matrix").unwrap_or(&YamlValue::Null);
+    if yaml_mapping_keys(Some(matrix)) != Some(expected_set(&["include"])) {
+        errors.push("native macOS matrix schema changed".to_owned());
+    }
+    let actual_matrix = yaml_sequence(yaml_get(matrix, "include"))
         .into_iter()
         .flatten()
         .filter_map(|entry| {
@@ -518,15 +761,204 @@ fn validate_macos_workflow(workflow: &YamlValue) -> Vec<String> {
                 yaml_string(yaml_get(entry, "arch"))?.to_owned(),
             ))
         })
-        .collect::<BTreeSet<_>>();
-    let expected_matrix = BTreeSet::from([
+        .collect::<Vec<_>>();
+    let expected_matrix = vec![
         ("macos-15".to_owned(), "arm64".to_owned()),
         ("macos-15-intel".to_owned(), "x86_64".to_owned()),
-    ]);
+    ];
     if actual_matrix != expected_matrix {
         errors.push(format!(
-            "native macOS matrix must cover ARM64 and Intel: {actual_matrix:?}"
+            "native macOS matrix must cover exact ARM64 and Intel runners: {actual_matrix:?}"
         ));
+    }
+    for row in yaml_sequence(yaml_get(matrix, "include"))
+        .into_iter()
+        .flatten()
+    {
+        if yaml_mapping_keys(Some(row)) != Some(expected_set(&["runner", "arch"])) {
+            errors.push("native macOS matrix row schema changed".to_owned());
+        }
+    }
+
+    let expected_names = [
+        "Checkout",
+        "Record Apple tool versions",
+        "Format both Cargo workspaces",
+        "Check both Cargo workspaces",
+        "Clippy both Cargo workspaces",
+        "Test both Cargo workspaces natively",
+        "Smoke-test native desktop window backend",
+        "Build and validate native packages",
+        "Run packaging self-tests",
+        "Scan native artifacts for JavaScript runtimes",
+        "Upload ephemeral native prototype artifacts",
+    ];
+    let actual_names = job_steps(workflow, "native")
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            yaml_string(yaml_get(step, "name"))
+                .unwrap_or("<unnamed>")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if actual_names
+        != expected_names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    {
+        errors.push(format!(
+            "native macOS ordered steps changed: {actual_names:?}"
+        ));
+    }
+
+    let script_steps = [
+        (
+            "Record Apple tool versions",
+            MACOS_RECORD_SCRIPT_SHA256,
+            &["name", "shell", "run"][..],
+            Some("bash"),
+        ),
+        (
+            "Format both Cargo workspaces",
+            MACOS_FORMAT_SCRIPT_SHA256,
+            &["name", "run"][..],
+            None,
+        ),
+        (
+            "Check both Cargo workspaces",
+            MACOS_CHECK_SCRIPT_SHA256,
+            &["name", "run"][..],
+            None,
+        ),
+        (
+            "Clippy both Cargo workspaces",
+            MACOS_CLIPPY_SCRIPT_SHA256,
+            &["name", "run"][..],
+            None,
+        ),
+        (
+            "Test both Cargo workspaces natively",
+            MACOS_TEST_SCRIPT_SHA256,
+            &["name", "run"][..],
+            None,
+        ),
+        (
+            "Build and validate native packages",
+            MACOS_BUILD_SCRIPT_SHA256,
+            &["name", "shell", "run"][..],
+            Some("bash"),
+        ),
+        (
+            "Scan native artifacts for JavaScript runtimes",
+            MACOS_SCAN_SCRIPT_SHA256,
+            &["name", "shell", "run"][..],
+            Some("bash"),
+        ),
+    ];
+    for (name, hash, keys, shell) in script_steps {
+        let Some(step) = step_by_name(workflow, "native", name) else {
+            continue;
+        };
+        validate_step_keys(step, name, keys, &mut errors);
+        validate_script_hash(step, name, hash, &mut errors);
+        if yaml_string(yaml_get(step, "shell")) != shell {
+            errors.push(format!("{name} shell changed"));
+        }
+        if yaml_get(step, "env").is_some() || yaml_get(step, "working-directory").is_some() {
+            errors.push(format!("{name} must not override env or working-directory"));
+        }
+    }
+
+    if let Some(step) = step_by_name(workflow, "native", "Checkout") {
+        validate_step_keys(
+            step,
+            "native Checkout",
+            &["name", "uses", "with"],
+            &mut errors,
+        );
+        if yaml_string(yaml_get(step, "uses"))
+            != Some("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
+            || yaml_mapping_keys(yaml_get(step, "with"))
+                != Some(expected_set(&["persist-credentials"]))
+            || yaml_bool(yaml_get(
+                yaml_get(step, "with").unwrap_or(&YamlValue::Null),
+                "persist-credentials",
+            )) != Some(false)
+        {
+            errors.push("native macOS checkout action or inputs changed".to_owned());
+        }
+    }
+
+    if let Some(step) = step_by_name(workflow, "native", "Run packaging self-tests") {
+        validate_step_keys(
+            step,
+            "Run packaging self-tests",
+            &["name", "if", "shell", "run"],
+            &mut errors,
+        );
+        validate_script_hash(
+            step,
+            "Run packaging self-tests",
+            MACOS_SELF_TEST_SCRIPT_SHA256,
+            &mut errors,
+        );
+        if yaml_string(yaml_get(step, "shell")) != Some("bash") {
+            errors.push("Run packaging self-tests shell changed".to_owned());
+        }
+    }
+
+    if let Some(step) = step_by_name(
+        workflow,
+        "native",
+        "Upload ephemeral native prototype artifacts",
+    ) {
+        validate_step_keys(
+            step,
+            "Upload ephemeral native prototype artifacts",
+            &["name", "uses", "with"],
+            &mut errors,
+        );
+        let with = yaml_get(step, "with").unwrap_or(&YamlValue::Null);
+        let expected_path = "target/macos-package/apps/${{ matrix.arch }}/GTA Claw.app\ntarget/macos-package/headless/${{ matrix.arch }}/*.tar.gz\ntarget/macos-package/headless/${{ matrix.arch }}/*.sha256\ntarget/macos-package/manifests/*.sha256\n";
+        if yaml_string(yaml_get(step, "uses"))
+            != Some("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+            || yaml_mapping_keys(Some(with))
+                != Some(expected_set(&[
+                    "name",
+                    "path",
+                    "if-no-files-found",
+                    "retention-days",
+                ]))
+            || yaml_string(yaml_get(with, "name"))
+                != Some("macos-${{ matrix.arch }}-prototype-${{ github.sha }}")
+            || yaml_string(yaml_get(with, "path")) != Some(expected_path)
+            || yaml_string(yaml_get(with, "if-no-files-found")) != Some("error")
+            || yaml_get(with, "retention-days").and_then(YamlValue::as_u64) != Some(7)
+        {
+            errors.push("native macOS upload action or inputs changed".to_owned());
+        }
+    }
+
+    for step in job_steps(workflow, "native").into_iter().flatten() {
+        let label = yaml_string(yaml_get(step, "name")).unwrap_or("<unnamed>");
+        if label == "Run packaging self-tests" {
+            if yaml_string(yaml_get(step, "if")) != Some("matrix.arch == 'arm64'")
+                || yaml_get(step, "continue-on-error").is_some()
+            {
+                errors.push("macOS packaging self-test condition changed".to_owned());
+            }
+        } else {
+            validate_critical_step(step, label, &mut errors);
+        }
+    }
+
+    let native_test = step_by_name(workflow, "native", "Test both Cargo workspaces natively");
+    let expected_native_test = "test \"$(uname -m)\" = \"${{ matrix.arch }}\"\ncargo test --workspace --all-targets --locked\ncargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked\n";
+    if native_test.and_then(|step| yaml_string(yaml_get(step, "run"))) != Some(expected_native_test)
+    {
+        errors.push("native macOS architecture assertion or test command changed".to_owned());
     }
 
     let name = "Smoke-test native desktop window backend";
@@ -535,15 +967,21 @@ fn validate_macos_workflow(workflow: &YamlValue) -> Vec<String> {
         return errors;
     };
     validate_critical_step(step, name, &mut errors);
+    if yaml_mapping_keys(Some(step))
+        != Some(expected_set(&["name", "timeout-minutes", "env", "run"]))
+    {
+        errors.push("macOS backend smoke step schema changed".to_owned());
+    }
     if yaml_get(step, "timeout-minutes").and_then(YamlValue::as_u64) != Some(2) {
         errors.push("macOS backend smoke must have a two-minute hard timeout".to_owned());
     }
-    if yaml_string(yaml_get(
-        yaml_get(step, "env").unwrap_or(&YamlValue::Null),
-        "SLINT_BACKEND",
-    )) != Some("winit-software")
+    if yaml_string_map(yaml_get(step, "env"))
+        != Some(BTreeMap::from([(
+            "SLINT_BACKEND".to_owned(),
+            "winit-software".to_owned(),
+        )]))
     {
-        errors.push("macOS backend smoke must select winit-software".to_owned());
+        errors.push("macOS backend smoke environment changed".to_owned());
     }
     if yaml_string(yaml_get(step, "run"))
         != Some("cargo test --manifest-path desktop/Cargo.toml --test macos_winit_smoke --locked")
@@ -671,6 +1109,102 @@ fn validate_deny_toml(deny: &TomlValue) -> Vec<String> {
     errors
 }
 
+fn validate_root_deny_toml(deny: &TomlValue) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(root) = deny.as_table() else {
+        return vec!["root deny config must be a TOML table".to_owned()];
+    };
+    if toml_keys(root) != expected_set(&["advisories", "bans", "graph", "licenses", "sources"]) {
+        errors.push("root deny top-level policy sections changed".to_owned());
+    }
+
+    let graph = toml_table(deny, "graph");
+    if graph.is_none_or(|table| {
+        toml_keys(table) != expected_set(&["all-features"])
+            || table.get("all-features") != Some(&TomlValue::Boolean(true))
+    }) {
+        errors.push("root deny graph policy changed".to_owned());
+    }
+
+    let advisories = toml_table(deny, "advisories");
+    if advisories.is_none_or(|table| {
+        toml_keys(table) != expected_set(&["ignore"])
+            || table
+                .get("ignore")
+                .and_then(TomlValue::as_array)
+                .is_none_or(|ignore| !ignore.is_empty())
+    }) {
+        errors.push("root deny advisories policy changed".to_owned());
+    }
+
+    let licenses = toml_table(deny, "licenses");
+    if licenses.is_none_or(|table| {
+        toml_keys(table) != expected_set(&["allow", "confidence-threshold"])
+            || toml_string_set(table.get("allow"))
+                != Some(expected_set(&[
+                    "Apache-2.0",
+                    "BSD-3-Clause",
+                    "ISC",
+                    "MIT",
+                    "Unicode-3.0",
+                ]))
+            || table
+                .get("confidence-threshold")
+                .and_then(TomlValue::as_float)
+                != Some(0.8)
+    }) {
+        errors.push("root deny license policy changed".to_owned());
+    }
+
+    let bans = toml_table(deny, "bans");
+    let skip = bans
+        .and_then(|table| table.get("skip"))
+        .and_then(TomlValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry.get("name")?.as_str()?.to_owned(),
+                entry.get("version")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_skip = BTreeSet::from([
+        ("rand_core".to_owned(), "0.6.4".to_owned()),
+        ("windows-sys".to_owned(), "0.52.0".to_owned()),
+    ]);
+    if bans.is_none_or(|table| {
+        toml_keys(table) != expected_set(&["highlight", "multiple-versions", "skip", "wildcards"])
+            || table.get("multiple-versions").and_then(TomlValue::as_str) != Some("deny")
+            || table.get("wildcards").and_then(TomlValue::as_str) != Some("deny")
+            || table.get("highlight").and_then(TomlValue::as_str) != Some("all")
+    }) || skip != expected_skip
+    {
+        errors.push("root deny bans policy changed".to_owned());
+    }
+
+    let sources = toml_table(deny, "sources");
+    if sources.is_none_or(|table| {
+        toml_keys(table)
+            != expected_set(&[
+                "allow-git",
+                "allow-registry",
+                "unknown-git",
+                "unknown-registry",
+            ])
+            || table.get("unknown-registry").and_then(TomlValue::as_str) != Some("deny")
+            || table.get("unknown-git").and_then(TomlValue::as_str) != Some("deny")
+            || toml_string_set(table.get("allow-git")).is_none_or(|allow| !allow.is_empty())
+            || toml_string_set(table.get("allow-registry"))
+                != Some(expected_set(&[
+                    "https://github.com/rust-lang/crates.io-index",
+                ]))
+    }) {
+        errors.push("root deny source policy changed".to_owned());
+    }
+    errors
+}
+
 fn validate_audit_toml(audit: &TomlValue) -> Vec<String> {
     let Some(root) = audit.as_table() else {
         return vec!["cargo audit config must be a TOML table".to_owned()];
@@ -793,6 +1327,8 @@ fn validate_dependency_graph(
 fn mutate_negative_case(
     mutation: &str,
     workflow: &mut YamlValue,
+    macos_workflow: &mut YamlValue,
+    root_deny: &mut TomlValue,
     deny: &mut TomlValue,
     audit: &mut TomlValue,
 ) {
@@ -839,10 +1375,14 @@ fn mutate_negative_case(
         }
         "cargo-audit-install-latest" => {
             yaml_mapping_mut(
-                step_by_name_mut(workflow, "supply-chain", "Install pinned cargo-audit")
-                    .expect("install audit step"),
+                step_by_name_mut(
+                    workflow,
+                    "supply-chain",
+                    "Bootstrap verified Rust security tools",
+                )
+                .expect("bootstrap tools step"),
             )
-            .expect("install audit mapping")
+            .expect("bootstrap tools mapping")
             .insert(
                 yaml_key("run"),
                 YamlValue::String("cargo install cargo-audit".to_owned()),
@@ -855,6 +1395,19 @@ fn mutate_negative_case(
                     yaml_string(yaml_get(step, "name"))
                         != Some("Check Windows ARM64 desktop dependency policy")
                 });
+        }
+        "supply-checkout-action-substitution" => {
+            yaml_mapping_mut(
+                step_by_name_mut(workflow, "supply-chain", "Checkout")
+                    .expect("supply-chain checkout"),
+            )
+            .expect("supply-chain checkout mapping")
+            .insert(
+                yaml_key("uses"),
+                YamlValue::String(
+                    "example/checkout@0000000000000000000000000000000000000000".to_owned(),
+                ),
+            );
         }
         "job-checks-write" => {
             let mut permissions = YamlMapping::new();
@@ -883,6 +1436,63 @@ fn mutate_negative_case(
                 YamlValue::String("write-all".to_owned()),
             );
         }
+        "supply-job-disabled" => {
+            yaml_mapping_mut(
+                yaml_get_mut(
+                    yaml_get_mut(workflow, "jobs").expect("workflow jobs"),
+                    "supply-chain",
+                )
+                .expect("supply-chain job"),
+            )
+            .expect("supply-chain mapping")
+            .insert(yaml_key("if"), YamlValue::Bool(false));
+        }
+        "supply-job-env-shadow" => {
+            let mut env = YamlMapping::new();
+            env.insert(
+                yaml_key("CARGO_AUDIT_BIN"),
+                YamlValue::String("/tmp/fake-audit".to_owned()),
+            );
+            yaml_mapping_mut(
+                yaml_get_mut(
+                    yaml_get_mut(workflow, "jobs").expect("workflow jobs"),
+                    "supply-chain",
+                )
+                .expect("supply-chain job"),
+            )
+            .expect("supply-chain mapping")
+            .insert(yaml_key("env"), YamlValue::Mapping(env));
+        }
+        "supply-unknown-shadow-step" => {
+            let mut shadow = YamlMapping::new();
+            shadow.insert(
+                yaml_key("name"),
+                YamlValue::String("Shadow verified audit binary".to_owned()),
+            );
+            shadow.insert(
+                yaml_key("run"),
+                YamlValue::String(
+                    "echo 'CARGO_AUDIT_BIN=/tmp/fake-audit' >> \"$GITHUB_ENV\"".to_owned(),
+                ),
+            );
+            job_steps_mut(workflow, "supply-chain")
+                .expect("supply-chain steps")
+                .insert(2, YamlValue::Mapping(shadow));
+        }
+        "bootstrap-wrapper-env" => {
+            let bootstrap = step_by_name_mut(
+                workflow,
+                "supply-chain",
+                "Bootstrap verified Rust security tools",
+            )
+            .expect("bootstrap tools step");
+            yaml_mapping_mut(yaml_get_mut(bootstrap, "env").expect("bootstrap environment"))
+                .expect("bootstrap environment mapping")
+                .insert(
+                    yaml_key("RUSTC_WRAPPER"),
+                    YamlValue::String("/tmp/fake-wrapper".to_owned()),
+                );
+        }
         "negative-desktop-path" => {
             yaml_sequence_mut(yaml_get_mut(
                 yaml_get_mut(
@@ -894,6 +1504,96 @@ fn mutate_negative_case(
             ))
             .expect("pull request paths")
             .push(YamlValue::String("!desktop/**".to_owned()));
+        }
+        "native-matrix-runner-collapse" => {
+            let jobs = yaml_get_mut(macos_workflow, "jobs").expect("macOS jobs");
+            let native = yaml_get_mut(jobs, "native").expect("native macOS job");
+            let strategy = yaml_get_mut(native, "strategy").expect("native strategy");
+            let matrix = yaml_get_mut(strategy, "matrix").expect("native matrix");
+            let include = yaml_sequence_mut(yaml_get_mut(matrix, "include"))
+                .expect("native include sequence");
+            yaml_mapping_mut(&mut include[1])
+                .expect("Intel matrix row")
+                .insert(yaml_key("runner"), YamlValue::String("macos-15".to_owned()));
+        }
+        "native-arch-assertion-removed" => {
+            yaml_mapping_mut(
+                step_by_name_mut(
+                    macos_workflow,
+                    "native",
+                    "Test both Cargo workspaces natively",
+                )
+                .expect("native workspace test"),
+            )
+            .expect("native workspace test mapping")
+            .insert(
+                yaml_key("run"),
+                YamlValue::String("cargo test --workspace --all-targets --locked\n".to_owned()),
+            );
+        }
+        "source-policy-disabled" => {
+            yaml_mapping_mut(
+                yaml_get_mut(
+                    yaml_get_mut(macos_workflow, "jobs").expect("macOS jobs"),
+                    "source-policy",
+                )
+                .expect("source-policy job"),
+            )
+            .expect("source-policy mapping")
+            .insert(yaml_key("if"), YamlValue::Bool(false));
+        }
+        "native-format-replaced" => {
+            yaml_mapping_mut(
+                step_by_name_mut(macos_workflow, "native", "Format both Cargo workspaces")
+                    .expect("native format step"),
+            )
+            .expect("native format mapping")
+            .insert(yaml_key("run"), YamlValue::String("true".to_owned()));
+        }
+        "native-arch-shell-added" => {
+            yaml_mapping_mut(
+                step_by_name_mut(
+                    macos_workflow,
+                    "native",
+                    "Test both Cargo workspaces natively",
+                )
+                .expect("native workspace test"),
+            )
+            .expect("native workspace test mapping")
+            .insert(yaml_key("shell"), YamlValue::String("sh".to_owned()));
+        }
+        "native-workflow-env-shadow" => {
+            yaml_mapping_mut(yaml_get_mut(macos_workflow, "env").expect("macOS workflow env"))
+                .expect("macOS workflow env mapping")
+                .insert(
+                    yaml_key("PATH"),
+                    YamlValue::String("/tmp/shadow".to_owned()),
+                );
+        }
+        "native-matrix-extra-key" => {
+            let jobs = yaml_get_mut(macos_workflow, "jobs").expect("macOS jobs");
+            let native = yaml_get_mut(jobs, "native").expect("native macOS job");
+            let strategy = yaml_get_mut(native, "strategy").expect("native strategy");
+            let matrix = yaml_get_mut(strategy, "matrix").expect("native matrix");
+            let include = yaml_sequence_mut(yaml_get_mut(matrix, "include"))
+                .expect("native include sequence");
+            yaml_mapping_mut(&mut include[0])
+                .expect("ARM matrix row")
+                .insert(yaml_key("image"), YamlValue::String("shadow".to_owned()));
+        }
+        "deny-no-locked" => {
+            let step = step_by_name_mut(
+                workflow,
+                "supply-chain",
+                "Check Windows x64 desktop dependency policy",
+            )
+            .expect("Windows x64 deny step");
+            let run = yaml_string(yaml_get(step, "run"))
+                .expect("Windows x64 deny command")
+                .replace(" --locked", "");
+            yaml_mapping_mut(step)
+                .expect("Windows x64 deny mapping")
+                .insert(yaml_key("run"), YamlValue::String(run));
         }
         "deny-advisory-ignore" => {
             toml_table_mut(deny, "advisories")
@@ -934,6 +1634,55 @@ fn mutate_negative_case(
                 TomlValue::Array(vec![TomlValue::String("quick-xml".to_owned())]),
             );
         }
+        "root-deny-license-widening" => {
+            root_deny
+                .get_mut("licenses")
+                .and_then(|licenses| licenses.get_mut("allow"))
+                .and_then(TomlValue::as_array_mut)
+                .expect("root deny license allow-list")
+                .push(TomlValue::String("GPL-3.0-only".to_owned()));
+        }
+        "root-deny-inline-exception" => {
+            let mut exception = toml::map::Map::new();
+            exception.insert(
+                "name".to_owned(),
+                TomlValue::String("prohibited".to_owned()),
+            );
+            exception.insert(
+                "allow".to_owned(),
+                TomlValue::Array(vec![TomlValue::String("GPL-3.0-only".to_owned())]),
+            );
+            toml_table_mut(root_deny, "licenses")
+                .expect("root deny licenses")
+                .insert(
+                    "exceptions".to_owned(),
+                    TomlValue::Array(vec![TomlValue::Table(exception)]),
+                );
+        }
+        "root-deny-source-widening" => {
+            toml_table_mut(root_deny, "sources")
+                .expect("root deny sources")
+                .insert(
+                    "allow-git".to_owned(),
+                    TomlValue::Array(vec![TomlValue::String(
+                        "https://github.com/example/unpinned".to_owned(),
+                    )]),
+                );
+        }
+        "root-deny-ban-skip" => {
+            let mut skipped = toml::map::Map::new();
+            skipped.insert(
+                "name".to_owned(),
+                TomlValue::String("prohibited".to_owned()),
+            );
+            skipped.insert("version".to_owned(), TomlValue::String("1.0.0".to_owned()));
+            root_deny
+                .get_mut("bans")
+                .and_then(|bans| bans.get_mut("skip"))
+                .and_then(TomlValue::as_array_mut)
+                .expect("root deny ban skips")
+                .push(TomlValue::Table(skipped));
+        }
         other => panic!("unknown policy mutation: {other}"),
     }
 }
@@ -943,6 +1692,7 @@ fn repository_policy_is_structurally_fail_closed() {
     let root = workspace_root();
     let rust_workflow = parse_yaml(&root.join(".github/workflows/rust.yml"));
     let macos_workflow = parse_yaml(&root.join(".github/workflows/macos-packaging.yml"));
+    let root_deny = parse_toml(&root.join("deny.toml"));
     let deny = parse_toml(&root.join("desktop/deny.toml"));
     let audit = parse_toml(&root.join(".cargo/audit.toml"));
     let desktop_manifest = parse_toml(&root.join("desktop/Cargo.toml"));
@@ -952,6 +1702,7 @@ fn repository_policy_is_structurally_fail_closed() {
 
     let mut errors = validate_rust_workflow(&rust_workflow);
     errors.extend(validate_macos_workflow(&macos_workflow));
+    errors.extend(validate_root_deny_toml(&root_deny));
     errors.extend(validate_deny_toml(&deny));
     errors.extend(validate_audit_toml(&audit));
     errors.extend(validate_dependency_graph(
@@ -960,6 +1711,12 @@ fn repository_policy_is_structurally_fail_closed() {
         &desktop_lock,
         &root_lock,
     ));
+    let exception_files = deny_exception_files(&root);
+    if !exception_files.is_empty() {
+        errors.push(format!(
+            "external cargo-deny exception files are forbidden: {exception_files:?}"
+        ));
+    }
     assert!(
         errors.is_empty(),
         "policy violations:\n{}",
@@ -971,6 +1728,8 @@ fn repository_policy_is_structurally_fail_closed() {
 fn negative_policy_fixtures_reject_bypasses() {
     let root = workspace_root();
     let baseline_workflow = parse_yaml(&root.join(".github/workflows/rust.yml"));
+    let baseline_macos_workflow = parse_yaml(&root.join(".github/workflows/macos-packaging.yml"));
+    let baseline_root_deny = parse_toml(&root.join("deny.toml"));
     let baseline_deny = parse_toml(&root.join("desktop/deny.toml"));
     let baseline_audit = parse_toml(&root.join(".cargo/audit.toml"));
     let cases = parse_toml(&root.join(
@@ -981,7 +1740,7 @@ fn negative_policy_fixtures_reject_bypasses() {
         .get("case")
         .and_then(TomlValue::as_array)
         .expect("negative policy cases");
-    assert_eq!(cases.len(), 13, "every bypass category must remain covered");
+    assert_eq!(cases.len(), 30, "every bypass category must remain covered");
     for case in cases {
         let name = case
             .get("name")
@@ -997,11 +1756,22 @@ fn negative_policy_fixtures_reject_bypasses() {
             .expect("case expected violation");
 
         let mut workflow = baseline_workflow.clone();
+        let mut macos_workflow = baseline_macos_workflow.clone();
+        let mut root_deny = baseline_root_deny.clone();
         let mut deny = baseline_deny.clone();
         let mut audit = baseline_audit.clone();
-        mutate_negative_case(mutation, &mut workflow, &mut deny, &mut audit);
+        mutate_negative_case(
+            mutation,
+            &mut workflow,
+            &mut macos_workflow,
+            &mut root_deny,
+            &mut deny,
+            &mut audit,
+        );
 
         let mut violations = validate_rust_workflow(&workflow);
+        violations.extend(validate_macos_workflow(&macos_workflow));
+        violations.extend(validate_root_deny_toml(&root_deny));
         violations.extend(validate_deny_toml(&deny));
         violations.extend(validate_audit_toml(&audit));
         assert!(
@@ -1030,4 +1800,34 @@ fn audit_lock_fixtures_exercise_warning_and_vulnerability_states() {
         vulnerable,
         BTreeMap::from([("quick-xml".to_owned(), "0.39.4".to_owned())])
     );
+}
+
+#[test]
+fn every_external_deny_exception_location_is_rejected() {
+    let unique = format!(
+        "gta-claw-deny-exceptions-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+
+    for relative in DENY_EXCEPTION_PATHS {
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("remove prior exception fixture");
+        }
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("exception path has a parent"))
+            .expect("create exception fixture directory");
+        fs::write(&path, "exceptions = []\n").expect("write exception fixture");
+        assert_eq!(
+            deny_exception_files(&root),
+            vec![relative.to_owned()],
+            "exception path was not detected: {relative}"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove exception fixture");
 }

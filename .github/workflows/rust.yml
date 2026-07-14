@@ -15,7 +15,8 @@ on:
       - "desktop/**"
       - "Cargo.lock"
       - "Cargo.toml"
-      - "deny.toml"
+      - ".deny*.toml"
+      - "deny*.toml"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
   pull_request:
@@ -30,7 +31,8 @@ on:
       - "desktop/**"
       - "Cargo.lock"
       - "Cargo.toml"
-      - "deny.toml"
+      - ".deny*.toml"
+      - "deny*.toml"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
   workflow_dispatch:
@@ -201,41 +203,145 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate supply-chain policy
-        run: cargo test --locked --package claw-security --test desktop_supply_chain_policy
-
-      - name: Check dependency policy
-        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
-        with:
-          arguments: --all-features
-          command: check
-          manifest-path: ./Cargo.toml
-
-      - name: Install pinned cargo-audit
+      - name: Bootstrap verified Rust security tools
         shell: bash
         env:
           CARGO_AUDIT_CRATE_SHA256: 700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a
           CARGO_AUDIT_VERSION: 0.22.2
+          CARGO_DENY_ARCHIVE_SHA256: 70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f
+          CARGO_DENY_VERSION: 0.19.8
         run: |
           set -euo pipefail
-          cargo info "cargo-audit@${CARGO_AUDIT_VERSION}" --quiet
-          mapfile -t archives < <(
-            find "${CARGO_HOME:-$HOME/.cargo}/registry/cache" \
-              -type f -name "cargo-audit-${CARGO_AUDIT_VERSION}.crate"
-          )
-          test "${#archives[@]}" -gt 0
-          for archive in "${archives[@]}"; do
-            printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$archive" |
-              sha256sum --check -
-          done
-          cargo install cargo-audit --version "=${CARGO_AUDIT_VERSION}" --locked --force
-          test "$(cargo audit --version)" = "cargo-audit-audit ${CARGO_AUDIT_VERSION}"
+          cargo_bin="$(command -v cargo)"
+          curl_bin="$(command -v curl)"
+          original_home="$HOME"
+          tool_root="$RUNNER_TEMP/verified-rust-security-tools"
+          poison_marker="$RUNNER_TEMP/poisoned-cargo-audit-built"
+          shadow_marker="$RUNNER_TEMP/poisoned-cargo-audit-executed"
+          rm -rf -- "$tool_root"
+          rm -f -- "$poison_marker" "$shadow_marker"
+          mkdir -p "$tool_root/downloads" "$tool_root/src"
+
+          poison_source="$original_home/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cargo-audit-${CARGO_AUDIT_VERSION}"
+          mkdir -p "$poison_source/src" "$original_home/.cargo/bin"
+          cat >"$poison_source/Cargo.toml" <<'EOF'
+          [package]
+          name = "cargo-audit"
+          version = "0.22.2"
+          edition = "2024"
+          build = "build.rs"
+
+          [[bin]]
+          name = "cargo-audit"
+          path = "src/main.rs"
+          EOF
+          cat >"$poison_source/build.rs" <<'EOF'
+          fn main() {
+              std::fs::write(std::env::var("POISON_MARKER").unwrap(), b"built").unwrap();
+          }
+          EOF
+          cat >"$poison_source/src/main.rs" <<'EOF'
+          fn main() {
+              println!("cargo-audit-audit 0.22.2");
+          }
+          EOF
+          touch "$poison_source/.cargo-ok"
+          printf '{"files":{},"package":"%s"}\n' "$CARGO_AUDIT_CRATE_SHA256" \
+            >"$poison_source/.cargo-checksum.json"
+          cat >"$original_home/.cargo/bin/cargo-audit" <<'EOF'
+          #!/usr/bin/env sh
+          printf 'executed\n' >"${POISON_SHADOW_MARKER:?}"
+          echo "cargo-audit-audit 0.22.2"
+          exit 0
+          EOF
+          chmod +x "$original_home/.cargo/bin/cargo-audit"
+          export POISON_SHADOW_MARKER="$shadow_marker"
+
+          audit_archive="$tool_root/downloads/cargo-audit-${CARGO_AUDIT_VERSION}.crate"
+          "$curl_bin" --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://static.crates.io/crates/cargo-audit/cargo-audit-${CARGO_AUDIT_VERSION}.crate" \
+            --output "$audit_archive"
+          printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$audit_archive" |
+            sha256sum --check -
+          tar --extract --gzip --file "$audit_archive" --directory "$tool_root/src"
+          audit_source="$tool_root/src/cargo-audit-${CARGO_AUDIT_VERSION}"
+
+          deny_archive="$tool_root/downloads/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          "$curl_bin" --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$deny_archive"
+          printf '%s  %s\n' "$CARGO_DENY_ARCHIVE_SHA256" "$deny_archive" |
+            sha256sum --check -
+          mkdir -p "$tool_root/cargo-deny"
+          tar --extract --gzip --file "$deny_archive" \
+            --directory "$tool_root/cargo-deny" --strip-components=1
+
+          export RUSTUP_HOME="${RUSTUP_HOME:-$original_home/.rustup}"
+          verified_rustup_home="$RUSTUP_HOME"
+          export HOME="$tool_root/home"
+          export CARGO_HOME="$tool_root/cargo-home"
+          mkdir -p "$HOME" "$CARGO_HOME"
+          unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET
+          unset CARGO_ENCODED_RUSTFLAGS CARGO_NET_GIT_FETCH_WITH_CLI
+          unset CARGO_REGISTRIES_CRATES_IO_INDEX CARGO_REGISTRIES_CRATES_IO_PROTOCOL
+          unset CARGO_TARGET_DIR RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
+          cd "$tool_root"
+          POISON_MARKER="$poison_marker" "$cargo_bin" install \
+            --path "$audit_source" --locked --root "$tool_root/cargo-audit" --force
+
+          audit_bin="$tool_root/cargo-audit/bin/cargo-audit"
+          deny_bin="$tool_root/cargo-deny/cargo-deny"
+          mkdir -p "$tool_root/bin" "$tool_root/work"
+          cat >"$tool_root/bin/run-cargo-clean" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export HOME="$VERIFIED_TOOL_HOME"
+          export CARGO_HOME="$VERIFIED_TOOL_CARGO_HOME"
+          export RUSTUP_HOME="$VERIFIED_TOOL_RUSTUP_HOME"
+          unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET
+          unset CARGO_ENCODED_RUSTFLAGS CARGO_NET_GIT_FETCH_WITH_CLI
+          unset CARGO_REGISTRIES_CRATES_IO_INDEX CARGO_REGISTRIES_CRATES_IO_PROTOCOL
+          unset CARGO_TARGET_DIR RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
+          cd "$VERIFIED_TOOL_WORKDIR"
+          exec "$VERIFIED_CARGO_BIN" "$@"
+          EOF
+          cat >"$tool_root/bin/run-cargo-deny-clean" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export HOME="$VERIFIED_TOOL_HOME"
+          export CARGO_HOME="$VERIFIED_TOOL_CARGO_HOME"
+          export RUSTUP_HOME="$VERIFIED_TOOL_RUSTUP_HOME"
+          unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET
+          unset CARGO_ENCODED_RUSTFLAGS CARGO_NET_GIT_FETCH_WITH_CLI
+          unset CARGO_REGISTRIES_CRATES_IO_INDEX CARGO_REGISTRIES_CRATES_IO_PROTOCOL
+          unset CARGO_TARGET_DIR RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
+          cd "$VERIFIED_TOOL_WORKDIR"
+          exec "$CARGO_DENY_BIN" "$@"
+          EOF
+          chmod +x "$tool_root/bin/run-cargo-clean" "$tool_root/bin/run-cargo-deny-clean"
+          test ! -e "$poison_marker"
+          test ! -e "$shadow_marker"
+          test "$("$audit_bin" audit --version)" = "cargo-audit-audit ${CARGO_AUDIT_VERSION}"
+          test "$("$deny_bin" --version)" = "cargo-deny ${CARGO_DENY_VERSION}"
+          {
+            printf 'CARGO_AUDIT_BIN=%s\n' "$audit_bin"
+            printf 'CARGO_DENY_BIN=%s\n' "$deny_bin"
+            printf 'CARGO_DENY_RUNNER=%s\n' "$tool_root/bin/run-cargo-deny-clean"
+            printf 'VERIFIED_CARGO_BIN=%s\n' "$cargo_bin"
+            printf 'VERIFIED_CARGO_RUNNER=%s\n' "$tool_root/bin/run-cargo-clean"
+            printf 'VERIFIED_TOOL_CARGO_HOME=%s\n' "$tool_root/cargo-home"
+            printf 'VERIFIED_TOOL_HOME=%s\n' "$tool_root/home"
+            printf 'VERIFIED_TOOL_RUSTUP_HOME=%s\n' "$verified_rustup_home"
+            printf 'VERIFIED_TOOL_WORKDIR=%s\n' "$tool_root/work"
+          } >>"$GITHUB_ENV"
 
       - name: Audit root lockfile
-        run: cargo audit --file Cargo.lock
+        run: '"$CARGO_AUDIT_BIN" audit --file Cargo.lock'
 
       - name: Audit desktop lockfile
-        run: cargo audit --file desktop/Cargo.lock --no-fetch
+        run: '"$CARGO_AUDIT_BIN" audit --file desktop/Cargo.lock --no-fetch'
 
       - name: Test cargo-audit exit policy
         shell: bash
@@ -250,7 +356,7 @@ jobs:
             fi
 
             warning_output="$(
-              cargo audit --no-fetch \
+              "$CARGO_AUDIT_BIN" audit --no-fetch \
                 --file .github/fixtures/cargo-audit/unmaintained/Cargo.lock 2>&1
             )"
             printf '%s\n' "$warning_output"
@@ -258,7 +364,7 @@ jobs:
 
             set +e
             vulnerable_output="$(
-              cargo audit --no-fetch \
+              "$CARGO_AUDIT_BIN" audit --no-fetch \
                 --file .github/fixtures/cargo-audit/vulnerable/Cargo.lock 2>&1
             )"
             vulnerable_status=$?
@@ -269,34 +375,125 @@ jobs:
             grep -F "RUSTSEC-2026-0195" <<<"$vulnerable_output"
           done
 
+      - name: Test cargo-deny lock and exception policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/cargo-deny-policy-fixture"
+          rm -rf -- "$fixture"
+          mkdir -p "$fixture/app/src" "$fixture/prohibited/src"
+          cat >"$fixture/Cargo.toml" <<'EOF'
+          [workspace]
+          members = ["app", "prohibited"]
+          resolver = "3"
+          EOF
+          cat >"$fixture/app/Cargo.toml" <<'EOF'
+          [package]
+          name = "app"
+          version = "0.0.0"
+          edition = "2024"
+          license = "MIT"
+
+          [dependencies]
+          prohibited = { path = "../prohibited" }
+          EOF
+          printf 'fn main() {}\n' >"$fixture/app/src/main.rs"
+          cat >"$fixture/prohibited/Cargo.toml" <<'EOF'
+          [package]
+          name = "prohibited"
+          version = "0.0.0"
+          edition = "2024"
+          license = "GPL-3.0-only"
+          EOF
+          printf '\n' >"$fixture/prohibited/src/lib.rs"
+          cat >"$fixture/deny.toml" <<'EOF'
+          [graph]
+          all-features = true
+
+          [licenses]
+          allow = ["MIT"]
+          confidence-threshold = 0.8
+          EOF
+          "$VERIFIED_CARGO_RUNNER" generate-lockfile \
+            --manifest-path "$fixture/Cargo.toml" --offline
+
+          set +e
+          rejected_output="$(
+            "$CARGO_DENY_RUNNER" --manifest-path "$fixture/Cargo.toml" --locked \
+              check --config "$fixture/deny.toml" licenses 2>&1
+          )"
+          rejected_status=$?
+          set -e
+          printf '%s\n' "$rejected_output"
+          test "$rejected_status" -ne 0
+          grep -F "GPL-3.0-only" <<<"$rejected_output"
+
+          cat >"$fixture/deny.exceptions.toml" <<'EOF'
+          exceptions = [
+            { allow = ["GPL-3.0-only"], name = "prohibited" },
+          ]
+          EOF
+          "$CARGO_DENY_RUNNER" --manifest-path "$fixture/Cargo.toml" --locked \
+            check --config "$fixture/deny.toml" licenses
+          rm "$fixture/deny.exceptions.toml"
+
+          mkdir -p "$fixture/late/src"
+          cat >"$fixture/late/Cargo.toml" <<'EOF'
+          [package]
+          name = "late"
+          version = "0.0.0"
+          edition = "2024"
+          license = "MIT"
+          EOF
+          printf '\n' >"$fixture/late/src/lib.rs"
+          cat >"$fixture/Cargo.toml" <<'EOF'
+          [workspace]
+          members = ["app", "prohibited", "late"]
+          resolver = "3"
+          EOF
+          set +e
+          stale_output="$(
+            "$CARGO_DENY_RUNNER" --manifest-path "$fixture/Cargo.toml" --locked \
+              check --config "$fixture/deny.toml" licenses 2>&1
+          )"
+          stale_status=$?
+          set -e
+          printf '%s\n' "$stale_output"
+          test "$stale_status" -ne 0
+          grep -F -- "--locked was passed" <<<"$stale_output"
+
+      - name: Check root dependency policy
+        run: >-
+          "$CARGO_DENY_RUNNER" --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+          --locked --all-features check --config "$GITHUB_WORKSPACE/deny.toml"
+
       - name: Check Windows x64 desktop dependency policy
-        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
-        with:
-          arguments: --target x86_64-pc-windows-msvc
-          command: check
-          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
-          manifest-path: ./desktop/Cargo.toml
+        run: >-
+          "$CARGO_DENY_RUNNER" --manifest-path "$GITHUB_WORKSPACE/desktop/Cargo.toml"
+          --locked --target x86_64-pc-windows-msvc check
+          --config "$GITHUB_WORKSPACE/desktop/deny.toml"
+          --warn unmaintained advisories licenses sources
 
       - name: Check Windows ARM64 desktop dependency policy
-        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
-        with:
-          arguments: --target aarch64-pc-windows-msvc
-          command: check
-          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
-          manifest-path: ./desktop/Cargo.toml
+        run: >-
+          "$CARGO_DENY_RUNNER" --manifest-path "$GITHUB_WORKSPACE/desktop/Cargo.toml"
+          --locked --target aarch64-pc-windows-msvc check
+          --config "$GITHUB_WORKSPACE/desktop/deny.toml"
+          --warn unmaintained advisories licenses sources
 
       - name: Check macOS Intel desktop dependency policy
-        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
-        with:
-          arguments: --target x86_64-apple-darwin
-          command: check
-          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
-          manifest-path: ./desktop/Cargo.toml
+        run: >-
+          "$CARGO_DENY_RUNNER" --manifest-path "$GITHUB_WORKSPACE/desktop/Cargo.toml"
+          --locked --target x86_64-apple-darwin check
+          --config "$GITHUB_WORKSPACE/desktop/deny.toml"
+          --warn unmaintained advisories licenses sources
 
       - name: Check macOS ARM64 desktop dependency policy
-        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87
-        with:
-          arguments: --target aarch64-apple-darwin
-          command: check
-          command-arguments: --config desktop/deny.toml --warn unmaintained advisories licenses sources
-          manifest-path: ./desktop/Cargo.toml
+        run: >-
+          "$CARGO_DENY_RUNNER" --manifest-path "$GITHUB_WORKSPACE/desktop/Cargo.toml"
+          --locked --target aarch64-apple-darwin check
+          --config "$GITHUB_WORKSPACE/desktop/deny.toml"
+          --warn unmaintained advisories licenses sources
+
+      - name: Validate supply-chain policy
+        run: cargo test --locked --package claw-security --test desktop_supply_chain_policy
