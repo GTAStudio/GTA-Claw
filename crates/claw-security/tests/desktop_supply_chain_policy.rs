@@ -49,6 +49,12 @@ const DENY_EXCEPTION_PATHS: [&str; 6] = [
     "desktop/.deny.exceptions.toml",
     "desktop/.cargo/deny.exceptions.toml",
 ];
+const CARGO_CONFIG_PATHS: [&str; 4] = [
+    ".cargo/config",
+    ".cargo/config.toml",
+    "desktop/.cargo/config",
+    "desktop/.cargo/config.toml",
+];
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -82,6 +88,14 @@ fn parse_toml(path: &Path) -> TomlValue {
 
 fn deny_exception_files(root: &Path) -> Vec<String> {
     DENY_EXCEPTION_PATHS
+        .iter()
+        .filter(|relative| root.join(relative).is_file())
+        .map(|relative| (*relative).to_owned())
+        .collect()
+}
+
+fn cargo_config_files(root: &Path) -> Vec<String> {
+    CARGO_CONFIG_PATHS
         .iter()
         .filter(|relative| root.join(relative).is_file())
         .map(|relative| (*relative).to_owned())
@@ -529,7 +543,7 @@ fn validate_supply_chain_job(workflow: &YamlValue, errors: &mut Vec<String>) {
     let exact_runs = [
         (
             "Validate supply-chain policy",
-            "cargo test --locked --package claw-security --test desktop_supply_chain_policy",
+            "\"$VERIFIED_CARGO_RUNNER\" test --manifest-path \"$GITHUB_WORKSPACE/Cargo.toml\" --locked --package claw-security --test desktop_supply_chain_policy",
         ),
         (
             "Check root dependency policy",
@@ -1717,6 +1731,12 @@ fn repository_policy_is_structurally_fail_closed() {
             "external cargo-deny exception files are forbidden: {exception_files:?}"
         ));
     }
+    let cargo_configs = cargo_config_files(&root);
+    if !cargo_configs.is_empty() {
+        errors.push(format!(
+            "repository Cargo configuration is forbidden for security enforcement: {cargo_configs:?}"
+        ));
+    }
     assert!(
         errors.is_empty(),
         "policy violations:\n{}",
@@ -1830,4 +1850,35 @@ fn every_external_deny_exception_location_is_rejected() {
     }
 
     fs::remove_dir_all(root).expect("remove exception fixture");
+}
+
+#[test]
+fn every_repository_cargo_config_location_is_rejected() {
+    let unique = format!(
+        "gta-claw-cargo-config-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+
+    for relative in CARGO_CONFIG_PATHS {
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("remove prior Cargo config fixture");
+        }
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("Cargo config path has a parent"))
+            .expect("create Cargo config fixture directory");
+        fs::write(&path, "[target.'cfg(all())']\nrunner = \"/bin/true\"\n")
+            .expect("write Cargo config fixture");
+        assert_eq!(
+            cargo_config_files(&root),
+            vec![relative.to_owned()],
+            "Cargo config path was not detected: {relative}"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove Cargo config fixture");
 }

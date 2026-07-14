@@ -496,4 +496,7 @@ jobs:
           --warn unmaintained advisories licenses sources
 
       - name: Validate supply-chain policy
-        run: cargo test --locked --package claw-security --test desktop_supply_chain_policy
+        run: >-
+          "$VERIFIED_CARGO_RUNNER" test
+          --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --locked
+          --package claw-security --test desktop_supply_chain_policy
