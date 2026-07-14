@@ -142,6 +142,18 @@ fn apply_command_result(window: &slint::Weak<AppWindow>, result: Result<(), Comm
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+fn handle_close_request(
+    weak_window: &slint::Weak<AppWindow>,
+    sender: &ControllerSender,
+) -> CloseRequestResponse {
+    if let Some(window) = weak_window.upgrade() {
+        window.set_token_input("".into());
+    }
+    sender.close();
+    CloseRequestResponse::HideWindow
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn wire_callbacks(
     window: &AppWindow,
     sender: ControllerSender,
@@ -219,11 +231,11 @@ fn wire_callbacks(
         }
     });
 
+    let weak_window = window.as_weak();
     let close_sender = sender;
-    window.window().on_close_requested(move || {
-        close_sender.close();
-        CloseRequestResponse::HideWindow
-    });
+    window
+        .window()
+        .on_close_requested(move || handle_close_request(&weak_window, &close_sender));
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -332,6 +344,12 @@ mod tests {
             controller.sender(),
             Rc::new(RefCell::new(VisualPreferencesState::default())),
         );
+        window.set_token_input("pending-close-secret".into());
+        assert!(matches!(
+            handle_close_request(&window.as_weak(), &controller.sender()),
+            CloseRequestResponse::HideWindow
+        ));
+        assert_eq!(window.get_token_input(), "");
         drop(window);
         controller.shutdown().expect("controller shutdown");
         assert!(snapshots.lock().expect("snapshots").iter().any(|snapshot| {

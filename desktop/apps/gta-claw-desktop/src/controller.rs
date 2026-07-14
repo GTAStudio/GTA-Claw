@@ -11,6 +11,7 @@ use claw_gateway_client::{
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, GatewayMethodName, RequestId, resolve_core_method,
 };
+use claw_security::authorization::{Scope, ScopeSet};
 use claw_security::identity::DeviceIdentity;
 use getrandom::{SysRng, rand_core::UnwrapErr};
 use serde_json::json;
@@ -241,6 +242,9 @@ async fn controller_loop(
                 };
                 match command {
                     ControllerCommand::Connect(request) => {
+                        if !model.can_start_connection() {
+                            continue;
+                        }
                         let endpoint = request.endpoint_display().to_owned();
                         let generation = model.begin(endpoint);
                         publish(&sink, &model);
@@ -268,6 +272,9 @@ async fn controller_loop(
                         active = Some(ActiveAttempt { cancellation, task });
                     }
                     ControllerCommand::RejectSubmission(rejection) => {
+                        if !model.can_start_connection() {
+                            continue;
+                        }
                         stop_attempt(active.take()).await;
                         model.reject_submission(rejection.endpoint_display, rejection.error);
                         publish(&sink, &model);
@@ -321,6 +328,7 @@ async fn run_attempt(
     let (url, token) = request.into_parts();
     let mut config = GatewayClientConfig::new(url, identity);
     config.credential = token.map_or(GatewayCredential::None, GatewayCredential::Token);
+    config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
     config.limits = ClientLimits {
         max_in_flight_requests: 4,
         command_queue_capacity: 8,
@@ -355,39 +363,32 @@ async fn run_attempt(
         }
     };
     let mut states = client.subscribe_state();
-    let mut last_connection_id: Option<String> = None;
     let mut health_sequence = 0_u64;
     let mut issued_tokens = Vec::new();
     let mut event_stream_open = true;
 
-    loop {
-        let state = states.borrow().clone();
-        let terminal = apply_client_state(
-            generation,
-            &client,
-            &updates,
-            state,
-            &mut last_connection_id,
-            &mut health_sequence,
-            &mut issued_tokens,
-            &cancellation,
-        )
-        .await;
-        if terminal {
-            break;
-        }
-
+    let initial_state = states.borrow_and_update().clone();
+    let mut terminal = apply_client_state(
+        generation,
+        &client,
+        &updates,
+        initial_state,
+        &mut health_sequence,
+        &mut issued_tokens,
+        &cancellation,
+    )
+    .await;
+    while !terminal {
         tokio::select! {
             () = cancellation.cancelled() => break,
             changed = states.changed() => {
                 if changed.is_err() {
-                    let final_state = states.borrow().clone();
+                    let final_state = states.borrow_and_update().clone();
                     let _ = apply_client_state(
                         generation,
                         &client,
                         &updates,
                         final_state,
-                        &mut last_connection_id,
                         &mut health_sequence,
                         &mut issued_tokens,
                         &cancellation,
@@ -395,6 +396,17 @@ async fn run_attempt(
                     .await;
                     break;
                 }
+                let state = states.borrow_and_update().clone();
+                terminal = apply_client_state(
+                    generation,
+                    &client,
+                    &updates,
+                    state,
+                    &mut health_sequence,
+                    &mut issued_tokens,
+                    &cancellation,
+                )
+                .await;
             }
             event = gateway_events.recv(), if event_stream_open => {
                 if event.is_none() {
@@ -417,13 +429,11 @@ async fn run_attempt(
     drop(issued_tokens);
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_client_state(
     generation: u64,
     client: &GatewayClient,
     updates: &mpsc::Sender<(u64, AttemptUpdate)>,
     state: ConnectionState,
-    last_connection_id: &mut Option<String>,
     health_sequence: &mut u64,
     issued_tokens: &mut Vec<claw_gateway_client::IssuedDeviceToken>,
     cancellation: &CancellationToken,
@@ -441,14 +451,17 @@ async fn apply_client_state(
         ConnectionState::Starting | ConnectionState::Connecting => Some(AttemptUpdate::Connecting),
         ConnectionState::Authenticating => Some(AttemptUpdate::Authenticating),
         ConnectionState::Reconnecting { attempt, .. } => {
-            *last_connection_id = None;
             Some(AttemptUpdate::Reconnecting { attempt })
         }
         ConnectionState::Ready(info) => {
-            if last_connection_id.as_deref() == Some(info.connection_id.as_str()) {
-                None
+            if !has_exact_read_scope(&info) {
+                health_failure = true;
+                Some(AttemptUpdate::Failed(UserError::from_gateway(
+                    &GatewayClientError::Protocol(
+                        claw_gateway_client::ProtocolFailure::HelloAuthenticationMismatch,
+                    ),
+                )))
             } else {
-                *last_connection_id = Some(info.connection_id.clone());
                 *health_sequence = health_sequence.wrapping_add(1);
                 if send_update(updates, generation, AttemptUpdate::Ready(info))
                     .await
@@ -504,6 +517,10 @@ async fn apply_client_state(
     terminal || health_failure
 }
 
+fn has_exact_read_scope(info: &claw_gateway_client::ConnectionInfo) -> bool {
+    info.scopes.len() == 1 && info.scopes[0] == Scope::OperatorRead.as_str()
+}
+
 async fn run_health_probe(
     client: &GatewayClient,
     generation: u64,
@@ -541,8 +558,9 @@ async fn send_update(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
     use std::sync::Mutex;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use fastwebsockets::Frame;
@@ -551,8 +569,9 @@ mod tests {
     use super::*;
     use crate::onboarding::{OnboardingPhase, UserErrorKind};
     use crate::test_gateway::{
-        TestGateway, handler, receive_connect, receive_request, send_challenge, send_connect_error,
-        send_health, send_hello, wait_for_close,
+        TestGateway, count_text_until_close, handler, receive_connect, receive_request,
+        send_challenge, send_connect_error, send_health, send_health_failure, send_hello,
+        send_hello_with_scopes, send_json, wait_for_close,
     };
 
     type Snapshots = Arc<Mutex<Vec<ViewSnapshot>>>;
@@ -599,6 +618,15 @@ mod tests {
         .expect("snapshot timeout")
     }
 
+    fn assert_authenticated_summary_cleared(snapshot: &ViewSnapshot) {
+        assert_eq!(snapshot.server(), "Not connected");
+        assert_eq!(snapshot.protocol(), "Not negotiated");
+        assert_eq!(snapshot.role(), "Not authenticated");
+        assert_eq!(snapshot.scopes(), "No effective scopes");
+        assert_eq!(snapshot.health(), "Not healthy - connection failed");
+        assert!(!snapshot.health().contains("Healthy"));
+    }
+
     #[test]
     fn command_rejections_are_typed_bounded_and_actionable() {
         for rejection in [CommandRejection::Busy, CommandRejection::Closed] {
@@ -633,6 +661,14 @@ mod tests {
         let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
             send_challenge(&mut socket).await;
             let (connect, params) = receive_connect(&mut socket).await;
+            let requested_scopes = params
+                .scopes
+                .as_ref()
+                .expect("requested scopes")
+                .iter()
+                .map(|scope| scope.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(requested_scopes, ["operator.read"]);
             assert!(
                 params
                     .auth
@@ -660,7 +696,7 @@ mod tests {
         assert_eq!(ready.server(), "desktop-test-gateway");
         assert_eq!(ready.protocol(), "Gateway v4");
         assert_eq!(ready.role(), "operator");
-        assert_eq!(ready.scopes(), "No effective scopes");
+        assert_eq!(ready.scopes(), "operator.read");
         assert_eq!(ready.health(), "Healthy - safe RPC completed");
         let rendered = format!("{ready:?}");
         assert!(!rendered.contains("desktop-session-token"));
@@ -673,6 +709,135 @@ mod tests {
                 && snapshot.identity() == "Discarded on disconnect"
         })
         .await;
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_empty_extra_and_admin_effective_scopes_before_health() {
+        let cases: [(&[&str], &str); 4] = [
+            (&[], "empty"),
+            (&["operator.read", "operator.write"], "extra"),
+            (&["operator.write"], "write"),
+            (&["operator.admin"], "admin"),
+        ];
+        for (scopes, marker) in cases {
+            let application_requests = Arc::new(AtomicUsize::new(0));
+            let counted_requests = Arc::clone(&application_requests);
+            let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+                let counted_requests = Arc::clone(&counted_requests);
+                async move {
+                    send_challenge(&mut socket).await;
+                    let (connect, params) = receive_connect(&mut socket).await;
+                    send_hello_with_scopes(
+                        &mut socket,
+                        &connect,
+                        &params,
+                        4,
+                        marker,
+                        false,
+                        scopes,
+                    )
+                    .await;
+                    count_text_until_close(&mut socket, counted_requests).await;
+                }
+            }))
+            .await;
+            let (controller, snapshots) = controller_with_snapshots();
+            controller
+                .sender()
+                .connect(request(&gateway.url))
+                .expect("connect");
+            let failed = wait_snapshot(&snapshots, |snapshot| {
+                snapshot.phase() == OnboardingPhase::Failed
+            })
+            .await;
+            assert_eq!(
+                failed.error().expect("scope error").code(),
+                "gateway.protocol-scope"
+            );
+            assert_authenticated_summary_cleared(&failed);
+            controller.shutdown().expect("shutdown");
+            gateway.shutdown().await;
+            assert_eq!(application_requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_queued_connect_keeps_first_token_and_single_attempt() {
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let captured_tokens = Arc::clone(&tokens);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let captured_tokens = Arc::clone(&captured_tokens);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                captured_tokens.lock().expect("tokens").push(
+                    params
+                        .auth
+                        .as_ref()
+                        .and_then(|auth| auth.token.as_ref())
+                        .cloned(),
+                );
+                send_hello(&mut socket, &connect, &params, 4, "first-attempt", false).await;
+                let health = receive_request(&mut socket).await;
+                send_health(&mut socket, &health).await;
+                wait_for_close(&mut socket).await;
+            }
+        }))
+        .await;
+
+        let entered_initial_publish = Arc::new(Barrier::new(2));
+        let release_initial_publish = Arc::new(Barrier::new(2));
+        let block_first_publish = Arc::new(AtomicBool::new(true));
+        let entered = Arc::clone(&entered_initial_publish);
+        let release = Arc::clone(&release_initial_publish);
+        let block = Arc::clone(&block_first_publish);
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&snapshots);
+        let controller = DesktopController::spawn(move |snapshot| {
+            if block.swap(false, Ordering::SeqCst) {
+                entered.wait();
+                release.wait();
+            }
+            sink.lock().expect("snapshots").push(snapshot);
+        })
+        .expect("controller");
+        entered_initial_publish.wait();
+
+        let sender = controller.sender();
+        sender
+            .connect(
+                ConnectRequest::prepare(
+                    gateway.url.as_str().trim_end_matches('/').to_owned(),
+                    "first-token".to_owned(),
+                    true,
+                )
+                .expect("first request"),
+            )
+            .expect("queue first");
+        sender
+            .connect(
+                ConnectRequest::prepare(
+                    gateway.url.as_str().trim_end_matches('/').to_owned(),
+                    String::new(),
+                    true,
+                )
+                .expect("duplicate request"),
+            )
+            .expect("queue duplicate");
+        release_initial_publish.wait();
+
+        wait_snapshot(&snapshots, |snapshot| {
+            snapshot.phase() == OnboardingPhase::Ready
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokens.lock().expect("tokens").as_slice(),
+            &[Some("first-token".to_owned())]
+        );
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
@@ -817,6 +982,90 @@ mod tests {
             failed.error().expect("close error").code(),
             "gateway.transport-closed"
         );
+        assert_authenticated_summary_cleared(&failed);
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_failure_clears_authenticated_summary_and_raw_payload() {
+        let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            send_hello(
+                &mut socket,
+                &connect,
+                &params,
+                4,
+                "desktop-health-failure",
+                false,
+            )
+            .await;
+            let health = receive_request(&mut socket).await;
+            send_health_failure(&mut socket, &health).await;
+            wait_for_close(&mut socket).await;
+        }))
+        .await;
+        let (controller, snapshots) = controller_with_snapshots();
+        controller
+            .sender()
+            .connect(request(&gateway.url))
+            .expect("connect");
+        let failed = wait_snapshot(&snapshots, |snapshot| {
+            snapshot.phase() == OnboardingPhase::Failed
+        })
+        .await;
+        assert_authenticated_summary_cleared(&failed);
+        assert!(!format!("{failed:?}").contains("raw health failure"));
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stable_ready_events_do_not_trigger_additional_health_probes() {
+        let additional_requests = Arc::new(AtomicUsize::new(0));
+        let counted_requests = Arc::clone(&additional_requests);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let counted_requests = Arc::clone(&counted_requests);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                send_hello(
+                    &mut socket,
+                    &connect,
+                    &params,
+                    4,
+                    "desktop-stable-ready",
+                    false,
+                )
+                .await;
+                let health = receive_request(&mut socket).await;
+                send_health(&mut socket, &health).await;
+                send_json(
+                    &mut socket,
+                    serde_json::json!({
+                        "type": "event",
+                        "event": "tick",
+                        "payload": {"ts": 1_700_000_000_100_u64},
+                        "seq": 1
+                    }),
+                )
+                .await;
+                count_text_until_close(&mut socket, counted_requests).await;
+            }
+        }))
+        .await;
+        let (controller, snapshots) = controller_with_snapshots();
+        controller
+            .sender()
+            .connect(request(&gateway.url))
+            .expect("connect");
+        wait_snapshot(&snapshots, |snapshot| {
+            snapshot.phase() == OnboardingPhase::Ready
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(additional_requests.load(Ordering::SeqCst), 0);
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
@@ -835,11 +1084,7 @@ mod tests {
                     &connect,
                     &params,
                     4,
-                    if index == 0 {
-                        "desktop-reconnect-one"
-                    } else {
-                        "desktop-reconnect-two"
-                    },
+                    "desktop-reused-connection-id",
                     false,
                 )
                 .await;

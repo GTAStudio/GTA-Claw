@@ -503,6 +503,15 @@ pub(crate) enum AttemptUpdate {
 }
 
 impl OnboardingModel {
+    pub(crate) fn can_start_connection(&self) -> bool {
+        matches!(
+            self.phase,
+            OnboardingPhase::Disconnected
+                | OnboardingPhase::Failed
+                | OnboardingPhase::PairingRequired
+        )
+    }
+
     pub(crate) fn begin(&mut self, endpoint_display: String) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.phase = OnboardingPhase::Connecting;
@@ -569,7 +578,13 @@ impl OnboardingModel {
                 } else {
                     OnboardingPhase::Failed
                 };
+                self.summary.server = "Not connected".to_owned();
+                self.summary.protocol = "Not negotiated".to_owned();
+                self.summary.role = "Not authenticated".to_owned();
+                self.summary.scopes = "No effective scopes".to_owned();
+                self.summary.health = "Not healthy - connection failed".to_owned();
                 self.error = Some(error);
+                self.reconnect_attempt = None;
             }
         }
         true
@@ -912,6 +927,28 @@ mod tests {
         assert_eq!(model.generation(), current);
         assert_eq!(model.snapshot().endpoint(), "ws://localhost:2000/");
         assert_eq!(model.snapshot().phase(), OnboardingPhase::Connecting);
+    }
+
+    #[test]
+    fn terminal_failure_clears_every_authenticated_summary() {
+        let mut model = OnboardingModel::default();
+        let generation = model.begin("wss://gateway.example/".to_owned());
+        assert!(model.apply(generation, AttemptUpdate::Ready(connection_info())));
+        assert!(model.apply(generation, AttemptUpdate::Healthy));
+        assert!(model.apply(
+            generation,
+            AttemptUpdate::Failed(UserError::transport(TransportFailure::Closed))
+        ));
+
+        let failed = model.snapshot();
+        assert_eq!(failed.phase(), OnboardingPhase::Failed);
+        assert_eq!(failed.endpoint(), "wss://gateway.example/");
+        assert_eq!(failed.server(), "Not connected");
+        assert_eq!(failed.protocol(), "Not negotiated");
+        assert_eq!(failed.role(), "Not authenticated");
+        assert_eq!(failed.scopes(), "No effective scopes");
+        assert_eq!(failed.health(), "Not healthy - connection failed");
+        assert!(!failed.health().contains("Healthy"));
     }
 
     #[test]

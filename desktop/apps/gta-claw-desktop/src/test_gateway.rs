@@ -228,16 +228,37 @@ pub(crate) async fn send_hello(
     connection_id: &str,
     issue_device_token: bool,
 ) {
-    let role = params
-        .role
-        .as_ref()
-        .map_or("operator", |role| role.as_str());
     let scopes = params.scopes.as_ref().map_or_else(Vec::new, |scopes| {
         scopes
             .iter()
             .map(|scope| scope.as_str())
             .collect::<Vec<_>>()
     });
+    send_hello_with_scopes(
+        socket,
+        request,
+        params,
+        protocol,
+        connection_id,
+        issue_device_token,
+        &scopes,
+    )
+    .await;
+}
+
+pub(crate) async fn send_hello_with_scopes(
+    socket: &mut TestSocket,
+    request: &RequestFrame,
+    params: &ConnectParams,
+    protocol: u64,
+    connection_id: &str,
+    issue_device_token: bool,
+    scopes: &[&str],
+) {
+    let role = params
+        .role
+        .as_ref()
+        .map_or("operator", |role| role.as_str());
     let auth = if issue_device_token {
         serde_json::json!({
             "role": role,
@@ -311,6 +332,22 @@ pub(crate) async fn send_health(socket: &mut TestSocket, request: &RequestFrame)
     .await;
 }
 
+pub(crate) async fn send_health_failure(socket: &mut TestSocket, request: &RequestFrame) {
+    send_json(
+        socket,
+        serde_json::json!({
+            "type": "res",
+            "id": request.id().as_str(),
+            "ok": false,
+            "error": {
+                "code": "UNAVAILABLE",
+                "message": "raw health failure must not render"
+            }
+        }),
+    )
+    .await;
+}
+
 pub(crate) async fn send_connect_error(
     socket: &mut TestSocket,
     request: &RequestFrame,
@@ -335,6 +372,25 @@ pub(crate) async fn send_connect_error(
 pub(crate) async fn wait_for_close(socket: &mut TestSocket) {
     loop {
         match socket.read_frame().await {
+            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => {
+                let _ = socket
+                    .write_frame(Frame::close(1000, b"server acknowledgement"))
+                    .await;
+                let _ = socket.flush().await;
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+pub(crate) async fn count_text_until_close(socket: &mut TestSocket, text_frames: Arc<AtomicUsize>) {
+    loop {
+        match socket.read_frame().await {
+            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {
+                text_frames.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => {
                 let _ = socket
                     .write_frame(Frame::close(1000, b"server acknowledgement"))
