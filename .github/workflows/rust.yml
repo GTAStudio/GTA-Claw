@@ -8,6 +8,7 @@ on:
       - ".cargo/**"
       - ".gitattributes"
       - ".github/fixtures/cargo-audit/**"
+      - ".github/fixtures/security-tools/**"
       - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
@@ -24,6 +25,7 @@ on:
       - ".cargo/**"
       - ".gitattributes"
       - ".github/fixtures/cargo-audit/**"
+      - ".github/fixtures/security-tools/**"
       - ".github/workflows/macos-packaging.yml"
       - ".github/workflows/rust.yml"
       - "apps/**"
@@ -204,16 +206,22 @@ jobs:
           persist-credentials: false
 
       - name: Bootstrap verified Rust security tools
-        shell: bash
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
         env:
-          ACTIONLINT_ARCHIVE_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
-          ACTIONLINT_VERSION: 1.7.7
-          CARGO_AUDIT_CRATE_SHA256: 700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a
-          CARGO_AUDIT_VERSION: 0.22.2
-          CARGO_DENY_ARCHIVE_SHA256: 70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f
-          CARGO_DENY_VERSION: 0.19.8
+          BASH_ENV: ${{ github.workspace }}/.github/fixtures/security-tools/bash-env-poison.sh
+          BASH_ENV_POISON_MARKER: ${{ runner.temp }}/bootstrap-bash-env-poisoned
+          PATH: ${{ github.workspace }}/.github/fixtures/security-tools/shadow-bin
+          SHADOW_TOOL_POISON_MARKER: ${{ runner.temp }}/bootstrap-shadow-tool-poisoned
         run: |
           set -euo pipefail
+          test ! -e "${{ runner.temp }}/bootstrap-bash-env-poisoned"
+          test ! -e "${{ runner.temp }}/bootstrap-shadow-tool-poisoned"
+          readonly ACTIONLINT_ARCHIVE_SHA256="023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+          readonly ACTIONLINT_VERSION="1.7.7"
+          readonly CARGO_AUDIT_CRATE_SHA256="700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a"
+          readonly CARGO_AUDIT_VERSION="0.22.2"
+          readonly CARGO_DENY_ARCHIVE_SHA256="70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f"
+          readonly CARGO_DENY_VERSION="0.19.8"
           original_home="$(
             /usr/bin/getent passwd "$(/usr/bin/id -u)" |
               /usr/bin/cut -d: -f6
@@ -238,16 +246,16 @@ jobs:
           )"
           test -x "$cargo_bin"
           test -x "$rustc_bin"
-          tool_root="$RUNNER_TEMP/verified-rust-security-tools"
-          poison_marker="$RUNNER_TEMP/poisoned-cargo-audit-built"
-          shadow_marker="$RUNNER_TEMP/poisoned-cargo-audit-executed"
-          rm -rf -- "$tool_root"
-          rm -f -- "$poison_marker" "$shadow_marker"
-          mkdir -p "$tool_root/downloads" "$tool_root/src"
+          tool_root="${{ runner.temp }}/verified-rust-security-tools"
+          poison_marker="${{ runner.temp }}/poisoned-cargo-audit-built"
+          shadow_marker="${{ runner.temp }}/poisoned-cargo-audit-executed"
+          /usr/bin/rm -rf -- "$tool_root"
+          /usr/bin/rm -f -- "$poison_marker" "$shadow_marker"
+          /usr/bin/mkdir -p "$tool_root/downloads" "$tool_root/src"
 
           poison_source="$original_home/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cargo-audit-${CARGO_AUDIT_VERSION}"
-          mkdir -p "$poison_source/src" "$original_home/.cargo/bin"
-          cat >"$poison_source/Cargo.toml" <<'EOF'
+          /usr/bin/mkdir -p "$poison_source/src" "$original_home/.cargo/bin"
+          /usr/bin/cat >"$poison_source/Cargo.toml" <<'EOF'
           [package]
           name = "cargo-audit"
           version = "0.22.2"
@@ -258,26 +266,26 @@ jobs:
           name = "cargo-audit"
           path = "src/main.rs"
           EOF
-          cat >"$poison_source/build.rs" <<'EOF'
+          /usr/bin/cat >"$poison_source/build.rs" <<'EOF'
           fn main() {
               std::fs::write(std::env::var("POISON_MARKER").unwrap(), b"built").unwrap();
           }
           EOF
-          cat >"$poison_source/src/main.rs" <<'EOF'
+          /usr/bin/cat >"$poison_source/src/main.rs" <<'EOF'
           fn main() {
               println!("cargo-audit-audit 0.22.2");
           }
           EOF
-          touch "$poison_source/.cargo-ok"
-          printf '{"files":{},"package":"%s"}\n' "$CARGO_AUDIT_CRATE_SHA256" \
+          /usr/bin/touch "$poison_source/.cargo-ok"
+          /usr/bin/printf '{"files":{},"package":"%s"}\n' "$CARGO_AUDIT_CRATE_SHA256" \
             >"$poison_source/.cargo-checksum.json"
-          cat >"$original_home/.cargo/bin/cargo-audit" <<'EOF'
+          /usr/bin/cat >"$original_home/.cargo/bin/cargo-audit" <<'EOF'
           #!/usr/bin/env sh
           printf 'executed\n' >"${POISON_SHADOW_MARKER:?}"
           echo "cargo-audit-audit 0.22.2"
           exit 0
           EOF
-          chmod +x "$original_home/.cargo/bin/cargo-audit"
+          /usr/bin/chmod +x "$original_home/.cargo/bin/cargo-audit"
           export POISON_SHADOW_MARKER="$shadow_marker"
 
           audit_archive="$tool_root/downloads/cargo-audit-${CARGO_AUDIT_VERSION}.crate"
@@ -285,9 +293,9 @@ jobs:
             --proto '=https' --tlsv1.2 \
             "https://static.crates.io/crates/cargo-audit/cargo-audit-${CARGO_AUDIT_VERSION}.crate" \
             --output "$audit_archive"
-          printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$audit_archive" |
-            sha256sum --check -
-          tar --extract --gzip --file "$audit_archive" --directory "$tool_root/src"
+          /usr/bin/printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$audit_archive" |
+            /usr/bin/sha256sum --check -
+          /usr/bin/tar --extract --gzip --file "$audit_archive" --directory "$tool_root/src"
           audit_source="$tool_root/src/cargo-audit-${CARGO_AUDIT_VERSION}"
 
           deny_archive="$tool_root/downloads/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
@@ -295,10 +303,10 @@ jobs:
             --proto '=https' --tlsv1.2 \
             "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
             --output "$deny_archive"
-          printf '%s  %s\n' "$CARGO_DENY_ARCHIVE_SHA256" "$deny_archive" |
-            sha256sum --check -
-          mkdir -p "$tool_root/cargo-deny"
-          tar --extract --gzip --file "$deny_archive" \
+          /usr/bin/printf '%s  %s\n' "$CARGO_DENY_ARCHIVE_SHA256" "$deny_archive" |
+            /usr/bin/sha256sum --check -
+          /usr/bin/mkdir -p "$tool_root/cargo-deny"
+          /usr/bin/tar --extract --gzip --file "$deny_archive" \
             --directory "$tool_root/cargo-deny" --strip-components=1
 
           actionlint_archive="$tool_root/downloads/actionlint-${ACTIONLINT_VERSION}-linux-x86_64.tar.gz"
@@ -306,13 +314,13 @@ jobs:
             --proto '=https' --tlsv1.2 \
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             --output "$actionlint_archive"
-          printf '%s  %s\n' "$ACTIONLINT_ARCHIVE_SHA256" "$actionlint_archive" |
-            sha256sum --check -
-          mkdir -p "$tool_root/actionlint"
-          tar --extract --gzip --file "$actionlint_archive" \
+          /usr/bin/printf '%s  %s\n' "$ACTIONLINT_ARCHIVE_SHA256" "$actionlint_archive" |
+            /usr/bin/sha256sum --check -
+          /usr/bin/mkdir -p "$tool_root/actionlint"
+          /usr/bin/tar --extract --gzip --file "$actionlint_archive" \
             --directory "$tool_root/actionlint" actionlint
 
-          mkdir -p "$tool_root/home" "$tool_root/cargo-home"
+          /usr/bin/mkdir -p "$tool_root/home" "$tool_root/cargo-home"
           cd "$tool_root"
           /usr/bin/env -i \
             HOME="$tool_root/home" \
@@ -327,8 +335,8 @@ jobs:
           audit_bin="$tool_root/cargo-audit/bin/cargo-audit"
           deny_bin="$tool_root/cargo-deny/cargo-deny"
           actionlint_bin="$tool_root/actionlint/actionlint"
-          mkdir -p "$tool_root/bin" "$tool_root/work"
-          cat >"$tool_root/bin/run-cargo-clean" <<EOF
+          /usr/bin/mkdir -p "$tool_root/bin" "$tool_root/work"
+          /usr/bin/cat >"$tool_root/bin/run-cargo-clean" <<EOF
           #!/bin/bash
           set -euo pipefail
           cd "$tool_root/work"
@@ -342,7 +350,7 @@ jobs:
             RUSTC="$rustc_bin" \
             "$cargo_bin" "\$@"
           EOF
-          cat >"$tool_root/bin/run-cargo-deny-clean" <<EOF
+          /usr/bin/cat >"$tool_root/bin/run-cargo-deny-clean" <<EOF
           #!/bin/bash
           set -euo pipefail
           cd "$tool_root/work"
@@ -356,12 +364,14 @@ jobs:
             RUSTC="$rustc_bin" \
             "$deny_bin" "\$@"
           EOF
-          chmod +x "$tool_root/bin/run-cargo-clean" "$tool_root/bin/run-cargo-deny-clean"
+          /usr/bin/chmod +x "$tool_root/bin/run-cargo-clean" "$tool_root/bin/run-cargo-deny-clean"
           test ! -e "$poison_marker"
           test ! -e "$shadow_marker"
           test "$("$audit_bin" audit --version)" = "cargo-audit-audit ${CARGO_AUDIT_VERSION}"
           test "$("$deny_bin" --version)" = "cargo-deny ${CARGO_DENY_VERSION}"
           test "$("$actionlint_bin" -version | /usr/bin/head -n 1)" = "$ACTIONLINT_VERSION"
+          test ! -e "${{ runner.temp }}/bootstrap-bash-env-poisoned"
+          test ! -e "${{ runner.temp }}/bootstrap-shadow-tool-poisoned"
 
       - name: Audit root lockfile
         run: >-

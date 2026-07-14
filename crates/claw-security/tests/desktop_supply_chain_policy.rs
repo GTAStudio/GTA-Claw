@@ -10,17 +10,8 @@ use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
-const CARGO_AUDIT_VERSION: &str = "0.22.2";
-const CARGO_AUDIT_CRATE_SHA256: &str =
-    "700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a";
-const CARGO_DENY_VERSION: &str = "0.19.8";
-const CARGO_DENY_ARCHIVE_SHA256: &str =
-    "70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f";
 const BOOTSTRAP_SCRIPT_SHA256: &str =
-    "abcdc7825442e5223f9c2fa0549d59996e889bce37080e384dd87d8d5d415c96";
-const ACTIONLINT_VERSION: &str = "1.7.7";
-const ACTIONLINT_ARCHIVE_SHA256: &str =
-    "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757";
+    "b4c11b68cb16c11558ca086bf8085a3ddaa294eca6cbab205e70d3dc8be9325d";
 const AUDIT_EXIT_SCRIPT_SHA256: &str =
     "285cf03a038395829455b55d4fc62ab4f9384be691dc48313e4ef482489e878f";
 const DENY_FIXTURE_SCRIPT_SHA256: &str =
@@ -370,6 +361,7 @@ fn validate_workflow_paths(workflow: &YamlValue, errors: &mut Vec<String>) {
         ".cargo/**",
         ".gitattributes",
         ".github/fixtures/cargo-audit/**",
+        ".github/fixtures/security-tools/**",
         ".github/workflows/macos-packaging.yml",
         ".github/workflows/rust.yml",
         "apps/**",
@@ -568,33 +560,32 @@ fn validate_supply_chain_job(workflow: &YamlValue, errors: &mut Vec<String>) {
             &["name", "shell", "env", "run"],
             errors,
         );
-        if yaml_string(yaml_get(step, "shell")) != Some("bash") {
-            errors.push("verified tool bootstrap shell must be bash".to_owned());
+        if yaml_string(yaml_get(step, "shell"))
+            != Some(
+                "/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}",
+            )
+        {
+            errors.push(
+                "verified tool bootstrap shell must clear the startup environment".to_owned(),
+            );
         }
         let expected_env = BTreeMap::from([
             (
-                "ACTIONLINT_ARCHIVE_SHA256".to_owned(),
-                ACTIONLINT_ARCHIVE_SHA256.to_owned(),
+                "BASH_ENV".to_owned(),
+                "${{ github.workspace }}/.github/fixtures/security-tools/bash-env-poison.sh"
+                    .to_owned(),
             ),
             (
-                "ACTIONLINT_VERSION".to_owned(),
-                ACTIONLINT_VERSION.to_owned(),
+                "BASH_ENV_POISON_MARKER".to_owned(),
+                "${{ runner.temp }}/bootstrap-bash-env-poisoned".to_owned(),
             ),
             (
-                "CARGO_AUDIT_CRATE_SHA256".to_owned(),
-                CARGO_AUDIT_CRATE_SHA256.to_owned(),
+                "PATH".to_owned(),
+                "${{ github.workspace }}/.github/fixtures/security-tools/shadow-bin".to_owned(),
             ),
             (
-                "CARGO_AUDIT_VERSION".to_owned(),
-                CARGO_AUDIT_VERSION.to_owned(),
-            ),
-            (
-                "CARGO_DENY_ARCHIVE_SHA256".to_owned(),
-                CARGO_DENY_ARCHIVE_SHA256.to_owned(),
-            ),
-            (
-                "CARGO_DENY_VERSION".to_owned(),
-                CARGO_DENY_VERSION.to_owned(),
+                "SHADOW_TOOL_POISON_MARKER".to_owned(),
+                "${{ runner.temp }}/bootstrap-shadow-tool-poisoned".to_owned(),
             ),
         ]);
         if yaml_string_map(yaml_get(step, "env")) != Some(expected_env) {
@@ -1459,6 +1450,64 @@ fn lock_packages(lock: &TomlValue) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn collect_named_toml_paths(
+    value: &TomlValue,
+    current: &mut Vec<String>,
+    names: &[&str],
+    paths: &mut BTreeSet<String>,
+) {
+    match value {
+        TomlValue::Table(table) => {
+            for (key, value) in table {
+                current.push(key.clone());
+                if names.contains(&key.as_str()) {
+                    paths.insert(current.join("."));
+                }
+                collect_named_toml_paths(value, current, names, paths);
+                current.pop();
+            }
+        }
+        TomlValue::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                current.push(format!("[{index}]"));
+                collect_named_toml_paths(value, current, names, paths);
+                current.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_slint_package_aliases(
+    value: &TomlValue,
+    current: &mut Vec<String>,
+    paths: &mut BTreeSet<String>,
+) {
+    match value {
+        TomlValue::Table(table) => {
+            if matches!(
+                table.get("package").and_then(TomlValue::as_str),
+                Some("slint" | "slint-build")
+            ) {
+                paths.insert(current.join("."));
+            }
+            for (key, value) in table {
+                current.push(key.clone());
+                collect_slint_package_aliases(value, current, paths);
+                current.pop();
+            }
+        }
+        TomlValue::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                current.push(format!("[{index}]"));
+                collect_slint_package_aliases(value, current, paths);
+                current.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_dependency_graph(
     desktop_manifest: &TomlValue,
     app_manifest: &TomlValue,
@@ -1466,14 +1515,119 @@ fn validate_dependency_graph(
     root_lock: &TomlValue,
 ) -> Vec<String> {
     let mut errors = Vec::new();
-    if desktop_manifest.get("patch").is_some() {
-        errors.push("desktop must not patch registry sources".to_owned());
+    if desktop_manifest.get("patch").is_some() || desktop_manifest.get("replace").is_some() {
+        errors.push("desktop must not patch or replace registry sources".to_owned());
+    }
+    let workspace_dependencies = desktop_manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(TomlValue::as_table);
+    if workspace_dependencies.is_none_or(|dependencies| {
+        toml_keys(dependencies) != expected_set(&["claw-application", "claw-platform"])
+    }) {
+        errors.push("desktop workspace dependency keys changed".to_owned());
+    }
+    for (name, path) in [
+        ("claw-application", "../crates/claw-application"),
+        ("claw-platform", "../crates/claw-platform"),
+    ] {
+        let dependency = workspace_dependencies
+            .and_then(|dependencies| dependencies.get(name))
+            .and_then(TomlValue::as_table);
+        if dependency.is_none_or(|dependency| {
+            toml_keys(dependency) != expected_set(&["path", "version"])
+                || dependency.get("path").and_then(TomlValue::as_str) != Some(path)
+                || dependency.get("version").and_then(TomlValue::as_str) != Some("0.1.0")
+        }) {
+            errors.push(format!(
+                "desktop workspace dependency policy changed: {name}"
+            ));
+        }
+    }
+    let mut workspace_slint_paths = BTreeSet::new();
+    collect_named_toml_paths(
+        desktop_manifest,
+        &mut Vec::new(),
+        &["slint", "slint-build"],
+        &mut workspace_slint_paths,
+    );
+    let mut workspace_aliases = BTreeSet::new();
+    collect_slint_package_aliases(desktop_manifest, &mut Vec::new(), &mut workspace_aliases);
+    if !workspace_slint_paths.is_empty() || !workspace_aliases.is_empty() {
+        errors.push(format!(
+            "desktop workspace contains unexpected Slint declarations: keys={workspace_slint_paths:?}, aliases={workspace_aliases:?}"
+        ));
+    }
+
+    let target_tables = app_manifest.get("target").and_then(TomlValue::as_table);
+    let target_name = r#"cfg(any(target_os = "windows", target_os = "macos"))"#;
+    if target_tables.is_none_or(|targets| toml_keys(targets) != expected_set(&[target_name])) {
+        errors.push("desktop target table schema changed".to_owned());
+    }
+    let target = target_tables
+        .and_then(|target| target.get(target_name))
+        .and_then(TomlValue::as_table);
+    if target.is_none_or(|target| {
+        toml_keys(target) != expected_set(&["build-dependencies", "dependencies"])
+    }) {
+        errors.push("desktop target dependency table schema changed".to_owned());
+    }
+    let dependencies = target
+        .and_then(|target| target.get("dependencies"))
+        .and_then(TomlValue::as_table);
+    if dependencies.is_none_or(|dependencies| {
+        toml_keys(dependencies) != expected_set(&["claw-application", "claw-platform", "slint"])
+    }) {
+        errors.push("desktop target dependency keys changed".to_owned());
+    }
+    let build_dependencies = target
+        .and_then(|target| target.get("build-dependencies"))
+        .and_then(TomlValue::as_table);
+    if build_dependencies
+        .is_none_or(|dependencies| toml_keys(dependencies) != expected_set(&["slint-build"]))
+    {
+        errors.push("desktop target build-dependency keys changed".to_owned());
+    }
+
+    let slint_build = build_dependencies
+        .and_then(|dependencies| dependencies.get("slint-build"))
+        .and_then(TomlValue::as_table);
+    if slint_build.is_none_or(|dependency| {
+        toml_keys(dependency) != expected_set(&["version"])
+            || dependency.get("version").and_then(TomlValue::as_str) != Some("=1.17.1")
+    }) {
+        errors.push("desktop slint-build dependency policy changed".to_owned());
+    }
+
+    let mut slint_paths = BTreeSet::new();
+    collect_named_toml_paths(
+        app_manifest,
+        &mut Vec::new(),
+        &["slint", "slint-build"],
+        &mut slint_paths,
+    );
+    let expected_paths = BTreeSet::from([
+        format!("target.{target_name}.dependencies.slint"),
+        format!("target.{target_name}.build-dependencies.slint-build"),
+    ]);
+    if slint_paths != expected_paths {
+        errors.push(format!(
+            "desktop contains unexpected Slint declarations: {slint_paths:?}"
+        ));
+    }
+    let mut aliases = BTreeSet::new();
+    collect_slint_package_aliases(app_manifest, &mut Vec::new(), &mut aliases);
+    if !aliases.is_empty() {
+        errors.push(format!(
+            "desktop contains unexpected Slint package aliases: {aliases:?}"
+        ));
     }
 
     let target = app_manifest
         .get("target")
         .and_then(TomlValue::as_table)
-        .and_then(|target| target.get(r#"cfg(any(target_os = "windows", target_os = "macos"))"#))
+        .and_then(|target| target.get(target_name))
         .and_then(TomlValue::as_table);
     let slint = target
         .and_then(|target| target.get("dependencies"))
@@ -1556,8 +1710,9 @@ fn mutate_negative_case(
     root_deny: &mut TomlValue,
     deny: &mut TomlValue,
     audit: &mut TomlValue,
-    app_manifest: &mut TomlValue,
+    manifests: (&mut TomlValue, &mut TomlValue),
 ) {
+    let (desktop_manifest, app_manifest) = manifests;
     match mutation {
         "root-audit-continue-on-error" => {
             yaml_mapping_mut(
@@ -1728,6 +1883,32 @@ fn mutate_negative_case(
                 .insert(
                     yaml_key("RUSTC_WRAPPER"),
                     YamlValue::String("/tmp/fake-wrapper".to_owned()),
+                );
+        }
+        "bootstrap-inherited-shell" => {
+            yaml_mapping_mut(
+                step_by_name_mut(
+                    workflow,
+                    "supply-chain",
+                    "Bootstrap verified Rust security tools",
+                )
+                .expect("bootstrap tools step"),
+            )
+            .expect("bootstrap tools mapping")
+            .insert(yaml_key("shell"), YamlValue::String("bash".to_owned()));
+        }
+        "bootstrap-shadow-path-change" => {
+            let bootstrap = step_by_name_mut(
+                workflow,
+                "supply-chain",
+                "Bootstrap verified Rust security tools",
+            )
+            .expect("bootstrap tools step");
+            yaml_mapping_mut(yaml_get_mut(bootstrap, "env").expect("bootstrap environment"))
+                .expect("bootstrap environment mapping")
+                .insert(
+                    yaml_key("PATH"),
+                    YamlValue::String("/tmp/shadow".to_owned()),
                 );
         }
         "policy-step-runner-env" => {
@@ -2042,6 +2223,108 @@ fn mutate_negative_case(
                 .expect("desktop Slint dependency")
                 .insert("version".to_owned(), TomlValue::String("*".to_owned()));
         }
+        "slint-build-caret-version" => {
+            app_manifest
+                .get_mut("target")
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| {
+                    target.get_mut(r#"cfg(any(target_os = "windows", target_os = "macos"))"#)
+                })
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| target.get_mut("build-dependencies"))
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|dependencies| dependencies.get_mut("slint-build"))
+                .and_then(TomlValue::as_table_mut)
+                .expect("desktop slint-build dependency")
+                .insert("version".to_owned(), TomlValue::String("1.17.1".to_owned()));
+        }
+        "duplicate-target-slint-widening" => {
+            let mut slint = toml::map::Map::new();
+            slint.insert(
+                "version".to_owned(),
+                TomlValue::String("=1.17.1".to_owned()),
+            );
+            slint.insert("default-features".to_owned(), TomlValue::Boolean(true));
+            slint.insert(
+                "features".to_owned(),
+                TomlValue::Array(vec![TomlValue::String("backend-winit".to_owned())]),
+            );
+            slint.insert(
+                "registry".to_owned(),
+                TomlValue::String("alternate".to_owned()),
+            );
+            let dependencies =
+                toml::map::Map::from_iter([("slint".to_owned(), TomlValue::Table(slint))]);
+            let duplicate_target = toml::map::Map::from_iter([(
+                "dependencies".to_owned(),
+                TomlValue::Table(dependencies),
+            )]);
+            app_manifest
+                .get_mut("target")
+                .and_then(TomlValue::as_table_mut)
+                .expect("desktop target tables")
+                .insert(
+                    r#"cfg(target_os = "windows")"#.to_owned(),
+                    TomlValue::Table(duplicate_target),
+                );
+        }
+        "renamed-slint-package" => {
+            app_manifest
+                .get_mut("target")
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| {
+                    target.get_mut(r#"cfg(any(target_os = "windows", target_os = "macos"))"#)
+                })
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| target.get_mut("dependencies"))
+                .and_then(TomlValue::as_table_mut)
+                .expect("desktop target dependencies")
+                .insert(
+                    "claw-application".to_owned(),
+                    TomlValue::Table(toml::map::Map::from_iter([
+                        ("package".to_owned(), TomlValue::String("slint".to_owned())),
+                        (
+                            "version".to_owned(),
+                            TomlValue::String("=1.17.1".to_owned()),
+                        ),
+                        ("default-features".to_owned(), TomlValue::Boolean(true)),
+                    ])),
+                );
+        }
+        "workspace-renamed-slint-package" => {
+            desktop_manifest
+                .get_mut("workspace")
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|workspace| workspace.get_mut("dependencies"))
+                .and_then(TomlValue::as_table_mut)
+                .expect("desktop workspace dependencies")
+                .insert(
+                    "claw-application".to_owned(),
+                    TomlValue::Table(toml::map::Map::from_iter([
+                        ("package".to_owned(), TomlValue::String("slint".to_owned())),
+                        (
+                            "version".to_owned(),
+                            TomlValue::String("=1.17.1".to_owned()),
+                        ),
+                        ("default-features".to_owned(), TomlValue::Boolean(true)),
+                    ])),
+                );
+        }
+        "desktop-replace-slint-build" => {
+            desktop_manifest
+                .as_table_mut()
+                .expect("desktop manifest table")
+                .insert(
+                    "replace".to_owned(),
+                    TomlValue::Table(toml::map::Map::from_iter([(
+                        "slint-build:1.17.1".to_owned(),
+                        TomlValue::Table(toml::map::Map::from_iter([(
+                            "path".to_owned(),
+                            TomlValue::String("vendor/slint-build".to_owned()),
+                        )])),
+                    )])),
+                );
+        }
         other => panic!("unknown policy mutation: {other}"),
     }
 }
@@ -2109,7 +2392,7 @@ fn negative_policy_fixtures_reject_bypasses() {
         .get("case")
         .and_then(TomlValue::as_array)
         .expect("negative policy cases");
-    assert_eq!(cases.len(), 39, "every bypass category must remain covered");
+    assert_eq!(cases.len(), 46, "every bypass category must remain covered");
     let require_actionlint = std::env::var("REQUIRE_ACTIONLINT").as_deref() == Ok("true");
     let actionlint = require_actionlint.then(|| {
         let path = PathBuf::from(
@@ -2151,6 +2434,7 @@ fn negative_policy_fixtures_reject_bypasses() {
         let mut root_deny = baseline_root_deny.clone();
         let mut deny = baseline_deny.clone();
         let mut audit = baseline_audit.clone();
+        let mut desktop_manifest = desktop_manifest.clone();
         let mut app_manifest = baseline_app_manifest.clone();
         mutate_negative_case(
             mutation,
@@ -2159,7 +2443,7 @@ fn negative_policy_fixtures_reject_bypasses() {
             &mut root_deny,
             &mut deny,
             &mut audit,
-            &mut app_manifest,
+            (&mut desktop_manifest, &mut app_manifest),
         );
         if require_actionlint {
             actionlint_paths.extend(write_actionlint_case(
@@ -2177,6 +2461,7 @@ fn negative_policy_fixtures_reject_bypasses() {
             root_deny,
             deny,
             audit,
+            desktop_manifest,
             app_manifest,
         ));
     }
@@ -2196,8 +2481,17 @@ fn negative_policy_fixtures_reject_bypasses() {
         fs::remove_dir_all(&actionlint_root).expect("remove actionlint fixtures");
     }
 
-    for (name, expected, workflow, macos_workflow, root_deny, deny, audit, app_manifest) in
-        mutated_cases
+    for (
+        name,
+        expected,
+        workflow,
+        macos_workflow,
+        root_deny,
+        deny,
+        audit,
+        desktop_manifest,
+        app_manifest,
+    ) in mutated_cases
     {
         let mut violations = validate_rust_workflow(&workflow);
         violations.extend(validate_macos_workflow(&macos_workflow));

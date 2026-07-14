@@ -84,6 +84,16 @@ mutation = "bootstrap-wrapper-env"
 expected = "verified tool bootstrap environment changed"
 
 [[case]]
+name = "bootstrap-inherited-shell"
+mutation = "bootstrap-inherited-shell"
+expected = "verified tool bootstrap shell must clear the startup environment"
+
+[[case]]
+name = "bootstrap-shadow-path-change"
+mutation = "bootstrap-shadow-path-change"
+expected = "verified tool bootstrap environment changed"
+
+[[case]]
 name = "policy-step-runner-env"
 mutation = "policy-step-runner-env"
 expected = "Validate supply-chain policy step schema changed"
@@ -192,3 +202,28 @@ expected = "root deny bans policy changed"
 name = "slint-wildcard-version"
 mutation = "slint-wildcard-version"
 expected = "desktop Slint dependency policy changed"
+
+[[case]]
+name = "slint-build-caret-version"
+mutation = "slint-build-caret-version"
+expected = "desktop slint-build dependency policy changed"
+
+[[case]]
+name = "duplicate-target-slint-widening"
+mutation = "duplicate-target-slint-widening"
+expected = "desktop target table schema changed"
+
+[[case]]
+name = "renamed-slint-package"
+mutation = "renamed-slint-package"
+expected = "desktop contains unexpected Slint package aliases"
+
+[[case]]
+name = "workspace-renamed-slint-package"
+mutation = "workspace-renamed-slint-package"
+expected = "desktop workspace dependency policy changed: claw-application"
+
+[[case]]
+name = "desktop-replace-slint-build"
+mutation = "desktop-replace-slint-build"
+expected = "desktop must not patch or replace registry sources"
