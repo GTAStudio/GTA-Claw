@@ -163,8 +163,11 @@ name = "claw-sqlite-file-control"
 version = "0.1.0"
 dependencies = [
  "libsqlite3-sys",
+ "rustix",
  "sqlx",
+ "tokio",
  "windows-sys 0.61.2",
+ "xattr",
 ]
 
 [[package]]

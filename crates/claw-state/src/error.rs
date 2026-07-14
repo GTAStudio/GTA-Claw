@@ -204,6 +204,13 @@ pub enum StateError {
         /// Stable rejection reason.
         reason: &'static str,
     },
+    /// A bounded store lifecycle operation exceeded its configured deadline.
+    OperationTimedOut {
+        /// Bounded operation name.
+        operation: &'static str,
+        /// Configured deadline in milliseconds.
+        timeout_ms: u64,
+    },
 }
 
 impl Display for StateError {
@@ -302,6 +309,13 @@ impl Display for StateError {
             Self::InvalidValue { field, reason } => {
                 write!(formatter, "invalid {field}: {reason}")
             }
+            Self::OperationTimedOut {
+                operation,
+                timeout_ms,
+            } => write!(
+                formatter,
+                "{operation} exceeded its {timeout_ms} ms deadline"
+            ),
         }
     }
 }

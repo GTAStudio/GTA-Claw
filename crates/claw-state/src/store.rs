@@ -23,7 +23,10 @@ const SNAPSHOT_PROVENANCE_OWNER: &str = "gta-claw-standalone-snapshot-v1";
 const UNIX_LOCK_IDENTITY_XATTR: &str = "user.gta-claw.writer-lock-path";
 #[cfg(unix)]
 const UNIX_BACKUP_SEAL_XATTR: &str = "user.gta-claw.backup-seal-id";
+#[cfg(unix)]
+const UNIX_SIDECAR_GENERATION_XATTR: &str = "user.gta-claw.sidecar-generation";
 const BACKUP_SEAL_MAGIC: &str = "gta-claw-backup-seal-v1";
+const MAX_CONFIGURED_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 static FAIL_AFTER_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
@@ -107,6 +110,7 @@ pub struct StoreConfig {
     max_connections: u32,
     busy_timeout: Duration,
     acquire_timeout: Duration,
+    open_timeout: Duration,
     close_timeout: Duration,
     synchronous: SynchronousPolicy,
 }
@@ -120,6 +124,7 @@ impl StoreConfig {
             max_connections: 1,
             busy_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
+            open_timeout: Duration::from_secs(30),
             close_timeout: Duration::from_millis(1_500),
             synchronous: SynchronousPolicy::Full,
         }
@@ -143,6 +148,13 @@ impl StoreConfig {
     #[must_use]
     pub const fn with_acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
         self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Sets one overall deadline for inspection, connection, and migration.
+    #[must_use]
+    pub const fn with_open_timeout(mut self, open_timeout: Duration) -> Self {
+        self.open_timeout = open_timeout;
         self
     }
 
@@ -243,6 +255,7 @@ pub struct StateStore {
     _process_identity: ProcessIdentityGuard,
     _database_file: File,
     max_connections: u32,
+    operation_timeout: Duration,
     close_timeout: Duration,
 }
 
@@ -268,6 +281,7 @@ impl OperationalIdentity<'_> {
                     self.lock_identity,
                 )
             })
+            .and_then(|()| validate_sqlite_sidecars(self.database_path, self.lock_identity))
     }
 }
 
@@ -278,6 +292,42 @@ static PROCESS_IDENTITIES: LazyLock<StdMutex<std::collections::HashSet<(u64, u64
 struct ProcessIdentityGuard {
     #[cfg(unix)]
     identity: Option<(u64, u64)>,
+}
+
+struct OpenDeadlineState {
+    deadline: std::time::Instant,
+    timeout_ms: u64,
+    cancelled: std::sync::atomic::AtomicBool,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl OpenDeadlineState {
+    fn permits_sqlite_work(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
+            || (!self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+                && std::time::Instant::now() < self.deadline)
+    }
+
+    fn timeout_error(&self) -> StateError {
+        StateError::OperationTimedOut {
+            operation: "state store open",
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+async fn install_open_deadline_handler(
+    connection: &mut SqliteConnection,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
+) -> Result<(), StateError> {
+    if let Some(deadline_state) = deadline_state {
+        let mut handle = connection
+            .lock_handle()
+            .await
+            .map_err(|error| database("lock deadline-bound SQLite connection", error))?;
+        handle.set_progress_handler(1_000, move || deadline_state.permits_sqlite_work());
+    }
+    Ok(())
 }
 
 impl Drop for ProcessIdentityGuard {
@@ -296,12 +346,75 @@ impl StateStore {
     /// Opens an explicit on-disk database, acquires its writer lock, and migrates forward.
     pub async fn open(config: StoreConfig) -> Result<Self, StateError> {
         validate_config(&config)?;
+        let timeout_ms = u64::try_from(config.open_timeout.as_millis()).map_err(|_| {
+            StateError::InvalidValue {
+                field: "open timeout",
+                reason: "must fit in milliseconds",
+            }
+        })?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(config.open_timeout)
+            .ok_or(StateError::InvalidValue {
+                field: "open timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+        let deadline_state = Arc::new(OpenDeadlineState {
+            deadline: deadline.into_std(),
+            timeout_ms,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let task_state = Arc::clone(&deadline_state);
+        let mut task = tokio::spawn(async move { Self::open_inner(config, task_state).await });
+        tokio::select! {
+            result = &mut task => {
+                let result = result.map_err(|error| StateError::InvalidValue {
+                    field: "state store open task",
+                    reason: if error.is_cancelled() {
+                        "was cancelled unexpectedly"
+                    } else {
+                        "failed unexpectedly"
+                    },
+                })?;
+                if result.is_ok() {
+                    deadline_state
+                        .finished
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                result
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                deadline_state
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                task.abort();
+                let _ = task.await;
+                Err(StateError::OperationTimedOut {
+                    operation: "state store open",
+                    timeout_ms,
+                })
+            }
+        }
+    }
+
+    async fn open_inner(
+        config: StoreConfig,
+        deadline_state: Arc<OpenDeadlineState>,
+    ) -> Result<Self, StateError> {
         let path = resolve_database_path(&config.path)?;
         let creation_lock = acquire_creation_lock(&path)?;
         let database_file = open_database_file(&path)?;
+        validate_private_database_file(&path, &database_file)?;
         verify_path_identity(&path, &database_file)?;
         reject_hard_link(&path, &database_file)?;
-        let preflight_state = inspect_database(&path, &database_file, false).await?;
+        validate_preflight_sidecars(&path, &database_file)?;
+        let preflight_state = inspect_database(
+            &path,
+            &database_file,
+            false,
+            Some(Arc::clone(&deadline_state)),
+        )
+        .await?;
         prepare_windows_database_identity(&path)?;
         let allow_identity_initialization = (creation_lock.is_some()
             && matches!(preflight_state, InspectedDatabase::Fresh))
@@ -316,7 +429,13 @@ impl StateStore {
             capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?;
         let owner = writer_owner()?;
         verify_path_identity(&path, &database_file)?;
-        let locked_state = inspect_database(&path, &database_file, false).await?;
+        let locked_state = inspect_database(
+            &path,
+            &database_file,
+            false,
+            Some(Arc::clone(&deadline_state)),
+        )
+        .await?;
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
@@ -338,6 +457,7 @@ impl StateStore {
                 .map_err(|error| file_error("clone writer lock handle", &lock_path, error))?,
         );
         let verified_lock_identity = lock_identity.clone();
+        let connect_deadline_state = Arc::clone(&deadline_state);
         let acquire_path = verified_path.clone();
         let acquire_file = Arc::clone(&verified_file);
         let acquire_lock_path = verified_lock_path.clone();
@@ -353,7 +473,14 @@ impl StateStore {
                 let lock_path = verified_lock_path.clone();
                 let lock_file = Arc::clone(&verified_lock_file);
                 let lock_identity = verified_lock_identity.clone();
+                let deadline_state = Arc::clone(&connect_deadline_state);
                 Box::pin(async move {
+                    {
+                        let mut handle = connection.lock_handle().await?;
+                        handle.set_progress_handler(1_000, move || {
+                            deadline_state.permits_sqlite_work()
+                        });
+                    }
                     verify_path_identity(&path, &file)
                         .and_then(|()| verify_path_identity(&lock_path, &lock_file))
                         .and_then(|()| {
@@ -367,7 +494,18 @@ impl StateStore {
                         })
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                     verify_sqlite_connection_identity(connection).await?;
-                    install_store_commit_guard(connection, &lock_path, &lock_file).await
+                    initialize_connection_sidecars(connection).await?;
+                    secure_sqlite_sidecars(&path, lock_identity.as_deref())
+                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                    install_store_commit_guard(
+                        connection,
+                        &path,
+                        &file,
+                        &lock_path,
+                        &lock_file,
+                        lock_identity.as_deref(),
+                    )
+                    .await
                 })
             })
             .before_acquire(move |connection, _metadata| {
@@ -388,6 +526,7 @@ impl StateStore {
                                 lock_identity.as_deref(),
                             )
                         })
+                        .and_then(|()| validate_sqlite_sidecars(&path, lock_identity.as_deref()))
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                     verify_sqlite_connection_identity(connection).await?;
                     Ok(true)
@@ -399,6 +538,44 @@ impl StateStore {
         if let Err(error) = verify_path_identity(&path, &database_file) {
             pool.close().await;
             return Err(error);
+        }
+
+        async fn initialize_connection_sidecars(
+            connection: &mut SqliteConnection,
+        ) -> Result<(), sqlx::Error> {
+            let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                .fetch_one(&mut *connection)
+                .await?;
+            if !matches!(application_id, 0 | APPLICATION_ID) {
+                return Err(sqlx::Error::Protocol(
+                    "database application identity changed before sidecar initialization"
+                        .to_owned(),
+                ));
+            }
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            let result = async {
+                sqlx::query("PRAGMA application_id = 1")
+                    .execute(&mut *connection)
+                    .await?;
+                if application_id == APPLICATION_ID {
+                    sqlx::query("PRAGMA application_id = 1196704067")
+                        .execute(&mut *connection)
+                        .await?;
+                } else {
+                    sqlx::query("PRAGMA application_id = 0")
+                        .execute(&mut *connection)
+                        .await?;
+                }
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok::<(), sqlx::Error>(())
+            }
+            .await;
+            if result.is_err() {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            }
+            result
         }
 
         let mut recovered_writer = None;
@@ -430,6 +607,7 @@ impl StateStore {
             _process_identity: process_identity,
             _database_file: database_file,
             max_connections: config.max_connections,
+            operation_timeout: config.open_timeout,
             close_timeout: config.close_timeout,
         })
     }
@@ -507,8 +685,32 @@ impl StateStore {
         let requested_destination = destination.as_ref();
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
-        let expected_version = schema_version(&self.pool).await?;
-        backup_pool(&self.pool, &destination, expected_version).await
+        let timeout_ms = u64::try_from(self.operation_timeout.as_millis()).map_err(|_| {
+            StateError::InvalidValue {
+                field: "backup timeout",
+                reason: "must fit in milliseconds",
+            }
+        })?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.operation_timeout)
+            .ok_or(StateError::InvalidValue {
+                field: "backup timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+        let expected_version = tokio::time::timeout_at(deadline, schema_version(&self.pool))
+            .await
+            .map_err(|_| StateError::OperationTimedOut {
+                operation: "SQLite backup",
+                timeout_ms,
+            })??;
+        backup_pool(
+            &self.pool,
+            &destination,
+            expected_version,
+            deadline,
+            timeout_ms,
+        )
+        .await
     }
 
     /// Restores a locally sealed backup to a destination that does not yet exist.
@@ -519,7 +721,7 @@ impl StateStore {
         backup: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> Result<(), StateError> {
-        let backup = resolve_database_path(backup.as_ref())?;
+        let backup = resolve_snapshot_source_path(backup.as_ref())?;
         let backup_file = open_existing_file_no_follow(&backup)?;
         verify_path_identity(&backup, &backup_file)?;
         reject_hard_link(&backup, &backup_file)?;
@@ -541,27 +743,32 @@ impl StateStore {
             Ok(pinned) => pinned,
             Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
         };
-        if let Err(error) = validate_snapshot_marker_pinned(&pinned).await {
+        if let Err(error) = validate_snapshot_marker_pinned(&pinned, None).await {
+            drop(pinned);
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
         if let Err(error) = clear_backup_writer_lock(&pinned).await {
+            drop(pinned);
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = validate_backup_pinned(&pinned, None).await {
+        if let Err(error) = validate_backup_pinned(&pinned, None, None).await {
+            drop(pinned);
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
         if let Err(error) = initialize_restored_store_identity(&temporary, &pinned.file) {
+            drop(pinned);
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
         if let Err(error) = pinned.sync() {
+            drop(pinned);
             remove_snapshot_artifacts(&temporary)?;
             return Err(error);
         }
-        if let Err(error) = publish_snapshot(&pinned, &destination) {
+        if let Err(error) = publish_snapshot(pinned, &destination, None) {
             return Err(cleanup_failed_snapshot(&temporary, error));
         }
         Ok(())
@@ -892,28 +1099,54 @@ fn validate_config(config: &StoreConfig) -> Result<(), StateError> {
             reason: "must be valid Unicode",
         });
     }
+    if !path.is_absolute() {
+        return Err(StateError::InvalidPath {
+            path: path.clone(),
+            reason: "must be an absolute path inside a service-private directory",
+        });
+    }
     if config.max_connections == 0 || config.max_connections > 8 {
         return Err(StateError::InvalidValue {
             field: "maximum connections",
             reason: "must be between one and eight identity-bound connections",
         });
     }
-    if config.busy_timeout.is_zero() {
+    validate_duration("busy timeout", config.busy_timeout, MAX_CONFIGURED_TIMEOUT)?;
+    validate_duration(
+        "connection acquire timeout",
+        config.acquire_timeout,
+        MAX_CONFIGURED_TIMEOUT,
+    )?;
+    validate_duration("open timeout", config.open_timeout, MAX_CONFIGURED_TIMEOUT)?;
+    validate_duration(
+        "close timeout",
+        config.close_timeout,
+        Duration::from_millis(1_500),
+    )?;
+    Ok(())
+}
+
+fn validate_duration(
+    field: &'static str,
+    duration: Duration,
+    maximum: Duration,
+) -> Result<(), StateError> {
+    if duration.is_zero() {
         return Err(StateError::InvalidValue {
-            field: "busy timeout",
+            field,
             reason: "must be greater than zero",
         });
     }
-    if config.acquire_timeout.is_zero() {
+    if duration > maximum {
         return Err(StateError::InvalidValue {
-            field: "connection acquire timeout",
-            reason: "must be greater than zero",
+            field,
+            reason: "exceeds the supported safe upper bound",
         });
     }
-    if config.close_timeout.is_zero() {
+    if !duration.subsec_nanos().is_multiple_of(1_000_000) {
         return Err(StateError::InvalidValue {
-            field: "close timeout",
-            reason: "must be greater than zero",
+            field,
+            reason: "must use whole-millisecond precision",
         });
     }
     Ok(())
@@ -927,6 +1160,7 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
                 reason: "symbolic-link database paths are not supported",
             });
         }
+
         Ok(_) => {
             let file_name = path.file_name().ok_or_else(|| StateError::InvalidPath {
                 path: path.to_owned(),
@@ -938,6 +1172,7 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
                 .unwrap_or_else(|| Path::new("."));
             let canonical_parent = std::fs::canonicalize(parent)
                 .map_err(|error| file_error("canonicalize state directory", parent, error))?;
+            validate_state_directory(&canonical_parent)?;
             return Ok(canonical_parent.join(file_name));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -955,7 +1190,108 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
         .unwrap_or_else(|| Path::new("."));
     let canonical_parent = std::fs::canonicalize(parent)
         .map_err(|error| file_error("canonicalize state directory", parent, error))?;
+    validate_state_directory(&canonical_parent)?;
     Ok(canonical_parent.join(file_name))
+}
+
+fn resolve_snapshot_source_path(path: &Path) -> Result<PathBuf, StateError> {
+    if !path.is_absolute() {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "snapshot source must be an absolute path",
+        });
+    }
+    let file_name = path.file_name().ok_or_else(|| StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "snapshot source must include a file name",
+    })?;
+    let parent = path.parent().ok_or_else(|| StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "snapshot source must have a parent directory",
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|error| file_error("canonicalize snapshot source directory", parent, error))?;
+    validate_snapshot_source_directory(&canonical_parent)?;
+    Ok(canonical_parent.join(file_name))
+}
+
+#[cfg(unix)]
+fn validate_snapshot_source_directory(path: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| file_error("inspect snapshot source directory", path, error))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "snapshot source directory must be service-owned and not writable by others",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_snapshot_source_directory(path: &Path) -> Result<(), StateError> {
+    validate_state_directory(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_snapshot_source_directory(path: &Path) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "private snapshot source directories are unsupported",
+    })
+}
+
+#[cfg(unix)]
+fn validate_state_directory(path: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| file_error("inspect state directory security", path, error))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state directory must be owned by the service, mode 0700, and non-symlink",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_state_directory(path: &Path) -> Result<(), StateError> {
+    let file = open_windows_directory_no_follow(path)?;
+    if !claw_sqlite_file_control::windows_file_is_service_private(&file).map_err(|error| {
+        StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: match error.code() {
+                Some(_) => "state directory security descriptor could not be validated",
+                None => "state directory security descriptor could not be validated",
+            },
+        }
+    })? {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state directory grants write or delete access outside the service identity",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_state_directory(path: &Path) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "service-private state directories are unsupported on this platform",
+    })
 }
 
 #[cfg(unix)]
@@ -967,6 +1303,7 @@ fn open_database_file(path: &Path) -> Result<File, StateError> {
                 reason: "symbolic-link database paths are not supported",
             });
         }
+
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(file_error("inspect state database path", path, error)),
@@ -983,7 +1320,36 @@ fn open_database_file(path: &Path) -> Result<File, StateError> {
 
 #[cfg(windows)]
 fn open_database_file(path: &Path) -> Result<File, StateError> {
-    let file = open_windows_file_no_follow(path, true, true)?;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let exists = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StateError::InvalidPath {
+                path: path.to_owned(),
+                reason: "Windows reparse-point database paths are not supported",
+            });
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(file_error("inspect Windows database path", path, error)),
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    if exists {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| file_error("open Windows database atomically", path, error))?;
     reject_windows_reparse(
         path,
         &file
@@ -991,6 +1357,109 @@ fn open_database_file(path: &Path) -> Result<File, StateError> {
             .map_err(|error| file_error("inspect Windows database handle", path, error))?,
     )?;
     Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_private_database_file(path: &Path, file: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| file_error("inspect state database security", path, error))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state database must be service-owned, mode 0600, regular, and single-link",
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_private_database_file(path: &Path, file: &File) -> Result<(), StateError> {
+    if !claw_sqlite_file_control::windows_file_is_service_private(file).map_err(|_| {
+        StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state database security descriptor could not be validated",
+        }
+    })? {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state database grants write or delete access outside the service identity",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_private_database_file(path: &Path, _file: &File) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "private state database files are unsupported on this platform",
+    })
+}
+
+#[cfg(unix)]
+fn secure_private_snapshot_file(path: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let file = open_existing_file_no_follow_writable(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| file_error("secure private SQLite artifact", path, error))?;
+    validate_private_database_file(path, &file)
+}
+
+#[cfg(windows)]
+fn secure_private_snapshot_file(path: &Path) -> Result<(), StateError> {
+    let file = open_existing_file_no_follow_writable(path)?;
+    validate_private_database_file(path, &file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn secure_private_snapshot_file(path: &Path) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "private SQLite artifacts are unsupported on this platform",
+    })
+}
+
+#[cfg(unix)]
+fn validate_private_snapshot_file(path: &Path, file: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| file_error("inspect snapshot security", path, error))?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || !matches!(mode, 0o400 | 0o600)
+        || metadata.nlink() != 1
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "snapshot must be service-owned, private, regular, and single-link",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_private_snapshot_file(path: &Path, file: &File) -> Result<(), StateError> {
+    validate_private_database_file(path, file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_private_snapshot_file(path: &Path, _file: &File) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "private snapshots are unsupported on this platform",
+    })
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -1007,17 +1476,40 @@ fn open_database_file(path: &Path) -> Result<File, StateError> {
 #[cfg(windows)]
 fn open_windows_file_no_follow(path: &Path, create: bool, write: bool) -> Result<File, StateError> {
     use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     OpenOptions::new()
         .create(create)
         .read(true)
         .write(write)
         .truncate(false)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| {
             file_error(
                 "open Windows file without following reparse points",
+                path,
+                error,
+            )
+        })
+}
+
+#[cfg(windows)]
+fn open_windows_directory_no_follow(path: &Path) -> Result<File, StateError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            file_error(
+                "open Windows directory without reparse traversal",
                 path,
                 error,
             )
@@ -1243,6 +1735,284 @@ fn database_artifacts(database: &Path) -> [PathBuf; 4] {
     ]
 }
 
+fn sqlite_mutable_sidecars(database: &Path) -> [PathBuf; 3] {
+    [
+        sqlite_sidecar(database, "-wal"),
+        sqlite_sidecar(database, "-shm"),
+        sqlite_sidecar(database, "-journal"),
+    ]
+}
+
+#[cfg(unix)]
+fn validate_preflight_sidecars(database: &Path, database_file: &File) -> Result<(), StateError> {
+    use xattr::FileExt as _;
+
+    let sidecars = sqlite_mutable_sidecars(database);
+    let mut any_sidecar = false;
+    for sidecar in &sidecars {
+        any_sidecar |= path_entry_exists(sidecar)?;
+    }
+    if !any_sidecar {
+        return Ok(());
+    }
+    let generation = database_file
+        .get_xattr(UNIX_LOCK_IDENTITY_XATTR)
+        .map_err(|error| file_error("read preflight database generation", database, error))?
+        .ok_or_else(|| StateError::InvalidPath {
+            path: database.to_owned(),
+            reason: "database with sidecars is missing its persistent generation",
+        })?;
+    validate_sqlite_sidecars(database, Some(&generation))
+}
+
+#[cfg(windows)]
+fn validate_preflight_sidecars(database: &Path, database_file: &File) -> Result<(), StateError> {
+    let mut any_sidecar = false;
+    for sidecar in sqlite_mutable_sidecars(database) {
+        any_sidecar |= path_entry_exists(&sidecar)?;
+    }
+    if !any_sidecar {
+        return Ok(());
+    }
+    let lock_path = lock_path_for(database);
+    let lock_file = open_windows_file_no_follow(&lock_path, false, false)?;
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(StateError::StoreLocked { path: lock_path });
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(file_error(
+                "acquire preflight Windows writer lock",
+                &lock_path,
+                error,
+            ));
+        }
+    }
+    let generation =
+        verify_windows_lock_binding(database, database_file, &lock_path, &lock_file, None)?;
+    File::unlock(&lock_file)
+        .map_err(|error| file_error("release preflight Windows writer lock", &lock_path, error))?;
+    validate_sqlite_sidecars(database, Some(&generation))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_preflight_sidecars(database: &Path, _database_file: &File) -> Result<(), StateError> {
+    if sqlite_mutable_sidecars(database)
+        .iter()
+        .any(|sidecar| path_entry_exists(sidecar).unwrap_or(true))
+    {
+        return Err(StateError::InvalidPath {
+            path: database.to_owned(),
+            reason: "preflight sidecar validation is unsupported",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_sqlite_sidecars(database: &Path, generation: Option<&[u8]>) -> Result<(), StateError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use xattr::FileExt as _;
+
+    let generation = generation.ok_or_else(|| StateError::InvalidPath {
+        path: database.to_owned(),
+        reason: "sidecar generation is unavailable",
+    })?;
+    for sidecar in sqlite_mutable_sidecars(database) {
+        if !path_entry_exists(&sidecar)? {
+            continue;
+        }
+        let file = open_existing_file_no_follow_writable(&sidecar)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| file_error("secure SQLite sidecar", &sidecar, error))?;
+        validate_private_database_file(&sidecar, &file)?;
+        match file
+            .get_xattr(UNIX_SIDECAR_GENERATION_XATTR)
+            .map_err(|error| file_error("read SQLite sidecar generation", &sidecar, error))?
+        {
+            Some(current) if current != generation => {
+                return Err(StateError::InvalidPath {
+                    path: sidecar,
+                    reason: "SQLite sidecar belongs to a different database generation",
+                });
+            }
+            Some(_) => {}
+            None => {
+                rustix::fs::fsetxattr(
+                    &file,
+                    UNIX_SIDECAR_GENERATION_XATTR,
+                    generation,
+                    rustix::fs::XattrFlags::CREATE,
+                )
+                .map_err(|error| {
+                    file_error("persist SQLite sidecar generation", &sidecar, error.into())
+                })?;
+                file.sync_all().map_err(|error| {
+                    file_error("sync SQLite sidecar generation", &sidecar, error)
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sqlite_sidecars(database: &Path, generation: Option<&[u8]>) -> Result<(), StateError> {
+    use xattr::FileExt as _;
+
+    let generation = generation.ok_or_else(|| StateError::InvalidPath {
+        path: database.to_owned(),
+        reason: "sidecar generation is unavailable",
+    })?;
+    for sidecar in sqlite_mutable_sidecars(database) {
+        if !path_entry_exists(&sidecar)? {
+            continue;
+        }
+        let file = open_existing_file_no_follow(&sidecar)?;
+        validate_private_database_file(&sidecar, &file)?;
+        let current = file
+            .get_xattr(UNIX_SIDECAR_GENERATION_XATTR)
+            .map_err(|error| file_error("verify SQLite sidecar generation", &sidecar, error))?
+            .ok_or_else(|| StateError::InvalidPath {
+                path: sidecar.clone(),
+                reason: "SQLite sidecar generation is missing",
+            })?;
+        if current != generation {
+            return Err(StateError::InvalidPath {
+                path: sidecar,
+                reason: "SQLite sidecar belongs to a different database generation",
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sidecar_generation_path(sidecar: &Path) -> PathBuf {
+    let mut path = sidecar.as_os_str().to_owned();
+    path.push(":gta-claw-generation");
+    PathBuf::from(path)
+}
+
+#[cfg(windows)]
+fn secure_sqlite_sidecars(database: &Path, generation: Option<&[u8]>) -> Result<(), StateError> {
+    use std::io::{Read as _, Write as _};
+
+    let generation = generation.ok_or_else(|| StateError::InvalidPath {
+        path: database.to_owned(),
+        reason: "sidecar generation is unavailable",
+    })?;
+    for sidecar in sqlite_mutable_sidecars(database) {
+        if !path_entry_exists(&sidecar)? {
+            continue;
+        }
+        let file = open_existing_file_no_follow_writable(&sidecar)?;
+        validate_private_database_file(&sidecar, &file)?;
+        let generation_path = sidecar_generation_path(&sidecar);
+        match OpenOptions::new().read(true).open(&generation_path) {
+            Ok(mut metadata) => {
+                let mut current = Vec::new();
+                metadata.read_to_end(&mut current).map_err(|error| {
+                    file_error("read SQLite sidecar generation", &sidecar, error)
+                })?;
+                if current != generation {
+                    return Err(StateError::InvalidPath {
+                        path: sidecar,
+                        reason: "SQLite sidecar belongs to a different database generation",
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut metadata = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&generation_path)
+                    .map_err(|error| {
+                        file_error("create SQLite sidecar generation", &sidecar, error)
+                    })?;
+                metadata
+                    .write_all(generation)
+                    .and_then(|()| metadata.sync_all())
+                    .map_err(|error| {
+                        file_error("persist SQLite sidecar generation", &sidecar, error)
+                    })?;
+            }
+            Err(error) => {
+                return Err(file_error(
+                    "open SQLite sidecar generation",
+                    &sidecar,
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_sqlite_sidecars(database: &Path, generation: Option<&[u8]>) -> Result<(), StateError> {
+    use std::io::Read as _;
+
+    let generation = generation.ok_or_else(|| StateError::InvalidPath {
+        path: database.to_owned(),
+        reason: "sidecar generation is unavailable",
+    })?;
+    for sidecar in sqlite_mutable_sidecars(database) {
+        if !path_entry_exists(&sidecar)? {
+            continue;
+        }
+        let file = open_existing_file_no_follow(&sidecar)?;
+        validate_private_database_file(&sidecar, &file)?;
+        let mut metadata = match File::open(sidecar_generation_path(&sidecar)) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !path_entry_exists(&sidecar)? =>
+            {
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StateError::InvalidPath {
+                    path: sidecar,
+                    reason: "SQLite sidecar generation is missing",
+                });
+            }
+            Err(error) => {
+                return Err(file_error(
+                    "open SQLite sidecar generation",
+                    &sidecar,
+                    error,
+                ));
+            }
+        };
+        let mut current = Vec::new();
+        metadata
+            .read_to_end(&mut current)
+            .map_err(|error| file_error("read SQLite sidecar generation", &sidecar, error))?;
+        if current != generation {
+            return Err(StateError::InvalidPath {
+                path: sidecar,
+                reason: "SQLite sidecar belongs to a different database generation",
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn secure_sqlite_sidecars(database: &Path, _generation: Option<&[u8]>) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: database.to_owned(),
+        reason: "secure SQLite sidecars are unsupported on this platform",
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_sqlite_sidecars(database: &Path, _generation: Option<&[u8]>) -> Result<(), StateError> {
+    secure_sqlite_sidecars(database, None)
+}
+
 fn ensure_database_artifacts_absent(database: &Path) -> Result<(), StateError> {
     for collision in database_artifacts(database) {
         if path_entry_exists(&collision)? {
@@ -1261,6 +2031,49 @@ struct PinnedSnapshot {
     parent_directory: File,
 }
 
+struct SnapshotCleanupGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl SnapshotCleanupGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SnapshotCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        for artifact in database_artifacts(&self.path) {
+            loop {
+                match std::fs::remove_file(&artifact) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error)
+                        if std::time::Instant::now() < deadline
+                            && (matches!(error.raw_os_error(), Some(32) | Some(33))
+                                || error.kind() == std::io::ErrorKind::PermissionDenied) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
 impl PinnedSnapshot {
     fn open(path: &Path) -> Result<Self, StateError> {
         let file = open_existing_file_no_follow(path)?;
@@ -1270,6 +2083,7 @@ impl PinnedSnapshot {
     }
 
     fn from_file(path: &Path, file: File) -> Result<Self, StateError> {
+        validate_private_snapshot_file(path, &file)?;
         #[cfg(unix)]
         let (parent_path, parent_directory) = {
             let parent_path = path
@@ -1459,9 +2273,13 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     })
 }
 
-fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), StateError> {
+fn publish_snapshot(
+    source: PinnedSnapshot,
+    destination: &Path,
+    publication_deadline: Option<(tokio::time::Instant, u64)>,
+) -> Result<(), StateError> {
     source.verify()?;
-    let source_path = &source.path;
+    let source_path = source.path.clone();
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -1475,15 +2293,25 @@ fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), S
         std::fs::write(destination, b"other publisher")
             .map_err(|error| file_error("inject competing publication", destination, error))?;
     }
+    if let Some((deadline, timeout_ms)) = publication_deadline
+        && tokio::time::Instant::now() >= deadline
+    {
+        drop(source);
+        reservations.release()?;
+        return Err(StateError::OperationTimedOut {
+            operation: "SQLite backup",
+            timeout_ms,
+        });
+    }
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
         target_vendor = "apple",
         target_os = "redox"
     ))]
-    let published = publish_unix_snapshot(source, destination, &destination_directory);
+    let published = publish_unix_snapshot(&source, destination, &destination_directory);
     #[cfg(windows)]
-    let published = publish_windows_snapshot(source_path, destination);
+    let published = publish_windows_snapshot(&source_path, destination);
     #[cfg(all(
         unix,
         not(any(
@@ -1519,7 +2347,7 @@ fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), S
         );
         let destination_owned = match path_entry_exists(destination) {
             Ok(false) => false,
-            Ok(true) => match files_share_identity(source_path, destination) {
+            Ok(true) => match files_share_identity(&source_path, destination) {
                 Ok(owned) => owned,
                 Err(identity_error) => {
                     let reservation_cleanup = reservations.release();
@@ -1544,7 +2372,7 @@ fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), S
             }
         };
         return Err(cleanup_failed_publication(
-            source_path,
+            &source_path,
             destination,
             reservations,
             primary,
@@ -1561,6 +2389,37 @@ fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), S
             ),
         });
     }
+    #[cfg(windows)]
+    {
+        #[cfg(test)]
+        let injected = take_publication_failpoint(&FAIL_WINDOWS_SOURCE_REMOVAL, destination);
+        #[cfg(not(test))]
+        let injected = false;
+        drop(source);
+        if injected {
+            let primary = StateError::FileSystem {
+                operation: "injected Windows source removal failure",
+                path: destination.to_owned(),
+                message: "test fault injection".to_owned(),
+            };
+            return Err(cleanup_failed_publication(
+                &source_path,
+                destination,
+                reservations,
+                primary,
+                true,
+            ));
+        }
+        if let Err(error) = std::fs::remove_file(&source_path) {
+            return Err(cleanup_failed_publication(
+                &source_path,
+                destination,
+                reservations,
+                file_error("remove published Windows staging name", &source_path, error),
+                true,
+            ));
+        }
+    }
     #[cfg(test)]
     if take_publication_failpoint(&FAIL_AFTER_PUBLICATION, destination) {
         let primary = StateError::FileSystem {
@@ -1569,7 +2428,7 @@ fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), S
             message: "test fault injection".to_owned(),
         };
         return Err(cleanup_failed_publication(
-            source_path,
+            &source_path,
             destination,
             reservations,
             primary,
@@ -1585,7 +2444,7 @@ fn publish_snapshot(source: &PinnedSnapshot, destination: &Path) -> Result<(), S
         target_vendor = "apple",
         target_os = "redox"
     ))]
-    let publication_sync = sync_published_snapshot(source, destination, &destination_directory);
+    let publication_sync = sync_published_snapshot(&source, destination, &destination_directory);
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
@@ -1727,14 +2586,7 @@ fn sync_published_snapshot(
 fn publish_windows_snapshot(source: &Path, destination: &Path) -> std::io::Result<()> {
     prepare_windows_published_identity(source, destination)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    std::fs::hard_link(source, destination)?;
-    #[cfg(test)]
-    if take_publication_failpoint(&FAIL_WINDOWS_SOURCE_REMOVAL, destination) {
-        return Err(std::io::Error::other(
-            "injected Windows source removal failure",
-        ));
-    }
-    std::fs::remove_file(source)
+    std::fs::hard_link(source, destination)
 }
 
 #[cfg(test)]
@@ -2220,7 +3072,32 @@ fn writer_identity_path_for(database: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| file_error("open writer lock", path, error))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StateError::StoreLocked {
+            path: path.to_owned(),
+        }),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(file_error("acquire writer lock", path, error))
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
     let file = OpenOptions::new()
         .create(true)
@@ -2269,7 +3146,61 @@ fn acquire_store_lock(
     Ok((lock_path, lock_file, guard))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn acquire_store_lock(
+    path: &Path,
+    database_file: &File,
+    _allow_identity_initialization: bool,
+) -> Result<(PathBuf, File, ProcessIdentityGuard), StateError> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    let lock_path = lock_path_for(path);
+    let mut lock_file = acquire_writer_lock(&lock_path)?;
+    validate_private_database_file(&lock_path, &lock_file)?;
+    let database_identity = claw_sqlite_file_control::windows_file_identity(database_file)
+        .map_err(|_| StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "stable Windows database identity is unavailable",
+        })?;
+    let lock_identity =
+        claw_sqlite_file_control::windows_file_identity(&lock_file).map_err(|_| {
+            StateError::InvalidPath {
+                path: lock_path.clone(),
+                reason: "stable Windows lock identity is unavailable",
+            }
+        })?;
+    let mut contents = String::new();
+    lock_file
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| lock_file.read_to_string(&mut contents))
+        .map_err(|error| file_error("read Windows writer-lock header", &lock_path, error))?;
+    let header_prefix = format!(
+        "v2\n{}\n{}\n",
+        hex_encode(&database_identity),
+        hex_encode(&lock_identity)
+    );
+    if contents.is_empty() {
+        contents = format!("{header_prefix}{}", writer_owner()?);
+        lock_file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| lock_file.write_all(contents.as_bytes()))
+            .and_then(|_| lock_file.sync_all())
+            .map_err(|error| {
+                file_error("initialize Windows writer-lock header", &lock_path, error)
+            })?;
+    } else if !contents.starts_with(&header_prefix)
+        || contents[header_prefix.len()..].is_empty()
+        || contents[header_prefix.len()..].contains('\n')
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path,
+            reason: "Windows writer-lock header does not match held file identities",
+        });
+    }
+    Ok((lock_path, lock_file, ProcessIdentityGuard {}))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn acquire_store_lock(
     path: &Path,
     _database_file: &File,
@@ -2671,7 +3602,17 @@ fn capture_store_lock_identity(
     Ok(Some(value))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn capture_store_lock_identity(
+    database_path: &Path,
+    database_file: &File,
+    lock_path: &Path,
+    lock_file: &File,
+) -> Result<Option<Vec<u8>>, StateError> {
+    verify_windows_lock_binding(database_path, database_file, lock_path, lock_file, None).map(Some)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn capture_store_lock_identity(
     _database_path: &Path,
     _database_file: &File,
@@ -2750,21 +3691,62 @@ async fn install_sqlite_commit_guard(connection: &mut SqliteConnection) -> Resul
 #[cfg(unix)]
 async fn install_store_commit_guard(
     connection: &mut SqliteConnection,
+    database_path: &Path,
+    database_file: &File,
     lock_path: &Path,
     lock_file: &File,
+    expected_identity: Option<&[u8]>,
 ) -> Result<(), sqlx::Error> {
-    claw_sqlite_file_control::install_identity_commit_guard(connection, lock_path, lock_file)
-        .await
-        .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+    let expected_identity = expected_identity
+        .ok_or_else(|| sqlx::Error::Protocol("commit identity generation is missing".to_owned()))?;
+    claw_sqlite_file_control::install_identity_commit_guard(
+        connection,
+        database_path,
+        database_file,
+        lock_path,
+        lock_file,
+        expected_identity,
+    )
+    .await
+    .map_err(|error| sqlx::Error::Protocol(error.to_string()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn install_store_commit_guard(
+    connection: &mut SqliteConnection,
+    database_path: &Path,
+    database_file: &File,
+    lock_path: &Path,
+    lock_file: &File,
+    expected_identity: Option<&[u8]>,
+) -> Result<(), sqlx::Error> {
+    let expected_identity = expected_identity.ok_or_else(|| {
+        sqlx::Error::Protocol("Windows commit identity generation is missing".to_owned())
+    })?;
+    claw_sqlite_file_control::install_windows_identity_commit_guard(
+        connection,
+        database_path,
+        database_file,
+        lock_path,
+        lock_file,
+        expected_identity,
+    )
+    .await
+    .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 async fn install_store_commit_guard(
     _connection: &mut SqliteConnection,
+    _database_path: &Path,
+    _database_file: &File,
     _lock_path: &Path,
     _lock_file: &File,
+    _expected_identity: Option<&[u8]>,
 ) -> Result<(), sqlx::Error> {
-    Ok(())
+    Err(sqlx::Error::Protocol(
+        "commit identity guards are unsupported on this platform".to_owned(),
+    ))
 }
 
 #[cfg(not(unix))]
@@ -2781,7 +3763,85 @@ async fn verify_sqlite_connection_identity(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_store_lock_binding(
+    database_path: &Path,
+    database_file: &File,
+    lock_path: &Path,
+    lock_file: &File,
+    expected: Option<&[u8]>,
+) -> Result<(), StateError> {
+    let current =
+        verify_windows_lock_binding(database_path, database_file, lock_path, lock_file, expected)?;
+    if let Some(expected) = expected
+        && current != expected
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path.to_owned(),
+            reason: "Windows writer-lock generation changed while open",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_windows_lock_binding(
+    database_path: &Path,
+    database_file: &File,
+    lock_path: &Path,
+    lock_file: &File,
+    expected: Option<&[u8]>,
+) -> Result<Vec<u8>, StateError> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    verify_path_identity(database_path, database_file)?;
+    verify_path_identity(lock_path, lock_file)?;
+    validate_private_database_file(lock_path, lock_file)?;
+    let database_identity = claw_sqlite_file_control::windows_file_identity(database_file)
+        .map_err(|_| StateError::InvalidPath {
+            path: database_path.to_owned(),
+            reason: "stable Windows database identity is unavailable",
+        })?;
+    let lock_identity =
+        claw_sqlite_file_control::windows_file_identity(lock_file).map_err(|_| {
+            StateError::InvalidPath {
+                path: lock_path.to_owned(),
+                reason: "stable Windows lock identity is unavailable",
+            }
+        })?;
+    let mut file = lock_file
+        .try_clone()
+        .map_err(|error| file_error("clone Windows writer lock", lock_path, error))?;
+    let mut contents = Vec::new();
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_to_end(&mut contents))
+        .map_err(|error| file_error("read Windows writer-lock header", lock_path, error))?;
+    let prefix = format!(
+        "v2\n{}\n{}\n",
+        hex_encode(&database_identity),
+        hex_encode(&lock_identity)
+    );
+    if !contents.starts_with(prefix.as_bytes())
+        || contents[prefix.len()..].is_empty()
+        || contents[prefix.len()..].contains(&b'\n')
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path.to_owned(),
+            reason: "Windows writer-lock header does not match held file identities",
+        });
+    }
+    if let Some(expected) = expected
+        && contents != expected
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path.to_owned(),
+            reason: "Windows writer-lock generation changed while open",
+        });
+    }
+    Ok(contents)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn verify_store_lock_binding(
     _database_path: &Path,
     _database_file: &File,
@@ -2942,6 +4002,7 @@ async fn inspect_database(
     path: &Path,
     database_file: &File,
     require_latest: bool,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
 ) -> Result<InspectedDatabase, StateError> {
     if database_file
         .metadata()
@@ -2954,10 +4015,24 @@ async fn inspect_database(
     verify_path_identity(path, database_file)?;
     for attempt in 0..3 {
         let temporary = inspection_temporary_path(path)?;
-        match materialize_sqlite_snapshot(path, database_file, &temporary, None).await {
+        let mut cleanup_guard = SnapshotCleanupGuard::new(&temporary);
+        match materialize_sqlite_snapshot(
+            path,
+            database_file,
+            &temporary,
+            None,
+            deadline_state.clone(),
+        )
+        .await
+        {
             Ok(()) => {
-                let result = inspect_database_snapshot(&temporary, require_latest).await;
+                let result =
+                    inspect_database_snapshot(&temporary, require_latest, deadline_state.clone())
+                        .await;
                 let cleanup = remove_snapshot_artifacts(&temporary);
+                if cleanup.is_ok() {
+                    cleanup_guard.disarm();
+                }
                 verify_path_identity(path, database_file)?;
                 return match (result, cleanup) {
                     (Err(error), _) => Err(error),
@@ -2967,9 +4042,11 @@ async fn inspect_database(
             }
             Err(error) if attempt < 2 && is_transient_sidecar_change(path, &error) => {
                 remove_snapshot_artifacts(&temporary)?;
+                cleanup_guard.disarm();
             }
             Err(error) => {
                 remove_snapshot_artifacts(&temporary)?;
+                cleanup_guard.disarm();
                 return Err(error);
             }
         }
@@ -2989,6 +4066,7 @@ fn is_transient_sidecar_change(database: &Path, error: &StateError) -> bool {
 async fn inspect_database_snapshot(
     path: &Path,
     require_latest: bool,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
 ) -> Result<InspectedDatabase, StateError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -2998,6 +4076,7 @@ async fn inspect_database_snapshot(
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| database("inspect state database read-only", error))?;
+    install_open_deadline_handler(&mut connection, deadline_state).await?;
     let result = inspect_database_connection(&mut connection, require_latest).await;
     let close = connection
         .close()
@@ -3652,7 +4731,15 @@ async fn ensure_destructive_backup(
             .await
             .map(|_| ());
     }
-    backup_pool(pool, destination, expected_version).await
+    backup_pool(
+        pool,
+        destination,
+        expected_version,
+        tokio::time::Instant::now() + MAX_CONFIGURED_TIMEOUT,
+        u64::try_from(MAX_CONFIGURED_TIMEOUT.as_millis())
+            .expect("maximum configured timeout fits u64"),
+    )
+    .await
 }
 
 async fn snapshot_database(
@@ -3661,7 +4748,7 @@ async fn snapshot_database(
     destination: &Path,
     expected_digest: Option<&[u8]>,
 ) -> Result<(), StateError> {
-    materialize_sqlite_snapshot(source, source_file, destination, expected_digest).await
+    materialize_sqlite_snapshot(source, source_file, destination, expected_digest, None).await
 }
 
 async fn materialize_sqlite_snapshot(
@@ -3669,6 +4756,7 @@ async fn materialize_sqlite_snapshot(
     source_file: &File,
     destination: &Path,
     expected_digest: Option<&[u8]>,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
 ) -> Result<(), StateError> {
     verify_path_identity(source, source_file)?;
     reject_hard_link(source, source_file)?;
@@ -3716,6 +4804,7 @@ async fn materialize_sqlite_snapshot(
             destination,
             [&wal_path, &shm_path, &journal_path],
             expected_digest,
+            deadline_state,
         )
         .await;
     }
@@ -3731,6 +4820,7 @@ async fn materialize_sqlite_snapshot(
             return Err(invalid_backup(source, "open snapshot source", error));
         }
     };
+    install_open_deadline_handler(&mut connection, deadline_state).await?;
     if let Err(error) = verify_sqlite_connection_identity(&mut connection).await {
         connection
             .close()
@@ -3782,7 +4872,7 @@ async fn materialize_sqlite_snapshot(
         (Ok(()), Err(error), _, _)
         | (Ok(()), Ok(()), Err(error), _)
         | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(cleanup_failed_snapshot(destination, error)),
-        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(()), Ok(()), Ok(())) => secure_private_snapshot_file(destination),
     }
 }
 
@@ -3792,10 +4882,11 @@ async fn materialize_pinned_main_snapshot(
     destination: &Path,
     sidecars: [&Path; 3],
     expected_digest: Option<&[u8]>,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
 ) -> Result<(), StateError> {
-    use std::io::{Seek as _, SeekFrom};
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
-    let before = file_digest(source_file)?;
+    let before = file_digest_with_deadline(source_file, deadline_state.as_deref())?;
     if let Some(expected_digest) = expected_digest
         && before != expected_digest
     {
@@ -3806,6 +4897,7 @@ async fn materialize_pinned_main_snapshot(
     }
     let pinned_copy = pinned_copy_temporary_path(destination)?;
     ensure_database_artifacts_absent(&pinned_copy)?;
+    let mut pinned_copy_guard = SnapshotCleanupGuard::new(&pinned_copy);
     let mut input = source_file
         .try_clone()
         .map_err(|error| file_error("clone pinned snapshot source", source, error))?;
@@ -3817,12 +4909,34 @@ async fn materialize_pinned_main_snapshot(
         .write(true)
         .open(&pinned_copy)
         .map_err(|error| file_error("create pinned snapshot copy", &pinned_copy, error))?;
-    std::io::copy(&mut input, &mut output)
-        .and_then(|_| output.sync_all())
-        .map_err(|error| file_error("copy pinned snapshot source", source, error))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if let Some(deadline_state) = deadline_state.as_deref()
+            && !deadline_state.permits_sqlite_work()
+        {
+            drop((input, output));
+            return Err(cleanup_failed_snapshot(
+                &pinned_copy,
+                deadline_state.timeout_error(),
+            ));
+        }
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| file_error("read pinned snapshot source", source, error))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| file_error("write pinned snapshot copy", &pinned_copy, error))?;
+    }
+    output
+        .sync_all()
+        .map_err(|error| file_error("sync pinned snapshot copy", &pinned_copy, error))?;
     drop((input, output));
+    secure_private_snapshot_file(&pinned_copy)?;
     let source_validation = verify_path_identity(source, source_file).and_then(|()| {
-        let after = file_digest(source_file)?;
+        let after = file_digest_with_deadline(source_file, deadline_state.as_deref())?;
         if after != before {
             return Err(StateError::InvalidPath {
                 path: source.to_owned(),
@@ -3852,7 +4966,7 @@ async fn materialize_pinned_main_snapshot(
     }
     let copied_file = File::open(&pinned_copy)
         .map_err(|error| file_error("open completed pinned snapshot copy", &pinned_copy, error))?;
-    if file_digest(&copied_file)? != before {
+    if file_digest_with_deadline(&copied_file, deadline_state.as_deref())? != before {
         return Err(cleanup_failed_snapshot(
             &pinned_copy,
             StateError::InvalidPath {
@@ -3884,6 +4998,7 @@ async fn materialize_pinned_main_snapshot(
             ));
         }
     };
+    install_open_deadline_handler(&mut connection, deadline_state).await?;
     let snapshot = sqlx::query("VACUUM main INTO ?")
         .bind(destination_text)
         .execute(&mut connection)
@@ -3895,11 +5010,14 @@ async fn materialize_pinned_main_snapshot(
         .await
         .map_err(|error| invalid_backup(source, "close pinned snapshot copy", error));
     let cleanup = remove_snapshot_artifacts(&pinned_copy);
+    if cleanup.is_ok() {
+        pinned_copy_guard.disarm();
+    }
     match (snapshot, close, cleanup) {
         (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
             Err(cleanup_failed_snapshot(destination, error))
         }
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(()), Ok(())) => secure_private_snapshot_file(destination),
     }
 }
 
@@ -3914,6 +5032,13 @@ fn pinned_copy_temporary_path(destination: &Path) -> Result<PathBuf, StateError>
 }
 
 fn file_digest(file: &File) -> Result<Vec<u8>, StateError> {
+    file_digest_with_deadline(file, None)
+}
+
+fn file_digest_with_deadline(
+    file: &File,
+    deadline_state: Option<&OpenDeadlineState>,
+) -> Result<Vec<u8>, StateError> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let path = Path::new("<open database handle>");
@@ -3925,6 +5050,11 @@ fn file_digest(file: &File) -> Result<Vec<u8>, StateError> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if let Some(deadline_state) = deadline_state
+            && !deadline_state.permits_sqlite_work()
+        {
+            return Err(deadline_state.timeout_error());
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|error| file_error("read database handle for digest", path, error))?;
@@ -4244,7 +5374,19 @@ async fn backup_pool(
     pool: &SqlitePool,
     destination: &Path,
     expected_version: i64,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
 ) -> Result<(), StateError> {
+    let timed_out = || StateError::OperationTimedOut {
+        operation: "SQLite backup",
+        timeout_ms,
+    };
+    let deadline_state = Arc::new(OpenDeadlineState {
+        deadline: deadline.into_std(),
+        timeout_ms,
+        cancelled: std::sync::atomic::AtomicBool::new(false),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    });
     ensure_database_artifacts_absent(destination)?;
     let temporary = snapshot_temporary_path(destination, "backup")?;
     ensure_database_artifacts_absent(&temporary)?;
@@ -4252,12 +5394,45 @@ async fn backup_pool(
         path: temporary.clone(),
         reason: "backup path must be valid Unicode",
     })?;
-    if let Err(error) = sqlx::query("VACUUM main INTO ?")
-        .bind(temporary_text)
-        .execute(pool)
-        .await
-        .map_err(|error| database("create consistent SQLite backup", error))
+    let mut connection = match tokio::time::timeout_at(deadline, pool.acquire()).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            return Err(cleanup_failed_snapshot(
+                &temporary,
+                database("acquire bounded backup connection", error),
+            ));
+        }
+        Err(_) => return Err(cleanup_failed_snapshot(&temporary, timed_out())),
+    };
     {
+        let mut handle = connection
+            .lock_handle()
+            .await
+            .map_err(|error| database("lock bounded backup connection", error))?;
+        let deadline_state = Arc::clone(&deadline_state);
+        handle.set_progress_handler(1_000, move || deadline_state.permits_sqlite_work());
+    }
+    let vacuum = claw_sqlite_file_control::vacuum_into_with_deadline(
+        &mut connection,
+        temporary_text,
+        deadline,
+    )
+    .await
+    .map_err(|error| database("create consistent SQLite backup", error))?;
+    {
+        let mut handle = connection
+            .lock_handle()
+            .await
+            .map_err(|error| database("unlock bounded backup connection", error))?;
+        handle.set_progress_handler(0, || true);
+    }
+    match vacuum {
+        claw_sqlite_file_control::VacuumDeadlineOutcome::Completed => {}
+        claw_sqlite_file_control::VacuumDeadlineOutcome::TimedOut => {
+            return Err(cleanup_failed_snapshot(&temporary, timed_out()));
+        }
+    }
+    if let Err(error) = secure_private_snapshot_file(&temporary) {
         return Err(cleanup_failed_snapshot(&temporary, error));
     }
     let pinned = match PinnedSnapshot::open(&temporary) {
@@ -4265,31 +5440,79 @@ async fn backup_pool(
         Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
     };
     #[cfg(test)]
-    wait_at_snapshot_test_barrier(destination, &temporary).await;
+    if tokio::time::timeout_at(
+        deadline,
+        wait_at_snapshot_test_barrier(destination, &temporary),
+    )
+    .await
+    .is_err()
+    {
+        drop(pinned);
+        return Err(cleanup_failed_snapshot(&temporary, timed_out()));
+    }
     let preparation = async {
-        mark_backup_provenance(&pinned).await?;
-        validate_snapshot_marker_pinned(&pinned).await?;
-        validate_backup_pinned(&pinned, Some(expected_version))
-            .await
-            .map(|_| ())?;
+        mark_backup_provenance(&pinned, Some(Arc::clone(&deadline_state))).await?;
+        validate_snapshot_marker_pinned(&pinned, Some(Arc::clone(&deadline_state))).await?;
+        validate_backup_pinned(
+            &pinned,
+            Some(expected_version),
+            Some(Arc::clone(&deadline_state)),
+        )
+        .await
+        .map(|_| ())?;
         initialize_restored_store_identity(&temporary, &pinned.file)
     }
     .await;
-    if let Err(error) = preparation {
-        return Err(cleanup_failed_snapshot(&temporary, error));
+    match preparation {
+        Ok(()) => {}
+        Err(error) => {
+            drop(pinned);
+            return Err(cleanup_failed_snapshot(
+                &temporary,
+                if tokio::time::Instant::now() >= deadline {
+                    timed_out()
+                } else {
+                    error
+                },
+            ));
+        }
+    }
+    if tokio::time::Instant::now() >= deadline {
+        drop(pinned);
+        return Err(cleanup_failed_snapshot(&temporary, timed_out()));
     }
     let seal = match create_trusted_backup_seal(&pinned) {
         Ok(seal) => seal,
-        Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
+        Err(error) => {
+            drop(pinned);
+            return Err(cleanup_failed_snapshot(&temporary, error));
+        }
     };
+    if tokio::time::Instant::now() >= deadline {
+        let seal_cleanup = seal.cleanup();
+        drop(pinned);
+        return Err(cleanup_failed_snapshot(
+            &temporary,
+            seal_cleanup.err().unwrap_or_else(timed_out),
+        ));
+    }
     if let Err(error) = pinned.sync() {
         let seal_cleanup = seal.cleanup();
+        drop(pinned);
         return Err(cleanup_failed_snapshot(
             &temporary,
             seal_cleanup.err().unwrap_or(error),
         ));
     }
-    match publish_snapshot(&pinned, destination) {
+    if tokio::time::Instant::now() >= deadline {
+        let seal_cleanup = seal.cleanup();
+        drop(pinned);
+        return Err(cleanup_failed_snapshot(
+            &temporary,
+            seal_cleanup.err().unwrap_or_else(timed_out),
+        ));
+    }
+    match publish_snapshot(pinned, destination, Some((deadline, timeout_ms))) {
         Ok(()) => Ok(()),
         Err(error @ StateError::PublicationUncertain { .. }) => {
             Err(cleanup_failed_snapshot(&temporary, error))
@@ -4320,7 +5543,10 @@ fn cleanup_failed_snapshot(path: &Path, error: StateError) -> StateError {
     }
 }
 
-async fn mark_backup_provenance(snapshot: &PinnedSnapshot) -> Result<(), StateError> {
+async fn mark_backup_provenance(
+    snapshot: &PinnedSnapshot,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
+) -> Result<(), StateError> {
     let path = &snapshot.path;
     snapshot.verify()?;
     let options = SqliteConnectOptions::new()
@@ -4330,6 +5556,7 @@ async fn mark_backup_provenance(snapshot: &PinnedSnapshot) -> Result<(), StateEr
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| invalid_backup(path, "open backup for provenance", error))?;
+    install_open_deadline_handler(&mut connection, deadline_state).await?;
     snapshot.verify()?;
     install_sqlite_commit_guard(&mut connection)
         .await
@@ -4368,11 +5595,14 @@ async fn validate_standalone_snapshot_source(path: &Path) -> Result<Vec<u8>, Sta
 async fn validate_standalone_snapshot_source_pinned(
     snapshot: &PinnedSnapshot,
 ) -> Result<Vec<u8>, StateError> {
-    validate_snapshot_marker_pinned(snapshot).await?;
+    validate_snapshot_marker_pinned(snapshot, None).await?;
     validate_trusted_backup_seal(snapshot)
 }
 
-async fn validate_snapshot_marker_pinned(snapshot: &PinnedSnapshot) -> Result<(), StateError> {
+async fn validate_snapshot_marker_pinned(
+    snapshot: &PinnedSnapshot,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
+) -> Result<(), StateError> {
     let path = &snapshot.path;
     snapshot.verify()?;
     for sidecar in [
@@ -4414,6 +5644,7 @@ async fn validate_snapshot_marker_pinned(snapshot: &PinnedSnapshot) -> Result<()
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| invalid_backup(path, "open standalone snapshot provenance", error))?;
+    install_open_deadline_handler(&mut connection, deadline_state).await?;
     let provenance = sqlx::query_scalar::<_, String>(
         "SELECT owner FROM claw_writer_lock
          WHERE singleton = 1 AND acquired_at_ms = 0",
@@ -4465,12 +5696,13 @@ async fn clear_backup_writer_lock(snapshot: &PinnedSnapshot) -> Result<(), State
 
 async fn validate_backup(path: &Path, expected_version: Option<i64>) -> Result<i64, StateError> {
     let snapshot = PinnedSnapshot::open(path)?;
-    validate_backup_pinned(&snapshot, expected_version).await
+    validate_backup_pinned(&snapshot, expected_version, None).await
 }
 
 async fn validate_backup_pinned(
     snapshot: &PinnedSnapshot,
     expected_version: Option<i64>,
+    deadline_state: Option<Arc<OpenDeadlineState>>,
 ) -> Result<i64, StateError> {
     let path = &snapshot.path;
     snapshot.verify()?;
@@ -4485,6 +5717,7 @@ async fn validate_backup_pinned(
             path: path.to_owned(),
             reason: DatabaseFailureText::render("open backup", error),
         })?;
+    install_open_deadline_handler(&mut connection, deadline_state).await?;
     let result = validate_backup_connection(path, &mut connection, expected_version).await;
     let close = connection
         .close()
@@ -4621,6 +5854,37 @@ pub(crate) mod test_support {
         &store.pool
     }
 
+    pub(crate) fn lock_path(store: &StateStore) -> &Path {
+        &store.lock_path
+    }
+
+    pub(crate) fn trust_existing_sidecars(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve sidecar fixture database");
+        let database_file =
+            super::open_existing_file_no_follow(&path).expect("open sidecar fixture database");
+        #[cfg(unix)]
+        let generation = {
+            use xattr::FileExt as _;
+
+            database_file
+                .get_xattr(super::UNIX_LOCK_IDENTITY_XATTR)
+                .expect("read sidecar fixture generation")
+                .expect("sidecar fixture generation exists")
+        };
+        #[cfg(windows)]
+        let generation = {
+            let lock_path = super::lock_path_for(&path);
+            let lock_file = super::open_windows_file_no_follow(&lock_path, false, false)
+                .expect("open sidecar fixture lock");
+            super::verify_windows_lock_binding(&path, &database_file, &lock_path, &lock_file, None)
+                .expect("read sidecar fixture lock generation")
+        };
+        #[cfg(all(not(unix), not(windows)))]
+        let generation = Vec::new();
+        super::secure_sqlite_sidecars(&path, Some(&generation))
+            .expect("trust explicitly constructed sidecar fixture");
+    }
+
     #[cfg(unix)]
     pub(crate) fn owner(store: &StateStore) -> &str {
         &store.owner
@@ -4751,6 +6015,13 @@ pub(crate) mod test_support {
     }
 
     #[cfg(unix)]
+    pub(crate) fn clear_migration_barrier() {
+        super::MIGRATION_TEST_BARRIER
+            .lock()
+            .expect("migration test barrier lock poisoned")
+            .take();
+    }
+
     pub(crate) fn set_snapshot_barrier(
         destination: &Path,
     ) -> (
@@ -4774,6 +6045,13 @@ pub(crate) mod test_support {
         (temporary, entered, release)
     }
 
+    pub(crate) fn clear_snapshot_barrier() {
+        super::SNAPSHOT_TEST_BARRIER
+            .lock()
+            .expect("snapshot test barrier lock poisoned")
+            .take();
+    }
+
     #[cfg(windows)]
     pub(crate) fn fail_windows_source_removal_once(destination: &Path) {
         let destination =
@@ -4786,7 +6064,7 @@ pub(crate) mod test_support {
     pub(crate) async fn journal_mode(path: &Path) -> Result<String, StateError> {
         let database_file = open_existing_file_no_follow(path)?;
         let temporary = inspection_temporary_path(path)?;
-        materialize_sqlite_snapshot(path, &database_file, &temporary, None).await?;
+        materialize_sqlite_snapshot(path, &database_file, &temporary, None, None).await?;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&temporary)
             .read_only(true)

@@ -39,6 +39,54 @@ impl Display for FileControlError {
 
 impl Error for FileControlError {}
 
+/// Outcome of one deadline-bound SQLite VACUUM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VacuumDeadlineOutcome {
+    /// SQLite completed and the destination is ready for validation.
+    Completed,
+    /// The deadline elapsed; SQLite was interrupted and joined before return.
+    TimedOut,
+}
+
+struct LiveInterruptPointer(NonNull<libsqlite3_sys::sqlite3>);
+
+// SAFETY: SQLite permits sqlite3_interrupt() from another thread, and this
+// pointer never outlives the connection borrowed by vacuum_into_with_deadline.
+unsafe impl Send for LiveInterruptPointer {}
+// SAFETY: sqlite3_interrupt() is concurrency-safe.
+unsafe impl Sync for LiveInterruptPointer {}
+
+/// Executes `VACUUM main INTO ?` and interrupts/joins SQLite on deadline.
+pub async fn vacuum_into_with_deadline(
+    connection: &mut sqlx::SqliteConnection,
+    destination: &str,
+    deadline: tokio::time::Instant,
+) -> Result<VacuumDeadlineOutcome, sqlx::Error> {
+    let database = LiveInterruptPointer({
+        let mut handle = connection.lock_handle().await?;
+        handle.as_raw_handle()
+    });
+    let query = sqlx::query("VACUUM main INTO ?")
+        .bind(destination)
+        .execute(&mut *connection);
+    tokio::pin!(query);
+    tokio::select! {
+        result = &mut query => {
+            result?;
+            Ok(VacuumDeadlineOutcome::Completed)
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            // SAFETY: `connection` remains mutably borrowed by `query`, so its
+            // SQLite handle stays live until the interrupted query is joined.
+            unsafe {
+                libsqlite3_sys::sqlite3_interrupt(database.0.as_ptr());
+            }
+            let _ = query.await;
+            Ok(VacuumDeadlineOutcome::TimedOut)
+        }
+    }
+}
+
 /// Returns whether SQLite reports that its open main database was moved or replaced.
 pub async fn main_database_has_moved(
     connection: &mut sqlx::SqliteConnection,
@@ -90,9 +138,22 @@ pub async fn install_moved_commit_guard(
 #[cfg(unix)]
 pub async fn install_identity_commit_guard(
     connection: &mut sqlx::SqliteConnection,
+    database_path: &std::path::Path,
+    database_file: &std::fs::File,
     lock_path: &std::path::Path,
     lock_file: &std::fs::File,
+    expected_identity: &[u8],
 ) -> Result<(), FileControlError> {
+    let database_file = database_file
+        .try_clone()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let expected_uid = {
+        use std::os::unix::fs::MetadataExt as _;
+        database_file
+            .metadata()
+            .map_err(|error| FileControlError::Handle(error.to_string()))?
+            .uid()
+    };
     let lock_file = lock_file
         .try_clone()
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
@@ -103,8 +164,12 @@ pub async fn install_identity_commit_guard(
     let database = database.as_raw_handle();
     let context = Box::new(IdentityCommitContext {
         database,
+        database_path: database_path.to_owned(),
+        database_file,
         lock_path: lock_path.to_owned(),
         lock_file,
+        expected_identity: expected_identity.to_vec(),
+        expected_uid,
     });
     let context = Box::into_raw(context);
     // SAFETY: SQLite assumes ownership of the boxed context and invokes the
@@ -136,8 +201,12 @@ pub async fn install_identity_commit_guard(
 #[cfg(unix)]
 struct IdentityCommitContext {
     database: NonNull<libsqlite3_sys::sqlite3>,
+    database_path: std::path::PathBuf,
+    database_file: std::fs::File,
     lock_path: std::path::PathBuf,
     lock_file: std::fs::File,
+    expected_identity: Vec<u8>,
+    expected_uid: u32,
 }
 
 #[cfg(unix)]
@@ -158,26 +227,269 @@ unsafe extern "C" fn reject_moved_or_unbound_commit(context: *mut std::ffi::c_vo
     // connection are live.
     let context = unsafe { context.as_ref() };
     let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        !database_has_moved(context.database) && unix_lock_identity_matches(context)
+        !database_has_moved(context.database) && unix_identity_matches(context)
     }))
     .unwrap_or(false);
     i32::from(!valid)
 }
 
 #[cfg(unix)]
-fn unix_lock_identity_matches(context: &IdentityCommitContext) -> bool {
+fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use xattr::FileExt as _;
+
+    if !unix_path_matches_private_file(
+        &context.database_path,
+        &context.database_file,
+        0o600,
+        context.expected_uid,
+    ) || !unix_path_matches_private_file(
+        &context.lock_path,
+        &context.lock_file,
+        0o600,
+        context.expected_uid,
+    ) {
+        return false;
+    }
+    let Ok(Some(identity)) = context
+        .database_file
+        .get_xattr("user.gta-claw.writer-lock-path")
+    else {
+        return false;
+    };
+    if identity != context.expected_identity {
+        return false;
+    }
+    for (suffix, required) in [("-wal", true), ("-shm", true), ("-journal", false)] {
+        let mut sidecar = context.database_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        if !unix_sidecar_matches_generation(
+            std::path::Path::new(&sidecar),
+            context.expected_uid,
+            &context.expected_identity,
+            required,
+        ) {
+            return false;
+        }
+    }
+    let Ok(metadata) = context.lock_file.metadata() else {
+        return false;
+    };
+    if usize::try_from(metadata.len()).ok() != Some(context.expected_identity.len()) {
+        return false;
+    }
+
+    #[cfg(unix)]
+    fn unix_sidecar_matches_generation(
+        path: &std::path::Path,
+        expected_uid: u32,
+        expected_identity: &[u8],
+        required: bool,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        use xattr::FileExt as _;
+
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return !required,
+            Err(_) => return false,
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(_) => {}
+        }
+        let Ok(file) = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if !metadata.file_type().is_file()
+            || metadata.uid() != expected_uid
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return false;
+        }
+        matches!(
+            file.get_xattr("user.gta-claw.sidecar-generation"),
+            Ok(Some(generation)) if generation == expected_identity
+        )
+    }
+    let mut contents = vec![0_u8; context.expected_identity.len()];
+    match context.lock_file.read_at(&mut contents, 0) {
+        Ok(read) => read == contents.len() && contents == context.expected_identity,
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn unix_path_matches_private_file(
+    path: &std::path::Path,
+    file: &std::fs::File,
+    expected_mode: u32,
+    expected_uid: u32,
+) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
-    let Ok(held) = context.lock_file.metadata() else {
+    let Ok(held) = file.metadata() else {
         return false;
     };
-    let Ok(current) = std::fs::symlink_metadata(&context.lock_path) else {
+    let Ok(current) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    current.file_type().is_file()
+    held.file_type().is_file()
+        && current.file_type().is_file()
         && !current.file_type().is_symlink()
         && current.dev() == held.dev()
         && current.ino() == held.ino()
+        && held.uid() == expected_uid
+        && current.uid() == expected_uid
+        && held.mode() & 0o7777 == expected_mode
+        && current.mode() & 0o7777 == expected_mode
+        && held.nlink() == 1
+        && current.nlink() == 1
+}
+
+/// Installs a Windows commit hook bound to held database/lock handles and lock generation.
+#[cfg(windows)]
+pub async fn install_windows_identity_commit_guard(
+    connection: &mut sqlx::SqliteConnection,
+    database_path: &std::path::Path,
+    database_file: &std::fs::File,
+    lock_path: &std::path::Path,
+    lock_file: &std::fs::File,
+    expected_identity: &[u8],
+) -> Result<(), FileControlError> {
+    let database_file = database_file
+        .try_clone()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let lock_file = lock_file
+        .try_clone()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let database = database.as_raw_handle();
+    let context = Box::new(WindowsIdentityCommitContext {
+        database_path: database_path.to_owned(),
+        database_file,
+        lock_path: lock_path.to_owned(),
+        lock_file,
+        expected_identity: expected_identity.to_vec(),
+    });
+    let context = Box::into_raw(context);
+    // SAFETY: SQLite owns the context and invokes its destructor exactly once.
+    let registered = unsafe {
+        libsqlite3_sys::sqlite3_set_clientdata(
+            database.as_ptr(),
+            c"gta-claw-windows-commit-identity".as_ptr(),
+            context.cast(),
+            Some(drop_windows_identity_commit_context),
+        )
+    };
+    if registered != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(registered));
+    }
+    // SAFETY: The registered context remains live until connection close.
+    unsafe {
+        libsqlite3_sys::sqlite3_commit_hook(
+            database.as_ptr(),
+            Some(reject_unbound_windows_commit),
+            context.cast(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsIdentityCommitContext {
+    database_path: std::path::PathBuf,
+    database_file: std::fs::File,
+    lock_path: std::path::PathBuf,
+    lock_file: std::fs::File,
+    expected_identity: Vec<u8>,
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn drop_windows_identity_commit_context(context: *mut std::ffi::c_void) {
+    if !context.is_null() {
+        // SAFETY: sqlite3_set_clientdata calls this once for the allocated Box.
+        drop(unsafe { Box::from_raw(context.cast::<WindowsIdentityCommitContext>()) });
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn reject_unbound_windows_commit(context: *mut std::ffi::c_void) -> i32 {
+    let Some(context) = NonNull::new(context.cast::<WindowsIdentityCommitContext>()) else {
+        return 1;
+    };
+    // SAFETY: SQLite invokes this while the client-data context is live.
+    let context = unsafe { context.as_ref() };
+    let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        windows_identity_matches(context)
+    }))
+    .unwrap_or(false);
+    i32::from(!valid)
+}
+
+#[cfg(windows)]
+fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
+    use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let open_current = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    };
+    let Ok(database_current) = open_current(&context.database_path) else {
+        return false;
+    };
+    let Ok(lock_current) = open_current(&context.lock_path) else {
+        return false;
+    };
+    let Ok(database_expected) = windows_file_identity(&context.database_file) else {
+        return false;
+    };
+    let Ok(database_actual) = windows_file_identity(&database_current) else {
+        return false;
+    };
+    let Ok(lock_expected) = windows_file_identity(&context.lock_file) else {
+        return false;
+    };
+    let Ok(lock_actual) = windows_file_identity(&lock_current) else {
+        return false;
+    };
+    if database_expected != database_actual
+        || lock_expected != lock_actual
+        || !windows_file_is_service_private(&context.database_file).unwrap_or(false)
+        || !windows_file_is_service_private(&context.lock_file).unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(length) = context.lock_file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    if usize::try_from(length).ok() != Some(context.expected_identity.len()) {
+        return false;
+    }
+    let mut contents = vec![0_u8; context.expected_identity.len()];
+    let header_matches = match context.lock_file.seek_read(&mut contents, 0) {
+        Ok(read) => read == contents.len() && contents == context.expected_identity,
+        Err(_) => false,
+    };
+    if !header_matches {
+        return false;
+    }
+    true
 }
 
 unsafe extern "C" fn reject_moved_commit(context: *mut std::ffi::c_void) -> i32 {
@@ -319,4 +631,169 @@ pub fn windows_file_identity(file: &std::fs::File) -> Result<[u8; 24], FileContr
     identity[..8].copy_from_slice(&information.VolumeSerialNumber.to_le_bytes());
     identity[8..].copy_from_slice(&information.FileId.Identifier);
     Ok(identity)
+}
+
+/// Returns whether a Windows file is owned by the current service identity and
+/// grants no write/delete authority to other non-administrative principals.
+#[cfg(windows)]
+pub fn windows_file_is_service_private(file: &std::fs::File) -> Result<bool, FileControlError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetTokenInformation,
+        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle valid for this call;
+    // token points to writable storage.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(FileControlError::Handle(format!(
+            "open current process token: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let result = (|| {
+        let mut required = 0_u32;
+        // SAFETY: The null probe is the documented way to obtain buffer size.
+        unsafe {
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut required);
+        }
+        if required == 0 {
+            return Err(FileControlError::Handle(format!(
+                "size current token user: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let word = std::mem::size_of::<usize>();
+        let words = usize::try_from(required)
+            .map_err(|_| FileControlError::Handle("token user buffer is too large".to_owned()))?
+            .div_ceil(word);
+        let mut token_buffer = vec![0_usize; words];
+        // SAFETY: The aligned buffer is at least `required` bytes and writable.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                token_buffer.as_mut_ptr().cast(),
+                required,
+                &raw mut required,
+            )
+        } == 0
+        {
+            return Err(FileControlError::Handle(format!(
+                "read current token user: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: GetTokenInformation initialized a TOKEN_USER at the buffer start.
+        let current_sid = unsafe { (*(token_buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: The file handle is live and all output pointers are writable.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                &raw mut dacl,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(FileControlError::Handle(format!(
+                "read file security descriptor: Windows error {status}"
+            )));
+        }
+        let private = (|| {
+            if owner.is_null()
+                || dacl.is_null()
+                // SAFETY: Both SIDs come from live token/security buffers.
+                || unsafe { EqualSid(owner, current_sid) } == 0
+            {
+                return Ok(false);
+            }
+            let mut acl_info = ACL_SIZE_INFORMATION::default();
+            // SAFETY: dacl is owned by descriptor and acl_info is writable.
+            if unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&raw mut acl_info).cast(),
+                    u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>())
+                        .expect("ACL_SIZE_INFORMATION size fits u32"),
+                    AclSizeInformation,
+                )
+            } == 0
+            {
+                return Err(FileControlError::Handle(format!(
+                    "inspect file DACL: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            const WRITE_AUTHORITY: u32 = 0x0000_0002
+                | 0x0000_0004
+                | 0x0000_0010
+                | 0x0000_0040
+                | 0x0000_0100
+                | 0x0001_0000
+                | 0x0004_0000
+                | 0x0008_0000
+                | 0x1000_0000
+                | 0x4000_0000;
+            for index in 0..acl_info.AceCount {
+                let mut ace = std::ptr::null_mut();
+                // SAFETY: index is within AceCount and ace is writable.
+                if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 {
+                    return Err(FileControlError::Handle(format!(
+                        "read file DACL entry: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                // Standard access-allowed ACE type is zero.
+                // SAFETY: GetAce returned a valid ACE pointer.
+                let header = unsafe { &*(ace.cast::<windows_sys::Win32::Security::ACE_HEADER>()) };
+                if matches!(header.AceType, 5 | 9 | 11) {
+                    return Ok(false);
+                }
+                if header.AceType != 0 {
+                    continue;
+                }
+                // SAFETY: A type-zero ACE has ACCESS_ALLOWED_ACE layout.
+                let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+                if allowed.Mask & WRITE_AUTHORITY == 0 {
+                    continue;
+                }
+                let sid = (&raw const allowed.SidStart).cast_mut().cast();
+                // SAFETY: sid points into the live ACE and current_sid is live.
+                let trusted = unsafe {
+                    EqualSid(sid, current_sid) != 0
+                        || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                        || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                };
+                if !trusted {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        // SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc.
+        unsafe {
+            LocalFree(descriptor);
+        }
+        private
+    })();
+    // SAFETY: OpenProcessToken returned an owned token handle.
+    unsafe {
+        CloseHandle(token);
+    }
+    result
 }

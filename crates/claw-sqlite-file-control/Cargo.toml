@@ -10,6 +10,11 @@ repository.workspace = true
 [dependencies]
 libsqlite3-sys = "0.37.0"
 sqlx.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+xattr.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

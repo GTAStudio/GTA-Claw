@@ -94,6 +94,22 @@ mod tests {
         directory.path().join(name)
     }
 
+    fn make_private_file(_path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(_path, fs::Permissions::from_mode(0o600))
+                .expect("make test database private");
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_private_empty_file(path: &Path) {
+        fs::File::create(path).expect("create private empty test file");
+        make_private_file(path);
+    }
+
     fn sidecar(path: &Path, suffix: &str) -> PathBuf {
         let mut value: OsString = path.as_os_str().to_owned();
         value.push(suffix);
@@ -382,6 +398,7 @@ mod tests {
             .close()
             .await
             .expect("close version-zero database");
+        make_private_file(&path);
 
         let store = StateStore::open(StoreConfig::new(&path))
             .await
@@ -416,6 +433,7 @@ mod tests {
         .execute(&mut external)
         .await
         .expect("create version-zero migration race prefix");
+        make_private_file(&path);
         let (entered, release) = test_support::set_migration_barrier(&path);
         let open_path = path.clone();
         let mut opener = Some(tokio::spawn(async move {
@@ -438,6 +456,7 @@ mod tests {
                     return Err(diagnostic);
                 }
             }
+
             let drift = external
                 .execute("ALTER TABLE claw_schema_migrations ADD COLUMN rogue TEXT")
                 .await;
@@ -498,6 +517,118 @@ mod tests {
                 panic!("migration race exceeded the single five-second deadline; {diagnostic}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unsafe_durations_and_relative_paths_fail_before_filesystem_access() {
+        let missing_parent = std::env::temp_dir().join(format!(
+            "claw-state-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
+        let path = missing_parent.join("state.sqlite");
+        for (field, config) in [
+            (
+                "busy timeout",
+                StoreConfig::new(&path).with_busy_timeout(Duration::MAX),
+            ),
+            (
+                "connection acquire timeout",
+                StoreConfig::new(&path).with_acquire_timeout(Duration::MAX),
+            ),
+            (
+                "open timeout",
+                StoreConfig::new(&path).with_open_timeout(Duration::MAX),
+            ),
+            (
+                "close timeout",
+                StoreConfig::new(&path).with_close_timeout(Duration::MAX),
+            ),
+        ] {
+            assert_eq!(
+                StateStore::open(config)
+                    .await
+                    .err()
+                    .expect("unsafe duration is rejected"),
+                StateError::InvalidValue {
+                    field,
+                    reason: "exceeds the supported safe upper bound",
+                }
+            );
+            assert!(!missing_parent.exists());
+        }
+        let relative = PathBuf::from("relative-state.sqlite");
+        assert_eq!(
+            StateStore::open(StoreConfig::new(&relative))
+                .await
+                .err()
+                .expect("relative state path is rejected"),
+            StateError::InvalidPath {
+                path: relative,
+                reason: "must be an absolute path inside a service-private directory",
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migration_timeout_rolls_back_without_late_mutation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "migration-timeout.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create migration timeout database");
+        sqlx::raw_sql(
+            "PRAGMA application_id = 1196704067;
+                 CREATE TABLE IF NOT EXISTS claw_schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+                    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+                 ) STRICT",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("create migration timeout prefix");
+        connection.close().await.expect("close timeout prefix");
+        make_private_file(&path);
+        let (entered, release) = test_support::set_migration_barrier(&path);
+        assert_eq!(
+                StateStore::open(
+                    StoreConfig::new(&path).with_open_timeout(Duration::from_millis(100)),
+                )
+                .await
+                .err()
+                .expect("gated migration reaches one overall timeout"),
+                StateError::OperationTimedOut {
+                    operation: "state store open",
+                    timeout_ms: 100,
+                }
+            );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("migration entered the deterministic gate");
+        release.notify_one();
+        test_support::clear_migration_barrier();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stable = database_artifact_bytes(&path);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&path));
+        let reopened = open(&path).await;
+        assert!(
+            reopened
+                .health()
+                .await
+                .expect("post-timeout health")
+                .is_healthy()
+        );
+        reopened.close().await.expect("post-timeout store closes");
     }
 
     #[tokio::test]
@@ -719,7 +850,10 @@ mod tests {
             .create(&owner_record)
             .await
             .expect_err("owner drift rejects repository write");
-        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert!(
+            matches!(error, StateError::InvalidMigrationHistory { .. }),
+            "unexpected owner-drift error: {error:?}"
+        );
         assert!(
             owner_store
                 .sessions()
@@ -1162,17 +1296,23 @@ mod tests {
         let path = database_path(&directory, "empty-history.sqlite");
         open(&path).await.close().await.expect("seed store closes");
         execute_direct(&path, "DELETE FROM claw_schema_migrations").await;
+        test_support::trust_existing_sidecars(&path);
         let journal_before = test_support::journal_mode(&path)
             .await
             .expect("read journal before empty-history rejection");
+        test_support::trust_existing_sidecars(&path);
         let writer_before = persisted_writer(&path).await;
+        test_support::trust_existing_sidecars(&path);
         let before = database_artifact_bytes(&path);
 
         let error = StateStore::open(StoreConfig::new(&path))
             .await
             .err()
             .expect("complete schema with empty history is rejected");
-        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert!(
+            matches!(error, StateError::InvalidMigrationHistory { .. }),
+            "unexpected empty-history error: {error:?}"
+        );
         assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
         assert_eq!(
             test_support::journal_mode(&path)
@@ -1194,10 +1334,13 @@ mod tests {
                 .await
                 .expect("seed schema store closes");
             execute_direct(&path, sql).await;
+            test_support::trust_existing_sidecars(&path);
             let journal_before = test_support::journal_mode(&path)
                 .await
                 .expect("read journal before schema rejection");
+            test_support::trust_existing_sidecars(&path);
             let writer_before = persisted_writer(&path).await;
+            test_support::trust_existing_sidecars(&path);
             let before = database_artifact_bytes(&path);
 
             let error = StateStore::open(StoreConfig::new(&path))
@@ -1313,6 +1456,7 @@ mod tests {
             .await
             .expect("create foreign schema");
         connection.close().await.expect("close foreign database");
+        make_private_file(&path);
 
         let error = StateStore::open(StoreConfig::new(&path))
             .await
@@ -1581,6 +1725,7 @@ mod tests {
             .await
             .expect("commit row to WAL");
         assert!(sidecar(&source_path, "-wal").exists());
+        test_support::trust_existing_sidecars(&source_path);
 
         let managed = open(&source_path).await;
         managed
@@ -1639,6 +1784,7 @@ mod tests {
         let mut checkpointer = SqliteConnection::connect_with(&options)
             .await
             .expect("open concurrent checkpointer");
+        test_support::trust_existing_sidecars(&source_path);
         let managed = open(&source_path).await;
 
         let (backup, checkpoint) = tokio::join!(managed.backup_to(&backup_path), async {
@@ -1662,6 +1808,104 @@ mod tests {
             .expect("count checkpoint-restored rows");
         assert_eq!(count, 200);
         restored.close().await.expect("restored store closes");
+    }
+
+    #[tokio::test]
+    async fn backup_timeout_removes_staging_without_late_publication() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "backup-timeout-source.sqlite");
+        let destination = database_path(&directory, "backup-timeout.sqlite");
+        let source = StateStore::open(
+            StoreConfig::new(&source_path).with_open_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .expect("backup timeout source opens");
+        let (temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
+        let error = tokio::time::timeout(Duration::from_secs(2), source.backup_to(&destination))
+            .await
+            .expect("backup timeout remains externally bounded")
+            .expect_err("gated backup reaches configured timeout");
+        assert_eq!(
+            error,
+            StateError::OperationTimedOut {
+                operation: "SQLite backup",
+                timeout_ms: 500,
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("backup reached deterministic post-VACUUM gate");
+        release.notify_one();
+        test_support::clear_snapshot_barrier();
+        let temporary = temporary
+            .lock()
+            .expect("snapshot temporary path lock poisoned")
+            .clone()
+            .expect("snapshot temporary path was published");
+        assert!(!destination.exists());
+        assert!(!temporary.exists());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!destination.exists());
+        assert!(!temporary.exists());
+        source.close().await.expect("backup timeout source closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_and_snapshot_artifacts_remain_mode_0600() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "mode-source.sqlite");
+        let backup_path = database_path(&directory, "mode-backup.sqlite");
+        let restored_path = database_path(&directory, "mode-restored.sqlite");
+        let source = open(&source_path).await;
+        source
+            .sessions()
+            .create(&session("mode-row", 1))
+            .await
+            .expect("create WAL-backed mode row");
+        source
+            .backup_to(&backup_path)
+            .await
+            .expect("create private backup");
+        for artifact in [
+            source_path.clone(),
+            sidecar(&source_path, "-wal"),
+            sidecar(&source_path, "-shm"),
+            backup_path.clone(),
+        ] {
+            assert_eq!(
+                fs::symlink_metadata(&artifact)
+                    .expect("inspect private artifact mode")
+                    .mode()
+                    & 0o7777,
+                0o600,
+                "artifact is not private: {}",
+                artifact.display()
+            );
+        }
+        StateStore::restore_backup(&backup_path, &restored_path)
+            .await
+            .expect("restore private backup");
+        let restored = open(&restored_path).await;
+        for artifact in [
+            restored_path.clone(),
+            sidecar(&restored_path, "-wal"),
+            sidecar(&restored_path, "-shm"),
+        ] {
+            assert_eq!(
+                fs::symlink_metadata(&artifact)
+                    .expect("inspect restored artifact mode")
+                    .mode()
+                    & 0o7777,
+                0o600,
+                "restored artifact is not private: {}",
+                artifact.display()
+            );
+        }
+        restored.close().await.expect("restored mode store closes");
+        source.close().await.expect("source mode store closes");
     }
 
     #[tokio::test]
@@ -1833,6 +2077,163 @@ mod tests {
             .close()
             .await
             .expect("hardlink WAL writer closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transplanted_and_recreated_sidecars_fail_closed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let victim_path = database_path(&directory, "sidecar-victim.sqlite");
+        let clone_path = database_path(&directory, "sidecar-clone.sqlite");
+        let victim = open(&victim_path).await;
+        victim.close().await.expect("seed sidecar victim closes");
+        let clone = open(&clone_path).await;
+        clone
+            .sessions()
+            .create(&session("clone-row", 1))
+            .await
+            .expect("create clone WAL row");
+        let clone_wal = sidecar(&clone_path, "-wal");
+        let clone_shm = sidecar(&clone_path, "-shm");
+        let victim_wal = sidecar(&victim_path, "-wal");
+        let victim_shm = sidecar(&victim_path, "-shm");
+        for (source, destination) in [(&clone_wal, &victim_wal), (&clone_shm, &victim_shm)] {
+            fs::copy(source, destination).expect("transplant valid clone sidecar");
+            fs::set_permissions(destination, fs::Permissions::from_mode(0o600))
+                .expect("preserve private transplanted sidecar mode");
+            let generation = fs::File::open(source)
+                .expect("open clone sidecar")
+                .get_xattr("user.gta-claw.sidecar-generation")
+                .expect("read clone sidecar generation")
+                .expect("clone sidecar generation exists");
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(destination)
+                .expect("open transplanted sidecar")
+                .set_xattr("user.gta-claw.sidecar-generation", &generation)
+                .expect("copy clone sidecar generation");
+        }
+        let before = database_artifact_bytes(&victim_path);
+        let error = StateStore::open(StoreConfig::new(&victim_path))
+            .await
+            .err()
+            .expect("transplanted sidecars are rejected");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath {
+                reason: "SQLite sidecar belongs to a different database generation",
+                ..
+            }
+        ));
+        assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&victim_path));
+        fs::remove_file(&victim_wal).expect("remove transplanted WAL");
+        fs::remove_file(&victim_shm).expect("remove transplanted SHM");
+
+        let live = std::sync::Arc::new(open(&victim_path).await);
+        let owner = test_support::owner(&live).to_owned();
+        let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
+        let record = session("recreated-sidecar-row", 2);
+        let record_id = record.id.clone();
+        let writer_store = std::sync::Arc::clone(&live);
+        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("writer reaches sidecar commit boundary");
+        fs::remove_file(&victim_wal).expect("unlink live victim WAL path");
+        fs::copy(&clone_wal, &victim_wal).expect("recreate victim WAL from clone");
+        fs::set_permissions(&victim_wal, fs::Permissions::from_mode(0o600))
+            .expect("secure recreated WAL");
+        let generation = fs::File::open(&clone_wal)
+            .expect("open clone WAL generation")
+            .get_xattr("user.gta-claw.sidecar-generation")
+            .expect("read clone WAL generation")
+            .expect("clone WAL generation exists");
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&victim_wal)
+            .expect("open recreated WAL")
+            .set_xattr("user.gta-claw.sidecar-generation", &generation)
+            .expect("attach clone generation to recreated WAL");
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .expect("sidecar commit rejection remains bounded")
+            .expect("sidecar writer task joins")
+            .expect_err("commit hook rejects recreated WAL generation");
+        let StateError::Database(failure) = error else {
+            panic!("expected commit-hook constraint, received {error:?}");
+        };
+        assert_eq!(failure.operation(), "commit session create");
+        assert_eq!(failure.code(), Some("531"));
+        assert!(
+            live.sessions()
+                .get(&record_id)
+                .await
+                .expect("read recreated-sidecar rollback")
+                .is_none()
+        );
+        fs::remove_file(&victim_wal).expect("remove rejected recreated WAL");
+        let live = std::sync::Arc::try_unwrap(live)
+            .unwrap_or_else(|_| panic!("writer retained live sidecar store"));
+        assert!(matches!(
+            live.close().await,
+            Err(StateError::CloseDegraded {
+                os_lock_released: true,
+                ..
+            })
+        ));
+        clone.close().await.expect("clone store closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_live_wal_path_rolls_back_commit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "missing-live-wal.sqlite");
+        let store = std::sync::Arc::new(open(&path).await);
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
+        let record = session("missing-wal-row", 1);
+        let record_id = record.id.clone();
+        let writer_store = std::sync::Arc::clone(&store);
+        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("writer reaches missing-WAL commit boundary");
+        fs::remove_file(sidecar(&path, "-wal")).expect("unlink live WAL pathname");
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .expect("missing-WAL rejection remains bounded")
+            .expect("missing-WAL writer joins")
+            .expect_err("commit hook rejects missing WAL pathname");
+        let StateError::Database(failure) = error else {
+            panic!("expected commit-hook constraint, received {error:?}");
+        };
+        assert_eq!(failure.operation(), "commit session create");
+        assert_eq!(failure.code(), Some("531"));
+        assert!(
+            store
+                .sessions()
+                .get(&record_id)
+                .await
+                .expect("read missing-WAL rollback")
+                .is_none()
+        );
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("writer retained missing-WAL store"));
+        assert!(matches!(
+            store.close().await,
+            Err(StateError::CloseDegraded {
+                os_lock_released: true,
+                ..
+            })
+        ));
     }
 
     #[cfg(unix)]
@@ -2086,7 +2487,10 @@ mod tests {
             .await
             .err()
             .expect("second writer is rejected");
-        assert!(matches!(error, StateError::StoreLocked { .. }));
+        assert!(
+            matches!(error, StateError::StoreLocked { .. }),
+            "unexpected second-writer error: {error:?}"
+        );
         assert!(
             owner
                 .health()
@@ -2393,7 +2797,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
 
         let symlink_db = database_path(&directory, "symlink-root.sqlite");
-        fs::File::create(&symlink_db).expect("create symlink-root database");
+        create_private_empty_file(&symlink_db);
         let real_root = directory.path().join("real-lock-root");
         fs::create_dir(&real_root).expect("create real lock root");
         fs::set_permissions(&real_root, fs::Permissions::from_mode(0o700))
@@ -2411,7 +2815,7 @@ mod tests {
         assert!(matches!(error, StateError::InvalidPath { .. }));
 
         let permissive_db = database_path(&directory, "permissive-root.sqlite");
-        fs::File::create(&permissive_db).expect("create permissive-root database");
+        create_private_empty_file(&permissive_db);
         let permissive_root = directory.path().join("permissive-lock-root");
         fs::create_dir(&permissive_root).expect("create permissive lock root");
         fs::set_permissions(&permissive_root, fs::Permissions::from_mode(0o755))
@@ -2427,7 +2831,7 @@ mod tests {
         assert!(matches!(error, StateError::InvalidPath { .. }));
 
         let hardlink_db = database_path(&directory, "hardlink-lock.sqlite");
-        fs::File::create(&hardlink_db).expect("create hardlink-lock database");
+        create_private_empty_file(&hardlink_db);
         let metadata = fs::metadata(&hardlink_db).expect("read hardlink DB identity");
         use std::os::unix::fs::MetadataExt as _;
         let hardlink_root = directory.path().join("hardlink-lock-root");
@@ -2451,7 +2855,7 @@ mod tests {
         assert!(matches!(error, StateError::InvalidPath { .. }));
 
         let stale_db = database_path(&directory, "stale-lock-entry.sqlite");
-        fs::File::create(&stale_db).expect("create stale-lock database");
+        create_private_empty_file(&stale_db);
         let stale_root = directory.path().join("stale-lock-root");
         fs::create_dir(&stale_root).expect("create stale lock root");
         fs::set_permissions(&stale_root, fs::Permissions::from_mode(0o700))
@@ -2486,7 +2890,7 @@ mod tests {
         );
         for attack in ["symlink", "hardlink", "stale"] {
             let database = database_path(&directory, &format!("canonical-{attack}.sqlite"));
-            fs::File::create(&database).expect("create canonical attack database");
+            create_private_empty_file(&database);
             let metadata = fs::metadata(&database).expect("read canonical attack identity");
             let lock_path = root.join(format!(
                 "dev-{}-ino-{}-{token}-{attack}.lock",
@@ -3006,6 +3410,83 @@ mod tests {
         store.close().await.expect("logical drift store closes");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_hook_rejects_xattr_and_lock_generation_drift() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use xattr::FileExt as _;
+
+        for drift in ["xattr", "header"] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = database_path(&directory, &format!("commit-{drift}.sqlite"));
+            let store = std::sync::Arc::new(open(&path).await);
+            let owner = test_support::owner(&store).to_owned();
+            let lock_path = unix_lock_path(&path);
+            let lock_header = fs::read(&lock_path).expect("read original lock header");
+            let database_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open database identity xattr");
+            let identity = database_file
+                .get_xattr("user.gta-claw.writer-lock-path")
+                .expect("read original database identity")
+                .expect("database identity exists");
+            let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
+            let record = session(&format!("commit-{drift}-rollback"), 1);
+            let record_id = record.id.clone();
+            let writer_store = std::sync::Arc::clone(&store);
+            let mut writer =
+                tokio::spawn(async move { writer_store.sessions().create(&record).await });
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("writer reaches actual SQLite commit boundary");
+
+            if drift == "xattr" {
+                database_file
+                    .remove_xattr("user.gta-claw.writer-lock-path")
+                    .expect("remove database generation before commit");
+            } else {
+                fs::write(&lock_path, vec![b'x'; lock_header.len()])
+                    .expect("replace lock generation bytes before commit");
+                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                    .expect("preserve private lock mode");
+            }
+            release.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+                .await
+                .expect("commit-hook rejection remains bounded")
+                .expect("writer task joins")
+                .expect_err("commit hook rejects lost binding");
+            let StateError::Database(failure) = error else {
+                panic!("expected SQLite commit-hook constraint, received {error:?}");
+            };
+            assert_eq!(failure.operation(), "commit session create");
+            assert_eq!(failure.code(), Some("531"));
+
+            if drift == "xattr" {
+                database_file
+                    .set_xattr("user.gta-claw.writer-lock-path", &identity)
+                    .expect("restore database generation");
+            } else {
+                fs::write(&lock_path, &lock_header).expect("restore lock generation");
+                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                    .expect("restore private lock mode");
+            }
+            assert!(
+                store
+                    .sessions()
+                    .get(&record_id)
+                    .await
+                    .expect("read rolled-back commit-hook row")
+                    .is_none()
+            );
+            let store = std::sync::Arc::try_unwrap(store)
+                .unwrap_or_else(|_| panic!("writer retained commit-hook store"));
+            store.close().await.expect("commit-hook store closes");
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_identity_handle_prevents_path_replacement() {
@@ -3032,6 +3513,104 @@ mod tests {
         store.close().await.expect("Windows identity store closes");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_live_lock_cannot_be_renamed_or_split() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "windows-live-lock.sqlite");
+        let renamed = database_path(&directory, "windows-live-lock-renamed");
+        let store = open(&path).await;
+        let lock_path = test_support::lock_path(&store).to_owned();
+        let owner_before = persisted_writer(&path)
+            .await
+            .expect("live Windows owner is persisted");
+        let error = fs::rename(&lock_path, &renamed)
+            .expect_err("held Windows lock excludes delete sharing");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+            ) || error.raw_os_error() == Some(32)
+        );
+        let second = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("second Windows writer is rejected");
+        assert!(matches!(second, StateError::StoreLocked { .. }));
+        assert_eq!(persisted_writer(&path).await, Some(owner_before));
+        store.close().await.expect("Windows live-lock store closes");
+        assert!(!renamed.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_world_writable_empty_database_is_not_adopted() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "world-writable-empty.sqlite");
+        fs::write(&path, b"").expect("precreate empty Windows database");
+        let status = Command::new("icacls.exe")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:(M)"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run native Windows ACL editor");
+        assert!(status.success());
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open insecure Windows database");
+        assert!(
+            !claw_sqlite_file_control::windows_file_is_service_private(&file)
+                .expect("inspect insecure Windows ACL")
+        );
+        let identity = claw_sqlite_file_control::windows_file_identity(&file)
+            .expect("capture insecure Windows identity");
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("world-writable empty database is rejected");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath {
+                reason: "state database grants write or delete access outside the service identity",
+                ..
+            }
+        ));
+        assert_eq!(fs::read(&path).expect("read unchanged empty database"), b"");
+        assert_eq!(
+            claw_sqlite_file_control::windows_file_identity(&file)
+                .expect("recapture insecure Windows identity"),
+            identity
+        );
+        assert!(!sidecar(&path, "-wal").exists());
+        assert!(!sidecar(&path, "-shm").exists());
+        assert!(!sidecar(&path, ":gta-claw-writer-identity").exists());
+
+        let readonly_path = database_path(&directory, "world-readable-empty.sqlite");
+        fs::write(&readonly_path, b"").expect("precreate readable empty Windows database");
+        let status = Command::new("icacls.exe")
+            .arg(&readonly_path)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("grant native Windows read-only ACL");
+        assert!(status.success());
+        let readonly_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&readonly_path)
+            .expect("open readable Windows database");
+        assert!(
+            claw_sqlite_file_control::windows_file_is_service_private(&readonly_file)
+                .expect("read-only cross-principal ACL remains private for mutation")
+        );
+        let store = open(&readonly_path).await;
+        store.close().await.expect("readable private store closes");
+    }
+
     #[tokio::test]
     async fn in_memory_and_uncreatable_paths_never_fall_back() {
         let memory = StateStore::open(StoreConfig::new(":memory:"))
@@ -3054,6 +3633,50 @@ mod tests {
             .expect("missing parent fails");
         assert!(matches!(error, StateError::FileSystem { .. }));
         assert!(!missing_parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn insecure_precreated_empty_database_is_rejected_without_mutation() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "foreign-empty.sqlite");
+        fs::write(&path, b"").expect("precreate empty database");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))
+            .expect("make precreated database untrusted");
+        let before = fs::symlink_metadata(&path).expect("inspect precreated database");
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("insecure precreated database is rejected");
+        assert_eq!(
+            error,
+            StateError::InvalidPath {
+                path: fs::canonicalize(directory.path())
+                    .expect("canonicalize test directory")
+                    .join("foreign-empty.sqlite"),
+                reason: "state database must be service-owned, mode 0600, regular, and single-link",
+            }
+        );
+        let after = fs::symlink_metadata(&path).expect("reinspect precreated database");
+        assert_eq!(
+            fs::read(&path).expect("read unchanged precreated database"),
+            b""
+        );
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.ino(), before.ino());
+        assert!(
+            fs::File::open(&path)
+                .expect("open unchanged database")
+                .get_xattr("user.gta-claw.writer-lock-path")
+                .expect("read unchanged identity xattr")
+                .is_none()
+        );
+        assert!(!sidecar(&path, "-wal").exists());
+        assert!(!sidecar(&path, "-shm").exists());
     }
 
     #[tokio::test]
