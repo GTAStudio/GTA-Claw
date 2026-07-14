@@ -330,10 +330,9 @@ impl GatewayClient {
             () = self.inner.cancellation.cancelled() => Err(GatewayClientError::Cancelled),
             result = tokio::time::timeout_at(deadline, response) => {
                 match result {
-                    Ok(Ok(Ok(response)))
-                        if response.epoch == expected_epoch
-                            && self.current_epoch() == Some(expected_epoch) =>
-                    {
+                    Ok(Ok(Ok(response))) if response.epoch == expected_epoch => {
+                        // The lifecycle-owned correlation map completed this response
+                        // before teardown; a following disconnect cannot invalidate it.
                         Ok(response.frame)
                     }
                     Ok(Ok(Ok(_))) | Ok(Err(_)) => Err(Self::connection_changed(expected_epoch)),
