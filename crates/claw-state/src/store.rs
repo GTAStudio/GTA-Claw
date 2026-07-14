@@ -1,8 +1,11 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 #[cfg(unix)]
 use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
@@ -117,6 +120,11 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     /// Creates a production-oriented configuration for an explicit file.
+    ///
+    /// The path must be absolute and its parent directory must already exist.
+    /// The parent is pinned for the store lifetime and must be owned exclusively
+    /// by the service (mode `0700` on Unix; a current-service-only writable DACL
+    /// on Windows).
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -246,6 +254,7 @@ pub struct RecoveredWriterLock {
 /// Exclusive writer access to one durable SQLite database.
 pub struct StateStore {
     path: PathBuf,
+    database_parent_path: PathBuf,
     lock_path: PathBuf,
     owner: String,
     recovered_writer: Option<RecoveredWriterLock>,
@@ -254,6 +263,8 @@ pub struct StateStore {
     lock_identity: Option<Vec<u8>>,
     _process_identity: ProcessIdentityGuard,
     _database_file: File,
+    _database_parent: File,
+    writer_generation: Arc<AtomicU64>,
     max_connections: u32,
     operation_timeout: Duration,
     close_timeout: Duration,
@@ -261,16 +272,26 @@ pub struct StateStore {
 
 #[derive(Clone, Copy)]
 pub(crate) struct OperationalIdentity<'store> {
+    database_parent_path: &'store Path,
+    database_parent: &'store File,
     database_path: &'store Path,
     database_file: &'store File,
     lock_path: &'store Path,
     lock_file: &'store File,
     lock_identity: Option<&'store [u8]>,
+    writer_generation: &'store AtomicU64,
 }
 
 impl OperationalIdentity<'_> {
     pub(crate) fn verify(self) -> Result<(), StateError> {
-        verify_path_identity(self.database_path, self.database_file)
+        if self.writer_generation.load(Ordering::Acquire) != 1 {
+            return Err(StateError::InvalidPath {
+                path: self.database_path.to_owned(),
+                reason: "state writer generation is no longer live",
+            });
+        }
+        verify_directory_path_identity(self.database_parent_path, self.database_parent)
+            .and_then(|()| verify_path_identity(self.database_path, self.database_file))
             .and_then(|()| verify_path_identity(self.lock_path, self.lock_file))
             .and_then(|()| {
                 verify_store_lock_binding(
@@ -402,6 +423,8 @@ impl StateStore {
         deadline_state: Arc<OpenDeadlineState>,
     ) -> Result<Self, StateError> {
         let path = resolve_database_path(&config.path)?;
+        let database_parent = pin_private_directory(&path)?;
+        let database_parent_path = database_parent.path.clone();
         let creation_lock = acquire_creation_lock(&path)?;
         let database_file = open_database_file(&path)?;
         validate_private_database_file(&path, &database_file)?;
@@ -428,6 +451,7 @@ impl StateStore {
         let lock_identity =
             capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?;
         let owner = writer_owner()?;
+        let writer_generation = Arc::new(AtomicU64::new(1));
         verify_path_identity(&path, &database_file)?;
         let locked_state = inspect_database(
             &path,
@@ -445,6 +469,10 @@ impl StateStore {
             .busy_timeout(config.busy_timeout)
             .synchronous(config.synchronous.sqlx());
         let verified_path = path.clone();
+        let verified_parent_path = database_parent_path.clone();
+        let verified_parent = Arc::new(database_parent.file.try_clone().map_err(|error| {
+            file_error("clone state directory handle", &database_parent_path, error)
+        })?);
         let verified_file = Arc::new(
             database_file
                 .try_clone()
@@ -457,22 +485,29 @@ impl StateStore {
                 .map_err(|error| file_error("clone writer lock handle", &lock_path, error))?,
         );
         let verified_lock_identity = lock_identity.clone();
+        let verified_writer_generation = Arc::clone(&writer_generation);
         let connect_deadline_state = Arc::clone(&deadline_state);
         let acquire_path = verified_path.clone();
+        let acquire_parent_path = verified_parent_path.clone();
+        let acquire_parent = Arc::clone(&verified_parent);
         let acquire_file = Arc::clone(&verified_file);
         let acquire_lock_path = verified_lock_path.clone();
         let acquire_lock_file = Arc::clone(&verified_lock_file);
         let acquire_lock_identity = verified_lock_identity.clone();
+        let acquire_writer_generation = Arc::clone(&verified_writer_generation);
         let pool = SqlitePoolOptions::new()
             .min_connections(1)
             .max_connections(config.max_connections)
             .acquire_timeout(config.acquire_timeout)
             .after_connect(move |connection, _metadata| {
                 let path = verified_path.clone();
+                let parent_path = verified_parent_path.clone();
+                let parent = Arc::clone(&verified_parent);
                 let file = Arc::clone(&verified_file);
                 let lock_path = verified_lock_path.clone();
                 let lock_file = Arc::clone(&verified_lock_file);
                 let lock_identity = verified_lock_identity.clone();
+                let writer_generation = Arc::clone(&verified_writer_generation);
                 let deadline_state = Arc::clone(&connect_deadline_state);
                 Box::pin(async move {
                     {
@@ -481,7 +516,13 @@ impl StateStore {
                             deadline_state.permits_sqlite_work()
                         });
                     }
-                    verify_path_identity(&path, &file)
+                    if writer_generation.load(Ordering::Acquire) != 1 {
+                        return Err(sqlx::Error::Protocol(
+                            "state writer generation is no longer live".to_owned(),
+                        ));
+                    }
+                    verify_directory_path_identity(&parent_path, &parent)
+                        .and_then(|()| verify_path_identity(&path, &file))
                         .and_then(|()| verify_path_identity(&lock_path, &lock_file))
                         .and_then(|()| {
                             verify_store_lock_binding(
@@ -499,23 +540,32 @@ impl StateStore {
                         .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                     install_store_commit_guard(
                         connection,
-                        &path,
-                        &file,
-                        &lock_path,
-                        &lock_file,
+                        (&parent_path, &parent),
+                        (&path, &file),
+                        (&lock_path, &lock_file),
                         lock_identity.as_deref(),
+                        (Arc::clone(&writer_generation), 1),
                     )
                     .await
                 })
             })
             .before_acquire(move |connection, _metadata| {
                 let path = acquire_path.clone();
+                let parent_path = acquire_parent_path.clone();
+                let parent = Arc::clone(&acquire_parent);
                 let file = Arc::clone(&acquire_file);
                 let lock_path = acquire_lock_path.clone();
                 let lock_file = Arc::clone(&acquire_lock_file);
                 let lock_identity = acquire_lock_identity.clone();
+                let writer_generation = Arc::clone(&acquire_writer_generation);
                 Box::pin(async move {
-                    verify_path_identity(&path, &file)
+                    if writer_generation.load(Ordering::Acquire) != 1 {
+                        return Err(sqlx::Error::Protocol(
+                            "state writer generation is no longer live".to_owned(),
+                        ));
+                    }
+                    verify_directory_path_identity(&parent_path, &parent)
+                        .and_then(|()| verify_path_identity(&path, &file))
                         .and_then(|()| verify_path_identity(&lock_path, &lock_file))
                         .and_then(|()| {
                             verify_store_lock_binding(
@@ -598,6 +648,7 @@ impl StateStore {
         }
         Ok(Self {
             path,
+            database_parent_path,
             lock_path,
             owner,
             recovered_writer,
@@ -606,6 +657,8 @@ impl StateStore {
             lock_identity,
             _process_identity: process_identity,
             _database_file: database_file,
+            _database_parent: database_parent.file,
+            writer_generation,
             max_connections: config.max_connections,
             operation_timeout: config.open_timeout,
             close_timeout: config.close_timeout,
@@ -650,11 +703,14 @@ impl StateStore {
 
     fn operational_identity(&self) -> OperationalIdentity<'_> {
         OperationalIdentity {
+            database_parent_path: &self.database_parent_path,
+            database_parent: &self._database_parent,
             database_path: &self.path,
             database_file: &self._database_file,
             lock_path: &self.lock_path,
             lock_file: &self.lock_file,
             lock_identity: self.lock_identity.as_deref(),
+            writer_generation: &self.writer_generation,
         }
     }
 
@@ -731,6 +787,7 @@ impl StateStore {
         ensure_database_artifacts_absent(requested_destination)?;
         let destination = resolve_database_path(requested_destination)?;
         ensure_database_artifacts_absent(&destination)?;
+        let destination_directory = pin_private_directory(&destination)?;
         let temporary = snapshot_temporary_path(&destination, "restore")?;
         snapshot_database(
             &backup,
@@ -744,31 +801,21 @@ impl StateStore {
             Err(error) => return Err(cleanup_failed_snapshot(&temporary, error)),
         };
         if let Err(error) = validate_snapshot_marker_pinned(&pinned, None).await {
-            drop(pinned);
-            remove_snapshot_artifacts(&temporary)?;
-            return Err(error);
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
         if let Err(error) = clear_backup_writer_lock(&pinned).await {
-            drop(pinned);
-            remove_snapshot_artifacts(&temporary)?;
-            return Err(error);
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
         if let Err(error) = validate_backup_pinned(&pinned, None, None).await {
-            drop(pinned);
-            remove_snapshot_artifacts(&temporary)?;
-            return Err(error);
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
         if let Err(error) = initialize_restored_store_identity(&temporary, &pinned.file) {
-            drop(pinned);
-            remove_snapshot_artifacts(&temporary)?;
-            return Err(error);
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
         if let Err(error) = pinned.sync() {
-            drop(pinned);
-            remove_snapshot_artifacts(&temporary)?;
-            return Err(error);
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
-        if let Err(error) = publish_snapshot(pinned, &destination, None) {
+        if let Err(error) = publish_snapshot(pinned, &destination, None, &destination_directory) {
             return Err(cleanup_failed_snapshot(&temporary, error));
         }
         Ok(())
@@ -847,22 +894,26 @@ impl StateStore {
     pub async fn close(self) -> Result<CheckpointReport, StateError> {
         let deadline = tokio::time::Instant::now() + self.close_timeout;
         let mut reasons = Vec::new();
-        let identity_valid =
-            match verify_path_identity(&self.path, &self._database_file).and_then(|()| {
-                verify_store_lock_binding(
-                    &self.path,
-                    &self._database_file,
-                    &self.lock_path,
-                    &self.lock_file,
-                    self.lock_identity.as_deref(),
-                )
-            }) {
-                Ok(()) => true,
-                Err(error) => {
-                    reasons.push(format!("database identity unavailable: {error}"));
-                    false
-                }
-            };
+        let identity_valid = match verify_directory_path_identity(
+            &self.database_parent_path,
+            &self._database_parent,
+        )
+        .and_then(|()| verify_path_identity(&self.path, &self._database_file))
+        .and_then(|()| {
+            verify_store_lock_binding(
+                &self.path,
+                &self._database_file,
+                &self.lock_path,
+                &self.lock_file,
+                self.lock_identity.as_deref(),
+            )
+        }) {
+            Ok(()) => true,
+            Err(error) => {
+                reasons.push(format!("database identity unavailable: {error}"));
+                false
+            }
+        };
         let mut connection = if identity_valid {
             match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
                 Ok(Ok(connection)) => Some(connection),
@@ -964,6 +1015,7 @@ impl StateStore {
         } else {
             false
         };
+        self.writer_generation.store(0, Ordering::Release);
         let final_connection_closed = if let Some(connection) = connection.take() {
             match close_final_connection(connection, deadline, &self.path).await {
                 Ok(()) => true,
@@ -1172,7 +1224,6 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
                 .unwrap_or_else(|| Path::new("."));
             let canonical_parent = std::fs::canonicalize(parent)
                 .map_err(|error| file_error("canonicalize state directory", parent, error))?;
-            validate_state_directory(&canonical_parent)?;
             return Ok(canonical_parent.join(file_name));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1190,7 +1241,6 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StateError> {
         .unwrap_or_else(|| Path::new("."));
     let canonical_parent = std::fs::canonicalize(parent)
         .map_err(|error| file_error("canonicalize state directory", parent, error))?;
-    validate_state_directory(&canonical_parent)?;
     Ok(canonical_parent.join(file_name))
 }
 
@@ -1224,11 +1274,11 @@ fn validate_snapshot_source_directory(path: &Path) -> Result<(), StateError> {
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o7777 != 0o700
     {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
-            reason: "snapshot source directory must be service-owned and not writable by others",
+            reason: "snapshot source directory must be service-owned, mode 0700, and non-symlink",
         });
     }
     Ok(())
@@ -1617,6 +1667,43 @@ fn verify_path_identity(path: &Path, _file: &File) -> Result<(), StateError> {
         });
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn verify_directory_path_identity(path: &Path, file: &File) -> Result<(), StateError> {
+    verify_path_identity(path, file)
+}
+
+#[cfg(windows)]
+fn verify_directory_path_identity(path: &Path, file: &File) -> Result<(), StateError> {
+    let current = open_windows_directory_no_follow(path)?;
+    let expected = claw_sqlite_file_control::windows_file_identity(file).map_err(|_| {
+        StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "stable Windows state-directory identity is unavailable",
+        }
+    })?;
+    let actual = claw_sqlite_file_control::windows_file_identity(&current).map_err(|_| {
+        StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "current Windows state-directory identity is unavailable",
+        }
+    })?;
+    if expected != actual {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state directory path changed after its identity was verified",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn verify_directory_path_identity(path: &Path, _file: &File) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "stable state-directory identity is unsupported on this platform",
+    })
 }
 
 #[cfg(unix)]
@@ -2025,9 +2112,7 @@ fn ensure_database_artifacts_absent(database: &Path) -> Result<(), StateError> {
 struct PinnedSnapshot {
     path: PathBuf,
     file: File,
-    #[cfg(unix)]
     parent_path: PathBuf,
-    #[cfg(unix)]
     parent_directory: File,
 }
 
@@ -2084,47 +2169,60 @@ impl PinnedSnapshot {
 
     fn from_file(path: &Path, file: File) -> Result<Self, StateError> {
         validate_private_snapshot_file(path, &file)?;
-        #[cfg(unix)]
         let (parent_path, parent_directory) = {
-            let parent_path = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_owned();
-            let parent_directory = rustix::fs::open(
-                &parent_path,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::CLOEXEC
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::DIRECTORY,
-                rustix::fs::Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(|error| {
-                file_error(
-                    "open pinned snapshot parent directory",
-                    &parent_path,
-                    error.into(),
-                )
-            })?;
-            verify_path_identity(&parent_path, &parent_directory)?;
-            (parent_path, parent_directory)
+            let pinned = pin_private_directory(path)?;
+            (pinned.path, pinned.file)
         };
         Ok(Self {
             path: path.to_owned(),
             file,
-            #[cfg(unix)]
             parent_path,
-            #[cfg(unix)]
             parent_directory,
         })
     }
 
     fn verify(&self) -> Result<(), StateError> {
         verify_path_identity(&self.path, &self.file)?;
-        #[cfg(unix)]
-        verify_path_identity(&self.parent_path, &self.parent_directory)?;
+        verify_directory_path_identity(&self.parent_path, &self.parent_directory)?;
         Ok(())
+    }
+
+    fn cleanup(self) -> Result<(), StateError> {
+        #[cfg(unix)]
+        {
+            let file_name = self
+                .path
+                .file_name()
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "snapshot has no file name",
+                })?;
+            rustix::fs::unlinkat(
+                &self.parent_directory,
+                file_name,
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(|error| {
+                file_error(
+                    "remove pinned snapshot through held parent",
+                    &self.path,
+                    error.into(),
+                )
+            })
+        }
+        #[cfg(windows)]
+        {
+            let path = self.path.clone();
+            drop(self);
+            remove_snapshot_artifacts(&path)
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            Err(StateError::InvalidPath {
+                path: self.path,
+                reason: "pinned snapshot cleanup is unsupported",
+            })
+        }
     }
 
     fn sync(&self) -> Result<(), StateError> {
@@ -2277,16 +2375,17 @@ fn publish_snapshot(
     source: PinnedSnapshot,
     destination: &Path,
     publication_deadline: Option<(tokio::time::Instant, u64)>,
+    destination_directory: &PinnedPrivateDirectory,
 ) -> Result<(), StateError> {
-    source.verify()?;
+    if let Err(error) = source.verify() {
+        return Err(source.cleanup().err().unwrap_or(error));
+    }
+    if let Err(error) =
+        verify_directory_path_identity(&destination_directory.path, &destination_directory.file)
+    {
+        return Err(source.cleanup().err().unwrap_or(error));
+    }
     let source_path = source.path.clone();
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple",
-        target_os = "redox"
-    ))]
-    let destination_directory = pin_destination_directory(destination)?;
     let reservations = reserve_destination_sidecars(destination)?;
     #[cfg(test)]
     if take_publication_failpoint(&CREATE_DESTINATION_BEFORE_PUBLICATION, destination) {
@@ -2309,7 +2408,7 @@ fn publish_snapshot(
         target_vendor = "apple",
         target_os = "redox"
     ))]
-    let published = publish_unix_snapshot(&source, destination, &destination_directory);
+    let published = publish_unix_snapshot(&source, destination, destination_directory);
     #[cfg(windows)]
     let published = publish_windows_snapshot(&source_path, destination);
     #[cfg(all(
@@ -2444,7 +2543,7 @@ fn publish_snapshot(
         target_vendor = "apple",
         target_os = "redox"
     ))]
-    let publication_sync = sync_published_snapshot(&source, destination, &destination_directory);
+    let publication_sync = sync_published_snapshot(&source, destination, destination_directory);
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
@@ -2461,29 +2560,18 @@ fn publish_snapshot(
     Ok(())
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple",
-    target_os = "redox"
-))]
-struct PinnedDestinationDirectory {
+struct PinnedPrivateDirectory {
     path: PathBuf,
     file: File,
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple",
-    target_os = "redox"
-))]
-fn pin_destination_directory(destination: &Path) -> Result<PinnedDestinationDirectory, StateError> {
+fn pin_private_directory(destination: &Path) -> Result<PinnedPrivateDirectory, StateError> {
     let path = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_owned();
+    #[cfg(unix)]
     let file = rustix::fs::open(
         &path,
         rustix::fs::OFlags::RDONLY
@@ -2494,8 +2582,93 @@ fn pin_destination_directory(destination: &Path) -> Result<PinnedDestinationDire
     )
     .map(File::from)
     .map_err(|error| file_error("open pinned publication directory", &path, error.into()))?;
-    verify_path_identity(&path, &file)?;
-    Ok(PinnedDestinationDirectory { path, file })
+    #[cfg(windows)]
+    let file = open_windows_directory_no_follow(&path)?;
+    #[cfg(all(not(unix), not(windows)))]
+    let file = return Err(StateError::InvalidPath {
+        path,
+        reason: "pinned private directories are unsupported on this platform",
+    });
+    verify_directory_path_identity(&path, &file)?;
+    validate_pinned_state_directory(&path, &file)?;
+    Ok(PinnedPrivateDirectory { path, file })
+}
+
+#[cfg(unix)]
+fn validate_pinned_state_directory(path: &Path, file: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| file_error("inspect pinned state directory", path, error))?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state directory must be owned by the service, mode 0700, and non-symlink",
+        });
+    }
+    validate_unix_ancestor_rename_safety(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_ancestor_rename_safety(path: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let service_uid = rustix::process::geteuid().as_raw();
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|error| file_error("inspect state-directory ancestor", ancestor, error))?;
+        let mode = metadata.mode();
+        let trusted_owner = matches!(metadata.uid(), 0) || metadata.uid() == service_uid;
+        let writable_by_others = mode & 0o022 != 0;
+        let root_sticky_directory =
+            metadata.uid() == 0 && mode & 0o1000 != 0 && metadata.file_type().is_dir();
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || !trusted_owner
+            || (writable_by_others && !root_sticky_directory)
+        {
+            return Err(StateError::InvalidPath {
+                path: path.to_owned(),
+                reason: "state directory ancestors must prevent cross-principal renaming",
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_pinned_state_directory(path: &Path, file: &File) -> Result<(), StateError> {
+    reject_windows_reparse(
+        path,
+        &file
+            .metadata()
+            .map_err(|error| file_error("inspect pinned Windows state directory", path, error))?,
+    )?;
+    if !claw_sqlite_file_control::windows_file_is_service_private(file).map_err(|_| {
+        StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state directory security descriptor could not be validated",
+        }
+    })? {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "state directory grants write or delete access outside the service identity",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_pinned_state_directory(path: &Path, _file: &File) -> Result<(), StateError> {
+    Err(StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "private state directories are unsupported on this platform",
+    })
 }
 
 #[cfg(any(
@@ -2507,9 +2680,9 @@ fn pin_destination_directory(destination: &Path) -> Result<PinnedDestinationDire
 fn publish_unix_snapshot(
     source: &PinnedSnapshot,
     destination: &Path,
-    destination_directory: &PinnedDestinationDirectory,
+    destination_directory: &PinnedPrivateDirectory,
 ) -> std::io::Result<()> {
-    verify_path_identity(&destination_directory.path, &destination_directory.file)
+    verify_directory_path_identity(&destination_directory.path, &destination_directory.file)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let source_name = source
         .path
@@ -2537,9 +2710,9 @@ fn publish_unix_snapshot(
 fn sync_published_snapshot(
     source: &PinnedSnapshot,
     destination: &Path,
-    destination_directory: &PinnedDestinationDirectory,
+    destination_directory: &PinnedPrivateDirectory,
 ) -> Result<(), StateError> {
-    verify_path_identity(&destination_directory.path, &destination_directory.file)?;
+    verify_directory_path_identity(&destination_directory.path, &destination_directory.file)?;
     let destination_name = destination
         .file_name()
         .ok_or_else(|| StateError::InvalidPath {
@@ -3075,17 +3248,25 @@ fn writer_identity_path_for(database: &Path) -> PathBuf {
 #[cfg(windows)]
 fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|error| file_error("open writer lock", path, error))?;
+        .map_err(|error| {
+            if matches!(error.raw_os_error(), Some(32) | Some(33)) {
+                StateError::StoreLocked {
+                    path: path.to_owned(),
+                }
+            } else {
+                file_error("open writer lock", path, error)
+            }
+        })?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(StateError::StoreLocked {
@@ -3691,21 +3872,21 @@ async fn install_sqlite_commit_guard(connection: &mut SqliteConnection) -> Resul
 #[cfg(unix)]
 async fn install_store_commit_guard(
     connection: &mut SqliteConnection,
-    database_path: &Path,
-    database_file: &File,
-    lock_path: &Path,
-    lock_file: &File,
+    database_parent: (&Path, &File),
+    database: (&Path, &File),
+    lock: (&Path, &File),
     expected_identity: Option<&[u8]>,
+    writer_generation: (Arc<AtomicU64>, u64),
 ) -> Result<(), sqlx::Error> {
     let expected_identity = expected_identity
         .ok_or_else(|| sqlx::Error::Protocol("commit identity generation is missing".to_owned()))?;
     claw_sqlite_file_control::install_identity_commit_guard(
         connection,
-        database_path,
-        database_file,
-        lock_path,
-        lock_file,
+        database_parent,
+        database,
+        lock,
         expected_identity,
+        writer_generation,
     )
     .await
     .map_err(|error| sqlx::Error::Protocol(error.to_string()))
@@ -3714,22 +3895,22 @@ async fn install_store_commit_guard(
 #[cfg(windows)]
 async fn install_store_commit_guard(
     connection: &mut SqliteConnection,
-    database_path: &Path,
-    database_file: &File,
-    lock_path: &Path,
-    lock_file: &File,
+    database_parent: (&Path, &File),
+    database: (&Path, &File),
+    lock: (&Path, &File),
     expected_identity: Option<&[u8]>,
+    writer_generation: (Arc<AtomicU64>, u64),
 ) -> Result<(), sqlx::Error> {
     let expected_identity = expected_identity.ok_or_else(|| {
         sqlx::Error::Protocol("Windows commit identity generation is missing".to_owned())
     })?;
     claw_sqlite_file_control::install_windows_identity_commit_guard(
         connection,
-        database_path,
-        database_file,
-        lock_path,
-        lock_file,
+        database_parent,
+        database,
+        lock,
         expected_identity,
+        writer_generation,
     )
     .await
     .map_err(|error| sqlx::Error::Protocol(error.to_string()))
@@ -3738,11 +3919,11 @@ async fn install_store_commit_guard(
 #[cfg(all(not(unix), not(windows)))]
 async fn install_store_commit_guard(
     _connection: &mut SqliteConnection,
-    _database_path: &Path,
-    _database_file: &File,
-    _lock_path: &Path,
-    _lock_file: &File,
+    _database_parent: (&Path, &File),
+    _database: (&Path, &File),
+    _lock: (&Path, &File),
     _expected_identity: Option<&[u8]>,
+    _writer_generation: (Arc<AtomicU64>, u64),
 ) -> Result<(), sqlx::Error> {
     Err(sqlx::Error::Protocol(
         "commit identity guards are unsupported on this platform".to_owned(),
@@ -3958,6 +4139,12 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
                         },
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             update = true;
+                        }
+                        Err(error) if matches!(error.raw_os_error(), Some(32) | Some(33)) => {
+                            return Err(StateError::InvalidPath {
+                                path: database.to_owned(),
+                                reason: "hard-linked SQLite databases are not supported",
+                            });
                         }
                         Err(error) => {
                             return Err(file_error(
@@ -5388,6 +5575,7 @@ async fn backup_pool(
         finished: std::sync::atomic::AtomicBool::new(false),
     });
     ensure_database_artifacts_absent(destination)?;
+    let destination_directory = pin_private_directory(destination)?;
     let temporary = snapshot_temporary_path(destination, "backup")?;
     ensure_database_artifacts_absent(&temporary)?;
     let temporary_text = temporary.to_str().ok_or_else(|| StateError::InvalidPath {
@@ -5447,8 +5635,7 @@ async fn backup_pool(
     .await
     .is_err()
     {
-        drop(pinned);
-        return Err(cleanup_failed_snapshot(&temporary, timed_out()));
+        return Err(pinned.cleanup().err().unwrap_or_else(timed_out));
     }
     let preparation = async {
         mark_backup_provenance(&pinned, Some(Arc::clone(&deadline_state))).await?;
@@ -5466,53 +5653,44 @@ async fn backup_pool(
     match preparation {
         Ok(()) => {}
         Err(error) => {
-            drop(pinned);
-            return Err(cleanup_failed_snapshot(
-                &temporary,
-                if tokio::time::Instant::now() >= deadline {
-                    timed_out()
-                } else {
-                    error
-                },
-            ));
+            let error = if tokio::time::Instant::now() >= deadline {
+                timed_out()
+            } else {
+                error
+            };
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
     }
     if tokio::time::Instant::now() >= deadline {
-        drop(pinned);
-        return Err(cleanup_failed_snapshot(&temporary, timed_out()));
+        return Err(pinned.cleanup().err().unwrap_or_else(timed_out));
     }
     let seal = match create_trusted_backup_seal(&pinned) {
         Ok(seal) => seal,
         Err(error) => {
-            drop(pinned);
-            return Err(cleanup_failed_snapshot(&temporary, error));
+            return Err(pinned.cleanup().err().unwrap_or(error));
         }
     };
     if tokio::time::Instant::now() >= deadline {
         let seal_cleanup = seal.cleanup();
-        drop(pinned);
-        return Err(cleanup_failed_snapshot(
-            &temporary,
-            seal_cleanup.err().unwrap_or_else(timed_out),
-        ));
+        let error = seal_cleanup.err().unwrap_or_else(timed_out);
+        return Err(pinned.cleanup().err().unwrap_or(error));
     }
     if let Err(error) = pinned.sync() {
         let seal_cleanup = seal.cleanup();
-        drop(pinned);
-        return Err(cleanup_failed_snapshot(
-            &temporary,
-            seal_cleanup.err().unwrap_or(error),
-        ));
+        let error = seal_cleanup.err().unwrap_or(error);
+        return Err(pinned.cleanup().err().unwrap_or(error));
     }
     if tokio::time::Instant::now() >= deadline {
         let seal_cleanup = seal.cleanup();
-        drop(pinned);
-        return Err(cleanup_failed_snapshot(
-            &temporary,
-            seal_cleanup.err().unwrap_or_else(timed_out),
-        ));
+        let error = seal_cleanup.err().unwrap_or_else(timed_out);
+        return Err(pinned.cleanup().err().unwrap_or(error));
     }
-    match publish_snapshot(pinned, destination, Some((deadline, timeout_ms))) {
+    match publish_snapshot(
+        pinned,
+        destination,
+        Some((deadline, timeout_ms)),
+        &destination_directory,
+    ) {
         Ok(()) => Ok(()),
         Err(error @ StateError::PublicationUncertain { .. }) => {
             Err(cleanup_failed_snapshot(&temporary, error))
@@ -5885,7 +6063,6 @@ pub(crate) mod test_support {
             .expect("trust explicitly constructed sidecar fixture");
     }
 
-    #[cfg(unix)]
     pub(crate) fn owner(store: &StateStore) -> &str {
         &store.owner
     }
@@ -6012,6 +6189,12 @@ pub(crate) mod test_support {
             release: std::sync::Arc::clone(&release),
         });
         (entered, release)
+    }
+
+    pub(crate) fn invalidate_writer_generation(store: &super::StateStore) {
+        store
+            .writer_generation
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(unix)]

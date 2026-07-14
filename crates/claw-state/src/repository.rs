@@ -712,56 +712,6 @@ async fn wait_at_commit_test_barrier(owner: &str) {
     }
 }
 
-#[cfg(all(test, unix))]
-pub(crate) mod test_support {
-    use super::{
-        Arc, COMMIT_TEST_BARRIERS, COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS, WriteTestBarrier,
-    };
-
-    pub(crate) fn set_write_barrier(
-        owner: &str,
-    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        WRITE_TEST_BARRIERS
-            .lock()
-            .expect("write test barriers lock poisoned")
-            .insert(
-                owner.to_owned(),
-                WriteTestBarrier {
-                    entered: Arc::clone(&entered),
-                    release: Arc::clone(&release),
-                },
-            );
-        (entered, release)
-    }
-
-    pub(crate) fn set_commit_tamper(owner: &str) {
-        COMMIT_TEST_TAMPERS
-            .lock()
-            .expect("commit test tampers lock poisoned")
-            .insert(owner.to_owned());
-    }
-
-    pub(crate) fn set_commit_barrier(
-        owner: &str,
-    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        COMMIT_TEST_BARRIERS
-            .lock()
-            .expect("commit test barriers lock poisoned")
-            .insert(
-                owner.to_owned(),
-                WriteTestBarrier {
-                    entered: Arc::clone(&entered),
-                    release: Arc::clone(&release),
-                },
-            );
-        (entered, release)
-    }
-}
-
 async fn commit_verified(
     mut transaction: Transaction<'_, Sqlite>,
     owner: &str,
@@ -1127,5 +1077,57 @@ fn conflict(entity: &'static str, id: &str, expected_version: i64) -> StateError
         entity,
         id: id.to_owned(),
         expected_version,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Arc, COMMIT_TEST_BARRIERS, WriteTestBarrier};
+    #[cfg(unix)]
+    use super::{COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS};
+
+    #[cfg(unix)]
+    pub(crate) fn set_write_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        WRITE_TEST_BARRIERS
+            .lock()
+            .expect("write test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_commit_tamper(owner: &str) {
+        COMMIT_TEST_TAMPERS
+            .lock()
+            .expect("commit test tampers lock poisoned")
+            .insert(owner.to_owned());
+    }
+
+    pub(crate) fn set_commit_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        COMMIT_TEST_BARRIERS
+            .lock()
+            .expect("commit test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
     }
 }

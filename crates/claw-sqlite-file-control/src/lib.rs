@@ -3,6 +3,10 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::ptr::NonNull;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 /// Failure returned by SQLite while inspecting its open main database file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileControlError {
@@ -138,12 +142,19 @@ pub async fn install_moved_commit_guard(
 #[cfg(unix)]
 pub async fn install_identity_commit_guard(
     connection: &mut sqlx::SqliteConnection,
-    database_path: &std::path::Path,
-    database_file: &std::fs::File,
-    lock_path: &std::path::Path,
-    lock_file: &std::fs::File,
+    database_parent: (&std::path::Path, &std::fs::File),
+    database: (&std::path::Path, &std::fs::File),
+    lock: (&std::path::Path, &std::fs::File),
     expected_identity: &[u8],
+    writer_generation: (Arc<AtomicU64>, u64),
 ) -> Result<(), FileControlError> {
+    let (database_parent_path, database_parent) = database_parent;
+    let (database_path, database_file) = database;
+    let (lock_path, lock_file) = lock;
+    let (writer_generation, expected_writer_generation) = writer_generation;
+    let database_parent = database_parent
+        .try_clone()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
     let database_file = database_file
         .try_clone()
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
@@ -157,6 +168,7 @@ pub async fn install_identity_commit_guard(
     let lock_file = lock_file
         .try_clone()
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let sidecars = unix_pinned_sidecars(database_path, expected_identity, expected_uid)?;
     let mut database = connection
         .lock_handle()
         .await
@@ -164,12 +176,17 @@ pub async fn install_identity_commit_guard(
     let database = database.as_raw_handle();
     let context = Box::new(IdentityCommitContext {
         database,
+        database_parent_path: database_parent_path.to_owned(),
+        database_parent,
         database_path: database_path.to_owned(),
         database_file,
         lock_path: lock_path.to_owned(),
         lock_file,
         expected_identity: expected_identity.to_vec(),
         expected_uid,
+        sidecars,
+        writer_generation,
+        expected_writer_generation,
     });
     let context = Box::into_raw(context);
     // SAFETY: SQLite assumes ownership of the boxed context and invokes the
@@ -201,12 +218,23 @@ pub async fn install_identity_commit_guard(
 #[cfg(unix)]
 struct IdentityCommitContext {
     database: NonNull<libsqlite3_sys::sqlite3>,
+    database_parent_path: std::path::PathBuf,
+    database_parent: std::fs::File,
     database_path: std::path::PathBuf,
     database_file: std::fs::File,
     lock_path: std::path::PathBuf,
     lock_file: std::fs::File,
     expected_identity: Vec<u8>,
     expected_uid: u32,
+    sidecars: Vec<PinnedSidecar>,
+    writer_generation: Arc<AtomicU64>,
+    expected_writer_generation: u64,
+}
+
+#[cfg(any(unix, windows))]
+struct PinnedSidecar {
+    path: std::path::PathBuf,
+    file: std::fs::File,
 }
 
 #[cfg(unix)]
@@ -238,17 +266,25 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
     use std::os::unix::fs::{FileExt as _, MetadataExt as _};
     use xattr::FileExt as _;
 
-    if !unix_path_matches_private_file(
-        &context.database_path,
-        &context.database_file,
-        0o600,
-        context.expected_uid,
-    ) || !unix_path_matches_private_file(
-        &context.lock_path,
-        &context.lock_file,
-        0o600,
-        context.expected_uid,
-    ) {
+    if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation
+        || !unix_path_matches_private_directory(
+            &context.database_parent_path,
+            &context.database_parent,
+            context.expected_uid,
+        )
+        || !unix_path_matches_private_file(
+            &context.database_path,
+            &context.database_file,
+            0o600,
+            context.expected_uid,
+        )
+        || !unix_path_matches_private_file(
+            &context.lock_path,
+            &context.lock_file,
+            0o600,
+            context.expected_uid,
+        )
+    {
         return false;
     }
     let Ok(Some(identity)) = context
@@ -260,23 +296,60 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
     if identity != context.expected_identity {
         return false;
     }
-    for (suffix, required) in [("-wal", true), ("-shm", true), ("-journal", false)] {
-        let mut sidecar = context.database_path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        if !unix_sidecar_matches_generation(
-            std::path::Path::new(&sidecar),
+    for sidecar in &context.sidecars {
+        if !unix_path_matches_private_file(
+            &sidecar.path,
+            &sidecar.file,
+            0o600,
             context.expected_uid,
-            &context.expected_identity,
-            required,
+        ) || !matches!(
+            sidecar
+                .file
+                .get_xattr("user.gta-claw.sidecar-generation"),
+            Ok(Some(generation)) if generation == context.expected_identity
         ) {
             return false;
         }
+    }
+    let mut journal = context.database_path.as_os_str().to_owned();
+    journal.push("-journal");
+    if !unix_sidecar_matches_generation(
+        std::path::Path::new(&journal),
+        context.expected_uid,
+        &context.expected_identity,
+        false,
+    ) {
+        return false;
     }
     let Ok(metadata) = context.lock_file.metadata() else {
         return false;
     };
     if usize::try_from(metadata.len()).ok() != Some(context.expected_identity.len()) {
         return false;
+    }
+
+    #[cfg(unix)]
+    fn unix_path_matches_private_directory(
+        path: &std::path::Path,
+        file: &std::fs::File,
+        expected_uid: u32,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Ok(held) = file.metadata() else {
+            return false;
+        };
+        let Ok(current) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        held.file_type().is_dir()
+            && current.file_type().is_dir()
+            && held.dev() == current.dev()
+            && held.ino() == current.ino()
+            && held.uid() == expected_uid
+            && current.uid() == expected_uid
+            && held.mode() & 0o7777 == 0o700
+            && current.mode() & 0o7777 == 0o700
     }
 
     #[cfg(unix)]
@@ -326,6 +399,51 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
 }
 
 #[cfg(unix)]
+fn unix_pinned_sidecars(
+    database_path: &std::path::Path,
+    expected_identity: &[u8],
+    expected_uid: u32,
+) -> Result<Vec<PinnedSidecar>, FileControlError> {
+    use std::os::unix::fs::MetadataExt as _;
+    use xattr::FileExt as _;
+
+    ["-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let mut path = database_path.as_os_str().to_owned();
+            path.push(suffix);
+            let path = std::path::PathBuf::from(path);
+            let file = rustix::fs::open(
+                &path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            if !metadata.file_type().is_file()
+                || metadata.uid() != expected_uid
+                || metadata.mode() & 0o7777 != 0o600
+                || metadata.nlink() != 1
+                || !matches!(
+                    file.get_xattr("user.gta-claw.sidecar-generation"),
+                    Ok(Some(generation)) if generation == expected_identity
+                )
+            {
+                return Err(FileControlError::Handle(
+                    "SQLite sidecar identity is not private and generation-bound".to_owned(),
+                ));
+            }
+            Ok(PinnedSidecar { path, file })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
 fn unix_path_matches_private_file(
     path: &std::path::Path,
     file: &std::fs::File,
@@ -357,29 +475,42 @@ fn unix_path_matches_private_file(
 #[cfg(windows)]
 pub async fn install_windows_identity_commit_guard(
     connection: &mut sqlx::SqliteConnection,
-    database_path: &std::path::Path,
-    database_file: &std::fs::File,
-    lock_path: &std::path::Path,
-    lock_file: &std::fs::File,
+    database_parent: (&std::path::Path, &std::fs::File),
+    database: (&std::path::Path, &std::fs::File),
+    lock: (&std::path::Path, &std::fs::File),
     expected_identity: &[u8],
+    writer_generation: (Arc<AtomicU64>, u64),
 ) -> Result<(), FileControlError> {
+    let (database_parent_path, database_parent) = database_parent;
+    let (database_path, database_file) = database;
+    let (lock_path, lock_file) = lock;
+    let (writer_generation, expected_writer_generation) = writer_generation;
+    let database_parent = database_parent
+        .try_clone()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
     let database_file = database_file
         .try_clone()
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
     let lock_file = lock_file
         .try_clone()
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let sidecars = windows_pinned_sidecars(database_path, expected_identity)?;
     let mut database = connection
         .lock_handle()
         .await
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
     let database = database.as_raw_handle();
     let context = Box::new(WindowsIdentityCommitContext {
+        database_parent_path: database_parent_path.to_owned(),
+        database_parent,
         database_path: database_path.to_owned(),
         database_file,
         lock_path: lock_path.to_owned(),
         lock_file,
         expected_identity: expected_identity.to_vec(),
+        sidecars,
+        writer_generation,
+        expected_writer_generation,
     });
     let context = Box::into_raw(context);
     // SAFETY: SQLite owns the context and invokes its destructor exactly once.
@@ -407,11 +538,16 @@ pub async fn install_windows_identity_commit_guard(
 
 #[cfg(windows)]
 struct WindowsIdentityCommitContext {
+    database_parent_path: std::path::PathBuf,
+    database_parent: std::fs::File,
     database_path: std::path::PathBuf,
     database_file: std::fs::File,
     lock_path: std::path::PathBuf,
     lock_file: std::fs::File,
     expected_identity: Vec<u8>,
+    sidecars: Vec<PinnedSidecar>,
+    writer_generation: Arc<AtomicU64>,
+    expected_writer_generation: u64,
 }
 
 #[cfg(windows)]
@@ -438,22 +574,42 @@ unsafe extern "C" fn reject_unbound_windows_commit(context: *mut std::ffi::c_voi
 
 #[cfg(windows)]
 fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
+    use std::io::Read as _;
     use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    let open_current = |path: &std::path::Path| {
+    if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation {
+        return false;
+    }
+    let open_current = |path: &std::path::Path, directory: bool| {
         std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+            )
             .open(path)
     };
-    let Ok(database_current) = open_current(&context.database_path) else {
+    let Ok(parent_current) = open_current(&context.database_parent_path, true) else {
         return false;
     };
-    let Ok(lock_current) = open_current(&context.lock_path) else {
+    let Ok(database_current) = open_current(&context.database_path, false) else {
+        return false;
+    };
+    let Ok(lock_current) = open_current(&context.lock_path, false) else {
+        return false;
+    };
+    let Ok(parent_expected) = windows_file_identity(&context.database_parent) else {
+        return false;
+    };
+    let Ok(parent_actual) = windows_file_identity(&parent_current) else {
         return false;
     };
     let Ok(database_expected) = windows_file_identity(&context.database_file) else {
@@ -468,8 +624,10 @@ fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
     let Ok(lock_actual) = windows_file_identity(&lock_current) else {
         return false;
     };
-    if database_expected != database_actual
+    if parent_expected != parent_actual
+        || database_expected != database_actual
         || lock_expected != lock_actual
+        || !windows_file_is_service_private(&context.database_parent).unwrap_or(false)
         || !windows_file_is_service_private(&context.database_file).unwrap_or(false)
         || !windows_file_is_service_private(&context.lock_file).unwrap_or(false)
     {
@@ -489,7 +647,80 @@ fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
     if !header_matches {
         return false;
     }
+    for sidecar in &context.sidecars {
+        let Ok(current) = open_current(&sidecar.path, false) else {
+            return false;
+        };
+        let Ok(current_identity) = windows_file_identity(&current) else {
+            return false;
+        };
+        let Ok(expected_identity) = windows_file_identity(&sidecar.file) else {
+            return false;
+        };
+        if current_identity != expected_identity
+            || !windows_file_is_service_private(&sidecar.file).unwrap_or(false)
+        {
+            return false;
+        }
+        let mut generation_path = sidecar.path.as_os_str().to_owned();
+        generation_path.push(":gta-claw-generation");
+        let Ok(mut metadata) = std::fs::File::open(std::path::PathBuf::from(generation_path))
+        else {
+            return false;
+        };
+        let mut generation = Vec::new();
+        if metadata.read_to_end(&mut generation).is_err() || generation != context.expected_identity
+        {
+            return false;
+        }
+    }
     true
+}
+
+#[cfg(windows)]
+fn windows_pinned_sidecars(
+    database_path: &std::path::Path,
+    expected_identity: &[u8],
+) -> Result<Vec<PinnedSidecar>, FileControlError> {
+    use std::io::Read as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    ["-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let mut path = database_path.as_os_str().to_owned();
+            path.push(suffix);
+            let path = std::path::PathBuf::from(path);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&path)
+                .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            if !windows_file_is_service_private(&file)
+                .map_err(|error| FileControlError::Handle(error.to_string()))?
+            {
+                return Err(FileControlError::Handle(
+                    "Windows SQLite sidecar is not service-private".to_owned(),
+                ));
+            }
+            let mut generation_path = path.as_os_str().to_owned();
+            generation_path.push(":gta-claw-generation");
+            let mut generation = Vec::new();
+            std::fs::File::open(std::path::PathBuf::from(generation_path))
+                .and_then(|mut metadata| metadata.read_to_end(&mut generation))
+                .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            if generation != expected_identity {
+                return Err(FileControlError::Handle(
+                    "Windows SQLite sidecar generation changed".to_owned(),
+                ));
+            }
+            Ok(PinnedSidecar { path, file })
+        })
+        .collect()
 }
 
 unsafe extern "C" fn reject_moved_commit(context: *mut std::ffi::c_void) -> i32 {

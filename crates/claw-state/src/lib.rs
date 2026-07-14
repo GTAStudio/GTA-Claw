@@ -629,6 +629,41 @@ mod tests {
                 .is_healthy()
         );
         reopened.close().await.expect("post-timeout store closes");
+
+        let fresh_path = database_path(&directory, "fresh-migration-timeout.sqlite");
+        let (entered, release) = test_support::set_migration_barrier(&fresh_path);
+        assert_eq!(
+            StateStore::open(
+                StoreConfig::new(&fresh_path).with_open_timeout(Duration::from_millis(100)),
+            )
+            .await
+            .err()
+            .expect("fresh gated migration reaches one overall timeout"),
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 100,
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("fresh migration entered deterministic gate");
+        release.notify_one();
+        test_support::clear_migration_barrier();
+        let stable = database_artifact_bytes(&fresh_path);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&fresh_path));
+        let reopened = open(&fresh_path).await;
+        assert!(
+            reopened
+                .health()
+                .await
+                .expect("fresh post-timeout health")
+                .is_healthy()
+        );
+        reopened
+            .close()
+            .await
+            .expect("fresh post-timeout store closes");
     }
 
     #[tokio::test]
@@ -1650,6 +1685,52 @@ mod tests {
         source.close().await.expect("source closes");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_parent_replacement_aborts_and_cleans_pinned_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "parent-pinned-source.sqlite");
+        let source = std::sync::Arc::new(open(&source_path).await);
+        let destination_parent = directory.path().join("private-backups");
+        fs::create_dir(&destination_parent).expect("create private backup directory");
+        fs::set_permissions(&destination_parent, fs::Permissions::from_mode(0o700))
+            .expect("secure private backup directory");
+        let moved_parent = directory.path().join("private-backups-moved");
+        let destination = destination_parent.join("snapshot.sqlite");
+        let (_temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
+        let backup_source = std::sync::Arc::clone(&source);
+        let backup_destination = destination.clone();
+        let mut backup =
+            tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("backup reaches pinned-parent barrier");
+        fs::rename(&destination_parent, &moved_parent).expect("detach pinned backup parent");
+        fs::create_dir(&destination_parent).expect("create replacement backup parent");
+        fs::set_permissions(&destination_parent, fs::Permissions::from_mode(0o700))
+            .expect("secure replacement backup parent");
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut backup)
+            .await
+            .expect("backup parent replacement remains bounded")
+            .expect("backup parent replacement task joins")
+            .expect_err("backup rejects replaced destination parent");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(!destination.exists());
+        assert!(
+            fs::read_dir(&moved_parent)
+                .expect("inspect detached backup parent")
+                .next()
+                .is_none(),
+            "pinned staging must be removed through the held parent"
+        );
+        let source = std::sync::Arc::try_unwrap(source)
+            .unwrap_or_else(|_| panic!("backup task retained source store"));
+        source.close().await.expect("backup source closes");
+    }
+
     #[tokio::test]
     async fn no_replace_failure_preserves_competing_destination() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -2236,6 +2317,60 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn commit_hook_rejects_invalidated_writer_generation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "invalidated-writer-generation.sqlite");
+        let store = std::sync::Arc::new(open(&path).await);
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
+        let record = session("invalidated-generation-row", 1);
+        let writer_store = std::sync::Arc::clone(&store);
+        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("writer reaches the actual commit boundary");
+        test_support::invalidate_writer_generation(&store);
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .expect("invalidated-generation rejection remains bounded")
+            .expect("invalidated-generation writer joins")
+            .expect_err("commit hook rejects an invalidated writer generation");
+        let StateError::Database(failure) = error else {
+            panic!("expected commit-hook constraint, received {error:?}");
+        };
+        assert_eq!(failure.operation(), "commit session create");
+        assert_eq!(failure.code(), Some("531"));
+
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .create_if_missing(false);
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open direct rollback reader");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'invalidated-generation-row'"
+            )
+            .fetch_one(&mut reader)
+            .await
+            .expect("read invalidated-generation rollback"),
+            0
+        );
+        reader.close().await.expect("close rollback reader");
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("writer retained invalidated-generation store"));
+        assert!(matches!(
+            store.close().await,
+            Err(StateError::CloseDegraded {
+                os_lock_released: true,
+                ..
+            })
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn restore_rejects_symlinked_source_wal() {
@@ -2761,7 +2896,10 @@ mod tests {
             .await
             .err()
             .expect("hard-link alias remains rejected after the owner closes");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(
+            matches!(error, StateError::InvalidPath { .. }),
+            "hard-link alias returned unexpected error: {error:?}"
+        );
         #[cfg(unix)]
         fs::remove_file(&alias).expect("remove rejected Unix hard-link alias");
         open(&path)
@@ -3259,6 +3397,71 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn state_parent_replacement_rolls_back_at_commit_boundary() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let original_parent = directory.path().to_owned();
+        let moved_parent = original_parent.with_extension("moved");
+        let path = database_path(&directory, "parent-replacement.sqlite");
+        let store = std::sync::Arc::new(open(&path).await);
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
+        let record = session("parent-replacement-row", 1);
+        let writer_store = std::sync::Arc::clone(&store);
+        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("writer reaches parent-identity commit boundary");
+        fs::rename(&original_parent, &moved_parent).expect("detach pinned state parent");
+        fs::create_dir(&original_parent).expect("create replacement state parent");
+        fs::set_permissions(&original_parent, fs::Permissions::from_mode(0o700))
+            .expect("secure replacement state parent");
+        release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+            .await
+            .expect("parent replacement rejection remains bounded")
+            .expect("parent replacement writer joins")
+            .expect_err("commit hook rejects a replaced state parent");
+        let StateError::Database(failure) = error else {
+            panic!("expected commit-hook constraint, received {error:?}");
+        };
+        assert_eq!(failure.operation(), "commit session create");
+        assert_eq!(failure.code(), Some("531"));
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("writer retained parent-replacement store"));
+        assert!(matches!(
+            store.close().await,
+            Err(StateError::CloseDegraded {
+                os_lock_released: true,
+                ..
+            })
+        ));
+
+        let moved_database = moved_parent.join("parent-replacement.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&moved_database)
+            .read_only(true)
+            .create_if_missing(false);
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open moved database rollback reader");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'parent-replacement-row'"
+            )
+            .fetch_one(&mut reader)
+            .await
+            .expect("read parent-replacement rollback"),
+            0
+        );
+        reader.close().await.expect("close moved rollback reader");
+        fs::remove_dir(&original_parent).expect("remove replacement state parent");
+        fs::remove_dir_all(&moved_parent).expect("remove moved state parent");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sqlite_handle_detects_path_swap_and_swap_back() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "sqlite-handle.sqlite");
@@ -3532,6 +3735,29 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
             ) || error.raw_os_error() == Some(32)
         );
+        let error = fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .expect_err("held Windows lock excludes hostile write handles");
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(5) | Some(32) | Some(33)
+        ));
+        let wal_path = sidecar(&path, "-wal");
+        let detached_wal = sidecar(&path, "-wal-detached");
+        let error = fs::rename(&wal_path, &detached_wal)
+            .expect_err("pinned Windows WAL handle excludes delete sharing");
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(5) | Some(32) | Some(33)
+        ));
+        let detached_parent = directory.path().with_extension("detached-parent");
+        let error = fs::rename(directory.path(), &detached_parent)
+            .expect_err("pinned Windows state directory excludes delete sharing");
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(5) | Some(32) | Some(33)
+        ));
         let second = StateStore::open(StoreConfig::new(&path))
             .await
             .err()
