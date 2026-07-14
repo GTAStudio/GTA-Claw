@@ -44,6 +44,26 @@ mutation = "negative-desktop-path"
 expected = "pull_request paths must exactly match the ordered dependency policy inputs"
 
 [[case]]
+name = "rust-branches-ignore"
+mutation = "rust-branches-ignore"
+expected = "rust pull_request trigger keys changed"
+
+[[case]]
+name = "rust-types-filter"
+mutation = "rust-types-filter"
+expected = "rust pull_request trigger keys changed"
+
+[[case]]
+name = "macos-branches-ignore"
+mutation = "macos-branches-ignore"
+expected = "macOS pull_request trigger changed"
+
+[[case]]
+name = "macos-types-filter"
+mutation = "macos-types-filter"
+expected = "macOS pull_request trigger changed"
+
+[[case]]
 name = "supply-job-disabled"
 mutation = "supply-job-disabled"
 expected = "supply-chain job must not set if"
@@ -62,6 +82,11 @@ expected = "supply-chain ordered steps changed"
 name = "bootstrap-wrapper-env"
 mutation = "bootstrap-wrapper-env"
 expected = "verified tool bootstrap environment changed"
+
+[[case]]
+name = "policy-step-runner-env"
+mutation = "policy-step-runner-env"
+expected = "Validate supply-chain policy step schema changed"
 
 [[case]]
 name = "native-matrix-runner-collapse"
@@ -147,3 +172,23 @@ expected = "root deny source policy changed"
 name = "root-deny-ban-skip"
 mutation = "root-deny-ban-skip"
 expected = "root deny bans policy changed"
+
+[[case]]
+name = "root-deny-string-skip"
+mutation = "root-deny-string-skip"
+expected = "root deny bans policy changed"
+
+[[case]]
+name = "root-deny-crate-skip"
+mutation = "root-deny-crate-skip"
+expected = "root deny bans policy changed"
+
+[[case]]
+name = "root-deny-versionless-name-skip"
+mutation = "root-deny-versionless-name-skip"
+expected = "root deny bans policy changed"
+
+[[case]]
+name = "slint-wildcard-version"
+mutation = "slint-wildcard-version"
+expected = "desktop Slint dependency policy changed"
