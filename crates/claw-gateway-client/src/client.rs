@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::num::NonZeroU64;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -19,10 +20,11 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::{GatewayClientConfig, GatewayCredential};
+use crate::config::{AuthorizationExpectation, GatewayClientConfig, GatewayCredential};
 use crate::error::{
-    AuthenticationFailure, BackpressureError, ConnectionInfo, ConnectionState, GatewayClientError,
-    GatewayEvent, IssuedDeviceToken, ProtocolFailure, ResyncRequired, TransportFailure,
+    AuthenticationFailure, BackpressureError, ConnectionEpoch, ConnectionInfo, ConnectionState,
+    GatewayClientError, GatewayEvent, IssuedDeviceToken, ProtocolFailure, ReadyConnection,
+    ResyncRequired, TransportFailure,
 };
 use crate::runtime::{ClientRuntime, SystemRuntime, reconnect_delay};
 use crate::transport::{self, Inbound, MessageReader, WireFailure};
@@ -38,7 +40,7 @@ pub struct GatewayClient {
 }
 
 struct ClientInner {
-    commands: mpsc::Sender<Command>,
+    active: Arc<RwLock<Option<ActiveConnection>>>,
     state: watch::Receiver<ConnectionState>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
@@ -48,7 +50,15 @@ struct ClientInner {
     request_timeout: Duration,
     shutdown_timeout: Duration,
     codec: Codec,
+    runtime: Arc<dyn ClientRuntime>,
     issued_device_tokens: Arc<Mutex<Vec<IssuedDeviceToken>>>,
+}
+
+#[derive(Clone)]
+struct ActiveConnection {
+    epoch: ConnectionEpoch,
+    commands: mpsc::Sender<Command>,
+    max_payload_bytes: usize,
 }
 
 /// Exclusive receiver for the bounded Gateway event queue.
@@ -79,18 +89,18 @@ impl GatewayClient {
         config
             .validate()
             .map_err(GatewayClientError::Configuration)?;
-        let (command_tx, command_rx) = mpsc::channel(config.limits.command_queue_capacity);
         let (event_tx, event_rx) = mpsc::channel(config.limits.event_queue_capacity);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Starting);
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
+        let active = Arc::new(RwLock::new(None));
         let permits = Arc::new(Semaphore::new(config.limits.max_in_flight_requests));
         let serialization_bytes = Arc::new(Semaphore::new(AUTHENTICATED_MAX_FRAME_BYTES));
         let outbound_bytes = Arc::new(Semaphore::new(config.limits.outbound_queue_bytes));
         let issued_device_tokens = Arc::new(Mutex::new(Vec::new()));
         let latest_device_token = Arc::new(Mutex::new(None));
         let inner = Arc::new(ClientInner {
-            commands: command_tx,
+            active: Arc::clone(&active),
             state: state_rx,
             cancellation: cancellation.clone(),
             tasks: tasks.clone(),
@@ -100,9 +110,11 @@ impl GatewayClient {
             request_timeout: config.timeouts.request,
             shutdown_timeout: config.timeouts.shutdown,
             codec: Codec::authenticated(),
+            runtime: Arc::clone(&runtime),
             issued_device_tokens: Arc::clone(&issued_device_tokens),
         });
         let resources = SupervisorResources {
+            active,
             events: event_tx,
             states: state_tx,
             cancellation,
@@ -111,7 +123,7 @@ impl GatewayClient {
             issued_device_tokens,
             latest_device_token,
         };
-        tasks.spawn(supervise(config, runtime, command_rx, resources));
+        tasks.spawn(supervise(config, runtime, resources));
         Ok((Self { inner }, GatewayEventStream { receiver: event_rx }))
     }
 
@@ -136,11 +148,11 @@ impl GatewayClient {
     }
 
     /// Waits until authentication succeeds or a terminal state is reached.
-    pub async fn wait_ready(&self) -> Result<ConnectionInfo, GatewayClientError> {
+    pub async fn wait_ready(&self) -> Result<ReadyConnection, GatewayClientError> {
         let mut receiver = self.inner.state.clone();
         loop {
             match receiver.borrow().clone() {
-                ConnectionState::Ready(info) => return Ok(info),
+                ConnectionState::Ready(ready) => return Ok(ready),
                 ConnectionState::AuthenticationFailed(error) => {
                     return Err(GatewayClientError::Authentication(error));
                 }
@@ -184,6 +196,27 @@ impl GatewayClient {
             .await
     }
 
+    /// Sends one request only on the explicitly observed Ready epoch.
+    pub async fn request_for_epoch<T>(
+        &self,
+        expected_epoch: ConnectionEpoch,
+        id: RequestId,
+        method: GatewayMethodName,
+        params: &T,
+    ) -> Result<ResponseFrame, GatewayClientError>
+    where
+        T: Serialize + ?Sized,
+    {
+        self.request_with_timeout_for_epoch(
+            expected_epoch,
+            id,
+            method,
+            params,
+            self.inner.request_timeout,
+        )
+        .await
+    }
+
     /// Sends one typed request with an explicit caller deadline.
     pub async fn request_with_timeout<T>(
         &self,
@@ -195,13 +228,46 @@ impl GatewayClient {
     where
         T: Serialize + ?Sized,
     {
+        let connection = self
+            .active_connection()
+            .ok_or(GatewayClientError::NotReady)?;
+        self.request_with_connection(connection, id, method, params, timeout)
+            .await
+    }
+
+    /// Sends one deadline-bounded request only on the explicitly observed Ready epoch.
+    pub async fn request_with_timeout_for_epoch<T>(
+        &self,
+        expected_epoch: ConnectionEpoch,
+        id: RequestId,
+        method: GatewayMethodName,
+        params: &T,
+        timeout: Duration,
+    ) -> Result<ResponseFrame, GatewayClientError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let connection = self.connection_for_epoch(expected_epoch)?;
+        self.request_with_connection(connection, id, method, params, timeout)
+            .await
+    }
+
+    async fn request_with_connection<T>(
+        &self,
+        connection: ActiveConnection,
+        id: RequestId,
+        method: GatewayMethodName,
+        params: &T,
+        timeout: Duration,
+    ) -> Result<ResponseFrame, GatewayClientError>
+    where
+        T: Serialize + ?Sized,
+    {
         if timeout.is_zero() {
             return Err(GatewayClientError::RequestTimedOut(id));
         }
-        let max_payload_bytes = match self.inner.state.borrow().clone() {
-            ConnectionState::Ready(info) => info.max_payload_bytes,
-            _ => return Err(GatewayClientError::NotReady),
-        };
+        let expected_epoch = connection.epoch;
+        let max_payload_bytes = connection.max_payload_bytes;
         let permit = Arc::clone(&self.inner.permits)
             .try_acquire_owned()
             .map_err(|_| GatewayClientError::Backpressure(BackpressureError::InFlightLimit))?;
@@ -229,11 +295,24 @@ impl GatewayClient {
                 GatewayClientError::Backpressure(BackpressureError::CommandBytesSaturated)
             })?;
         drop(serialization_permit);
-        let (completion, response) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + timeout;
-        self.inner
+        tokio::select! {
+            () = self.inner.cancellation.cancelled() => {
+                return Err(GatewayClientError::Cancelled);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(GatewayClientError::RequestTimedOut(id));
+            }
+            () = self.inner.runtime.before_request_enqueue() => {}
+        }
+        if self.current_epoch() != Some(expected_epoch) {
+            return Err(Self::connection_changed(expected_epoch));
+        }
+        let (completion, response) = oneshot::channel();
+        connection
             .commands
             .try_send(Command::Request {
+                epoch: expected_epoch,
                 id: id.clone(),
                 bytes,
                 completion,
@@ -245,18 +324,55 @@ impl GatewayClient {
                 mpsc::error::TrySendError::Full(_) => {
                     GatewayClientError::Backpressure(BackpressureError::CommandQueueSaturated)
                 }
-                mpsc::error::TrySendError::Closed(_) => GatewayClientError::Cancelled,
+                mpsc::error::TrySendError::Closed(_) => Self::connection_changed(expected_epoch),
             })?;
         tokio::select! {
             () = self.inner.cancellation.cancelled() => Err(GatewayClientError::Cancelled),
             result = tokio::time::timeout_at(deadline, response) => {
                 match result {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(_)) => Err(GatewayClientError::DisconnectedNotReplayed),
+                    Ok(Ok(Ok(response)))
+                        if response.epoch == expected_epoch
+                            && self.current_epoch() == Some(expected_epoch) =>
+                    {
+                        Ok(response.frame)
+                    }
+                    Ok(Ok(Ok(_))) | Ok(Err(_)) => Err(Self::connection_changed(expected_epoch)),
+                    Ok(Ok(Err(error))) => Err(error),
                     Err(_) => Err(GatewayClientError::RequestTimedOut(id)),
                 }
             }
         }
+    }
+
+    fn active_connection(&self) -> Option<ActiveConnection> {
+        self.inner
+            .active
+            .read()
+            .expect("active Gateway connection lock")
+            .clone()
+    }
+
+    fn connection_for_epoch(
+        &self,
+        expected_epoch: ConnectionEpoch,
+    ) -> Result<ActiveConnection, GatewayClientError> {
+        match self.active_connection() {
+            Some(connection) if connection.epoch == expected_epoch => Ok(connection),
+            Some(_) | None => Err(Self::connection_changed(expected_epoch)),
+        }
+    }
+
+    fn current_epoch(&self) -> Option<ConnectionEpoch> {
+        self.inner
+            .active
+            .read()
+            .expect("active Gateway connection lock")
+            .as_ref()
+            .map(|connection| connection.epoch)
+    }
+
+    const fn connection_changed(expected: ConnectionEpoch) -> GatewayClientError {
+        GatewayClientError::ConnectionChanged { expected }
     }
 
     /// Cancels pending work, performs a bounded close, and waits for every tracked task.
@@ -283,17 +399,23 @@ impl Drop for GatewayClient {
 
 enum Command {
     Request {
+        epoch: ConnectionEpoch,
         id: RequestId,
         bytes: Vec<u8>,
-        completion: oneshot::Sender<Result<ResponseFrame, GatewayClientError>>,
+        completion: oneshot::Sender<Result<EpochResponse, GatewayClientError>>,
         deadline: tokio::time::Instant,
         _permit: OwnedSemaphorePermit,
         _byte_permit: OwnedSemaphorePermit,
     },
 }
 
+struct EpochResponse {
+    epoch: ConnectionEpoch,
+    frame: ResponseFrame,
+}
+
 struct PendingRequest {
-    completion: oneshot::Sender<Result<ResponseFrame, GatewayClientError>>,
+    completion: oneshot::Sender<Result<EpochResponse, GatewayClientError>>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -303,6 +425,7 @@ struct SessionOutcome {
 }
 
 struct SupervisorResources {
+    active: Arc<RwLock<Option<ActiveConnection>>>,
     events: mpsc::Sender<GatewayEvent>,
     states: watch::Sender<ConnectionState>,
     cancellation: CancellationToken,
@@ -312,19 +435,34 @@ struct SupervisorResources {
     latest_device_token: Arc<Mutex<Option<SecretString>>>,
 }
 
+struct EpochAllocator {
+    next: u64,
+}
+
+impl EpochAllocator {
+    const fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    fn allocate(&mut self) -> Option<ConnectionEpoch> {
+        let value = NonZeroU64::new(self.next)?;
+        self.next = self.next.checked_add(1).unwrap_or(0);
+        Some(ConnectionEpoch::new(value))
+    }
+}
+
 async fn supervise(
     mut config: GatewayClientConfig,
     runtime: Arc<dyn ClientRuntime>,
-    mut commands: mpsc::Receiver<Command>,
     resources: SupervisorResources,
 ) {
     let mut retry = 0_u32;
     let mut corrective_device_retry_used = false;
+    let mut epochs = EpochAllocator::new();
     loop {
         set_state(&resources.states, ConnectionState::Connecting);
         let outcome =
-            run_connection(&mut config, Arc::clone(&runtime), &mut commands, &resources).await;
-        drain_commands(&mut commands, GatewayClientError::DisconnectedNotReplayed);
+            run_connection(&mut config, Arc::clone(&runtime), &mut epochs, &resources).await;
         match outcome.result {
             Err(GatewayClientError::Cancelled) | Ok(()) => {
                 set_state(&resources.states, ConnectionState::Stopped);
@@ -358,13 +496,7 @@ async fn supervise(
                                 delay,
                             },
                         );
-                        if wait_to_reconnect(
-                            runtime.as_ref(),
-                            delay,
-                            &mut commands,
-                            &resources.cancellation,
-                        )
-                        .await
+                        if wait_to_reconnect(runtime.as_ref(), delay, &resources.cancellation).await
                         {
                             continue;
                         }
@@ -407,14 +539,7 @@ async fn supervise(
                         delay,
                     },
                 );
-                if !wait_to_reconnect(
-                    runtime.as_ref(),
-                    delay,
-                    &mut commands,
-                    &resources.cancellation,
-                )
-                .await
-                {
+                if !wait_to_reconnect(runtime.as_ref(), delay, &resources.cancellation).await {
                     set_state(&resources.states, ConnectionState::Stopped);
                     break;
                 }
@@ -435,29 +560,20 @@ async fn supervise(
 async fn wait_to_reconnect(
     runtime: &dyn ClientRuntime,
     delay: Duration,
-    commands: &mut mpsc::Receiver<Command>,
     cancellation: &CancellationToken,
 ) -> bool {
     let sleeper = runtime.sleep(delay);
     tokio::pin!(sleeper);
-    loop {
-        tokio::select! {
-            () = cancellation.cancelled() => return false,
-            () = &mut sleeper => return true,
-            command = commands.recv() => {
-                match command {
-                    Some(command) => reject_command(command, GatewayClientError::NotReady),
-                    None => return false,
-                }
-            }
-        }
+    tokio::select! {
+        () = cancellation.cancelled() => false,
+        () = &mut sleeper => true,
     }
 }
 
 async fn run_connection(
     config: &mut GatewayClientConfig,
     runtime: Arc<dyn ClientRuntime>,
-    commands: &mut mpsc::Receiver<Command>,
+    epochs: &mut EpochAllocator,
     resources: &SupervisorResources,
 ) -> SessionOutcome {
     let opening = tokio::time::timeout(config.timeouts.connect, transport::connect(&config.url));
@@ -528,17 +644,38 @@ async fn run_connection(
             config.credential = GatewayCredential::DeviceToken(token);
         }
     }
-    set_state(
-        &resources.states,
-        ConnectionState::Ready(authenticated.info.clone()),
+    let Some(epoch) = epochs.allocate() else {
+        bounded_close(&mut socket, config.timeouts.shutdown).await;
+        return SessionOutcome {
+            result: Err(GatewayClientError::Protocol(
+                ProtocolFailure::ConnectionEpochExhausted,
+            )),
+            was_ready: false,
+        };
+    };
+    let (command_tx, command_rx) = mpsc::channel(config.limits.command_queue_capacity);
+    publish_ready(
+        resources,
+        ActiveConnection {
+            epoch,
+            commands: command_tx,
+            max_payload_bytes: authenticated.max_payload_bytes,
+        },
+        ReadyConnection {
+            epoch,
+            info: authenticated.info.clone(),
+        },
     );
     let result = run_ready(
         socket,
-        authenticated.max_payload_bytes,
+        ReadySession {
+            epoch,
+            max_payload_bytes: authenticated.max_payload_bytes,
+            tick_interval: authenticated.tick_interval,
+        },
         config,
-        commands,
+        command_rx,
         resources,
-        authenticated.tick_interval,
         Arc::clone(&runtime),
     )
     .await;
@@ -554,6 +691,13 @@ struct Authenticated {
     tick_interval: Duration,
     reconnect_device_token: Option<SecretString>,
     issued_device_tokens: Vec<IssuedDeviceToken>,
+}
+
+#[derive(Clone, Copy)]
+struct ReadySession {
+    epoch: ConnectionEpoch,
+    max_payload_bytes: usize,
+    tick_interval: Duration,
 }
 
 async fn authenticate(
@@ -640,6 +784,18 @@ async fn authenticate(
         if OperatorScope::from_identity(scope.as_str()).is_none()
             || !effective_scope_identities.insert(scope.as_str())
         {
+            return Err(GatewayClientError::Protocol(
+                ProtocolFailure::HelloAuthenticationMismatch,
+            ));
+        }
+    }
+    if config.authorization_expectation == AuthorizationExpectation::ExactRequested {
+        let requested_scope_identities = config
+            .scopes
+            .iter()
+            .map(claw_security::authorization::Scope::as_str)
+            .collect::<HashSet<_>>();
+        if effective_scope_identities != requested_scope_identities {
             return Err(GatewayClientError::Protocol(
                 ProtocolFailure::HelloAuthenticationMismatch,
             ));
@@ -859,11 +1015,10 @@ fn connect_recovery(codec: &Codec, response: &ResponseFrame) -> Option<ConnectRe
 
 async fn run_ready(
     socket: transport::GatewaySocket,
-    max_payload_bytes: usize,
+    session: ReadySession,
     config: &GatewayClientConfig,
-    commands: &mut mpsc::Receiver<Command>,
+    mut commands: mpsc::Receiver<Command>,
     resources: &SupervisorResources,
-    tick_interval: Duration,
     runtime: Arc<dyn ClientRuntime>,
 ) -> Result<(), GatewayClientError> {
     let (mut read, mut write) = transport::split(socket);
@@ -875,7 +1030,7 @@ async fn run_ready(
         loop {
             let inbound = tokio::select! {
                 () = reader_token.cancelled() => break,
-                result = reader.read_split(&mut read, max_payload_bytes) => result,
+                result = reader.read_split(&mut read, session.max_payload_bytes) => result,
             };
             let terminal = matches!(inbound, Ok(Inbound::Close(_)) | Err(_));
             let sent = tokio::select! {
@@ -893,14 +1048,14 @@ async fn run_ready(
     let mut abandoned = CompletedIds::new(config.limits.completed_id_capacity);
     let mut sequences = EventSequenceTracker::new();
     let command_policy = CommandPolicy {
-        max_payload_bytes,
+        max_payload_bytes: session.max_payload_bytes,
         max_in_flight: config.limits.max_in_flight_requests,
         identifier_capacity: config.limits.completed_id_capacity,
         write_timeout: config.timeouts.request,
     };
     let mut cleanup = tokio::time::interval(Duration::from_millis(100));
     cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let watchdog_timeout = tick_interval.saturating_mul(3);
+    let watchdog_timeout = session.tick_interval.saturating_mul(3);
     let watchdog = tokio::time::sleep(watchdog_timeout);
     tokio::pin!(watchdog);
     let result = loop {
@@ -923,6 +1078,7 @@ async fn run_ready(
                     break Err(GatewayClientError::Cancelled);
                 };
                 let context = CommandContext {
+                    epoch: session.epoch,
                     policy: command_policy,
                     cancellation: &resources.cancellation,
                     runtime: runtime.as_ref(),
@@ -945,14 +1101,18 @@ async fn run_ready(
                 watchdog.as_mut().reset(tokio::time::Instant::now() + watchdog_timeout);
                 match inbound {
                     Ok(Inbound::Text(bytes)) => {
+                        let mut context = InboundContext {
+                            epoch: session.epoch,
+                            pending: &mut pending,
+                            completed: &mut completed,
+                            abandoned: &mut abandoned,
+                            sequences: &mut sequences,
+                            resources,
+                        };
                         if let Err(error) = handle_inbound(
                             &codec,
                             &bytes,
-                            &mut pending,
-                            &mut completed,
-                            &mut abandoned,
-                            &mut sequences,
-                            resources,
+                            &mut context,
                         ) {
                             break Err(error);
                         }
@@ -1004,11 +1164,13 @@ async fn run_ready(
             }
         }
     };
+    clear_active(&resources.active, session.epoch);
     reader_cancellation.cancel();
     let _ = reader_task.await;
     fail_pending(
         &mut pending,
         matches!(result, Err(GatewayClientError::Cancelled)),
+        session.epoch,
     );
     result
 }
@@ -1022,6 +1184,7 @@ struct CommandPolicy {
 }
 
 struct CommandContext<'a> {
+    epoch: ConnectionEpoch,
     policy: CommandPolicy,
     cancellation: &'a CancellationToken,
     runtime: &'a dyn ClientRuntime,
@@ -1036,6 +1199,7 @@ async fn handle_command(
     pending: &mut HashMap<RequestId, PendingRequest>,
 ) -> Result<(), GatewayClientError> {
     let Command::Request {
+        epoch,
         id,
         bytes,
         mut completion,
@@ -1043,6 +1207,12 @@ async fn handle_command(
         _permit,
         _byte_permit,
     } = command;
+    if epoch != context.epoch {
+        let _ = completion.send(Err(GatewayClientError::ConnectionChanged {
+            expected: epoch,
+        }));
+        return Ok(());
+    }
     if completion.is_closed() || tokio::time::Instant::now() >= deadline {
         return Ok(());
     }
@@ -1119,28 +1289,36 @@ async fn handle_command(
     Ok(())
 }
 
+struct InboundContext<'a> {
+    epoch: ConnectionEpoch,
+    pending: &'a mut HashMap<RequestId, PendingRequest>,
+    completed: &'a mut CompletedIds,
+    abandoned: &'a mut CompletedIds,
+    sequences: &'a mut EventSequenceTracker,
+    resources: &'a SupervisorResources,
+}
+
 fn handle_inbound(
     codec: &Codec,
     bytes: &[u8],
-    pending: &mut HashMap<RequestId, PendingRequest>,
-    completed: &mut CompletedIds,
-    abandoned: &mut CompletedIds,
-    sequences: &mut EventSequenceTracker,
-    resources: &SupervisorResources,
+    context: &mut InboundContext<'_>,
 ) -> Result<(), GatewayClientError> {
     match codec.decode(bytes)? {
         Frame::Response(response) => {
             let id = response.id().clone();
-            if let Some(request) = pending.remove(&id) {
-                completed.insert(id);
-                let _ = request.completion.send(Ok(response));
+            if let Some(request) = context.pending.remove(&id) {
+                context.completed.insert(id);
+                let _ = request.completion.send(Ok(EpochResponse {
+                    epoch: context.epoch,
+                    frame: response,
+                }));
                 Ok(())
-            } else if completed.contains(&id) {
+            } else if context.completed.contains(&id) {
                 Err(GatewayClientError::Protocol(
                     ProtocolFailure::DuplicateResponse(id),
                 ))
-            } else if abandoned.remove(&id) {
-                completed.insert(id);
+            } else if context.abandoned.remove(&id) {
+                context.completed.insert(id);
                 Ok(())
             } else {
                 Err(GatewayClientError::Protocol(
@@ -1149,7 +1327,7 @@ fn handle_inbound(
             }
         }
         Frame::Event(event) => {
-            if let Err(error) = sequences.observe(event.sequence()) {
+            if let Err(error) = context.sequences.observe(event.sequence()) {
                 let reason = match error {
                     EventSequenceError::Gap { expected, received } => {
                         ResyncRequired::Gap { expected, received }
@@ -1169,7 +1347,7 @@ fn handle_inbound(
                     ProtocolFailure::ResyncRequired(reason),
                 ));
             }
-            if resources.events.is_closed() {
+            if context.resources.events.is_closed() {
                 return Ok(());
             }
             let encoded_bytes = u32::try_from(bytes.len().max(1)).map_err(|_| {
@@ -1177,14 +1355,15 @@ fn handle_inbound(
                     ResyncRequired::EventQueueSaturated,
                 ))
             })?;
-            let byte_permit = Arc::clone(&resources.event_bytes)
+            let byte_permit = Arc::clone(&context.resources.event_bytes)
                 .try_acquire_many_owned(encoded_bytes)
                 .map_err(|_| {
                     GatewayClientError::Protocol(ProtocolFailure::ResyncRequired(
                         ResyncRequired::EventQueueSaturated,
                     ))
                 })?;
-            match resources
+            match context
+                .resources
                 .events
                 .try_send(GatewayEvent::new(event, byte_permit))
             {
@@ -1246,31 +1425,18 @@ fn remove_cancelled(
     }
 }
 
-fn fail_pending(pending: &mut HashMap<RequestId, PendingRequest>, cancelled: bool) {
+fn fail_pending(
+    pending: &mut HashMap<RequestId, PendingRequest>,
+    cancelled: bool,
+    epoch: ConnectionEpoch,
+) {
     for (_, request) in pending.drain() {
         let error = if cancelled {
             GatewayClientError::Cancelled
         } else {
-            GatewayClientError::DisconnectedNotReplayed
+            GatewayClientError::ConnectionChanged { expected: epoch }
         };
         let _ = request.completion.send(Err(error));
-    }
-}
-
-fn reject_command(command: Command, error: GatewayClientError) {
-    let Command::Request { completion, .. } = command;
-    let _ = completion.send(Err(error));
-}
-
-fn drain_commands(commands: &mut mpsc::Receiver<Command>, error: GatewayClientError) {
-    let mut first = Some(error);
-    while let Ok(command) = commands.try_recv() {
-        reject_command(
-            command,
-            first
-                .take()
-                .unwrap_or(GatewayClientError::DisconnectedNotReplayed),
-        );
     }
 }
 
@@ -1293,4 +1459,44 @@ async fn bounded_close(socket: &mut transport::GatewaySocket, timeout: Duration)
 
 fn set_state(states: &watch::Sender<ConnectionState>, state: ConnectionState) {
     states.send_replace(state);
+}
+
+fn publish_ready(
+    resources: &SupervisorResources,
+    connection: ActiveConnection,
+    ready: ReadyConnection,
+) {
+    let mut active = resources
+        .active
+        .write()
+        .expect("active Gateway connection lock");
+    *active = Some(connection);
+    resources.states.send_replace(ConnectionState::Ready(ready));
+}
+
+fn clear_active(active: &RwLock<Option<ActiveConnection>>, epoch: ConnectionEpoch) {
+    let mut active = active.write().expect("active Gateway connection lock");
+    if active
+        .as_ref()
+        .is_some_and(|connection| connection.epoch == epoch)
+    {
+        *active = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EpochAllocator;
+
+    #[test]
+    fn connection_epoch_exhaustion_fails_closed_without_wrapping() {
+        let mut epochs = EpochAllocator { next: u64::MAX };
+        assert_eq!(
+            epochs.allocate().expect("last epoch").get(),
+            u64::MAX,
+            "the final non-zero epoch remains usable"
+        );
+        assert!(epochs.allocate().is_none());
+        assert!(epochs.allocate().is_none());
+    }
 }

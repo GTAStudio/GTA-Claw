@@ -2,6 +2,7 @@
 
 mod support;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,9 +11,10 @@ use std::task::Poll;
 use std::time::Duration;
 
 use claw_gateway_client::{
-    BackpressureError, ClientLimits, ClientMetadata, ClientRuntime, ClientTimeouts,
-    ConnectionState, GatewayClient, GatewayClientConfig, GatewayClientError, GatewayCredential,
-    ProtocolFailure, ReconnectPolicy, ResyncRequired, SystemRuntime,
+    AuthorizationExpectation, BackpressureError, ClientLimits, ClientMetadata, ClientRuntime,
+    ClientTimeouts, ConnectionEpoch, ConnectionState, GatewayClient, GatewayClientConfig,
+    GatewayClientError, GatewayCredential, ProtocolFailure, ReconnectPolicy, ResyncRequired,
+    SystemRuntime,
 };
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, ClientId, ClientMode, Codec, CodecError, GatewayMethodName,
@@ -27,15 +29,15 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::json;
-use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use url::Url;
 
 use support::{
     TestGateway, complete_handshake, complete_handshake_with_tick_interval, handler,
     raw_stalled_server, receive_connect, receive_request, send_challenge, send_connect_error,
-    send_connect_error_details, send_hello_with_device_token, send_hello_with_tick_interval,
-    send_json, send_raw_text, send_response, wait_for_close,
+    send_connect_error_details, send_hello_with_authorization, send_hello_with_device_token,
+    send_hello_with_tick_interval, send_json, send_raw_text, send_response, wait_for_close,
 };
 
 fn identity() -> Arc<DeviceIdentity> {
@@ -55,6 +57,12 @@ fn config(url: Url) -> GatewayClientConfig {
         request: Duration::from_secs(2),
         shutdown: Duration::from_secs(1),
     };
+    config
+}
+
+fn exact_config(url: Url) -> GatewayClientConfig {
+    let mut config = config(url);
+    config.authorization_expectation = AuthorizationExpectation::ExactRequested;
     config
 }
 
@@ -154,6 +162,122 @@ impl ClientRuntime for WriteGateRuntime {
                     .await
                     .expect("write gate remains open")
                     .forget();
+            })
+        } else {
+            Box::pin(async {})
+        }
+    }
+}
+
+#[derive(Default)]
+struct ImmediateRuntime {
+    system: SystemRuntime,
+}
+
+impl ClientRuntime for ImmediateRuntime {
+    fn unix_millis(&self) -> u64 {
+        self.system.unix_millis()
+    }
+
+    fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(async {})
+    }
+
+    fn jitter(&self, _maximum: Duration) -> Duration {
+        Duration::ZERO
+    }
+}
+
+struct EnqueueGateRuntime {
+    base: ImmediateRuntime,
+    gate_next: AtomicBool,
+    entered: Notify,
+    release: Arc<Semaphore>,
+    released: AtomicBool,
+    consumed: Arc<AtomicBool>,
+    enqueue_entries: AtomicUsize,
+}
+
+struct EnqueueGateGuard {
+    runtime: Arc<EnqueueGateRuntime>,
+}
+
+impl EnqueueGateRuntime {
+    fn new() -> (Arc<Self>, EnqueueGateGuard) {
+        let runtime = Arc::new(Self {
+            base: ImmediateRuntime::default(),
+            gate_next: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Arc::new(Semaphore::new(0)),
+            released: AtomicBool::new(false),
+            consumed: Arc::new(AtomicBool::new(false)),
+            enqueue_entries: AtomicUsize::new(0),
+        });
+        let guard = EnqueueGateGuard {
+            runtime: Arc::clone(&runtime),
+        };
+        (runtime, guard)
+    }
+
+    async fn wait_until_blocked(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.entered.notified())
+            .await
+            .expect("request reached deterministic enqueue gate");
+    }
+
+    fn unblock(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.release.add_permits(1);
+        }
+    }
+
+    fn was_consumed(&self) -> bool {
+        self.consumed.load(Ordering::SeqCst)
+    }
+
+    fn enqueue_entries(&self) -> usize {
+        self.enqueue_entries.load(Ordering::SeqCst)
+    }
+}
+
+impl EnqueueGateGuard {
+    fn unblock(&self) {
+        self.runtime.unblock();
+    }
+}
+
+impl Drop for EnqueueGateGuard {
+    fn drop(&mut self) {
+        self.runtime.unblock();
+    }
+}
+
+impl ClientRuntime for EnqueueGateRuntime {
+    fn unix_millis(&self) -> u64 {
+        self.base.unix_millis()
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.base.sleep(duration)
+    }
+
+    fn jitter(&self, maximum: Duration) -> Duration {
+        self.base.jitter(maximum)
+    }
+
+    fn before_request_enqueue(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.enqueue_entries.fetch_add(1, Ordering::SeqCst);
+        if self.gate_next.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            let release = Arc::clone(&self.release);
+            let consumed = Arc::clone(&self.consumed);
+            Box::pin(async move {
+                release
+                    .acquire_owned()
+                    .await
+                    .expect("enqueue gate remains open")
+                    .forget();
+                consumed.store(true, Ordering::SeqCst);
             })
         } else {
             Box::pin(async {})
@@ -374,6 +498,100 @@ async fn accepts_closed_effective_scopes_reported_by_server_hello() {
     );
     client.shutdown().await.expect("shutdown");
     gateway.shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_requested_authorization_is_enforced_before_ready_or_rpc() {
+    for (label, scopes, accepted) in [
+        ("exact-read", &["operator.read"][..], true),
+        ("empty", &[][..], false),
+        ("write", &["operator.write"][..], false),
+        ("admin", &["operator.admin"][..], false),
+        (
+            "read-plus-extra",
+            &["operator.read", "operator.admin"][..],
+            false,
+        ),
+    ] {
+        let application_requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = Arc::clone(&application_requests);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let application_requests = Arc::clone(&handler_requests);
+            async move {
+                send_challenge(&mut socket).await;
+                let (request, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                send_hello_with_authorization(
+                    &mut socket,
+                    request.id(),
+                    "reused-server-connection",
+                    "operator",
+                    scopes,
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                )
+                .await;
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == OpCode::Text => {
+                            application_requests.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(frame) if frame.opcode == OpCode::Close => return,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            }
+        }))
+        .await;
+        let (client, _) =
+            GatewayClient::start(exact_config(gateway.url.clone())).expect("start exact client");
+        let mut states = client.subscribe_state();
+        let ready_observer = tokio::spawn(async move {
+            loop {
+                match states.borrow().clone() {
+                    ConnectionState::Ready(_) => return true,
+                    ConnectionState::ProtocolFailed { .. } => return false,
+                    ConnectionState::AuthenticationFailed(_)
+                    | ConnectionState::ReconnectExhausted
+                    | ConnectionState::ResyncRequired(_)
+                    | ConnectionState::Stopped => {
+                        panic!("unexpected terminal state while checking {label}")
+                    }
+                    ConnectionState::Starting
+                    | ConnectionState::Connecting
+                    | ConnectionState::Authenticating
+                    | ConnectionState::Reconnecting { .. } => {}
+                }
+                states.changed().await.expect("state channel");
+            }
+        });
+        let ready = client.wait_ready().await;
+        if accepted {
+            let ready = ready.expect("exact singleton authorization reaches Ready");
+            assert_eq!(ready.info.role, "operator");
+            assert_eq!(ready.info.scopes.as_ref(), ["operator.read".to_owned()]);
+            assert!(
+                ready_observer.await.expect("Ready observer"),
+                "{label} must publish Ready"
+            );
+        } else {
+            assert!(
+                matches!(ready, Err(GatewayClientError::Protocol(_))),
+                "{label} unexpectedly reached Ready: {ready:?}"
+            );
+            assert!(
+                !ready_observer.await.expect("terminal observer"),
+                "{label} must fail before Ready"
+            );
+        }
+        client.shutdown().await.expect("exact client shutdown");
+        gateway.shutdown().await;
+        assert_eq!(
+            application_requests.load(Ordering::SeqCst),
+            0,
+            "{label} sent an application RPC"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1265,11 +1483,17 @@ async fn rejects_unknown_and_duplicate_responses() {
     client.shutdown().await.expect("shutdown");
     unknown.shutdown().await;
 
-    let duplicate = TestGateway::spawn(handler(|mut socket, _| async move {
-        complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
-        let request = receive_request(&mut socket).await;
-        send_response(&mut socket, request.id().as_str(), 1).await;
-        send_response(&mut socket, request.id().as_str(), 1).await;
+    let release_duplicate = Arc::new(Notify::new());
+    let handler_release_duplicate = Arc::clone(&release_duplicate);
+    let duplicate = TestGateway::spawn(handler(move |mut socket, _| {
+        let release_duplicate = Arc::clone(&handler_release_duplicate);
+        async move {
+            complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+            let request = receive_request(&mut socket).await;
+            send_response(&mut socket, request.id().as_str(), 1).await;
+            release_duplicate.notified().await;
+            send_response(&mut socket, request.id().as_str(), 1).await;
+        }
     }))
     .await;
     let (client, _) = GatewayClient::start(config(duplicate.url.clone())).expect("start");
@@ -1278,6 +1502,7 @@ async fn rejects_unknown_and_duplicate_responses() {
         .request(request_id("duplicate"), health_method(), &json!({}))
         .await
         .expect("first response");
+    release_duplicate.notify_one();
     wait_for_state(&client, |state| {
         matches!(state, ConnectionState::ProtocolFailed { .. })
     })
@@ -1716,6 +1941,486 @@ async fn cancellation_is_safe_during_connect_auth_and_reconnect() {
 }
 
 #[tokio::test]
+async fn stale_epoch_is_rejected_after_reconnect_before_enqueue_without_writing_on_b() {
+    let close_a = Arc::new(Notify::new());
+    let handler_close_a = Arc::clone(&close_a);
+    let b_writes = Arc::new(AtomicUsize::new(0));
+    let handler_b_writes = Arc::clone(&b_writes);
+    let (b_request_tx, b_request_rx) = oneshot::channel::<String>();
+    let b_request_tx = Arc::new(Mutex::new(Some(b_request_tx)));
+    let handler_b_request_tx = Arc::clone(&b_request_tx);
+    let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+        let close_a = Arc::clone(&handler_close_a);
+        let b_writes = Arc::clone(&handler_b_writes);
+        let b_request_tx = Arc::clone(&handler_b_request_tx);
+        async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            support::verify_connect_proof(&params);
+            send_hello_with_authorization(
+                &mut socket,
+                connect.id(),
+                "same-server-conn-id",
+                "operator",
+                &["operator.read"],
+                AUTHENTICATED_MAX_FRAME_BYTES,
+            )
+            .await;
+            match index {
+                0 => {
+                    close_a.notified().await;
+                    socket
+                        .write_frame(Frame::close(1012, b"replace A with B"))
+                        .await
+                        .expect("close A");
+                    socket.flush().await.expect("flush A close");
+                }
+                1 => {
+                    let request = receive_request(&mut socket).await;
+                    b_writes.fetch_add(1, Ordering::SeqCst);
+                    if let Some(sender) = b_request_tx.lock().await.take() {
+                        let _ = sender.send(request.id().as_str().to_owned());
+                    }
+                    send_response(&mut socket, request.id().as_str(), 2).await;
+                    wait_for_close(&mut socket).await;
+                }
+                _ => panic!("unexpected extra connection {index}"),
+            }
+        }
+    }))
+    .await;
+    let mut client_config = exact_config(gateway.url.clone());
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 3,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        max_jitter: Duration::ZERO,
+    };
+    client_config.timeouts.request = Duration::from_secs(5);
+    let (runtime, gate) = EnqueueGateRuntime::new();
+    let (client, _) = GatewayClient::start_with_runtime(
+        client_config,
+        Arc::clone(&runtime) as Arc<dyn ClientRuntime>,
+    )
+    .expect("start");
+    let ready_a = client.wait_ready().await.expect("Ready A");
+    let epoch_a = ready_a.epoch;
+    assert_eq!(ready_a.info.connection_id, "same-server-conn-id");
+    let request_client = client.clone();
+    let stale = tokio::spawn(async move {
+        request_client
+            .request_with_timeout_for_epoch(
+                epoch_a,
+                request_id("a-bound-before-enqueue"),
+                health_method(),
+                &json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    runtime.wait_until_blocked().await;
+    assert_eq!(runtime.enqueue_entries(), 1, "enqueue barrier entry");
+    close_a.notify_one();
+    let ready_b = match wait_for_state(
+        &client,
+        |state| matches!(state, ConnectionState::Ready(ready) if ready.epoch != epoch_a),
+    )
+    .await
+    {
+        ConnectionState::Ready(ready) => ready,
+        _ => unreachable!("predicate only accepts Ready"),
+    };
+    assert_ne!(ready_b.epoch, epoch_a);
+    assert_eq!(ready_b.info.connection_id, "same-server-conn-id");
+    gate.unblock();
+    let stale_result = stale.await.expect("stale request task");
+    assert!(runtime.was_consumed(), "enqueue barrier must be consumed");
+    assert!(matches!(
+        stale_result,
+        Err(GatewayClientError::ConnectionChanged { expected }) if expected == epoch_a
+    ));
+    let response = client
+        .request_for_epoch(
+            ready_b.epoch,
+            request_id("fresh-b"),
+            health_method(),
+            &json!({}),
+        )
+        .await
+        .expect("fresh B-bound request");
+    assert!(response.ok());
+    let observed_b_request = b_request_rx.await.expect("B request observation");
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+    assert_eq!(
+        observed_b_request, "fresh-b",
+        "the first method write on B must be the explicitly B-bound request"
+    );
+    assert_eq!(b_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.enqueue_entries(), 2);
+}
+
+#[tokio::test]
+async fn pending_a_response_cannot_complete_as_b_success_or_replay() {
+    let disconnect_a = Arc::new(Notify::new());
+    let handler_disconnect_a = Arc::clone(&disconnect_a);
+    let response_gate_entered = Arc::new(Notify::new());
+    let handler_response_gate_entered = Arc::clone(&response_gate_entered);
+    let response_gate_release = Arc::new(Notify::new());
+    let handler_response_gate_release = Arc::clone(&response_gate_release);
+    let response_gate_consumed = Arc::new(Notify::new());
+    let handler_response_gate_consumed = Arc::clone(&response_gate_consumed);
+    let b_writes = Arc::new(AtomicUsize::new(0));
+    let handler_b_writes = Arc::clone(&b_writes);
+    let (b_request_tx, b_request_rx) = oneshot::channel::<String>();
+    let b_request_tx = Arc::new(Mutex::new(Some(b_request_tx)));
+    let handler_b_request_tx = Arc::clone(&b_request_tx);
+    let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+        let disconnect_a = Arc::clone(&handler_disconnect_a);
+        let response_gate_entered = Arc::clone(&handler_response_gate_entered);
+        let response_gate_release = Arc::clone(&handler_response_gate_release);
+        let response_gate_consumed = Arc::clone(&handler_response_gate_consumed);
+        let b_writes = Arc::clone(&handler_b_writes);
+        let b_request_tx = Arc::clone(&handler_b_request_tx);
+        async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            support::verify_connect_proof(&params);
+            send_hello_with_authorization(
+                &mut socket,
+                connect.id(),
+                "same-server-conn-id",
+                "operator",
+                &["operator.read"],
+                AUTHENTICATED_MAX_FRAME_BYTES,
+            )
+            .await;
+            match index {
+                0 => {
+                    let request = receive_request(&mut socket).await;
+                    assert_eq!(request.id().as_str(), "shared-correlation-id");
+                    response_gate_entered.notify_one();
+                    disconnect_a.notified().await;
+                    socket
+                        .write_frame(Frame::close(1012, b"disconnect pending A"))
+                        .await
+                        .expect("close pending A");
+                    socket.flush().await.expect("flush pending A close");
+                    response_gate_release.notified().await;
+                    response_gate_consumed.notify_one();
+                }
+                1 => {
+                    let request = receive_request(&mut socket).await;
+                    b_writes.fetch_add(1, Ordering::SeqCst);
+                    if let Some(sender) = b_request_tx.lock().await.take() {
+                        let _ = sender.send(request.id().as_str().to_owned());
+                    }
+                    send_response(&mut socket, request.id().as_str(), 7).await;
+                    wait_for_close(&mut socket).await;
+                }
+                _ => panic!("unexpected extra connection {index}"),
+            }
+        }
+    }))
+    .await;
+    let mut client_config = exact_config(gateway.url.clone());
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 3,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        max_jitter: Duration::ZERO,
+    };
+    client_config.timeouts.request = Duration::from_secs(5);
+    let (client, _) =
+        GatewayClient::start_with_runtime(client_config, Arc::new(ImmediateRuntime::default()))
+            .expect("start");
+    let ready_a = client.wait_ready().await.expect("Ready A");
+    let epoch_a = ready_a.epoch;
+    let request_client = client.clone();
+    let pending_a = tokio::spawn(async move {
+        request_client
+            .request_with_timeout_for_epoch(
+                epoch_a,
+                request_id("shared-correlation-id"),
+                health_method(),
+                &json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), response_gate_entered.notified())
+        .await
+        .expect("A response gate entered");
+    disconnect_a.notify_one();
+    let ready_b = match wait_for_state(
+        &client,
+        |state| matches!(state, ConnectionState::Ready(ready) if ready.epoch != epoch_a),
+    )
+    .await
+    {
+        ConnectionState::Ready(ready) => ready,
+        _ => unreachable!("predicate only accepts Ready"),
+    };
+    response_gate_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), response_gate_consumed.notified())
+        .await
+        .expect("A response gate consumed");
+    let fresh_params = json!({});
+    let fresh_b = client.request_for_epoch(
+        ready_b.epoch,
+        request_id("shared-correlation-id"),
+        health_method(),
+        &fresh_params,
+    );
+    let (pending_result, response) =
+        tokio::join!(async { pending_a.await.expect("pending A task") }, fresh_b);
+    assert!(matches!(
+        pending_result,
+        Err(GatewayClientError::ConnectionChanged { expected }) if expected == epoch_a
+    ));
+    let response = response.expect("fresh B request with reused correlation id");
+    let payload: serde_json::Value = Codec::authenticated()
+        .decode_opaque(response.payload().value().expect("payload"))
+        .expect("decode B response");
+    assert_eq!(payload["marker"], 7);
+    let observed_b_request = b_request_rx.await.expect("B request observation");
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+    assert_eq!(observed_b_request, "shared-correlation-id");
+    assert_eq!(b_writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn invalid_authorization_on_b_never_publishes_ready_or_accepts_rpc() {
+    let close_a = Arc::new(Notify::new());
+    let handler_close_a = Arc::clone(&close_a);
+    let b_requests = Arc::new(AtomicUsize::new(0));
+    let handler_b_requests = Arc::clone(&b_requests);
+    let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+        let close_a = Arc::clone(&handler_close_a);
+        let b_requests = Arc::clone(&handler_b_requests);
+        async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            support::verify_connect_proof(&params);
+            let scopes = if index == 0 {
+                &["operator.read"][..]
+            } else {
+                &[][..]
+            };
+            send_hello_with_authorization(
+                &mut socket,
+                connect.id(),
+                "same-server-conn-id",
+                "operator",
+                scopes,
+                AUTHENTICATED_MAX_FRAME_BYTES,
+            )
+            .await;
+            if index == 0 {
+                close_a.notified().await;
+                socket
+                    .write_frame(Frame::close(1012, b"invalid B follows"))
+                    .await
+                    .expect("close A");
+                socket.flush().await.expect("flush A close");
+            } else {
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == OpCode::Text => {
+                            b_requests.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(frame) if frame.opcode == OpCode::Close => return,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
+    }))
+    .await;
+    let mut client_config = exact_config(gateway.url.clone());
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 3,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) =
+        GatewayClient::start_with_runtime(client_config, Arc::new(ImmediateRuntime::default()))
+            .expect("start");
+    let ready_a = client.wait_ready().await.expect("Ready A");
+    let epoch_a = ready_a.epoch;
+    let mut states = client.subscribe_state();
+    let b_ready_observer = tokio::spawn(async move {
+        loop {
+            match states.borrow().clone() {
+                ConnectionState::Ready(ready) if ready.epoch != epoch_a => return true,
+                ConnectionState::ProtocolFailed { .. } => return false,
+                ConnectionState::AuthenticationFailed(_)
+                | ConnectionState::ReconnectExhausted
+                | ConnectionState::ResyncRequired(_)
+                | ConnectionState::Stopped => {
+                    panic!("unexpected terminal state while waiting for invalid B")
+                }
+                ConnectionState::Starting
+                | ConnectionState::Connecting
+                | ConnectionState::Authenticating
+                | ConnectionState::Ready(_)
+                | ConnectionState::Reconnecting { .. } => {}
+            }
+            states.changed().await.expect("state channel");
+        }
+    });
+    close_a.notify_one();
+    assert!(
+        !b_ready_observer.await.expect("B state observer"),
+        "invalid-scope B must not publish Ready"
+    );
+    assert!(matches!(
+        client
+            .request_for_epoch(
+                epoch_a,
+                request_id("must-not-reach-invalid-b"),
+                health_method(),
+                &json!({}),
+            )
+            .await,
+        Err(GatewayClientError::ConnectionChanged { expected }) if expected == epoch_a
+    ));
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+    assert_eq!(b_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reconnect_storm_allocates_distinct_epochs_and_only_fresh_binds_write() {
+    const CONNECTIONS: usize = 6;
+    let releases = Arc::new(
+        (0..CONNECTIONS - 1)
+            .map(|_| Arc::new(Notify::new()))
+            .collect::<Vec<_>>(),
+    );
+    let handler_releases = Arc::clone(&releases);
+    let (ready_tx, mut ready_rx) = mpsc::channel::<usize>(CONNECTIONS);
+    let final_writes = Arc::new(AtomicUsize::new(0));
+    let handler_final_writes = Arc::clone(&final_writes);
+    let (final_request_tx, final_request_rx) = oneshot::channel::<String>();
+    let final_request_tx = Arc::new(Mutex::new(Some(final_request_tx)));
+    let handler_final_request_tx = Arc::clone(&final_request_tx);
+    let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+        let releases = Arc::clone(&handler_releases);
+        let ready_tx = ready_tx.clone();
+        let final_writes = Arc::clone(&handler_final_writes);
+        let final_request_tx = Arc::clone(&handler_final_request_tx);
+        async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            support::verify_connect_proof(&params);
+            send_hello_with_authorization(
+                &mut socket,
+                connect.id(),
+                "storm-reused-server-id",
+                "operator",
+                &["operator.read"],
+                AUTHENTICATED_MAX_FRAME_BYTES,
+            )
+            .await;
+            ready_tx.send(index).await.expect("report server Ready");
+            if index + 1 < CONNECTIONS {
+                releases[index].notified().await;
+                socket
+                    .write_frame(Frame::close(1012, b"storm reconnect"))
+                    .await
+                    .expect("storm close");
+                socket.flush().await.expect("flush storm close");
+            } else {
+                let request = receive_request(&mut socket).await;
+                final_writes.fetch_add(1, Ordering::SeqCst);
+                if let Some(sender) = final_request_tx.lock().await.take() {
+                    let _ = sender.send(request.id().as_str().to_owned());
+                }
+                send_response(&mut socket, request.id().as_str(), 11).await;
+                wait_for_close(&mut socket).await;
+            }
+        }
+    }))
+    .await;
+    let mut client_config = exact_config(gateway.url.clone());
+    client_config.reconnect = ReconnectPolicy::Bounded {
+        max_attempts: 8,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        max_jitter: Duration::ZERO,
+    };
+    let (client, _) =
+        GatewayClient::start_with_runtime(client_config, Arc::new(ImmediateRuntime::default()))
+            .expect("start");
+    let mut epochs = Vec::<ConnectionEpoch>::new();
+    for index in 0..CONNECTIONS {
+        let reported = tokio::time::timeout(Duration::from_secs(2), ready_rx.recv())
+            .await
+            .expect("server Ready report timeout")
+            .expect("server Ready report");
+        assert_eq!(reported, index);
+        let state = wait_for_state(&client, |state| {
+            matches!(
+                state,
+                ConnectionState::Ready(ready) if !epochs.contains(&ready.epoch)
+            )
+        })
+        .await;
+        let ready = match state {
+            ConnectionState::Ready(ready) => ready,
+            _ => unreachable!("predicate only accepts Ready"),
+        };
+        assert_eq!(ready.info.connection_id, "storm-reused-server-id");
+        for (old_index, old_epoch) in epochs.iter().copied().enumerate() {
+            let result = client
+                .request_for_epoch(
+                    old_epoch,
+                    request_id(&format!("stale-{index}-{old_index}")),
+                    health_method(),
+                    &json!({}),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(GatewayClientError::ConnectionChanged { expected })
+                    if expected == old_epoch
+            ));
+        }
+        epochs.push(ready.epoch);
+        if index + 1 < CONNECTIONS {
+            releases[index].notify_one();
+        }
+    }
+    assert_eq!(
+        epochs.iter().copied().collect::<HashSet<_>>().len(),
+        CONNECTIONS
+    );
+    let final_epoch = *epochs.last().expect("final epoch");
+    let response = client
+        .request_for_epoch(
+            final_epoch,
+            request_id("fresh-final-health"),
+            health_method(),
+            &json!({}),
+        )
+        .await
+        .expect("final epoch health");
+    let payload: serde_json::Value = Codec::authenticated()
+        .decode_opaque(response.payload().value().expect("payload"))
+        .expect("decode final response");
+    assert_eq!(payload["marker"], 11);
+    let observed_final_request = final_request_rx.await.expect("final request observation");
+    client.shutdown().await.expect("shutdown");
+    gateway.shutdown().await;
+    assert_eq!(observed_final_request, "fresh-final-health");
+    assert_eq!(final_writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn transient_reconnect_reauthenticates_and_never_replays_requests() {
     let second_ready = Arc::new(Notify::new());
     let second_ready_handler = Arc::clone(&second_ready);
@@ -1756,7 +2461,7 @@ async fn transient_reconnect_reauthenticates_and_never_replays_requests() {
         .await;
     assert!(matches!(
         first,
-        Err(GatewayClientError::DisconnectedNotReplayed)
+        Err(GatewayClientError::ConnectionChanged { .. })
     ));
     wait_for_state(&client, |state| {
         matches!(state, ConnectionState::Ready(_))
