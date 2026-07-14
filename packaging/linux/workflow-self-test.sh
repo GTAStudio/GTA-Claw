@@ -29,6 +29,94 @@ workflow_event_names() {
   ' "$1"
 }
 
+validate_workflow_on_structure() {
+  awk '
+    function reject(message) {
+      print "workflow on structure: " message > "/dev/stderr"
+      bad = 1
+    }
+    $0 == "on:" {
+      in_on = 1
+      next
+    }
+    in_on && /^[^ ]/ {
+      exit
+    }
+    in_on && /^  [^ ]/ {
+      section = ""
+      if ($0 == "  push:") {
+        event = "push"
+        push_events++
+      } else if ($0 == "  pull_request:") {
+        event = "pull_request"
+        pull_request_events++
+      } else if ($0 == "  workflow_dispatch:") {
+        event = "workflow_dispatch"
+        workflow_dispatch_events++
+      } else {
+        reject("unsupported event declaration: " $0)
+        event = "unsupported"
+      }
+      next
+    }
+    in_on && /^    [^ ]/ {
+      if (event == "push" && $0 == "    branches:") {
+        section = "branches"
+        push_branches++
+      } else if ((event == "push" || event == "pull_request") &&
+                 $0 == "    paths:") {
+        section = "paths"
+        if (event == "push") {
+          push_paths++
+        } else {
+          pull_request_paths++
+        }
+      } else {
+        reject("unsupported " event " option: " $0)
+        section = "unsupported"
+      }
+      next
+    }
+    in_on && /^      - / {
+      if (section == "branches") {
+        if ($0 != "      - main") {
+          reject("unsupported push branch entry: " $0)
+        }
+        push_branch_entries++
+      } else if (section != "paths") {
+        reject("list entry outside an allowed trigger list: " $0)
+      }
+      next
+    }
+    in_on && /^        / {
+      if (section != "paths") {
+        reject("nested trigger content outside paths: " $0)
+      }
+      next
+    }
+    in_on && $0 == "" && event == "workflow_dispatch" {
+      separator_blanks++
+      next
+    }
+    in_on {
+      reject("unsupported trigger content: " $0)
+    }
+    END {
+      if (push_events != 1 ||
+          pull_request_events != 1 ||
+          workflow_dispatch_events != 1 ||
+          push_branches != 1 ||
+          push_branch_entries != 1 ||
+          push_paths != 1 ||
+          pull_request_paths != 1 ||
+          separator_blanks != 1) {
+        reject("required event structure missing or duplicated")
+      }
+      exit bad
+    }
+  ' "$1"
+}
+
 workflow_trigger_paths() {
   local event="$1"
   local candidate="$2"
@@ -167,6 +255,32 @@ workflow_permissions() {
   ' "$1"
 }
 
+workflow_top_level_lines() {
+  awk '/^[^[:space:]]/ { print }' "$1"
+}
+
+workflow_top_level_block() {
+  local key="$1"
+  local candidate="$2"
+  awk -v key="$key" '
+    $0 == key ":" {
+      in_block = 1
+      found++
+    }
+    in_block && $0 != key ":" && /^[^[:space:]]/ {
+      exit
+    }
+    in_block {
+      print
+    }
+    END {
+      if (found != 1) {
+        exit 1
+      }
+    }
+  ' "$candidate"
+}
+
 workflow_job_ids() {
   awk '
     $0 == "jobs:" {
@@ -181,6 +295,21 @@ workflow_job_ids() {
       sub(/^  /, "", line)
       sub(/:$/, "", line)
       print line
+    }
+  ' "$1"
+}
+
+workflow_job_headers() {
+  awk '
+    $0 == "jobs:" {
+      in_jobs = 1
+      next
+    }
+    in_jobs && /^[^ ]/ {
+      exit
+    }
+    in_jobs && /^  [^ ]/ {
+      print
     }
   ' "$1"
 }
@@ -204,6 +333,28 @@ workflow_step_names() {
   ' "$candidate"
 }
 
+workflow_job_block() {
+  local job="$1"
+  local candidate="$2"
+  awk -v job="$job" '
+    $0 == "  " job ":" {
+      in_job = 1
+      found++
+    }
+    in_job && $0 != "  " job ":" && /^  [[:alnum:]_-]+:$/ {
+      exit
+    }
+    in_job {
+      print
+    }
+    END {
+      if (found != 1) {
+        exit 1
+      }
+    }
+  ' "$candidate"
+}
+
 assert_exact_block() {
   local label="$1"
   local expected="$2"
@@ -215,12 +366,46 @@ assert_exact_block() {
   }
 }
 
+assert_required_job() {
+  local job="$1"
+  local expected_digest="$2"
+  local expected_steps="$3"
+  local candidate="$4"
+  local actual
+  local actual_digest
+  local block
+
+  actual="$(workflow_step_names "$job" "$candidate")" || return 1
+  assert_exact_block "$job steps" "$expected_steps" "$actual" || return 1
+
+  block="$(workflow_job_block "$job" "$candidate")" || {
+    printf 'required workflow job missing: %s\n' "$job" >&2
+    return 1
+  }
+  if grep -Eq \
+    '^    (if|continue-on-error):|^        (if|continue-on-error):' \
+    <<<"$block"; then
+    printf 'required job or step can be skipped or error-masked: %s\n' \
+      "$job" >&2
+    return 1
+  fi
+
+  actual_digest="$(
+    printf '%s\n' "$block" |
+      sha256sum |
+      awk '{ print $1 }'
+  )"
+  [[ "$actual_digest" == "$expected_digest" ]] || {
+    printf '%s structure differs from the exact command/action allowlist\n' \
+      "$job" >&2
+    return 1
+  }
+}
+
 validate_workflow() {
   local candidate="$1"
   local actual
-  local contract
   local expected
-  local forbidden
 
   awk '
     /uses:/ {
@@ -232,6 +417,19 @@ validate_workflow() {
     }
     END { exit bad }
   ' "$candidate" || return 1
+
+  expected="$(printf '%s\n' \
+    'name: Linux headless packaging prototype' \
+    'on:' \
+    'permissions:' \
+    'concurrency:' \
+    'env:' \
+    'jobs:')"
+  actual="$(workflow_top_level_lines "$candidate")"
+  assert_exact_block "workflow top-level declarations" \
+    "$expected" "$actual" || return 1
+
+  validate_workflow_on_structure "$candidate" || return 1
 
   expected="$(printf '%s\n' push pull_request workflow_dispatch)"
   actual="$(workflow_event_names "$candidate")"
@@ -260,6 +458,27 @@ validate_workflow() {
   assert_exact_block "workflow permissions" "contents: read" "$actual" || return 1
 
   expected="$(printf '%s\n' \
+    'permissions:' \
+    '  contents: read')"
+  actual="$(workflow_top_level_block permissions "$candidate")" || return 1
+  assert_exact_block "permissions structure" "$expected" "$actual" || return 1
+
+  expected="$(printf '%s\n' \
+    'concurrency:' \
+    '  group: linux-packaging-${{ github.workflow }}-${{ github.ref }}' \
+    '  cancel-in-progress: true')"
+  actual="$(workflow_top_level_block concurrency "$candidate")" || return 1
+  assert_exact_block "concurrency structure" "$expected" "$actual" || return 1
+
+  expected="$(printf '%s\n' \
+    'env:' \
+    '  CARGO_TERM_COLOR: always' \
+    '  RUSTFLAGS: -Dwarnings')"
+  actual="$(workflow_top_level_block env "$candidate")" || return 1
+  assert_exact_block "workflow environment structure" \
+    "$expected" "$actual" || return 1
+
+  expected="$(printf '%s\n' \
     source-policy \
     rust-supply-chain \
     native-x86 \
@@ -268,53 +487,63 @@ validate_workflow() {
   assert_exact_block "workflow jobs" "$expected" "$actual" || return 1
 
   expected="$(printf '%s\n' \
-    'Checkout without credential persistence' \
-    'Install native policy tools' \
-    'Check shell, workflow, source, and release policy' \
-    'Preserve root Linux metadata and desktop rejection')"
-  actual="$(workflow_step_names source-policy "$candidate")"
-  assert_exact_block "source-policy steps" "$expected" "$actual" || return 1
+    '  source-policy:' \
+    '  rust-supply-chain:' \
+    '  native-x86:' \
+    '  cross-arm64:')"
+  actual="$(workflow_job_headers "$candidate")"
+  assert_exact_block "workflow job declarations" \
+    "$expected" "$actual" || return 1
 
-  for forbidden in \
-    'Enforce focused source ownership' \
-    'git diff --name-only' \
-    '--diff-filter' \
-    'BASE_SHA' \
-    'github.event.pull_request.base.sha' \
-    'P04d changed a path outside its ownership'; do
-    if grep -F -- "$forbidden" "$candidate" >/dev/null; then
-      printf 'PR-diff ownership restriction found: %s\n' "$forbidden" >&2
-      return 1
-    fi
-  done
-  if grep -Ein \
-    '(non-packaging|outside (the )?packaging|outside (its |the )?ownership)' \
-    "$candidate" >/dev/null; then
-    echo "non-packaging changed-path rejection contract found" >&2
-    return 1
-  fi
+  assert_required_job \
+    source-policy \
+    8dbca08bd966c4fff889ebae5382d1de819dfdedaa81ed406db5da676f278c04 \
+    "$(printf '%s\n' \
+      'Checkout without credential persistence' \
+      'Install native policy tools' \
+      'Check shell, workflow, source, and release policy' \
+      'Preserve root Linux metadata and desktop rejection')" \
+    "$candidate" || return 1
 
-  for contract in \
-    'name: Source policy and shell security' \
-    'name: Root Rust, MSRV, deny, and audit' \
-    'name: Native x86_64 runtime and packages' \
-    'name: Cross-built arm64 layouts' \
-    'retention-days: 3' \
-    'persist-credentials: false' \
-    './packaging/linux/workflow-self-test.sh' \
-    './packaging/linux/self-test.sh' \
-    './packaging/linux/safeio-self-test.sh' \
-    'cargo metadata --locked --format-version 1' \
-    'select(. == "slint" or . == "slint-build" or startswith("i-slint"))' \
-    'gta-claw-desktop supports only Windows and macOS' \
-    'systemd-analyze verify' \
-    'cmp -s' \
-    'RELEASE_MODE'; do
-    grep -F -- "$contract" "$candidate" >/dev/null || {
-      printf 'workflow contract missing: %s\n' "$contract" >&2
-      return 1
-    }
-  done
+  assert_required_job \
+    rust-supply-chain \
+    3eb617e6b307c5eee65053150ea88b3a03128fdb38bcee8bd2aa0886eaa2eb70 \
+    "$(printf '%s\n' \
+      'Checkout' \
+      'Format, check, lint, and test root workspace' \
+      'Check root workspace at MSRV' \
+      'Check dependency policy' \
+      'Audit advisories')" \
+    "$candidate" || return 1
+
+  assert_required_job \
+    native-x86 \
+    cb0e04fca2614c6a4b7aaac15e35e61d0ead3270a8574190d28ec1fd3e7fd832 \
+    "$(printf '%s\n' \
+      'Checkout' \
+      'Install native package inspection tools' \
+      'Build twice in pinned Bookworm with different umasks' \
+      'Execute binaries on the pinned oldest supported environment' \
+      'Reject forged build manifests and substituted binaries' \
+      'Package independent builds and prove deterministic outputs' \
+      'Mutate every published OCI trust edge' \
+      'Install and execute Debian package on pinned Bookworm' \
+      'Verify systemd unit with packaged executable' \
+      'Prove real Debian and RPM lifecycle' \
+      'Prove release and publication stay disabled' \
+      'Upload short-lived x86_64 prototype artifacts')" \
+    "$candidate" || return 1
+
+  assert_required_job \
+    cross-arm64 \
+    a813a82001df0461d87569206a31306702af423e23d02b0d524f1830300e4172 \
+    "$(printf '%s\n' \
+      'Checkout' \
+      'Install arm64 cross and native package tools' \
+      'Cross-build arm64 twice in pinned Bookworm' \
+      'Package twice and prove deterministic arm64 layouts' \
+      'Upload short-lived arm64 prototype artifacts')" \
+    "$candidate" || return 1
 }
 
 workflow_accepts_path() {
@@ -354,7 +583,8 @@ expect_actionlint_valid_validation_failure() {
     printf 'semantic mutation is not actionlint-valid: %s\n' "$label" >&2
     return 1
   }
-  expect_validation_failure "$label" "$candidate"
+  expect_validation_failure "$label" "$candidate" || return 1
+  printf 'actionlint-valid semantic mutation rejected: %s\n' "$label"
 }
 
 expect_actionlint_valid_validation_success() {
@@ -368,6 +598,62 @@ expect_actionlint_valid_validation_success() {
     printf 'workflow validation rejected equivalent scalars: %s\n' "$label" >&2
     return 1
   }
+  printf 'actionlint-valid equivalent fixture accepted: %s\n' "$label"
+}
+
+insert_event_path() {
+  local event="$1"
+  local entry="$2"
+  local candidate="$3"
+  local output="$4"
+  awk -v event="$event" -v entry="$entry" '
+    $0 == "  " event ":" {
+      in_event = 1
+    }
+    in_event && $0 != "  " event ":" && /^  [^ ]/ {
+      in_event = 0
+    }
+    in_event && !inserted && $0 == "      - \"apps/**\"" {
+      print
+      print entry
+      inserted++
+      next
+    }
+    { print }
+    END {
+      if (inserted != 1) {
+        exit 1
+      }
+    }
+  ' "$candidate" >"$output"
+}
+
+insert_event_block_path() {
+  local event="$1"
+  local style="$2"
+  local candidate="$3"
+  local output="$4"
+  awk -v event="$event" -v style="$style" '
+    $0 == "  " event ":" {
+      in_event = 1
+    }
+    in_event && $0 != "  " event ":" && /^  [^ ]/ {
+      in_event = 0
+    }
+    in_event && !inserted && $0 == "      - \"apps/**\"" {
+      print
+      print "      - " style
+      print "        !apps/**"
+      inserted++
+      next
+    }
+    { print }
+    END {
+      if (inserted != 1) {
+        exit 1
+      }
+    }
+  ' "$candidate" >"$output"
 }
 
 synthetic_app_path="apps/gta-claw-cli/src/lib.rs"
@@ -386,12 +672,29 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 grep -vF './packaging/linux/self-test.sh' "$workflow" \
   >"$tmp_dir/missing-security-self-test.yml"
-expect_validation_failure \
+expect_actionlint_valid_validation_failure \
   "removed Linux security self-test" \
   "$tmp_dir/missing-security-self-test.yml"
 
-grep -vF '  native-x86:' "$workflow" >"$tmp_dir/missing-package-job.yml"
-expect_validation_failure \
+awk '
+  $0 == "  native-x86:" {
+    skip = 1
+    removed++
+    next
+  }
+  skip && $0 == "  cross-arm64:" {
+    skip = 0
+  }
+  !skip {
+    print
+  }
+  END {
+    if (removed != 1 || skip) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/missing-package-job.yml"
+expect_actionlint_valid_validation_failure \
   "removed native package job" \
   "$tmp_dir/missing-package-job.yml"
 
@@ -400,12 +703,209 @@ awk '
     print "      - name: Enforce focused source ownership"
     print "        shell: bash"
     print "        run: git diff --name-only --diff-filter=ACDMRT"
+    inserted++
   }
   { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
 ' "$workflow" >"$tmp_dir/reintroduced-ownership-gate.yml"
-expect_validation_failure \
+expect_actionlint_valid_validation_failure \
   "reintroduced PR-diff ownership gate" \
   "$tmp_dir/reintroduced-ownership-gate.yml"
+
+awk '
+  /^      - name: Check shell, workflow, source, and release policy$/ {
+    inserted++
+  }
+  {
+    print
+  }
+  inserted == 1 && /^            \.\/packaging\/linux\/safeio-self-test\.sh$/ {
+    print "          git diff --name-status \"origin/$GITHUB_BASE_REF...HEAD\" |"
+    print "            awk '\''$2 !~ /^(packaging\\/linux\\/|\\.github\\/workflows\\/linux-packaging\\.yml$)/ { bad=1 } END { exit bad }'\''"
+    inserted++
+  }
+  END {
+    if (inserted != 2) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/equivalent-ownership-gate.yml"
+expect_actionlint_valid_validation_failure \
+  "equivalent Git-history ownership gate" \
+  "$tmp_dir/equivalent-ownership-gate.yml"
+
+awk '
+  $0 == "  source-policy:" {
+    print
+    print "    if: github.event_name == '\''schedule'\''"
+    inserted++
+    next
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/conditional-source-policy-job.yml"
+expect_actionlint_valid_validation_failure \
+  "false condition on source-policy job" \
+  "$tmp_dir/conditional-source-policy-job.yml"
+
+awk '
+  $0 == "      - name: Audit advisories" {
+    print
+    print "        if: github.event_name == '\''schedule'\''"
+    inserted++
+    next
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/skipped-audit-step.yml"
+expect_actionlint_valid_validation_failure \
+  "skipped audit security step" \
+  "$tmp_dir/skipped-audit-step.yml"
+
+awk '
+  $0 == "      - name: Audit advisories" {
+    print
+    print "        continue-on-error: true"
+    inserted++
+    next
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/continue-on-error-audit-step.yml"
+expect_actionlint_valid_validation_failure \
+  "error-masked audit security step" \
+  "$tmp_dir/continue-on-error-audit-step.yml"
+
+awk '
+  $0 == "      - name: Audit advisories" {
+    skip = 1
+    removed++
+    next
+  }
+  skip && (/^      - name: / || /^  [[:alnum:]_-]+:$/) {
+    skip = 0
+  }
+  !skip {
+    print
+  }
+  END {
+    if (removed != 1 || skip) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/missing-audit-step.yml"
+expect_actionlint_valid_validation_failure \
+  "complete audit security step deletion" \
+  "$tmp_dir/missing-audit-step.yml"
+
+awk '
+  $0 == "          ./packaging/linux/self-test.sh" {
+    print "          # ./packaging/linux/self-test.sh"
+    changed++
+    next
+  }
+  { print }
+  END {
+    if (changed != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/commented-security-command.yml"
+expect_actionlint_valid_validation_failure \
+  "required security command commented out" \
+  "$tmp_dir/commented-security-command.yml"
+
+awk '
+  $0 == "  pull_request:" {
+    in_pr = 1
+  }
+  in_pr && $0 == "    paths:" {
+    print "    branches:"
+    print "      - never-run"
+    print
+    inserted++
+    next
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/conditional-pr-branches.yml"
+expect_actionlint_valid_validation_failure \
+  "pull-request branch filter suppresses mandatory checks" \
+  "$tmp_dir/conditional-pr-branches.yml"
+
+awk '
+  $0 == "  workflow_dispatch:" {
+    print "  pull_request_target:"
+    inserted++
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/extra-trigger-event.yml"
+expect_actionlint_valid_validation_failure \
+  "extra pull-request-target trigger" \
+  "$tmp_dir/extra-trigger-event.yml"
+
+awk '
+  $0 == "  source-policy:" {
+    print "  \"extra-job\":"
+    print "    runs-on: ubuntu-latest"
+    print "    steps:"
+    print "      - run: echo unexpected"
+    inserted++
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/quoted-extra-job.yml"
+expect_actionlint_valid_validation_failure \
+  "quoted extra workflow job" \
+  "$tmp_dir/quoted-extra-job.yml"
+
+awk '
+  $0 == "jobs:" {
+    print "defaults:"
+    print "  run:"
+    print "    shell: bash -c '\''exit 0'\'' {0}"
+    print ""
+    inserted++
+  }
+  { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/masking-workflow-defaults.yml"
+expect_actionlint_valid_validation_failure \
+  "workflow defaults mask mandatory run steps" \
+  "$tmp_dir/masking-workflow-defaults.yml"
 
 awk '
   !changed && /^      - "apps\/\*\*"$/ {
@@ -419,55 +919,135 @@ awk '
     next
   }
   { print }
+  END {
+    if (changed != 2) {
+      exit 1
+    }
+  }
 ' "$workflow" >"$tmp_dir/equivalent-path-scalars.yml"
 expect_actionlint_valid_validation_success \
   "single-quoted and unquoted positive path scalars" \
   "$tmp_dir/equivalent-path-scalars.yml"
 
-awk '
-  !inserted && /^      - "apps\/\*\*"$/ {
-    print
-    print "      - '\''!apps/**'\''"
-    inserted = 1
-    next
-  }
-  { print }
-' "$workflow" >"$tmp_dir/single-quoted-negative-path.yml"
+insert_event_path \
+  push \
+  '      - "!apps/**"' \
+  "$workflow" \
+  "$tmp_dir/push-double-quoted-negative-path.yml"
 expect_actionlint_valid_validation_failure \
-  "single-quoted negative path pattern" \
-  "$tmp_dir/single-quoted-negative-path.yml"
+  "push double-quoted negative path pattern" \
+  "$tmp_dir/push-double-quoted-negative-path.yml"
+
+insert_event_path \
+  pull_request \
+  '      - "!apps/**"' \
+  "$workflow" \
+  "$tmp_dir/pr-double-quoted-negative-path.yml"
+expect_actionlint_valid_validation_failure \
+  "pull-request double-quoted negative path pattern" \
+  "$tmp_dir/pr-double-quoted-negative-path.yml"
+
+insert_event_path \
+  pull_request \
+  "      - '!apps/**'" \
+  "$workflow" \
+  "$tmp_dir/pr-single-quoted-negative-path.yml"
+expect_actionlint_valid_validation_failure \
+  "pull-request single-quoted negative path pattern" \
+  "$tmp_dir/pr-single-quoted-negative-path.yml"
+
+insert_event_path \
+  pull_request \
+  "      - !!str '!apps/**'" \
+  "$workflow" \
+  "$tmp_dir/pr-tagged-negative-path.yml"
+expect_actionlint_valid_validation_failure \
+  "pull-request tagged negative path pattern" \
+  "$tmp_dir/pr-tagged-negative-path.yml"
+
+insert_event_block_path \
+  pull_request \
+  '>-' \
+  "$workflow" \
+  "$tmp_dir/pr-folded-negative-path.yml"
+expect_actionlint_valid_validation_failure \
+  "pull-request folded negative path pattern" \
+  "$tmp_dir/pr-folded-negative-path.yml"
+
+insert_event_block_path \
+  pull_request \
+  '|-' \
+  "$workflow" \
+  "$tmp_dir/pr-literal-negative-path.yml"
+expect_actionlint_valid_validation_failure \
+  "pull-request literal negative path pattern" \
+  "$tmp_dir/pr-literal-negative-path.yml"
 
 awk '
-  /^    paths:$/ {
+  $0 == "  pull_request:" {
+    in_pr = 1
+  }
+  in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
+    in_pr = 0
+  }
+  in_pr && $0 == "    paths:" {
     print "    paths-ignore:"
+    changed++
     next
   }
   { print }
-' "$workflow" >"$tmp_dir/paths-ignore.yml"
+  END {
+    if (changed != 1) {
+      exit 1
+    }
+  }
+' "$workflow" >"$tmp_dir/pr-paths-ignore.yml"
 expect_actionlint_valid_validation_failure \
-  "paths-ignore replaces required paths" \
-  "$tmp_dir/paths-ignore.yml"
+  "pull-request paths-ignore replaces required paths" \
+  "$tmp_dir/pr-paths-ignore.yml"
 
 awk '
-  !changed && /^      - "apps\/\*\*"$/ {
+  $0 == "  pull_request:" {
+    in_pr = 1
+  }
+  in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
+    in_pr = 0
+  }
+  in_pr && !changed && /^      - "apps\/\*\*"$/ {
     print "      - apps/** # semantically equivalent but unsupported comment"
-    changed = 1
+    changed++
     next
   }
   { print }
+  END {
+    if (changed != 1) {
+      exit 1
+    }
+  }
 ' "$workflow" >"$tmp_dir/commented-path-scalar.yml"
 expect_actionlint_valid_validation_failure \
   "commented path scalar cannot be proved equivalent" \
   "$tmp_dir/commented-path-scalar.yml"
 
 awk '
-  !inserted && /^      - "apps\/\*\*"$/ {
+  $0 == "  pull_request:" {
+    in_pr = 1
+  }
+  in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
+    in_pr = 0
+  }
+  in_pr && !inserted && /^      - "apps\/\*\*"$/ {
     print
     print "      - docs/**"
-    inserted = 1
+    inserted++
     next
   }
   { print }
+  END {
+    if (inserted != 1) {
+      exit 1
+    }
+  }
 ' "$workflow" >"$tmp_dir/extra-path.yml"
 expect_actionlint_valid_validation_failure \
   "extra path entry" \
