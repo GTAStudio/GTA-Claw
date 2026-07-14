@@ -66,29 +66,127 @@ pub async fn vacuum_into_with_deadline(
     destination: &str,
     deadline: tokio::time::Instant,
 ) -> Result<VacuumDeadlineOutcome, sqlx::Error> {
-    let database = LiveInterruptPointer({
-        let mut handle = connection.lock_handle().await?;
-        handle.as_raw_handle()
-    });
-    let query = sqlx::query("VACUUM main INTO ?")
-        .bind(destination)
-        .execute(&mut *connection);
+    let database = match tokio::time::timeout_at(deadline, connection.lock_handle()).await {
+        Ok(handle) => LiveInterruptPointer(handle?.as_raw_handle()),
+        Err(_) => return Ok(VacuumDeadlineOutcome::TimedOut),
+    };
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let query_started = std::sync::Arc::clone(&started);
+    let query = async move {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        query_started.store(true, std::sync::atomic::Ordering::Release);
+        Some(
+            sqlx::query("VACUUM main INTO ?")
+                .bind(destination)
+                .execute(&mut *connection)
+                .await,
+        )
+    };
     tokio::pin!(query);
     tokio::select! {
-        result = &mut query => {
-            result?;
-            Ok(VacuumDeadlineOutcome::Completed)
-        }
+        biased;
         () = tokio::time::sleep_until(deadline) => {
-            // SAFETY: `connection` remains mutably borrowed by `query`, so its
-            // SQLite handle stays live until the interrupted query is joined.
-            unsafe {
-                libsqlite3_sys::sqlite3_interrupt(database.0.as_ptr());
+            if started.load(std::sync::atomic::Ordering::Acquire) {
+                let mut interrupt = tokio::time::interval(std::time::Duration::from_millis(1));
+                interrupt.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    // SAFETY: `connection` remains mutably borrowed by `query`, so its
+                    // SQLite handle stays live until the interrupted query is joined.
+                    unsafe {
+                        libsqlite3_sys::sqlite3_interrupt(database.0.as_ptr());
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = &mut query => break,
+                        _ = interrupt.tick() => {}
+                    }
+                }
             }
-            let _ = query.await;
             Ok(VacuumDeadlineOutcome::TimedOut)
         }
+        result = &mut query => {
+            match result {
+                Some(result) => {
+                    result?;
+                    Ok(VacuumDeadlineOutcome::Completed)
+                }
+                None => Ok(VacuumDeadlineOutcome::TimedOut),
+            }
+        }
     }
+}
+
+/// Returns whether a Unix file has the expected owner/mode and no effective
+/// platform ACL beyond those mode bits.
+#[cfg(unix)]
+pub fn unix_file_is_service_private(
+    file: &std::fs::File,
+    expected_uid: u32,
+    expected_mode: u32,
+) -> Result<bool, FileControlError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    if metadata.uid() != expected_uid || metadata.mode() & 0o7777 != expected_mode {
+        return Ok(false);
+    }
+    unix_file_has_trivial_acl(file)
+}
+
+/// Returns whether platform ACLs grant no authority beyond Unix mode bits.
+#[cfg(unix)]
+pub fn unix_file_has_trivial_acl(file: &std::fs::File) -> Result<bool, FileControlError> {
+    #[cfg(target_vendor = "apple")]
+    {
+        apple_file_acl_is_trivial(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = file;
+        Ok(true)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn apple_file_acl_is_trivial(file: &std::fs::File) -> Result<bool, FileControlError> {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::AsRawFd as _;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(file_descriptor: c_int, acl_type: c_int) -> *mut c_void;
+        fn acl_is_trivial_np(acl: *const c_void, trivial: *mut c_int) -> c_int;
+        fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    // SAFETY: The file descriptor is live and ACL_TYPE_EXTENDED is the Darwin
+    // extended-ACL selector.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        if std::io::Error::last_os_error().raw_os_error() == Some(2) {
+            return Ok(true);
+        }
+        return Err(FileControlError::Handle(format!(
+            "read Apple file ACL: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut trivial = 0;
+    // SAFETY: `acl` is live until acl_free below and `trivial` is writable.
+    let inspected = unsafe { acl_is_trivial_np(acl, &raw mut trivial) };
+    // SAFETY: acl_get_fd_np returned this owned ACL allocation.
+    let freed = unsafe { acl_free(acl) };
+    if inspected != 0 || freed != 0 {
+        return Err(FileControlError::Handle(format!(
+            "inspect Apple file ACL: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(trivial != 0)
 }
 
 /// Returns whether SQLite reports that its open main database was moved or replaced.
@@ -112,6 +210,40 @@ pub async fn main_database_has_moved(
     };
     if result == libsqlite3_sys::SQLITE_OK {
         Ok(moved != 0)
+    } else {
+        Err(FileControlError::SQLite(result))
+    }
+}
+
+/// Commits the current SQLite transaction synchronously while holding SQLx's
+/// connection lock, so cancellation cannot detach an in-flight commit.
+pub async fn commit_synchronously(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<(), FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut message = std::ptr::null_mut();
+    // SAFETY: The SQL string is static and NUL-terminated. SQLx's locked handle
+    // prevents concurrent worker access for the duration of sqlite3_exec.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_exec(
+            database.as_raw_handle().as_ptr(),
+            c"COMMIT".as_ptr(),
+            None,
+            std::ptr::null_mut(),
+            &raw mut message,
+        )
+    };
+    if !message.is_null() {
+        // SAFETY: sqlite3_exec allocates an error message with sqlite3_malloc.
+        unsafe {
+            libsqlite3_sys::sqlite3_free(message.cast());
+        }
+    }
+    if result == libsqlite3_sys::SQLITE_OK {
+        Ok(())
     } else {
         Err(FileControlError::SQLite(result))
     }
@@ -263,7 +395,7 @@ unsafe extern "C" fn reject_moved_or_unbound_commit(context: *mut std::ffi::c_vo
 
 #[cfg(unix)]
 fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
-    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use std::os::unix::fs::FileExt as _;
     use xattr::FileExt as _;
 
     if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation
@@ -348,8 +480,7 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
             && held.ino() == current.ino()
             && held.uid() == expected_uid
             && current.uid() == expected_uid
-            && held.mode() & 0o7777 == 0o700
-            && current.mode() & 0o7777 == 0o700
+            && unix_file_is_service_private(file, expected_uid, 0o700).unwrap_or(false)
     }
 
     #[cfg(unix)]
@@ -380,8 +511,7 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
             return false;
         };
         if !metadata.file_type().is_file()
-            || metadata.uid() != expected_uid
-            || metadata.mode() & 0o7777 != 0o600
+            || !unix_file_is_service_private(&file, expected_uid, 0o600).unwrap_or(false)
             || metadata.nlink() != 1
         {
             return false;
@@ -426,8 +556,7 @@ fn unix_pinned_sidecars(
                 .metadata()
                 .map_err(|error| FileControlError::Handle(error.to_string()))?;
             if !metadata.file_type().is_file()
-                || metadata.uid() != expected_uid
-                || metadata.mode() & 0o7777 != 0o600
+                || !unix_file_is_service_private(&file, expected_uid, 0o600).unwrap_or(false)
                 || metadata.nlink() != 1
                 || !matches!(
                     file.get_xattr("user.gta-claw.sidecar-generation"),
@@ -463,10 +592,8 @@ fn unix_path_matches_private_file(
         && !current.file_type().is_symlink()
         && current.dev() == held.dev()
         && current.ino() == held.ino()
-        && held.uid() == expected_uid
         && current.uid() == expected_uid
-        && held.mode() & 0o7777 == expected_mode
-        && current.mode() & 0o7777 == expected_mode
+        && unix_file_is_service_private(file, expected_uid, expected_mode).unwrap_or(false)
         && held.nlink() == 1
         && current.nlink() == 1
 }
@@ -575,16 +702,17 @@ unsafe extern "C" fn reject_unbound_windows_commit(context: *mut std::ffi::c_voi
 #[cfg(windows)]
 fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
     use std::io::Read as _;
-    use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
+    use std::os::windows::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation {
         return false;
     }
     let open_current = |path: &std::path::Path, directory: bool| {
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(
@@ -595,7 +723,13 @@ fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
                         0
                     },
             )
-            .open(path)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(
+                "Windows commit identity path is a reparse point",
+            ));
+        }
+        Ok(file)
     };
     let Ok(parent_current) = open_current(&context.database_parent_path, true) else {
         return false;
@@ -683,9 +817,10 @@ fn windows_pinned_sidecars(
     expected_identity: &[u8],
 ) -> Result<Vec<PinnedSidecar>, FileControlError> {
     use std::io::Read as _;
-    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
     ["-wal", "-shm"]
@@ -700,6 +835,17 @@ fn windows_pinned_sidecars(
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&path)
                 .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            if file
+                .metadata()
+                .map_err(|error| FileControlError::Handle(error.to_string()))?
+                .file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+            {
+                return Err(FileControlError::Handle(
+                    "Windows SQLite sidecar is a reparse point".to_owned(),
+                ));
+            }
             if !windows_file_is_service_private(&file)
                 .map_err(|error| FileControlError::Handle(error.to_string()))?
             {
@@ -1027,4 +1173,104 @@ pub fn windows_file_is_service_private(file: &std::fs::File) -> Result<bool, Fil
         CloseHandle(token);
     }
     result
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::windows::fs::{OpenOptionsExt as _, symlink_file};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn windows_commit_callback_rejects_reparse_sidecar() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let identity = Command::new("whoami.exe")
+            .output()
+            .expect("read Windows test identity");
+        assert!(identity.status.success());
+        let identity = String::from_utf8(identity.stdout)
+            .expect("Windows identity is UTF-8")
+            .trim()
+            .to_owned();
+        let status = Command::new("icacls.exe")
+            .arg(directory.path())
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{identity}:(OI)(CI)F"))
+            .arg("*S-1-5-18:(OI)(CI)F")
+            .arg("*S-1-5-32-544:(OI)(CI)F")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("secure Windows callback fixture");
+        assert!(status.success());
+
+        let database_path = directory.path().join("state.sqlite");
+        let lock_path = directory.path().join("state.sqlite.writer.lock");
+        let wal_path = directory.path().join("state.sqlite-wal");
+        let shm_path = directory.path().join("state.sqlite-shm");
+        let generation = b"callback-generation".to_vec();
+        std::fs::write(&database_path, b"database").expect("create database fixture");
+        std::fs::write(&lock_path, &generation).expect("create lock fixture");
+        std::fs::write(&wal_path, b"wal").expect("create WAL fixture");
+        std::fs::write(&shm_path, b"shm").expect("create SHM fixture");
+        for sidecar in [&wal_path, &shm_path] {
+            let mut generation_path = sidecar.as_os_str().to_owned();
+            generation_path.push(":gta-claw-generation");
+            std::fs::File::create(std::path::PathBuf::from(generation_path))
+                .and_then(|mut file| file.write_all(&generation))
+                .expect("attach sidecar generation");
+        }
+
+        let database_parent = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(directory.path())
+            .expect("open fixture parent");
+        let database_file = std::fs::File::open(&database_path).expect("open database fixture");
+        let lock_file = std::fs::File::open(&lock_path).expect("open lock fixture");
+        let sidecars = [&wal_path, &shm_path]
+            .into_iter()
+            .map(|path| PinnedSidecar {
+                path: path.clone(),
+                file: std::fs::File::open(path).expect("open sidecar fixture"),
+            })
+            .collect();
+        let context = WindowsIdentityCommitContext {
+            database_parent_path: directory.path().to_owned(),
+            database_parent,
+            database_path: database_path.clone(),
+            database_file,
+            lock_path,
+            lock_file,
+            expected_identity: generation,
+            sidecars,
+            writer_generation: std::sync::Arc::new(AtomicU64::new(1)),
+            expected_writer_generation: 1,
+        };
+        assert!(windows_identity_matches(&context));
+
+        std::fs::remove_file(&wal_path).expect("remove live WAL fixture path");
+        let replacement = directory.path().join("replacement-wal");
+        std::fs::write(&replacement, b"replacement").expect("create reparse target");
+        if let Err(error) = symlink_file(&replacement, &wal_path) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("create WAL reparse point: {error}");
+        }
+        let mut context = context;
+        // SAFETY: The callback receives the same live context layout registered
+        // with SQLite and does not take ownership.
+        let rejected =
+            unsafe { reject_unbound_windows_commit((&raw mut context).cast::<std::ffi::c_void>()) };
+        assert_eq!(rejected, 1);
+    }
 }

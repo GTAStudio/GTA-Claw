@@ -165,6 +165,7 @@ dependencies = [
  "libsqlite3-sys",
  "rustix",
  "sqlx",
+ "tempfile",
  "tokio",
  "windows-sys 0.61.2",
  "xattr",

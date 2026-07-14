@@ -97,11 +97,10 @@ impl<'store> SessionRepository<'store> {
         let rows = sqlx::query(
             "SELECT id, status, created_at_ms, updated_at_ms, version
              FROM sessions
-             WHERE created_at_ms > ? OR (created_at_ms = ? AND id > ?)
+             WHERE (created_at_ms, id) > (?, ?)
              ORDER BY created_at_ms, id
              LIMIT ?",
         )
-        .bind(after_time)
         .bind(after_time)
         .bind(after_id)
         .bind(request.query_limit())
@@ -264,11 +263,10 @@ impl<'store> DeviceRepository<'store> {
         let rows = sqlx::query(
             "SELECT id, display_name, created_at_ms, updated_at_ms, version
              FROM devices
-             WHERE created_at_ms > ? OR (created_at_ms = ? AND id > ?)
+             WHERE (created_at_ms, id) > (?, ?)
              ORDER BY created_at_ms, id
              LIMIT ?",
         )
-        .bind(after_time)
         .bind(after_time)
         .bind(after_id)
         .bind(request.query_limit())
@@ -401,12 +399,11 @@ impl<'store> AuthenticationRepository<'store> {
             "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
              FROM authentication_records
              WHERE device_id = ?
-               AND (created_at_ms > ? OR (created_at_ms = ? AND id > ?))
+               AND (created_at_ms, id) > (?, ?)
              ORDER BY created_at_ms, id
              LIMIT ?",
         )
         .bind(device_id.as_str())
-        .bind(after_time)
         .bind(after_time)
         .bind(after_id)
         .bind(request.query_limit())
@@ -549,12 +546,11 @@ impl<'store> TaskRepository<'store> {
             "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
              FROM tasks
              WHERE session_id = ?
-               AND (created_at_ms > ? OR (created_at_ms = ? AND id > ?))
+               AND (created_at_ms, id) > (?, ?)
              ORDER BY created_at_ms, id
              LIMIT ?",
         )
         .bind(session_id.as_str())
-        .bind(after_time)
         .bind(after_time)
         .bind(after_id)
         .bind(request.query_limit())

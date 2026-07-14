@@ -30,14 +30,23 @@ mod tests {
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
+    #[cfg(windows)]
+    use std::{
+        collections::HashSet,
+        sync::{LazyLock, Mutex},
+    };
 
     use claw_domain::SessionId;
     use sqlx::sqlite::SqliteConnectOptions;
-    use sqlx::{Connection, Executor, SqliteConnection};
+    use sqlx::{Connection, Executor, Row, SqliteConnection};
     use tempfile::TempDir;
 
     use super::*;
     use crate::store::test_support;
+
+    #[cfg(windows)]
+    static SECURED_TEST_DIRECTORIES: LazyLock<Mutex<HashSet<PathBuf>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
 
     struct ChildGuard {
         child: Option<Child>,
@@ -91,7 +100,45 @@ mod tests {
     }
 
     fn database_path(directory: &TempDir, name: &str) -> PathBuf {
+        #[cfg(windows)]
+        secure_windows_test_directory(directory.path());
         directory.path().join(name)
+    }
+
+    #[cfg(windows)]
+    fn secure_windows_test_directory(path: &Path) {
+        let path = fs::canonicalize(path).expect("canonicalize Windows test state directory");
+        let mut secured = SECURED_TEST_DIRECTORIES
+            .lock()
+            .expect("secured test directories lock poisoned");
+        if !secured.insert(path.clone()) {
+            return;
+        }
+        let identity = Command::new("whoami.exe")
+            .output()
+            .expect("read current Windows test identity");
+        assert!(identity.status.success());
+        let identity = String::from_utf8(identity.stdout)
+            .expect("Windows test identity is UTF-8")
+            .trim()
+            .to_owned();
+        assert!(!identity.is_empty());
+        let status = Command::new("icacls.exe")
+            .arg(&path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{identity}:(OI)(CI)F"))
+            .arg("*S-1-5-18:(OI)(CI)F")
+            .arg("*S-1-5-32-544:(OI)(CI)F")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("secure Windows test state directory");
+        assert!(status.success());
+        assert!(
+            test_support::state_directory_is_private(&path),
+            "Windows test fixture must satisfy the production private-directory contract"
+        );
     }
 
     fn make_private_file(_path: &Path) {
@@ -409,6 +456,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_one_store_upgrades_to_pagination_indexes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "version-one-upgrade.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create version-one database");
+        sqlx::raw_sql(
+            "PRAGMA application_id = 1196704067;
+             CREATE TABLE claw_schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+                applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+             ) STRICT",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("create version-one migration prefix");
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&mut connection)
+            .await
+            .expect("apply immutable version-one schema");
+        sqlx::query(
+            "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+             VALUES (1, 'initial', ?, 1)",
+        )
+        .bind(test_support::checksum(include_str!(
+            "../migrations/0001_initial.sql"
+        )))
+        .execute(&mut connection)
+        .await
+        .expect("record immutable version-one migration");
+        connection.close().await.expect("close version-one seed");
+        make_private_file(&path);
+        test_support::initialize_store_identity_fixture(&path);
+
+        let store = open(&path).await;
+        let health = store.health().await.expect("upgraded store health");
+        assert_eq!(health.schema_version, 2);
+        assert!(health.is_healthy());
+        for index in ["sessions_creation_order", "devices_creation_order"] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = ?",
+                )
+                .bind(index)
+                .fetch_one(test_support::pool(&store))
+                .await
+                .expect("inspect pagination index"),
+                1
+            );
+        }
+        store.close().await.expect("upgraded store closes");
+    }
+
+    #[tokio::test]
+    async fn sealed_version_one_backup_restores_then_migrates_forward() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let backup = database_path(&directory, "version-one-backup.sqlite");
+        let destination = database_path(&directory, "version-one-restored.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&backup)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create version-one backup");
+        sqlx::raw_sql(
+            "PRAGMA application_id = 1196704067;
+             CREATE TABLE claw_schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+                applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+             ) STRICT",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("create version-one backup prefix");
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&mut connection)
+            .await
+            .expect("apply version-one backup schema");
+        sqlx::query(
+            "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+             VALUES (1, 'initial', ?, 1)",
+        )
+        .bind(test_support::checksum(include_str!(
+            "../migrations/0001_initial.sql"
+        )))
+        .execute(&mut connection)
+        .await
+        .expect("record version-one backup migration");
+        sqlx::query(
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'gta-claw-standalone-snapshot-v1', 0)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("mark version-one standalone snapshot");
+        connection.close().await.expect("close version-one backup");
+        make_private_file(&backup);
+        test_support::reseal_backup_fixture(&backup);
+
+        StateStore::restore_backup(&backup, &destination)
+            .await
+            .expect("restore supported version-one backup");
+        let restored = open(&destination).await;
+        let health = restored.health().await.expect("restored migration health");
+        assert_eq!(health.schema_version, 2);
+        assert!(health.is_healthy());
+        restored.close().await.expect("restored store closes");
+    }
+
+    #[tokio::test]
     async fn migration_transaction_excludes_external_schema_writer() {
         const OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -450,6 +614,7 @@ mod tests {
                             let close = store.close().await;
                             format!("opener succeeded early; close result: {close:?}")
                         }
+
                         Ok(Err(error)) => format!("opener failed early: {error}"),
                         Err(error) => format!("opener task failed early: {error}"),
                     };
@@ -512,11 +677,111 @@ mod tests {
                             Err(error) => format!("opener task stopped: {error}"),
                         }
                     }
+
                     None => "opener was already joined before a later stage timed out".to_owned(),
                 };
                 panic!("migration race exceeded the single five-second deadline; {diagnostic}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_open_aborts_migration_without_late_owner_claim() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "cancelled-open.sqlite");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create cancelled-open database");
+        sqlx::raw_sql(
+            "PRAGMA application_id = 1196704067;
+                 CREATE TABLE claw_schema_migrations (
+                    version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+                    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0)
+                 ) STRICT",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("create cancelled-open migration prefix");
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&mut connection)
+            .await
+            .expect("apply cancelled-open version-one schema");
+        sqlx::query(
+            "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
+             VALUES (1, 'initial', ?, 1)",
+        )
+        .bind(test_support::checksum(include_str!(
+            "../migrations/0001_initial.sql"
+        )))
+        .execute(&mut connection)
+        .await
+        .expect("record cancelled-open version-one migration");
+        sqlx::query(
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'pre-cancel-owner', 7)",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("seed pre-cancel writer owner");
+        connection.close().await.expect("close cancelled-open seed");
+        make_private_file(&path);
+        test_support::initialize_store_identity_fixture(&path);
+        let (entered, _release) = test_support::set_migration_barrier(&path);
+        let open_path = path.clone();
+        let opener =
+            tokio::spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("open reaches transactional migration barrier");
+        opener.abort();
+        assert!(
+            opener
+                .await
+                .expect_err("cancelled opener task")
+                .is_cancelled()
+        );
+        test_support::clear_migration_barrier(&path);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let options = SqliteConnectOptions::new().filename(&path).read_only(true);
+        let mut inspection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("inspect cancelled open");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM claw_schema_migrations")
+                .fetch_one(&mut inspection)
+                .await
+                .expect("read cancelled migration history"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT owner, acquired_at_ms FROM claw_writer_lock WHERE singleton = 1",
+            )
+            .fetch_one(&mut inspection)
+            .await
+            .expect("read unchanged pre-cancel writer"),
+            ("pre-cancel-owner".to_owned(), 7)
+        );
+        inspection
+            .close()
+            .await
+            .expect("close cancellation inspection");
+        let reopened = open(&path).await;
+        assert_eq!(
+            reopened.recovered_writer(),
+            Some(&RecoveredWriterLock {
+                previous_owner: "pre-cancel-owner".to_owned(),
+                previous_acquired_at_ms: 7,
+            })
+        );
+        reopened.close().await.expect("post-cancel store closes");
     }
 
     #[tokio::test]
@@ -615,7 +880,7 @@ mod tests {
             .await
             .expect("migration entered the deterministic gate");
         release.notify_one();
-        test_support::clear_migration_barrier();
+        test_support::clear_migration_barrier(&path);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stable = database_artifact_bytes(&path);
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -648,7 +913,7 @@ mod tests {
             .await
             .expect("fresh migration entered deterministic gate");
         release.notify_one();
-        test_support::clear_migration_barrier();
+        test_support::clear_migration_barrier(&fresh_path);
         let stable = database_artifact_bytes(&fresh_path);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&fresh_path));
@@ -1047,6 +1312,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pagination_queries_use_ordering_range_indexes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "pagination-plans.sqlite")).await;
+        let plans = [
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM sessions
+                 WHERE (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id LIMIT ?",
+                "sessions_creation_order",
+                false,
+            ),
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM devices
+                 WHERE (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id LIMIT ?",
+                "devices_creation_order",
+                false,
+            ),
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM authentication_records
+                 WHERE device_id = ? AND (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id LIMIT ?",
+                "authentication_records_device_order",
+                true,
+            ),
+            (
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM tasks
+                 WHERE session_id = ? AND (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id LIMIT ?",
+                "tasks_session_order",
+                true,
+            ),
+        ];
+        for (sql, expected_index, scoped) in plans {
+            let mut query = sqlx::query(sql);
+            if scoped {
+                query = query.bind("parent");
+            }
+            let details = query
+                .bind(1_i64)
+                .bind("cursor")
+                .bind(10_i64)
+                .fetch_all(test_support::pool(&store))
+                .await
+                .expect("inspect pagination query plan")
+                .into_iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(
+                details.contains(expected_index) && details.contains("SEARCH"),
+                "expected range search through {expected_index}, received {details}"
+            );
+        }
+        store.close().await.expect("pagination plan store closes");
+    }
+
+    #[tokio::test]
     async fn busy_timeout_returns_a_database_failure_instead_of_hanging() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = StateStore::open(
@@ -1245,7 +1572,7 @@ mod tests {
         let store = open(&path).await;
         sqlx::query(
             "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
-             VALUES (2, 'future', ?, 1)",
+             VALUES (3, 'future', ?, 1)",
         )
         .bind("f".repeat(64))
         .execute(test_support::pool(&store))
@@ -1270,8 +1597,8 @@ mod tests {
         assert_eq!(
             error,
             StateError::NewerSchema {
-                found: 2,
-                supported: 1,
+                found: 3,
+                supported: 2,
             }
         );
         assert_database_artifacts_unchanged(&before, &database_artifact_bytes(&path));
@@ -1564,15 +1891,15 @@ mod tests {
         let source_path = database_path(&directory, "read-only-source.sqlite");
         let backup_directory = directory.path().join("read-only-backup");
         fs::create_dir(&backup_directory).expect("create read-only backup directory");
+        fs::set_permissions(&backup_directory, fs::Permissions::from_mode(0o700))
+            .expect("make backup directory service-private");
         let backup_path = backup_directory.join("backup.sqlite");
         let destination = database_path(&directory, "read-only-restored.sqlite");
         let source = open(&source_path).await;
         source.backup_to(&backup_path).await.expect("create backup");
         source.close().await.expect("source store closes");
-        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o444))
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o400))
             .expect("make backup read-only");
-        fs::set_permissions(&backup_directory, fs::Permissions::from_mode(0o555))
-            .expect("make backup directory read-only");
 
         StateStore::restore_backup(&backup_path, &destination)
             .await
@@ -1582,9 +1909,6 @@ mod tests {
             .close()
             .await
             .expect("restored store closes");
-
-        fs::set_permissions(&backup_directory, fs::Permissions::from_mode(0o755))
-            .expect("restore backup directory permissions for cleanup");
     }
 
     #[tokio::test]
@@ -1640,7 +1964,7 @@ mod tests {
         let (temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
         let backup_source = std::sync::Arc::clone(&source);
         let backup_destination = destination.clone();
-        let mut backup =
+        let backup =
             tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -1702,7 +2026,7 @@ mod tests {
         let (_temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
         let backup_source = std::sync::Arc::clone(&source);
         let backup_destination = destination.clone();
-        let mut backup =
+        let backup =
             tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -1917,7 +2241,7 @@ mod tests {
             .await
             .expect("backup reached deterministic post-VACUUM gate");
         release.notify_one();
-        test_support::clear_snapshot_barrier();
+        test_support::clear_snapshot_barrier(&destination);
         let temporary = temporary
             .lock()
             .expect("snapshot temporary path lock poisoned")
@@ -1929,6 +2253,104 @@ mod tests {
         assert!(!destination.exists());
         assert!(!temporary.exists());
         source.close().await.expect("backup timeout source closes");
+    }
+
+    #[tokio::test]
+    async fn expired_vacuum_never_starts_and_backup_error_does_not_poison_pool() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "vacuum-lifecycle.sqlite");
+        let expired_destination = database_path(&directory, "expired-vacuum.sqlite");
+        let failed_backup = database_path(&directory, "failed-backup.sqlite");
+        let store = open(&path).await;
+
+        assert_eq!(
+            test_support::expired_vacuum_does_not_start(&store, &expired_destination).await,
+            claw_sqlite_file_control::VacuumDeadlineOutcome::TimedOut
+        );
+        assert!(!expired_destination.exists());
+
+        test_support::fail_backup_vacuum_once(&failed_backup);
+        assert!(store.backup_to(&failed_backup).await.is_err());
+        assert!(!failed_backup.exists());
+        store
+            .sessions()
+            .create(&session("post-backup-error", 1))
+            .await
+            .expect("backup failure leaves the sole pooled connection usable");
+        store.close().await.expect("vacuum lifecycle store closes");
+    }
+
+    #[tokio::test]
+    async fn cancelling_backup_and_restore_cleans_staging_and_keeps_pool_usable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "cancel-source.sqlite");
+        let backup_path = database_path(&directory, "cancel-backup.sqlite");
+        let restore_path = database_path(&directory, "cancel-restore.sqlite");
+        let source = std::sync::Arc::new(open(&source_path).await);
+
+        let (backup_temporary, entered, _release) =
+            test_support::set_snapshot_barrier(&backup_path);
+        let backup_source = std::sync::Arc::clone(&source);
+        let backup_destination = backup_path.clone();
+        let backup =
+            tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("backup reaches cancellation barrier");
+        let backup_temporary = backup_temporary
+            .lock()
+            .expect("backup temporary path lock poisoned")
+            .clone()
+            .expect("backup temporary path published");
+        backup.abort();
+        assert!(
+            backup
+                .await
+                .expect_err("cancelled backup task")
+                .is_cancelled()
+        );
+        test_support::clear_snapshot_barrier(&backup_path);
+        assert!(!backup_path.exists());
+        assert!(!backup_temporary.exists());
+        source
+            .sessions()
+            .create(&session("post-cancel-backup", 1))
+            .await
+            .expect("cancelled backup leaves pool usable");
+
+        source
+            .backup_to(&backup_path)
+            .await
+            .expect("create restore cancellation source");
+        let (restore_temporary, entered, _release) =
+            test_support::set_snapshot_barrier(&restore_path);
+        let restore_source = backup_path.clone();
+        let restore_destination = restore_path.clone();
+        let restore = tokio::spawn(async move {
+            StateStore::restore_backup(&restore_source, &restore_destination).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("restore reaches cancellation barrier");
+        let restore_temporary = restore_temporary
+            .lock()
+            .expect("restore temporary path lock poisoned")
+            .clone()
+            .expect("restore temporary path published");
+        restore.abort();
+        assert!(
+            restore
+                .await
+                .expect_err("cancelled restore task")
+                .is_cancelled()
+        );
+        test_support::clear_snapshot_barrier(&restore_path);
+        assert!(!restore_path.exists());
+        assert!(!restore_temporary.exists());
+
+        let source = std::sync::Arc::try_unwrap(source)
+            .unwrap_or_else(|_| panic!("cancelled operations retained source store"));
+        source.close().await.expect("cancellation source closes");
     }
 
     #[cfg(unix)]
@@ -2509,6 +2931,7 @@ mod tests {
                 source.close().await.expect("source store closes");
                 return;
             }
+
             panic!("create destination WAL reparse point: {error}");
         }
 
@@ -2517,6 +2940,36 @@ mod tests {
             .expect_err("destination reparse sidecar rejects restore");
         assert!(matches!(error, StateError::BackupDestinationExists { .. }));
         assert!(!destination.exists());
+        source.close().await.expect("source store closes");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn restore_rejects_stale_windows_writer_lock_without_publication() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "stale-lock-source.sqlite");
+        let backup_path = database_path(&directory, "stale-lock-backup.sqlite");
+        let destination = database_path(&directory, "stale-lock-destination.sqlite");
+        let mut lock_path = destination.as_os_str().to_owned();
+        lock_path.push(".writer.lock");
+        let lock_path = PathBuf::from(lock_path);
+        let source = open(&source_path).await;
+        source.backup_to(&backup_path).await.expect("create backup");
+        fs::write(&lock_path, b"stale-lock-header").expect("create stale writer lock");
+
+        assert_eq!(
+            StateStore::restore_backup(&backup_path, &destination)
+                .await
+                .expect_err("stale destination writer lock rejects restore"),
+            StateError::BackupDestinationExists {
+                path: lock_path.clone(),
+            }
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(&lock_path).expect("read unchanged stale writer lock"),
+            b"stale-lock-header"
+        );
         source.close().await.expect("source store closes");
     }
 
@@ -2553,7 +3006,7 @@ mod tests {
             (
                 "newer",
                 "INSERT INTO claw_schema_migrations(version, name, checksum, applied_at_ms)
-                 VALUES (2, 'future', 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 1)",
+                 VALUES (3, 'future', 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 1)",
             ),
             (
                 "invalid-type",
@@ -3835,6 +4288,80 @@ mod tests {
         );
         let store = open(&readonly_path).await;
         store.close().await.expect("readable private store closes");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_inherited_temp_parent_requires_private_fixture_preparation() {
+        let outer = tempfile::tempdir().expect("outer temporary directory");
+        let status = Command::new("icacls.exe")
+            .arg(outer.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("grant inheritable world-write test ACL");
+        assert!(status.success());
+        let inherited = tempfile::Builder::new()
+            .prefix("inherited-state-")
+            .tempdir_in(outer.path())
+            .expect("create inherited temporary directory");
+        let path = inherited.path().join("state.sqlite");
+
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("raw inherited temporary parent is rejected");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath {
+                reason: "state directory grants write or delete access outside the service identity",
+                ..
+            }
+        ));
+        assert!(!path.exists());
+
+        secure_windows_test_directory(inherited.path());
+        open(&path)
+            .await
+            .close()
+            .await
+            .expect("prepared temporary parent satisfies the public path contract");
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn apple_extended_acl_is_rejected_without_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let ancestor = root.path().join("acl-ancestor");
+        fs::create_dir(&ancestor).expect("create ACL-bearing ancestor");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("set private ancestor mode before ACL");
+        let parent = ancestor.join("clean-state-parent");
+        fs::create_dir(&parent).expect("create ACL state parent");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+            .expect("set clean state-parent mode");
+        let status = Command::new("chmod")
+            .args(["+a", "everyone allow write,delete"])
+            .arg(&ancestor)
+            .status()
+            .expect("attach Apple ancestor ACL");
+        assert!(status.success());
+        let path = parent.join("state.sqlite");
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("Apple extended ACL is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(!path.exists());
+        let status = Command::new("chmod")
+            .arg("-N")
+            .arg(&ancestor)
+            .status()
+            .expect("remove Apple ancestor ACL for cleanup");
+        assert!(status.success());
     }
 
     #[tokio::test]
