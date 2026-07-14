@@ -16,7 +16,7 @@ use claw_security::identity::DeviceIdentity;
 use getrandom::{SysRng, rand_core::UnwrapErr};
 use serde_json::json;
 use tokio::runtime::Builder;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -31,12 +31,22 @@ const ATTEMPT_STOP_TIMEOUT: Duration = Duration::from_millis(2_500);
 const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 
 type ViewSink = Arc<dyn Fn(ViewSnapshot) + Send + Sync + 'static>;
+type GatewayEventObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 
 enum ControllerCommand {
-    Connect(ConnectRequest),
+    Connect {
+        request: ConnectRequest,
+        completion: Option<oneshot::Sender<ConnectDisposition>>,
+    },
     RejectSubmission(SubmissionRejection),
     Cancel,
     Disconnect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectDisposition {
+    Started,
+    IgnoredBusy,
 }
 
 #[derive(Clone)]
@@ -47,9 +57,30 @@ pub(crate) struct ControllerSender {
 
 impl ControllerSender {
     pub(crate) fn connect(&self, request: ConnectRequest) -> Result<(), CommandRejection> {
+        self.enqueue_connect(request, None)
+    }
+
+    fn enqueue_connect(
+        &self,
+        request: ConnectRequest,
+        completion: Option<oneshot::Sender<ConnectDisposition>>,
+    ) -> Result<(), CommandRejection> {
         self.commands
-            .try_send(ControllerCommand::Connect(request))
+            .try_send(ControllerCommand::Connect {
+                request,
+                completion,
+            })
             .map_err(CommandRejection::from_send)
+    }
+
+    #[cfg(test)]
+    fn connect_observed(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<oneshot::Receiver<ConnectDisposition>, CommandRejection> {
+        let (completion, observed) = oneshot::channel();
+        self.enqueue_connect(request, Some(completion))?;
+        Ok(observed)
     }
 
     pub(crate) fn cancel(&self) -> Result<(), CommandRejection> {
@@ -118,6 +149,13 @@ impl DesktopController {
     pub(crate) fn spawn(
         sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
     ) -> Result<Self, ControllerStartError> {
+        Self::spawn_inner(Arc::new(sink), None)
+    }
+
+    fn spawn_inner(
+        sink: ViewSink,
+        event_observer: Option<GatewayEventObserver>,
+    ) -> Result<Self, ControllerStartError> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("gta-claw-gateway")
@@ -130,12 +168,11 @@ impl DesktopController {
             commands,
             close: close.clone(),
         };
-        let sink: ViewSink = Arc::new(sink);
         let (completion_tx, completion) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("gta-claw-controller".to_owned())
             .spawn(move || {
-                runtime.block_on(controller_loop(receiver, close, sink));
+                runtime.block_on(controller_loop(receiver, close, sink, event_observer));
                 let _ = completion_tx.send(());
             })
             .map_err(ControllerStartError)?;
@@ -144,6 +181,14 @@ impl DesktopController {
             completion,
             thread: Some(thread),
         })
+    }
+
+    #[cfg(test)]
+    fn spawn_with_event_observer(
+        sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
+        event_observer: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, ControllerStartError> {
+        Self::spawn_inner(Arc::new(sink), Some(Arc::new(event_observer)))
     }
 
     pub(crate) fn sender(&self) -> ControllerSender {
@@ -211,6 +256,7 @@ async fn controller_loop(
     mut commands: mpsc::Receiver<ControllerCommand>,
     close: CancellationToken,
     sink: ViewSink,
+    event_observer: Option<GatewayEventObserver>,
 ) {
     let mut model = OnboardingModel::default();
     publish(&sink, &model);
@@ -241,8 +287,12 @@ async fn controller_loop(
                     break;
                 };
                 match command {
-                    ControllerCommand::Connect(request) => {
+                    ControllerCommand::Connect {
+                        request,
+                        completion,
+                    } => {
                         if !model.can_start_connection() {
+                            complete_connect(completion, ConnectDisposition::IgnoredBusy);
                             continue;
                         }
                         let endpoint = request.endpoint_display().to_owned();
@@ -268,8 +318,10 @@ async fn controller_loop(
                             identity,
                             cancellation.clone(),
                             attempt_events.clone(),
+                            event_observer.clone(),
                         ));
                         active = Some(ActiveAttempt { cancellation, task });
+                        complete_connect(completion, ConnectDisposition::Started);
                     }
                     ControllerCommand::RejectSubmission(rejection) => {
                         if !model.can_start_connection() {
@@ -300,6 +352,15 @@ async fn controller_loop(
     }
 }
 
+fn complete_connect(
+    completion: Option<oneshot::Sender<ConnectDisposition>>,
+    disposition: ConnectDisposition,
+) {
+    if let Some(completion) = completion {
+        let _ = completion.send(disposition);
+    }
+}
+
 fn publish(sink: &ViewSink, model: &OnboardingModel) {
     sink(model.snapshot());
 }
@@ -324,6 +385,7 @@ async fn run_attempt(
     identity: Arc<DeviceIdentity>,
     cancellation: CancellationToken,
     updates: mpsc::Sender<(u64, AttemptUpdate)>,
+    event_observer: Option<GatewayEventObserver>,
 ) {
     let (url, token) = request.into_parts();
     let mut config = GatewayClientConfig::new(url, identity);
@@ -409,8 +471,13 @@ async fn run_attempt(
                 .await;
             }
             event = gateway_events.recv(), if event_stream_open => {
-                if event.is_none() {
-                    event_stream_open = false;
+                match event {
+                    Some(_) => {
+                        if let Some(observer) = &event_observer {
+                            observer();
+                        }
+                    }
+                    None => event_stream_open = false,
                 }
             }
         }
@@ -806,8 +873,8 @@ mod tests {
         entered_initial_publish.wait();
 
         let sender = controller.sender();
-        sender
-            .connect(
+        let first_observed = sender
+            .connect_observed(
                 ConnectRequest::prepare(
                     gateway.url.as_str().trim_end_matches('/').to_owned(),
                     "first-token".to_owned(),
@@ -816,8 +883,8 @@ mod tests {
                 .expect("first request"),
             )
             .expect("queue first");
-        sender
-            .connect(
+        let duplicate_observed = sender
+            .connect_observed(
                 ConnectRequest::prepare(
                     gateway.url.as_str().trim_end_matches('/').to_owned(),
                     String::new(),
@@ -827,19 +894,29 @@ mod tests {
             )
             .expect("queue duplicate");
         release_initial_publish.wait();
+        assert_eq!(
+            first_observed.await.expect("first command observed"),
+            ConnectDisposition::Started
+        );
+        assert_eq!(
+            duplicate_observed
+                .await
+                .expect("duplicate command observed"),
+            ConnectDisposition::IgnoredBusy
+        );
 
         wait_snapshot(&snapshots, |snapshot| {
             snapshot.phase() == OnboardingPhase::Ready
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(gateway.connections.load(Ordering::SeqCst), 1);
+        let connections = Arc::clone(&gateway.connections);
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
         assert_eq!(
             tokens.lock().expect("tokens").as_slice(),
             &[Some("first-token".to_owned())]
         );
-        controller.shutdown().expect("shutdown");
-        gateway.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1055,7 +1132,22 @@ mod tests {
             }
         }))
         .await;
-        let (controller, snapshots) = controller_with_snapshots();
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&snapshots);
+        let (event_consumed, observed_event) = oneshot::channel();
+        let event_consumed = Arc::new(Mutex::new(Some(event_consumed)));
+        let event_observer = Arc::clone(&event_consumed);
+        let controller = DesktopController::spawn_with_event_observer(
+            move |snapshot| {
+                sink.lock().expect("snapshots").push(snapshot);
+            },
+            move || {
+                if let Some(observed) = event_observer.lock().expect("event observer").take() {
+                    let _ = observed.send(());
+                }
+            },
+        )
+        .expect("controller");
         controller
             .sender()
             .connect(request(&gateway.url))
@@ -1064,10 +1156,13 @@ mod tests {
             snapshot.phase() == OnboardingPhase::Ready
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(additional_requests.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(2), observed_event)
+            .await
+            .expect("event branch timeout")
+            .expect("event branch closed");
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
+        assert_eq!(additional_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

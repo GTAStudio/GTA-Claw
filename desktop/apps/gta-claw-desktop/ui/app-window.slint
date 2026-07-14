@@ -45,6 +45,10 @@ export component AppWindow inherits Window {
     callback disconnect-requested();
     callback error-dismiss-requested();
 
+    public function request-close() -> bool {
+        return root.close();
+    }
+
     onboarding := GatewayOnboardingSurface {
         width: 100%;
         height: 100%;

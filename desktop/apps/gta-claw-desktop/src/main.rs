@@ -344,13 +344,15 @@ mod tests {
             controller.sender(),
             Rc::new(RefCell::new(VisualPreferencesState::default())),
         );
+        let weak_window = window.as_weak();
         window.set_token_input("pending-close-secret".into());
-        assert!(matches!(
-            handle_close_request(&window.as_weak(), &controller.sender()),
-            CloseRequestResponse::HideWindow
-        ));
+        assert!(window.invoke_request_close());
         assert_eq!(window.get_token_input(), "");
         drop(window);
+        assert!(matches!(
+            handle_close_request(&weak_window, &controller.sender()),
+            CloseRequestResponse::HideWindow
+        ));
         controller.shutdown().expect("controller shutdown");
         assert!(snapshots.lock().expect("snapshots").iter().any(|snapshot| {
             matches!(
