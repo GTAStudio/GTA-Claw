@@ -227,3 +227,13 @@ expected = "desktop workspace dependency policy changed: claw-application"
 name = "desktop-replace-slint-build"
 mutation = "desktop-replace-slint-build"
 expected = "desktop must not patch or replace registry sources"
+
+[[case]]
+name = "app-claw-application-registry"
+mutation = "app-claw-application-registry"
+expected = "desktop app workspace dependency policy changed: claw-application"
+
+[[case]]
+name = "app-claw-platform-path"
+mutation = "app-claw-platform-path"
+expected = "desktop app workspace dependency policy changed: claw-platform"

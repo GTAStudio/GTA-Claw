@@ -1581,6 +1581,19 @@ fn validate_dependency_graph(
     }) {
         errors.push("desktop target dependency keys changed".to_owned());
     }
+    for name in ["claw-application", "claw-platform"] {
+        let dependency = dependencies
+            .and_then(|dependencies| dependencies.get(name))
+            .and_then(TomlValue::as_table);
+        if dependency.is_none_or(|dependency| {
+            toml_keys(dependency) != expected_set(&["workspace"])
+                || dependency.get("workspace").and_then(TomlValue::as_bool) != Some(true)
+        }) {
+            errors.push(format!(
+                "desktop app workspace dependency policy changed: {name}"
+            ));
+        }
+    }
     let build_dependencies = target
         .and_then(|target| target.get("build-dependencies"))
         .and_then(TomlValue::as_table);
@@ -2310,6 +2323,44 @@ fn mutate_negative_case(
                     ])),
                 );
         }
+        "app-claw-application-registry" => {
+            app_manifest
+                .get_mut("target")
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| {
+                    target.get_mut(r#"cfg(any(target_os = "windows", target_os = "macos"))"#)
+                })
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| target.get_mut("dependencies"))
+                .and_then(TomlValue::as_table_mut)
+                .expect("desktop app dependencies")
+                .insert(
+                    "claw-application".to_owned(),
+                    TomlValue::Table(toml::map::Map::from_iter([(
+                        "version".to_owned(),
+                        TomlValue::String("0.1.0".to_owned()),
+                    )])),
+                );
+        }
+        "app-claw-platform-path" => {
+            app_manifest
+                .get_mut("target")
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| {
+                    target.get_mut(r#"cfg(any(target_os = "windows", target_os = "macos"))"#)
+                })
+                .and_then(TomlValue::as_table_mut)
+                .and_then(|target| target.get_mut("dependencies"))
+                .and_then(TomlValue::as_table_mut)
+                .expect("desktop app dependencies")
+                .insert(
+                    "claw-platform".to_owned(),
+                    TomlValue::Table(toml::map::Map::from_iter([(
+                        "path".to_owned(),
+                        TomlValue::String("../../../../untrusted".to_owned()),
+                    )])),
+                );
+        }
         "desktop-replace-slint-build" => {
             desktop_manifest
                 .as_table_mut()
@@ -2392,7 +2443,7 @@ fn negative_policy_fixtures_reject_bypasses() {
         .get("case")
         .and_then(TomlValue::as_array)
         .expect("negative policy cases");
-    assert_eq!(cases.len(), 46, "every bypass category must remain covered");
+    assert_eq!(cases.len(), 48, "every bypass category must remain covered");
     let require_actionlint = std::env::var("REQUIRE_ACTIONLINT").as_deref() == Ok("true");
     let actionlint = require_actionlint.then(|| {
         let path = PathBuf::from(
