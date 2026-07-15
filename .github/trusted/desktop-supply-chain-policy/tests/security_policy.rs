@@ -402,6 +402,70 @@ fn authoritative_ruleset_workflow_queues_instead_of_cancelling() {
 }
 
 #[test]
+fn tagged_yaml_values_fail_closed_in_every_workflow_position() {
+    validate_inventory(&SafeRoot::new(repo_root()).expect("open canonical workflows"))
+        .expect("canonical workflows remain accepted");
+
+    let cases = [
+        (
+            "job-concurrency",
+            AUTHORITATIVE_PATH,
+            "    runs-on: ubuntu-24.04\n",
+            "    runs-on: ubuntu-24.04\n    concurrency: !job\n      group: authoritative-job\n      cancel-in-progress: true\n",
+        ),
+        (
+            "workflow-root",
+            AUTHORITATIVE_PATH,
+            "name: GTA Claw authoritative desktop supply-chain policy\n",
+            "--- !workflow\nname: GTA Claw authoritative desktop supply-chain policy\n",
+        ),
+        (
+            "workflow-concurrency",
+            AUTHORITATIVE_PATH,
+            "concurrency:\n  group: trusted-desktop-policy-${{ github.event.pull_request.number }}\n",
+            "concurrency: !workflow\n  group: trusted-desktop-policy-${{ github.event.pull_request.number }}\n  cancel-in-progress: true\n",
+        ),
+        (
+            "nested-sequence-value",
+            AUTHORITATIVE_PATH,
+            "      - opened\n",
+            "      - !activity opened\n",
+        ),
+        (
+            "nested-mapping-key",
+            AUTHORITATIVE_PATH,
+            "          BASH_ENV: \"\"\n",
+            "          !environment BASH_ENV: \"\"\n",
+        ),
+        (
+            "nested-mapping-value",
+            AUTHORITATIVE_PATH,
+            "          ENV: \"\"\n",
+            "          ENV: !empty \"\"\n",
+        ),
+        (
+            "non-authoritative-workflow",
+            BOOTSTRAP_PATH,
+            "      - name: Checkout candidate validator\n",
+            "      - !step\n        name: Checkout candidate validator\n",
+        ),
+    ];
+
+    for (label, path, from, to) in cases {
+        let tree = copy_repo(&format!("tagged-yaml-{label}"));
+        replace(&tree.join(path), from, to);
+        let error = validate_inventory(&SafeRoot::new(&tree.path).expect("open tagged workflow"))
+            .expect_err("tagged workflow unexpectedly passed");
+        assert!(
+            error
+                .to_string()
+                .contains("tagged YAML values are forbidden"),
+            "{label} failed for the wrong reason: {error}"
+        );
+    }
+}
+
+#[test]
 fn authoritative_workflow_checkout_and_event_controls_are_exact() {
     let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
         .expect("read authoritative workflow");

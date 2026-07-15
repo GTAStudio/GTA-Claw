@@ -154,6 +154,28 @@ fn parse_identity(path: &str, workflow: &YamlValue) -> PolicyResult<WorkflowIden
     })
 }
 
+fn reject_tagged_yaml(value: &YamlValue, path: &str) -> PolicyResult<()> {
+    match value {
+        YamlValue::Tagged(_) => Err(PolicyError::new(format!(
+            "tagged YAML values are forbidden in repository workflow: {path}"
+        ))),
+        YamlValue::Mapping(values) => {
+            for (key, value) in values {
+                reject_tagged_yaml(key, path)?;
+                reject_tagged_yaml(value, path)?;
+            }
+            Ok(())
+        }
+        YamlValue::Sequence(values) => {
+            for value in values {
+                reject_tagged_yaml(value, path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn uses_cancel_in_progress(value: &YamlValue) -> bool {
     match value {
         YamlValue::Mapping(values) => {
@@ -243,6 +265,7 @@ pub fn validate_inventory(root: &SafeRoot) -> PolicyResult<Vec<WorkflowIdentity>
         let text = root.read_text(&path, MAX_WORKFLOW_BYTES)?;
         let workflow: YamlValue = serde_yaml_ng::from_str(&text)
             .map_err(|cause| error(&format!("parse workflow {path}"), cause))?;
+        reject_tagged_yaml(&workflow, &path)?;
         if path == AUTHORITATIVE_PATH {
             validate_ruleset_workflow_eligibility(&workflow)?;
         }
