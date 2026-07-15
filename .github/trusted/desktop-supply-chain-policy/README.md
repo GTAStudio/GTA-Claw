@@ -37,7 +37,9 @@ authority:
 
 The authoritative workflow has no `paths` or `paths-ignore` filter. It runs on every
 pull request targeting `main` and computes the complete direct base-to-head changed
-paths with trusted Git.
+paths with trusted Git. It fetches the exact protected base at depth 1 and the exact
+immutable head at depth 10,001, never fetches tags or wildcard fork refs, and rejects
+direct pull-request ranges above 10,000 commits.
 
 The validator recognizes two base states:
 
@@ -59,10 +61,23 @@ The validator exact-freezes:
 
 - both workflow definitions and the complete trusted tree;
 - reserved workflow/job/check identities;
+- canonical Unicode-normalized, full-case-folded path-component collisions while
+  retaining strict ASCII-only security-sensitive names;
+- the legacy `rust-toolchain` basename at every depth, with canonical ownership coverage
+  for attempted additions and only `rust-toolchain.toml` permitted;
 - deny, audit, toolchain, and intentional exception policies;
+- root/headless GUI exclusion including Slint, GTK4, GDK4, and GSK4 package families,
+  renamed dependencies, metadata, and transitive lock entries;
 - the desktop workspace's sole app member;
 - the desktop package name, manifest, build script, Slint declarations, targets,
   dependencies, smoke test, lock agreement, and Cargo metadata paths;
+- locked offline Cargo-metadata release-version agreement across root and desktop
+  workspaces, independent of TOML whitespace;
+- one exact `CFBundleExecutable`, one regular non-symlink executable in
+  `Contents/MacOS`, and repeated pre/post-signing and notarization verification;
+- raw LF execution bytes and executable modes for adversarial shell-tool fixtures;
+- an independent 48-case archived mutation inventory bound to exact artifact rule
+  classes and messages;
 - the three real lockfile locations: root, desktop, and this validator.
 
 The root headless workspace remains extensible. A new canonical `crates/<name>` or

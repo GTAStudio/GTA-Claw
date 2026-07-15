@@ -297,10 +297,10 @@ pub fn mutate_negative_case(
                 env.insert(yaml_key(key), YamlValue::String("/tmp/poison".to_owned()));
             }
             yaml_mapping_mut(
-                step_by_name_mut(workflow, "supply-chain", "Validate supply-chain policy")
-                    .expect("policy validation step"),
+                step_by_name_mut(workflow, "supply-chain", "Check root dependency policy")
+                    .expect("root dependency policy step"),
             )
-            .expect("policy validation mapping")
+            .expect("root dependency policy mapping")
             .insert(yaml_key("env"), YamlValue::Mapping(env));
         }
         "negative-desktop-path" => {

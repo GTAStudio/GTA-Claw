@@ -96,7 +96,7 @@ expected = "verified tool bootstrap environment changed"
 [[case]]
 name = "policy-step-runner-env"
 mutation = "policy-step-runner-env"
-expected = "Validate supply-chain policy step schema changed"
+expected = "Check root dependency policy step schema changed"
 
 [[case]]
 name = "native-matrix-runner-collapse"

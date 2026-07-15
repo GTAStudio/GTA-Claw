@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value as JsonValue;
 
 use crate::input::{SafeRoot, sha256};
-use crate::policy::RootWorkspace;
+use crate::policy::{RootWorkspace, is_forbidden_gui};
 use crate::process::{CommandSpec, canonical_tool, run_checked};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -272,6 +272,90 @@ fn string_array(value: Option<&JsonValue>, label: &str) -> PolicyResult<Vec<Stri
     .collect()
 }
 
+fn plain_semver(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn workspace_version(metadata: &JsonValue, label: &str) -> PolicyResult<String> {
+    let root = object(metadata, label)?;
+    let packages = array(
+        root.get("packages")
+            .ok_or_else(|| PolicyError::new(format!("{label} packages are missing")))?,
+        &format!("{label} packages"),
+    )?;
+    if packages.is_empty() {
+        return Err(PolicyError::new(format!(
+            "{label} packages must not be empty"
+        )));
+    }
+    let mut package_ids = BTreeSet::new();
+    let mut versions = BTreeSet::new();
+    for package in packages {
+        let package = object(package, &format!("{label} package"))?;
+        let id = text(package.get("id"), &format!("{label} package.id"))?;
+        if !package_ids.insert(id.to_owned()) {
+            return Err(PolicyError::new(format!(
+                "{label} contains a duplicate package ID"
+            )));
+        }
+        let version = text(package.get("version"), &format!("{label} package.version"))?;
+        if !plain_semver(version) {
+            return Err(PolicyError::new(format!(
+                "{label} package version is not a plain semantic version: {version:?}"
+            )));
+        }
+        versions.insert(version.to_owned());
+    }
+    for key in ["workspace_members", "workspace_default_members"] {
+        let member_values = string_array(root.get(key), &format!("{label} {key}"))?;
+        let members = member_values.iter().cloned().collect::<BTreeSet<_>>();
+        if members.len() != member_values.len() || members != package_ids {
+            return Err(PolicyError::new(format!(
+                "{label} {key} is not duplicate-free or does not exactly match package IDs"
+            )));
+        }
+    }
+    if versions.len() != 1 {
+        return Err(PolicyError::new(format!(
+            "{label} must contain exactly one workspace package version"
+        )));
+    }
+    Ok(versions.into_iter().next().expect("one checked version"))
+}
+
+/// Returns the one agreed root/desktop release version from bounded Cargo metadata documents.
+pub fn release_version_from_metadata_documents(
+    root_document: &[u8],
+    desktop_document: &[u8],
+) -> PolicyResult<String> {
+    for (label, document) in [
+        ("root release metadata", root_document),
+        ("desktop release metadata", desktop_document),
+    ] {
+        if document.len() > MAX_METADATA_BYTES {
+            return Err(PolicyError::new(format!(
+                "{label} exceeds the production output bound"
+            )));
+        }
+    }
+    let root_metadata: JsonValue = serde_json::from_slice(root_document)
+        .map_err(|cause| error("parse root release metadata", cause))?;
+    let desktop_metadata: JsonValue = serde_json::from_slice(desktop_document)
+        .map_err(|cause| error("parse desktop release metadata", cause))?;
+    let root_version = workspace_version(&root_metadata, "root release metadata")?;
+    let desktop_version = workspace_version(&desktop_metadata, "desktop release metadata")?;
+    if root_version != desktop_version {
+        return Err(PolicyError::new(format!(
+            "root and desktop workspace release versions disagree: {root_version} != {desktop_version}"
+        )));
+    }
+    Ok(root_version)
+}
+
 fn require_package_metadata(
     package: &serde_json::Map<String, JsonValue>,
     expected_name: &str,
@@ -438,6 +522,7 @@ fn require_desktop_dependencies(
 /// Runs and verifies exact locked desktop package metadata.
 pub fn validate_desktop_metadata(
     candidate: &SafeRoot,
+    expected_version: &str,
     tools: &MetadataTools,
     isolation_root: &Path,
 ) -> PolicyResult<()> {
@@ -448,11 +533,12 @@ pub fn validate_desktop_metadata(
         isolation_root,
         "desktop-metadata",
     )?;
-    validate_desktop_metadata_value(candidate, &metadata, &isolation.target)
+    validate_desktop_metadata_value(candidate, expected_version, &metadata, &isolation.target)
 }
 
 fn validate_desktop_metadata_value(
     candidate: &SafeRoot,
+    expected_version: &str,
     metadata: &JsonValue,
     expected_target_path: &Path,
 ) -> PolicyResult<()> {
@@ -487,7 +573,7 @@ fn validate_desktop_metadata_value(
         ));
     }
     let package = object(&packages[0], "desktop package")?;
-    require_package_metadata(package, "gta-claw-desktop", "0.1.0")?;
+    require_package_metadata(package, "gta-claw-desktop", expected_version)?;
     require_path(
         text(package.get("manifest_path"), "manifest_path")?,
         &candidate
@@ -564,6 +650,7 @@ fn validate_desktop_metadata_value(
 /// Verifies an already bounded metadata document for adversarial parser tests.
 pub fn validate_desktop_metadata_document(
     candidate: &SafeRoot,
+    expected_version: &str,
     expected_target: &Path,
     document: &[u8],
 ) -> PolicyResult<()> {
@@ -574,7 +661,7 @@ pub fn validate_desktop_metadata_document(
     }
     let metadata: JsonValue = serde_json::from_slice(document)
         .map_err(|cause| error("parse bounded metadata document", cause))?;
-    validate_desktop_metadata_value(candidate, &metadata, expected_target)
+    validate_desktop_metadata_value(candidate, expected_version, &metadata, expected_target)
 }
 
 /// Runs and verifies the declared extensible root member metadata.
@@ -616,6 +703,32 @@ pub fn validate_root_metadata(
         let package = object(package, "root package")?;
         let name = text(package.get("name"), "package.name")?;
         require_package_metadata(package, name, &workspace.version)?;
+        for dependency in array(
+            package
+                .get("dependencies")
+                .ok_or_else(|| PolicyError::new("root package dependencies are missing"))?,
+            "root package dependencies",
+        )? {
+            let dependency = object(dependency, "root package dependency")?;
+            let dependency_name = text(dependency.get("name"), "dependency.name")?;
+            if is_forbidden_gui(dependency_name) {
+                return Err(PolicyError::new(format!(
+                    "root metadata contains forbidden GUI dependency: {dependency_name}"
+                )));
+            }
+            if let Some(rename) = dependency.get("rename")
+                && !rename.is_null()
+            {
+                let rename = rename.as_str().ok_or_else(|| {
+                    PolicyError::new("root metadata dependency rename is not a string")
+                })?;
+                if is_forbidden_gui(rename) {
+                    return Err(PolicyError::new(format!(
+                        "root metadata aliases a forbidden GUI dependency as {rename}"
+                    )));
+                }
+            }
+        }
         let manifest = canonical_metadata_path(
             text(package.get("manifest_path"), "manifest_path")?,
             "root member manifest",
@@ -632,6 +745,14 @@ pub fn validate_root_metadata(
             .map(|component| component.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
+        let member = relative
+            .strip_suffix("/Cargo.toml")
+            .ok_or_else(|| PolicyError::new("root metadata member manifest is not canonical"))?;
+        if workspace.members.get(member).map(String::as_str) != Some(name) {
+            return Err(PolicyError::new(format!(
+                "root metadata package name does not match declared member: {member}"
+            )));
+        }
         if !manifests.insert(relative) {
             return Err(PolicyError::new("duplicate root metadata member manifest"));
         }

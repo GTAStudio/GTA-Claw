@@ -288,6 +288,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Install pinned release metadata toolchain
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          readonly rustup_bin="/home/runner/.cargo/bin/rustup"
+          [[ -x "$rustup_bin" ]]
+          "$rustup_bin" toolchain install 1.97.0 \
+            --profile minimal \
+            --no-self-update
+
       - name: Enforce protected main and semantic tag policy
         id: policy
         shell: bash
@@ -345,16 +354,38 @@ jobs:
           }
 
           version="${GITHUB_REF_NAME#v}"
+          readonly metadata_script="$GITHUB_WORKSPACE/.github/trusted/desktop-supply-chain-policy/scripts/release-metadata-version.sh"
+          readonly metadata_root="${RUNNER_TEMP}/gta-claw-release-version"
+          readonly rustup_bin="/home/runner/.cargo/bin/rustup"
+          [[ "$RUNNER_TEMP" == /home/runner/work/_temp/* ]]
+          [[ "$GITHUB_WORKSPACE" == /home/runner/work/* ]]
+          [[ -f "$metadata_script" && ! -L "$metadata_script" ]]
+          [[ -x "$rustup_bin" && ! -e "$metadata_root" ]]
+          cargo_bin="$(
+            /usr/bin/env -i \
+              HOME=/home/runner \
+              RUSTUP_HOME=/home/runner/.rustup \
+              PATH=/usr/bin:/bin \
+              "$rustup_bin" which --toolchain 1.97.0 cargo
+          )"
+          rustc_bin="$(
+            /usr/bin/env -i \
+              HOME=/home/runner \
+              RUSTUP_HOME=/home/runner/.rustup \
+              PATH=/usr/bin:/bin \
+              "$rustup_bin" which --toolchain 1.97.0 rustc
+          )"
+          [[ "$cargo_bin" == /home/runner/.rustup/toolchains/1.97.0-*/bin/cargo ]]
+          [[ "$rustc_bin" == /home/runner/.rustup/toolchains/1.97.0-*/bin/rustc ]]
+          [[ -x "$cargo_bin" && -x "$rustc_bin" ]]
           cargo_version="$(
-            awk '
-              /^\[workspace\.package\]$/ { in_package = 1; next }
-              /^\[/ { in_package = 0 }
-              in_package && $1 == "version" {
-                gsub(/"/, "", $3)
-                print $3
-                exit
-              }
-            ' Cargo.toml
+            /bin/bash "$metadata_script" \
+              "$cargo_bin" \
+              "$rustc_bin" \
+              "$GITHUB_WORKSPACE" \
+              "$metadata_root" \
+              "$version" \
+              "$REQUESTED_VERSION"
           )"
           test "$version" = "$cargo_version" || {
             echo "Tag version $version does not match Cargo version $cargo_version" >&2
@@ -366,9 +397,11 @@ jobs:
               exit 1
             }
           fi
-          echo "release-sha=$GITHUB_SHA" >>"$GITHUB_OUTPUT"
-          echo "release-ref=$GITHUB_REF" >>"$GITHUB_OUTPUT"
-          echo "version=$version" >>"$GITHUB_OUTPUT"
+          {
+            printf 'release-sha=%s\n' "$GITHUB_SHA"
+            printf 'release-ref=%s\n' "$GITHUB_REF"
+            printf 'version=%s\n' "$version"
+          } >>"$GITHUB_OUTPUT"
 
   protected-release-contract:
     name: Protected signing and notarization contract
@@ -383,6 +416,22 @@ jobs:
       actions: read
       contents: read
     steps:
+      - name: Checkout exact trusted release verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.release-policy.outputs.release-sha }}
+          path: trusted-release-policy
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          sparse-checkout: .github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh
+          sparse-checkout-cone-mode: false
+          submodules: false
+          lfs: false
+          clean: true
+          set-safe-directory: false
+          show-progress: false
+
       - name: Download exact secret-free release input
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -455,8 +504,10 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumSystemVersion' "$metadata")" = "14.0"
 
           app="$root/GTA Claw.app"
+          verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
           plist="$app/Contents/Info.plist"
           binary="$app/Contents/MacOS/gta-claw-desktop"
+          /bin/bash "$verifier" "$app"
           test -f "$binary" -a -x "$binary" -a ! -L "$binary"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = "com.gtastudio.gta-claw"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$EXPECTED_VERSION"
@@ -464,16 +515,23 @@ jobs:
           lipo "$binary" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dvvv "$app" 2>&1 | grep -F 'Signature=adhoc' >/dev/null
-          if otool -L "$binary" |
-            tail -n +2 |
+          dependencies="$(otool -L "$binary")" || {
+            echo "otool could not inspect release app dependencies" >&2
+            exit 1
+          }
+          if tail -n +2 <<<"$dependencies" |
             sed -E 's/^[[:space:]]*//; /:$/d; s/[[:space:]]+\(compatibility version.*$//' |
             grep -Ev '^(/System/Library/Frameworks/|/usr/lib/)'; then
             echo "Release app contains a non-system dynamic dependency" >&2
             exit 1
           fi
-          if otool -l "$binary" |
-            awk '$1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
-                 in_rpath && $1 == "path" { print $2; in_rpath = 0 }' |
+          load_commands="$(otool -l "$binary")" || {
+            echo "otool could not inspect release app load commands" >&2
+            exit 1
+          }
+          if awk '$1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+                 in_rpath && $1 == "path" { print $2; in_rpath = 0 }' \
+              <<<"$load_commands" |
             grep -Ev '^(@executable_path/\.\./Frameworks|@loader_path/\.\./Frameworks)$'; then
             echo "Release app contains an unexpected rpath" >&2
             exit 1
@@ -533,6 +591,8 @@ jobs:
           EOF
           plutil -lint "$entitlements" >/dev/null
           app="$state/release-input/GTA Claw.app"
+          verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
+          /bin/bash "$verifier" "$app"
           if [[ -d "$app/Contents/Frameworks" ]]; then
             while IFS= read -r code; do
               codesign --force --options runtime --timestamp \
@@ -545,6 +605,7 @@ jobs:
             --sign "$DEVELOPER_ID_APPLICATION" \
             "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
+          /bin/bash "$verifier" "$app"
           details="$(codesign -dvvv "$app" 2>&1)"
           requirement="$(codesign -d -r- "$app" 2>&1)"
           grep -F 'Authority=Developer ID Application:' <<<"$details" >/dev/null
@@ -574,6 +635,9 @@ jobs:
           trap 'rm -f -- "$key" "$archive" "$result"' EXIT INT TERM
           printf '%s' "$ASC_KEY_P8" >"$key"
           app="$state/release-input/GTA Claw.app"
+          verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
+          /bin/bash "$verifier" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
           ditto -c -k --keepParent "$app" "$archive"
           xcrun notarytool submit "$archive" \
             --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
@@ -588,6 +652,8 @@ jobs:
           fi
           xcrun stapler staple "$app"
           xcrun stapler validate "$app"
+          /bin/bash "$verifier" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
 
       - name: Import installer identity and sign DMG and PKG
         shell: bash
@@ -634,6 +700,9 @@ jobs:
           ditto "$app" "$dmg_stage/GTA Claw.app"
           ditto "$app" "$package_root/Applications/GTA Claw.app"
           test -z "$(find "$dmg_stage" "$package_root" -type l -print -quit)"
+          verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
+          /bin/bash "$verifier" "$dmg_stage/GTA Claw.app"
+          /bin/bash "$verifier" "$package_root/Applications/GTA Claw.app"
 
           dmg="$distribution/gta-claw-${{ needs.release-policy.outputs.version }}-macos.dmg"
           hdiutil create \
@@ -708,6 +777,8 @@ jobs:
           state="$RUNNER_TEMP/gta-claw-release"
           app="$state/release-input/GTA Claw.app"
           distribution="$state/distribution"
+          verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
+          /bin/bash "$verifier" "$app"
           lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=4 "$app"

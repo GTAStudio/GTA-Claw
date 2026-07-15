@@ -10,6 +10,7 @@
 /.gitattributes @aizhihuxiao
 /.cargo/audit.toml @aizhihuxiao
 /deny.toml @aizhihuxiao
+rust-toolchain @aizhihuxiao
 /rust-toolchain.toml @aizhihuxiao
 /rustfmt.toml @aizhihuxiao
 /desktop/Cargo.toml @aizhihuxiao
