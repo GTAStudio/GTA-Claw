@@ -1672,8 +1672,9 @@ fn protected_macos_signing_binds_one_exact_bundle_executable() {
     )
     .expect("read trusted macOS verifier");
     for required in [
-        "CFBundleExecutable json -expect string",
-        "== '\"gta-claw-desktop\"'",
+        "/usr/bin/cmp -s",
+        "CFBundleExecutable raw -expect string",
+        "/usr/bin/printf 'gta-claw-desktop\\n'",
         "-mindepth 1 -maxdepth 1 -print0",
         "\"${#entries[@]}\" -eq 1",
         "-f \"$executable\" && ! -L \"$executable\" && -x \"$executable\"",

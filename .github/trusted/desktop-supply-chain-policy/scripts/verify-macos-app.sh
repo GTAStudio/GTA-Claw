@@ -18,7 +18,9 @@ readonly executable="$macos/gta-claw-desktop"
 [[ -f "$plist" && ! -L "$plist" ]]
 [[ -z "$(/usr/bin/find "$app" -type l -print -quit)" ]]
 /usr/bin/plutil -lint "$plist" >/dev/null
-[[ "$(/usr/bin/plutil -extract CFBundleExecutable json -expect string -o - "$plist")" == '"gta-claw-desktop"' ]]
+/usr/bin/cmp -s \
+  <(/usr/bin/plutil -extract CFBundleExecutable raw -expect string -o - "$plist") \
+  <(/usr/bin/printf 'gta-claw-desktop\n')
 
 entries=()
 while IFS= read -r -d '' entry; do

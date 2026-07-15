@@ -353,6 +353,13 @@ expect_failure plist-executable-non-string \
 
 expect_success restore-fixture \
   "$MACOS_DIR/assemble-app.sh" "$work/hello-${host_arch/arm64/arm64}" "$host_arch" "$host_arch"
+/usr/bin/plutil -replace CFBundleExecutable -string $'gta-claw-desktop\n' \
+  "$fixture_app/Contents/Info.plist"
+expect_failure plist-executable-trailing-newline \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+expect_success restore-fixture \
+  "$MACOS_DIR/assemble-app.sh" "$work/hello-${host_arch/arm64/arm64}" "$host_arch" "$host_arch"
 touch "$fixture_app/Contents/MacOS/alternate-desktop"
 chmod +x "$fixture_app/Contents/MacOS/alternate-desktop"
 expect_failure alternate-executable \

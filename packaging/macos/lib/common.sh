@@ -463,7 +463,9 @@ assert_app_executable_contract() {
   [[ -f "$plist" && ! -L "$plist" ]] || die "invalid app Info.plist"
   reject_symlinks "$app"
   /usr/bin/plutil -lint "$plist" >/dev/null
-  [[ "$(/usr/bin/plutil -extract CFBundleExecutable json -expect string -o - "$plist")" == '"gta-claw-desktop"' ]] ||
+  /usr/bin/cmp -s \
+    <(/usr/bin/plutil -extract CFBundleExecutable raw -expect string -o - "$plist") \
+    <(/usr/bin/printf 'gta-claw-desktop\n') ||
     die "CFBundleExecutable must be exactly gta-claw-desktop"
   while IFS= read -r -d '' entry; do
     entries+=("$entry")
