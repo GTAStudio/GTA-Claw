@@ -1,0 +1,643 @@
+name: rust
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".cargo/**"
+      - ".gitattributes"
+      - ".github/fixtures/cargo-audit/**"
+      - ".github/fixtures/security-tools/**"
+      - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/rust.yml"
+      - "apps/**"
+      - "crates/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".deny*.toml"
+      - "deny*.toml"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".gitattributes"
+      - ".github/fixtures/cargo-audit/**"
+      - ".github/fixtures/security-tools/**"
+      - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/rust.yml"
+      - "apps/**"
+      - "crates/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".deny*.toml"
+      - "deny*.toml"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless:
+    name: Headless (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    env:
+      CARGO_BUILD_WARNINGS: deny
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Assert root metadata excludes Slint
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo metadata --locked --format-version 1 |
+            python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"root metadata contains Slint packages: {forbidden}"'
+
+  msrv:
+    name: MSRV (1.94.0)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal
+
+      - name: Check workspace at MSRV
+        run: cargo +1.94.0 check --workspace --all-targets --locked
+
+  gateway-stress:
+    name: Gateway synchronization stress (macOS Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Repeat deterministic Gateway regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in $(seq 1 100); do
+            echo "Gateway synchronization iteration ${iteration}/100"
+            cargo test --locked --package claw-gateway-client \
+              --test gateway_client \
+              cumulative_outbound_bytes_bound_multiple_requests_behind_stalled_writer \
+              -- --exact
+            cargo test --locked --package claw-gateway-client \
+              --test gateway_client \
+              expired_queued_side_effect_is_never_transmitted_and_releases_budgets \
+              -- --exact
+          done
+
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    env:
+      CARGO_BUILD_WARNINGS: deny
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+
+      - name: Check workspace
+        run: cargo check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+
+      - name: Build desktop application
+        run: cargo build --manifest-path desktop/Cargo.toml --workspace --locked
+
+  desktop-unsupported:
+    name: Desktop rejects Linux
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_WARNINGS: deny
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Assert Linux desktop graph excludes Slint
+        shell: bash
+        run: |
+          cargo metadata --manifest-path desktop/Cargo.toml --locked --format-version 1 \
+            --filter-platform x86_64-unknown-linux-gnu |
+            python -c 'import json, sys; names = {package["name"] for package in json.load(sys.stdin)["packages"]}; forbidden = sorted(name for name in names if name == "slint" or name == "slint-build" or name.startswith("i-slint")); assert not forbidden, f"Linux desktop metadata contains Slint packages: {forbidden}"'
+
+      - name: Assert desktop build rejects Linux
+        shell: bash
+        run: |
+          set +e
+          output=$(cargo check --manifest-path desktop/Cargo.toml \
+            --package gta-claw-desktop --locked 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "Desktop build unexpectedly succeeded on Linux"
+            exit 1
+          fi
+          grep -F "gta-claw-desktop supports only Windows and macOS" <<<"$output"
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Bootstrap verified Rust security tools
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASH_ENV: ${{ github.workspace }}/.github/fixtures/security-tools/bash-env-poison.sh
+          BASH_ENV_POISON_MARKER: ${{ runner.temp }}/bootstrap-bash-env-poisoned
+          PATH: ${{ github.workspace }}/.github/fixtures/security-tools/shadow-bin
+          SHADOW_TOOL_POISON_MARKER: ${{ runner.temp }}/bootstrap-shadow-tool-poisoned
+        run: |
+          set -euo pipefail
+          test ! -e "${{ runner.temp }}/bootstrap-bash-env-poisoned"
+          test ! -e "${{ runner.temp }}/bootstrap-shadow-tool-poisoned"
+          readonly ACTIONLINT_ARCHIVE_SHA256="023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+          readonly ACTIONLINT_VERSION="1.7.7"
+          readonly CARGO_AUDIT_CRATE_SHA256="700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a"
+          readonly CARGO_AUDIT_VERSION="0.22.2"
+          readonly CARGO_DENY_ARCHIVE_SHA256="70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f"
+          readonly CARGO_DENY_VERSION="0.19.8"
+          original_home="$(
+            /usr/bin/getent passwd "$(/usr/bin/id -u)" |
+              /usr/bin/cut -d: -f6
+          )"
+          verified_rustup_home="$original_home/.rustup"
+          rustup_bin="$original_home/.cargo/bin/rustup"
+          curl_bin="/usr/bin/curl"
+          test -x "$rustup_bin"
+          cargo_bin="$(
+            /usr/bin/env -i \
+              HOME="$original_home" \
+              RUSTUP_HOME="$verified_rustup_home" \
+              PATH="/usr/bin:/bin" \
+              "$rustup_bin" which cargo
+          )"
+          rustc_bin="$(
+            /usr/bin/env -i \
+              HOME="$original_home" \
+              RUSTUP_HOME="$verified_rustup_home" \
+              PATH="/usr/bin:/bin" \
+              "$rustup_bin" which rustc
+          )"
+          test -x "$cargo_bin"
+          test -x "$rustc_bin"
+          tool_root="${{ runner.temp }}/verified-rust-security-tools"
+          poison_marker="${{ runner.temp }}/poisoned-cargo-audit-built"
+          shadow_marker="${{ runner.temp }}/poisoned-cargo-audit-executed"
+          /usr/bin/rm -rf -- "$tool_root"
+          /usr/bin/rm -f -- "$poison_marker" "$shadow_marker"
+          /usr/bin/mkdir -p "$tool_root/downloads" "$tool_root/src"
+
+          poison_source="$original_home/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cargo-audit-${CARGO_AUDIT_VERSION}"
+          /usr/bin/mkdir -p "$poison_source/src" "$original_home/.cargo/bin"
+          /usr/bin/cat >"$poison_source/Cargo.toml" <<'EOF'
+          [package]
+          name = "cargo-audit"
+          version = "0.22.2"
+          edition = "2024"
+          build = "build.rs"
+
+          [[bin]]
+          name = "cargo-audit"
+          path = "src/main.rs"
+          EOF
+          /usr/bin/cat >"$poison_source/build.rs" <<'EOF'
+          fn main() {
+              std::fs::write(std::env::var("POISON_MARKER").unwrap(), b"built").unwrap();
+          }
+          EOF
+          /usr/bin/cat >"$poison_source/src/main.rs" <<'EOF'
+          fn main() {
+              println!("cargo-audit-audit 0.22.2");
+          }
+          EOF
+          /usr/bin/touch "$poison_source/.cargo-ok"
+          /usr/bin/printf '{"files":{},"package":"%s"}\n' "$CARGO_AUDIT_CRATE_SHA256" \
+            >"$poison_source/.cargo-checksum.json"
+          /usr/bin/cat >"$original_home/.cargo/bin/cargo-audit" <<'EOF'
+          #!/usr/bin/env sh
+          printf 'executed\n' >"${POISON_SHADOW_MARKER:?}"
+          echo "cargo-audit-audit 0.22.2"
+          exit 0
+          EOF
+          /usr/bin/chmod +x "$original_home/.cargo/bin/cargo-audit"
+          export POISON_SHADOW_MARKER="$shadow_marker"
+
+          audit_archive="$tool_root/downloads/cargo-audit-${CARGO_AUDIT_VERSION}.crate"
+          "$curl_bin" --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://static.crates.io/crates/cargo-audit/cargo-audit-${CARGO_AUDIT_VERSION}.crate" \
+            --output "$audit_archive"
+          /usr/bin/printf '%s  %s\n' "$CARGO_AUDIT_CRATE_SHA256" "$audit_archive" |
+            /usr/bin/sha256sum --check -
+          /usr/bin/tar --extract --gzip --file "$audit_archive" --directory "$tool_root/src"
+          audit_source="$tool_root/src/cargo-audit-${CARGO_AUDIT_VERSION}"
+
+          deny_archive="$tool_root/downloads/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          "$curl_bin" --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$deny_archive"
+          /usr/bin/printf '%s  %s\n' "$CARGO_DENY_ARCHIVE_SHA256" "$deny_archive" |
+            /usr/bin/sha256sum --check -
+          /usr/bin/mkdir -p "$tool_root/cargo-deny"
+          /usr/bin/tar --extract --gzip --file "$deny_archive" \
+            --directory "$tool_root/cargo-deny" --strip-components=1
+
+          actionlint_archive="$tool_root/downloads/actionlint-${ACTIONLINT_VERSION}-linux-x86_64.tar.gz"
+          "$curl_bin" --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$actionlint_archive"
+          /usr/bin/printf '%s  %s\n' "$ACTIONLINT_ARCHIVE_SHA256" "$actionlint_archive" |
+            /usr/bin/sha256sum --check -
+          /usr/bin/mkdir -p "$tool_root/actionlint"
+          /usr/bin/tar --extract --gzip --file "$actionlint_archive" \
+            --directory "$tool_root/actionlint" actionlint
+
+          /usr/bin/mkdir -p "$tool_root/home" "$tool_root/cargo-home"
+          cd "$tool_root"
+          /usr/bin/env -i \
+            HOME="$tool_root/home" \
+            CARGO_HOME="$tool_root/cargo-home" \
+            RUSTUP_HOME="$verified_rustup_home" \
+            PATH="/usr/bin:/bin" \
+            RUSTC="$rustc_bin" \
+            POISON_MARKER="$poison_marker" \
+            "$cargo_bin" install --path "$audit_source" --locked \
+              --root "$tool_root/cargo-audit" --force
+
+          audit_bin="$tool_root/cargo-audit/bin/cargo-audit"
+          deny_bin="$tool_root/cargo-deny/cargo-deny"
+          actionlint_bin="$tool_root/actionlint/actionlint"
+          /usr/bin/mkdir -p "$tool_root/bin" "$tool_root/work"
+          /usr/bin/cat >"$tool_root/bin/run-cargo-clean" <<EOF
+          #!/bin/bash
+          set -euo pipefail
+          cd "$tool_root/work"
+          exec /usr/bin/env -i \
+            HOME="$tool_root/home" \
+            CARGO_HOME="$tool_root/cargo-home" \
+            RUSTUP_HOME="$verified_rustup_home" \
+            PATH="/usr/bin:/bin" \
+            CARGO="$cargo_bin" \
+            CARGO_TARGET_DIR="$tool_root/target" \
+            RUSTC="$rustc_bin" \
+            "$cargo_bin" "\$@"
+          EOF
+          /usr/bin/cat >"$tool_root/bin/run-cargo-deny-clean" <<EOF
+          #!/bin/bash
+          set -euo pipefail
+          cd "$tool_root/work"
+          exec /usr/bin/env -i \
+            HOME="$tool_root/home" \
+            CARGO_HOME="$tool_root/cargo-home" \
+            RUSTUP_HOME="$verified_rustup_home" \
+            PATH="/usr/bin:/bin" \
+            CARGO="$cargo_bin" \
+            CARGO_TARGET_DIR="$tool_root/target" \
+            RUSTC="$rustc_bin" \
+            "$deny_bin" "\$@"
+          EOF
+          /usr/bin/chmod +x "$tool_root/bin/run-cargo-clean" "$tool_root/bin/run-cargo-deny-clean"
+          test ! -e "$poison_marker"
+          test ! -e "$shadow_marker"
+          test "$("$audit_bin" audit --version)" = "cargo-audit-audit ${CARGO_AUDIT_VERSION}"
+          test "$("$deny_bin" --version)" = "cargo-deny ${CARGO_DENY_VERSION}"
+          test "$("$actionlint_bin" -version | /usr/bin/head -n 1)" = "$ACTIONLINT_VERSION"
+          test ! -e "${{ runner.temp }}/bootstrap-bash-env-poisoned"
+          test ! -e "${{ runner.temp }}/bootstrap-shadow-tool-poisoned"
+
+      - name: Audit root lockfile
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/cargo-audit/bin/cargo-audit"
+          audit --file Cargo.lock
+
+      - name: Audit desktop lockfile
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/cargo-audit/bin/cargo-audit"
+          audit --file desktop/Cargo.lock --no-fetch
+
+      - name: Test cargo-audit exit policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_bin="${{ runner.temp }}/verified-rust-security-tools/cargo-audit/bin/cargo-audit"
+          for event_name in pull_request push; do
+            export GITHUB_EVENT_NAME="$event_name"
+            if [[ "$event_name" == "pull_request" ]]; then
+              export GITHUB_HEAD_REF="audit-policy-fixture"
+            else
+              unset GITHUB_HEAD_REF
+            fi
+
+            warning_output="$(
+              "$audit_bin" audit --no-fetch \
+                --file .github/fixtures/cargo-audit/unmaintained/Cargo.lock 2>&1
+            )"
+            printf '%s\n' "$warning_output"
+            grep -F "RUSTSEC-2025-0141" <<<"$warning_output"
+
+            set +e
+            vulnerable_output="$(
+              "$audit_bin" audit --no-fetch \
+                --file .github/fixtures/cargo-audit/vulnerable/Cargo.lock 2>&1
+            )"
+            vulnerable_status=$?
+            set -e
+            printf '%s\n' "$vulnerable_output"
+            test "$vulnerable_status" -ne 0
+            grep -F "RUSTSEC-2026-0194" <<<"$vulnerable_output"
+            grep -F "RUSTSEC-2026-0195" <<<"$vulnerable_output"
+          done
+
+      - name: Test cargo-deny lock and exception policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_runner="${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-clean"
+          deny_runner="${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          fixture="${{ runner.temp }}/cargo-deny-policy-fixture"
+          rm -rf -- "$fixture"
+          mkdir -p "$fixture/app/src" "$fixture/prohibited/src"
+          cat >"$fixture/Cargo.toml" <<'EOF'
+          [workspace]
+          members = ["app", "prohibited"]
+          resolver = "3"
+          EOF
+          cat >"$fixture/app/Cargo.toml" <<'EOF'
+          [package]
+          name = "app"
+          version = "0.0.0"
+          edition = "2024"
+          license = "MIT"
+
+          [dependencies]
+          prohibited = { path = "../prohibited" }
+          EOF
+          printf 'fn main() {}\n' >"$fixture/app/src/main.rs"
+          cat >"$fixture/prohibited/Cargo.toml" <<'EOF'
+          [package]
+          name = "prohibited"
+          version = "0.0.0"
+          edition = "2024"
+          license = "GPL-3.0-only"
+          EOF
+          printf '\n' >"$fixture/prohibited/src/lib.rs"
+          cat >"$fixture/deny.toml" <<'EOF'
+          [graph]
+          all-features = true
+
+          [licenses]
+          allow = ["MIT"]
+          confidence-threshold = 0.8
+          EOF
+          "$cargo_runner" generate-lockfile \
+            --manifest-path "$fixture/Cargo.toml" --offline
+
+          set +e
+          rejected_output="$(
+            "$deny_runner" --manifest-path "$fixture/Cargo.toml" --locked \
+              check --config "$fixture/deny.toml" licenses 2>&1
+          )"
+          rejected_status=$?
+          set -e
+          printf '%s\n' "$rejected_output"
+          test "$rejected_status" -ne 0
+          grep -F "GPL-3.0-only" <<<"$rejected_output"
+
+          cat >"$fixture/deny.exceptions.toml" <<'EOF'
+          exceptions = [
+            { allow = ["GPL-3.0-only"], name = "prohibited" },
+          ]
+          EOF
+          "$deny_runner" --manifest-path "$fixture/Cargo.toml" --locked \
+            check --config "$fixture/deny.toml" licenses
+          rm "$fixture/deny.exceptions.toml"
+
+          mkdir -p "$fixture/late/src"
+          cat >"$fixture/late/Cargo.toml" <<'EOF'
+          [package]
+          name = "late"
+          version = "0.0.0"
+          edition = "2024"
+          license = "MIT"
+          EOF
+          printf '\n' >"$fixture/late/src/lib.rs"
+          cat >"$fixture/Cargo.toml" <<'EOF'
+          [workspace]
+          members = ["app", "prohibited", "late"]
+          resolver = "3"
+          EOF
+          set +e
+          stale_output="$(
+            "$deny_runner" --manifest-path "$fixture/Cargo.toml" --locked \
+              check --config "$fixture/deny.toml" licenses 2>&1
+          )"
+          stale_status=$?
+          set -e
+          printf '%s\n' "$stale_output"
+          test "$stale_status" -ne 0
+          grep -F -- "--locked was passed" <<<"$stale_output"
+
+      - name: Check root dependency policy
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          --manifest-path "${{ github.workspace }}/Cargo.toml" --locked
+          --all-features check --config "${{ github.workspace }}/deny.toml"
+
+      - name: Check Windows x64 desktop dependency policy
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
+          --target x86_64-pc-windows-msvc check
+          --config "${{ github.workspace }}/desktop/deny.toml"
+          --warn unmaintained advisories bans licenses sources
+
+      - name: Check Windows ARM64 desktop dependency policy
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
+          --target aarch64-pc-windows-msvc check
+          --config "${{ github.workspace }}/desktop/deny.toml"
+          --warn unmaintained advisories bans licenses sources
+
+      - name: Check macOS Intel desktop dependency policy
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
+          --target x86_64-apple-darwin check
+          --config "${{ github.workspace }}/desktop/deny.toml"
+          --warn unmaintained advisories bans licenses sources
+
+      - name: Check macOS ARM64 desktop dependency policy
+        run: >-
+          "${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" --locked
+          --target aarch64-apple-darwin check
+          --config "${{ github.workspace }}/desktop/deny.toml"
+          --warn unmaintained advisories bans licenses sources
+
+      - name: Test desktop wildcard dependency policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          deny_runner="${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-deny-clean"
+          manifest="${{ github.workspace }}/desktop/apps/gta-claw-desktop/Cargo.toml"
+          backup="${{ runner.temp }}/gta-claw-desktop.Cargo.toml"
+          cp "$manifest" "$backup"
+          restore_manifest() {
+            cp "$backup" "$manifest"
+          }
+          trap restore_manifest EXIT
+          python3 - "$manifest" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          old = 'slint = { version = "=1.17.1",'
+          new = 'slint = { version = "*",'
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one Slint version constraint")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          for target in \
+            x86_64-pc-windows-msvc \
+            aarch64-pc-windows-msvc \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            set +e
+            output="$(
+              "$deny_runner" \
+                --manifest-path "${{ github.workspace }}/desktop/Cargo.toml" \
+                --locked --target "$target" check \
+                --config "${{ github.workspace }}/desktop/deny.toml" bans 2>&1
+            )"
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            test "$status" -ne 0
+            grep -F "wildcard" <<<"$output"
+          done
+          restore_manifest
+          trap - EXIT
+          cmp "$manifest" "$backup"
+
+      - name: Validate supply-chain policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          actionlint_bin="${{ runner.temp }}/verified-rust-security-tools/actionlint/actionlint"
+          cargo_runner="${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-clean"
+          target_dir="${{ runner.temp }}/verified-rust-security-tools/target"
+          messages="${{ runner.temp }}/desktop-supply-chain-policy.json"
+          rm -rf -- "$target_dir"
+          mkdir -p "$target_dir"
+          "$cargo_runner" test \
+            --manifest-path "${{ github.workspace }}/Cargo.toml" \
+            --locked \
+            --package claw-security \
+            --test desktop_supply_chain_policy \
+            --no-run \
+            --message-format json >"$messages"
+          policy_binary="$(
+            /usr/bin/python3 - "$messages" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          executables = []
+          for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+              message = json.loads(line)
+              target = message.get("target", {})
+              if (
+                  message.get("reason") == "compiler-artifact"
+                  and target.get("name") == "desktop_supply_chain_policy"
+                  and "test" in target.get("kind", [])
+                  and message.get("executable")
+              ):
+                  executables.append(message["executable"])
+          if len(executables) != 1:
+              raise SystemExit(f"expected one policy test executable, found {executables!r}")
+          print(executables[0])
+          PY
+          )"
+          test -x "$policy_binary"
+          case "$policy_binary" in
+            "$target_dir"/*) ;;
+            *)
+              echo "Policy test executable escaped verified target: $policy_binary" >&2
+              exit 1
+              ;;
+          esac
+          /usr/bin/env -i \
+            ACTIONLINT_BIN="$actionlint_bin" \
+            REQUIRE_ACTIONLINT="true" \
+            PATH="/usr/bin:/bin" \
+            "$policy_binary" --nocapture
