@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 pub mod changes;
+pub mod identity;
 pub mod input;
 pub mod metadata;
 pub mod ownership;

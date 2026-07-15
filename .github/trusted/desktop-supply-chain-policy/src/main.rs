@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use desktop_supply_chain_policy::changes::{compute_manifest, write_manifest};
 use desktop_supply_chain_policy::input::SafeRoot;
 use desktop_supply_chain_policy::metadata::linux_tools;
-use desktop_supply_chain_policy::policy::bootstrap_fingerprint;
+use desktop_supply_chain_policy::policy::{bootstrap_fingerprint, write_bootstrap_snapshot};
 use desktop_supply_chain_policy::validation::{ValidationRequest, validate_request};
 use desktop_supply_chain_policy::workflows::linux_actionlint;
 use desktop_supply_chain_policy::{PolicyError, PolicyResult};
@@ -91,6 +91,14 @@ fn fingerprint(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     Ok(())
 }
 
+fn snapshot(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
+    let mut options = parse_options(values)?;
+    let root = required(&mut options, "root")?;
+    let output = required(&mut options, "output")?;
+    reject_unknown(&options)?;
+    write_bootstrap_snapshot(&SafeRoot::new(root)?, &output)
+}
+
 fn validate(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     let mut options = parse_options(values)?;
     let trusted_root = required(&mut options, "trusted-root")?;
@@ -130,6 +138,7 @@ fn run() -> PolicyResult<()> {
     match command.to_str() {
         Some("diff-manifest") => diff_manifest(arguments),
         Some("bootstrap-fingerprint") => fingerprint(arguments),
+        Some("write-bootstrap-snapshot") => snapshot(arguments),
         Some("validate") => validate(arguments),
         Some(other) => Err(PolicyError::new(format!(
             "unknown validator command: {other}"

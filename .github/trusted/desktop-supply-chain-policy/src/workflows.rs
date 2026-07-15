@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 
+use crate::identity::spoof_identity;
 use crate::input::sha256;
 use crate::input::{SafeRoot, compare_trees};
 use crate::ownership::CODEOWNERS_PATH;
@@ -39,6 +40,8 @@ const CANONICAL_MACOS: &[u8] =
 const MAX_WORKFLOW_BYTES: u64 = 512 * 1024;
 const MAX_WORKFLOW_TREE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIONLINT_BYTES: u64 = 64 * 1024 * 1024;
+const AUTHORITATIVE_CONCURRENCY_GROUP: &str =
+    "trusted-desktop-policy-${{ github.event.pull_request.number }}";
 /// Trusted actionlint 1.7.7 Linux binary SHA-256.
 pub const ACTIONLINT_SHA256: &str =
     "9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c";
@@ -120,15 +123,142 @@ fn require_ascii_identity(value: &str, label: &str) -> PolicyResult<String> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn parse_identity(path: &str, text: &str) -> PolicyResult<WorkflowIdentity> {
-    let workflow: YamlValue = serde_yaml_ng::from_str(text)
-        .map_err(|cause| error(&format!("parse workflow {path}"), cause))?;
-    let workflow_name = string(get(&workflow, "name"))
+fn reserved_spoof_identities() -> BTreeSet<String> {
+    [
+        AUTHORITATIVE_WORKFLOW_NAME,
+        AUTHORITATIVE_JOB_NAME,
+        AUTHORITATIVE_JOB_ID,
+        BOOTSTRAP_WORKFLOW_NAME,
+        BOOTSTRAP_JOB_NAME,
+        BOOTSTRAP_JOB_ID,
+    ]
+    .into_iter()
+    .map(spoof_identity)
+    .collect()
+}
+
+fn template_chunks(value: &str, label: &str) -> PolicyResult<Option<Vec<String>>> {
+    if !value.contains("${{") {
+        if value.contains("}}") {
+            return Err(PolicyError::new(format!(
+                "{label} contains an unmatched expression terminator"
+            )));
+        }
+        return Ok(None);
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = value;
+    loop {
+        let Some(start) = remaining.find("${{") else {
+            if remaining.contains("}}") {
+                return Err(PolicyError::new(format!(
+                    "{label} contains an unmatched expression terminator"
+                )));
+            }
+            chunks.push(spoof_identity(remaining));
+            break;
+        };
+        let static_chunk = &remaining[..start];
+        if static_chunk.contains("}}") {
+            return Err(PolicyError::new(format!(
+                "{label} contains malformed expression delimiters"
+            )));
+        }
+        chunks.push(spoof_identity(static_chunk));
+        let expression = &remaining[start + 3..];
+        let end = expression.find("}}").ok_or_else(|| {
+            PolicyError::new(format!("{label} contains an unterminated expression"))
+        })?;
+        let body = &expression[..end];
+        if body.trim().is_empty() || body.contains("${{") {
+            return Err(PolicyError::new(format!(
+                "{label} contains an empty or nested expression"
+            )));
+        }
+        remaining = &expression[end + 2..];
+    }
+    Ok(Some(chunks))
+}
+
+fn template_can_render(chunks: &[String], reserved: &str) -> bool {
+    let Some(first) = chunks.first() else {
+        return false;
+    };
+    if !reserved.starts_with(first) {
+        return false;
+    }
+    let mut positions = BTreeSet::from([first.len()]);
+    for chunk in &chunks[1..] {
+        let mut next = BTreeSet::new();
+        for previous in positions {
+            for start in previous..=reserved.len() {
+                if reserved
+                    .get(start..)
+                    .is_some_and(|suffix| suffix.starts_with(chunk))
+                {
+                    next.insert(start + chunk.len());
+                }
+            }
+        }
+        positions = next;
+        if positions.is_empty() {
+            return false;
+        }
+    }
+    positions.contains(&reserved.len())
+}
+
+fn validate_matrix_values(
+    value: &YamlValue,
+    reserved: &BTreeSet<String>,
+    path: &str,
+) -> PolicyResult<()> {
+    match value {
+        YamlValue::String(value) => {
+            if template_chunks(value, "matrix value")?.is_some() {
+                return Err(PolicyError::new(format!(
+                    "dynamic matrix value is forbidden in workflow: {path}"
+                )));
+            }
+            if reserved.contains(&spoof_identity(value)) {
+                return Err(PolicyError::new(format!(
+                    "matrix value can spoof a reserved workflow identity: {path}"
+                )));
+            }
+        }
+        YamlValue::Sequence(values) => {
+            for value in values {
+                validate_matrix_values(value, reserved, path)?;
+            }
+        }
+        YamlValue::Mapping(values) => {
+            for value in values.values() {
+                validate_matrix_values(value, reserved, path)?;
+            }
+        }
+        YamlValue::Tagged(_) => {
+            return Err(PolicyError::new(format!(
+                "tagged matrix value is forbidden in workflow: {path}"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_identity(path: &str, workflow: &YamlValue) -> PolicyResult<WorkflowIdentity> {
+    let workflow_name = string(get(workflow, "name"))
         .ok_or_else(|| PolicyError::new(format!("workflow has no string name: {path}")))?
         .to_owned();
     require_ascii_identity(&workflow_name, "workflow name")?;
+    if template_chunks(&workflow_name, "workflow name")?.is_some() {
+        return Err(PolicyError::new(
+            "top-level workflow name must not contain expressions",
+        ));
+    }
+    let reserved = reserved_spoof_identities();
     let jobs = mapping(
-        get(&workflow, "jobs")
+        get(workflow, "jobs")
             .ok_or_else(|| PolicyError::new(format!("workflow has no jobs mapping: {path}")))?,
     )
     .ok_or_else(|| PolicyError::new(format!("workflow jobs are not a mapping: {path}")))?;
@@ -142,8 +272,30 @@ fn parse_identity(path: &str, text: &str) -> PolicyResult<WorkflowIdentity> {
         let job_id = string(Some(job_id))
             .ok_or_else(|| PolicyError::new(format!("workflow job ID is not a string: {path}")))?;
         require_ascii_identity(job_id, "workflow job ID")?;
-        let job_name = string(get(job, "name")).unwrap_or(job_id);
+        if template_chunks(job_id, "workflow job ID")?.is_some() {
+            return Err(PolicyError::new("workflow job ID must be static"));
+        }
+        let declared_job_name = string(get(job, "name"));
+        let matrix = get(get(job, "strategy").unwrap_or(&YamlValue::Null), "matrix");
+        if matrix.is_some() && declared_job_name.is_none() {
+            return Err(PolicyError::new(format!(
+                "matrix workflow job must declare an explicit audited name: {path}"
+            )));
+        }
+        let job_name = declared_job_name.unwrap_or(job_id);
         require_ascii_identity(job_name, "workflow job name")?;
+        if let Some(chunks) = template_chunks(job_name, "workflow job name")?
+            && reserved
+                .iter()
+                .any(|identity| template_can_render(&chunks, identity))
+        {
+            return Err(PolicyError::new(format!(
+                "dynamic workflow job name can render a reserved identity: {path}"
+            )));
+        }
+        if let Some(matrix) = matrix {
+            validate_matrix_values(matrix, &reserved, path)?;
+        }
         parsed_jobs.push((job_id.to_owned(), job_name.to_owned()));
     }
     parsed_jobs.sort();
@@ -152,6 +304,72 @@ fn parse_identity(path: &str, text: &str) -> PolicyResult<WorkflowIdentity> {
         workflow_name,
         jobs: parsed_jobs,
     })
+}
+
+fn reject_tagged_yaml(value: &YamlValue, path: &str) -> PolicyResult<()> {
+    match value {
+        YamlValue::Tagged(_) => Err(PolicyError::new(format!(
+            "tagged YAML values are forbidden in repository workflow: {path}"
+        ))),
+        YamlValue::Mapping(values) => {
+            for (key, value) in values {
+                reject_tagged_yaml(key, path)?;
+                reject_tagged_yaml(value, path)?;
+            }
+            Ok(())
+        }
+        YamlValue::Sequence(values) => {
+            for value in values {
+                reject_tagged_yaml(value, path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn uses_cancel_in_progress(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::Mapping(values) => {
+            values
+                .get(yaml_key("concurrency"))
+                .is_some_and(|concurrency| get(concurrency, "cancel-in-progress").is_some())
+                || values.values().any(uses_cancel_in_progress)
+        }
+        YamlValue::Sequence(values) => values.iter().any(uses_cancel_in_progress),
+        _ => false,
+    }
+}
+
+fn validate_ruleset_workflow_eligibility(workflow: &YamlValue) -> PolicyResult<()> {
+    if get(
+        get(workflow, "on").unwrap_or(&YamlValue::Null),
+        "pull_request_target",
+    )
+    .is_none()
+    {
+        return Err(PolicyError::new(
+            "authoritative ruleset workflow must use pull_request_target",
+        ));
+    }
+    if uses_cancel_in_progress(workflow) {
+        return Err(PolicyError::new(
+            "authoritative ruleset workflow must not use the cancel-in-progress concurrency setting",
+        ));
+    }
+    let concurrency = mapping(
+        get(workflow, "concurrency")
+            .ok_or_else(|| PolicyError::new("authoritative workflow concurrency is missing"))?,
+    )
+    .ok_or_else(|| PolicyError::new("authoritative workflow concurrency is not a mapping"))?;
+    if concurrency.len() != 1
+        || string(concurrency.get(yaml_key("group"))) != Some(AUTHORITATIVE_CONCURRENCY_GROUP)
+    {
+        return Err(PolicyError::new(
+            "authoritative workflow concurrency must retain the exact per-PR queue group",
+        ));
+    }
+    Ok(())
 }
 
 fn expected_workflow_files(root: &SafeRoot) -> PolicyResult<Vec<String>> {
@@ -173,21 +391,12 @@ fn expected_workflow_files(root: &SafeRoot) -> PolicyResult<Vec<String>> {
 }
 
 fn owns_reserved_identity(identity: &WorkflowIdentity, reserved: &str) -> bool {
-    let reserved = spoof_key(reserved);
-    spoof_key(&identity.workflow_name) == reserved
+    let reserved = spoof_identity(reserved);
+    spoof_identity(&identity.workflow_name) == reserved
         || identity
             .jobs
             .iter()
-            .any(|(id, name)| spoof_key(id) == reserved || spoof_key(name) == reserved)
-}
-
-fn spoof_key(value: &str) -> String {
-    value
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .map(char::from)
-        .flat_map(char::to_lowercase)
-        .collect()
+            .any(|(id, name)| spoof_identity(id) == reserved || spoof_identity(name) == reserved)
 }
 
 /// Validates the complete workflow inventory and required-check identities.
@@ -197,7 +406,13 @@ pub fn validate_inventory(root: &SafeRoot) -> PolicyResult<Vec<WorkflowIdentity>
     let mut workflow_names = BTreeMap::new();
     for path in paths {
         let text = root.read_text(&path, MAX_WORKFLOW_BYTES)?;
-        let identity = parse_identity(&path, &text)?;
+        let workflow: YamlValue = serde_yaml_ng::from_str(&text)
+            .map_err(|cause| error(&format!("parse workflow {path}"), cause))?;
+        reject_tagged_yaml(&workflow, &path)?;
+        if path == AUTHORITATIVE_PATH {
+            validate_ruleset_workflow_eligibility(&workflow)?;
+        }
+        let identity = parse_identity(&path, &workflow)?;
         let normalized = require_ascii_identity(&identity.workflow_name, "workflow name")?;
         if let Some(previous) = workflow_names.insert(normalized, path.clone()) {
             return Err(PolicyError::new(format!(

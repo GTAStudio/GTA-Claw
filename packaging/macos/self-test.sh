@@ -25,8 +25,10 @@ expect_success() {
   local name="$1"
   shift
   tests=$((tests + 1))
-  "$@" >"$work/$name.stdout" 2>"$work/$name.stderr" ||
+  "$@" >"$work/$name.stdout" 2>"$work/$name.stderr" || {
+    cat "$work/$name.stderr" >&2
     die "self-test failed: $name (see $work/$name.stderr)"
+  }
 }
 
 work="$OUTPUT_ROOT/self-test"
@@ -268,7 +270,27 @@ xcrun clang \
 expect_failure unexpected-rpath \
   bash -c "source '$common'; validate_macho_dependencies '$work/hello-bad-rpath' '$work'"
 
+mkdir -p "$work/failing-tools"
+cat >"$work/failing-tools/otool" <<'EOF'
+#!/bin/sh
+exit 99
+EOF
+chmod +x "$work/failing-tools/otool"
+expect_failure otool-capture-fails-closed \
+  env PATH="$work/failing-tools:$PATH" \
+  bash -c "source '$common'; validate_macho_dependencies '$work/hello-${host_arch/arm64/arm64}' '$work'"
+
 fixture_app="$OUTPUT_ROOT/apps/$host_arch/$APP_NAME.app"
+fresh_fixture() {
+  local label="$1"
+  expect_success "assemble-$label" \
+    "$MACOS_DIR/assemble-app.sh" \
+    "$work/hello-${host_arch/arm64/arm64}" \
+    "self-test-$label" \
+    "$host_arch"
+  fixture_app="$OUTPUT_ROOT/apps/self-test-$label/$APP_NAME.app"
+}
+
 expect_success assemble-first \
   "$MACOS_DIR/assemble-app.sh" "$work/hello-${host_arch/arm64/arm64}" "$host_arch" "$host_arch"
 first_manifest="$work/first-app.sha256"
@@ -325,8 +347,50 @@ codesign \
 expect_failure entitlement-mismatch \
   "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
 
-expect_success restore-fixture \
-  "$MACOS_DIR/assemble-app.sh" "$work/hello-${host_arch/arm64/arm64}" "$host_arch" "$host_arch"
+fresh_fixture plist-decoy
+/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable decoy" \
+  "$fixture_app/Contents/Info.plist"
+expect_failure plist-executable-decoy \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture plist-non-string
+/usr/libexec/PlistBuddy -c "Delete :CFBundleExecutable" \
+  "$fixture_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable array" \
+  "$fixture_app/Contents/Info.plist"
+expect_failure plist-executable-non-string \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture plist-trailing-newline
+/usr/bin/plutil -replace CFBundleExecutable -string $'gta-claw-desktop\n' \
+  "$fixture_app/Contents/Info.plist"
+expect_failure plist-executable-trailing-newline \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture alternate-executable
+touch "$fixture_app/Contents/MacOS/alternate-desktop"
+chmod +x "$fixture_app/Contents/MacOS/alternate-desktop"
+expect_failure alternate-executable \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture macos-decoy
+touch "$fixture_app/Contents/MacOS/README"
+expect_failure macos-decoy-file \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture executable-symlink
+mv "$fixture_app/Contents/MacOS/gta-claw-desktop" \
+  "$fixture_app/Contents/MacOS/real-desktop"
+ln -s real-desktop "$fixture_app/Contents/MacOS/gta-claw-desktop"
+expect_failure executable-symlink \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture non-executable
+chmod -x "$fixture_app/Contents/MacOS/gta-claw-desktop"
+expect_failure non-executable-main \
+  "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
+
+fresh_fixture javascript-runtime
 touch "$fixture_app/Contents/Resources/node"
 expect_failure javascript-runtime-file \
   "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::identity::canonical_caseless;
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
 use crate::{PolicyError, PolicyResult};
 
@@ -12,7 +13,7 @@ pub const CODEOWNER: &str = "@aizhihuxiao";
 
 const CANONICAL_CODEOWNERS: &[u8] = include_bytes!("../../../CODEOWNERS");
 
-const PATTERNS: [&str; 20] = [
+const PATTERNS: [&str; 21] = [
     "/.github/CODEOWNERS",
     "/.github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     "/.github/workflows/trusted-desktop-supply-chain-policy.yml",
@@ -24,6 +25,7 @@ const PATTERNS: [&str; 20] = [
     "/.gitattributes",
     "/.cargo/audit.toml",
     "/deny.toml",
+    "rust-toolchain",
     "/rust-toolchain.toml",
     "/rustfmt.toml",
     "/desktop/Cargo.toml",
@@ -35,7 +37,7 @@ const PATTERNS: [&str; 20] = [
     "/crates/claw-security/tests/fixtures/desktop_supply_chain_policy/**",
 ];
 
-const FROZEN_SURFACES: [&str; 20] = [
+const FROZEN_SURFACES: [&str; 21] = [
     ".github/CODEOWNERS",
     ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/trusted-desktop-supply-chain-policy.yml",
@@ -47,6 +49,7 @@ const FROZEN_SURFACES: [&str; 20] = [
     ".gitattributes",
     ".cargo/audit.toml",
     "deny.toml",
+    "rust-toolchain",
     "rust-toolchain.toml",
     "rustfmt.toml",
     "desktop/Cargo.toml",
@@ -81,6 +84,8 @@ fn pattern_covers(pattern: &str, path: &str) -> bool {
                 .as_bytes()
                 .get(prefix.len())
                 .is_some_and(|separator| *separator == b'/')
+    } else if !pattern.contains('/') {
+        path.rsplit('/').next() == Some(pattern)
     } else {
         pattern == path
     }
@@ -142,14 +147,13 @@ pub fn validate_codeowners(root: &SafeRoot) -> PolicyResult<()> {
 /// Returns whether a repository path is a canonical or alternate CODEOWNERS location.
 #[must_use]
 pub fn is_codeowners_path_or_alias(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    let parts = lower.split('/').collect::<Vec<_>>();
-    let file_name = parts.last().copied().unwrap_or(&lower);
+    let parts = path.split('/').map(canonical_caseless).collect::<Vec<_>>();
+    let file_name = parts.last().map(String::as_str).unwrap_or_default();
     if file_name.trim_end_matches(['.', ' ']) == "codeowners" {
         return true;
     }
     let recognized_location =
-        parts.len() == 1 || parts.len() == 2 && matches!(parts[0], ".github" | "docs");
+        parts.len() == 1 || parts.len() == 2 && matches!(parts[0].as_str(), ".github" | "docs");
     recognized_location && !path.is_ascii() && !file_name.contains('.')
 }
 

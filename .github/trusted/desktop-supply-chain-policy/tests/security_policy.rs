@@ -8,20 +8,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use desktop_supply_chain_policy::changes::{
-    ChangeManifest, ChangedPath, compute_manifest, has_policy_relevant_change, is_policy_relevant,
-    read_manifest, write_manifest,
+    ChangeManifest, ChangedPath, MAX_GIT_PACK_FILES, MAX_PULL_REQUEST_COMMITS, compute_manifest,
+    has_policy_relevant_change, is_policy_relevant, read_manifest,
+    validate_pull_request_commit_count, write_manifest,
 };
+use desktop_supply_chain_policy::identity::canonical_caseless;
 use desktop_supply_chain_policy::input::{SafeRoot, compare_trees, sha256};
 use desktop_supply_chain_policy::metadata::{
-    MetadataTools, validate_desktop_metadata, validate_desktop_metadata_document,
-    validate_root_metadata,
+    MetadataTools, release_version_from_metadata_documents, validate_desktop_metadata,
+    validate_desktop_metadata_document, validate_root_metadata,
 };
 use desktop_supply_chain_policy::ownership::{
     CODEOWNER, CODEOWNERS_PATH, canonical_codeowners, frozen_surfaces, validate_codeowners,
     validate_codeowners_text,
 };
 use desktop_supply_chain_policy::policy::{
-    bootstrap_fingerprint, expected_bootstrap_fingerprint, is_bootstrap_state,
+    bootstrap_fingerprint, bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
     validate_casefold_paths, validate_final_static,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
@@ -35,6 +37,401 @@ use desktop_supply_chain_policy::workflows::{
 };
 
 mod mutations;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MutationArtifact {
+    RustWorkflow,
+    MacosWorkflow,
+    RootDeny,
+    DesktopDeny,
+    Audit,
+    DesktopManifest,
+    AppManifest,
+}
+
+impl MutationArtifact {
+    const fn production_error(self) -> &'static str {
+        match self {
+            Self::RustWorkflow => {
+                "candidate workflow does not match trusted final P04f policy: .github/workflows/rust.yml"
+            }
+            Self::MacosWorkflow => {
+                "candidate workflow does not match trusted final P04f policy: .github/workflows/macos-packaging.yml"
+            }
+            Self::RootDeny => "exact security policy file changed: deny.toml",
+            Self::DesktopDeny => "exact security policy file changed: desktop/deny.toml",
+            Self::Audit => "exact security policy file changed: .cargo/audit.toml",
+            Self::DesktopManifest => "exact security policy file changed: desktop/Cargo.toml",
+            Self::AppManifest => {
+                "exact security policy file changed: desktop/apps/gta-claw-desktop/Cargo.toml"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ExpectedMutation {
+    name: &'static str,
+    mutation: &'static str,
+    artifact: MutationArtifact,
+    expected: &'static str,
+}
+
+const fn expected_mutation(
+    name: &'static str,
+    mutation: &'static str,
+    artifact: MutationArtifact,
+    expected: &'static str,
+) -> ExpectedMutation {
+    ExpectedMutation {
+        name,
+        mutation,
+        artifact,
+        expected,
+    }
+}
+
+const P04F_MUTATION_ORACLE: [ExpectedMutation; 48] = [
+    expected_mutation(
+        "root-audit-continue-on-error",
+        "root-audit-continue-on-error",
+        MutationArtifact::RustWorkflow,
+        "Audit root lockfile must not set continue-on-error",
+    ),
+    expected_mutation(
+        "desktop-audit-disabled",
+        "desktop-audit-disabled",
+        MutationArtifact::RustWorkflow,
+        "Audit desktop lockfile must not have an if condition",
+    ),
+    expected_mutation(
+        "desktop-audit-redirected",
+        "desktop-audit-redirected",
+        MutationArtifact::RustWorkflow,
+        "Audit desktop lockfile must not set working-directory",
+    ),
+    expected_mutation(
+        "cargo-audit-install-latest",
+        "cargo-audit-install-latest",
+        MutationArtifact::RustWorkflow,
+        "Bootstrap verified Rust security tools script hash changed",
+    ),
+    expected_mutation(
+        "windows-arm64-deny-missing",
+        "windows-arm64-deny-missing",
+        MutationArtifact::RustWorkflow,
+        "missing Check Windows ARM64 desktop dependency policy step",
+    ),
+    expected_mutation(
+        "supply-checkout-action-substitution",
+        "supply-checkout-action-substitution",
+        MutationArtifact::RustWorkflow,
+        "supply-chain checkout action or inputs changed",
+    ),
+    expected_mutation(
+        "job-checks-write",
+        "job-checks-write",
+        MutationArtifact::RustWorkflow,
+        "job supply-chain permissions exceed read-only allow-list",
+    ),
+    expected_mutation(
+        "job-write-all",
+        "job-write-all",
+        MutationArtifact::RustWorkflow,
+        "job supply-chain permissions must be a read-only mapping",
+    ),
+    expected_mutation(
+        "negative-desktop-path",
+        "negative-desktop-path",
+        MutationArtifact::RustWorkflow,
+        "pull_request paths must exactly match the ordered dependency policy inputs",
+    ),
+    expected_mutation(
+        "rust-branches-ignore",
+        "rust-branches-ignore",
+        MutationArtifact::RustWorkflow,
+        "rust pull_request trigger keys changed",
+    ),
+    expected_mutation(
+        "rust-types-filter",
+        "rust-types-filter",
+        MutationArtifact::RustWorkflow,
+        "rust pull_request trigger keys changed",
+    ),
+    expected_mutation(
+        "macos-branches-ignore",
+        "macos-branches-ignore",
+        MutationArtifact::MacosWorkflow,
+        "macOS pull_request trigger changed",
+    ),
+    expected_mutation(
+        "macos-types-filter",
+        "macos-types-filter",
+        MutationArtifact::MacosWorkflow,
+        "macOS pull_request trigger changed",
+    ),
+    expected_mutation(
+        "supply-job-disabled",
+        "supply-job-disabled",
+        MutationArtifact::RustWorkflow,
+        "supply-chain job must not set if",
+    ),
+    expected_mutation(
+        "supply-job-env-shadow",
+        "supply-job-env-shadow",
+        MutationArtifact::RustWorkflow,
+        "supply-chain job must not set env",
+    ),
+    expected_mutation(
+        "supply-unknown-shadow-step",
+        "supply-unknown-shadow-step",
+        MutationArtifact::RustWorkflow,
+        "supply-chain ordered steps changed",
+    ),
+    expected_mutation(
+        "bootstrap-wrapper-env",
+        "bootstrap-wrapper-env",
+        MutationArtifact::RustWorkflow,
+        "verified tool bootstrap environment changed",
+    ),
+    expected_mutation(
+        "bootstrap-inherited-shell",
+        "bootstrap-inherited-shell",
+        MutationArtifact::RustWorkflow,
+        "verified tool bootstrap shell must clear the startup environment",
+    ),
+    expected_mutation(
+        "bootstrap-shadow-path-change",
+        "bootstrap-shadow-path-change",
+        MutationArtifact::RustWorkflow,
+        "verified tool bootstrap environment changed",
+    ),
+    expected_mutation(
+        "policy-step-runner-env",
+        "policy-step-runner-env",
+        MutationArtifact::RustWorkflow,
+        "Check root dependency policy step schema changed",
+    ),
+    expected_mutation(
+        "native-matrix-runner-collapse",
+        "native-matrix-runner-collapse",
+        MutationArtifact::MacosWorkflow,
+        "native macOS matrix must cover exact ARM64 and Intel runners",
+    ),
+    expected_mutation(
+        "source-policy-disabled",
+        "source-policy-disabled",
+        MutationArtifact::MacosWorkflow,
+        "macOS source-policy job must not set if",
+    ),
+    expected_mutation(
+        "native-arch-assertion-removed",
+        "native-arch-assertion-removed",
+        MutationArtifact::MacosWorkflow,
+        "native macOS architecture assertion or test command changed",
+    ),
+    expected_mutation(
+        "native-format-replaced",
+        "native-format-replaced",
+        MutationArtifact::MacosWorkflow,
+        "Format both Cargo workspaces script hash changed",
+    ),
+    expected_mutation(
+        "native-arch-shell-added",
+        "native-arch-shell-added",
+        MutationArtifact::MacosWorkflow,
+        "Test both Cargo workspaces natively step schema changed",
+    ),
+    expected_mutation(
+        "native-workflow-env-shadow",
+        "native-workflow-env-shadow",
+        MutationArtifact::MacosWorkflow,
+        "macOS workflow inherited environment changed",
+    ),
+    expected_mutation(
+        "native-matrix-extra-key",
+        "native-matrix-extra-key",
+        MutationArtifact::MacosWorkflow,
+        "native macOS matrix row schema changed",
+    ),
+    expected_mutation(
+        "deny-no-locked",
+        "deny-no-locked",
+        MutationArtifact::RustWorkflow,
+        "Check Windows x64 desktop dependency policy command is not exact",
+    ),
+    expected_mutation(
+        "deny-advisory-ignore",
+        "deny-advisory-ignore",
+        MutationArtifact::DesktopDeny,
+        "desktop deny advisories.ignore must be empty",
+    ),
+    expected_mutation(
+        "audit-config-ignore",
+        "audit-config-ignore",
+        MutationArtifact::Audit,
+        "cargo audit advisories.ignore must be empty",
+    ),
+    expected_mutation(
+        "deny-git-source",
+        "deny-git-source",
+        MutationArtifact::DesktopDeny,
+        "desktop deny sources.allow-git must be empty",
+    ),
+    expected_mutation(
+        "deny-license-widening",
+        "deny-license-widening",
+        MutationArtifact::DesktopDeny,
+        "desktop deny license allow-list changed",
+    ),
+    expected_mutation(
+        "deny-graph-exclude",
+        "deny-graph-exclude",
+        MutationArtifact::DesktopDeny,
+        "desktop deny graph policy keys changed",
+    ),
+    expected_mutation(
+        "root-deny-license-widening",
+        "root-deny-license-widening",
+        MutationArtifact::RootDeny,
+        "root deny license policy changed",
+    ),
+    expected_mutation(
+        "root-deny-inline-exception",
+        "root-deny-inline-exception",
+        MutationArtifact::RootDeny,
+        "root deny license policy changed",
+    ),
+    expected_mutation(
+        "root-deny-source-widening",
+        "root-deny-source-widening",
+        MutationArtifact::RootDeny,
+        "root deny source policy changed",
+    ),
+    expected_mutation(
+        "root-deny-ban-skip",
+        "root-deny-ban-skip",
+        MutationArtifact::RootDeny,
+        "root deny bans policy changed",
+    ),
+    expected_mutation(
+        "root-deny-string-skip",
+        "root-deny-string-skip",
+        MutationArtifact::RootDeny,
+        "root deny bans policy changed",
+    ),
+    expected_mutation(
+        "root-deny-crate-skip",
+        "root-deny-crate-skip",
+        MutationArtifact::RootDeny,
+        "root deny bans policy changed",
+    ),
+    expected_mutation(
+        "root-deny-versionless-name-skip",
+        "root-deny-versionless-name-skip",
+        MutationArtifact::RootDeny,
+        "root deny bans policy changed",
+    ),
+    expected_mutation(
+        "slint-wildcard-version",
+        "slint-wildcard-version",
+        MutationArtifact::AppManifest,
+        "desktop Slint dependency policy changed",
+    ),
+    expected_mutation(
+        "slint-build-caret-version",
+        "slint-build-caret-version",
+        MutationArtifact::AppManifest,
+        "desktop slint-build dependency policy changed",
+    ),
+    expected_mutation(
+        "duplicate-target-slint-widening",
+        "duplicate-target-slint-widening",
+        MutationArtifact::AppManifest,
+        "desktop target table schema changed",
+    ),
+    expected_mutation(
+        "renamed-slint-package",
+        "renamed-slint-package",
+        MutationArtifact::AppManifest,
+        "desktop contains unexpected Slint package aliases",
+    ),
+    expected_mutation(
+        "workspace-renamed-slint-package",
+        "workspace-renamed-slint-package",
+        MutationArtifact::DesktopManifest,
+        "desktop workspace dependency policy changed: claw-application",
+    ),
+    expected_mutation(
+        "desktop-replace-slint-build",
+        "desktop-replace-slint-build",
+        MutationArtifact::DesktopManifest,
+        "desktop must not patch or replace registry sources",
+    ),
+    expected_mutation(
+        "app-claw-application-registry",
+        "app-claw-application-registry",
+        MutationArtifact::AppManifest,
+        "desktop app workspace dependency policy changed: claw-application",
+    ),
+    expected_mutation(
+        "app-claw-platform-path",
+        "app-claw-platform-path",
+        MutationArtifact::AppManifest,
+        "desktop app workspace dependency policy changed: claw-platform",
+    ),
+];
+
+const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
+    "90e24e0c9fc0d53b0f916c78c5a68412cf26d03a9c1e247dc4d63a75b57fa970",
+    "61c7ff94f9f7030e9ddab3e43dd81a5af90d1676ecba5ac2109a26870f6e59d7",
+    "748b4fe8c75731d4af37df67feb12440538cbfb6f00c2d37f743033b54cd67c0",
+    "c16d255135044fc70e6804c0beda1653fa4c51a913d3fa27bc30580c9ddf4771",
+    "ada5d293265b7f62be3e813c901bc32a67562ce83c3da329f8efa46e33535b7f",
+    "d3aa806687c3f70ad56e79aaf3e03f447b0eaacd2be960a5b0f95522fd52a34f",
+    "93bc016b4eff2f2856d63c63ff1a7884fba5142d702c689aa1b65fafd114a3e7",
+    "11bf6afdb402b75010f93578d1b23eefc809f724789805cecf905004dda02a82",
+    "69d4dd13274184df81e40850af72b43a61616d39053756e4b9af048c6258d300",
+    "9753cc1eadca7a09df356d08dafec088e646c94c0ce2868f84710df1943a2441",
+    "3467fde87a6a406cc94335bd2bd63f0b8e3522c134e063976328a630de1dcaa7",
+    "75cb7f837f26e830939ba4367817b0de70c2e3d9adc3b84e7e65fa9064d020ab",
+    "579a3c2a71181662079aaf327014ea83086ad3f2ba820b90f49888aaa4cc2f83",
+    "167036eb447029f002f216247434daa4bb2e4134c0d5bc93267aaed0cc069327",
+    "a8bbfc6d471d39ed81ad4676e57f477b5b50afd82129068eb6bc6d6f57733342",
+    "a20a835fd001a0eca4eb665cf735848ff18c5fa311de33e905d6306f31bc3140",
+    "26b9dfaacb1ebafbc10112322f708fc9b8e65f2c136e1a2c1e1d0e1c4e4515ca",
+    "ec82eef948d01d5cab301b32086204cb966db73dd01644070f6c6777a4b45924",
+    "0bdd763bd89d491d9b8b35421b4ad3654a4679c86f1822bbf1c909c87374e00e",
+    "5aee908db7a976b943b26425e848cfa90931ee626f804e39cb252486cf047383",
+    "3f051c251bafdf3a6b0f14c37e21ffdb1ef92c7e3bea0d303341544e7e0e0374",
+    "b5c925fa778bb9e0199b48b60eb8cfdc39c414c91cf9d9f02ce1cbadb511e1ff",
+    "98067986b73b2e60c3e49c54db9c255c041bcf40710f3a993f1eeedc98f84685",
+    "fa4fd6982b510690dc10aec44125af48bd4365a76be708650f5759b7598ea274",
+    "347bf30ac68502a5bc0f76186f59be0c4aab3ca708581e6ebd46e2062b326393",
+    "fe56db78495e1ae5104940a929f0178466c7c350c78b129e24594a578e2051c8",
+    "420e9159c23eae96a5b7c8fbdd1e84fead0e99e83b88a90b42bad93872947e4b",
+    "6323a7af697145771d2c7347e8d58b7473a03aebdd9f4f454373265cd878b109",
+    "0e4b6c44ec573890a54febe755febd8c901c0cf7de0490edabdaa1038d23a4b6",
+    "d25d49c53c9c183dd0686e25d714c17a8658992615b1c51b5154af2d5795eec7",
+    "5a9b6f736707897a7ebd1f005088b5ed62229b26772e89247b7d89fddfc55ca8",
+    "2dda511e493e182898c3bbc4a62f7aa4fd79d195dd31f8273a7dee8dfde29388",
+    "487e80e3e0b7b4faceabfbce8ee8073ff198503e46797515ddf61128ec4ad5e9",
+    "0139b9474d8e201c6126a900524d1ad1d3f59e3b1ea9a4665374fd72761112d6",
+    "6303571211846bc3ae6c676d63d7fec0a67eef5e71a050a493aed1d4472a82b8",
+    "0b9e411b3b2fe050d3a5e7783a9ad76c8ddb2572a662c245fe263479b026adff",
+    "7d98f5977c922b1d98736aa652eb59f2a6fc784c398ca0c2e7feabb22e8f2f80",
+    "b7c8d0cca17dca4c9c797578b707b421d3711d55a06cf742b40cf520869c0cf6",
+    "65a029857e31de2dbcbf828894bc531934cc1b44f118cd5e8385ff14f0989a3e",
+    "47e61272f490f577ea2199560cd5bffcf5cd473c2d228f14f6950cd2b2dde010",
+    "80698528e94f193ba01baf5ec24cf963507704b16d30c366c971956fe36825bd",
+    "98d13c554f8823e8cf6030d6a206bdfca2fe268b5c36bbac72a1e58388f237e6",
+    "f6a3a3a845863f323a93fa19c5aa911a11eaf9797d7b2985357d29963a30e748",
+    "957b9f80f941b2aa1f36ca66855d991b8befb905c2e92b9eccecd749d1ccdf98",
+    "68c138394fefda8e53f2979c35119c04be161e26fd15247ee6bf4d377beb41e4",
+    "d6c702ce21d50e0ad523c001a94b780cbac70e0a55be980672827bbad9d45e47",
+    "c248cd7d6b3d87a4f49786447e461f9f313a6d2be045cd07ed9c429616fea737",
+    "f6bbca51ac1b269d21d05bec735c79ec9848c1dd05085bda1881dfdea2c86ad0",
+];
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -142,7 +539,7 @@ fn bootstrap_tree(label: &str) -> TempTree {
     assert!(snapshot.starts_with(b"GTABOOT1"));
     let mut offset = 8;
     let count = read_u32(&snapshot, &mut offset);
-    assert_eq!(count, 26);
+    assert_eq!(count, 28);
     for _ in 0..count {
         let path_length = read_u32(&snapshot, &mut offset) as usize;
         let data_length =
@@ -165,13 +562,6 @@ fn bootstrap_tree(label: &str) -> TempTree {
         &tree.join(".github/trusted/desktop-supply-chain-policy"),
     )
     .expect("copy protected trust root into bootstrap fixture");
-    for workflow in [AUTHORITATIVE_PATH, BOOTSTRAP_PATH] {
-        let destination = tree.join(workflow);
-        fs::create_dir_all(destination.parent().expect("workflow parent"))
-            .expect("create workflow parent");
-        fs::copy(repo_root().join(workflow), destination)
-            .expect("copy protected workflow into bootstrap fixture");
-    }
     tree
 }
 
@@ -235,6 +625,114 @@ fn replace(path: &Path, from: &str, to: &str) {
     let text = fs::read_to_string(path).expect("read mutation input");
     assert!(text.contains(from), "mutation source missing: {from:?}");
     fs::write(path, text.replacen(from, to, 1)).expect("write mutation");
+}
+
+fn write_release_workspace(
+    root: &Path,
+    name: &str,
+    version: &str,
+    alternative_formatting: bool,
+    second_version: Option<&str>,
+) -> PathBuf {
+    fs::create_dir_all(root.join("member/src")).expect("create release metadata member");
+    let mut members = vec!["member"];
+    if second_version.is_some() {
+        members.push("other");
+        fs::create_dir_all(root.join("other/src")).expect("create second metadata member");
+    }
+    let manifest = if alternative_formatting {
+        format!(
+            "[workspace] # formatting must not affect semantic version extraction\nmembers = [ {} ]\nresolver=\"3\"\n\n[workspace.package]\nversion=  \"{version}\" # deliberately spaced\n",
+            members
+                .iter()
+                .map(|member| format!("\"{member}\","))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    } else {
+        format!(
+            "[workspace]\nmembers = [{}]\nresolver = \"3\"\n\n[workspace.package]\nversion = \"{version}\"\n",
+            members
+                .iter()
+                .map(|member| format!("\"{member}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    fs::create_dir_all(root).expect("create release metadata workspace");
+    fs::write(root.join("Cargo.toml"), manifest).expect("write release workspace manifest");
+    fs::write(
+        root.join("member/Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}-member\"\nversion.workspace = true\nedition = \"2024\"\nbuild = \"build.rs\"\n"
+        ),
+    )
+    .expect("write release member manifest");
+    fs::write(root.join("member/src/lib.rs"), "").expect("write release member source");
+    fs::write(
+        root.join("member/build.rs"),
+        "fn main() { panic!(\"cargo metadata executed build.rs\"); }\n",
+    )
+    .expect("write non-executing build script");
+    let mut lock_packages = vec![(format!("{name}-member"), version.to_owned())];
+    if let Some(second_version) = second_version {
+        fs::write(
+            root.join("other/Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}-other\"\nversion = \"{second_version}\"\nedition = \"2024\"\n"
+            ),
+        )
+        .expect("write second release member manifest");
+        fs::write(root.join("other/src/lib.rs"), "").expect("write second release member source");
+        lock_packages.push((format!("{name}-other"), second_version.to_owned()));
+    }
+    lock_packages.sort();
+    let mut lock =
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n"
+            .to_owned();
+    for (package, package_version) in lock_packages {
+        lock.push_str(&format!(
+            "\n[[package]]\nname = \"{package}\"\nversion = \"{package_version}\"\n"
+        ));
+    }
+    fs::write(root.join("Cargo.lock"), lock).expect("write release metadata lock");
+    root.join("Cargo.toml")
+}
+
+fn run_release_metadata_fixture(
+    tools: &MetadataTools,
+    manifest: &Path,
+    isolation: &Path,
+) -> std::process::Output {
+    fs::create_dir_all(isolation.join("home")).expect("create metadata fixture home");
+    fs::create_dir_all(isolation.join("cargo-home")).expect("create metadata fixture Cargo home");
+    fs::create_dir_all(isolation.join("target")).expect("create metadata fixture target");
+    fs::create_dir_all(isolation.join("temp")).expect("create metadata fixture temp");
+    fs::create_dir_all(isolation.join("cwd")).expect("create metadata fixture cwd");
+    Command::new(&tools.cargo)
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(manifest)
+        .current_dir(isolation.join("cwd"))
+        .env_clear()
+        .env("HOME", isolation.join("home"))
+        .env("CARGO_HOME", isolation.join("cargo-home"))
+        .env("CARGO_TARGET_DIR", isolation.join("target"))
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("RUSTC", &tools.rustc)
+        .env("TMPDIR", isolation.join("temp"))
+        .env("TEMP", isolation.join("temp"))
+        .env("TMP", isolation.join("temp"))
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run release metadata fixture")
 }
 
 fn local_metadata_tools() -> MetadataTools {
@@ -325,6 +823,17 @@ fn immutable_bootstrap_snapshot_matches_the_transition_fingerprint() {
 }
 
 #[test]
+fn immutable_bootstrap_snapshot_is_canonical_validator_output() {
+    let root = SafeRoot::new(repo_root()).expect("open live repository");
+    let expected = bootstrap_snapshot(&root).expect("generate canonical Bootstrap snapshot");
+    let actual = fs::read(
+        repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
+    )
+    .expect("read committed Bootstrap snapshot");
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn authoritative_workflow_has_no_path_filter() {
     let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
         .expect("read authoritative workflow");
@@ -341,6 +850,204 @@ fn authoritative_workflow_has_no_path_filter() {
         workflow.contains("BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}")
     );
     assert!(!workflow.contains("${{ github.event.pull_request.head.repo.full_name }}\""));
+}
+
+#[test]
+fn authoritative_ruleset_workflow_queues_instead_of_cancelling() {
+    let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
+        .expect("read authoritative workflow");
+    let yaml: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&workflow).expect("parse authoritative workflow");
+    let concurrency = yaml
+        .get("concurrency")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+        .expect("authoritative concurrency mapping");
+    assert_eq!(concurrency.len(), 1);
+    assert_eq!(
+        concurrency
+            .get(serde_yaml_ng::Value::String("group".to_owned()))
+            .and_then(serde_yaml_ng::Value::as_str),
+        Some("trusted-desktop-policy-${{ github.event.pull_request.number }}")
+    );
+    assert!(
+        !workflow.contains("cancel-in-progress"),
+        "GitHub ruleset workflows must queue rather than cancel in-progress runs"
+    );
+
+    for value in ["true", "false", "\"${{ true }}\""] {
+        let tree = copy_repo(&format!(
+            "authoritative-cancellation-{}",
+            value.replace(['$', '{', '}', '"'], "")
+        ));
+        replace(
+            &tree.join(AUTHORITATIVE_PATH),
+            "  group: trusted-desktop-policy-${{ github.event.pull_request.number }}\n",
+            &format!(
+                "  group: trusted-desktop-policy-${{{{ github.event.pull_request.number }}}}\n  cancel-in-progress: {value}\n"
+            ),
+        );
+        assert!(
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open cancellation mutation"))
+                .is_err(),
+            "cancel-in-progress setting unexpectedly passed with value {value}"
+        );
+    }
+
+    let job_scoped = copy_repo("authoritative-job-cancellation");
+    replace(
+        &job_scoped.join(AUTHORITATIVE_PATH),
+        "    runs-on: ubuntu-24.04\n",
+        "    runs-on: ubuntu-24.04\n    concurrency:\n      group: authoritative-job\n      cancel-in-progress: true\n",
+    );
+    assert!(
+        validate_inventory(&SafeRoot::new(&job_scoped.path).expect("open job cancellation"))
+            .is_err(),
+        "job-scoped cancel-in-progress setting unexpectedly passed"
+    );
+}
+
+#[test]
+fn tagged_yaml_values_fail_closed_in_every_workflow_position() {
+    validate_inventory(&SafeRoot::new(repo_root()).expect("open canonical workflows"))
+        .expect("canonical workflows remain accepted");
+
+    let cases = [
+        (
+            "job-concurrency",
+            AUTHORITATIVE_PATH,
+            "    runs-on: ubuntu-24.04\n",
+            "    runs-on: ubuntu-24.04\n    concurrency: !job\n      group: authoritative-job\n      cancel-in-progress: true\n",
+        ),
+        (
+            "workflow-root",
+            AUTHORITATIVE_PATH,
+            "name: GTA Claw authoritative desktop supply-chain policy\n",
+            "--- !workflow\nname: GTA Claw authoritative desktop supply-chain policy\n",
+        ),
+        (
+            "workflow-concurrency",
+            AUTHORITATIVE_PATH,
+            "concurrency:\n  group: trusted-desktop-policy-${{ github.event.pull_request.number }}\n",
+            "concurrency: !workflow\n  group: trusted-desktop-policy-${{ github.event.pull_request.number }}\n  cancel-in-progress: true\n",
+        ),
+        (
+            "nested-sequence-value",
+            AUTHORITATIVE_PATH,
+            "      - opened\n",
+            "      - !activity opened\n",
+        ),
+        (
+            "nested-mapping-key",
+            AUTHORITATIVE_PATH,
+            "          BASH_ENV: \"\"\n",
+            "          !environment BASH_ENV: \"\"\n",
+        ),
+        (
+            "nested-mapping-value",
+            AUTHORITATIVE_PATH,
+            "          ENV: \"\"\n",
+            "          ENV: !empty \"\"\n",
+        ),
+        (
+            "non-authoritative-workflow",
+            BOOTSTRAP_PATH,
+            "      - name: Checkout candidate validator\n",
+            "      - !step\n        name: Checkout candidate validator\n",
+        ),
+    ];
+
+    for (label, path, from, to) in cases {
+        let tree = copy_repo(&format!("tagged-yaml-{label}"));
+        replace(&tree.join(path), from, to);
+        let error = validate_inventory(&SafeRoot::new(&tree.path).expect("open tagged workflow"))
+            .expect_err("tagged workflow unexpectedly passed");
+        assert!(
+            error
+                .to_string()
+                .contains("tagged YAML values are forbidden"),
+            "{label} failed for the wrong reason: {error}"
+        );
+    }
+}
+
+#[test]
+fn dynamic_and_matrix_workflow_identities_cannot_spoof_reserved_checks() {
+    validate_inventory(&SafeRoot::new(repo_root()).expect("open canonical workflow inventory"))
+        .expect("audited dynamic job-name prefixes remain safe");
+    let cases = [
+        (
+            "dynamic-workflow-name",
+            ".github/workflows/rust.yml",
+            "name: rust\n",
+            "name: ${{ matrix.name }}\n",
+        ),
+        (
+            "exact-expression-job-name",
+            ".github/workflows/rust.yml",
+            "    name: Headless (${{ matrix.os }})\n",
+            "    name: ${{ matrix.name }}\n",
+        ),
+        (
+            "reserved-prefix-job-name",
+            ".github/workflows/rust.yml",
+            "    name: Headless (${{ matrix.os }})\n",
+            "    name: \"[AUTHORITATIVE] ${{ matrix.tail }}\"\n",
+        ),
+        (
+            "reserved-suffix-job-name",
+            ".github/workflows/rust.yml",
+            "    name: Headless (${{ matrix.os }})\n",
+            "    name: \"${{ matrix.head }} desktop supply-chain policy\"\n",
+        ),
+        (
+            "reserved-matrix-value",
+            ".github/workflows/rust.yml",
+            "          - ubuntu-latest\n",
+            "          - trusted_desktop_supply_chain_policy\n",
+        ),
+        (
+            "dynamic-matrix-value",
+            ".github/workflows/rust.yml",
+            "          - ubuntu-latest\n",
+            "          - \"${{ fromJSON('ubuntu-latest') }}\"\n",
+        ),
+        (
+            "unnamed-split-matrix-identity",
+            ".github/workflows/rust.yml",
+            "  headless:\n    name: Headless (${{ matrix.os }})\n",
+            "  trusted-desktop:\n",
+        ),
+        (
+            "punctuated-reserved-workflow",
+            ".github/workflows/rust.yml",
+            "name: rust\n",
+            "name: \"GTA-CLAW authoritative.desktop_supply chain POLICY\"\n",
+        ),
+    ];
+    for (label, path, from, to) in cases {
+        let tree = copy_repo(&format!("workflow-identity-{label}"));
+        replace(&tree.join(path), from, to);
+        assert!(
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open spoof workflow")).is_err(),
+            "workflow identity spoof unexpectedly passed: {label}"
+        );
+    }
+
+    let split = copy_repo("workflow-identity-unnamed-split-render");
+    replace(
+        &split.join(".github/workflows/rust.yml"),
+        "  headless:\n    name: Headless (${{ matrix.os }})\n",
+        "  trusted-desktop:\n",
+    );
+    replace(
+        &split.join(".github/workflows/rust.yml"),
+        "          - ubuntu-latest\n",
+        "          - supply-chain-policy\n",
+    );
+    assert!(
+        validate_inventory(&SafeRoot::new(&split.path).expect("open split matrix spoof")).is_err(),
+        "unnamed matrix split reserved identity unexpectedly passed"
+    );
 }
 
 #[test]
@@ -384,7 +1091,27 @@ fn authoritative_workflow_checkout_and_event_controls_are_exact() {
         })
         .collect::<Vec<_>>();
     assert_eq!(checkout_steps.len(), 2);
-    for checkout in checkout_steps {
+    assert!(!workflow.contains("fetch-depth: 0"));
+    for (name, repository, reference, path, depth) in [
+        (
+            "Checkout exact protected base",
+            "GTAStudio/GTA-Claw",
+            "${{ github.event.pull_request.base.sha }}",
+            "policy-checkouts/trusted",
+            1_u64,
+        ),
+        (
+            "Checkout exact immutable candidate",
+            "${{ github.event.pull_request.head.repo.full_name }}",
+            "${{ github.event.pull_request.head.sha }}",
+            "policy-checkouts/candidate",
+            u64::try_from(MAX_PULL_REQUEST_COMMITS + 1).expect("checkout depth fits u64"),
+        ),
+    ] {
+        let checkout = checkout_steps
+            .iter()
+            .find(|step| step.get("name").and_then(serde_yaml_ng::Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("missing checkout step: {name}"));
         assert_eq!(
             checkout.get("uses").and_then(serde_yaml_ng::Value::as_str),
             Some("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
@@ -393,8 +1120,16 @@ fn authoritative_workflow_checkout_and_event_controls_are_exact() {
             .get("with")
             .and_then(serde_yaml_ng::Value::as_mapping)
             .expect("checkout inputs");
+        assert_eq!(inputs.len(), 11);
         for (key, expected) in [
-            ("fetch-depth", serde_yaml_ng::Value::Number(0_u64.into())),
+            (
+                "repository",
+                serde_yaml_ng::Value::String(repository.to_owned()),
+            ),
+            ("ref", serde_yaml_ng::Value::String(reference.to_owned())),
+            ("path", serde_yaml_ng::Value::String(path.to_owned())),
+            ("fetch-depth", serde_yaml_ng::Value::Number(depth.into())),
+            ("fetch-tags", serde_yaml_ng::Value::Bool(false)),
             ("persist-credentials", serde_yaml_ng::Value::Bool(false)),
             ("submodules", serde_yaml_ng::Value::Bool(false)),
             ("lfs", serde_yaml_ng::Value::Bool(false)),
@@ -602,6 +1337,43 @@ fn casefolded_policy_aliases_and_collisions_fail_on_every_host() {
             ".github/CODEOWNERS".to_owned(),
             ".github/CODEOWNERS".to_owned(),
         ],
+        vec![
+            "crates/example/src/caf\u{00e9}.rs".to_owned(),
+            "crates/example/src/cafe\u{0301}.rs".to_owned(),
+        ],
+        vec![
+            "docs/q\u{0307}\u{0323}.md".to_owned(),
+            "docs/q\u{0323}\u{0307}.md".to_owned(),
+        ],
+        vec![
+            "crates/example/src/\u{0394}elta.rs".to_owned(),
+            "crates/example/src/\u{03b4}elta.rs".to_owned(),
+        ],
+        vec![
+            "crates/example/src/\u{0130}.rs".to_owned(),
+            "crates/example/src/i\u{0307}.rs".to_owned(),
+        ],
+        vec!["docs/\u{1e9e}.md".to_owned(), "docs/\u{00df}.md".to_owned()],
+        vec![
+            "docs/caf\u{00e9}/a.md".to_owned(),
+            "docs/cafe\u{0301}/b.md".to_owned(),
+        ],
+        vec!["docs/evil\u{0007}.md".to_owned()],
+        vec!["docs/evil\u{0085}.md".to_owned()],
+        vec![
+            "docs/strasse.md".to_owned(),
+            "docs/stra\u{00df}e.md".to_owned(),
+        ],
+        vec!["docs/\u{03c3}.md".to_owned(), "docs/\u{03c2}.md".to_owned()],
+        vec![
+            "docs/source.rs".to_owned(),
+            "docs/\u{017f}ource.rs".to_owned(),
+        ],
+        vec!["rust-toolchain".to_owned()],
+        vec!["nested/rust-toolchain".to_owned()],
+        vec!["nested/RUST-TOOLCHAIN".to_owned()],
+        vec!["nested/ru\u{017f}t-toolchain".to_owned()],
+        vec![".github/workflow\u{017f}/spoof.yml".to_owned()],
     ] {
         assert!(
             validate_casefold_paths(&paths).is_err(),
@@ -613,6 +1385,9 @@ fn casefolded_policy_aliases_and_collisions_fail_on_every_host() {
             "Cargo.toml".to_owned(),
             "crates/example/Cargo.toml".to_owned(),
             "crates/example/src/\u{65e5}\u{672c}\u{8a9e}.rs".to_owned(),
+            "crates/example/src/ma\u{00f1}ana.rs".to_owned(),
+            "docs/guide-\u{2460}.md".to_owned(),
+            "docs/guide-1.md".to_owned(),
         ])
         .is_ok()
     );
@@ -623,6 +1398,16 @@ fn casefolded_policy_aliases_and_collisions_fail_on_every_host() {
     assert!(is_policy_relevant(CODEOWNERS_PATH));
     assert!(is_policy_relevant("docs/CODEOWNERS"));
     assert!(is_policy_relevant(".github/CODEOWNER\u{212a}"));
+    assert!(is_policy_relevant("nested/ru\u{017f}t-toolchain"));
+    assert_eq!(
+        canonical_caseless("Stra\u{00df}e"),
+        canonical_caseless("STRASSE")
+    );
+    assert_eq!(
+        canonical_caseless("\u{03a3}"),
+        canonical_caseless("\u{03c2}")
+    );
+    assert_ne!(canonical_caseless("\u{2460}"), canonical_caseless("1"));
 }
 
 #[test]
@@ -638,6 +1423,11 @@ fn canonical_codeowners_is_exact_and_does_not_freeze_root_growth() {
     assert!(!canonical_codeowners().contains("\n/Cargo.lock "));
     assert!(!canonical_codeowners().contains("/apps/**"));
     assert!(!canonical_codeowners().contains("/crates/**"));
+    assert!(
+        canonical_codeowners()
+            .replace("\r\n", "\n")
+            .contains("\nrust-toolchain @aizhihuxiao\n")
+    );
 }
 
 #[test]
@@ -702,6 +1492,354 @@ fn complete_final_fixture_passes_static_policy() {
     validate_inventory(&root).expect("validate final workflow inventory");
     validate_final_workflows(&root).expect("validate exact final workflows");
     validate_final_static(&root).expect("validate final static policy");
+}
+
+#[test]
+fn root_gui_family_aliases_and_lock_packages_fail_closed() {
+    for (label, dependency) in [
+        ("gtk4-direct", "gtk4-helper = \"=1.0.0\"\n"),
+        (
+            "gdk4-renamed",
+            "friendly-ui = { package = \"gdk4-sys\", version = \"=1.0.0\" }\n",
+        ),
+        (
+            "gsk4-renamed",
+            "friendly-ui = { package = \"GSK4_helper\", version = \"=1.0.0\" }\n",
+        ),
+        (
+            "invalid-package-type",
+            "friendly-ui = { package = 4, version = \"=1.0.0\" }\n",
+        ),
+    ] {
+        let tree = final_tree(&format!("root-gui-{label}"));
+        replace(
+            &tree.join("Cargo.toml"),
+            "serde = { version = \"=1.0.228\", features = [\"derive\"] }\n",
+            &format!("serde = {{ version = \"=1.0.228\", features = [\"derive\"] }}\n{dependency}"),
+        );
+        assert!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open GUI mutation")).is_err(),
+            "root GUI dependency mutation unexpectedly passed: {label}"
+        );
+    }
+
+    let lock = final_tree("root-gui-lock");
+    let mut lock_text = fs::read_to_string(lock.join("Cargo.lock")).expect("read root lock");
+    lock_text.push_str(
+        "\n[[package]]\nname = \"gsk4-sys\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
+    );
+    fs::write(lock.join("Cargo.lock"), lock_text).expect("write GUI lock mutation");
+    assert!(
+        validate_final_static(&SafeRoot::new(&lock.path).expect("open GUI lock mutation")).is_err(),
+        "transitive GTK4-family lock package unexpectedly passed"
+    );
+
+    let positive = final_tree("root-gui-positive");
+    replace(
+        &positive.join("Cargo.toml"),
+        "serde = { version = \"=1.0.228\", features = [\"derive\"] }\n",
+        "serde = { version = \"=1.0.228\", features = [\"derive\"] }\ntoolkit-helper = { package = \"serde\", version = \"=1.0.228\" }\n",
+    );
+    validate_final_static(&SafeRoot::new(&positive.path).expect("open GUI positive"))
+        .expect("unrelated dependency name remains accepted");
+}
+
+#[test]
+fn executable_security_fixtures_require_raw_lf_bytes() {
+    let fixture_root = repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/final");
+    for path in [
+        ".github/fixtures/security-tools/bash-env-poison.sh",
+        ".github/fixtures/security-tools/shadow-bin/sha256sum",
+        ".github/fixtures/security-tools/shadow-bin/tar",
+    ] {
+        let bytes = fs::read(fixture_root.join(path)).expect("read LF security fixture");
+        assert!(
+            !bytes.contains(&b'\r'),
+            "security fixture contains CR: {path}"
+        );
+        assert_eq!(bytes.last(), Some(&b'\n'));
+
+        let tree = final_tree(&format!(
+            "security-crlf-{}",
+            path.rsplit('/').next().expect("fixture basename")
+        ));
+        let crlf = String::from_utf8(bytes)
+            .expect("security fixture is UTF-8")
+            .replace('\n', "\r\n");
+        fs::write(tree.join(path), crlf).expect("write CRLF security mutation");
+        assert!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open CRLF mutation")).is_err(),
+            "CRLF security fixture unexpectedly passed: {path}"
+        );
+    }
+
+    #[cfg(unix)]
+    for path in [
+        ".github/fixtures/security-tools/shadow-bin/sha256sum",
+        ".github/fixtures/security-tools/shadow-bin/tar",
+    ] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tree = final_tree(&format!(
+            "security-mode-{}",
+            path.rsplit('/').next().expect("fixture basename")
+        ));
+        let file = tree.join(path);
+        let mut permissions = fs::metadata(&file)
+            .expect("inspect shadow fixture")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(file, permissions).expect("remove shadow executable mode");
+        assert!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open mode mutation")).is_err(),
+            "non-executable shadow tool unexpectedly passed: {path}"
+        );
+    }
+}
+
+#[test]
+fn protected_macos_release_version_uses_locked_offline_metadata() {
+    let mut policy_runs = Vec::new();
+    for path in [
+        ".github/workflows/macos-packaging.yml",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/.github/workflows/macos-packaging.yml",
+    ] {
+        let workflow = fs::read_to_string(repo_root().join(path)).expect("read macOS workflow");
+        let yaml: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&workflow).expect("parse macOS workflow");
+        let run = yaml
+            .get("jobs")
+            .and_then(|jobs| jobs.get("release-policy"))
+            .and_then(|job| job.get("steps"))
+            .and_then(serde_yaml_ng::Value::as_sequence)
+            .and_then(|steps| {
+                steps.iter().find(|step| {
+                    step.get("name").and_then(serde_yaml_ng::Value::as_str)
+                        == Some("Enforce protected main and semantic tag policy")
+                })
+            })
+            .and_then(|step| step.get("run"))
+            .and_then(serde_yaml_ng::Value::as_str)
+            .expect("release policy script");
+        assert!(!run.contains(r#"$1 == "version""#));
+        for required in [
+            ".github/trusted/desktop-supply-chain-policy/scripts/release-metadata-version.sh",
+            "/bin/bash \"$metadata_script\"",
+            "\"$cargo_bin\"",
+            "\"$rustc_bin\"",
+            "\"$GITHUB_WORKSPACE\"",
+            "\"$version\"",
+            "\"$REQUESTED_VERSION\"",
+        ] {
+            assert!(
+                run.contains(required),
+                "release metadata policy is missing {required:?} in {path}"
+            );
+        }
+        policy_runs.push(run.to_owned());
+    }
+    assert_eq!(
+        policy_runs[0], policy_runs[1],
+        "live and protected final release policies diverged"
+    );
+    let script =
+        fs::read_to_string(repo_root().join(
+            ".github/trusted/desktop-supply-chain-policy/scripts/release-metadata-version.sh",
+        ))
+        .expect("read trusted release metadata script");
+    for required in [
+        "--locked",
+        "--offline",
+        "--no-deps",
+        "--format-version 1",
+        "CARGO_NET_OFFLINE=true",
+        "workspace_members is invalid or duplicated",
+        "workspace packages do not have one exact version",
+        "root_version\" == \"$desktop_version",
+        "root_version\" == \"$tag_version",
+    ] {
+        assert!(
+            script.contains(required),
+            "trusted release metadata script is missing {required:?}"
+        );
+    }
+    assert!(!script.contains("python"));
+}
+
+#[test]
+fn protected_macos_signing_binds_one_exact_bundle_executable() {
+    let verifier = fs::read_to_string(
+        repo_root().join(".github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"),
+    )
+    .expect("read trusted macOS verifier");
+    for required in [
+        "/usr/bin/cmp -s",
+        "CFBundleExecutable raw -expect string",
+        "/usr/bin/printf 'gta-claw-desktop\\n'",
+        "-mindepth 1 -maxdepth 1 -print0",
+        "\"${#entries[@]}\" -eq 1",
+        "-f \"$executable\" && ! -L \"$executable\" && -x \"$executable\"",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "trusted macOS verifier is missing {required:?}"
+        );
+    }
+
+    let mut protected_jobs = Vec::new();
+    for path in [
+        ".github/workflows/macos-packaging.yml",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/.github/workflows/macos-packaging.yml",
+    ] {
+        let workflow = fs::read_to_string(repo_root().join(path)).expect("read macOS workflow");
+        assert!(
+            workflow.matches("/bin/bash \"$verifier\"").count() >= 8,
+            "macOS release boundaries are not all verified in {path}"
+        );
+        assert!(workflow.contains("dependencies=\"$(otool -L \"$binary\")\" || {"));
+        assert!(workflow.contains("load_commands=\"$(otool -l \"$binary\")\" || {"));
+        assert!(!workflow.contains("if otool -L \"$binary\" |"));
+        assert!(!workflow.contains("if otool -l \"$binary\" |"));
+        assert!(workflow.contains(
+            "sparse-checkout: .github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
+        ));
+        let yaml: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&workflow).expect("parse macOS workflow");
+        protected_jobs.push(
+            yaml.get("jobs")
+                .and_then(|jobs| jobs.get("protected-release-contract"))
+                .cloned()
+                .expect("protected release job"),
+        );
+    }
+    assert_eq!(
+        protected_jobs[0], protected_jobs[1],
+        "live and protected Final signing contracts diverged"
+    );
+}
+
+#[test]
+fn release_metadata_version_is_format_independent_and_requires_agreement() {
+    let fixture = TempTree::new("release-metadata");
+    let tools = local_metadata_tools();
+    let root_manifest = write_release_workspace(&fixture.path, "root", "1.2.3", true, None);
+    let desktop_manifest =
+        write_release_workspace(&fixture.join("desktop"), "desktop", "1.2.3", false, None);
+    let root =
+        run_release_metadata_fixture(&tools, &root_manifest, &fixture.join("root-isolation"));
+    let desktop = run_release_metadata_fixture(
+        &tools,
+        &desktop_manifest,
+        &fixture.join("desktop-isolation"),
+    );
+    assert!(
+        root.status.success(),
+        "formatted root metadata failed: {}",
+        String::from_utf8_lossy(&root.stderr)
+    );
+    assert!(
+        desktop.status.success(),
+        "desktop metadata failed: {}",
+        String::from_utf8_lossy(&desktop.stderr)
+    );
+    assert_eq!(
+        release_version_from_metadata_documents(&root.stdout, &desktop.stdout)
+            .expect("formatted metadata versions agree"),
+        "1.2.3"
+    );
+    let mut duplicated: serde_json::Value =
+        serde_json::from_slice(&root.stdout).expect("parse root metadata for duplicate mutation");
+    let first_member = duplicated["workspace_members"][0].clone();
+    duplicated["workspace_members"]
+        .as_array_mut()
+        .expect("workspace_members array")
+        .push(first_member);
+    assert!(
+        release_version_from_metadata_documents(
+            &serde_json::to_vec(&duplicated).expect("serialize duplicate metadata"),
+            &desktop.stdout,
+        )
+        .is_err(),
+        "duplicate workspace member unexpectedly passed"
+    );
+
+    #[cfg(not(windows))]
+    {
+        let script = repo_root().join(
+            ".github/trusted/desktop-supply-chain-policy/scripts/release-metadata-version.sh",
+        );
+        let script_isolation = fixture.join("exact-script-isolation");
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .args([
+                tools.cargo.as_os_str(),
+                tools.rustc.as_os_str(),
+                fixture.path.as_os_str(),
+                script_isolation.as_os_str(),
+                std::ffi::OsStr::new("1.2.3"),
+                std::ffi::OsStr::new("1.2.3"),
+            ])
+            .env_clear()
+            .output()
+            .expect("run exact release metadata script");
+        assert!(
+            output.status.success(),
+            "exact release metadata script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"1.2.3\n");
+    }
+
+    let disagreement_manifest = write_release_workspace(
+        &fixture.join("disagreement"),
+        "disagreement",
+        "1.2.4",
+        false,
+        None,
+    );
+    let disagreement = run_release_metadata_fixture(
+        &tools,
+        &disagreement_manifest,
+        &fixture.join("disagreement-isolation"),
+    );
+    assert!(disagreement.status.success());
+    assert!(
+        release_version_from_metadata_documents(&root.stdout, &disagreement.stdout).is_err(),
+        "root/desktop release version disagreement unexpectedly passed"
+    );
+
+    let multiple_manifest = write_release_workspace(
+        &fixture.join("multiple"),
+        "multiple",
+        "1.2.3",
+        false,
+        Some("1.2.4"),
+    );
+    let multiple = run_release_metadata_fixture(
+        &tools,
+        &multiple_manifest,
+        &fixture.join("multiple-isolation"),
+    );
+    assert!(
+        multiple.status.success(),
+        "multiple-version metadata command failed before semantic validation: {}",
+        String::from_utf8_lossy(&multiple.stderr)
+    );
+    assert!(
+        release_version_from_metadata_documents(&multiple.stdout, &desktop.stdout).is_err(),
+        "multiple workspace package versions unexpectedly passed"
+    );
+
+    fs::write(
+        &root_manifest,
+        "[workspace]\nmembers = [\"member\"]\n[workspace.package]\nversion = [\n",
+    )
+    .expect("write malformed release manifest");
+    let malformed =
+        run_release_metadata_fixture(&tools, &root_manifest, &fixture.join("malformed-isolation"));
+    assert!(
+        !malformed.status.success(),
+        "malformed Cargo metadata manifest unexpectedly passed"
+    );
 }
 
 #[test]
@@ -966,7 +2104,7 @@ fn candidate_cargo_config_and_build_marker_never_execute() {
 
     let root = SafeRoot::new(&tree.path).expect("open poison fixture");
     let isolation = TempTree::new("cargo-poison-isolation");
-    validate_desktop_metadata(&root, &local_metadata_tools(), &isolation.path)
+    validate_desktop_metadata(&root, "0.1.0", &local_metadata_tools(), &isolation.path)
         .expect("isolated metadata ignores candidate Cargo config and build script");
     assert!(!marker.exists(), "candidate marker command executed");
     assert!(
@@ -1010,7 +2148,7 @@ fn crafted_metadata_manifest_path_escape_fails_closed() {
     }))
     .expect("serialize crafted metadata");
     assert!(
-        validate_desktop_metadata_document(&root, &target, &document).is_err(),
+        validate_desktop_metadata_document(&root, "0.1.0", &target, &document).is_err(),
         "metadata manifest path escape unexpectedly passed"
     );
 }
@@ -1120,23 +2258,111 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
         )
         .expect("write changed fixture");
     }
+    fs::write(candidate.join("docs/source.pack"), "ordinary source data\n")
+        .expect("write unrelated worktree pack-suffix file");
     fs::create_dir_all(candidate.join("desktop")).expect("create relevant directory");
     fs::write(candidate.join("desktop/Cargo.toml"), "[workspace]\n")
         .expect("write late relevant path");
     run_git(&git, &candidate, &["add", "."]);
     run_git(&git, &candidate, &["commit", "--quiet", "-m", "head"]);
+    fs::write(candidate.join("README.txt"), "second head\n").expect("write second head fixture");
+    run_git(&git, &candidate, &["add", "README.txt"]);
+    run_git(
+        &git,
+        &candidate,
+        &["commit", "--quiet", "-m", "second head"],
+    );
     let head = run_git(&git, &candidate, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        run_git(
+            &git,
+            &candidate,
+            &["rev-list", "--count", &format!("{base}..{head}")]
+        ),
+        "2"
+    );
     let isolated_home = fixture.join("home");
     fs::create_dir_all(&isolated_home).expect("create Git isolation home");
     let manifest = compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
         .unwrap_or_else(|error| panic!("compute complete Git manifest in {fixture_path}: {error}"));
-    assert_eq!(manifest.paths.len(), 351);
+    assert_eq!(manifest.paths.len(), 353);
     assert!(has_policy_relevant_change(&manifest));
     assert!(
         manifest
             .paths
             .iter()
             .any(|entry| entry.path == "desktop/Cargo.toml")
+    );
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .any(|entry| entry.path == "docs/source.pack"),
+        "worktree .pack file was incorrectly treated as Git object storage"
+    );
+    assert!(!is_policy_relevant("docs/source.pack"));
+    let pack_root = candidate.join(".git/objects/pack");
+    let mut fake_packs = Vec::new();
+    for index in 0..=MAX_GIT_PACK_FILES {
+        let path = pack_root.join(format!("pack-fake-{index:03}.pack"));
+        fs::write(&path, []).expect("write bounded fake Git pack entry");
+        fake_packs.push(path);
+    }
+    let pack_error = compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+        .expect_err("oversized Git pack inventory unexpectedly passed");
+    assert!(pack_error.to_string().contains("Git pack storage exceeds"));
+    for path in fake_packs {
+        fs::remove_file(path).expect("remove fake Git pack entry");
+    }
+    validate_pull_request_commit_count(1).expect("one commit is accepted");
+    validate_pull_request_commit_count(MAX_PULL_REQUEST_COMMITS)
+        .expect("exact pull request commit cap is accepted");
+    assert!(validate_pull_request_commit_count(0).is_err());
+    assert!(validate_pull_request_commit_count(MAX_PULL_REQUEST_COMMITS + 1).is_err());
+
+    fs::write(trusted.join("TRUSTED.txt"), "advanced base\n").expect("write advanced base");
+    run_git(&git, &trusted, &["add", "TRUSTED.txt"]);
+    run_git(
+        &git,
+        &trusted,
+        &["commit", "--quiet", "-m", "advanced base"],
+    );
+    let advanced_base = run_git(&git, &trusted, &["rev-parse", "HEAD"]);
+    let stale = compute_manifest(
+        &git,
+        &trusted,
+        &candidate,
+        &isolated_home,
+        &advanced_base,
+        &head,
+    )
+    .expect_err("stale pull request unexpectedly passed");
+    assert!(stale.to_string().contains("base is not an ancestor"));
+
+    let unrelated = fixture.join("unrelated");
+    fs::create_dir_all(&unrelated).expect("create unrelated Git fixture");
+    run_git(&git, &unrelated, &["init", "--quiet"]);
+    run_git(&git, &unrelated, &["config", "user.name", "Policy Test"]);
+    run_git(
+        &git,
+        &unrelated,
+        &["config", "user.email", "policy@example.invalid"],
+    );
+    fs::write(unrelated.join("UNRELATED.txt"), "unrelated\n").expect("write unrelated fixture");
+    run_git(&git, &unrelated, &["add", "."]);
+    run_git(&git, &unrelated, &["commit", "--quiet", "-m", "unrelated"]);
+    let unrelated_head = run_git(&git, &unrelated, &["rev-parse", "HEAD"]);
+    assert!(
+        compute_manifest(
+            &git,
+            &trusted,
+            &unrelated,
+            &isolated_home,
+            &advanced_base,
+            &unrelated_head,
+        )
+        .is_err(),
+        "unrelated pull request history unexpectedly passed"
     );
 }
 
@@ -1205,6 +2431,11 @@ fn final_base_enforces_final_policy_for_an_unrelated_change() {
 #[test]
 fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
     let root = repo_root();
+    let canonical = final_tree("mutation-canonical-baseline");
+    let canonical_root = SafeRoot::new(&canonical.path).expect("open canonical mutation baseline");
+    validate_final_workflows(&canonical_root).expect("canonical workflow baseline passes");
+    validate_final_static(&canonical_root).expect("canonical static baseline passes");
+
     let cases = fs::read_to_string(root.join(
         ".github/trusted/desktop-supply-chain-policy/policy/final/crates/claw-security/tests/fixtures/desktop_supply_chain_policy/negative-cases.toml",
     ))
@@ -1214,12 +2445,26 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
         .get("case")
         .and_then(toml::Value::as_array)
         .expect("negative cases array");
-    assert_eq!(cases.len(), 48);
+    assert_eq!(cases.len(), P04F_MUTATION_ORACLE.len());
+    for (fixture, oracle) in cases.iter().zip(P04F_MUTATION_ORACLE) {
+        assert_eq!(
+            fixture.get("name").and_then(toml::Value::as_str),
+            Some(oracle.name)
+        );
+        assert_eq!(
+            fixture.get("mutation").and_then(toml::Value::as_str),
+            Some(oracle.mutation)
+        );
+        assert_eq!(
+            fixture.get("expected").and_then(toml::Value::as_str),
+            Some(oracle.expected)
+        );
+    }
 
     let reference = root.join(".github/trusted/desktop-supply-chain-policy/policy");
     let baseline_workflow: serde_yaml_ng::Value = serde_yaml_ng::from_str(
-        &fs::read_to_string(reference.join("reference/rust-pr22.yml.fixture"))
-            .expect("read original PR22 Rust workflow"),
+        &fs::read_to_string(reference.join("final/.github/workflows/rust.yml"))
+            .expect("read canonical Final Rust workflow"),
     )
     .expect("parse original PR22 Rust workflow");
     let baseline_macos: serde_yaml_ng::Value = serde_yaml_ng::from_str(
@@ -1257,21 +2502,14 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
     let actionlint_fixture = TempTree::new("actual-actionlint-mutations");
     let mut actionlint_paths = Vec::new();
     let mut names = BTreeSet::new();
-    for case in cases {
-        let name = case
-            .get("name")
-            .and_then(toml::Value::as_str)
-            .expect("negative case name");
-        let mutation = case
-            .get("mutation")
-            .and_then(toml::Value::as_str)
-            .expect("negative mutation name");
-        let expected = case
-            .get("expected")
-            .and_then(toml::Value::as_str)
-            .expect("negative expected violation");
-        assert!(!expected.is_empty());
+    for (index, (case, oracle)) in cases.iter().zip(P04F_MUTATION_ORACLE).enumerate() {
+        let name = oracle.name;
+        let mutation = oracle.mutation;
         assert!(names.insert(name));
+        assert_eq!(
+            case.get("expected").and_then(toml::Value::as_str),
+            Some(oracle.expected)
+        );
 
         let mut workflow = baseline_workflow.clone();
         let mut macos = baseline_macos.clone();
@@ -1289,16 +2527,55 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
             &mut audit,
             (&mut desktop, &mut app),
         );
-        let changed = workflow != baseline_workflow
-            || macos != baseline_macos
-            || root_deny != baseline_root_deny
-            || deny != baseline_deny
-            || audit != baseline_audit
-            || desktop != baseline_desktop
-            || app != baseline_app;
-        assert!(
+        let changed = [
+            (
+                workflow != baseline_workflow,
+                MutationArtifact::RustWorkflow,
+            ),
+            (macos != baseline_macos, MutationArtifact::MacosWorkflow),
+            (root_deny != baseline_root_deny, MutationArtifact::RootDeny),
+            (deny != baseline_deny, MutationArtifact::DesktopDeny),
+            (audit != baseline_audit, MutationArtifact::Audit),
+            (
+                desktop != baseline_desktop,
+                MutationArtifact::DesktopManifest,
+            ),
+            (app != baseline_app, MutationArtifact::AppManifest),
+        ]
+        .into_iter()
+        .filter_map(|(changed, artifact)| changed.then_some(artifact))
+        .collect::<Vec<_>>();
+        assert_eq!(
             changed,
-            "archived mutation changed no policy data: {mutation}"
+            [oracle.artifact],
+            "archived mutation changed the wrong policy artifact: {mutation}"
+        );
+        let mutated_bytes = match oracle.artifact {
+            MutationArtifact::RustWorkflow => {
+                serde_yaml_ng::to_string(&workflow).expect("serialize oracle Rust workflow")
+            }
+            MutationArtifact::MacosWorkflow => {
+                serde_yaml_ng::to_string(&macos).expect("serialize oracle macOS workflow")
+            }
+            MutationArtifact::RootDeny => {
+                toml::to_string(&root_deny).expect("serialize oracle root deny")
+            }
+            MutationArtifact::DesktopDeny => {
+                toml::to_string(&deny).expect("serialize oracle desktop deny")
+            }
+            MutationArtifact::Audit => toml::to_string(&audit).expect("serialize oracle audit"),
+            MutationArtifact::DesktopManifest => {
+                toml::to_string(&desktop).expect("serialize oracle desktop manifest")
+            }
+            MutationArtifact::AppManifest => {
+                toml::to_string(&app).expect("serialize oracle app manifest")
+            }
+        };
+        assert_eq!(
+            sha256(mutated_bytes.as_bytes()),
+            P04F_MUTATED_ARTIFACT_SHA256[index],
+            "mutation bytes do not match the independent rule oracle: {mutation} ({})",
+            oracle.expected
         );
 
         let rust_path = actionlint_fixture.join(format!("{name}-rust.yml"));
@@ -1351,13 +2628,23 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
             }
         }
         let candidate = SafeRoot::new(&tree.path).expect("open actual mutation fixture");
-        assert!(
-            validate_final_workflows(&candidate).is_err()
-                || validate_final_static(&candidate).is_err(),
-            "trusted final policy accepted archived mutation {mutation} ({expected})"
+        let error = match oracle.artifact {
+            MutationArtifact::RustWorkflow | MutationArtifact::MacosWorkflow => {
+                validate_final_workflows(&candidate)
+                    .expect_err("trusted final workflow policy accepted archived mutation")
+            }
+            _ => validate_final_static(&candidate)
+                .expect_err("trusted final static policy accepted archived mutation"),
+        };
+        assert_eq!(
+            error.to_string(),
+            oracle.artifact.production_error(),
+            "mutation was rejected by the wrong production rule class: {mutation} ({})",
+            oracle.expected
         );
     }
-    assert_eq!(names.len(), 48);
+    assert_eq!(names.len(), P04F_MUTATION_ORACLE.len());
+    assert_eq!(actionlint_paths.len(), P04F_MUTATION_ORACLE.len() * 2);
 
     if let Some(actionlint) = local_actionlint() {
         let mut spec = CommandSpec::new(&actionlint.path, &actionlint_fixture.path)

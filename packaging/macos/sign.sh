@@ -13,8 +13,7 @@ require_tool security
 [[ "$#" -eq 2 ]] || die "usage: sign.sh adhoc|release APP"
 mode="$1"
 app="$2"
-[[ -d "$app/Contents" && ! -L "$app" ]] || die "invalid app bundle: $app"
-reject_symlinks "$app"
+assert_app_executable_contract "$app"
 
 identity="-"
 timestamp="--timestamp=none"
@@ -64,6 +63,7 @@ codesign \
   "$app"
 
 codesign --verify --deep --strict --verbose=2 "$app"
+assert_app_executable_contract "$app"
 details="$(codesign -dvvv "$app" 2>&1)"
 requirement="$(codesign -d -r- "$app" 2>&1)"
 grep -F "designated =>" <<<"$requirement" >/dev/null ||

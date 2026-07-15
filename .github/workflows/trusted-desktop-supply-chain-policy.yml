@@ -15,7 +15,6 @@ permissions:
 
 concurrency:
   group: trusted-desktop-policy-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   trusted-desktop-supply-chain-policy:
@@ -57,7 +56,8 @@ jobs:
           repository: GTAStudio/GTA-Claw
           ref: ${{ github.event.pull_request.base.sha }}
           path: policy-checkouts/trusted
-          fetch-depth: 0
+          fetch-depth: 1
+          fetch-tags: false
           persist-credentials: false
           submodules: false
           lfs: false
@@ -71,7 +71,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           path: policy-checkouts/candidate
-          fetch-depth: 0
+          fetch-depth: 10001
+          fetch-tags: false
           persist-credentials: false
           submodules: false
           lfs: false

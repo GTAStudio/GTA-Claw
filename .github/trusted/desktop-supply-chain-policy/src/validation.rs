@@ -89,7 +89,7 @@ fn validate_final(
     })?;
     run_actionlint(root, actionlint, &root_isolation)?;
     validate_root_metadata(root, &workspace, tools, &root_isolation)?;
-    validate_desktop_metadata(root, tools, &root_isolation)
+    validate_desktop_metadata(root, &workspace.version, tools, &root_isolation)
 }
 
 fn validate_manifest_roots(

@@ -1,7 +1,12 @@
 # Keep Rust workspace inputs deterministic on Windows checkouts.
+/.gitattributes text eol=lf
 *.rs text eol=lf
 *.slint text eol=lf
 *.toml text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+*.sh text eol=lf
 Cargo.lock text eol=lf
+rust-toolchain text eol=lf
+.github/fixtures/security-tools/shadow-bin/* text eol=lf
+.github/trusted/desktop-supply-chain-policy/policy/final/.github/fixtures/security-tools/shadow-bin/* text eol=lf

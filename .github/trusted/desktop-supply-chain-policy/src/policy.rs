@@ -1,11 +1,13 @@
 //! Static final-state policy and extensible root workspace validation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path};
 
 use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
+use crate::identity::canonical_caseless;
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
 use crate::ownership::{CODEOWNERS_PATH, is_codeowners_path_or_alias, validate_codeowners};
 use crate::{PolicyError, PolicyResult, error};
@@ -45,19 +47,23 @@ const FINAL_TAR_POISON: &[u8] =
 const ROOT_AUDIT: &[u8] = b"[advisories]\nignore = []\n";
 const ROOT_TOOLCHAIN: &[u8] = b"[toolchain]\nchannel = \"1.97.0\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n";
 const ROOT_RUSTFMT: &[u8] = b"edition = \"2024\"\nmax_width = 100\nnewline_style = \"Unix\"\nuse_field_init_shorthand = true\nuse_try_shorthand = true\n";
-const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\nCargo.lock text eol=lf\n";
+const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n/.gitattributes text eol=lf\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\n*.sh text eol=lf\nCargo.lock text eol=lf\nrust-toolchain text eol=lf\n.github/fixtures/security-tools/shadow-bin/* text eol=lf\n.github/trusted/desktop-supply-chain-policy/policy/final/.github/fixtures/security-tools/shadow-bin/* text eol=lf\n";
 
 const BOOTSTRAP_FINGERPRINT: &str =
-    "ce36154c5fdafa53b073f24e8f78b03662fc7e1a62f897e2c3728ae61ff3a8c9";
+    "4a52e1daad1fc3b3136c72585e3934dae390dbe7e8e9e330e8c60da784a15237";
 
-const BOOTSTRAP_FILES: [&str; 26] = [
+const BOOTSTRAP_SNAPSHOT_MAGIC: &[u8; 8] = b"GTABOOT1";
+
+const BOOTSTRAP_FILES: [&str; 28] = [
     ".cargo/audit.toml",
     ".gitattributes",
     ".github/CODEOWNERS",
+    ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/docker-publish.yml",
     ".github/workflows/linux-packaging.yml",
     ".github/workflows/macos-packaging.yml",
     ".github/workflows/rust.yml",
+    ".github/workflows/trusted-desktop-supply-chain-policy.yml",
     ".github/workflows/upstream-gateway-reference.yml",
     ".github/workflows/windows-packaging.yml",
     "Cargo.lock",
@@ -164,11 +170,29 @@ fn require_exact_file(root: &SafeRoot, path: &str, expected: &[u8]) -> PolicyRes
     Ok(())
 }
 
-fn is_forbidden_gui(name: &str) -> bool {
-    name.starts_with("i-slint")
+fn require_exact_lf_file(root: &SafeRoot, path: &str, expected: &[u8]) -> PolicyResult<()> {
+    let actual = root.read_bytes(path, DEFAULT_FILE_LIMIT.max(expected.len() as u64))?;
+    if expected.contains(&b'\r')
+        || actual.contains(&b'\r')
+        || expected.last() != Some(&b'\n')
+        || actual != expected
+    {
+        return Err(PolicyError::new(format!(
+            "exact LF security script changed: {path}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_forbidden_gui(name: &str) -> bool {
+    let canonical = canonical_caseless(name).replace('_', "-");
+    canonical.starts_with("i-slint")
+        || ["gtk4", "gdk4", "gsk4"]
+            .iter()
+            .any(|prefix| canonical.starts_with(prefix))
         || FORBIDDEN_GUI_NAMES
             .iter()
-            .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+            .any(|forbidden| canonical == canonical_caseless(forbidden))
 }
 
 fn require_workspace_inheritance(
@@ -418,12 +442,17 @@ fn validate_dependency(
             "dependency source/schema is forbidden: {dependency_name}"
         )));
     }
-    if let Some(package) = dependency.get("package").and_then(TomlValue::as_str)
-        && is_forbidden_gui(package)
-    {
-        return Err(PolicyError::new(format!(
-            "root/headless manifest aliases forbidden GUI package {package} as {dependency_name}"
-        )));
+    if let Some(package) = dependency.get("package") {
+        let package = package.as_str().ok_or_else(|| {
+            PolicyError::new(format!(
+                "dependency package rename is not a string: {dependency_name}"
+            ))
+        })?;
+        if is_forbidden_gui(package) {
+            return Err(PolicyError::new(format!(
+                "root/headless manifest aliases forbidden GUI package {package} as {dependency_name}"
+            )));
+        }
     }
     if dependency.get("workspace").and_then(TomlValue::as_bool) == Some(true) {
         if dependency.contains_key("path") || dependency.contains_key("version") {
@@ -714,11 +743,70 @@ fn repository_inventory(root: &SafeRoot) -> PolicyResult<Vec<String>> {
     Ok(inventory)
 }
 
-/// Rejects case-folded aliases and collisions before another platform reinterprets them.
+fn canonical_lower_component(component: &str) -> PolicyResult<String> {
+    if component.is_empty()
+        || matches!(component, "." | "..")
+        || component.contains(['/', '\\'])
+        || component.chars().any(char::is_control)
+    {
+        return Err(PolicyError::new(format!(
+            "repository path component is unsafe: {component:?}"
+        )));
+    }
+    let normalized = canonical_caseless(component);
+    if normalized.is_empty()
+        || matches!(normalized.as_str(), "." | "..")
+        || normalized.contains(['/', '\\'])
+        || normalized.chars().any(char::is_control)
+    {
+        return Err(PolicyError::new(format!(
+            "normalized repository path component is unsafe: {component:?}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn register_portable_path(
+    nodes: &mut BTreeMap<Vec<String>, (String, bool)>,
+    path: &str,
+) -> PolicyResult<()> {
+    let components = path.split('/').collect::<Vec<_>>();
+    let mut key = Vec::with_capacity(components.len());
+    let mut original = String::new();
+    for (index, component) in components.iter().enumerate() {
+        key.push(canonical_lower_component(component)?);
+        if !original.is_empty() {
+            original.push('/');
+        }
+        original.push_str(component);
+        let is_file = index + 1 == components.len();
+        if let Some((previous, previous_is_file)) = nodes.get(&key) {
+            if previous != &original || is_file || *previous_is_file {
+                return Err(PolicyError::new(format!(
+                    "repository contains a Unicode-normalized path collision: {previous:?} and {original:?}"
+                )));
+            }
+        } else {
+            nodes.insert(key.clone(), (original.clone(), is_file));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects portable Unicode/case aliases and collisions before another platform reinterprets them.
 pub fn validate_casefold_paths(paths: &[String]) -> PolicyResult<()> {
-    let mut folded = BTreeMap::new();
+    let mut portable_nodes = BTreeMap::new();
     for path in paths {
-        let lower = path.to_ascii_lowercase();
+        register_portable_path(&mut portable_nodes, path)?;
+        let components = path.split('/').map(canonical_caseless).collect::<Vec<_>>();
+        if components
+            .iter()
+            .any(|component| component == "rust-toolchain")
+        {
+            return Err(PolicyError::new(format!(
+                "legacy rust-toolchain basename is forbidden at every repository depth: {path:?}"
+            )));
+        }
         if is_codeowners_path_or_alias(path) && path != CODEOWNERS_PATH {
             return Err(PolicyError::new(format!(
                 "alternate, aliased, or duplicate CODEOWNERS path is forbidden: {path:?}"
@@ -729,24 +817,15 @@ pub fn validate_casefold_paths(paths: &[String]) -> PolicyResult<()> {
                 "security-sensitive path contains non-ASCII filesystem aliases: {path:?}"
             )));
         }
-        if let Some(previous) = folded.insert(lower.clone(), path.as_str()) {
-            return Err(PolicyError::new(format!(
-                "repository contains a case-folded path collision: {previous:?} and {path:?}"
-            )));
-        }
         let file_name = path.rsplit('/').next().unwrap_or(path);
-        let lower_name = file_name.to_ascii_lowercase();
+        let portable_name = canonical_caseless(file_name);
         for component in path.split('/') {
             if component.ends_with('.') || component.ends_with(' ') || component.contains(':') {
                 return Err(PolicyError::new(format!(
                     "repository path is not portable to Windows/macOS: {path:?}"
                 )));
             }
-            let device = component
-                .split('.')
-                .next()
-                .unwrap_or(component)
-                .to_ascii_lowercase();
+            let device = canonical_caseless(component.split('.').next().unwrap_or(component));
             if matches!(device.as_str(), "con" | "prn" | "aux" | "nul")
                 || device.strip_prefix("com").is_some_and(|value| {
                     matches!(value, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
@@ -766,28 +845,41 @@ pub fn validate_casefold_paths(paths: &[String]) -> PolicyResult<()> {
             "rust-toolchain.toml",
             "rustfmt.toml",
         ] {
-            if lower_name == canonical.to_ascii_lowercase() && file_name != canonical {
+            if portable_name == canonical_caseless(canonical) && file_name != canonical {
                 return Err(PolicyError::new(format!(
                     "security-sensitive file uses a case alias: {path}"
                 )));
             }
         }
-        for prefix in [
-            ".github/workflows/",
-            ".github/trusted/desktop-supply-chain-policy/",
-            ".cargo/",
-            "apps/",
-            "crates/",
-            "desktop/",
+        for (prefix, portable_prefix) in [
+            (".github/workflows/", &[".github", "workflows"][..]),
+            (
+                ".github/trusted/desktop-supply-chain-policy/",
+                &[".github", "trusted", "desktop-supply-chain-policy"][..],
+            ),
+            (".cargo/", &[".cargo"][..]),
+            ("apps/", &["apps"][..]),
+            ("crates/", &["crates"][..]),
+            ("desktop/", &["desktop"][..]),
         ] {
-            if lower.starts_with(prefix) && !path.starts_with(prefix) {
+            if components
+                .iter()
+                .map(String::as_str)
+                .zip(portable_prefix.iter().copied())
+                .all(|(actual, expected)| actual == expected)
+                && components.len() >= portable_prefix.len()
+                && !path.starts_with(prefix)
+            {
                 return Err(PolicyError::new(format!(
                     "security-sensitive directory uses a case alias: {path}"
                 )));
             }
         }
-        let in_cargo_directory = lower.starts_with(".cargo/") || lower.contains("/.cargo/");
-        if in_cargo_directory && matches!(lower_name.as_str(), "config" | "config.toml") {
+        let in_cargo_directory = components
+            .iter()
+            .take(components.len().saturating_sub(1))
+            .any(|component| component == ".cargo");
+        if in_cargo_directory && matches!(portable_name.as_str(), "config" | "config.toml") {
             return Err(PolicyError::new(format!(
                 "repository Cargo configuration is forbidden, including case aliases: {path}"
             )));
@@ -802,9 +894,8 @@ pub fn is_non_ascii_security_path(path: &str) -> bool {
     if path.is_ascii() {
         return false;
     }
-    let lower = path.to_ascii_lowercase();
-    let parts = lower.split('/').collect::<Vec<_>>();
-    let file_name = parts.last().copied().unwrap_or(&lower);
+    let parts = path.split('/').map(canonical_caseless).collect::<Vec<_>>();
+    let file_name = parts.last().map(String::as_str).unwrap_or_default();
     let policy_name = is_codeowners_path_or_alias(path)
         || file_name.ends_with(".toml")
         || file_name.ends_with(".lock")
@@ -817,11 +908,18 @@ pub fn is_non_ascii_security_path(path: &str) -> bool {
         || file_name.contains("rust-toolchain")
         || file_name.contains("rustfmt");
     policy_name
-        || lower.starts_with(".cargo/")
-        || lower.starts_with(".github/workflows/")
-        || lower.starts_with(".github/trusted/desktop-supply-chain-policy/")
-        || lower.starts_with("desktop/") && parts.len() <= 4
-        || matches!(parts.first(), Some(&"apps" | &"crates")) && parts.len() <= 3
+        || parts.first().is_some_and(|part| part == ".cargo")
+        || parts.starts_with(&[".github".to_owned(), "workflows".to_owned()])
+        || parts.starts_with(&[
+            ".github".to_owned(),
+            "trusted".to_owned(),
+            "desktop-supply-chain-policy".to_owned(),
+        ])
+        || parts.first().is_some_and(|part| part == "desktop") && parts.len() <= 4
+        || parts
+            .first()
+            .is_some_and(|part| matches!(part.as_str(), "apps" | "crates"))
+            && parts.len() <= 3
 }
 
 fn validate_manifest_and_lock_inventory(
@@ -1051,6 +1149,10 @@ fn validate_final_fixed_files(root: &SafeRoot) -> PolicyResult<()> {
             ".github/fixtures/cargo-audit/vulnerable/Cargo.lock.fixture",
             FINAL_AUDIT_VULNERABLE,
         ),
+    ] {
+        require_exact_file(root, path, expected)?;
+    }
+    for (path, expected) in [
         (
             ".github/fixtures/security-tools/bash-env-poison.sh",
             FINAL_BASH_POISON,
@@ -1064,7 +1166,24 @@ fn validate_final_fixed_files(root: &SafeRoot) -> PolicyResult<()> {
             FINAL_TAR_POISON,
         ),
     ] {
-        require_exact_file(root, path, expected)?;
+        require_exact_lf_file(root, path, expected)?;
+    }
+    #[cfg(unix)]
+    for path in [
+        ".github/fixtures/security-tools/shadow-bin/sha256sum",
+        ".github/fixtures/security-tools/shadow-bin/tar",
+    ] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let executable = root.regular_file(path, DEFAULT_FILE_LIMIT)?;
+        let mode = fs::metadata(&executable)
+            .map_err(|cause| error("inspect shadow tool permissions", cause))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err(PolicyError::new(format!(
+                "security shadow tool is not executable: {path}"
+            )));
+        }
     }
     if root.exists(LEGACY_VALIDATOR)? || root.exists(LEGACY_FIXTURES)? {
         return Err(PolicyError::new(
@@ -1120,7 +1239,7 @@ fn bootstrap_manifest_inventory(root: &SafeRoot) -> PolicyResult<bool> {
         && !root.exists(LEGACY_FIXTURES)?)
 }
 
-/// Computes the exact pre-P04f product-policy fingerprint.
+/// Computes the exact pre-P04f product and trust-root workflow fingerprint.
 pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
     let mut digest = Sha256::new();
     for path in BOOTSTRAP_FILES {
@@ -1137,7 +1256,34 @@ pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
         .collect())
 }
 
-/// Returns whether a checkout is the exact short-lived pre-P04f product state.
+/// Serializes the exact pre-P04f policy inputs into the canonical Bootstrap snapshot format.
+pub fn bootstrap_snapshot(root: &SafeRoot) -> PolicyResult<Vec<u8>> {
+    let file_count = u32::try_from(BOOTSTRAP_FILES.len())
+        .map_err(|_| PolicyError::new("Bootstrap snapshot file count exceeds u32"))?;
+    let mut snapshot = Vec::new();
+    snapshot.extend_from_slice(BOOTSTRAP_SNAPSHOT_MAGIC);
+    snapshot.extend_from_slice(&file_count.to_le_bytes());
+    for path in BOOTSTRAP_FILES {
+        let path_length = u32::try_from(path.len())
+            .map_err(|_| PolicyError::new("Bootstrap snapshot path length exceeds u32"))?;
+        let bytes = normalize_text(&root.read_bytes(path, MAX_LOCK_BYTES)?);
+        let data_length = u64::try_from(bytes.len())
+            .map_err(|_| PolicyError::new("Bootstrap snapshot file length exceeds u64"))?;
+        snapshot.extend_from_slice(&path_length.to_le_bytes());
+        snapshot.extend_from_slice(&data_length.to_le_bytes());
+        snapshot.extend_from_slice(path.as_bytes());
+        snapshot.extend_from_slice(&bytes);
+    }
+    Ok(snapshot)
+}
+
+/// Writes a canonical Bootstrap snapshot generated from trusted policy inputs.
+pub fn write_bootstrap_snapshot(root: &SafeRoot, output: &Path) -> PolicyResult<()> {
+    fs::write(output, bootstrap_snapshot(root)?)
+        .map_err(|cause| error("write Bootstrap snapshot", cause))
+}
+
+/// Returns whether a checkout is the exact short-lived pre-P04f policy state.
 pub fn is_bootstrap_state(root: &SafeRoot) -> PolicyResult<bool> {
     validate_codeowners(root)?;
     Ok(

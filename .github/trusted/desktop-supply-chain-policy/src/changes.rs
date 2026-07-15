@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value as JsonValue, json};
 
+use crate::identity::canonical_caseless;
 use crate::ownership::is_codeowners_path_or_alias;
 use crate::policy::is_non_ascii_security_path;
 use crate::process::{CommandSpec, run};
@@ -16,6 +17,12 @@ use crate::{PolicyError, PolicyResult, error};
 pub const MAX_CHANGED_PATHS: usize = 20_000;
 /// Maximum serialized changed-path bytes.
 pub const MAX_CHANGED_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum direct base-to-head commits accepted for one pull request.
+pub const MAX_PULL_REQUEST_COMMITS: usize = 10_000;
+/// Maximum regular files accepted in one checkout's Git pack directory.
+pub const MAX_GIT_PACK_FILES: usize = 64;
+/// Maximum aggregate bytes accepted in one checkout's Git pack directory.
+pub const MAX_GIT_PACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// One direct base-to-head path status.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -87,6 +94,53 @@ fn require_clean_stderr(bytes: &[u8], label: &str) -> PolicyResult<()> {
     }
 }
 
+fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
+    let pack_root = checkout.join(".git").join("objects").join("pack");
+    if !pack_root.is_dir() {
+        return Err(PolicyError::new(format!(
+            "Git pack directory is unavailable: {}",
+            pack_root.display()
+        )));
+    }
+    let mut entries =
+        fs::read_dir(&pack_root).map_err(|cause| error("read Git pack directory", cause))?;
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
+    entries.try_for_each(|entry| -> PolicyResult<()> {
+        let entry = entry.map_err(|cause| error("read Git pack entry", cause))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|cause| error("inspect Git pack entry", cause))?;
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || !matches!(extension.as_str(), "pack" | "idx" | "rev")
+        {
+            return Err(PolicyError::new(format!(
+                "Git pack directory contains an unexpected entry: {}",
+                entry.path().display()
+            )));
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| PolicyError::new("Git pack file count overflow"))?;
+        bytes = bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| PolicyError::new("Git pack byte count overflow"))?;
+        if count > MAX_GIT_PACK_FILES || bytes > MAX_GIT_PACK_BYTES {
+            return Err(PolicyError::new(format!(
+                "Git pack storage exceeds fixed bounds: files={count} bytes={bytes}"
+            )));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// Verifies one checkout's exact HEAD and absence of credential-like local config.
 pub fn verify_checkout(
     git: &Path,
@@ -95,6 +149,7 @@ pub fn verify_checkout(
     expected_oid: &str,
 ) -> PolicyResult<()> {
     validate_oid(expected_oid, "expected checkout OID")?;
+    verify_pack_storage(checkout)?;
     let head = run(&git_spec(
         git,
         checkout,
@@ -202,6 +257,73 @@ pub fn verify_up_to_date(
     }
 }
 
+/// Requires a non-empty direct pull-request commit range within the fixed checkout cap.
+pub fn validate_pull_request_commit_count(count: usize) -> PolicyResult<()> {
+    if (1..=MAX_PULL_REQUEST_COMMITS).contains(&count) {
+        Ok(())
+    } else {
+        Err(PolicyError::new(format!(
+            "pull request commit count must be between 1 and {MAX_PULL_REQUEST_COMMITS}, found {count}"
+        )))
+    }
+}
+
+fn verify_commit_count(
+    git: &Path,
+    trusted_repo: &Path,
+    candidate_repo: &Path,
+    isolated_home: &Path,
+    base: &str,
+    head: &str,
+) -> PolicyResult<()> {
+    let [git_dir_flag, git_dir] = repository_args(trusted_repo);
+    let output = run(&git_spec(
+        git,
+        trusted_repo,
+        isolated_home,
+        [
+            git_dir_flag,
+            git_dir,
+            OsString::from("rev-list"),
+            OsString::from("--count"),
+            OsString::from(format!("--max-count={}", MAX_PULL_REQUEST_COMMITS + 1)),
+            OsString::from(head),
+            OsString::from(format!("^{base}")),
+            OsString::from("--"),
+        ],
+    )?
+    .env(
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        alternate_objects(candidate_repo)?,
+    )
+    .output_limits(64 * 1024, 64 * 1024))?;
+    if !output.status.success() {
+        return Err(PolicyError::new(format!(
+            "git rev-list failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    require_clean_stderr(&output.stderr, "git rev-list")?;
+    let count = std::str::from_utf8(&output.stdout)
+        .map_err(|cause| error("decode pull request commit count", cause))?
+        .trim();
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(PolicyError::new(format!(
+            "git rev-list returned an invalid commit count: {count:?}"
+        )));
+    }
+    let parsed = count
+        .parse::<usize>()
+        .map_err(|cause| error("parse pull request commit count", cause))?;
+    if count != parsed.to_string() {
+        return Err(PolicyError::new(format!(
+            "git rev-list returned a non-canonical commit count: {count:?}"
+        )));
+    }
+    validate_pull_request_commit_count(parsed)
+}
+
 fn parse_name_status(bytes: &[u8]) -> PolicyResult<Vec<ChangedPath>> {
     let mut fields = bytes.split(|byte| *byte == 0);
     let mut paths = Vec::new();
@@ -278,6 +400,7 @@ pub fn compute_manifest(
     verify_checkout(git, trusted_repo, isolated_home, base)?;
     verify_checkout(git, candidate_repo, isolated_home, head)?;
     verify_up_to_date(git, trusted_repo, candidate_repo, isolated_home, base, head)?;
+    verify_commit_count(git, trusted_repo, candidate_repo, isolated_home, base, head)?;
     let [git_dir_flag, git_dir] = repository_args(trusted_repo);
     let spec = git_spec(
         git,
@@ -447,7 +570,8 @@ pub fn is_policy_relevant(path: &str) -> bool {
     if is_codeowners_path_or_alias(path) || is_non_ascii_security_path(path) {
         return true;
     }
-    let normalized = path.to_ascii_lowercase();
+    let components = path.split('/').map(canonical_caseless).collect::<Vec<_>>();
+    let normalized = components.join("/");
     if normalized.starts_with(".github/workflows/")
         || normalized.starts_with(".github/trusted/desktop-supply-chain-policy/")
         || normalized.starts_with(".github/fixtures/cargo-audit/")
@@ -459,7 +583,13 @@ pub fn is_policy_relevant(path: &str) -> bool {
     {
         return true;
     }
-    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if components
+        .iter()
+        .any(|component| component == "rust-toolchain")
+    {
+        return true;
+    }
+    let file_name = components.last().map(String::as_str).unwrap_or_default();
     if matches!(
         file_name,
         "cargo.toml"
