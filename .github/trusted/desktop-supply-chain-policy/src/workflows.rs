@@ -39,6 +39,8 @@ const CANONICAL_MACOS: &[u8] =
 const MAX_WORKFLOW_BYTES: u64 = 512 * 1024;
 const MAX_WORKFLOW_TREE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIONLINT_BYTES: u64 = 64 * 1024 * 1024;
+const AUTHORITATIVE_CONCURRENCY_GROUP: &str =
+    "trusted-desktop-policy-${{ github.event.pull_request.number }}";
 /// Trusted actionlint 1.7.7 Linux binary SHA-256.
 pub const ACTIONLINT_SHA256: &str =
     "9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c";
@@ -120,15 +122,13 @@ fn require_ascii_identity(value: &str, label: &str) -> PolicyResult<String> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn parse_identity(path: &str, text: &str) -> PolicyResult<WorkflowIdentity> {
-    let workflow: YamlValue = serde_yaml_ng::from_str(text)
-        .map_err(|cause| error(&format!("parse workflow {path}"), cause))?;
-    let workflow_name = string(get(&workflow, "name"))
+fn parse_identity(path: &str, workflow: &YamlValue) -> PolicyResult<WorkflowIdentity> {
+    let workflow_name = string(get(workflow, "name"))
         .ok_or_else(|| PolicyError::new(format!("workflow has no string name: {path}")))?
         .to_owned();
     require_ascii_identity(&workflow_name, "workflow name")?;
     let jobs = mapping(
-        get(&workflow, "jobs")
+        get(workflow, "jobs")
             .ok_or_else(|| PolicyError::new(format!("workflow has no jobs mapping: {path}")))?,
     )
     .ok_or_else(|| PolicyError::new(format!("workflow jobs are not a mapping: {path}")))?;
@@ -152,6 +152,50 @@ fn parse_identity(path: &str, text: &str) -> PolicyResult<WorkflowIdentity> {
         workflow_name,
         jobs: parsed_jobs,
     })
+}
+
+fn uses_cancel_in_progress(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::Mapping(values) => {
+            values
+                .get(yaml_key("concurrency"))
+                .is_some_and(|concurrency| get(concurrency, "cancel-in-progress").is_some())
+                || values.values().any(uses_cancel_in_progress)
+        }
+        YamlValue::Sequence(values) => values.iter().any(uses_cancel_in_progress),
+        _ => false,
+    }
+}
+
+fn validate_ruleset_workflow_eligibility(workflow: &YamlValue) -> PolicyResult<()> {
+    if get(
+        get(workflow, "on").unwrap_or(&YamlValue::Null),
+        "pull_request_target",
+    )
+    .is_none()
+    {
+        return Err(PolicyError::new(
+            "authoritative ruleset workflow must use pull_request_target",
+        ));
+    }
+    if uses_cancel_in_progress(workflow) {
+        return Err(PolicyError::new(
+            "authoritative ruleset workflow must not use the cancel-in-progress concurrency setting",
+        ));
+    }
+    let concurrency = mapping(
+        get(workflow, "concurrency")
+            .ok_or_else(|| PolicyError::new("authoritative workflow concurrency is missing"))?,
+    )
+    .ok_or_else(|| PolicyError::new("authoritative workflow concurrency is not a mapping"))?;
+    if concurrency.len() != 1
+        || string(concurrency.get(yaml_key("group"))) != Some(AUTHORITATIVE_CONCURRENCY_GROUP)
+    {
+        return Err(PolicyError::new(
+            "authoritative workflow concurrency must retain the exact per-PR queue group",
+        ));
+    }
+    Ok(())
 }
 
 fn expected_workflow_files(root: &SafeRoot) -> PolicyResult<Vec<String>> {
@@ -197,7 +241,12 @@ pub fn validate_inventory(root: &SafeRoot) -> PolicyResult<Vec<WorkflowIdentity>
     let mut workflow_names = BTreeMap::new();
     for path in paths {
         let text = root.read_text(&path, MAX_WORKFLOW_BYTES)?;
-        let identity = parse_identity(&path, &text)?;
+        let workflow: YamlValue = serde_yaml_ng::from_str(&text)
+            .map_err(|cause| error(&format!("parse workflow {path}"), cause))?;
+        if path == AUTHORITATIVE_PATH {
+            validate_ruleset_workflow_eligibility(&workflow)?;
+        }
+        let identity = parse_identity(&path, &workflow)?;
         let normalized = require_ascii_identity(&identity.workflow_name, "workflow name")?;
         if let Some(previous) = workflow_names.insert(normalized, path.clone()) {
             return Err(PolicyError::new(format!(

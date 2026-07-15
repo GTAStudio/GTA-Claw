@@ -1,6 +1,7 @@
 //! Static final-state policy and extensible root workspace validation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path};
 
 use sha2::{Digest as _, Sha256};
@@ -48,16 +49,20 @@ const ROOT_RUSTFMT: &[u8] = b"edition = \"2024\"\nmax_width = 100\nnewline_style
 const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\nCargo.lock text eol=lf\n";
 
 const BOOTSTRAP_FINGERPRINT: &str =
-    "ce36154c5fdafa53b073f24e8f78b03662fc7e1a62f897e2c3728ae61ff3a8c9";
+    "7af7e591c937416724b035adf5a7d7d1d518d2c6b2a6e9b53120b3bb30a0521b";
 
-const BOOTSTRAP_FILES: [&str; 26] = [
+const BOOTSTRAP_SNAPSHOT_MAGIC: &[u8; 8] = b"GTABOOT1";
+
+const BOOTSTRAP_FILES: [&str; 28] = [
     ".cargo/audit.toml",
     ".gitattributes",
     ".github/CODEOWNERS",
+    ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/docker-publish.yml",
     ".github/workflows/linux-packaging.yml",
     ".github/workflows/macos-packaging.yml",
     ".github/workflows/rust.yml",
+    ".github/workflows/trusted-desktop-supply-chain-policy.yml",
     ".github/workflows/upstream-gateway-reference.yml",
     ".github/workflows/windows-packaging.yml",
     "Cargo.lock",
@@ -1120,7 +1125,7 @@ fn bootstrap_manifest_inventory(root: &SafeRoot) -> PolicyResult<bool> {
         && !root.exists(LEGACY_FIXTURES)?)
 }
 
-/// Computes the exact pre-P04f product-policy fingerprint.
+/// Computes the exact pre-P04f product and trust-root workflow fingerprint.
 pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
     let mut digest = Sha256::new();
     for path in BOOTSTRAP_FILES {
@@ -1137,7 +1142,34 @@ pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
         .collect())
 }
 
-/// Returns whether a checkout is the exact short-lived pre-P04f product state.
+/// Serializes the exact pre-P04f policy inputs into the canonical Bootstrap snapshot format.
+pub fn bootstrap_snapshot(root: &SafeRoot) -> PolicyResult<Vec<u8>> {
+    let file_count = u32::try_from(BOOTSTRAP_FILES.len())
+        .map_err(|_| PolicyError::new("Bootstrap snapshot file count exceeds u32"))?;
+    let mut snapshot = Vec::new();
+    snapshot.extend_from_slice(BOOTSTRAP_SNAPSHOT_MAGIC);
+    snapshot.extend_from_slice(&file_count.to_le_bytes());
+    for path in BOOTSTRAP_FILES {
+        let path_length = u32::try_from(path.len())
+            .map_err(|_| PolicyError::new("Bootstrap snapshot path length exceeds u32"))?;
+        let bytes = normalize_text(&root.read_bytes(path, MAX_LOCK_BYTES)?);
+        let data_length = u64::try_from(bytes.len())
+            .map_err(|_| PolicyError::new("Bootstrap snapshot file length exceeds u64"))?;
+        snapshot.extend_from_slice(&path_length.to_le_bytes());
+        snapshot.extend_from_slice(&data_length.to_le_bytes());
+        snapshot.extend_from_slice(path.as_bytes());
+        snapshot.extend_from_slice(&bytes);
+    }
+    Ok(snapshot)
+}
+
+/// Writes a canonical Bootstrap snapshot generated from trusted policy inputs.
+pub fn write_bootstrap_snapshot(root: &SafeRoot, output: &Path) -> PolicyResult<()> {
+    fs::write(output, bootstrap_snapshot(root)?)
+        .map_err(|cause| error("write Bootstrap snapshot", cause))
+}
+
+/// Returns whether a checkout is the exact short-lived pre-P04f policy state.
 pub fn is_bootstrap_state(root: &SafeRoot) -> PolicyResult<bool> {
     validate_codeowners(root)?;
     Ok(

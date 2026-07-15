@@ -41,10 +41,11 @@ paths with trusted Git.
 
 The validator recognizes two base states:
 
-- **Bootstrap:** product-policy files exactly match the fingerprint rooted at
-  `8137bccb6e47097f41f016afe5c4b7b2e3d63002`. An unrelated change may pass while that
-  exact product-policy fingerprint is retained. Any policy-relevant change must
-  establish complete final P04f state in one pull request.
+- **Bootstrap:** product-policy files rooted at
+  `8137bccb6e47097f41f016afe5c4b7b2e3d63002` and both protected trust-root workflows
+  exactly match the Bootstrap fingerprint. An unrelated change may pass while those
+  exact bytes are retained. Any policy-relevant change must establish complete final
+  P04f state in one pull request.
 - **Final:** the base satisfies complete final P04f policy. Every candidate must retain
   final policy, including candidates whose changed files are otherwise unrelated.
 
@@ -83,6 +84,16 @@ and still pass the authoritative job. A future update requires:
 5. Subsequent product-policy pull requests based on the new protected main.
 
 No hash stored in a candidate checkout authorizes an update.
+
+The required-workflow eligibility follow-up based on
+`a3288d7d5eabea9fc2464a4c54b75727cd5ee99b` intentionally changes the authoritative
+workflow and this frozen validator tree. The base-owned
+`[AUTHORITATIVE] Trusted desktop supply-chain policy` check is therefore expected to
+reject that pull request as a protected-file mutation. It must not be weakened to pass.
+Only the already-audited pull-request-mode ruleset bypass may unblock that hosted check,
+after the candidate-owned `[NON-AUTHORITATIVE] Candidate desktop policy validator CI`
+and the independent reviews are green. Required-workflow authority is not established
+until an administrator separately binds the eligible workflow after this update merges.
 
 ### Sole-maintainer ownership limitation
 
@@ -127,6 +138,14 @@ cargo +1.94.0 fmt --manifest-path .github/trusted/desktop-supply-chain-policy/Ca
 cargo +1.94.0 check --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --all-targets
 cargo +1.94.0 clippy --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --all-targets -- -D warnings
 cargo +1.94.0 test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --all-targets
+```
+
+During an audited Bootstrap trust-root update, regenerate the binary snapshot only
+through the validator and then copy its printed fingerprint into the reviewed constant:
+
+```text
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- write-bootstrap-snapshot --root "$PWD" --output "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$PWD"
 ```
 
 Hosted bootstrap CI additionally supplies checksum-pinned actionlint and Git binaries,

@@ -21,7 +21,7 @@ use desktop_supply_chain_policy::ownership::{
     validate_codeowners_text,
 };
 use desktop_supply_chain_policy::policy::{
-    bootstrap_fingerprint, expected_bootstrap_fingerprint, is_bootstrap_state,
+    bootstrap_fingerprint, bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
     validate_casefold_paths, validate_final_static,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
@@ -142,7 +142,7 @@ fn bootstrap_tree(label: &str) -> TempTree {
     assert!(snapshot.starts_with(b"GTABOOT1"));
     let mut offset = 8;
     let count = read_u32(&snapshot, &mut offset);
-    assert_eq!(count, 26);
+    assert_eq!(count, 28);
     for _ in 0..count {
         let path_length = read_u32(&snapshot, &mut offset) as usize;
         let data_length =
@@ -165,13 +165,6 @@ fn bootstrap_tree(label: &str) -> TempTree {
         &tree.join(".github/trusted/desktop-supply-chain-policy"),
     )
     .expect("copy protected trust root into bootstrap fixture");
-    for workflow in [AUTHORITATIVE_PATH, BOOTSTRAP_PATH] {
-        let destination = tree.join(workflow);
-        fs::create_dir_all(destination.parent().expect("workflow parent"))
-            .expect("create workflow parent");
-        fs::copy(repo_root().join(workflow), destination)
-            .expect("copy protected workflow into bootstrap fixture");
-    }
     tree
 }
 
@@ -325,6 +318,17 @@ fn immutable_bootstrap_snapshot_matches_the_transition_fingerprint() {
 }
 
 #[test]
+fn immutable_bootstrap_snapshot_is_canonical_validator_output() {
+    let root = SafeRoot::new(repo_root()).expect("open live repository");
+    let expected = bootstrap_snapshot(&root).expect("generate canonical Bootstrap snapshot");
+    let actual = fs::read(
+        repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
+    )
+    .expect("read committed Bootstrap snapshot");
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn authoritative_workflow_has_no_path_filter() {
     let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
         .expect("read authoritative workflow");
@@ -341,6 +345,60 @@ fn authoritative_workflow_has_no_path_filter() {
         workflow.contains("BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}")
     );
     assert!(!workflow.contains("${{ github.event.pull_request.head.repo.full_name }}\""));
+}
+
+#[test]
+fn authoritative_ruleset_workflow_queues_instead_of_cancelling() {
+    let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
+        .expect("read authoritative workflow");
+    let yaml: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&workflow).expect("parse authoritative workflow");
+    let concurrency = yaml
+        .get("concurrency")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+        .expect("authoritative concurrency mapping");
+    assert_eq!(concurrency.len(), 1);
+    assert_eq!(
+        concurrency
+            .get(serde_yaml_ng::Value::String("group".to_owned()))
+            .and_then(serde_yaml_ng::Value::as_str),
+        Some("trusted-desktop-policy-${{ github.event.pull_request.number }}")
+    );
+    assert!(
+        !workflow.contains("cancel-in-progress"),
+        "GitHub ruleset workflows must queue rather than cancel in-progress runs"
+    );
+
+    for value in ["true", "false", "\"${{ true }}\""] {
+        let tree = copy_repo(&format!(
+            "authoritative-cancellation-{}",
+            value.replace(['$', '{', '}', '"'], "")
+        ));
+        replace(
+            &tree.join(AUTHORITATIVE_PATH),
+            "  group: trusted-desktop-policy-${{ github.event.pull_request.number }}\n",
+            &format!(
+                "  group: trusted-desktop-policy-${{{{ github.event.pull_request.number }}}}\n  cancel-in-progress: {value}\n"
+            ),
+        );
+        assert!(
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open cancellation mutation"))
+                .is_err(),
+            "cancel-in-progress setting unexpectedly passed with value {value}"
+        );
+    }
+
+    let job_scoped = copy_repo("authoritative-job-cancellation");
+    replace(
+        &job_scoped.join(AUTHORITATIVE_PATH),
+        "    runs-on: ubuntu-24.04\n",
+        "    runs-on: ubuntu-24.04\n    concurrency:\n      group: authoritative-job\n      cancel-in-progress: true\n",
+    );
+    assert!(
+        validate_inventory(&SafeRoot::new(&job_scoped.path).expect("open job cancellation"))
+            .is_err(),
+        "job-scoped cancel-in-progress setting unexpectedly passed"
+    );
 }
 
 #[test]
