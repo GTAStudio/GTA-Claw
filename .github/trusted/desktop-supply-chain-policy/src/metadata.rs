@@ -170,7 +170,7 @@ fn run_metadata(
     let isolation = prepare_isolation(isolation_root, label)?;
     let (cargo, rustc) = verify_tools(tools, &isolation.cwd)?;
     let manifest = candidate.regular_file(manifest, 4 * 1024 * 1024)?;
-    let mut spec = CommandSpec::new(cargo, &isolation.cwd)?
+    let spec = CommandSpec::new(cargo, &isolation.cwd)?
         .args([
             "metadata",
             "--locked",
@@ -194,9 +194,7 @@ fn run_metadata(
         .timeout(Duration::from_secs(30))
         .output_limits(MAX_METADATA_BYTES, 512 * 1024);
     #[cfg(windows)]
-    {
-        spec = spec.env("USERPROFILE", &isolation.home);
-    }
+    let spec = spec.env("USERPROFILE", &isolation.home);
     let output = run_checked(&spec, "trusted Cargo metadata")?;
     if !output.stderr.is_empty() {
         return Err(PolicyError::new(format!(
