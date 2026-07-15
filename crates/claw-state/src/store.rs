@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 
-use crate::error::database;
+use crate::error::{database, database_code};
 use crate::{
     AuthenticationRepository, DeviceRepository, SessionRepository, StateError, TaskRepository,
 };
@@ -30,12 +30,24 @@ const UNIX_BACKUP_SEAL_XATTR: &str = "user.gta-claw.backup-seal-id";
 const UNIX_SIDECAR_GENERATION_XATTR: &str = "user.gta-claw.sidecar-generation";
 const BACKUP_SEAL_MAGIC: &str = "gta-claw-backup-seal-v1";
 const MAX_CONFIGURED_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn file_control_database(
+    operation: &'static str,
+    error: claw_sqlite_file_control::FileControlError,
+) -> StateError {
+    error.code().map_or_else(
+        || database(operation, sqlx::Error::Protocol(error.to_string())),
+        |code| database_code(operation, code, error.to_string()),
+    )
+}
 #[cfg(test)]
 static FAIL_AFTER_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static CREATE_DESTINATION_BEFORE_PUBLICATION: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static CREATE_BACKUP_TEMP_BEFORE_VACUUM: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static FAIL_BACKUP_HANDLER_RESET: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(all(test, windows))]
 static FAIL_WINDOWS_SOURCE_REMOVAL: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
@@ -331,21 +343,52 @@ struct OpenDeadlineState {
     deadline: std::time::Instant,
     timeout_ms: u64,
     operation: &'static str,
+    expired: Arc<std::sync::atomic::AtomicBool>,
     cancelled: std::sync::atomic::AtomicBool,
     finished: std::sync::atomic::AtomicBool,
 }
 
 impl OpenDeadlineState {
     fn permits_sqlite_work(&self) -> bool {
+        if std::time::Instant::now() >= self.deadline {
+            self.expired
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         self.finished.load(std::sync::atomic::Ordering::Acquire)
             || (!self.cancelled.load(std::sync::atomic::Ordering::Acquire)
-                && std::time::Instant::now() < self.deadline)
+                && !self.expired.load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn timeout_error(&self) -> StateError {
         StateError::OperationTimedOut {
             operation: self.operation,
             timeout_ms: self.timeout_ms,
+        }
+    }
+
+    fn deadline_or_error(
+        deadline_state: Option<&OpenDeadlineState>,
+        error: StateError,
+    ) -> StateError {
+        let Some(deadline_state) = deadline_state else {
+            return error;
+        };
+        if std::time::Instant::now() >= deadline_state.deadline {
+            deadline_state
+                .expired
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if deadline_state
+            .expired
+            .load(std::sync::atomic::Ordering::Acquire)
+            || deadline_state
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            deadline_state.timeout_error()
+        } else {
+            error
         }
     }
 }
@@ -359,7 +402,7 @@ async fn install_open_deadline_handler(
             .lock_handle()
             .await
             .map_err(|error| database("lock deadline-bound SQLite connection", error))?;
-        handle.set_progress_handler(1_000, move || deadline_state.permits_sqlite_work());
+        handle.set_progress_handler(100, move || deadline_state.permits_sqlite_work());
     }
     Ok(())
 }
@@ -396,6 +439,7 @@ impl StateStore {
             deadline: deadline.into_std(),
             timeout_ms,
             operation: "state store open",
+            expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             finished: std::sync::atomic::AtomicBool::new(false),
         });
@@ -597,19 +641,19 @@ impl StateStore {
         async fn initialize_connection_sidecars(
             connection: &mut SqliteConnection,
         ) -> Result<(), sqlx::Error> {
-            let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
-                .fetch_one(&mut *connection)
-                .await?;
-            if !matches!(application_id, 0 | APPLICATION_ID) {
-                return Err(sqlx::Error::Protocol(
-                    "database application identity changed before sidecar initialization"
-                        .to_owned(),
-                ));
-            }
             sqlx::query("BEGIN IMMEDIATE")
                 .execute(&mut *connection)
                 .await?;
             let result = async {
+                let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if !matches!(application_id, 0 | APPLICATION_ID) {
+                    return Err(sqlx::Error::Protocol(
+                        "database application identity changed before sidecar initialization"
+                            .to_owned(),
+                    ));
+                }
                 sqlx::query("PRAGMA application_id = 1")
                     .execute(&mut *connection)
                     .await?;
@@ -622,6 +666,16 @@ impl StateStore {
                         .execute(&mut *connection)
                         .await?;
                 }
+                let restored = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if restored != application_id {
+                    return Err(sqlx::Error::Protocol(
+                        "database application identity changed during sidecar initialization"
+                            .to_owned(),
+                    ));
+                }
+                verify_sqlite_connection_identity(connection).await?;
                 sqlx::query("COMMIT").execute(&mut *connection).await?;
                 Ok::<(), sqlx::Error>(())
             }
@@ -777,6 +831,7 @@ impl StateStore {
             deadline: deadline.into_std(),
             timeout_ms,
             operation: "SQLite restore",
+            expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancelled: std::sync::atomic::AtomicBool::new(false),
             finished: std::sync::atomic::AtomicBool::new(false),
         });
@@ -820,33 +875,35 @@ impl StateStore {
         .await
         .is_err()
         {
-            return Err(pinned
-                .cleanup()
-                .err()
-                .unwrap_or_else(|| deadline_state.timeout_error()));
+            return Err(cleanup_pinned_or_error(
+                "SQLite restore",
+                pinned,
+                deadline_state.timeout_error(),
+            ));
         }
         if let Err(error) =
             validate_snapshot_marker_pinned(&pinned, Some(Arc::clone(&deadline_state))).await
         {
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(cleanup_pinned_or_error("SQLite restore", pinned, error));
         }
         if let Err(error) = clear_backup_writer_lock(&pinned).await {
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(cleanup_pinned_or_error("SQLite restore", pinned, error));
         }
         if let Err(error) =
             validate_backup_pinned(&pinned, None, Some(Arc::clone(&deadline_state))).await
         {
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(cleanup_pinned_or_error("SQLite restore", pinned, error));
         }
         if let Err(error) = initialize_restored_store_identity(&temporary, &pinned.file) {
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(cleanup_pinned_or_error("SQLite restore", pinned, error));
         }
         if let Err(error) = pinned.sync() {
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(cleanup_pinned_or_error("SQLite restore", pinned, error));
         }
         if let Err(error) = publish_snapshot(
             pinned,
             &destination,
+            "SQLite restore",
             Some((deadline, timeout_ms)),
             &destination_directory,
         ) {
@@ -1841,10 +1898,8 @@ fn snapshot_temporary_path(destination: &Path, purpose: &str) -> Result<PathBuf,
             reason: "snapshot destination must include a file name",
         })?
         .to_string_lossy();
-    Ok(
-        default_private_lock_root()?
-            .join(format!(".{file_name}.{}.{purpose}-tmp", writer_owner()?)),
-    )
+    Ok(private_lock_root_for(destination)?
+        .join(format!(".{file_name}.{}.{purpose}-tmp", writer_owner()?)))
 }
 
 #[cfg(not(unix))]
@@ -2475,20 +2530,45 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     {
         Ok(file) => file,
         Err(error) => {
-            verify_path_identity(&wal_path, &wal_file)?;
-            drop(wal_file);
-            std::fs::remove_file(&wal_path).map_err(|cleanup| {
-                file_error(
-                    "release failed destination WAL reservation",
-                    &wal_path,
-                    cleanup,
-                )
-            })?;
-            return if path_entry_exists(&shm_path)? {
-                Err(StateError::BackupDestinationExists { path: shm_path })
-            } else {
-                Err(file_error("reserve destination SHM", &shm_path, error))
+            let mut primary = file_error("reserve destination SHM", &shm_path, error);
+            match path_entry_exists(&shm_path) {
+                Ok(true) => {
+                    primary = StateError::BackupDestinationExists {
+                        path: shm_path.clone(),
+                    };
+                }
+                Ok(false) => {}
+                Err(inspection) => {
+                    primary = append_operation_cleanup(
+                        "SQLite snapshot reservation",
+                        primary,
+                        format!("failed destination SHM inspection: {inspection}"),
+                    );
+                }
+            }
+            let wal_owned = match verify_path_identity(&wal_path, &wal_file) {
+                Ok(()) => true,
+                Err(cleanup) => {
+                    primary = append_operation_cleanup(
+                        "SQLite snapshot reservation",
+                        primary,
+                        format!("WAL identity cleanup check failed; removal skipped: {cleanup}"),
+                    );
+                    false
+                }
             };
+            drop(wal_file);
+            if wal_owned && let Err(cleanup) = std::fs::remove_file(&wal_path) {
+                primary = append_operation_cleanup(
+                    "SQLite snapshot reservation",
+                    primary,
+                    format!(
+                        "WAL reservation cleanup failed: {}",
+                        file_error("release destination WAL reservation", &wal_path, cleanup)
+                    ),
+                );
+            }
+            return Err(primary);
         }
     };
     let journal_file = match OpenOptions::new()
@@ -2499,27 +2579,57 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
     {
         Ok(file) => file,
         Err(error) => {
-            verify_path_identity(&wal_path, &wal_file)?;
-            verify_path_identity(&shm_path, &shm_file)?;
-            drop((wal_file, shm_file));
-            for reservation in [&wal_path, &shm_path] {
-                std::fs::remove_file(reservation).map_err(|cleanup| {
-                    file_error(
-                        "release failed destination sidecar reservation",
-                        reservation,
-                        cleanup,
-                    )
-                })?;
+            let mut primary = file_error("reserve destination journal", &journal_path, error);
+            match path_entry_exists(&journal_path) {
+                Ok(true) => {
+                    primary = StateError::BackupDestinationExists {
+                        path: journal_path.clone(),
+                    };
+                }
+                Ok(false) => {}
+                Err(inspection) => {
+                    primary = append_operation_cleanup(
+                        "SQLite snapshot reservation",
+                        primary,
+                        format!("failed destination journal inspection: {inspection}"),
+                    );
+                }
             }
-            return if path_entry_exists(&journal_path)? {
-                Err(StateError::BackupDestinationExists { path: journal_path })
-            } else {
-                Err(file_error(
-                    "reserve destination journal",
-                    &journal_path,
-                    error,
-                ))
-            };
+            let mut owned = [true, true];
+            for (index, (path, file, label)) in
+                [(&wal_path, &wal_file, "WAL"), (&shm_path, &shm_file, "SHM")]
+                    .into_iter()
+                    .enumerate()
+            {
+                if let Err(cleanup) = verify_path_identity(path, file) {
+                    owned[index] = false;
+                    primary = append_operation_cleanup(
+                        "SQLite snapshot reservation",
+                        primary,
+                        format!(
+                            "{label} identity cleanup check failed; removal skipped: {cleanup}"
+                        ),
+                    );
+                }
+            }
+            drop((wal_file, shm_file));
+            for (reservation, owned) in [(&wal_path, owned[0]), (&shm_path, owned[1])] {
+                if owned && let Err(cleanup) = std::fs::remove_file(reservation) {
+                    primary = append_operation_cleanup(
+                        "SQLite snapshot reservation",
+                        primary,
+                        format!(
+                            "sidecar reservation cleanup failed: {}",
+                            file_error(
+                                "release destination sidecar reservation",
+                                reservation,
+                                cleanup
+                            )
+                        ),
+                    );
+                }
+            }
+            return Err(primary);
         }
     };
     Ok(SidecarReservations {
@@ -2535,16 +2645,25 @@ fn reserve_destination_sidecars(database: &Path) -> Result<SidecarReservations, 
 fn publish_snapshot(
     source: PinnedSnapshot,
     destination: &Path,
+    operation: &'static str,
     publication_deadline: Option<(tokio::time::Instant, u64)>,
     destination_directory: &PinnedPrivateDirectory,
 ) -> Result<(), StateError> {
     if let Err(error) = source.verify() {
-        return Err(source.cleanup().err().unwrap_or(error));
+        return Err(cleanup_pinned_or_error(
+            "SQLite snapshot publication",
+            source,
+            error,
+        ));
     }
     if let Err(error) =
         verify_directory_path_identity(&destination_directory.path, &destination_directory.file)
     {
-        return Err(source.cleanup().err().unwrap_or(error));
+        return Err(cleanup_pinned_or_error(
+            "SQLite snapshot publication",
+            source,
+            error,
+        ));
     }
     let source_path = source.path.clone();
     let reservations = reserve_destination_sidecars(destination)?;
@@ -2557,10 +2676,17 @@ fn publish_snapshot(
         && tokio::time::Instant::now() >= deadline
     {
         drop(source);
-        reservations.release()?;
-        return Err(StateError::OperationTimedOut {
-            operation: "SQLite backup",
+        let primary = StateError::OperationTimedOut {
+            operation,
             timeout_ms,
+        };
+        return Err(match reservations.release() {
+            Ok(()) => primary,
+            Err(cleanup) => append_operation_cleanup(
+                operation,
+                primary,
+                format!("reservation cleanup failed: {cleanup}"),
+            ),
         });
     }
     #[cfg(any(
@@ -3222,7 +3348,7 @@ fn acquire_creation_lock(path: &Path) -> Result<Option<File>, StateError> {
         parent_metadata.ino()
     );
     let lock_path =
-        default_private_lock_root()?.join(format!("create-{}.lock", migration_checksum(&contents)));
+        private_lock_root_for(path)?.join(format!("create-{}.lock", migration_checksum(&contents)));
     let mut lock_file = open_private_lock_file(&lock_path, PrivateLockOpen::Create)?;
     match lock_file.try_lock() {
         Ok(()) => {}
@@ -3253,7 +3379,7 @@ fn acquire_creation_lock(_path: &Path) -> Result<Option<File>, StateError> {
     Ok(None)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 fn default_private_lock_root() -> Result<PathBuf, StateError> {
     use std::os::unix::fs::DirBuilderExt as _;
     use uzers::os::unix::UserExt as _;
@@ -3288,6 +3414,37 @@ fn default_private_lock_root() -> Result<PathBuf, StateError> {
         validate_private_lock_directory(directory)?;
     }
     Ok(locks)
+}
+
+#[cfg(all(unix, not(test)))]
+fn private_lock_root_for(_path: &Path) -> Result<PathBuf, StateError> {
+    default_private_lock_root()
+}
+
+#[cfg(all(unix, test))]
+fn private_lock_root_for(path: &Path) -> Result<PathBuf, StateError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    if let Some(root) = path.ancestors().skip(1).find(|ancestor| {
+        ancestor.file_name().and_then(|name| name.to_str()) == Some(".gta-claw-test-locks")
+    }) {
+        validate_private_lock_directory(root)?;
+        return Ok(root.to_owned());
+    }
+    let parent = path.parent().ok_or_else(|| StateError::InvalidPath {
+        path: path.to_owned(),
+        reason: "test state path must have a private parent",
+    })?;
+    let root = parent.join(".gta-claw-test-locks");
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(file_error("create isolated test lock root", &root, error));
+        }
+    }
+    validate_private_lock_directory(&root)?;
+    Ok(root)
 }
 
 #[cfg(unix)]
@@ -3682,7 +3839,7 @@ fn acquire_unix_identity_lock(
     }
 
     let token = writer_owner()?;
-    let lock_path = default_private_lock_root()?.join(format!(
+    let lock_path = private_lock_root_for(path)?.join(format!(
         "dev-{}-ino-{}-{token}.lock",
         identity.0, identity.1
     ));
@@ -3711,27 +3868,52 @@ fn acquire_unix_identity_lock(
         &lock_path,
         rustix::fs::RenameFlags::NOREPLACE,
     ) {
-        let primary = file_error(
+        let mut primary = file_error(
             "publish persistent writer-lock inode",
             &lock_path,
             error.into(),
         );
-        verify_path_identity(&lock_temporary, &lock_file)?;
-        File::unlock(&lock_file).map_err(|unlock| {
-            file_error(
-                "release failed temporary writer lock",
-                &lock_temporary,
-                unlock,
-            )
-        })?;
+        let temporary_owned = match verify_path_identity(&lock_temporary, &lock_file) {
+            Ok(()) => true,
+            Err(cleanup) => {
+                primary = append_operation_cleanup(
+                    "writer lock publication",
+                    primary,
+                    format!(
+                        "temporary lock identity cleanup check failed; removal skipped: {cleanup}"
+                    ),
+                );
+                false
+            }
+        };
+        if let Err(unlock) = File::unlock(&lock_file) {
+            primary = append_operation_cleanup(
+                "writer lock publication",
+                primary,
+                format!(
+                    "temporary lock unlock failed: {}",
+                    file_error("release temporary writer lock", &lock_temporary, unlock)
+                ),
+            );
+        }
         drop(lock_file);
-        std::fs::remove_file(&lock_temporary).map_err(|cleanup| {
-            file_error(
-                "remove failed temporary writer lock",
-                &lock_temporary,
-                cleanup,
-            )
-        })?;
+        if temporary_owned && let Err(cleanup) = std::fs::remove_file(&lock_temporary) {
+            primary = append_operation_cleanup(
+                "writer lock publication",
+                primary,
+                format!(
+                    "temporary lock removal failed: {}",
+                    file_error("remove temporary writer lock", &lock_temporary, cleanup)
+                ),
+            );
+        }
+        if let Err(cleanup) = sync_parent_directory(&lock_temporary) {
+            primary = append_operation_cleanup(
+                "writer lock publication",
+                primary,
+                format!("temporary lock parent sync failed: {cleanup}"),
+            );
+        }
         return Err(primary);
     }
     verify_path_identity(&lock_path, &lock_file)?;
@@ -3797,20 +3979,48 @@ fn acquire_unix_identity_lock(
             Ok((winner_path, winner_file))
         }
         Err(error) => {
-            let primary = file_error("persist database lock identity", path, error.into());
-            verify_path_identity(&lock_path, &lock_file)?;
-            File::unlock(&lock_file).map_err(|unlock| {
-                file_error("release failed unpublished writer lock", &lock_path, unlock)
-            })?;
+            let mut primary = file_error("persist database lock identity", path, error.into());
+            let lock_owned = match verify_path_identity(&lock_path, &lock_file) {
+                Ok(()) => true,
+                Err(cleanup) => {
+                    primary = append_operation_cleanup(
+                        "writer lock identity",
+                        primary,
+                        format!(
+                            "unpublished lock identity cleanup check failed; removal skipped: {cleanup}"
+                        ),
+                    );
+                    false
+                }
+            };
+            if let Err(unlock) = File::unlock(&lock_file) {
+                primary = append_operation_cleanup(
+                    "writer lock identity",
+                    primary,
+                    format!(
+                        "unpublished lock unlock failed: {}",
+                        file_error("release unpublished writer lock", &lock_path, unlock)
+                    ),
+                );
+            }
             drop(lock_file);
-            std::fs::remove_file(&lock_path).map_err(|cleanup| {
-                file_error(
-                    "remove failed unreferenced writer lock",
-                    &lock_path,
-                    cleanup,
-                )
-            })?;
-            sync_parent_directory(&lock_path)?;
+            if lock_owned && let Err(cleanup) = std::fs::remove_file(&lock_path) {
+                primary = append_operation_cleanup(
+                    "writer lock identity",
+                    primary,
+                    format!(
+                        "unreferenced lock removal failed: {}",
+                        file_error("remove unreferenced writer lock", &lock_path, cleanup)
+                    ),
+                );
+            }
+            if let Err(cleanup) = sync_parent_directory(&lock_path) {
+                primary = append_operation_cleanup(
+                    "writer lock identity",
+                    primary,
+                    format!("unreferenced lock parent sync failed: {cleanup}"),
+                );
+            }
             Err(primary)
         }
     }
@@ -3894,7 +4104,7 @@ fn parse_unix_lock_identity(
         reason: "database lock identity must have a private parent",
     })?;
     validate_private_lock_directory(parent)?;
-    if parent != default_private_lock_root()? {
+    if parent != private_lock_root_for(database_path)? {
         return Err(StateError::InvalidPath {
             path: lock_path,
             reason: "database lock identity is outside the canonical private lock root",
@@ -4428,7 +4638,12 @@ async fn inspect_database(
                 }
                 verify_path_identity(path, database_file)?;
                 return match (result, cleanup) {
-                    (Err(error), _) => Err(error),
+                    (Err(error), Err(cleanup)) => Err(append_operation_cleanup(
+                        "SQLite inspection",
+                        error,
+                        format!("temporary cleanup failed: {cleanup}"),
+                    )),
+                    (Err(error), Ok(())) => Err(error),
                     (Ok(_), Err(error)) => Err(error),
                     (Ok(inspected), Ok(())) => Ok(inspected),
                 };
@@ -4438,7 +4653,13 @@ async fn inspect_database(
                 cleanup_guard.disarm();
             }
             Err(error) => {
-                remove_snapshot_artifacts(&temporary)?;
+                if let Err(cleanup) = remove_snapshot_artifacts(&temporary) {
+                    return Err(append_operation_cleanup(
+                        "SQLite inspection",
+                        error,
+                        format!("temporary cleanup failed: {cleanup}"),
+                    ));
+                }
                 cleanup_guard.disarm();
                 return Err(error);
             }
@@ -4469,7 +4690,7 @@ async fn inspect_database_snapshot(
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| database("inspect state database read-only", error))?;
-    install_open_deadline_handler(&mut connection, deadline_state).await?;
+    install_open_deadline_handler(&mut connection, deadline_state.clone()).await?;
     let result = inspect_database_connection(&mut connection, require_latest).await;
     let close = connection
         .close()
@@ -4562,10 +4783,9 @@ async fn initialize_fresh_database(
         .await
         .map_err(|error| database("acquire state database bootstrap connection", error))?;
     let mut connection = BackupConnectionGuard::new(pooled);
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut **connection)
+    let transaction_token = claw_sqlite_file_control::begin_manual_transaction(&mut connection)
         .await
-        .map_err(|error| database("begin state database bootstrap", error))?;
+        .map_err(|error| file_control_database("begin state database bootstrap", error))?;
     #[cfg(test)]
     wait_at_migration_test_barrier(path).await;
     let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
@@ -4609,14 +4829,9 @@ async fn initialize_fresh_database(
     }
     let recovered_writer = claim_application_lock_connection(&mut connection, owner).await?;
     validate_migration_history_connection(&mut connection, true).await?;
-    claw_sqlite_file_control::commit_synchronously(&mut connection)
+    claw_sqlite_file_control::commit_synchronously(&mut connection, transaction_token)
         .await
-        .map_err(|error| {
-            database(
-                "commit state database bootstrap",
-                sqlx::Error::Protocol(error.to_string()),
-            )
-        })?;
+        .map_err(|error| file_control_database("commit state database bootstrap", error))?;
     connection.mark_reusable();
     Ok(recovered_writer)
 }
@@ -4633,10 +4848,21 @@ async fn claim_application_lock_connection(
     .fetch_optional(&mut *connection)
     .await
     .map_err(|error| database("read previous application writer", error))?
-    .map(|row| RecoveredWriterLock {
-        previous_owner: row.get("owner"),
-        previous_acquired_at_ms: row.get("acquired_at_ms"),
-    });
+    .map(|row| {
+        Ok(RecoveredWriterLock {
+            previous_owner: row.try_get("owner").map_err(|error| {
+                StateError::InvalidMigrationHistory {
+                    reason: format!("persisted application writer owner is invalid: {error}"),
+                }
+            })?,
+            previous_acquired_at_ms: row.try_get("acquired_at_ms").map_err(|error| {
+                StateError::InvalidMigrationHistory {
+                    reason: format!("persisted application writer timestamp is invalid: {error}"),
+                }
+            })?,
+        })
+    })
+    .transpose()?;
     sqlx::query(
         "DELETE FROM claw_writer_lock
          WHERE singleton = 1",
@@ -4987,10 +5213,9 @@ async fn apply_migrations(
         .await
         .map_err(|error| database("acquire transactional migration connection", error))?;
     let mut connection = BackupConnectionGuard::new(pooled);
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut **connection)
+    let transaction_token = claw_sqlite_file_control::begin_manual_transaction(&mut connection)
         .await
-        .map_err(|error| database("begin immediate schema migration", error))?;
+        .map_err(|error| file_control_database("begin immediate schema migration", error))?;
     #[cfg(test)]
     wait_at_migration_test_barrier(path).await;
     let migration_result = async {
@@ -5032,13 +5257,10 @@ async fn apply_migrations(
     }
     .await;
     let recovered_writer = migration_result?;
-    claw_sqlite_file_control::commit_synchronously(&mut connection)
+    claw_sqlite_file_control::commit_synchronously(&mut connection, transaction_token)
         .await
         .map_err(|error| {
-            database(
-                "commit schema migration and writer claim",
-                sqlx::Error::Protocol(error.to_string()),
-            )
+            file_control_database("commit schema migration and writer claim", error)
         })?;
     connection.mark_reusable();
     Ok(recovered_writer)
@@ -5177,6 +5399,12 @@ async fn materialize_sqlite_snapshot(
             reason: "snapshot source has an ambiguous WAL/SHM artifact set",
         });
     }
+    if expected_digest.is_some() && wal_existed {
+        return Err(StateError::InvalidBackup {
+            path: source.to_owned(),
+            reason: "sealed snapshot source must not have WAL or SHM sidecars".to_owned(),
+        });
+    }
     if !wal_existed {
         return materialize_pinned_main_snapshot(
             source,
@@ -5200,31 +5428,47 @@ async fn materialize_sqlite_snapshot(
             return Err(invalid_backup(source, "open snapshot source", error));
         }
     };
-    install_open_deadline_handler(&mut connection, deadline_state).await?;
+    install_open_deadline_handler(&mut connection, deadline_state.clone()).await?;
     if let Err(error) = verify_sqlite_connection_identity(&mut connection).await {
-        connection
+        let primary = invalid_backup(source, "verify opened snapshot identity", error);
+        let close = connection
             .close()
             .await
-            .map_err(|close| invalid_backup(source, "close changed snapshot source", close))?;
-        return Err(invalid_backup(
-            source,
-            "verify opened snapshot identity",
-            error,
-        ));
+            .map_err(|close| invalid_backup(source, "close changed snapshot source", close));
+        return Err(match close {
+            Ok(()) => primary,
+            Err(cleanup) => append_operation_cleanup(
+                "SQLite snapshot materialization",
+                primary,
+                format!("connection close failed: {cleanup}"),
+            ),
+        });
     }
     if let Err(error) = verify_path_identity(source, source_file) {
-        connection
+        let close = connection
             .close()
             .await
-            .map_err(|close| invalid_backup(source, "close changed snapshot source", close))?;
-        return Err(error);
+            .map_err(|close| invalid_backup(source, "close changed snapshot source", close));
+        return Err(match close {
+            Ok(()) => error,
+            Err(cleanup) => append_operation_cleanup(
+                "SQLite snapshot materialization",
+                error,
+                format!("connection close failed: {cleanup}"),
+            ),
+        });
     }
     let snapshot = sqlx::query("VACUUM main INTO ?")
         .bind(destination_text)
         .execute(&mut connection)
         .await
         .map(|_| ())
-        .map_err(|error| invalid_backup(source, "materialize source snapshot", error));
+        .map_err(|error| {
+            OpenDeadlineState::deadline_or_error(
+                deadline_state.as_deref(),
+                invalid_backup(source, "materialize source snapshot", error),
+            )
+        });
     let sqlite_identity = verify_sqlite_connection_identity(&mut connection)
         .await
         .map_err(|error| invalid_backup(source, "reverify snapshot identity", error));
@@ -5378,13 +5622,18 @@ async fn materialize_pinned_main_snapshot(
             ));
         }
     };
-    install_open_deadline_handler(&mut connection, deadline_state).await?;
+    install_open_deadline_handler(&mut connection, deadline_state.clone()).await?;
     let snapshot = sqlx::query("VACUUM main INTO ?")
         .bind(destination_text)
         .execute(&mut connection)
         .await
         .map(|_| ())
-        .map_err(|error| invalid_backup(source, "vacuum pinned snapshot copy", error));
+        .map_err(|error| {
+            OpenDeadlineState::deadline_or_error(
+                deadline_state.as_deref(),
+                invalid_backup(source, "vacuum pinned snapshot copy", error),
+            )
+        });
     let close = connection
         .close()
         .await
@@ -5393,17 +5642,33 @@ async fn materialize_pinned_main_snapshot(
     if cleanup.is_ok() {
         pinned_copy_guard.disarm();
     }
-    match (snapshot, close, cleanup) {
-        (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
-            Err(cleanup_failed_snapshot(destination, error))
+    let mut failure = None;
+    for (label, result) in [
+        ("VACUUM", snapshot),
+        ("connection close", close),
+        ("pinned-copy cleanup", cleanup),
+    ] {
+        if let Err(error) = result {
+            failure = Some(match failure {
+                Some(primary) => append_operation_cleanup(
+                    "SQLite pinned snapshot materialization",
+                    primary,
+                    format!("{label} failed: {error}"),
+                ),
+                None => error,
+            });
         }
-        (Ok(()), Ok(()), Ok(())) => secure_private_snapshot_file(destination),
+    }
+    if let Some(error) = failure {
+        Err(cleanup_failed_snapshot(destination, error))
+    } else {
+        secure_private_snapshot_file(destination)
     }
 }
 
 #[cfg(unix)]
-fn pinned_copy_temporary_path(_destination: &Path) -> Result<PathBuf, StateError> {
-    Ok(default_private_lock_root()?.join(format!("snapshot-{}.sqlite", writer_owner()?)))
+fn pinned_copy_temporary_path(destination: &Path) -> Result<PathBuf, StateError> {
+    Ok(private_lock_root_for(destination)?.join(format!("snapshot-{}.sqlite", writer_owner()?)))
 }
 
 #[cfg(not(unix))]
@@ -5548,6 +5813,58 @@ struct TrustedBackupSeal {
     file: File,
 }
 
+#[cfg(unix)]
+struct SealCreationGuard {
+    temporary: PathBuf,
+    published: PathBuf,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl SealCreationGuard {
+    fn new(temporary: PathBuf, published: PathBuf) -> Self {
+        Self {
+            temporary,
+            published,
+            armed: true,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), StateError> {
+        let mut failure = None;
+        for path in [&self.temporary, &self.published] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if failure.is_none() => {
+                    failure = Some(file_error("remove incomplete backup seal", path, error));
+                }
+                Err(_) => {}
+            }
+        }
+        if let Err(error) = sync_parent_directory(&self.published)
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+        self.armed = false;
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SealCreationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cleanup();
+        }
+    }
+}
+
 impl TrustedBackupSeal {
     fn cleanup(self) -> Result<(), StateError> {
         #[cfg(unix)]
@@ -5572,51 +5889,60 @@ fn create_trusted_backup_seal(
 
     snapshot.verify()?;
     let seal_id = writer_owner()?;
-    let seal_path = default_private_lock_root()?.join(format!("backup-seal-{seal_id}.record"));
+    let seal_path =
+        private_lock_root_for(&snapshot.path)?.join(format!("backup-seal-{seal_id}.record"));
     let temporary = seal_path.with_file_name(format!(".backup-seal-publish-{}", writer_owner()?));
+    let mut guard = SealCreationGuard::new(temporary.clone(), seal_path.clone());
     let mut record = open_private_lock_file(&temporary, PrivateLockOpen::CreateNew)?;
-    let manifest = trusted_backup_manifest(snapshot, deadline_state)?;
-    initialize_or_validate_lock_contents(&temporary, &mut record, &manifest, true)?;
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        &temporary,
-        rustix::fs::CWD,
-        &seal_path,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|error| {
-        file_error(
-            "publish trusted backup seal",
+    let result = (|| {
+        let manifest = trusted_backup_manifest(snapshot, deadline_state)?;
+        initialize_or_validate_lock_contents(&temporary, &mut record, &manifest, true)?;
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &temporary,
+            rustix::fs::CWD,
             &seal_path,
-            std::io::Error::from(error),
+            rustix::fs::RenameFlags::NOREPLACE,
         )
-    })?;
-    verify_path_identity(&seal_path, &record)?;
-    sync_parent_directory(&seal_path)?;
-
-    let writable = open_existing_file_no_follow_writable(&snapshot.path)?;
-    if !files_share_identity_from_handles_portable(&snapshot.file, &writable)? {
-        return Err(StateError::InvalidBackup {
-            path: snapshot.path.clone(),
-            reason: "snapshot changed before trusted seal attachment".to_owned(),
-        });
-    }
-    if let Err(error) = writable.set_xattr(UNIX_BACKUP_SEAL_XATTR, seal_id.as_bytes()) {
+        .map_err(|error| {
+            file_error(
+                "publish trusted backup seal",
+                &seal_path,
+                std::io::Error::from(error),
+            )
+        })?;
         verify_path_identity(&seal_path, &record)?;
-        drop(record);
-        std::fs::remove_file(&seal_path)
-            .map_err(|cleanup| file_error("remove unattached backup seal", &seal_path, cleanup))?;
         sync_parent_directory(&seal_path)?;
-        return Err(file_error(
-            "attach trusted backup seal index",
-            &snapshot.path,
-            error,
-        ));
+
+        let writable = open_existing_file_no_follow_writable(&snapshot.path)?;
+        if !files_share_identity_from_handles_portable(&snapshot.file, &writable)? {
+            return Err(StateError::InvalidBackup {
+                path: snapshot.path.clone(),
+                reason: "snapshot changed before trusted seal attachment".to_owned(),
+            });
+        }
+        writable
+            .set_xattr(UNIX_BACKUP_SEAL_XATTR, seal_id.as_bytes())
+            .map_err(|error| {
+                file_error("attach trusted backup seal index", &snapshot.path, error)
+            })?;
+        writable
+            .sync_all()
+            .map_err(|error| file_error("sync trusted backup seal index", &snapshot.path, error))?;
+        snapshot.verify()
+    })();
+    if let Err(primary) = result {
+        drop(record);
+        return match guard.cleanup() {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(StateError::OperationCleanupFailed {
+                operation: "trusted backup seal",
+                primary: Box::new(primary),
+                cleanup: cleanup.to_string(),
+            }),
+        };
     }
-    writable
-        .sync_all()
-        .map_err(|error| file_error("sync trusted backup seal index", &snapshot.path, error))?;
-    snapshot.verify()?;
+    guard.disarm();
     Ok(TrustedBackupSeal {
         path: seal_path,
         file: record,
@@ -5699,7 +6025,8 @@ fn validate_trusted_backup_seal(
             path: snapshot.path.clone(),
             reason: "trusted backup seal index has an invalid format".to_owned(),
         })?;
-    let seal_path = default_private_lock_root()?.join(format!("backup-seal-{seal_id}.record"));
+    let seal_path =
+        private_lock_root_for(&snapshot.path)?.join(format!("backup-seal-{seal_id}.record"));
     let mut record =
         open_private_lock_file(&seal_path, PrivateLockOpen::Existing).map_err(|_| {
             StateError::BackupNotPortable {
@@ -5794,6 +6121,7 @@ async fn backup_pool(
         deadline: deadline.into_std(),
         timeout_ms,
         operation: "SQLite backup",
+        expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cancelled: std::sync::atomic::AtomicBool::new(false),
         finished: std::sync::atomic::AtomicBool::new(false),
     });
@@ -5835,15 +6163,23 @@ async fn backup_pool(
             .await
             .map_err(|error| database("lock bounded backup connection", error))?;
         let deadline_state = Arc::clone(&deadline_state);
-        handle.set_progress_handler(1_000, move || deadline_state.permits_sqlite_work());
+        handle.set_progress_handler(100, move || deadline_state.permits_sqlite_work());
     }
     let vacuum = claw_sqlite_file_control::vacuum_into_with_deadline(
         &mut connection,
         temporary_text,
         deadline,
+        Arc::clone(&deadline_state.expired),
     )
-    .await;
+    .await
+    .map_err(|error| database("create consistent SQLite backup", error));
     let reset_handler = async {
+        #[cfg(test)]
+        if take_publication_failpoint(&FAIL_BACKUP_HANDLER_RESET, destination) {
+            return Err(sqlx::Error::Protocol(
+                "injected backup progress-handler reset failure".to_owned(),
+            ));
+        }
         let mut handle = connection.lock_handle().await?;
         handle.set_progress_handler(0, || true);
         Ok::<(), sqlx::Error>(())
@@ -5851,18 +6187,25 @@ async fn backup_pool(
     .await;
     if let Err(error) = reset_handler {
         connection.discard().await;
-        return Err(cleanup_failed_snapshot(
-            &temporary,
-            database("reset bounded backup progress handler", error),
-        ));
+        let cleanup = database("reset bounded backup progress handler", error);
+        let primary = match vacuum {
+            Err(primary) => Some(primary),
+            Ok(claw_sqlite_file_control::VacuumDeadlineOutcome::TimedOut) => Some(timed_out()),
+            Ok(claw_sqlite_file_control::VacuumDeadlineOutcome::Completed) => None,
+        };
+        let failure = if let Some(primary) = primary {
+            StateError::OperationCleanupFailed {
+                operation: "SQLite backup",
+                primary: Box::new(primary),
+                cleanup: cleanup.to_string(),
+            }
+        } else {
+            cleanup
+        };
+        return Err(cleanup_failed_snapshot(&temporary, failure));
     }
     connection.mark_reusable();
-    let vacuum = vacuum.map_err(|error| {
-        cleanup_failed_snapshot(
-            &temporary,
-            database("create consistent SQLite backup", error),
-        )
-    })?;
+    let vacuum = vacuum.map_err(|error| cleanup_failed_snapshot(&temporary, error))?;
     match vacuum {
         claw_sqlite_file_control::VacuumDeadlineOutcome::Completed => {}
         claw_sqlite_file_control::VacuumDeadlineOutcome::TimedOut => {
@@ -5884,7 +6227,11 @@ async fn backup_pool(
     .await
     .is_err()
     {
-        return Err(pinned.cleanup().err().unwrap_or_else(timed_out));
+        return Err(cleanup_pinned_or_error(
+            "SQLite backup",
+            pinned,
+            timed_out(),
+        ));
     }
     let preparation = async {
         mark_backup_provenance(&pinned, Some(Arc::clone(&deadline_state))).await?;
@@ -5907,36 +6254,66 @@ async fn backup_pool(
             } else {
                 error
             };
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(cleanup_pinned_or_error("SQLite backup", pinned, error));
         }
     }
     if tokio::time::Instant::now() >= deadline {
-        return Err(pinned.cleanup().err().unwrap_or_else(timed_out));
+        return Err(cleanup_pinned_or_error(
+            "SQLite backup",
+            pinned,
+            timed_out(),
+        ));
     }
     let seal = match create_trusted_backup_seal(&pinned, Some(deadline_state.as_ref())) {
         Ok(seal) => seal,
         Err(error) => {
-            return Err(pinned.cleanup().err().unwrap_or(error));
+            return Err(match pinned.cleanup() {
+                Ok(()) => error,
+                Err(cleanup) => append_operation_cleanup(
+                    "SQLite backup",
+                    error,
+                    format!("snapshot cleanup failed: {cleanup}"),
+                ),
+            });
         }
     };
     if tokio::time::Instant::now() >= deadline {
-        let seal_cleanup = seal.cleanup();
-        let error = seal_cleanup.err().unwrap_or_else(timed_out);
-        return Err(pinned.cleanup().err().unwrap_or(error));
+        let error = match seal.cleanup() {
+            Ok(()) => timed_out(),
+            Err(cleanup) => append_operation_cleanup(
+                "SQLite backup",
+                timed_out(),
+                format!("seal cleanup failed: {cleanup}"),
+            ),
+        };
+        return Err(cleanup_pinned_or_error("SQLite backup", pinned, error));
     }
     if let Err(error) = pinned.sync() {
-        let seal_cleanup = seal.cleanup();
-        let error = seal_cleanup.err().unwrap_or(error);
-        return Err(pinned.cleanup().err().unwrap_or(error));
+        let error = match seal.cleanup() {
+            Ok(()) => error,
+            Err(cleanup) => append_operation_cleanup(
+                "SQLite backup",
+                error,
+                format!("seal cleanup failed: {cleanup}"),
+            ),
+        };
+        return Err(cleanup_pinned_or_error("SQLite backup", pinned, error));
     }
     if tokio::time::Instant::now() >= deadline {
-        let seal_cleanup = seal.cleanup();
-        let error = seal_cleanup.err().unwrap_or_else(timed_out);
-        return Err(pinned.cleanup().err().unwrap_or(error));
+        let error = match seal.cleanup() {
+            Ok(()) => timed_out(),
+            Err(cleanup) => append_operation_cleanup(
+                "SQLite backup",
+                timed_out(),
+                format!("seal cleanup failed: {cleanup}"),
+            ),
+        };
+        return Err(cleanup_pinned_or_error("SQLite backup", pinned, error));
     }
     let published = match publish_snapshot(
         pinned,
         destination,
+        "SQLite backup",
         Some((deadline, timeout_ms)),
         &destination_directory,
     ) {
@@ -5945,11 +6322,15 @@ async fn backup_pool(
             Err(cleanup_failed_snapshot(&temporary, error))
         }
         Err(error) => {
-            let seal_cleanup = seal.cleanup();
-            Err(cleanup_failed_snapshot(
-                &temporary,
-                seal_cleanup.err().unwrap_or(error),
-            ))
+            let error = match seal.cleanup() {
+                Ok(()) => error,
+                Err(cleanup) => append_operation_cleanup(
+                    "SQLite backup publication",
+                    error,
+                    format!("seal cleanup failed: {cleanup}"),
+                ),
+            };
+            Err(cleanup_failed_snapshot(&temporary, error))
         }
     };
     if published.is_ok() {
@@ -5970,8 +6351,59 @@ fn cleanup_failed_snapshot(path: &Path, error: StateError) -> StateError {
                 path: destination,
                 reason: format!("{reason}; temporary cleanup failed: {cleanup_error}"),
             },
-            _ => cleanup_error,
+            StateError::OperationCleanupFailed {
+                operation,
+                primary,
+                cleanup,
+            } => StateError::OperationCleanupFailed {
+                operation,
+                primary,
+                cleanup: format!("{cleanup}; temporary artifact cleanup failed: {cleanup_error}"),
+            },
+            primary => append_operation_cleanup(
+                "SQLite snapshot",
+                primary,
+                format!("temporary artifact cleanup failed: {cleanup_error}"),
+            ),
         },
+    }
+}
+
+fn append_operation_cleanup(
+    operation: &'static str,
+    error: StateError,
+    additional_cleanup: String,
+) -> StateError {
+    match error {
+        StateError::OperationCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } => StateError::OperationCleanupFailed {
+            operation,
+            primary,
+            cleanup: format!("{cleanup}; {additional_cleanup}"),
+        },
+        primary => StateError::OperationCleanupFailed {
+            operation,
+            primary: Box::new(primary),
+            cleanup: additional_cleanup,
+        },
+    }
+}
+
+fn cleanup_pinned_or_error(
+    operation: &'static str,
+    pinned: PinnedSnapshot,
+    error: StateError,
+) -> StateError {
+    match pinned.cleanup() {
+        Ok(()) => error,
+        Err(cleanup) => append_operation_cleanup(
+            operation,
+            error,
+            format!("snapshot cleanup failed: {cleanup}"),
+        ),
     }
 }
 
@@ -6077,14 +6509,19 @@ async fn validate_snapshot_marker_pinned(
     let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| invalid_backup(path, "open standalone snapshot provenance", error))?;
-    install_open_deadline_handler(&mut connection, deadline_state).await?;
+    install_open_deadline_handler(&mut connection, deadline_state.clone()).await?;
     let provenance = sqlx::query_scalar::<_, String>(
         "SELECT owner FROM claw_writer_lock
          WHERE singleton = 1 AND acquired_at_ms = 0",
     )
     .fetch_optional(&mut connection)
     .await
-    .map_err(|error| invalid_backup(path, "read standalone snapshot provenance", error));
+    .map_err(|error| {
+        OpenDeadlineState::deadline_or_error(
+            deadline_state.as_deref(),
+            invalid_backup(path, "read standalone snapshot provenance", error),
+        )
+    });
     let close = connection
         .close()
         .await
@@ -6150,8 +6587,10 @@ async fn validate_backup_pinned(
             path: path.to_owned(),
             reason: DatabaseFailureText::render("open backup", error),
         })?;
-    install_open_deadline_handler(&mut connection, deadline_state).await?;
-    let result = validate_backup_connection(path, &mut connection, expected_version).await;
+    install_open_deadline_handler(&mut connection, deadline_state.clone()).await?;
+    let result = validate_backup_connection(path, &mut connection, expected_version)
+        .await
+        .map_err(|error| OpenDeadlineState::deadline_or_error(deadline_state.as_deref(), error));
     let close = connection
         .close()
         .await
@@ -6325,8 +6764,8 @@ pub(crate) mod test_support {
     }
 
     #[cfg(unix)]
-    pub(crate) fn private_lock_root() -> std::path::PathBuf {
-        super::default_private_lock_root().expect("resolve canonical private lock root")
+    pub(crate) fn private_lock_root(path: &Path) -> std::path::PathBuf {
+        super::private_lock_root_for(path).expect("resolve canonical private lock root")
     }
 
     pub(crate) fn checksum(sql: &str) -> String {
@@ -6420,7 +6859,7 @@ pub(crate) mod test_support {
                 .expect("remove Unix backup fixture seal index");
             let seal_id =
                 std::str::from_utf8(&seal_id).expect("Unix backup fixture seal id is UTF-8");
-            let seal_path = super::default_private_lock_root()
+            let seal_path = super::private_lock_root_for(&path)
                 .expect("resolve private seal root")
                 .join(format!("backup-seal-{seal_id}.record"));
             std::fs::remove_file(&seal_path).expect("remove Unix backup fixture seal record");
@@ -6448,6 +6887,14 @@ pub(crate) mod test_support {
             .expect("backup failure lock poisoned") = Some(destination);
     }
 
+    pub(crate) fn fail_backup_handler_reset_once(destination: &Path) {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve backup reset failure path");
+        *super::FAIL_BACKUP_HANDLER_RESET
+            .lock()
+            .expect("backup reset failure lock poisoned") = Some(destination);
+    }
+
     pub(crate) async fn expired_vacuum_does_not_start(
         store: &StateStore,
         destination: &Path,
@@ -6463,6 +6910,7 @@ pub(crate) mod test_support {
                 .to_str()
                 .expect("vacuum test destination is Unicode"),
             tokio::time::Instant::now() - std::time::Duration::from_millis(1),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .expect("expired vacuum returns a typed outcome")
@@ -6494,6 +6942,12 @@ pub(crate) mod test_support {
         store
             .writer_generation
             .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn restore_writer_generation(store: &super::StateStore) {
+        store
+            .writer_generation
+            .store(1, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(windows)]

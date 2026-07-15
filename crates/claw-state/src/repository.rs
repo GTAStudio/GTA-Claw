@@ -1,9 +1,9 @@
 use claw_domain::SessionId;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
 #[cfg(test)]
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::error::database;
+use crate::error::{database, database_code};
 use crate::model::{finish_page, invalid_stored, validate_text};
 use crate::store::{OperationalIdentity, validate_operational_schema};
 use crate::{
@@ -13,6 +13,73 @@ use crate::{
 };
 
 const APPLICATION_ID: i64 = 0x4754_4143;
+
+struct VerifiedWriteTransaction {
+    connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
+    token: Option<claw_sqlite_file_control::ManualTransactionToken>,
+}
+
+impl VerifiedWriteTransaction {
+    fn new(connection: sqlx::pool::PoolConnection<Sqlite>) -> Self {
+        Self {
+            connection: Some(connection),
+            token: None,
+        }
+    }
+
+    fn set_token(&mut self, token: claw_sqlite_file_control::ManualTransactionToken) {
+        self.token = Some(token);
+    }
+
+    async fn commit(mut self, operation: &'static str) -> Result<(), StateError> {
+        let token = self
+            .token
+            .take()
+            .expect("manual transaction token remains live");
+        let result = claw_sqlite_file_control::commit_synchronously(&mut self, token).await;
+        match result {
+            Ok(()) => {
+                drop(self.connection.take());
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(connection) = self.connection.take() {
+                    drop(connection.detach());
+                }
+                Err(error.code().map_or_else(
+                    || database(operation, sqlx::Error::Protocol(error.to_string())),
+                    |code| database_code(operation, code, error.to_string()),
+                ))
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for VerifiedWriteTransaction {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_deref()
+            .expect("verified write connection remains live")
+    }
+}
+
+impl std::ops::DerefMut for VerifiedWriteTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_deref_mut()
+            .expect("verified write connection remains live")
+    }
+}
+
+impl Drop for VerifiedWriteTransaction {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            drop(connection.detach());
+        }
+    }
+}
 
 #[cfg(test)]
 static WRITE_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
@@ -623,16 +690,28 @@ impl<'store> TaskRepository<'store> {
     }
 }
 
-async fn begin_verified_write<'pool>(
-    pool: &'pool SqlitePool,
+async fn begin_verified_write(
+    pool: &SqlitePool,
     owner: &str,
     identity: OperationalIdentity<'_>,
     operation: &'static str,
-) -> Result<Transaction<'pool, Sqlite>, StateError> {
-    let mut transaction = pool
-        .begin()
+) -> Result<VerifiedWriteTransaction, StateError> {
+    let connection = pool
+        .acquire()
         .await
         .map_err(|error| database(operation, error))?;
+    let mut transaction = VerifiedWriteTransaction::new(connection);
+    let token = match claw_sqlite_file_control::begin_manual_transaction(&mut transaction).await {
+        Ok(token) => token,
+        Err(error) => {
+            let begin_operation = "lock and verify application writer";
+            return Err(error.code().map_or_else(
+                || database(begin_operation, sqlx::Error::Protocol(error.to_string())),
+                |code| database_code(begin_operation, code, error.to_string()),
+            ));
+        }
+    };
+    transaction.set_token(token);
     let ownership = sqlx::query(
         "UPDATE claw_writer_lock
          SET owner = owner
@@ -709,7 +788,7 @@ async fn wait_at_commit_test_barrier(owner: &str) {
 }
 
 async fn commit_verified(
-    mut transaction: Transaction<'_, Sqlite>,
+    mut transaction: VerifiedWriteTransaction,
     owner: &str,
     identity: OperationalIdentity<'_>,
     operation: &'static str,
@@ -754,15 +833,12 @@ async fn commit_verified(
     }
     #[cfg(test)]
     wait_at_commit_test_barrier(owner).await;
-    transaction
-        .commit()
-        .await
-        .map_err(|error| database(operation, error))
+    transaction.commit(operation).await
 }
 
 #[cfg(test)]
 async fn apply_commit_test_tamper(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut VerifiedWriteTransaction,
     owner: &str,
 ) -> Result<(), StateError> {
     let tamper = COMMIT_TEST_TAMPERS
@@ -785,7 +861,7 @@ async fn apply_commit_test_tamper(
 }
 
 async fn insert_device(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut VerifiedWriteTransaction,
     record: &DeviceRecord,
 ) -> Result<(), StateError> {
     sqlx::query(
@@ -804,7 +880,7 @@ async fn insert_device(
 }
 
 async fn insert_authentication(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut VerifiedWriteTransaction,
     record: &AuthenticationRecord,
 ) -> Result<(), StateError> {
     sqlx::query(
@@ -834,7 +910,7 @@ async fn insert_authentication(
 }
 
 async fn insert_task(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut VerifiedWriteTransaction,
     record: &TaskRecord,
 ) -> Result<(), StateError> {
     let result = sqlx::query(
@@ -887,54 +963,191 @@ async fn insert_task(
     Ok(())
 }
 
+fn stored_session_id(raw: String, field: &'static str) -> Result<SessionId, StateError> {
+    let id = SessionId::new(raw.clone()).map_err(|_| invalid_stored(field))?;
+    if id.as_str() == raw {
+        Ok(id)
+    } else {
+        Err(invalid_stored(field))
+    }
+}
+
+fn stored_device_id(raw: String, field: &'static str) -> Result<DeviceId, StateError> {
+    let id = DeviceId::new(raw.clone()).map_err(|_| invalid_stored(field))?;
+    if id.as_str() == raw {
+        Ok(id)
+    } else {
+        Err(invalid_stored(field))
+    }
+}
+
+fn stored_authentication_id(
+    raw: String,
+    field: &'static str,
+) -> Result<AuthenticationId, StateError> {
+    let id = AuthenticationId::new(raw.clone()).map_err(|_| invalid_stored(field))?;
+    if id.as_str() == raw {
+        Ok(id)
+    } else {
+        Err(invalid_stored(field))
+    }
+}
+
+fn stored_task_id(raw: String, field: &'static str) -> Result<TaskId, StateError> {
+    let id = TaskId::new(raw.clone()).map_err(|_| invalid_stored(field))?;
+    if id.as_str() == raw {
+        Ok(id)
+    } else {
+        Err(invalid_stored(field))
+    }
+}
+
 fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionRecord, StateError> {
+    let created_at = TimestampMs::new(
+        row.try_get("created_at_ms")
+            .map_err(|_| invalid_stored("session created timestamp"))?,
+    )?;
+    let updated_at = TimestampMs::new(
+        row.try_get("updated_at_ms")
+            .map_err(|_| invalid_stored("session updated timestamp"))?,
+    )?;
+    validate_update_time(created_at, updated_at)?;
     Ok(SessionRecord {
-        id: SessionId::new(row.get::<String, _>("id")).map_err(|_| invalid_stored("session id"))?,
-        status: SessionStatus::from_db(row.get("status"))?,
-        created_at: TimestampMs::new(row.get("created_at_ms"))?,
-        updated_at: TimestampMs::new(row.get("updated_at_ms"))?,
-        version: valid_version(row.get("version"))?,
+        id: stored_session_id(
+            row.try_get::<String, _>("id")
+                .map_err(|_| invalid_stored("session id"))?,
+            "session id",
+        )?,
+        status: SessionStatus::from_db(
+            row.try_get("status")
+                .map_err(|_| invalid_stored("session status"))?,
+        )?,
+        created_at,
+        updated_at,
+        version: valid_version(
+            row.try_get("version")
+                .map_err(|_| invalid_stored("session version"))?,
+        )?,
     })
 }
 
 fn device_from_row(row: sqlx::sqlite::SqliteRow) -> Result<DeviceRecord, StateError> {
+    let created_at = TimestampMs::new(
+        row.try_get("created_at_ms")
+            .map_err(|_| invalid_stored("device created timestamp"))?,
+    )?;
+    let updated_at = TimestampMs::new(
+        row.try_get("updated_at_ms")
+            .map_err(|_| invalid_stored("device updated timestamp"))?,
+    )?;
+    validate_update_time(created_at, updated_at)?;
     Ok(DeviceRecord {
-        id: DeviceId::new(row.get::<String, _>("id"))?,
-        display_name: validate_text("stored device display name", row.get("display_name"))?,
-        created_at: TimestampMs::new(row.get("created_at_ms"))?,
-        updated_at: TimestampMs::new(row.get("updated_at_ms"))?,
-        version: valid_version(row.get("version"))?,
+        id: stored_device_id(
+            row.try_get::<String, _>("id")
+                .map_err(|_| invalid_stored("device id"))?,
+            "device id",
+        )?,
+        display_name: validate_text(
+            "stored device display name",
+            row.try_get("display_name")
+                .map_err(|_| invalid_stored("device display name"))?,
+        )?,
+        created_at,
+        updated_at,
+        version: valid_version(
+            row.try_get("version")
+                .map_err(|_| invalid_stored("device version"))?,
+        )?,
     })
 }
 
 fn authentication_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<AuthenticationRecord, StateError> {
-    let status = AuthenticationStatus::from_db(row.get("status"))?;
-    let subject = validate_auth_subject(status, row.get("subject"))?;
+    let status = AuthenticationStatus::from_db(
+        row.try_get("status")
+            .map_err(|_| invalid_stored("authentication status"))?,
+    )?;
+    let subject = validate_auth_subject(
+        status,
+        row.try_get("subject")
+            .map_err(|_| invalid_stored("authentication subject"))?,
+    )?;
+    let created_at = TimestampMs::new(
+        row.try_get("created_at_ms")
+            .map_err(|_| invalid_stored("authentication created timestamp"))?,
+    )?;
+    let updated_at = TimestampMs::new(
+        row.try_get("updated_at_ms")
+            .map_err(|_| invalid_stored("authentication updated timestamp"))?,
+    )?;
+    validate_update_time(created_at, updated_at)?;
     Ok(AuthenticationRecord {
-        id: AuthenticationId::new(row.get::<String, _>("id"))?,
-        device_id: DeviceId::new(row.get::<String, _>("device_id"))?,
-        provider: validate_text("stored authentication provider", row.get("provider"))?,
+        id: stored_authentication_id(
+            row.try_get::<String, _>("id")
+                .map_err(|_| invalid_stored("authentication id"))?,
+            "authentication id",
+        )?,
+        device_id: stored_device_id(
+            row.try_get::<String, _>("device_id")
+                .map_err(|_| invalid_stored("authentication device id"))?,
+            "authentication device id",
+        )?,
+        provider: validate_text(
+            "stored authentication provider",
+            row.try_get("provider")
+                .map_err(|_| invalid_stored("authentication provider"))?,
+        )?,
         subject,
         status,
-        created_at: TimestampMs::new(row.get("created_at_ms"))?,
-        updated_at: TimestampMs::new(row.get("updated_at_ms"))?,
-        version: valid_version(row.get("version"))?,
+        created_at,
+        updated_at,
+        version: valid_version(
+            row.try_get("version")
+                .map_err(|_| invalid_stored("authentication version"))?,
+        )?,
     })
 }
 
 fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TaskRecord, StateError> {
+    let created_at = TimestampMs::new(
+        row.try_get("created_at_ms")
+            .map_err(|_| invalid_stored("task created timestamp"))?,
+    )?;
+    let updated_at = TimestampMs::new(
+        row.try_get("updated_at_ms")
+            .map_err(|_| invalid_stored("task updated timestamp"))?,
+    )?;
+    validate_update_time(created_at, updated_at)?;
     Ok(TaskRecord {
-        id: TaskId::new(row.get::<String, _>("id"))?,
-        session_id: SessionId::new(row.get::<String, _>("session_id"))
-            .map_err(|_| invalid_stored("task session id"))?,
-        kind: validate_text("stored task kind", row.get("kind"))?,
-        payload: row.get("payload"),
-        status: TaskStatus::from_db(row.get("status"))?,
-        created_at: TimestampMs::new(row.get("created_at_ms"))?,
-        updated_at: TimestampMs::new(row.get("updated_at_ms"))?,
-        version: valid_version(row.get("version"))?,
+        id: stored_task_id(
+            row.try_get::<String, _>("id")
+                .map_err(|_| invalid_stored("task id"))?,
+            "task id",
+        )?,
+        session_id: stored_session_id(
+            row.try_get::<String, _>("session_id")
+                .map_err(|_| invalid_stored("task session id"))?,
+            "task session id",
+        )?,
+        kind: validate_text(
+            "stored task kind",
+            row.try_get("kind")
+                .map_err(|_| invalid_stored("task kind"))?,
+        )?,
+        payload: row
+            .try_get("payload")
+            .map_err(|_| invalid_stored("task payload"))?,
+        status: TaskStatus::from_db(
+            row.try_get("status")
+                .map_err(|_| invalid_stored("task status"))?,
+        )?,
+        created_at,
+        updated_at,
+        version: valid_version(
+            row.try_get("version")
+                .map_err(|_| invalid_stored("task version"))?,
+        )?,
     })
 }
 

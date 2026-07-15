@@ -100,6 +100,13 @@ mod tests {
     }
 
     fn database_path(directory: &TempDir, name: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("secure Unix test state directory");
+        }
         #[cfg(windows)]
         secure_windows_test_directory(directory.path());
         directory.path().join(name)
@@ -1062,6 +1069,97 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn malformed_persisted_text_returns_typed_error_without_panicking() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "malformed-text.sqlite")).await;
+        sqlx::query(
+            "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+             VALUES(CAST(X'80' AS TEXT), 'active', 1, 1, 1)",
+        )
+        .execute(test_support::pool(&store))
+        .await
+        .expect("seed malformed persisted TEXT");
+        assert_eq!(
+            store
+                .sessions()
+                .list(&PageRequest::new(10, None).expect("valid malformed-text page"))
+                .await
+                .expect_err("malformed TEXT returns a typed error"),
+            StateError::InvalidValue {
+                field: "session id",
+                reason: "persisted value is not supported",
+            }
+        );
+        store.close().await.expect("malformed-text store closes");
+    }
+
+    #[tokio::test]
+    async fn noncanonical_persisted_id_is_rejected_instead_of_trimmed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "noncanonical-id.sqlite")).await;
+        sqlx::query(
+            "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+             VALUES('session-with-space ', 'active', 1, 1, 1)",
+        )
+        .execute(test_support::pool(&store))
+        .await
+        .expect("seed noncanonical persisted id");
+        assert_eq!(
+            store
+                .sessions()
+                .list(&PageRequest::new(10, None).expect("valid noncanonical-id page"))
+                .await
+                .expect_err("noncanonical persisted id is rejected"),
+            StateError::InvalidValue {
+                field: "session id",
+                reason: "persisted value is not supported",
+            }
+        );
+        store.close().await.expect("noncanonical-id store closes");
+    }
+
+    #[tokio::test]
+    async fn impossible_persisted_timestamp_history_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = open(&database_path(&directory, "invalid-timestamps.sqlite")).await;
+        let mut connection = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("acquire timestamp tamper connection");
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .expect("disable check constraints for tamper fixture");
+        sqlx::query(
+            "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+             VALUES('time-travel', 'active', 10, 9, 1)",
+        )
+        .execute(&mut *connection)
+        .await
+        .expect("seed impossible timestamp history");
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&mut *connection)
+            .await
+            .expect("restore check constraints");
+        drop(connection);
+        assert_eq!(
+            store
+                .sessions()
+                .list(&PageRequest::new(10, None).expect("valid timestamp page"))
+                .await
+                .expect_err("impossible timestamp history is rejected"),
+            StateError::InvalidValue {
+                field: "updated timestamp",
+                reason: "must not precede the current timestamp",
+            }
+        );
+        store
+            .close()
+            .await
+            .expect("invalid-timestamps store closes");
     }
 
     #[tokio::test]
@@ -2264,7 +2362,11 @@ mod tests {
         let path = database_path(&directory, "vacuum-lifecycle.sqlite");
         let expired_destination = database_path(&directory, "expired-vacuum.sqlite");
         let failed_backup = database_path(&directory, "failed-backup.sqlite");
-        let store = open(&path).await;
+        let reset_failed_backup = database_path(&directory, "reset-failed-backup.sqlite");
+        let store =
+            StateStore::open(StoreConfig::new(&path).with_open_timeout(Duration::from_secs(1)))
+                .await
+                .expect("vacuum lifecycle store opens");
 
         assert_eq!(
             test_support::expired_vacuum_does_not_start(&store, &expired_destination).await,
@@ -2280,6 +2382,31 @@ mod tests {
             .create(&session("post-backup-error", 1))
             .await
             .expect("backup failure leaves the sole pooled connection usable");
+
+        test_support::fail_backup_vacuum_once(&reset_failed_backup);
+        test_support::fail_backup_handler_reset_once(&reset_failed_backup);
+        let error = store
+            .backup_to(&reset_failed_backup)
+            .await
+            .expect_err("handler-reset failure degrades the backup");
+        let StateError::OperationCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = error
+        else {
+            panic!("expected primary-plus-cleanup backup error, received {error:?}");
+        };
+        assert_eq!(operation, "SQLite backup");
+        assert!(matches!(*primary, StateError::Database(_)));
+        assert!(cleanup.contains("injected backup progress-handler reset failure"));
+        assert!(!reset_failed_backup.exists());
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        store
+            .sessions()
+            .create(&session("post-reset-failure", 2))
+            .await
+            .expect("discarded connection is replaced without a stale handler");
         store.close().await.expect("vacuum lifecycle store closes");
     }
 
@@ -2785,15 +2912,32 @@ mod tests {
             0
         );
         reader.close().await.expect("close rollback reader");
+        test_support::restore_writer_generation(&store);
+        let recovered_record = session("post-veto-row", 2);
+        store
+            .sessions()
+            .create(&recovered_record)
+            .await
+            .expect("replacement connection commits after callback veto");
         let store = std::sync::Arc::try_unwrap(store)
             .unwrap_or_else(|_| panic!("writer retained invalidated-generation store"));
-        assert!(matches!(
-            store.close().await,
-            Err(StateError::CloseDegraded {
-                os_lock_released: true,
-                ..
-            })
-        ));
+        store
+            .close()
+            .await
+            .expect("restored-generation store closes");
+        let reopened = open(&path).await;
+        assert_eq!(
+            reopened
+                .sessions()
+                .get(&recovered_record.id)
+                .await
+                .expect("read post-veto durable row"),
+            Some(recovered_record)
+        );
+        reopened
+            .close()
+            .await
+            .expect("post-veto reopened store closes");
     }
 
     #[cfg(unix)]
@@ -3473,7 +3617,6 @@ mod tests {
         use xattr::FileExt as _;
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let root = test_support::private_lock_root();
         let token = format!(
             "{}-{}",
             std::process::id(),
@@ -3484,6 +3627,7 @@ mod tests {
         );
         for attack in ["symlink", "hardlink", "stale"] {
             let database = database_path(&directory, &format!("canonical-{attack}.sqlite"));
+            let root = test_support::private_lock_root(&database);
             create_private_empty_file(&database);
             let metadata = fs::metadata(&database).expect("read canonical attack identity");
             let lock_path = root.join(format!(

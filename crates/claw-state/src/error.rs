@@ -26,6 +26,14 @@ impl DatabaseFailure {
         }
     }
 
+    pub(crate) fn from_code(operation: &'static str, code: i32, message: String) -> Self {
+        Self {
+            operation,
+            code: Some(code.to_string()),
+            message,
+        }
+    }
+
     /// Returns the operation that failed.
     #[must_use]
     pub const fn operation(&self) -> &'static str {
@@ -211,6 +219,15 @@ pub enum StateError {
         /// Configured deadline in milliseconds.
         timeout_ms: u64,
     },
+    /// An operation failed and cleanup also degraded.
+    OperationCleanupFailed {
+        /// Operation whose cleanup degraded.
+        operation: &'static str,
+        /// Original operation failure.
+        primary: Box<StateError>,
+        /// Cleanup/close diagnostic.
+        cleanup: String,
+    },
 }
 
 impl Display for StateError {
@@ -316,6 +333,14 @@ impl Display for StateError {
                 formatter,
                 "{operation} exceeded its {timeout_ms} ms deadline"
             ),
+            Self::OperationCleanupFailed {
+                operation,
+                primary,
+                cleanup,
+            } => write!(
+                formatter,
+                "{primary}; {operation} cleanup failed: {cleanup}"
+            ),
         }
     }
 }
@@ -324,6 +349,7 @@ impl Error for StateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::OperationCleanupFailed { primary, .. } => Some(primary),
             _ => None,
         }
     }
@@ -331,4 +357,8 @@ impl Error for StateError {
 
 pub(crate) fn database(operation: &'static str, error: sqlx::Error) -> StateError {
     StateError::Database(DatabaseFailure::from_sqlx(operation, error))
+}
+
+pub(crate) fn database_code(operation: &'static str, code: i32, message: String) -> StateError {
+    StateError::Database(DatabaseFailure::from_code(operation, code, message))
 }

@@ -54,6 +54,54 @@ pub enum VacuumDeadlineOutcome {
 
 struct LiveInterruptPointer(NonNull<libsqlite3_sys::sqlite3>);
 
+#[cfg(test)]
+struct VacuumTestGate {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    interrupted: std::sync::Arc<tokio::sync::Notify>,
+    interrupts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+static VACUUM_TEST_GATE: std::sync::LazyLock<std::sync::Mutex<Option<VacuumTestGate>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn wait_at_vacuum_test_gate() {
+    let gate = VACUUM_TEST_GATE
+        .lock()
+        .expect("vacuum test gate lock poisoned")
+        .as_ref()
+        .map(|gate| {
+            (
+                std::sync::Arc::clone(&gate.entered),
+                std::sync::Arc::clone(&gate.release),
+            )
+        });
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn record_vacuum_test_interrupt() {
+    if let Some((interrupts, interrupted)) = VACUUM_TEST_GATE
+        .lock()
+        .expect("vacuum test gate lock poisoned")
+        .as_ref()
+        .map(|gate| {
+            (
+                std::sync::Arc::clone(&gate.interrupts),
+                std::sync::Arc::clone(&gate.interrupted),
+            )
+        })
+    {
+        interrupts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        interrupted.notify_one();
+    }
+}
+
 // SAFETY: SQLite permits sqlite3_interrupt() from another thread, and this
 // pointer never outlives the connection borrowed by vacuum_into_with_deadline.
 unsafe impl Send for LiveInterruptPointer {}
@@ -65,18 +113,28 @@ pub async fn vacuum_into_with_deadline(
     connection: &mut sqlx::SqliteConnection,
     destination: &str,
     deadline: tokio::time::Instant,
+    deadline_expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<VacuumDeadlineOutcome, sqlx::Error> {
     let database = match tokio::time::timeout_at(deadline, connection.lock_handle()).await {
         Ok(handle) => LiveInterruptPointer(handle?.as_raw_handle()),
-        Err(_) => return Ok(VacuumDeadlineOutcome::TimedOut),
+        Err(_) => {
+            deadline_expired.store(true, std::sync::atomic::Ordering::Release);
+            return Ok(VacuumDeadlineOutcome::TimedOut);
+        }
     };
     let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let query_started = std::sync::Arc::clone(&started);
+    let query_deadline_expired = std::sync::Arc::clone(&deadline_expired);
     let query = async move {
-        if tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline
+            || query_deadline_expired.load(std::sync::atomic::Ordering::Acquire)
+        {
+            query_deadline_expired.store(true, std::sync::atomic::Ordering::Release);
             return None;
         }
         query_started.store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(test)]
+        wait_at_vacuum_test_gate().await;
         Some(
             sqlx::query("VACUUM main INTO ?")
                 .bind(destination)
@@ -88,6 +146,7 @@ pub async fn vacuum_into_with_deadline(
     tokio::select! {
         biased;
         () = tokio::time::sleep_until(deadline) => {
+            deadline_expired.store(true, std::sync::atomic::Ordering::Release);
             if started.load(std::sync::atomic::Ordering::Acquire) {
                 let mut interrupt = tokio::time::interval(std::time::Duration::from_millis(1));
                 interrupt.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -97,6 +156,8 @@ pub async fn vacuum_into_with_deadline(
                     unsafe {
                         libsqlite3_sys::sqlite3_interrupt(database.0.as_ptr());
                     }
+                    #[cfg(test)]
+                    record_vacuum_test_interrupt();
                     tokio::select! {
                         biased;
                         _ = &mut query => break,
@@ -144,10 +205,32 @@ pub fn unix_file_has_trivial_acl(file: &std::fs::File) -> Result<bool, FileContr
     {
         apple_file_acl_is_trivial(file)
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use xattr::FileExt as _;
+
+        let acl_names = [
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+            "system.nfs4_acl",
+        ];
+        let names = file
+            .list_xattr()
+            .map_err(|error| FileControlError::Handle(error.to_string()))?;
+        for name in names {
+            if acl_names.iter().any(|acl| name == *acl) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    #[cfg(all(
+        not(target_vendor = "apple"),
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
     {
         let _ = file;
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -157,9 +240,10 @@ fn apple_file_acl_is_trivial(file: &std::fs::File) -> Result<bool, FileControlEr
     use std::os::fd::AsRawFd as _;
 
     const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
     unsafe extern "C" {
         fn acl_get_fd_np(file_descriptor: c_int, acl_type: c_int) -> *mut c_void;
-        fn acl_is_trivial_np(acl: *const c_void, trivial: *mut c_int) -> c_int;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
         fn acl_free(object: *mut c_void) -> c_int;
     }
 
@@ -175,18 +259,26 @@ fn apple_file_acl_is_trivial(file: &std::fs::File) -> Result<bool, FileControlEr
             std::io::Error::last_os_error()
         )));
     }
-    let mut trivial = 0;
-    // SAFETY: `acl` is live until acl_free below and `trivial` is writable.
-    let inspected = unsafe { acl_is_trivial_np(acl, &raw mut trivial) };
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: `acl` is live and `entry` points to writable storage.
+    let entry_status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &raw mut entry) };
+    let entry_error = std::io::Error::last_os_error();
     // SAFETY: acl_get_fd_np returned this owned ACL allocation.
     let freed = unsafe { acl_free(acl) };
-    if inspected != 0 || freed != 0 {
+    if freed != 0 {
         return Err(FileControlError::Handle(format!(
-            "inspect Apple file ACL: {}",
+            "free Apple file ACL: {}",
             std::io::Error::last_os_error()
         )));
     }
-    Ok(trivial != 0)
+    match entry_status {
+        0 => Ok(false),
+        -1 if entry_error.raw_os_error() == Some(22) => Ok(true),
+        _ => Err(FileControlError::Handle(format!(
+            "inspect Apple file ACL entries: {}",
+            entry_error
+        ))),
+    }
 }
 
 /// Returns whether SQLite reports that its open main database was moved or replaced.
@@ -215,15 +307,60 @@ pub async fn main_database_has_moved(
     }
 }
 
-/// Commits the current SQLite transaction synchronously while holding SQLx's
-/// connection lock, so cancellation cannot detach an in-flight commit.
+/// Proof that this crate started a manual transaction on one SQLite connection.
+pub struct ManualTransactionToken {
+    database_address: usize,
+}
+
+/// Starts a manual immediate transaction and returns an opaque connection-bound token.
+pub async fn begin_manual_transaction(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<ManualTransactionToken, FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut message = std::ptr::null_mut();
+    // SAFETY: SQL is static/NUL-terminated and the locked handle excludes the
+    // SQLx worker until the manual transaction has synchronously started.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_exec(
+            database.as_raw_handle().as_ptr(),
+            c"BEGIN IMMEDIATE".as_ptr(),
+            None,
+            std::ptr::null_mut(),
+            &raw mut message,
+        )
+    };
+    if !message.is_null() {
+        // SAFETY: sqlite3_exec allocated this diagnostic with sqlite3_malloc.
+        unsafe {
+            libsqlite3_sys::sqlite3_free(message.cast());
+        }
+    }
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    Ok(ManualTransactionToken {
+        database_address: database.as_raw_handle().as_ptr() as usize,
+    })
+}
+
+/// Commits a transaction created by [`begin_manual_transaction`] synchronously
+/// while holding SQLx's connection lock.
 pub async fn commit_synchronously(
     connection: &mut sqlx::SqliteConnection,
+    token: ManualTransactionToken,
 ) -> Result<(), FileControlError> {
     let mut database = connection
         .lock_handle()
         .await
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    if database.as_raw_handle().as_ptr() as usize != token.database_address {
+        return Err(FileControlError::Handle(
+            "manual transaction token belongs to another SQLite connection".to_owned(),
+        ));
+    }
     let mut message = std::ptr::null_mut();
     // SAFETY: The SQL string is static and NUL-terminated. SQLx's locked handle
     // prevents concurrent worker access for the duration of sqlite3_exec.
@@ -1175,8 +1312,116 @@ pub fn windows_file_is_service_private(file: &std::fs::File) -> Result<bool, Fil
     result
 }
 
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use sqlx::{Connection as _, Executor as _};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn queued_vacuum_is_repeatedly_interrupted_and_joined_after_expiry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("snapshot.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&source)
+            .create_if_missing(true);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("open tiny SQLite source");
+        connection
+            .execute("CREATE TABLE tiny(value INTEGER)")
+            .await
+            .expect("create tiny SQLite schema");
+
+        let expired = Arc::new(AtomicBool::new(false));
+        let progress_hits = Arc::new(AtomicUsize::new(0));
+        {
+            let expired = Arc::clone(&expired);
+            let progress_hits = Arc::clone(&progress_hits);
+            let mut handle = connection.lock_handle().await.expect("lock tiny source");
+            handle.set_progress_handler(1, move || {
+                if expired.load(Ordering::Acquire) {
+                    progress_hits.fetch_add(1, Ordering::AcqRel);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let interrupted = Arc::new(tokio::sync::Notify::new());
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        *VACUUM_TEST_GATE
+            .lock()
+            .expect("vacuum test gate lock poisoned") = Some(VacuumTestGate {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            interrupted: Arc::clone(&interrupted),
+            interrupts: Arc::clone(&interrupts),
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
+        let destination_text = destination
+            .to_str()
+            .expect("snapshot path is Unicode")
+            .to_owned();
+        let task_expired = Arc::clone(&expired);
+        let task = tokio::spawn(async move {
+            let outcome = vacuum_into_with_deadline(
+                &mut connection,
+                &destination_text,
+                deadline,
+                task_expired,
+            )
+            .await;
+            (connection, outcome)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("VACUUM future reaches queued gate");
+        tokio::time::timeout(std::time::Duration::from_secs(1), interrupted.notified())
+            .await
+            .expect("deadline loop issues its first queued interrupt");
+        assert!(
+            interrupts.load(Ordering::Acquire) > 0,
+            "the first queued interrupt must occur before execution is released"
+        );
+        assert!(!destination.exists());
+        release.notify_one();
+        let (mut connection, outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("interrupted VACUUM joins")
+                .expect("VACUUM task joins");
+        VACUUM_TEST_GATE
+            .lock()
+            .expect("vacuum test gate lock poisoned")
+            .take();
+        assert_eq!(
+            outcome.expect("VACUUM returns typed outcome"),
+            VacuumDeadlineOutcome::TimedOut
+        );
+        assert!(
+            progress_hits.load(Ordering::Acquire) > 0,
+            "expired progress callback must reach the worker after the queued no-op interrupt"
+        );
+        assert!(!destination.exists());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!destination.exists());
+        let mut handle = connection.lock_handle().await.expect("relock tiny source");
+        handle.set_progress_handler(0, || true);
+        drop(handle);
+        connection.close().await.expect("close tiny source");
+    }
+}
+
 #[cfg(all(test, windows))]
-mod tests {
+mod windows_tests {
     use super::*;
     use std::io::Write as _;
     use std::os::windows::fs::{OpenOptionsExt as _, symlink_file};
@@ -1194,6 +1439,15 @@ mod tests {
             .expect("Windows identity is UTF-8")
             .trim()
             .to_owned();
+        let status = Command::new("icacls.exe")
+            .arg(directory.path())
+            .arg("/setowner")
+            .arg(&identity)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("set Windows callback fixture owner");
+        assert!(status.success());
         let status = Command::new("icacls.exe")
             .arg(directory.path())
             .arg("/inheritance:r")
@@ -1240,7 +1494,24 @@ mod tests {
                 path: path.clone(),
                 file: std::fs::File::open(path).expect("open sidecar fixture"),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        assert!(
+            windows_file_is_service_private(&database_parent)
+                .expect("validate callback parent security")
+        );
+        assert!(
+            windows_file_is_service_private(&database_file)
+                .expect("validate callback database security")
+        );
+        assert!(
+            windows_file_is_service_private(&lock_file).expect("validate callback lock security")
+        );
+        for sidecar in &sidecars {
+            assert!(
+                windows_file_is_service_private(&sidecar.file)
+                    .expect("validate callback sidecar security")
+            );
+        }
         let context = WindowsIdentityCommitContext {
             database_parent_path: directory.path().to_owned(),
             database_parent,
