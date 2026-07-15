@@ -1,0 +1,146 @@
+name: GTA Claw authoritative desktop supply-chain policy
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-desktop-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-desktop-supply-chain-policy:
+    name: "[AUTHORITATIVE] Trusted desktop supply-chain policy"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Validate immutable pull request event
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          [[ "$EVENT_NAME" == "pull_request_target" ]]
+          [[ "$REPOSITORY" == "GTAStudio/GTA-Claw" ]]
+          [[ "$BASE_REPOSITORY" == "GTAStudio/GTA-Claw" ]]
+          [[ "$BASE_REF" == "main" ]]
+          [[ "$EVENT_ACTION" =~ ^(opened|reopened|synchronize|ready_for_review)$ ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE_SHA" != "$HEAD_SHA" ]]
+          [[ "$HEAD_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$ ]]
+          [[ "$HEAD_REPOSITORY" != *".."* ]]
+
+      - name: Checkout exact protected base
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: GTAStudio/GTA-Claw
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy-checkouts/trusted
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          clean: true
+          set-safe-directory: false
+          show-progress: false
+
+      - name: Checkout exact immutable candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: policy-checkouts/candidate
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          clean: true
+          set-safe-directory: false
+          show-progress: false
+
+      - name: Build and audit protected validator
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          /bin/bash \
+            "${{ github.workspace }}/policy-checkouts/trusted/.github/trusted/desktop-supply-chain-policy/scripts/bootstrap-tools.sh" \
+            "${{ runner.temp }}/gta-claw-desktop-policy-tools" \
+            "${{ github.workspace }}/policy-checkouts/trusted" \
+            "/home/runner/.cargo/bin/rustup"
+
+      - name: Verify OIDs and derive complete changed paths
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          readonly tool_root="${{ runner.temp }}/gta-claw-desktop-policy-tools"
+          readonly validator="$tool_root/validator-target/release/desktop-supply-chain-policy"
+          readonly trusted="${{ github.workspace }}/policy-checkouts/trusted"
+          readonly candidate="${{ github.workspace }}/policy-checkouts/candidate"
+          readonly diff_home="${{ runner.temp }}/gta-claw-desktop-policy-diff-home"
+          readonly manifest="${{ runner.temp }}/gta-claw-desktop-policy-changes.json"
+          /usr/bin/mkdir -p "$diff_home"
+          "$validator" diff-manifest \
+            --git /usr/bin/git \
+            --trusted-repo "$trusted" \
+            --candidate-repo "$candidate" \
+            --isolated-home "$diff_home" \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --output "$manifest"
+          /usr/bin/rm -rf -- "$trusted/.git" "$candidate/.git"
+          [[ ! -e "$trusted/.git" && ! -e "$candidate/.git" ]]
+
+      - name: Validate candidate as bounded data
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          readonly tool_root="${{ runner.temp }}/gta-claw-desktop-policy-tools"
+          readonly validator="$tool_root/validator-target/release/desktop-supply-chain-policy"
+          readonly trusted="${{ github.workspace }}/policy-checkouts/trusted"
+          readonly candidate="${{ github.workspace }}/policy-checkouts/candidate"
+          readonly evidence="${{ runner.temp }}/gta-claw-desktop-policy-evidence.txt"
+          readonly isolation="${{ runner.temp }}/gta-claw-desktop-policy-validation"
+          readonly toolchain_bin="$tool_root/rustup-home/toolchains/1.94.0-x86_64-unknown-linux-gnu/bin"
+          ulimit -t 180
+          ulimit -f 16384
+          ulimit -n 256
+          ulimit -u 256
+          ulimit -v 2097152
+          /usr/bin/mkdir -p "$isolation"
+          cd "$isolation"
+          "$validator" validate \
+            --trusted-root "$trusted" \
+            --candidate-root "$candidate" \
+            --changes "${{ runner.temp }}/gta-claw-desktop-policy-changes.json" \
+            --cargo "$toolchain_bin/cargo" \
+            --rustc "$toolchain_bin/rustc" \
+            --actionlint "$tool_root/actionlint/actionlint" \
+            --isolation-root "$isolation" |
+            /usr/bin/tee "$evidence"
+          /bin/bash \
+            "$trusted/.github/trusted/desktop-supply-chain-policy/scripts/run-candidate-gates.sh" \
+            "$tool_root" "$candidate" "$evidence"
