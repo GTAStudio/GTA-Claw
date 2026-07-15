@@ -7,6 +7,7 @@ use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
+use crate::ownership::{CODEOWNERS_PATH, is_codeowners_path_or_alias, validate_codeowners};
 use crate::{PolicyError, PolicyResult, error};
 
 const MAX_REPOSITORY_FILES: usize = 50_000;
@@ -47,11 +48,12 @@ const ROOT_RUSTFMT: &[u8] = b"edition = \"2024\"\nmax_width = 100\nnewline_style
 const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\nCargo.lock text eol=lf\n";
 
 const BOOTSTRAP_FINGERPRINT: &str =
-    "b74cda6c7174b48f61c816d56c2d226c26eae5096e2452a82586f9bf2a03c693";
+    "ce36154c5fdafa53b073f24e8f78b03662fc7e1a62f897e2c3728ae61ff3a8c9";
 
-const BOOTSTRAP_FILES: [&str; 25] = [
+const BOOTSTRAP_FILES: [&str; 26] = [
     ".cargo/audit.toml",
     ".gitattributes",
+    ".github/CODEOWNERS",
     ".github/workflows/docker-publish.yml",
     ".github/workflows/linux-packaging.yml",
     ".github/workflows/macos-packaging.yml",
@@ -717,6 +719,11 @@ pub fn validate_casefold_paths(paths: &[String]) -> PolicyResult<()> {
     let mut folded = BTreeMap::new();
     for path in paths {
         let lower = path.to_ascii_lowercase();
+        if is_codeowners_path_or_alias(path) && path != CODEOWNERS_PATH {
+            return Err(PolicyError::new(format!(
+                "alternate, aliased, or duplicate CODEOWNERS path is forbidden: {path:?}"
+            )));
+        }
         if is_non_ascii_security_path(path) {
             return Err(PolicyError::new(format!(
                 "security-sensitive path contains non-ASCII filesystem aliases: {path:?}"
@@ -798,7 +805,8 @@ pub fn is_non_ascii_security_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let parts = lower.split('/').collect::<Vec<_>>();
     let file_name = parts.last().copied().unwrap_or(&lower);
-    let policy_name = file_name.ends_with(".toml")
+    let policy_name = is_codeowners_path_or_alias(path)
+        || file_name.ends_with(".toml")
         || file_name.ends_with(".lock")
         || file_name.ends_with(".yml")
         || file_name.ends_with(".yaml")
@@ -1021,6 +1029,7 @@ fn validate_desktop_lock(root: &SafeRoot) -> PolicyResult<()> {
 }
 
 fn validate_final_fixed_files(root: &SafeRoot) -> PolicyResult<()> {
+    validate_codeowners(root)?;
     for (path, expected) in [
         ("deny.toml", FINAL_ROOT_DENY),
         (".cargo/audit.toml", ROOT_AUDIT),
@@ -1130,6 +1139,7 @@ pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
 
 /// Returns whether a checkout is the exact short-lived pre-P04f product state.
 pub fn is_bootstrap_state(root: &SafeRoot) -> PolicyResult<bool> {
+    validate_codeowners(root)?;
     Ok(
         bootstrap_manifest_inventory(root)?
             && bootstrap_fingerprint(root)? == BOOTSTRAP_FINGERPRINT,

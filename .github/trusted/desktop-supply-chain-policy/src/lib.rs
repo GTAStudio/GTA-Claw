@@ -6,6 +6,7 @@ use std::fmt;
 pub mod changes;
 pub mod input;
 pub mod metadata;
+pub mod ownership;
 pub mod policy;
 pub mod process;
 pub mod validation;

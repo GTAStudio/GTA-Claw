@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::changes::{ChangeManifest, has_policy_relevant_change, read_manifest};
 use crate::input::SafeRoot;
 use crate::metadata::{MetadataTools, validate_desktop_metadata, validate_root_metadata};
+use crate::ownership::validate_codeowners;
 use crate::policy::{is_bootstrap_state, validate_final_static};
 use crate::workflows::{
     ActionlintTool, run_actionlint, validate_final_workflows, validate_inventory,
@@ -126,6 +127,8 @@ pub fn validate_request(request: &ValidationRequest) -> PolicyResult<ValidationE
     let manifest = read_manifest(&request.changes)?;
     validate_manifest_roots(&manifest, &trusted, &candidate)?;
 
+    validate_codeowners(&trusted)?;
+    validate_codeowners(&candidate)?;
     validate_protected_files(&trusted, &candidate)?;
     validate_inventory(&trusted)?;
     validate_inventory(&candidate)?;

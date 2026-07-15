@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value as JsonValue, json};
 
+use crate::ownership::is_codeowners_path_or_alias;
 use crate::policy::is_non_ascii_security_path;
 use crate::process::{CommandSpec, run};
 use crate::{PolicyError, PolicyResult, error};
@@ -443,7 +444,7 @@ pub fn read_manifest(path: &Path) -> PolicyResult<ChangeManifest> {
 /// Returns whether a complete changed-path entry can affect supply-chain policy.
 #[must_use]
 pub fn is_policy_relevant(path: &str) -> bool {
-    if is_non_ascii_security_path(path) {
+    if is_codeowners_path_or_alias(path) || is_non_ascii_security_path(path) {
         return true;
     }
     let normalized = path.to_ascii_lowercase();

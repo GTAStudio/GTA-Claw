@@ -1,0 +1,21 @@
+# Security-critical desktop supply-chain ownership.
+/.github/CODEOWNERS @aizhihuxiao
+/.github/workflows/bootstrap-desktop-supply-chain-policy.yml @aizhihuxiao
+/.github/workflows/trusted-desktop-supply-chain-policy.yml @aizhihuxiao
+/.github/trusted/desktop-supply-chain-policy/** @aizhihuxiao
+/.github/workflows/rust.yml @aizhihuxiao
+/.github/workflows/macos-packaging.yml @aizhihuxiao
+/.github/fixtures/cargo-audit/** @aizhihuxiao
+/.github/fixtures/security-tools/** @aizhihuxiao
+/.gitattributes @aizhihuxiao
+/.cargo/audit.toml @aizhihuxiao
+/deny.toml @aizhihuxiao
+/rust-toolchain.toml @aizhihuxiao
+/rustfmt.toml @aizhihuxiao
+/desktop/Cargo.toml @aizhihuxiao
+/desktop/Cargo.lock @aizhihuxiao
+/desktop/deny.toml @aizhihuxiao
+/desktop/apps/gta-claw-desktop/Cargo.toml @aizhihuxiao
+/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs @aizhihuxiao
+/crates/claw-security/tests/desktop_supply_chain_policy.rs @aizhihuxiao
+/crates/claw-security/tests/fixtures/desktop_supply_chain_policy/** @aizhihuxiao

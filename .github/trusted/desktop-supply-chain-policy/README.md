@@ -17,6 +17,7 @@ repository administrators configure and the coordinator verifies all of the foll
 3. Force pushes and branch deletion are blocked.
 4. Bypass actors are narrowly restricted.
 5. Code-owner review protects:
+   - `.github/CODEOWNERS`
    - `.github/workflows/trusted-desktop-supply-chain-policy.yml`
    - `.github/workflows/bootstrap-desktop-supply-chain-policy.yml`
    - `.github/trusted/desktop-supply-chain-policy/**`
@@ -82,6 +83,18 @@ and still pass the authoritative job. A future update requires:
 5. Subsequent product-policy pull requests based on the new protected main.
 
 No hash stored in a candidate checkout authorizes an update.
+
+### Sole-maintainer ownership limitation
+
+The canonical `.github/CODEOWNERS` currently assigns these security-critical paths only
+to `@aizhihuxiao`. GitHub does not permit a pull-request author to approve their own
+change, so a trust-root or CODEOWNERS update authored by the sole maintainer can require
+the narrowly restricted repository-rules bypass.
+
+That bypass is an audited exception, not normal approval. It is acceptable only after
+independent SECURITY and FULL reviews of the complete diff are recorded `CLEAN`, the
+bootstrap/final gates pass, and an authorized maintainer verifies the exact change.
+This repository code does not grant the bypass or configure repository permissions.
 
 ## P04f absorption and live proof
 

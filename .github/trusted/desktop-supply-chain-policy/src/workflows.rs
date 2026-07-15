@@ -9,6 +9,7 @@ use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 
 use crate::input::sha256;
 use crate::input::{SafeRoot, compare_trees};
+use crate::ownership::CODEOWNERS_PATH;
 use crate::process::{CommandSpec, canonical_tool, run_checked};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -265,7 +266,7 @@ pub fn validate_protected_files(trusted: &SafeRoot, candidate: &SafeRoot) -> Pol
         candidate,
         ".github/trusted/desktop-supply-chain-policy",
     )?;
-    for path in [AUTHORITATIVE_PATH, BOOTSTRAP_PATH] {
+    for path in [CODEOWNERS_PATH, AUTHORITATIVE_PATH, BOOTSTRAP_PATH] {
         let trusted_bytes = trusted.read_bytes(path, MAX_WORKFLOW_BYTES)?;
         let candidate_bytes = candidate.read_bytes(path, MAX_WORKFLOW_BYTES)?;
         if trusted_bytes != candidate_bytes {

@@ -16,6 +16,10 @@ use desktop_supply_chain_policy::metadata::{
     MetadataTools, validate_desktop_metadata, validate_desktop_metadata_document,
     validate_root_metadata,
 };
+use desktop_supply_chain_policy::ownership::{
+    CODEOWNER, CODEOWNERS_PATH, canonical_codeowners, frozen_surfaces, validate_codeowners,
+    validate_codeowners_text,
+};
 use desktop_supply_chain_policy::policy::{
     bootstrap_fingerprint, expected_bootstrap_fingerprint, is_bootstrap_state,
     validate_casefold_paths, validate_final_static,
@@ -138,7 +142,7 @@ fn bootstrap_tree(label: &str) -> TempTree {
     assert!(snapshot.starts_with(b"GTABOOT1"));
     let mut offset = 8;
     let count = read_u32(&snapshot, &mut offset);
-    assert_eq!(count, 25);
+    assert_eq!(count, 26);
     for _ in 0..count {
         let path_length = read_u32(&snapshot, &mut offset) as usize;
         let data_length =
@@ -275,7 +279,8 @@ fn fake_manifest(path: &Path, relevant: bool) {
 
 #[test]
 fn live_tree_is_a_valid_bootstrap_or_final_policy_state() {
-    let root = SafeRoot::new(repo_root()).expect("open live repository");
+    let tree = copy_repo("live-policy-state");
+    let root = SafeRoot::new(&tree.path).expect("open copied live repository");
     let identities = validate_inventory(&root).expect("validate live workflow inventory");
     assert_eq!(identities.len(), 8);
     assert!(identities.iter().any(|identity| {
@@ -587,6 +592,16 @@ fn casefolded_policy_aliases_and_collisions_fail_on_every_host() {
             "crates/Example/Cargo.toml".to_owned(),
         ],
         vec![".GitHub/workflows/spoof.yml".to_owned()],
+        vec!["CODEOWNERS".to_owned()],
+        vec!["docs/CODEOWNERS".to_owned()],
+        vec![".github/codeowners".to_owned()],
+        vec![".github/CODEOWNER\u{212a}".to_owned()],
+        vec![".github/CODEOWNERS.".to_owned()],
+        vec![".github/CODEOWNERS ".to_owned()],
+        vec![
+            ".github/CODEOWNERS".to_owned(),
+            ".github/CODEOWNERS".to_owned(),
+        ],
     ] {
         assert!(
             validate_casefold_paths(&paths).is_err(),
@@ -605,6 +620,79 @@ fn casefolded_policy_aliases_and_collisions_fail_on_every_host() {
     assert!(!is_policy_relevant("docs/config.toml"));
     assert!(is_policy_relevant(".cargo/Config.toml"));
     assert!(is_policy_relevant("desktop/Cargo.loc\u{212a}"));
+    assert!(is_policy_relevant(CODEOWNERS_PATH));
+    assert!(is_policy_relevant("docs/CODEOWNERS"));
+    assert!(is_policy_relevant(".github/CODEOWNER\u{212a}"));
+}
+
+#[test]
+fn canonical_codeowners_is_exact_and_does_not_freeze_root_growth() {
+    let root = SafeRoot::new(repo_root()).expect("open live ownership tree");
+    validate_codeowners(&root).expect("validate canonical CODEOWNERS");
+    validate_codeowners_text(canonical_codeowners(), frozen_surfaces())
+        .expect("canonical ownership covers every frozen surface");
+    assert!(canonical_codeowners().lines().all(|line| {
+        line.starts_with('#') || line.trim().is_empty() || line.ends_with(&format!(" {CODEOWNER}"))
+    }));
+    assert!(!canonical_codeowners().contains("\n/Cargo.toml "));
+    assert!(!canonical_codeowners().contains("\n/Cargo.lock "));
+    assert!(!canonical_codeowners().contains("/apps/**"));
+    assert!(!canonical_codeowners().contains("/crates/**"));
+}
+
+#[test]
+fn codeowners_deletion_widening_owner_and_surface_removal_fail() {
+    let canonical = canonical_codeowners().replace("\r\n", "\n");
+    let mutations = [
+        canonical.replace(CODEOWNER, "@untrusted"),
+        canonical.replace(
+            "/desktop/Cargo.toml @aizhihuxiao",
+            "/desktop/** @aizhihuxiao",
+        ),
+        canonical.replace("/desktop/Cargo.lock @aizhihuxiao\n", ""),
+        format!("{canonical}\n/.github/** @aizhihuxiao\n",),
+    ];
+    for (index, mutation) in mutations.iter().enumerate() {
+        let tree = copy_repo(&format!("codeowners-mutation-{index}"));
+        fs::write(tree.join(CODEOWNERS_PATH), mutation).expect("write CODEOWNERS mutation");
+        assert!(
+            validate_codeowners(&SafeRoot::new(&tree.path).expect("open mutation")).is_err(),
+            "CODEOWNERS mutation unexpectedly passed: {mutation}"
+        );
+    }
+
+    let deleted = copy_repo("codeowners-deleted");
+    fs::remove_file(deleted.join(CODEOWNERS_PATH)).expect("delete CODEOWNERS");
+    assert!(validate_codeowners(&SafeRoot::new(&deleted.path).expect("open deletion")).is_err());
+
+    let mut expanded = frozen_surfaces().to_vec();
+    expanded.push("desktop/new-exact-policy.toml");
+    assert!(
+        validate_codeowners_text(canonical_codeowners(), &expanded).is_err(),
+        "new frozen surface passed without canonical ownership"
+    );
+}
+
+#[test]
+fn alternate_codeowners_locations_fail_final_inventory() {
+    let alternates = vec!["CODEOWNERS", "docs/CODEOWNERS"];
+    #[cfg(not(windows))]
+    let alternates = {
+        let mut values = alternates;
+        values.push(".github/codeowners");
+        values
+    };
+    for alternate in alternates {
+        let tree = final_tree(&format!("alternate-{}", alternate.replace('/', "-")));
+        let path = tree.join(alternate);
+        fs::create_dir_all(path.parent().unwrap_or(&tree.path))
+            .expect("create alternate CODEOWNERS parent");
+        fs::write(path, canonical_codeowners()).expect("write alternate CODEOWNERS");
+        assert!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open alternate")).is_err(),
+            "alternate CODEOWNERS unexpectedly passed: {alternate}"
+        );
+    }
 }
 
 #[test]
