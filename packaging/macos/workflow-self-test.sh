@@ -45,10 +45,16 @@ grep -F 'environment: macos-release' <<<"$protected_release" >/dev/null
 grep -F 'actions/download-artifact@' <<<"$protected_release" >/dev/null
 grep -F 'if: always()' <<<"$protected_release" >/dev/null
 
-if grep -F 'actions/checkout@' <<<"$protected_release" >/dev/null; then
-  echo "protected release job must never checkout repository code" >&2
-  exit 1
-fi
+test "$(grep -c 'uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' <<<"$protected_release")" -eq 1
+# shellcheck disable=SC2016
+grep -F 'ref: ${{ needs.release-policy.outputs.release-sha }}' \
+  <<<"$protected_release" >/dev/null
+grep -F 'fetch-depth: 1' <<<"$protected_release" >/dev/null
+grep -F 'fetch-tags: false' <<<"$protected_release" >/dev/null
+grep -F 'persist-credentials: false' <<<"$protected_release" >/dev/null
+grep -F 'sparse-checkout: .github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh' \
+  <<<"$protected_release" >/dev/null
+grep -F 'sparse-checkout-cone-mode: false' <<<"$protected_release" >/dev/null
 if grep -E '^    env:' <<<"$protected_release" >/dev/null; then
   echo "protected release job must not define job-scoped secrets" >&2
   exit 1

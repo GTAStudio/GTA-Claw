@@ -1,0 +1,3 @@
+#!/bin/sh
+printf 'executed\n' >"${SHADOW_TOOL_POISON_MARKER:?}"
+exit 99

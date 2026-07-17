@@ -20,7 +20,7 @@ binary="$app/Contents/MacOS/$EXECUTABLE_NAME"
 icon="$app/Contents/Resources/GTAClaw.icns"
 
 [[ -d "$app" && ! -L "$app" ]] || die "missing app bundle: $app"
-reject_symlinks "$app"
+assert_app_executable_contract "$app"
 [[ -f "$plist" && -f "$binary" && -x "$binary" && -s "$icon" ]] ||
   die "app bundle is missing required plist, executable, or icon"
 plutil -lint "$plist" >/dev/null
@@ -57,7 +57,9 @@ if find "$app" -type f \( \
 \) -print -quit | grep . >/dev/null; then
   die "app bundle contains a JavaScript or Node runtime artifact"
 fi
-if macho_dependencies "$binary" | grep -Ei '(^|/)libnode|javascriptcore' >/dev/null; then
+dependencies="$(macho_dependencies "$binary")" ||
+  die "otool could not inspect runtime dependencies for $binary"
+if grep -Ei '(^|/)libnode|javascriptcore' <<<"$dependencies" >/dev/null; then
   die "app binary links a JavaScript runtime"
 fi
 
