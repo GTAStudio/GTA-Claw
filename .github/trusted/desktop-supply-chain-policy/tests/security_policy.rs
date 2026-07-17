@@ -24,7 +24,7 @@ use desktop_supply_chain_policy::ownership::{
 };
 use desktop_supply_chain_policy::policy::{
     bootstrap_fingerprint, bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
-    validate_casefold_paths, validate_final_static,
+    validate_casefold_paths, validate_final_static, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
 use desktop_supply_chain_policy::validation::{
@@ -411,11 +411,11 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "fe56db78495e1ae5104940a929f0178466c7c350c78b129e24594a578e2051c8",
     "420e9159c23eae96a5b7c8fbdd1e84fead0e99e83b88a90b42bad93872947e4b",
     "6323a7af697145771d2c7347e8d58b7473a03aebdd9f4f454373265cd878b109",
-    "0e4b6c44ec573890a54febe755febd8c901c0cf7de0490edabdaa1038d23a4b6",
+    "6f9e9832a4b82fb713d312da5003f65c5c95324fc10a1ec64f5f59cc28bafcb0",
     "d25d49c53c9c183dd0686e25d714c17a8658992615b1c51b5154af2d5795eec7",
-    "5a9b6f736707897a7ebd1f005088b5ed62229b26772e89247b7d89fddfc55ca8",
-    "2dda511e493e182898c3bbc4a62f7aa4fd79d195dd31f8273a7dee8dfde29388",
-    "487e80e3e0b7b4faceabfbce8ee8073ff198503e46797515ddf61128ec4ad5e9",
+    "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
+    "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe",
+    "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d",
     "0139b9474d8e201c6126a900524d1ad1d3f59e3b1ea9a4665374fd72761112d6",
     "6303571211846bc3ae6c676d63d7fec0a67eef5e71a050a493aed1d4472a82b8",
     "0b9e411b3b2fe050d3a5e7783a9ad76c8ddb2572a662c245fe263479b026adff",
@@ -423,14 +423,20 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "b7c8d0cca17dca4c9c797578b707b421d3711d55a06cf742b40cf520869c0cf6",
     "65a029857e31de2dbcbf828894bc531934cc1b44f118cd5e8385ff14f0989a3e",
     "47e61272f490f577ea2199560cd5bffcf5cd473c2d228f14f6950cd2b2dde010",
-    "80698528e94f193ba01baf5ec24cf963507704b16d30c366c971956fe36825bd",
-    "98d13c554f8823e8cf6030d6a206bdfca2fe268b5c36bbac72a1e58388f237e6",
-    "f6a3a3a845863f323a93fa19c5aa911a11eaf9797d7b2985357d29963a30e748",
-    "957b9f80f941b2aa1f36ca66855d991b8befb905c2e92b9eccecd749d1ccdf98",
-    "68c138394fefda8e53f2979c35119c04be161e26fd15247ee6bf4d377beb41e4",
-    "d6c702ce21d50e0ad523c001a94b780cbac70e0a55be980672827bbad9d45e47",
-    "c248cd7d6b3d87a4f49786447e461f9f313a6d2be045cd07ed9c429616fea737",
-    "f6bbca51ac1b269d21d05bec735c79ec9848c1dd05085bda1881dfdea2c86ad0",
+    "dbbf5e53488e8977958a95ab58e03ba89ee9da7503ffe0e58dd946946afb8179",
+    "bb2febc949e862a6e5c0904f4041b19853e7bde3f06f17627f4c828519b856d7",
+    "781a04de8ae53429a22b602b303fe9f870def0c545f7a056c7ea322677984409",
+    "8fcfb80aae55f86784ae9beb5156adbc0fc39d1fd94e4c38168eb98d2b2eb673",
+    "9c80415e5ee8df92ffd430eccb522092c976a664e465a2ff0b1f1b005bee9b98",
+    "615596b62a471f0770006a9c0cc42b2c0693550f2fbdee876478b060f176b4f9",
+    "3491150028a9366726ce7d277138d1e28603a1d6f94fa1f2c22db61297659d07",
+    "a2575b5c38377babd9418a0d7741c1e3bebf551b5dcac449c306e3fcc3352567",
+];
+
+const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
+    "597bfbaf79ac07fa1cbddb25acba7ac1446a8e1d02296149e5a3fe715ce85f06",
+    "d1cc4a296b767bcb4082506c572d30d91369ec99db4ce5182ea24e93526d8a79",
+    "c0bf44bbc8a93fbe08f33fcc990354cc36dac8da1a556e9a4b05e8686d3b50ae",
 ];
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1496,6 +1502,189 @@ fn complete_final_fixture_passes_static_policy() {
 }
 
 #[test]
+fn final_dependency_fixture_writer_is_canonical() {
+    let tree = copy_repo("final-dependency-writer");
+    let root = SafeRoot::new(&tree.path).expect("open Final dependency writer fixture");
+    for fixture in [
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.toml.fixture",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.lock.fixture",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/deny.toml.fixture",
+    ] {
+        fs::write(tree.join(fixture), b"stale\n").expect("stale Final dependency fixture");
+    }
+    write_final_dependency_fixtures(&root).expect("write canonical Final dependency fixtures");
+    for (live, fixture) in [
+        (
+            "desktop/Cargo.toml",
+            ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.toml.fixture",
+        ),
+        (
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture",
+        ),
+        (
+            "desktop/Cargo.lock",
+            ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.lock.fixture",
+        ),
+        (
+            "desktop/deny.toml",
+            ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/deny.toml.fixture",
+        ),
+    ] {
+        assert_eq!(
+            fs::read(tree.join(live)).expect("read live dependency artifact"),
+            fs::read(tree.join(fixture)).expect("read Final dependency fixture"),
+            "canonical writer diverged for {live}"
+        );
+    }
+}
+
+#[test]
+fn superseded_final_and_dependency_surface_mutations_are_rejected() {
+    let canonical = final_tree("dependency-transition-canonical");
+    let paths = [
+        "desktop/Cargo.toml",
+        "desktop/apps/gta-claw-desktop/Cargo.toml",
+        "desktop/Cargo.lock",
+    ];
+    for (path, superseded) in paths.iter().zip(SUPERSEDED_FINAL_DEPENDENCY_SHA256) {
+        let current = sha256(&fs::read(canonical.join(path)).expect("read canonical dependency"));
+        assert_ne!(
+            current, superseded,
+            "canonical Final retained superseded bytes: {path}"
+        );
+    }
+
+    let superseded_desktop = final_tree("superseded-desktop-manifest");
+    let mut desktop = fs::read_to_string(superseded_desktop.join("desktop/Cargo.toml"))
+        .expect("read canonical desktop manifest");
+    for addition in [
+        "claw-gateway-client = { path = \"../crates/claw-gateway-client\", version = \"0.1.0\" }\n",
+        "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }\n",
+        "claw-security = { path = \"../crates/claw-security\", version = \"0.1.0\" }\n",
+    ] {
+        desktop = desktop.replacen(addition, "", 1);
+    }
+    assert_eq!(
+        sha256(desktop.as_bytes()),
+        SUPERSEDED_FINAL_DEPENDENCY_SHA256[0]
+    );
+    fs::write(superseded_desktop.join("desktop/Cargo.toml"), desktop)
+        .expect("write superseded desktop manifest");
+    assert_eq!(
+        validate_final_static(
+            &SafeRoot::new(&superseded_desktop.path).expect("open superseded desktop manifest")
+        )
+        .expect_err("superseded desktop manifest unexpectedly passed")
+        .to_string(),
+        "exact security policy file changed: desktop/Cargo.toml"
+    );
+
+    let superseded_app = final_tree("superseded-app-manifest");
+    let mut app =
+        fs::read_to_string(superseded_app.join("desktop/apps/gta-claw-desktop/Cargo.toml"))
+            .expect("read canonical app manifest");
+    for addition in [
+        "claw-gateway-client.workspace = true\n",
+        "claw-protocol.workspace = true\n",
+        "claw-security.workspace = true\n",
+        "getrandom = { version = \"=0.4.3\", features = [\"sys_rng\"] }\n",
+        "secrecy = \"=0.10.3\"\n",
+        "serde_json = { version = \"=1.0.150\", features = [\"raw_value\"] }\n",
+        "tokio = { version = \"=1.52.3\", features = [\"io-util\", \"macros\", \"net\", \"rt-multi-thread\", \"sync\", \"time\"] }\n",
+        "tokio-util = { version = \"=0.7.18\", features = [\"rt\"] }\n",
+        "url = \"=2.5.8\"\n",
+        "\n[target.'cfg(any(target_os = \"windows\", target_os = \"macos\"))'.dev-dependencies]\nbase64 = \"=0.22.1\"\nfastwebsockets = { version = \"=0.10.0\", default-features = false }\nhttparse = \"=1.10.1\"\nsha1 = \"=0.11.0\"\n",
+    ] {
+        app = app.replacen(addition, "", 1);
+    }
+    assert_eq!(
+        sha256(app.as_bytes()),
+        SUPERSEDED_FINAL_DEPENDENCY_SHA256[1]
+    );
+    fs::write(
+        superseded_app.join("desktop/apps/gta-claw-desktop/Cargo.toml"),
+        app,
+    )
+    .expect("write superseded app manifest");
+    assert_eq!(
+        validate_final_static(
+            &SafeRoot::new(&superseded_app.path).expect("open superseded app manifest")
+        )
+        .expect_err("superseded app manifest unexpectedly passed")
+        .to_string(),
+        "exact security policy file changed: desktop/apps/gta-claw-desktop/Cargo.toml"
+    );
+
+    for (label, file, from, to) in [
+        (
+            "gateway-registry",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "claw-gateway-client.workspace = true",
+            "claw-gateway-client = \"=0.1.0\"",
+        ),
+        (
+            "security-path",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "claw-security.workspace = true",
+            "claw-security = { path = \"../../../../crates/claw-security\" }",
+        ),
+        (
+            "tokio-extra-feature",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "\"sync\", \"time\"]",
+            "\"sync\", \"time\", \"tracing\"]",
+        ),
+        (
+            "extra-dependency",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "url = \"=2.5.8\"",
+            "url = \"=2.5.8\"\nzeroize = \"=1.9.0\"",
+        ),
+        (
+            "dependency-alias",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "claw-security.workspace = true",
+            "security-alias = { package = \"claw-security\", workspace = true }",
+        ),
+        (
+            "linux-slint",
+            "desktop/apps/gta-claw-desktop/Cargo.toml",
+            "[lints]",
+            "[target.'cfg(target_os = \"linux\")'.dependencies]\nslint = \"=1.17.1\"\n\n[lints]",
+        ),
+    ] {
+        let tree = final_tree(label);
+        replace(&tree.join(file), from, to);
+        assert!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open dependency mutation"))
+                .is_err(),
+            "dependency surface mutation unexpectedly passed: {label}"
+        );
+    }
+
+    for package in [
+        "extra-audit-lock",
+        "quick-xml",
+        "wayland-client",
+        "smithay-client-toolkit",
+    ] {
+        let tree = final_tree(&format!("lock-{package}"));
+        let mut lock = fs::read_to_string(tree.join("desktop/Cargo.lock"))
+            .expect("read canonical desktop lock");
+        lock.push_str(&format!(
+            "\n[[package]]\nname = \"{package}\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n"
+        ));
+        fs::write(tree.join("desktop/Cargo.lock"), lock).expect("write desktop lock mutation");
+        assert!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open lock mutation")).is_err(),
+            "desktop lock mutation unexpectedly passed: {package}"
+        );
+    }
+}
+
+#[test]
 fn root_gui_family_aliases_and_lock_packages_fail_closed() {
     for (label, dependency) in [
         ("gtk4-direct", "gtk4-helper = \"=1.0.0\"\n"),
@@ -2502,8 +2691,9 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
 
     let actionlint_fixture = TempTree::new("actual-actionlint-mutations");
     let mut actionlint_paths = Vec::new();
+    let mut mutated_hashes = Vec::with_capacity(P04F_MUTATION_ORACLE.len());
     let mut names = BTreeSet::new();
-    for (index, (case, oracle)) in cases.iter().zip(P04F_MUTATION_ORACLE).enumerate() {
+    for (case, oracle) in cases.iter().zip(P04F_MUTATION_ORACLE) {
         let name = oracle.name;
         let mutation = oracle.mutation;
         assert!(names.insert(name));
@@ -2572,12 +2762,7 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
                 toml::to_string(&app).expect("serialize oracle app manifest")
             }
         };
-        assert_eq!(
-            sha256(mutated_bytes.as_bytes()),
-            P04F_MUTATED_ARTIFACT_SHA256[index],
-            "mutation bytes do not match the independent rule oracle: {mutation} ({})",
-            oracle.expected
-        );
+        mutated_hashes.push(sha256(mutated_bytes.as_bytes()));
 
         let rust_path = actionlint_fixture.join(format!("{name}-rust.yml"));
         let macos_path = actionlint_fixture.join(format!("{name}-macos.yml"));
@@ -2646,6 +2831,14 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
     }
     assert_eq!(names.len(), P04F_MUTATION_ORACLE.len());
     assert_eq!(actionlint_paths.len(), P04F_MUTATION_ORACLE.len() * 2);
+    assert_eq!(
+        mutated_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        P04F_MUTATED_ARTIFACT_SHA256,
+        "mutation bytes do not match the independent rule oracle"
+    );
 
     if let Some(actionlint) = local_actionlint() {
         let mut spec = CommandSpec::new(&actionlint.path, &actionlint_fixture.path)

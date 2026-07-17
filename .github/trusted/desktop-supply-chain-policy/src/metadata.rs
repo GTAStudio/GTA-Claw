@@ -17,6 +17,64 @@ const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const TARGET_EXPRESSION: &str = r#"cfg(any(target_os = "windows", target_os = "macos"))"#;
 const CARGO_VERSION: &str = "cargo 1.94.0 (85eff7c80 2026-01-15)";
 const RUSTC_VERSION_PREFIX: &str = "rustc 1.94.0 (4a4ef493e 2026-03-02)";
+const EMPTY_FEATURES: &[&str] = &[];
+const DESKTOP_DEPENDENCIES: [ExpectedDesktopDependency; 17] = [
+    ExpectedDesktopDependency::registry("base64", "=0.22.1", Some("dev"), true, EMPTY_FEATURES),
+    ExpectedDesktopDependency::local("claw-application"),
+    ExpectedDesktopDependency::local("claw-gateway-client"),
+    ExpectedDesktopDependency::local("claw-platform"),
+    ExpectedDesktopDependency::local("claw-protocol"),
+    ExpectedDesktopDependency::local("claw-security"),
+    ExpectedDesktopDependency::registry(
+        "fastwebsockets",
+        "=0.10.0",
+        Some("dev"),
+        false,
+        EMPTY_FEATURES,
+    ),
+    ExpectedDesktopDependency::registry("getrandom", "=0.4.3", None, true, &["sys_rng"]),
+    ExpectedDesktopDependency::registry("httparse", "=1.10.1", Some("dev"), true, EMPTY_FEATURES),
+    ExpectedDesktopDependency::registry("secrecy", "=0.10.3", None, true, EMPTY_FEATURES),
+    ExpectedDesktopDependency::registry("serde_json", "=1.0.150", None, true, &["raw_value"]),
+    ExpectedDesktopDependency::registry("sha1", "=0.11.0", Some("dev"), true, EMPTY_FEATURES),
+    ExpectedDesktopDependency::registry(
+        "slint",
+        "=1.17.1",
+        None,
+        false,
+        &[
+            "accessibility",
+            "backend-winit-x11",
+            "compat-1-2",
+            "renderer-femtovg",
+            "renderer-software",
+            "std",
+        ],
+    ),
+    ExpectedDesktopDependency::registry(
+        "slint-build",
+        "=1.17.1",
+        Some("build"),
+        true,
+        EMPTY_FEATURES,
+    ),
+    ExpectedDesktopDependency::registry(
+        "tokio",
+        "=1.52.3",
+        None,
+        true,
+        &[
+            "io-util",
+            "macros",
+            "net",
+            "rt-multi-thread",
+            "sync",
+            "time",
+        ],
+    ),
+    ExpectedDesktopDependency::registry("tokio-util", "=0.7.18", None, true, &["rt"]),
+    ExpectedDesktopDependency::registry("url", "=2.5.8", None, true, EMPTY_FEATURES),
+];
 /// Official Rust 1.94.0 Linux Cargo binary SHA-256.
 pub const LINUX_CARGO_SHA256: &str =
     "77f14b761b02b47e6747473f556b3bc9f98f7e4525b7c3b8d74898ff816e4636";
@@ -35,6 +93,46 @@ pub struct MetadataTools {
     pub cargo_sha256: String,
     /// Lowercase SHA-256 for rustc.
     pub rustc_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedDesktopDependency {
+    name: &'static str,
+    requirement: &'static str,
+    kind: Option<&'static str>,
+    uses_default_features: bool,
+    features: &'static [&'static str],
+    local: bool,
+}
+
+impl ExpectedDesktopDependency {
+    const fn local(name: &'static str) -> Self {
+        Self {
+            name,
+            requirement: "^0.1.0",
+            kind: None,
+            uses_default_features: true,
+            features: EMPTY_FEATURES,
+            local: true,
+        }
+    }
+
+    const fn registry(
+        name: &'static str,
+        requirement: &'static str,
+        kind: Option<&'static str>,
+        uses_default_features: bool,
+        features: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            requirement,
+            kind,
+            uses_default_features,
+            features,
+            local: false,
+        }
+    }
 }
 
 /// Constructs the production Linux tool pins from base-owned constants.
@@ -226,6 +324,16 @@ fn text<'a>(value: Option<&'a JsonValue>, label: &str) -> PolicyResult<&'a str> 
     value
         .and_then(JsonValue::as_str)
         .ok_or_else(|| PolicyError::new(format!("{label} must be a JSON string")))
+}
+
+fn nullable_text<'a>(value: Option<&'a JsonValue>, label: &str) -> PolicyResult<Option<&'a str>> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(_) => Err(PolicyError::new(format!(
+            "{label} must be a JSON string or null"
+        ))),
+    }
 }
 
 fn canonical_metadata_path(value: &str, label: &str) -> PolicyResult<PathBuf> {
@@ -422,7 +530,7 @@ fn require_desktop_dependencies(
             .ok_or_else(|| PolicyError::new("desktop metadata dependencies are missing"))?,
         "desktop dependencies",
     )?;
-    if dependencies.len() != 4 {
+    if dependencies.len() != DESKTOP_DEPENDENCIES.len() {
         return Err(PolicyError::new(format!(
             "desktop metadata dependency count changed: {}",
             dependencies.len()
@@ -432,6 +540,13 @@ fn require_desktop_dependencies(
     for dependency in dependencies {
         let dependency = object(dependency, "desktop dependency")?;
         let name = text(dependency.get("name"), "dependency.name")?;
+        let expected = DESKTOP_DEPENDENCIES
+            .iter()
+            .find(|expected| expected.name == name)
+            .ok_or_else(|| {
+                PolicyError::new(format!("unexpected desktop metadata dependency: {name}"))
+            })?;
+        let features = string_array(dependency.get("features"), "dependency.features")?;
         if !seen.insert(name.to_owned())
             || dependency
                 .get("rename")
@@ -441,79 +556,41 @@ fn require_desktop_dependencies(
             || dependency
                 .get("registry")
                 .is_some_and(|value| !value.is_null())
+            || text(dependency.get("req"), "dependency.req")? != expected.requirement
+            || nullable_text(dependency.get("kind"), "dependency.kind")? != expected.kind
+            || dependency
+                .get("uses_default_features")
+                .and_then(JsonValue::as_bool)
+                != Some(expected.uses_default_features)
+            || !features
+                .iter()
+                .map(String::as_str)
+                .eq(expected.features.iter().copied())
         {
             return Err(PolicyError::new(format!(
                 "desktop metadata dependency controls changed: {name}"
             )));
         }
-        match name {
-            "claw-application" | "claw-platform" => {
-                if dependency
-                    .get("source")
-                    .is_some_and(|value| !value.is_null())
-                    || text(dependency.get("req"), "dependency.req")? != "^0.1.0"
-                    || dependency.get("kind").is_some_and(|value| !value.is_null())
-                    || dependency
-                        .get("uses_default_features")
-                        .and_then(JsonValue::as_bool)
-                        != Some(true)
-                    || !string_array(dependency.get("features"), "dependency.features")?.is_empty()
-                {
-                    return Err(PolicyError::new(format!(
-                        "desktop local dependency metadata changed: {name}"
-                    )));
-                }
-                let expected = candidate.path().join("crates").join(name);
-                require_path(
-                    text(dependency.get("path"), "dependency.path")?,
-                    &expected,
-                    candidate,
-                    "desktop local dependency path",
-                )?;
-            }
-            "slint" => {
-                if text(dependency.get("source"), "slint.source")?
-                    != "registry+https://github.com/rust-lang/crates.io-index"
-                    || text(dependency.get("req"), "slint.req")? != "=1.17.1"
-                    || dependency.get("kind").is_some_and(|value| !value.is_null())
-                    || dependency.get("path").is_some_and(|value| !value.is_null())
-                    || dependency
-                        .get("uses_default_features")
-                        .and_then(JsonValue::as_bool)
-                        != Some(false)
-                    || string_array(dependency.get("features"), "slint.features")?
-                        != [
-                            "accessibility",
-                            "backend-winit-x11",
-                            "compat-1-2",
-                            "renderer-femtovg",
-                            "renderer-software",
-                            "std",
-                        ]
-                {
-                    return Err(PolicyError::new("desktop Slint metadata changed"));
-                }
-            }
-            "slint-build" => {
-                if text(dependency.get("source"), "slint-build.source")?
-                    != "registry+https://github.com/rust-lang/crates.io-index"
-                    || text(dependency.get("req"), "slint-build.req")? != "=1.17.1"
-                    || text(dependency.get("kind"), "slint-build.kind")? != "build"
-                    || dependency.get("path").is_some_and(|value| !value.is_null())
-                    || dependency
-                        .get("uses_default_features")
-                        .and_then(JsonValue::as_bool)
-                        != Some(true)
-                    || !string_array(dependency.get("features"), "slint-build.features")?.is_empty()
-                {
-                    return Err(PolicyError::new("desktop slint-build metadata changed"));
-                }
-            }
-            _ => {
+        if expected.local {
+            if nullable_text(dependency.get("source"), "dependency.source")?.is_some() {
                 return Err(PolicyError::new(format!(
-                    "unexpected desktop metadata dependency: {name}"
+                    "desktop local dependency metadata changed: {name}"
                 )));
             }
+            let expected_path = candidate.path().join("crates").join(name);
+            require_path(
+                text(dependency.get("path"), "dependency.path")?,
+                &expected_path,
+                candidate,
+                "desktop local dependency path",
+            )?;
+        } else if nullable_text(dependency.get("source"), "dependency.source")?
+            != Some("registry+https://github.com/rust-lang/crates.io-index")
+            || nullable_text(dependency.get("path"), "dependency.path")?.is_some()
+        {
+            return Err(PolicyError::new(format!(
+                "desktop registry dependency metadata changed: {name}"
+            )));
         }
     }
     Ok(())
