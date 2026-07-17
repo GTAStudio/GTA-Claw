@@ -1,0 +1,14 @@
+# Deferred contract only: this file deliberately does not have a .socket
+# suffix and is not installed into systemd's unit search path.
+#
+# The current gta-claw-daemon neither accepts a listening socket nor consumes
+# LISTEN_FDS/LISTEN_PID. Installing or enabling a socket unit would therefore
+# create a listener whose clients hang. Once the daemon implements systemd
+# socket activation, the intended endpoint is:
+#
+# [Socket]
+# ListenStream=/run/gta-claw/daemon.sock
+# SocketMode=0660
+# RemoveOnStop=yes
+#
+# No Linux package currently claims or enables this endpoint.

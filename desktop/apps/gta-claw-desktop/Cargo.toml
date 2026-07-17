@@ -19,7 +19,7 @@ secrecy = "=0.10.3"
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
 slint = { version = "=1.17.1", default-features = false, features = [
   "accessibility",
-  "backend-winit",
+  "backend-winit-x11",
   "compat-1-2",
   "renderer-femtovg",
   "renderer-software",
@@ -37,6 +37,11 @@ base64 = "=0.22.1"
 fastwebsockets = { version = "=0.10.0", default-features = false }
 httparse = "=1.10.1"
 sha1 = "=0.11.0"
+
+[[test]]
+name = "macos_winit_smoke"
+path = "tests/macos_winit_smoke.rs"
+harness = false
 
 [lints]
 workspace = true

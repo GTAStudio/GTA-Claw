@@ -355,24 +355,27 @@ assert_binary_arches() {
 }
 
 macho_dependencies() {
-  otool -L "$1" |
-    tail -n +2 |
+  local output
+  output="$(otool -L "$1")" || return 1
+  tail -n +2 <<<"$output" |
     sed -E 's/^[[:space:]]*//; /:$/d; s/[[:space:]]+\(compatibility version.*$//' |
     LC_ALL=C sort -u
 }
 
 macho_rpaths() {
-  otool -l "$1" |
-    awk '
+  local output
+  output="$(otool -l "$1")" || return 1
+  awk '
       $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
       in_rpath && $1 == "path" { print $2; in_rpath = 0 }
-    ' |
+    ' <<<"$output" |
     LC_ALL=C sort -u
 }
 
 macho_minimum_versions() {
-  otool -l "$1" |
-    awk '
+  local output
+  output="$(otool -l "$1")" || return 1
+  awk '
       $1 == "cmd" && ($2 == "LC_BUILD_VERSION" || $2 == "LC_VERSION_MIN_MACOSX") {
         in_version = 1
         next
@@ -381,7 +384,7 @@ macho_minimum_versions() {
         print $2
         in_version = 0
       }
-    ' |
+    ' <<<"$output" |
     LC_ALL=C sort -u
 }
 
@@ -389,20 +392,26 @@ assert_macho_minimum_version() {
   local binary="$1"
   local found=0
   local version
+  local versions
+  versions="$(macho_minimum_versions "$binary")" ||
+    die "otool could not inspect minimum versions for $binary"
   while IFS= read -r version; do
     [[ -n "$version" ]] || continue
     found=1
     [[ "$version" == "$MINIMUM_MACOS_VERSION" || "$version" == "$MINIMUM_MACOS_VERSION.0" ]] ||
       die "deployment target mismatch for $binary (expected $MINIMUM_MACOS_VERSION, found $version)"
-  done < <(macho_minimum_versions "$binary")
+  done <<<"$versions"
   [[ "$found" -eq 1 ]] || die "no macOS deployment target found in $binary"
 }
 
 validate_macho_dependencies() {
   local binary="$1"
   local dependency
+  local dependencies
   local allowed
   local matched
+  dependencies="$(macho_dependencies "$binary")" ||
+    die "otool could not inspect dependencies for $binary"
   while IFS= read -r dependency; do
     [[ -n "$dependency" ]] || continue
     matched=0
@@ -420,20 +429,51 @@ validate_macho_dependencies() {
       matched=1
     fi
     [[ "$matched" -eq 1 ]] || die "unexpected dynamic dependency in $binary: $dependency"
-  done < <(macho_dependencies "$binary")
+  done <<<"$dependencies"
 
   local rpath
+  local rpaths
+  rpaths="$(macho_rpaths "$binary")" ||
+    die "otool could not inspect rpaths for $binary"
   while IFS= read -r rpath; do
     [[ -n "$rpath" ]] || continue
     case "$rpath" in
       @executable_path/../Frameworks | @loader_path/../Frameworks) ;;
       *) die "unexpected LC_RPATH in $binary: $rpath" ;;
     esac
-  done < <(macho_rpaths "$binary")
+  done <<<"$rpaths"
 }
 
 plist_value() {
   /usr/libexec/PlistBuddy -c "Print :$2" "$1"
+}
+
+assert_app_executable_contract() {
+  local app="$1"
+  local contents="$app/Contents"
+  local macos="$contents/MacOS"
+  local plist="$contents/Info.plist"
+  local executable="$macos/gta-claw-desktop"
+  local -a entries=()
+  local entry
+
+  [[ -d "$app" && ! -L "$app" ]] || die "invalid app bundle: $app"
+  [[ -d "$contents" && ! -L "$contents" ]] || die "invalid app Contents directory"
+  [[ -d "$macos" && ! -L "$macos" ]] || die "invalid app MacOS directory"
+  [[ -f "$plist" && ! -L "$plist" ]] || die "invalid app Info.plist"
+  reject_symlinks "$app"
+  /usr/bin/plutil -lint "$plist" >/dev/null
+  /usr/bin/cmp -s \
+    <(/usr/bin/plutil -extract CFBundleExecutable raw -expect string -o - "$plist") \
+    <(/usr/bin/printf 'gta-claw-desktop\n') ||
+    die "CFBundleExecutable must be exactly gta-claw-desktop"
+  while IFS= read -r -d '' entry; do
+    entries+=("$entry")
+  done < <(/usr/bin/find "$macos" -mindepth 1 -maxdepth 1 -print0)
+  [[ "${#entries[@]}" -eq 1 && "${entries[0]}" == "$executable" ]] ||
+    die "Contents/MacOS must contain only gta-claw-desktop"
+  [[ -f "$executable" && ! -L "$executable" && -x "$executable" ]] ||
+    die "canonical app executable is not a regular executable"
 }
 
 source "$MACOS_DIR/config.sh"

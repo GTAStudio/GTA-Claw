@@ -199,6 +199,13 @@ impl TestGateway {
     }
 }
 
+impl Drop for TestGateway {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.tasks.close();
+    }
+}
+
 pub(crate) async fn raw_stalled_server() -> (Url, CancellationToken, TaskTracker) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
@@ -372,6 +379,47 @@ pub(crate) async fn send_hello_with_tick_interval(
     tick_interval_ms: u64,
 ) {
     send_hello_with_policy(socket, id, params, max_payload, None, tick_interval_ms).await;
+}
+
+pub(crate) async fn send_hello_with_authorization(
+    socket: &mut TestSocket,
+    id: &RequestId,
+    connection_id: &str,
+    role: &str,
+    scopes: &[&str],
+    max_payload: usize,
+) {
+    send_json(
+        socket,
+        json!({
+            "type": "res",
+            "id": id.as_str(),
+            "ok": true,
+            "payload": {
+                "type": "hello-ok",
+                "protocol": 4,
+                "server": {"version": "test-gateway", "connId": connection_id},
+                "features": {
+                    "methods": ["health"],
+                    "events": ["connect.challenge", "tick"]
+                },
+                "snapshot": {
+                    "presence": [],
+                    "health": {},
+                    "stateVersion": {"presence": 0, "health": 0},
+                    "uptimeMs": 1,
+                    "authMode": "token"
+                },
+                "auth": {"role": role, "scopes": scopes},
+                "policy": {
+                    "maxPayload": max_payload,
+                    "maxBufferedBytes": max_payload,
+                    "tickIntervalMs": 1000
+                }
+            }
+        }),
+    )
+    .await;
 }
 
 async fn send_hello_with_policy(
