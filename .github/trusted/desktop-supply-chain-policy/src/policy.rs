@@ -43,6 +43,28 @@ const FINAL_SHA_POISON: &[u8] =
     include_bytes!("../policy/final/.github/fixtures/security-tools/shadow-bin/sha256sum");
 const FINAL_TAR_POISON: &[u8] =
     include_bytes!("../policy/final/.github/fixtures/security-tools/shadow-bin/tar");
+const FINAL_DEPENDENCY_FILES: [(&str, &str, u64); 4] = [
+    (
+        DESKTOP_MANIFEST,
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.toml.fixture",
+        DEFAULT_FILE_LIMIT,
+    ),
+    (
+        APP_MANIFEST,
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture",
+        DEFAULT_FILE_LIMIT,
+    ),
+    (
+        DESKTOP_LOCK,
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.lock.fixture",
+        MAX_LOCK_BYTES,
+    ),
+    (
+        "desktop/deny.toml",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/deny.toml.fixture",
+        DEFAULT_FILE_LIMIT,
+    ),
+];
 
 const ROOT_AUDIT: &[u8] = b"[advisories]\nignore = []\n";
 const ROOT_TOOLCHAIN: &[u8] = b"[toolchain]\nchannel = \"1.97.0\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n";
@@ -1060,8 +1082,10 @@ fn validate_desktop_lock(root: &SafeRoot) -> PolicyResult<()> {
     let expected_local = BTreeSet::from([
         "claw-application".to_owned(),
         "claw-domain".to_owned(),
+        "claw-gateway-client".to_owned(),
         "claw-platform".to_owned(),
         "claw-protocol".to_owned(),
+        "claw-security".to_owned(),
         "gta-claw-desktop".to_owned(),
     ]);
     let mut local_packages = BTreeSet::new();
@@ -1136,6 +1160,7 @@ fn validate_final_fixed_files(root: &SafeRoot) -> PolicyResult<()> {
         (".gitattributes", ROOT_GITATTRIBUTES),
         (DESKTOP_MANIFEST, FINAL_DESKTOP_MANIFEST),
         (APP_MANIFEST, FINAL_APP_MANIFEST),
+        (DESKTOP_LOCK, FINAL_DESKTOP_LOCK),
         ("desktop/deny.toml", FINAL_DESKTOP_DENY),
         (
             "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs",
@@ -1281,6 +1306,21 @@ pub fn bootstrap_snapshot(root: &SafeRoot) -> PolicyResult<Vec<u8>> {
 pub fn write_bootstrap_snapshot(root: &SafeRoot, output: &Path) -> PolicyResult<()> {
     fs::write(output, bootstrap_snapshot(root)?)
         .map_err(|cause| error("write Bootstrap snapshot", cause))
+}
+
+/// Copies live dependency artifacts and policy into their canonical Final audit fixtures.
+pub fn write_final_dependency_fixtures(root: &SafeRoot) -> PolicyResult<()> {
+    let mut copies = Vec::with_capacity(FINAL_DEPENDENCY_FILES.len());
+    for (source, destination, limit) in FINAL_DEPENDENCY_FILES {
+        let bytes = root.read_bytes(source, limit)?;
+        let destination = root.regular_file(destination, limit)?;
+        copies.push((destination, bytes));
+    }
+    for (destination, bytes) in copies {
+        fs::write(destination, bytes)
+            .map_err(|cause| error("write Final dependency fixture", cause))?;
+    }
+    Ok(())
 }
 
 /// Returns whether a checkout is the exact short-lived pre-P04f policy state.
