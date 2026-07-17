@@ -5,6 +5,8 @@ import {
     Divider,
     LoadingIndicator,
     PrimaryButton,
+    ResettableTextField,
+    SecureTextField,
     SecondaryButton,
     StatusBadge,
     TextField,
@@ -84,13 +86,19 @@ component ConnectionSummary {
 
 component ConnectionForm {
     in-out property <string> endpoint-input;
+    in property <bool> endpoint-reset-selector;
+    in property <bool> endpoint-preserve-focus;
     in-out property <string> token-input;
+    in property <bool> token-reset-selector;
+    in property <bool> token-preserve-focus;
     in-out property <bool> consent-checked;
     in property <bool> busy;
     in property <bool> can-connect;
     in property <bool> can-cancel;
     in property <bool> can-disconnect;
     in property <bool> can-retry;
+    out property <bool> endpoint-has-focus: endpoint-field.has-focus;
+    out property <bool> token-has-focus: token-field.has-focus;
     callback connect-requested(string, string, bool);
     callback retry-requested(string, string, bool);
     callback cancel-requested;
@@ -126,21 +134,24 @@ component ConnectionForm {
             accessible-role: none;
         }
 
-        endpoint-field := TextField {
+        endpoint-field := ResettableTextField {
             label: "Gateway WebSocket address";
             accessible-name: "Gateway WebSocket address";
             placeholder: "wss://gateway.example";
             text <=> root.endpoint-input;
+            reset-selector: root.endpoint-reset-selector;
+            preserve-focus-on-reset: root.endpoint-preserve-focus;
             enabled: !root.busy && !root.can-disconnect;
             accepted => { root.submit-form(); }
         }
 
-        token-field := TextField {
+        token-field := SecureTextField {
             label: "Session token";
             accessible-name: "Session-only Gateway token";
             placeholder: "Optional when Gateway policy allows";
-            input-type: InputType.password;
             text <=> root.token-input;
+            reset-selector: root.token-reset-selector;
+            preserve-focus-on-reset: root.token-preserve-focus;
             enabled: !root.busy && !root.can-disconnect;
             accepted => { root.submit-form(); }
         }
@@ -240,9 +251,15 @@ export component GatewayOnboardingSurface inherits FocusScope {
     in property <bool> can-disconnect;
     in property <bool> can-retry;
     in-out property <string> endpoint-input;
+    in property <bool> endpoint-reset-selector;
+    in property <bool> endpoint-preserve-focus;
     in-out property <string> token-input;
+    in property <bool> token-reset-selector;
+    in property <bool> token-preserve-focus;
     in-out property <bool> consent-checked;
     out property <bool> narrow-layout: root.available-width < 900px;
+    out property <bool> endpoint-has-focus: connection-form.endpoint-has-focus;
+    out property <bool> token-has-focus: connection-form.token-has-focus;
 
     callback connect-requested(string, string, bool);
     callback retry-requested(string, string, bool);
@@ -376,14 +393,25 @@ export component GatewayOnboardingSurface inherits FocusScope {
                     dismiss-requested => { root.error-dismiss-requested(); }
                 }
 
-                if (!root.narrow-layout) : HorizontalLayout {
-                    spacing: Metrics.space-4;
-                    alignment: start;
+                responsive-content := Rectangle {
+                    min-height: root.narrow-layout
+                        ? connection-form.min-height + Metrics.space-4 + connection-summary.min-height
+                        : max(connection-form.min-height, connection-summary.min-height);
+                    background: transparent;
 
-                    ConnectionForm {
-                        horizontal-stretch: 1;
+                    connection-form := ConnectionForm {
+                        x: 0px;
+                        y: 0px;
+                        width: root.narrow-layout
+                            ? parent.width
+                            : max(0px, parent.width - Metrics.space-4 - 420px);
+                        height: self.min-height;
                         endpoint-input <=> root.endpoint-input;
+                        endpoint-reset-selector: root.endpoint-reset-selector;
+                        endpoint-preserve-focus: root.endpoint-preserve-focus;
                         token-input <=> root.token-input;
+                        token-reset-selector: root.token-reset-selector;
+                        token-preserve-focus: root.token-preserve-focus;
                         consent-checked <=> root.consent-checked;
                         busy: root.busy;
                         can-connect: root.can-connect;
@@ -400,42 +428,11 @@ export component GatewayOnboardingSurface inherits FocusScope {
                         disconnect-requested => { root.disconnect-requested(); }
                     }
 
-                    ConnectionSummary {
-                        width: 420px;
-                        horizontal-stretch: 0;
-                        endpoint: root.endpoint-summary;
-                        server: root.server-summary;
-                        protocol: root.protocol-summary;
-                        role: root.role-summary;
-                        scopes: root.scopes-summary;
-                        health: root.health-summary;
-                        identity: root.identity-summary;
-                    }
-                }
-
-                if (root.narrow-layout) : VerticalLayout {
-                    spacing: Metrics.space-4;
-
-                    ConnectionForm {
-                        endpoint-input <=> root.endpoint-input;
-                        token-input <=> root.token-input;
-                        consent-checked <=> root.consent-checked;
-                        busy: root.busy;
-                        can-connect: root.can-connect;
-                        can-cancel: root.can-cancel;
-                        can-disconnect: root.can-disconnect;
-                        can-retry: root.can-retry;
-                        connect-requested(endpoint, token, consent) => {
-                            root.connect-requested(endpoint, token, consent);
-                        }
-                        retry-requested(endpoint, token, consent) => {
-                            root.retry-requested(endpoint, token, consent);
-                        }
-                        cancel-requested => { root.cancel-requested(); }
-                        disconnect-requested => { root.disconnect-requested(); }
-                    }
-
-                    ConnectionSummary {
+                    connection-summary := ConnectionSummary {
+                        x: root.narrow-layout ? 0px : parent.width - self.width;
+                        y: root.narrow-layout ? connection-form.min-height + Metrics.space-4 : 0px;
+                        width: root.narrow-layout ? parent.width : 420px;
+                        height: self.min-height;
                         endpoint: root.endpoint-summary;
                         server: root.server-summary;
                         protocol: root.protocol-summary;

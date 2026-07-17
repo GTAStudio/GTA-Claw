@@ -109,6 +109,12 @@ impl UserError {
                 "The health check was cancelled when the connection changed.",
                 "A fresh health check will run after reconnection.",
             ),
+            GatewayClientError::ConnectionChanged { .. } => Self::new(
+                UserErrorKind::Transport,
+                "gateway.connection-changed",
+                "The Gateway connection changed before this health check completed.",
+                "A fresh health check will run on the new authenticated connection.",
+            ),
             GatewayClientError::RequestTimedOut(_) => Self::new(
                 UserErrorKind::Transport,
                 "gateway.health-timeout",
@@ -198,7 +204,8 @@ impl UserError {
                 "gateway.protocol-version",
                 "The Gateway does not support the required pinned protocol version.",
             ),
-            ProtocolFailure::HelloAuthenticationMismatch => (
+            ProtocolFailure::HelloAuthenticationMismatch
+            | ProtocolFailure::WebSocketProtocol("hello authentication mismatch") => (
                 "gateway.protocol-scope",
                 "The Gateway returned role or scope claims that did not match the request.",
             ),
@@ -270,11 +277,11 @@ impl GatewayEndpoint {
         }
 
         let url = Url::parse(&input).map_err(|_| EndpointRejection::invalid(None, None))?;
+        if !matches!(url.scheme(), "ws" | "wss") || url.host().is_none() {
+            return Err(EndpointRejection::invalid(None, None));
+        }
         let input = sanitize_url(&url);
         let display = bounded_text(input.clone(), MAX_ENDPOINT_DISPLAY_CHARS);
-        if !matches!(url.scheme(), "ws" | "wss") || url.host().is_none() {
-            return Err(EndpointRejection::invalid(Some(input), Some(display)));
-        }
         if !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -379,25 +386,33 @@ impl ConnectRequest {
         token: String,
         consent: bool,
     ) -> Result<Self, SubmissionRejection> {
+        let token_len = token.len();
         let token = if token.is_empty() {
             None
-        } else if token.len() <= MAX_TOKEN_BYTES {
-            Some(SecretString::from(token))
         } else {
+            Some(SecretString::from(token))
+        };
+        let endpoint =
+            GatewayEndpoint::parse(endpoint).map_err(|rejection| SubmissionRejection {
+                endpoint_input: rejection.input,
+                endpoint_display: rejection.display,
+                error: rejection.error,
+            })?;
+        if token_len > MAX_TOKEN_BYTES {
             return Err(SubmissionRejection {
-                endpoint_input: None,
-                endpoint_display: None,
+                endpoint_input: Some(endpoint.input().to_owned()),
+                endpoint_display: Some(endpoint.display().to_owned()),
                 error: UserError::input(
                     "token.too-long",
                     "The session token exceeds the desktop safety bound.",
                     "Use a valid bounded Gateway token.",
                 ),
             });
-        };
+        }
         if !consent {
             return Err(SubmissionRejection {
-                endpoint_input: None,
-                endpoint_display: None,
+                endpoint_input: Some(endpoint.input().to_owned()),
+                endpoint_display: Some(endpoint.display().to_owned()),
                 error: UserError::input(
                     "identity.consent-required",
                     "Consent is required before creating an ephemeral device identity.",
@@ -405,14 +420,7 @@ impl ConnectRequest {
                 ),
             });
         }
-        match GatewayEndpoint::parse(endpoint) {
-            Ok(endpoint) => Ok(Self { endpoint, token }),
-            Err(rejection) => Err(SubmissionRejection {
-                endpoint_input: rejection.input,
-                endpoint_display: rejection.display,
-                error: rejection.error,
-            }),
-        }
+        Ok(Self { endpoint, token })
     }
 
     pub(crate) fn endpoint_display(&self) -> &str {
@@ -971,6 +979,16 @@ mod tests {
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("hidden"));
         assert!(!rendered.contains("private"));
+
+        let rejection = ConnectRequest::prepare(
+            "data:text/plain,SESSION_TOKEN".to_owned(),
+            String::new(),
+            true,
+        )
+        .expect_err("unsupported opaque scheme rejected");
+        assert_eq!(rejection.endpoint_input, None);
+        assert_eq!(rejection.endpoint_display, None);
+        assert!(!format!("{rejection:?}").contains("SESSION_TOKEN"));
     }
 
     #[test]
@@ -1005,6 +1023,10 @@ mod tests {
         )
         .expect_err("oversized token");
         assert_eq!(rejection.error.code(), "token.too-long");
+        assert_eq!(
+            rejection.endpoint_input.as_deref(),
+            Some("ws://localhost:18789/")
+        );
     }
 
     #[test]
@@ -1013,6 +1035,19 @@ mod tests {
             ConnectRequest::prepare("ws://localhost:18789".to_owned(), String::new(), false)
                 .expect_err("consent required");
         assert_eq!(rejection.error.code(), "identity.consent-required");
+        assert_eq!(
+            rejection.endpoint_input.as_deref(),
+            Some("ws://localhost:18789/")
+        );
+
+        let rejection = ConnectRequest::prepare(
+            "not-a-gateway token=must-not-survive ".to_owned(),
+            String::new(),
+            false,
+        )
+        .expect_err("malformed endpoint rejected before consent");
+        assert_eq!(rejection.error.code(), "endpoint.invalid");
+        assert_eq!(rejection.endpoint_input, None);
     }
 
     #[test]

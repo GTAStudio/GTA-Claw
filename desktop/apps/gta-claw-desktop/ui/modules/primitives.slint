@@ -356,6 +356,241 @@ export component TextField {
     }
 }
 
+component ResettableTextFieldInstance {
+    in property <string> label: "";
+    in property <string> accessible-name: root.label;
+    in-out property <string> text <=> field.text;
+    in property <string> placeholder: "";
+    in property <bool> enabled: true;
+    in property <bool> focus-requested;
+    in property <bool> focus-on-init;
+    out property <bool> has-focus: field.has-focus;
+    callback accepted;
+    callback focus-state-changed(bool);
+
+    min-width: 180px;
+    min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
+    forward-focus: field;
+
+    changed focus-requested => {
+        if (root.focus-requested) {
+            field.focus();
+        }
+    }
+
+    changed has-focus => {
+        root.focus-state-changed(root.has-focus);
+    }
+
+    init => {
+        if (root.focus-on-init) {
+            field.focus();
+        }
+    }
+
+    field := TextField {
+        label: root.label;
+        accessible-name: root.accessible-name;
+        placeholder: root.placeholder;
+        enabled: root.enabled;
+        accepted => { root.accepted(); }
+    }
+}
+
+export component ResettableTextField {
+    in property <string> label: "";
+    in property <string> accessible-name: root.label;
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> enabled: true;
+    in property <bool> reset-selector: false;
+    in property <bool> preserve-focus-on-reset: false;
+    out property <bool> has-focus: false;
+    callback accepted;
+
+    min-width: 180px;
+    min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
+    forward-focus: focus-proxy;
+
+    focus-proxy := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: root.enabled;
+    }
+
+    if (!root.reset-selector) : ResettableTextFieldInstance {
+        label: root.label;
+        accessible-name: root.accessible-name;
+        text <=> root.text;
+        placeholder: root.placeholder;
+        enabled: root.enabled;
+        focus-requested: focus-proxy.has-focus;
+        focus-on-init: root.preserve-focus-on-reset;
+        accepted => { root.accepted(); }
+        focus-state-changed(focused) => { root.has-focus = focused; }
+    }
+
+    if (root.reset-selector) : ResettableTextFieldInstance {
+        label: root.label;
+        accessible-name: root.accessible-name;
+        text <=> root.text;
+        placeholder: root.placeholder;
+        enabled: root.enabled;
+        focus-requested: focus-proxy.has-focus;
+        focus-on-init: root.preserve-focus-on-reset;
+        accepted => { root.accepted(); }
+        focus-state-changed(focused) => { root.has-focus = focused; }
+    }
+}
+
+component SecureEditorInstance {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <string> accessible-name;
+    in property <bool> enabled;
+    in property <bool> focus-requested;
+    in property <bool> focus-on-init;
+    out property <bool> has-focus: field.has-focus;
+    callback accepted;
+    callback focus-state-changed(bool);
+    forward-focus: field;
+    min-height: Metrics.control-medium;
+
+    accessible-role: text-input;
+    accessible-label: root.accessible-name;
+    accessible-value: "";
+    accessible-placeholder-text: root.placeholder;
+    accessible-enabled: root.enabled;
+    accessible-read-only: false;
+
+    changed focus-requested => {
+        if (root.focus-requested) {
+            field.focus();
+        }
+    }
+
+    changed has-focus => {
+        root.focus-state-changed(root.has-focus);
+    }
+
+    init => {
+        if (root.focus-on-init) {
+        field.focus();
+        }
+    }
+
+    Rectangle {
+        background: root.enabled ? DesignTokens.surface-raised : DesignTokens.surface-subtle;
+        border-width: field.has-focus || VisualPreferences.high-contrast ? Metrics.focus-width : 1px;
+        border-color: field.has-focus ? DesignTokens.focus-ring : DesignTokens.border-default;
+        border-radius: Metrics.radius-medium;
+    }
+
+    viewport := Rectangle {
+        x: Metrics.space-3;
+        y: 1px;
+        width: parent.width - 2 * Metrics.space-3;
+        height: parent.height - 2px;
+        clip: true;
+        background: transparent;
+
+        Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text == "" && field.preedit-text == "" ? root.placeholder : "";
+        color: DesignTokens.text-muted;
+        font-size: Metrics.type-small;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+        }
+
+        field := TextInput {
+        private property <length> computed-x: 0px;
+
+        x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+        width: max(parent.width - self.text-cursor-width, self.preferred-width);
+        height: parent.height;
+        text <=> root.text;
+        input-type: InputType.password;
+        enabled: root.enabled;
+        single-line: true;
+        color: DesignTokens.text-primary;
+        font-size: Metrics.type-small;
+        vertical-alignment: center;
+        selection-background-color: DesignTokens.accent;
+        selection-foreground-color: DesignTokens.accent-on;
+        accessible-role: none;
+
+        cursor-position-changed(cursor-position) => {
+            if (cursor-position.x + self.computed-x < 0px) {
+                self.computed-x = -cursor-position.x;
+            } else if (cursor-position.x + self.computed-x > parent.width - self.text-cursor-width) {
+                self.computed-x = parent.width - cursor-position.x - self.text-cursor-width;
+            }
+        }
+
+        accepted => { root.accepted(); }
+        }
+    }
+}
+
+export component SecureTextField {
+    in property <string> label: "";
+    in property <string> accessible-name: root.label;
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> enabled: true;
+    in property <bool> reset-selector: false;
+    in property <bool> preserve-focus-on-reset: false;
+    out property <bool> has-focus: false;
+    callback accepted;
+
+    min-width: 180px;
+    min-height: Metrics.control-medium + (root.label == "" ? 0px : Metrics.line-caption + Metrics.space-1);
+    forward-focus: focus-proxy;
+
+    focus-proxy := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: root.enabled;
+    }
+
+    VerticalLayout {
+        spacing: Metrics.space-1;
+
+        if (root.label != "") : Text {
+            text: root.label;
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-caption;
+            font-weight: 650;
+            accessible-role: none;
+        }
+
+        if (!root.reset-selector) : even-instance := SecureEditorInstance {
+            text <=> root.text;
+            placeholder: root.placeholder;
+            accessible-name: root.accessible-name;
+            enabled: root.enabled;
+            focus-requested: focus-proxy.has-focus;
+            focus-on-init: root.preserve-focus-on-reset;
+            accepted => { root.accepted(); }
+            focus-state-changed(focused) => { root.has-focus = focused; }
+        }
+
+        if (root.reset-selector) : odd-instance := SecureEditorInstance {
+            text <=> root.text;
+            placeholder: root.placeholder;
+            accessible-name: root.accessible-name;
+            enabled: root.enabled;
+            focus-requested: focus-proxy.has-focus;
+            focus-on-init: root.preserve-focus-on-reset;
+            accepted => { root.accepted(); }
+            focus-state-changed(focused) => { root.has-focus = focused; }
+        }
+    }
+}
+
 export component ComposerShell {
     in-out property <string> text <=> composer.text;
     in property <string> accessible-name: "Message composer";
@@ -678,8 +913,20 @@ export component ToastBanner {
     in property <string> message: "Notification";
     in property <bool> dismissible: true;
     callback dismiss-requested;
+    private property <color> semantic-color: root.kind == StatusKind.success
+        ? DesignTokens.success
+        : (root.kind == StatusKind.warning
+            ? DesignTokens.warning
+            : (root.kind == StatusKind.danger
+                ? DesignTokens.danger
+                : (root.kind == StatusKind.info ? DesignTokens.info : DesignTokens.text-secondary)));
+    private property <string> icon-text: root.kind == StatusKind.success
+        ? "OK"
+        : (root.kind == StatusKind.warning
+            ? "!"
+            : (root.kind == StatusKind.danger ? "X" : (root.kind == StatusKind.info ? "i" : "-")));
 
-    min-height: Metrics.control-large;
+    min-height: max(Metrics.control-large, message-text.min-height + 2 * Metrics.space-2);
     accessible-role: region;
     accessible-label: message;
     accessible-live-region: root.kind == StatusKind.danger ? assertive : polite;
@@ -695,12 +942,37 @@ export component ToastBanner {
             spacing: Metrics.space-2;
             alignment: center;
 
-            StatusBadge {
-                kind: root.kind;
-                text: root.message;
+            Rectangle {
+                width: Metrics.type-title;
+                height: Metrics.type-title;
+                horizontal-stretch: 0;
+                background: root.semantic-color;
+                border-radius: Metrics.radius-pill;
+
+                Text {
+                    text: root.icon-text;
+                    color: root.kind == StatusKind.warning && !VisualPreferences.high-contrast
+                        ? #1b1608
+                        : DesignTokens.accent-on;
+                    font-size: Metrics.type-caption;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
             }
 
-            Rectangle { horizontal-stretch: 1; }
+            message-text := Text {
+                text: root.message;
+                min-width: 0px;
+                horizontal-stretch: 1;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-caption;
+                font-weight: 650;
+                vertical-alignment: center;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
 
             if (root.dismissible) : ToolbarIconButton {
                 glyph: "X";

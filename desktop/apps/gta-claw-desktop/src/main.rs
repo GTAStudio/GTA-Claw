@@ -113,19 +113,16 @@ fn enqueue_submission(
         return;
     };
 
-    // The Slint property is cleared synchronously after the Rust secrecy boundary takes ownership.
-    window.set_token_input("".into());
+    // Destroying the editor also removes its private undo, selection, and preedit state.
+    window.invoke_purge_token_input();
+    let safe_endpoint = match &submission {
+        Ok(request) => request.endpoint_input(),
+        Err(rejection) => rejection.endpoint_input.as_deref().unwrap_or(""),
+    };
+    window.invoke_replace_endpoint_input(safe_endpoint.into());
     let result = match submission {
-        Ok(request) => {
-            window.set_endpoint_input(request.endpoint_input().into());
-            sender.connect(request)
-        }
-        Err(rejection) => {
-            if let Some(input) = &rejection.endpoint_input {
-                window.set_endpoint_input(input.into());
-            }
-            sender.reject_submission(rejection)
-        }
+        Ok(request) => sender.connect(request),
+        Err(rejection) => sender.reject_submission(rejection),
     };
     if let Err(rejection) = result {
         apply_error(&window, &rejection.user_error());
@@ -147,7 +144,7 @@ fn handle_close_request(
     sender: &ControllerSender,
 ) -> CloseRequestResponse {
     if let Some(window) = weak_window.upgrade() {
-        window.set_token_input("".into());
+        window.invoke_purge_token_input();
     }
     sender.close();
     CloseRequestResponse::HideWindow
@@ -324,14 +321,73 @@ mod tests {
         assert!(window.get_narrow_layout());
 
         window.set_token_input("do-not-mirror".into());
+        let token_reset_selector = window.get_token_reset_selector();
+        let endpoint_reset_selector = window.get_endpoint_reset_selector();
         window.invoke_connect_requested("not-a-gateway".into(), "do-not-mirror".into(), true);
         assert_eq!(window.get_token_input(), "");
+        assert_ne!(window.get_token_reset_selector(), token_reset_selector);
+        assert_eq!(window.get_endpoint_input(), "");
+        assert_ne!(
+            window.get_endpoint_reset_selector(),
+            endpoint_reset_selector
+        );
         assert!(!window.get_error_message().contains("do-not-mirror"));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn component_callbacks_clear_the_secure_field_synchronously() {
+        fn dispatch_key(window: &AppWindow, text: slint::SharedString) {
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+        }
+
+        fn focus_secure_field(window: &AppWindow) {
+            for _ in 0..12 {
+                dispatch_key(window, slint::platform::Key::Tab.into());
+                dispatch_key(window, "x".into());
+                if window.get_token_input() == "x" {
+                    return;
+                }
+                window.set_endpoint_input("ws://localhost:18789".into());
+            }
+            panic!("secure field must remain keyboard reachable");
+        }
+
+        fn focus_endpoint_field(window: &AppWindow) {
+            for _ in 0..32 {
+                dispatch_key(window, slint::platform::Key::Tab.into());
+                let prior = window.get_endpoint_input();
+                dispatch_key(window, "x".into());
+                let current = window.get_endpoint_input();
+                if current.len() == prior.len() + 1 && current.contains(prior.as_str()) {
+                    return;
+                }
+                if !window.get_token_input().is_empty() {
+                    window.invoke_purge_token_input();
+                }
+            }
+            panic!("endpoint field must remain keyboard reachable");
+        }
+
+        fn undo(window: &AppWindow) {
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                    text: slint::platform::Key::Control.into(),
+                });
+            dispatch_key(window, "z".into());
+            window
+                .window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                    text: slint::platform::Key::Control.into(),
+                });
+        }
+
         let snapshots = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&snapshots);
         let controller = DesktopController::spawn(move |snapshot| {
@@ -339,15 +395,87 @@ mod tests {
         })
         .expect("controller");
         let window = AppWindow::new().expect("component construction");
+        window.show().expect("window visibility");
         exercise_generated_contracts(
             &window,
             controller.sender(),
             Rc::new(RefCell::new(VisualPreferencesState::default())),
         );
         let weak_window = window.as_weak();
+        window.set_endpoint_input("".into());
+        focus_endpoint_field(&window);
+        window.set_endpoint_input("".into());
+        for character in
+            "wss://endpoint-user:endpoint-secret@gateway.example/path?token=hidden#private".chars()
+        {
+            dispatch_key(&window, character.into());
+        }
+        let endpoint_reset_selector = window.get_endpoint_reset_selector();
+        window.invoke_connect_requested(
+            window.get_endpoint_input(),
+            slint::SharedString::default(),
+            true,
+        );
+        assert_eq!(window.get_endpoint_input(), "wss://gateway.example/path");
+        assert_ne!(
+            window.get_endpoint_reset_selector(),
+            endpoint_reset_selector
+        );
+        assert!(window.get_endpoint_preserve_focus());
+        dispatch_key(&window, "y".into());
+        let edited_endpoint = window.get_endpoint_input();
+        assert_eq!(
+            edited_endpoint.len(),
+            "wss://gateway.example/path".len() + 1
+        );
+        assert!(edited_endpoint.contains("wss://gateway.example/path"));
+        undo(&window);
+        undo(&window);
+        assert_eq!(window.get_endpoint_input(), "wss://gateway.example/path");
+
+        let endpoint_reset_selector = window.get_endpoint_reset_selector();
+        window.set_endpoint_input("not-a-gateway token=must-not-survive ".into());
+        window.invoke_connect_requested(
+            window.get_endpoint_input(),
+            slint::SharedString::default(),
+            true,
+        );
+        assert_eq!(window.get_endpoint_input(), "");
+        assert_ne!(
+            window.get_endpoint_reset_selector(),
+            endpoint_reset_selector
+        );
+
+        focus_secure_field(&window);
+        window.set_token_input("".into());
+        for character in "undo-secret".chars() {
+            dispatch_key(&window, character.into());
+        }
+        assert_eq!(window.get_token_input(), "undo-secret");
+        window.set_layout_width(720.0);
+        dispatch_key(&window, "r".into());
+        assert_eq!(window.get_token_input(), "undo-secretr");
+        window.set_layout_width(1080.0);
+        let reset_selector = window.get_token_reset_selector();
+        window.invoke_connect_requested(
+            "ws://localhost:18789".into(),
+            window.get_token_input(),
+            true,
+        );
+        assert_eq!(window.get_token_input(), "");
+        assert_ne!(window.get_token_reset_selector(), reset_selector);
+        assert!(window.get_token_preserve_focus());
+        dispatch_key(&window, "x".into());
+        assert_eq!(window.get_token_input(), "x");
+        undo(&window);
+        undo(&window);
+        assert_eq!(window.get_token_input(), "");
+
         window.set_token_input("pending-close-secret".into());
+        let reset_selector = window.get_token_reset_selector();
         assert!(window.invoke_request_close());
         assert_eq!(window.get_token_input(), "");
+        assert_ne!(window.get_token_reset_selector(), reset_selector);
         drop(window);
         assert!(matches!(
             handle_close_request(&weak_window, &controller.sender()),
@@ -378,12 +506,55 @@ mod tests {
         let onboarding = include_str!("../ui/modules/gateway-onboarding.slint");
         let primitives = include_str!("../ui/modules/primitives.slint");
         let build = include_str!("../build.rs");
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/app-window.rs"));
 
         assert!(app.contains("min-width: 720px"));
         assert!(app.contains("min-height: 520px"));
         assert!(onboarding.contains("narrow-layout: root.available-width < 900px"));
-        assert!(onboarding.contains("input-type: InputType.password"));
+        assert!(primitives.contains("export component SecureTextField"));
+        assert!(primitives.contains("export component ResettableTextField"));
+        assert_eq!(
+            primitives.matches("input-type: InputType.password").count(),
+            1
+        );
+        assert_eq!(primitives.matches("accessible-value: \"\"").count(), 1);
+        assert!(primitives.contains("field := TextInput"));
+        assert!(primitives.contains("accessible-role: none"));
+        assert!(
+            primitives
+                .contains("if (!root.reset-selector) : even-instance := SecureEditorInstance")
+        );
+        assert!(
+            primitives.contains("if (root.reset-selector) : odd-instance := SecureEditorInstance")
+        );
+        assert!(app.contains("root.token-reset-selector = !root.token-reset-selector"));
+        assert!(app.contains("root.endpoint-reset-selector = !root.endpoint-reset-selector"));
         assert!(onboarding.contains("accessible-name: \"Session-only Gateway token\""));
+        assert!(onboarding.contains("token-field := SecureTextField"));
+        assert!(onboarding.contains("endpoint-field := ResettableTextField"));
+        assert_eq!(
+            onboarding
+                .matches("connection-form := ConnectionForm")
+                .count(),
+            1
+        );
+        assert!(!onboarding.contains("if (!root.narrow-layout)"));
+        assert!(primitives.contains("message-text := Text"));
+        assert!(primitives.contains("wrap: word-wrap"));
+        let secure_start = generated
+            .find("struct InnerSecureEditorInstance")
+            .expect("generated secure editor");
+        let secure_end = generated[secure_start..]
+            .find("struct InnerSecureTextField")
+            .map(|offset| secure_start + offset)
+            .expect("generated secure field follows editor");
+        let secure_generated = &generated[secure_start..secure_end];
+        assert!(secure_generated.contains(
+            "AccessibleStringProperty :: r#Value) => sp :: Some (sp :: SharedString :: from (\"\"))"
+        ));
+        assert!(!secure_generated.contains(
+            "AccessibleStringProperty :: r#Value) => sp :: Some ((InnerSecureEditorInstance"
+        ));
         assert!(!onboarding.contains("accessible-label: root.token-input"));
         assert!(!onboarding.contains("text: root.token-input"));
         assert!(onboarding.contains("event.text == Key.Escape"));

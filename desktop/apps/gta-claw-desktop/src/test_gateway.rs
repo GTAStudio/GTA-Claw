@@ -317,16 +317,42 @@ pub(crate) async fn receive_request(socket: &mut TestSocket) -> RequestFrame {
 }
 
 pub(crate) async fn send_health(socket: &mut TestSocket, request: &RequestFrame) {
+    send_health_payload(
+        socket,
+        request,
+        serde_json::json!({
+            "ok": true,
+            "ts": 1_700_000_000_100_u64,
+            "durationMs": 1,
+            "channels": {},
+            "channelOrder": [],
+            "channelLabels": {},
+            "heartbeatSeconds": 30,
+            "defaultAgentId": "main",
+            "agents": [],
+            "sessions": {
+                "path": "[not rendered]",
+                "count": 0,
+                "recent": []
+            },
+            "secretServerField": "must-never-render"
+        }),
+    )
+    .await;
+}
+
+pub(crate) async fn send_health_payload(
+    socket: &mut TestSocket,
+    request: &RequestFrame,
+    payload: serde_json::Value,
+) {
     send_json(
         socket,
         serde_json::json!({
             "type": "res",
             "id": request.id().as_str(),
             "ok": true,
-            "payload": {
-                "status": "ok",
-                "secretServerField": "must-never-render"
-            }
+            "payload": payload
         }),
     )
     .await;

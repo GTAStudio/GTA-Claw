@@ -30,7 +30,11 @@ export component AppWindow inherits Window {
     in property <bool> can-disconnect: false;
     in property <bool> can-retry: false;
     in-out property <string> endpoint-input: "ws://localhost:18789";
+    in-out property <bool> endpoint-reset-selector: false;
+    in-out property <bool> endpoint-preserve-focus: false;
     in-out property <string> token-input: "";
+    in-out property <bool> token-reset-selector: false;
+    in-out property <bool> token-preserve-focus: false;
     in-out property <bool> consent-checked: false;
     in property <length> layout-width: root.width;
     out property <bool> narrow-layout <=> onboarding.narrow-layout;
@@ -47,6 +51,18 @@ export component AppWindow inherits Window {
 
     public function request-close() -> bool {
         return root.close();
+    }
+
+    public function purge-token-input() {
+        root.token-preserve-focus = onboarding.token-has-focus;
+        root.token-input = "";
+        root.token-reset-selector = !root.token-reset-selector;
+    }
+
+    public function replace-endpoint-input(value: string) {
+        root.endpoint-preserve-focus = onboarding.endpoint-has-focus;
+        root.endpoint-input = value;
+        root.endpoint-reset-selector = !root.endpoint-reset-selector;
     }
 
     onboarding := GatewayOnboardingSurface {
@@ -74,7 +90,11 @@ export component AppWindow inherits Window {
         can-disconnect: root.can-disconnect;
         can-retry: root.can-retry;
         endpoint-input <=> root.endpoint-input;
+        endpoint-reset-selector: root.endpoint-reset-selector;
+        endpoint-preserve-focus: root.endpoint-preserve-focus;
         token-input <=> root.token-input;
+        token-reset-selector: root.token-reset-selector;
+        token-preserve-focus: root.token-preserve-focus;
         consent-checked <=> root.consent-checked;
         connect-requested(endpoint, token, consent) => {
             root.connect-requested(endpoint, token, consent);
