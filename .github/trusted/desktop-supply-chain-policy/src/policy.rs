@@ -24,6 +24,8 @@ const TRUSTED_MANIFEST: &str = ".github/trusted/desktop-supply-chain-policy/Carg
 const TRUSTED_LOCK: &str = ".github/trusted/desktop-supply-chain-policy/Cargo.lock";
 const LEGACY_VALIDATOR: &str = "crates/claw-security/tests/desktop_supply_chain_policy.rs";
 const LEGACY_FIXTURES: &str = "crates/claw-security/tests/fixtures/desktop_supply_chain_policy";
+const SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
+const SQLITE_FILE_CONTROL_PACKAGE: &str = "claw-sqlite-file-control";
 
 const FINAL_ROOT_DENY: &[u8] = include_bytes!("../policy/final/root-deny.toml.fixture");
 const FINAL_DESKTOP_MANIFEST: &[u8] = include_bytes!("../policy/final/desktop/Cargo.toml.fixture");
@@ -43,7 +45,12 @@ const FINAL_SHA_POISON: &[u8] =
     include_bytes!("../policy/final/.github/fixtures/security-tools/shadow-bin/sha256sum");
 const FINAL_TAR_POISON: &[u8] =
     include_bytes!("../policy/final/.github/fixtures/security-tools/shadow-bin/tar");
-const FINAL_DEPENDENCY_FILES: [(&str, &str, u64); 4] = [
+const FINAL_DEPENDENCY_FILES: [(&str, &str, u64); 5] = [
+    (
+        "deny.toml",
+        ".github/trusted/desktop-supply-chain-policy/policy/final/root-deny.toml.fixture",
+        DEFAULT_FILE_LIMIT,
+    ),
     (
         DESKTOP_MANIFEST,
         ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.toml.fixture",
@@ -560,6 +567,49 @@ fn validate_dependencies(
     Ok(())
 }
 
+fn validate_sqlite_file_control_lints(manifest: &TomlValue) -> PolicyResult<()> {
+    let lints = table(manifest, "lints")?;
+    let rust = lints
+        .get("rust")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-sqlite-file-control Rust lints are missing"))?;
+    let clippy = lints
+        .get("clippy")
+        .and_then(TomlValue::as_table)
+        .ok_or_else(|| PolicyError::new("claw-sqlite-file-control Clippy lints are missing"))?;
+    if keys(lints) != expected_keys(&["clippy", "rust"])
+        || rust
+            != &toml::map::Map::from_iter([
+                (
+                    "missing_docs".to_owned(),
+                    TomlValue::String("warn".to_owned()),
+                ),
+                (
+                    "unsafe_code".to_owned(),
+                    TomlValue::String("allow".to_owned()),
+                ),
+                (
+                    "unsafe_op_in_unsafe_fn".to_owned(),
+                    TomlValue::String("deny".to_owned()),
+                ),
+                (
+                    "unreachable_pub".to_owned(),
+                    TomlValue::String("warn".to_owned()),
+                ),
+            ])
+        || clippy
+            != &toml::map::Map::from_iter([(
+                "all".to_owned(),
+                TomlValue::String("warn".to_owned()),
+            )])
+    {
+        return Err(PolicyError::new(
+            "claw-sqlite-file-control's audited native-FFI lint exception changed",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_member_manifest(
     root: &SafeRoot,
     member: &str,
@@ -645,6 +695,8 @@ fn validate_member_manifest(
                 "claw-config's generated-code lint exception changed",
             ));
         }
+    } else if member == SQLITE_FILE_CONTROL_MEMBER && name == SQLITE_FILE_CONTROL_PACKAGE {
+        validate_sqlite_file_control_lints(&manifest)?;
     } else {
         let lints = table(&manifest, "lints")?;
         if keys(lints) != expected_keys(&["workspace"])

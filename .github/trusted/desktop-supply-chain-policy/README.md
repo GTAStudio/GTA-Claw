@@ -85,7 +85,17 @@ The root headless workspace remains extensible. A new canonical `crates/<name>` 
 declared, uses the required workspace inheritance, introduces no nested workspace or
 local lock, uses only approved sources, contains no Slint/GUI dependency, and passes
 trusted metadata, deny, and audit checks. The root lock contents may evolve under those
-same invariants.
+same invariants. Every member except the existing `claw-config` generated-code exception
+must inherit the workspace lint policy exactly, with one path-and-package-bound exception:
+only `crates/claw-sqlite-file-control` / `claw-sqlite-file-control` may declare the audited
+native-FFI lint table (`missing_docs = "warn"`, `unsafe_code = "allow"`,
+`unsafe_op_in_unsafe_fn = "deny"`, `unreachable_pub = "warn"`, and
+`clippy.all = "warn"`). Aliases, sibling paths, additional lint keys, and any level drift
+fail closed.
+
+The Final root `deny.toml` is the exact reviewed P03b policy. It permits only the
+version-pinned duplicate skips recorded there; the former root deny bytes, wildcard or
+versionless skips, source widening, advisory exceptions, and any other drift are rejected.
 
 ## Trust-root updates
 
@@ -163,8 +173,9 @@ cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Ca
 cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$PWD"
 ```
 
-During an audited Final dependency-surface update, copy the reviewed live manifests,
-lock, and deny policy into their exact audit fixtures only through the validator:
+During an audited Final dependency-surface update, copy the reviewed live root deny
+policy, desktop manifests, desktop lock, and desktop deny policy into their exact audit
+fixtures only through the validator:
 
 ```text
 cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- write-final-dependency-fixtures --root "$PWD"
