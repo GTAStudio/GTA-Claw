@@ -416,13 +416,13 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
     "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe",
     "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d",
-    "0139b9474d8e201c6126a900524d1ad1d3f59e3b1ea9a4665374fd72761112d6",
-    "6303571211846bc3ae6c676d63d7fec0a67eef5e71a050a493aed1d4472a82b8",
-    "0b9e411b3b2fe050d3a5e7783a9ad76c8ddb2572a662c245fe263479b026adff",
-    "7d98f5977c922b1d98736aa652eb59f2a6fc784c398ca0c2e7feabb22e8f2f80",
-    "b7c8d0cca17dca4c9c797578b707b421d3711d55a06cf742b40cf520869c0cf6",
-    "65a029857e31de2dbcbf828894bc531934cc1b44f118cd5e8385ff14f0989a3e",
-    "47e61272f490f577ea2199560cd5bffcf5cd473c2d228f14f6950cd2b2dde010",
+    "f4775eb50cf55c650c2728ecd8df5ecdb1416594a8040e842170f5e2955644ec",
+    "7e484191a722d535eb1999415ae4501800d68886a4239ce698414e3be671c026",
+    "ef8cdaff12a8668db1d6baa3bc6de9fe9ea21ba5155d489da461bd164beeaf3e",
+    "fa8679ae53080ddeac28d06766a7c477f804bf97ddbd78229322375ac5ba4f61",
+    "14d751183327dde77c2c7562160cc86cf13791d8812f5864da879965dc89a3cb",
+    "be91c8b6cf649072ffb4288b1d2c108ed5483224b1010a63484853e955160b00",
+    "ec1672f8007f5e9c21c2199fd034b6bf8d2fc922d6c227af9086af58b383691d",
     "dbbf5e53488e8977958a95ab58e03ba89ee9da7503ffe0e58dd946946afb8179",
     "bb2febc949e862a6e5c0904f4041b19853e7bde3f06f17627f4c828519b856d7",
     "781a04de8ae53429a22b602b303fe9f870def0c545f7a056c7ea322677984409",
@@ -438,6 +438,47 @@ const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
     "d1cc4a296b767bcb4082506c572d30d91369ec99db4ce5182ea24e93526d8a79",
     "c0bf44bbc8a93fbe08f33fcc990354cc36dac8da1a556e9a4b05e8686d3b50ae",
 ];
+
+const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
+    "1ef27d2e3ddc7444397d9aa2efb5ceaa4a58412b1d73c921a094104eefe70860";
+const P03B_ROOT_DENY_SHA256: &str =
+    "f5c7a2a654d35d14aa4b7a277f457c67d85e4364f30fefa858a0bb3d489aa065";
+const SUPERSEDED_ROOT_DENY_SHA256: &str =
+    "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
+const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
+name = "claw-sqlite-file-control"
+description = "Audited SQLite file-control boundary for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libsqlite3-sys = "0.37.0"
+sqlx.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+xattr.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = "warn"
+"#;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -631,6 +672,50 @@ fn replace(path: &Path, from: &str, to: &str) {
     let text = fs::read_to_string(path).expect("read mutation input");
     assert!(text.contains(from), "mutation source missing: {from:?}");
     fs::write(path, text.replacen(from, to, 1)).expect("write mutation");
+}
+
+fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
+    let root_manifest_path = tree.join("Cargo.toml");
+    let mut root_manifest: toml::Value = toml::from_str(
+        &fs::read_to_string(&root_manifest_path).expect("read root member fixture manifest"),
+    )
+    .expect("parse root member fixture manifest");
+    let members = root_manifest
+        .get_mut("workspace")
+        .and_then(|workspace| workspace.get_mut("members"))
+        .and_then(toml::Value::as_array_mut)
+        .expect("root workspace member array");
+    members.push(toml::Value::String(member.to_owned()));
+    members.sort_by(|left, right| {
+        left.as_str()
+            .expect("left member string")
+            .cmp(right.as_str().expect("right member string"))
+    });
+    fs::write(
+        root_manifest_path,
+        toml::to_string(&root_manifest).expect("serialize root member fixture manifest"),
+    )
+    .expect("write root member fixture manifest");
+
+    let member_manifest_value: toml::Value =
+        toml::from_str(member_manifest).expect("parse synthetic member manifest");
+    let package_name = member_manifest_value
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .expect("synthetic member package name");
+    let manifest_path = tree.join(member).join("Cargo.toml");
+    fs::create_dir_all(manifest_path.parent().expect("synthetic member parent"))
+        .expect("create synthetic member");
+    fs::write(&manifest_path, member_manifest).expect("write synthetic member manifest");
+    fs::create_dir_all(tree.join(member).join("src")).expect("create synthetic member source");
+    fs::write(tree.join(member).join("src/lib.rs"), "").expect("write synthetic member source");
+
+    let mut lock = fs::read_to_string(tree.join("Cargo.lock")).expect("read root lock");
+    lock.push_str(&format!(
+        "\n[[package]]\nname = \"{package_name}\"\nversion = \"0.1.0\"\n"
+    ));
+    fs::write(tree.join("Cargo.lock"), lock).expect("write synthetic member lock entry");
 }
 
 fn write_release_workspace(
@@ -1506,6 +1591,7 @@ fn final_dependency_fixture_writer_is_canonical() {
     let tree = copy_repo("final-dependency-writer");
     let root = SafeRoot::new(&tree.path).expect("open Final dependency writer fixture");
     for fixture in [
+        ".github/trusted/desktop-supply-chain-policy/policy/final/root-deny.toml.fixture",
         ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.toml.fixture",
         ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/Cargo.toml.fixture",
         ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.lock.fixture",
@@ -1515,6 +1601,10 @@ fn final_dependency_fixture_writer_is_canonical() {
     }
     write_final_dependency_fixtures(&root).expect("write canonical Final dependency fixtures");
     for (live, fixture) in [
+        (
+            "deny.toml",
+            ".github/trusted/desktop-supply-chain-policy/policy/final/root-deny.toml.fixture",
+        ),
         (
             "desktop/Cargo.toml",
             ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/Cargo.toml.fixture",
@@ -1541,6 +1631,200 @@ fn final_dependency_fixture_writer_is_canonical() {
 }
 
 #[test]
+fn final_root_deny_accepts_only_the_reviewed_p03b_bytes() {
+    let canonical = final_tree("p03b-root-deny");
+    let canonical_text = fs::read_to_string(canonical.join("deny.toml"))
+        .expect("read canonical root deny")
+        .replace("\r\n", "\n");
+    assert_eq!(sha256(canonical_text.as_bytes()), P03B_ROOT_DENY_SHA256);
+    validate_final_static(&SafeRoot::new(&canonical.path).expect("open P03b root deny fixture"))
+        .expect("accept exact reviewed P03b root deny");
+
+    let bootstrap = bootstrap_tree("superseded-root-deny-source");
+    let superseded_text = fs::read_to_string(bootstrap.join("deny.toml"))
+        .expect("read immutable superseded root deny")
+        .replace("\r\n", "\n")
+        .replace("version = \"0.6.4\"", "version = \"=0.6.4\"")
+        .replace("version = \"0.52.0\"", "version = \"=0.52.0\"");
+    assert_eq!(
+        sha256(superseded_text.as_bytes()),
+        SUPERSEDED_ROOT_DENY_SHA256
+    );
+    let superseded = final_tree("superseded-root-deny");
+    fs::write(superseded.join("deny.toml"), superseded_text).expect("write superseded root deny");
+    assert_eq!(
+        validate_final_static(
+            &SafeRoot::new(&superseded.path).expect("open superseded root deny fixture")
+        )
+        .expect_err("superseded root deny unexpectedly passed")
+        .to_string(),
+        "exact security policy file changed: deny.toml"
+    );
+
+    for (label, from, to) in [
+        ("wildcard-skip", "version = \"=0.10.9\"", "version = \"*\""),
+        (
+            "extra-skip",
+            "[sources]",
+            "[[bans.skip]]\nname = \"extra\"\nversion = \"=1.0.0\"\n\n[sources]",
+        ),
+        (
+            "advisory-ignore",
+            "ignore = []",
+            "ignore = [\"RUSTSEC-0000-0000\"]",
+        ),
+    ] {
+        let tree = final_tree(label);
+        replace(&tree.join("deny.toml"), from, to);
+        assert_eq!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open root deny mutation"))
+                .expect_err("root deny drift unexpectedly passed")
+                .to_string(),
+            "exact security policy file changed: deny.toml",
+            "root deny mutation escaped exact policy: {label}"
+        );
+    }
+}
+
+#[test]
+fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
+    assert_eq!(
+        sha256(P03B_SQLITE_FILE_CONTROL_MANIFEST.as_bytes()),
+        P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256
+    );
+    let accepted = final_tree("sqlite-file-control-lints");
+    add_root_member(
+        &accepted,
+        "crates/claw-sqlite-file-control",
+        P03B_SQLITE_FILE_CONTROL_MANIFEST,
+    );
+    let workspace = validate_final_static(
+        &SafeRoot::new(&accepted.path).expect("open exact native-FFI member fixture"),
+    )
+    .expect("accept the exact reviewed native-FFI lint exception");
+    assert_eq!(
+        workspace
+            .members
+            .get("crates/claw-sqlite-file-control")
+            .map(String::as_str),
+        Some("claw-sqlite-file-control")
+    );
+
+    let cases = [
+        (
+            "sibling-path",
+            "crates/claw-native-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "name = \"claw-sqlite-file-control\"",
+                "name = \"claw-native-control\"",
+                1,
+            ),
+            "lints must inherit exactly from workspace",
+        ),
+        (
+            "apps-path",
+            "apps/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.to_owned(),
+            "lints must inherit exactly from workspace",
+        ),
+        (
+            "prefix-path",
+            "crates/claw-sqlite-file-control-extra",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "name = \"claw-sqlite-file-control\"",
+                "name = \"claw-sqlite-file-control-extra\"",
+                1,
+            ),
+            "lints must inherit exactly from workspace",
+        ),
+        (
+            "package-alias",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "name = \"claw-sqlite-file-control\"",
+                "name = \"sqlite-file-control-alias\"",
+                1,
+            ),
+            "package name must match its canonical directory",
+        ),
+        (
+            "unsafe-level-drift",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "unsafe_code = \"allow\"",
+                "unsafe_code = \"warn\"",
+                1,
+            ),
+            "audited native-FFI lint exception changed",
+        ),
+        (
+            "missing-docs-weakened",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "missing_docs = \"warn\"",
+                "missing_docs = \"allow\"",
+                1,
+            ),
+            "audited native-FFI lint exception changed",
+        ),
+        (
+            "unsafe-op-weakened",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "unsafe_op_in_unsafe_fn = \"deny\"",
+                "unsafe_op_in_unsafe_fn = \"allow\"",
+                1,
+            ),
+            "audited native-FFI lint exception changed",
+        ),
+        (
+            "additional-allow",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "unsafe_code = \"allow\"",
+                "unsafe_code = \"allow\"\nunused_variables = \"allow\"",
+                1,
+            ),
+            "audited native-FFI lint exception changed",
+        ),
+        (
+            "renamed-lint",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+                "unsafe_op_in_unsafe_fn",
+                "unsafe_op_in_unsafe_block",
+                1,
+            ),
+            "audited native-FFI lint exception changed",
+        ),
+        (
+            "missing-rust-warning",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen("missing_docs = \"warn\"\n", "", 1),
+            "audited native-FFI lint exception changed",
+        ),
+        (
+            "missing-clippy-warning",
+            "crates/claw-sqlite-file-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen("all = \"warn\"\n", "", 1),
+            "audited native-FFI lint exception changed",
+        ),
+    ];
+    for (label, member, manifest, expected) in cases {
+        let tree = final_tree(label);
+        add_root_member(&tree, member, &manifest);
+        let error =
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open lint mutation fixture"))
+                .expect_err("unauthorized local lint policy unexpectedly passed")
+                .to_string();
+        assert!(
+            error.contains(expected),
+            "lint mutation failed through the wrong rule: {label}: {error}"
+        );
+    }
+}
+
+#[test]
 fn superseded_final_and_dependency_surface_mutations_are_rejected() {
     let canonical = final_tree("dependency-transition-canonical");
     let paths = [
@@ -1558,7 +1842,8 @@ fn superseded_final_and_dependency_surface_mutations_are_rejected() {
 
     let superseded_desktop = final_tree("superseded-desktop-manifest");
     let mut desktop = fs::read_to_string(superseded_desktop.join("desktop/Cargo.toml"))
-        .expect("read canonical desktop manifest");
+        .expect("read canonical desktop manifest")
+        .replace("\r\n", "\n");
     for addition in [
         "claw-gateway-client = { path = \"../crates/claw-gateway-client\", version = \"0.1.0\" }\n",
         "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }\n",
@@ -1584,7 +1869,8 @@ fn superseded_final_and_dependency_surface_mutations_are_rejected() {
     let superseded_app = final_tree("superseded-app-manifest");
     let mut app =
         fs::read_to_string(superseded_app.join("desktop/apps/gta-claw-desktop/Cargo.toml"))
-            .expect("read canonical app manifest");
+            .expect("read canonical app manifest")
+            .replace("\r\n", "\n");
     for addition in [
         "claw-gateway-client.workspace = true\n",
         "claw-protocol.workspace = true\n",
