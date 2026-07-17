@@ -837,12 +837,15 @@ async fn non_resolving_dns_cannot_hold_the_process_past_its_bound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn endpoint_credentials_query_and_fragment_are_never_rendered() {
     let endpoint = "ws://operator:argv-secret@127.0.0.1:9/path?token=query-secret#fragment-secret";
-    let output = run_cli(gateway_arguments(endpoint), Some(&format!("{TOKEN}\n"))).await;
+    let (output, elapsed) = run_cli_with_open_stdin(gateway_arguments(endpoint)).await;
     assert_eq!(output.status.code(), Some(2));
+    assert!(elapsed < Duration::from_secs(1));
     let summary = parse_json(&output);
+    assert_eq!(summary["category"], "usage_config");
+    assert_eq!(summary["status"], "credential_bearing_endpoint");
     assert_eq!(summary["endpoint"], "ws://127.0.0.1:9");
     let captured = String::from_utf8_lossy(&output.stdout);
-    for secret in ["argv-secret", "query-secret", "fragment-secret", TOKEN] {
+    for secret in ["argv-secret", "query-secret", "fragment-secret"] {
         assert!(!captured.contains(secret));
     }
 }
