@@ -2527,6 +2527,49 @@ mod tests {
         source.close().await.expect("source store closes");
     }
 
+    #[tokio::test]
+    async fn published_backup_remains_writer_excluded_until_final_handoff() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "handoff-source.sqlite");
+        let backup_path = database_path(&directory, "handoff-backup.sqlite");
+        let restored_path = database_path(&directory, "handoff-restored.sqlite");
+        let source = std::sync::Arc::new(open(&source_path).await);
+        let (entered, release) = test_support::set_published_handoff_barrier(&backup_path);
+        let backup_source = std::sync::Arc::clone(&source);
+        let backup_destination = backup_path.clone();
+        let backup =
+            tokio::spawn(async move { backup_source.backup_to(&backup_destination).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("backup reaches final published handoff");
+        let competing = StateStore::open(StoreConfig::new(&backup_path))
+            .await
+            .err()
+            .expect("published backup remains writer-excluded");
+        assert!(matches!(competing, StateError::StoreLocked { .. }));
+        assert!(!sidecar(&backup_path, "-wal").exists());
+        assert!(!sidecar(&backup_path, "-shm").exists());
+        release.notify_one();
+        backup
+            .await
+            .expect("backup handoff task joins")
+            .expect("backup handoff completes");
+        StateStore::restore_backup(&backup_path, &restored_path)
+            .await
+            .expect("writer-excluded backup remains restorable");
+        open(&restored_path)
+            .await
+            .close()
+            .await
+            .expect("handoff-restored store closes");
+        std::sync::Arc::try_unwrap(source)
+            .ok()
+            .expect("backup handoff task releases source")
+            .close()
+            .await
+            .expect("handoff source closes");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn restore_accepts_read_only_standalone_backup() {
