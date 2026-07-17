@@ -441,6 +441,7 @@ const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
 
 const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "1ef27d2e3ddc7444397d9aa2efb5ceaa4a58412b1d73c921a094104eefe70860";
+const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const P03B_ROOT_DENY_SHA256: &str =
     "f5c7a2a654d35d14aa4b7a277f457c67d85e4364f30fefa858a0bb3d489aa065";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
@@ -674,6 +675,17 @@ fn replace(path: &Path, from: &str, to: &str) {
     fs::write(path, text.replacen(from, to, 1)).expect("write mutation");
 }
 
+fn assert_unique_sorted_root_members(members: &[toml::Value]) {
+    let members = members
+        .iter()
+        .map(|member| member.as_str().expect("root workspace member string"))
+        .collect::<Vec<_>>();
+    assert!(
+        members.windows(2).all(|pair| pair[0] < pair[1]),
+        "synthetic setup requires unique sorted root workspace members"
+    );
+}
+
 fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
     let root_manifest_path = tree.join("Cargo.toml");
     let mut root_manifest: toml::Value = toml::from_str(
@@ -685,12 +697,34 @@ fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
         .and_then(|workspace| workspace.get_mut("members"))
         .and_then(toml::Value::as_array_mut)
         .expect("root workspace member array");
-    members.push(toml::Value::String(member.to_owned()));
-    members.sort_by(|left, right| {
-        left.as_str()
-            .expect("left member string")
-            .cmp(right.as_str().expect("right member string"))
-    });
+    assert_unique_sorted_root_members(members);
+    let position = match members.binary_search_by(|candidate| {
+        candidate
+            .as_str()
+            .expect("root workspace member string")
+            .cmp(member)
+    }) {
+        Ok(_) => {
+            assert_eq!(
+                member, P03B_SQLITE_FILE_CONTROL_MEMBER,
+                "only the exact native-FFI member setup is idempotent"
+            );
+            assert_eq!(
+                member_manifest, P03B_SQLITE_FILE_CONTROL_MANIFEST,
+                "existing native-FFI member must use the canonical manifest"
+            );
+            assert_eq!(
+                fs::read_to_string(tree.join(member).join("Cargo.toml"))
+                    .expect("read existing native-FFI member manifest")
+                    .replace("\r\n", "\n"),
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+                "existing native-FFI member manifest changed"
+            );
+            return;
+        }
+        Err(position) => position,
+    };
+    members.insert(position, toml::Value::String(member.to_owned()));
     fs::write(
         root_manifest_path,
         toml::to_string(&root_manifest).expect("serialize root member fixture manifest"),
@@ -1687,6 +1721,88 @@ fn final_root_deny_accepts_only_the_reviewed_p03b_bytes() {
 }
 
 #[test]
+fn sqlite_file_control_synthetic_setup_is_idempotent() {
+    for (label, already_present) in [("member-absent", false), ("member-present", true)] {
+        let tree = TempTree::new(label);
+        let member_line = if already_present {
+            format!("  \"{P03B_SQLITE_FILE_CONTROL_MEMBER}\",\n")
+        } else {
+            String::new()
+        };
+        fs::write(
+            tree.join("Cargo.toml"),
+            format!(
+                "[workspace]\nmembers = [\n  \"apps/fixture\",\n{member_line}  \"crates/fixture\",\n]\n"
+            ),
+        )
+        .expect("write synthetic root manifest");
+        fs::write(
+            tree.join("Cargo.lock"),
+            if already_present {
+                "version = 4\n\n[[package]]\nname = \"claw-sqlite-file-control\"\nversion = \"0.1.0\"\n"
+            } else {
+                "version = 4\n"
+            },
+        )
+        .expect("write synthetic root lock");
+        let manifest_path = tree
+            .join(P03B_SQLITE_FILE_CONTROL_MEMBER)
+            .join("Cargo.toml");
+        if already_present {
+            fs::create_dir_all(manifest_path.parent().expect("native-FFI member parent"))
+                .expect("create native-FFI member");
+            fs::write(
+                &manifest_path,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST.replace('\n', "\r\n"),
+            )
+            .expect("write exact native-FFI member manifest");
+        }
+        let manifest_before = already_present
+            .then(|| fs::read(&manifest_path).expect("read native-FFI manifest before setup"));
+
+        add_root_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        add_root_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+
+        assert_eq!(
+            fs::read_to_string(tree.join("Cargo.toml"))
+                .expect("read synthetic root manifest after setup")
+                .matches(P03B_SQLITE_FILE_CONTROL_MEMBER)
+                .count(),
+            1,
+            "native-FFI member setup was not idempotent: {label}"
+        );
+        assert_eq!(
+            fs::read_to_string(&manifest_path)
+                .expect("read native-FFI member manifest after setup")
+                .replace("\r\n", "\n"),
+            P03B_SQLITE_FILE_CONTROL_MANIFEST
+        );
+        assert_eq!(
+            fs::read_to_string(tree.join("Cargo.lock"))
+                .expect("read synthetic root lock after setup")
+                .matches("name = \"claw-sqlite-file-control\"")
+                .count(),
+            1,
+            "native-FFI lock setup was not idempotent: {label}"
+        );
+        if already_present {
+            assert_eq!(
+                fs::read(&manifest_path).expect("read existing native-FFI manifest after setup"),
+                manifest_before.expect("present manifest snapshot")
+            );
+        }
+    }
+}
+
+#[test]
 fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
     assert_eq!(
         sha256(P03B_SQLITE_FILE_CONTROL_MANIFEST.as_bytes()),
@@ -1695,7 +1811,7 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
     let accepted = final_tree("sqlite-file-control-lints");
     add_root_member(
         &accepted,
-        "crates/claw-sqlite-file-control",
+        P03B_SQLITE_FILE_CONTROL_MEMBER,
         P03B_SQLITE_FILE_CONTROL_MANIFEST,
     );
     let workspace = validate_final_static(
@@ -1812,7 +1928,17 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
     ];
     for (label, member, manifest, expected) in cases {
         let tree = final_tree(label);
-        add_root_member(&tree, member, &manifest);
+        if member == P03B_SQLITE_FILE_CONTROL_MEMBER {
+            add_root_member(
+                &tree,
+                P03B_SQLITE_FILE_CONTROL_MEMBER,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+            );
+            fs::write(tree.join(member).join("Cargo.toml"), manifest)
+                .expect("write native-FFI manifest mutation");
+        } else {
+            add_root_member(&tree, member, &manifest);
+        }
         let error =
             validate_final_static(&SafeRoot::new(&tree.path).expect("open lint mutation fixture"))
                 .expect_err("unauthorized local lint policy unexpectedly passed")
@@ -1820,6 +1946,53 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
         assert!(
             error.contains(expected),
             "lint mutation failed through the wrong rule: {label}: {error}"
+        );
+    }
+
+    for mutation in ["duplicate", "unsorted"] {
+        let tree = final_tree(&format!("sqlite-file-control-{mutation}"));
+        add_root_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        let root_manifest_path = tree.join("Cargo.toml");
+        let mut root_manifest: toml::Value = toml::from_str(
+            &fs::read_to_string(&root_manifest_path).expect("read root member mutation manifest"),
+        )
+        .expect("parse root member mutation manifest");
+        let members = root_manifest
+            .get_mut("workspace")
+            .and_then(|workspace| workspace.get_mut("members"))
+            .and_then(toml::Value::as_array_mut)
+            .expect("root workspace member array");
+        match mutation {
+            "duplicate" => {
+                let position = members
+                    .iter()
+                    .position(|member| member.as_str() == Some(P03B_SQLITE_FILE_CONTROL_MEMBER))
+                    .expect("exact native-FFI member");
+                members.insert(
+                    position,
+                    toml::Value::String(P03B_SQLITE_FILE_CONTROL_MEMBER.to_owned()),
+                );
+            }
+            "unsorted" => members.swap(0, 1),
+            _ => unreachable!(),
+        }
+        fs::write(
+            root_manifest_path,
+            toml::to_string(&root_manifest).expect("serialize root member mutation manifest"),
+        )
+        .expect("write root member mutation manifest");
+        assert_eq!(
+            validate_final_static(
+                &SafeRoot::new(&tree.path).expect("open root member mutation fixture")
+            )
+            .expect_err("malicious root member mutation unexpectedly passed")
+            .to_string(),
+            "root workspace members must be unique and sorted",
+            "root member mutation failed through the wrong rule: {mutation}"
         );
     }
 }
