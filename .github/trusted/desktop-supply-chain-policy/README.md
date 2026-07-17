@@ -163,6 +163,13 @@ cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Ca
 cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$PWD"
 ```
 
+During an audited Final dependency-surface update, copy the reviewed live manifests,
+lock, and deny policy into their exact audit fixtures only through the validator:
+
+```text
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- write-final-dependency-fixtures --root "$PWD"
+```
+
 Hosted bootstrap CI additionally supplies checksum-pinned actionlint and Git binaries,
 audits this directory's `Cargo.lock`, checks `deny.toml`, and verifies the exact
 build-script/proc-macro allow-list for parser dependencies.
