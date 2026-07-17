@@ -13,7 +13,7 @@ claw-application.workspace = true
 claw-platform.workspace = true
 slint = { version = "=1.17.1", default-features = false, features = [
   "accessibility",
-  "backend-winit",
+  "backend-winit-x11",
   "compat-1-2",
   "renderer-femtovg",
   "renderer-software",
@@ -22,6 +22,11 @@ slint = { version = "=1.17.1", default-features = false, features = [
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.build-dependencies]
 slint-build = { version = "=1.17.1" }
+
+[[test]]
+name = "macos_winit_smoke"
+path = "tests/macos_winit_smoke.rs"
+harness = false
 
 [lints]
 workspace = true

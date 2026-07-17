@@ -15,8 +15,8 @@ highlight = "all"
 # fastwebsockets 0.10 uses rand 0.8 solely for RFC 6455 client masking.
 # ring 0.17 pins windows-sys 0.52 for rustls cryptography internals.
 skip = [
-  { name = "rand_core", version = "0.6.4" },
-  { name = "windows-sys", version = "0.52.0" },
+  { name = "rand_core", version = "=0.6.4" },
+  { name = "windows-sys", version = "=0.52.0" },
 ]
 
 [sources]
