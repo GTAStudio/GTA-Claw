@@ -33,8 +33,17 @@ const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 
 type ViewSink = Arc<dyn Fn(ViewSnapshot) + Send + Sync + 'static>;
 type GatewayEventObserver = Arc<dyn Fn(&GatewayEvent) + Send + Sync + 'static>;
+type HealthObserverFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+type HealthSuccessObserver = Arc<dyn Fn() -> HealthObserverFuture + Send + Sync + 'static>;
 type AttemptStopObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 type GatewayRuntime = Arc<dyn ClientRuntime>;
+
+#[derive(Clone, Default)]
+struct AttemptObservers {
+    gateway_event: Option<GatewayEventObserver>,
+    health_success: Option<HealthSuccessObserver>,
+}
 
 enum ControllerCommand {
     Connect {
@@ -153,12 +162,12 @@ impl DesktopController {
     pub(crate) fn spawn(
         sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
     ) -> Result<Self, ControllerStartError> {
-        Self::spawn_inner(Arc::new(sink), None, None, None)
+        Self::spawn_inner(Arc::new(sink), AttemptObservers::default(), None, None)
     }
 
     fn spawn_inner(
         sink: ViewSink,
-        event_observer: Option<GatewayEventObserver>,
+        observers: AttemptObservers,
         gateway_runtime: Option<GatewayRuntime>,
         attempt_stop_observer: Option<AttemptStopObserver>,
     ) -> Result<Self, ControllerStartError> {
@@ -182,7 +191,7 @@ impl DesktopController {
                     receiver,
                     close,
                     sink,
-                    event_observer,
+                    observers,
                     gateway_runtime,
                     attempt_stop_observer,
                 ));
@@ -201,7 +210,15 @@ impl DesktopController {
         sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
         event_observer: impl Fn(&GatewayEvent) + Send + Sync + 'static,
     ) -> Result<Self, ControllerStartError> {
-        Self::spawn_inner(Arc::new(sink), Some(Arc::new(event_observer)), None, None)
+        Self::spawn_inner(
+            Arc::new(sink),
+            AttemptObservers {
+                gateway_event: Some(Arc::new(event_observer)),
+                health_success: None,
+            },
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -209,7 +226,12 @@ impl DesktopController {
         sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
         gateway_runtime: GatewayRuntime,
     ) -> Result<Self, ControllerStartError> {
-        Self::spawn_inner(Arc::new(sink), None, Some(gateway_runtime), None)
+        Self::spawn_inner(
+            Arc::new(sink),
+            AttemptObservers::default(),
+            Some(gateway_runtime),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -219,9 +241,29 @@ impl DesktopController {
     ) -> Result<Self, ControllerStartError> {
         Self::spawn_inner(
             Arc::new(sink),
-            None,
+            AttemptObservers::default(),
             None,
             Some(Arc::new(attempt_stop_observer)),
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_with_health_success_observer<F, Fut>(
+        sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
+        health_success_observer: F,
+    ) -> Result<Self, ControllerStartError>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self::spawn_inner(
+            Arc::new(sink),
+            AttemptObservers {
+                gateway_event: None,
+                health_success: Some(Arc::new(move || Box::pin(health_success_observer()))),
+            },
+            None,
+            None,
         )
     }
 
@@ -290,7 +332,7 @@ async fn controller_loop(
     mut commands: mpsc::Receiver<ControllerCommand>,
     close: CancellationToken,
     sink: ViewSink,
-    event_observer: Option<GatewayEventObserver>,
+    observers: AttemptObservers,
     gateway_runtime: Option<GatewayRuntime>,
     attempt_stop_observer: Option<AttemptStopObserver>,
 ) {
@@ -358,7 +400,7 @@ async fn controller_loop(
                             identity,
                             cancellation.clone(),
                             attempt_events.clone(),
-                            event_observer.clone(),
+                            observers.clone(),
                             gateway_runtime.clone(),
                         ));
                         active = Some(ActiveAttempt { cancellation, task });
@@ -432,7 +474,7 @@ async fn run_attempt(
     identity: Arc<DeviceIdentity>,
     cancellation: CancellationToken,
     updates: mpsc::Sender<(u64, AttemptUpdate)>,
-    event_observer: Option<GatewayEventObserver>,
+    observers: AttemptObservers,
     gateway_runtime: Option<GatewayRuntime>,
 ) {
     let (url, token) = request.into_parts();
@@ -484,6 +526,7 @@ async fn run_attempt(
         client: &client,
         updates: &updates,
         cancellation: &cancellation,
+        health_success_observer: observers.health_success.as_ref(),
     };
     let mut progress = AttemptProgress {
         last_ready_epoch: None,
@@ -498,7 +541,7 @@ async fn run_attempt(
                 states: &mut states,
                 gateway_events: &mut gateway_events,
                 event_stream_open: &mut event_stream_open,
-                event_observer: event_observer.as_ref(),
+                event_observer: observers.gateway_event.as_ref(),
             };
             match apply_client_state(&context, state, &mut progress, &mut streams).await {
                 StateApplication::Continue => {}
@@ -513,7 +556,11 @@ async fn run_attempt(
                 pending_state = Some(states.borrow_and_update().clone());
             }
             event = gateway_events.recv(), if event_stream_open => {
-                observe_gateway_event(event, &mut event_stream_open, event_observer.as_ref());
+                observe_gateway_event(
+                    event,
+                    &mut event_stream_open,
+                    observers.gateway_event.as_ref(),
+                );
             }
         }
     }
@@ -548,6 +595,7 @@ struct AttemptContext<'a> {
     client: &'a GatewayClient,
     updates: &'a mpsc::Sender<(u64, AttemptUpdate)>,
     cancellation: &'a CancellationToken,
+    health_success_observer: Option<&'a HealthSuccessObserver>,
 }
 
 struct AttemptProgress {
@@ -669,11 +717,10 @@ async fn wait_for_health_while_draining(
             biased;
             () = context.cancellation.cancelled() => return HealthWait::Cancelled,
             result = &mut health => {
-                let current = streams.states.borrow().clone();
-                if !is_ready_epoch(&current, epoch) {
-                    return HealthWait::StateChanged(
-                        streams.states.borrow_and_update().clone()
-                    );
+                if result.is_ok()
+                    && let Some(observer) = context.health_success_observer
+                {
+                    observer().await;
                 }
                 return HealthWait::Completed(result);
             }
@@ -1302,36 +1349,169 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn normal_peer_close_cannot_leave_a_stale_ready_snapshot() {
-        let ready_to_close = Arc::new(Semaphore::new(0));
-        let server_close_gate = Arc::clone(&ready_to_close);
-        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
-            let server_close_gate = Arc::clone(&server_close_gate);
+    async fn response_before_close_preserves_ready_before_later_epoch_failure() {
+        let health_accepted = Arc::new(Semaphore::new(0));
+        let release_ready = Arc::new(Semaphore::new(0));
+        let close_epoch_a = Arc::new(Semaphore::new(0));
+        let epoch_b_connected = Arc::new(Semaphore::new(0));
+        let health_ids = Arc::new(Mutex::new(Vec::new()));
+        let unexpected_epoch_b_health = Arc::new(AtomicUsize::new(0));
+        let server_close_epoch_a = Arc::clone(&close_epoch_a);
+        let server_epoch_b_connected = Arc::clone(&epoch_b_connected);
+        let server_health_ids = Arc::clone(&health_ids);
+        let counted_epoch_b_health = Arc::clone(&unexpected_epoch_b_health);
+        let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+            let server_close_epoch_a = Arc::clone(&server_close_epoch_a);
+            let server_epoch_b_connected = Arc::clone(&server_epoch_b_connected);
+            let server_health_ids = Arc::clone(&server_health_ids);
+            let counted_epoch_b_health = Arc::clone(&counted_epoch_b_health);
             async move {
+                if index == 1 {
+                    server_epoch_b_connected.add_permits(1);
+                }
                 send_challenge(&mut socket).await;
                 let (connect, params) = receive_connect(&mut socket).await;
-                send_hello(
-                    &mut socket,
-                    &connect,
-                    &params,
-                    4,
-                    "desktop-normal-close",
-                    false,
-                )
-                .await;
-                let health = receive_request(&mut socket).await;
-                send_health(&mut socket, &health).await;
-                tokio::time::timeout(Duration::from_secs(2), server_close_gate.acquire())
-                    .await
-                    .expect("Ready observation releases normal close")
-                    .expect("normal close semaphore remains open")
-                    .forget();
-                socket
-                    .write_frame(Frame::close(1000, b"normal close"))
-                    .await
-                    .expect("close");
-                socket.flush().await.expect("flush");
+                if index == 0 {
+                    send_hello(
+                        &mut socket,
+                        &connect,
+                        &params,
+                        4,
+                        "desktop-response-wins",
+                        false,
+                    )
+                    .await;
+                    let health = receive_request(&mut socket).await;
+                    server_health_ids
+                        .lock()
+                        .expect("health ids")
+                        .push(health.id().as_str().to_owned());
+                    send_health(&mut socket, &health).await;
+                    server_close_epoch_a
+                        .acquire()
+                        .await
+                        .expect("close gate remains open")
+                        .forget();
+                    socket
+                        .write_frame(Frame::close(1012, b"restart after response"))
+                        .await
+                        .expect("close epoch A");
+                    socket.flush().await.expect("flush epoch A close");
+                } else {
+                    send_hello_with_scopes(
+                        &mut socket,
+                        &connect,
+                        &params,
+                        4,
+                        "desktop-response-wins",
+                        false,
+                        &["operator.admin"],
+                    )
+                    .await;
+                    count_text_until_close(&mut socket, counted_epoch_b_health).await;
+                }
             }
+        }))
+        .await;
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&snapshots);
+        let observed_health = Arc::clone(&health_accepted);
+        let ready_release = Arc::clone(&release_ready);
+        let controller = DesktopController::spawn_with_health_success_observer(
+            move |snapshot| {
+                sink.lock().expect("snapshots").push(snapshot);
+            },
+            move || {
+                let observed_health = Arc::clone(&observed_health);
+                let ready_release = Arc::clone(&ready_release);
+                async move {
+                    observed_health.add_permits(1);
+                    ready_release
+                        .acquire()
+                        .await
+                        .expect("Ready release semaphore remains open")
+                        .forget();
+                }
+            },
+        )
+        .expect("controller");
+        controller
+            .sender()
+            .connect(request(&gateway.url))
+            .expect("connect");
+        tokio::time::timeout(Duration::from_secs(2), health_accepted.acquire())
+            .await
+            .expect("health response must complete")
+            .expect("health acceptance semaphore remains open")
+            .forget();
+        close_epoch_a.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), epoch_b_connected.acquire())
+            .await
+            .expect("epoch B must connect before Ready processing resumes")
+            .expect("epoch B semaphore remains open")
+            .forget();
+        release_ready.add_permits(1);
+        wait_snapshot(&snapshots, |snapshot| {
+            snapshot.phase() == OnboardingPhase::Ready
+        })
+        .await;
+        let failed = wait_snapshot(&snapshots, |snapshot| {
+            snapshot.phase() == OnboardingPhase::Failed
+        })
+        .await;
+        assert_eq!(
+            failed.error().expect("epoch B scope error").code(),
+            "gateway.protocol-scope"
+        );
+        assert_authenticated_summary_cleared(&failed);
+        {
+            let snapshots = snapshots.lock().expect("snapshots");
+            let ready_index = snapshots
+                .iter()
+                .position(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
+                .expect("response A must produce Ready");
+            let failed_index = snapshots
+                .iter()
+                .position(|snapshot| snapshot.phase() == OnboardingPhase::Failed)
+                .expect("epoch B must fail closed");
+            assert!(ready_index < failed_index);
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            health_ids.lock().expect("health ids").as_slice(),
+            &["desktop-health-1-epoch-1"]
+        );
+        assert_eq!(unexpected_epoch_b_health.load(Ordering::SeqCst), 0);
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_before_health_response_never_publishes_ready() {
+        let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            send_hello(
+                &mut socket,
+                &connect,
+                &params,
+                4,
+                "desktop-close-wins",
+                false,
+            )
+            .await;
+            let _health = receive_request(&mut socket).await;
+            socket
+                .write_frame(Frame::close(1000, b"close before response"))
+                .await
+                .expect("close before health");
+            socket.flush().await.expect("flush close");
         }))
         .await;
         let (controller, snapshots) = controller_with_snapshots();
@@ -1339,11 +1519,6 @@ mod tests {
             .sender()
             .connect(request(&gateway.url))
             .expect("connect");
-        wait_snapshot(&snapshots, |snapshot| {
-            snapshot.phase() == OnboardingPhase::Ready
-        })
-        .await;
-        ready_to_close.add_permits(1);
         let failed = wait_snapshot(&snapshots, |snapshot| {
             snapshot.phase() == OnboardingPhase::Failed
         })
@@ -1353,6 +1528,15 @@ mod tests {
             "gateway.transport-closed"
         );
         assert_authenticated_summary_cleared(&failed);
+        assert_eq!(
+            snapshots
+                .lock()
+                .expect("snapshots")
+                .iter()
+                .filter(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
+                .count(),
+            0
+        );
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
