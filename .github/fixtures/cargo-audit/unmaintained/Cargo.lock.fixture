@@ -1,0 +1,8 @@
+# This file is intentionally vulnerable to an informational advisory.
+version = 4
+
+[[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"

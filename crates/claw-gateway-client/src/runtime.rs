@@ -16,6 +16,14 @@ pub trait ClientRuntime: Send + Sync + 'static {
     /// Returns additive jitter in the inclusive range from zero through `maximum`.
     fn jitter(&self, maximum: Duration) -> Duration;
 
+    /// Optional scheduling barrier before a request enters its captured connection queue.
+    ///
+    /// Production runtimes normally use the no-op default. Deterministic tests
+    /// can pause after the atomic connection snapshot without mocking transport.
+    fn before_request_enqueue(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(async {})
+    }
+
     /// Optional scheduling barrier before an authenticated application write.
     ///
     /// Production runtimes normally use the no-op default. Deterministic tests

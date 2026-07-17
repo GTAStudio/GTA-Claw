@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 
 use claw_application::Application;
 use claw_gateway_client::{
-    AuthenticationFailure, ClientMetadata, ClientTimeouts, ConfigurationError, ConnectionInfo,
-    ConnectionState, GatewayClient, GatewayClientConfig, GatewayClientError, GatewayCredential,
-    ProtocolFailure, ReconnectPolicy, TransportFailure,
+    AuthenticationFailure, AuthorizationExpectation, ClientMetadata, ClientTimeouts,
+    ConfigurationError, ConnectionEpoch, ConnectionInfo, ConnectionState, GatewayClient,
+    GatewayClientConfig, GatewayClientError, GatewayCredential, ProtocolFailure, ReconnectPolicy,
+    TransportFailure,
 };
 use claw_platform::NativeSystemProbe;
 use claw_protocol::gateway::{
@@ -30,6 +31,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
+use tokio::sync::watch;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
@@ -585,6 +587,7 @@ async fn run_gateway(
     config.credential = credential;
     config.role = Role::Operator;
     config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
+    config.authorization_expectation = AuthorizationExpectation::ExactRequested;
     config.client = ClientMetadata {
         id: ClientId::Probe,
         display_name: Some(Name::new("GTA Claw Gateway diagnostic", 64).expect("static name")),
@@ -641,9 +644,9 @@ async fn run_gateway(
 }
 
 async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
-    let info = match client.wait_ready().await {
-        Ok(info) => match SafeConnectionInfo::try_from(info) {
-            Ok(info) => info,
+    let (epoch, info) = match client.wait_ready().await {
+        Ok(ready) => match SafeConnectionInfo::try_from(ready.info) {
+            Ok(info) => (ready.epoch, info),
             Err(failure) => return DiagnosticAttempt::failure(failure),
         },
         Err(error) => {
@@ -655,7 +658,7 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
     let method = GatewayMethodName::Core(
         resolve_core_method("health").expect("P02a registry contains health"),
     );
-    let response = match request_health(client, request_id, method).await {
+    let response = match request_health(client, epoch, request_id, method).await {
         Ok(response) => response,
         Err(failure) => return DiagnosticAttempt::with_info(failure, info),
     };
@@ -709,22 +712,40 @@ async fn execute_health(client: &GatewayClient) -> DiagnosticAttempt {
 
 async fn request_health(
     client: &GatewayClient,
+    epoch: ConnectionEpoch,
     request_id: RequestId,
     method: GatewayMethodName,
 ) -> Result<ResponseFrame, DiagnosticFailure> {
     let params = EmptyParams {};
-    let request = client.request(request_id, method, &params);
-    tokio::pin!(request);
-    let mut states = client.subscribe_state();
+    race_operation_against_state(client.subscribe_state(), || async {
+        match client
+            .request_for_epoch(epoch, request_id, method, &params)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => Err(classify_request_error(client, &error).await),
+        }
+    })
+    .await
+}
+
+async fn race_operation_against_state<T, MakeOperation, Operation>(
+    mut states: watch::Receiver<ConnectionState>,
+    make_operation: MakeOperation,
+) -> Result<T, DiagnosticFailure>
+where
+    MakeOperation: FnOnce() -> Operation,
+    Operation: Future<Output = Result<T, DiagnosticFailure>>,
+{
+    if let Some(failure) = terminal_state_failure(states.borrow().clone()) {
+        return Err(failure);
+    }
+    let operation = make_operation();
+    tokio::pin!(operation);
     loop {
         tokio::select! {
             biased;
-            result = &mut request => {
-                return match result {
-                    Ok(response) => Ok(response),
-                    Err(error) => Err(classify_request_error(client, &error).await),
-                };
-            }
+            result = &mut operation => return result,
             changed = states.changed() => {
                 if changed.is_err() {
                     return Err(transport_failure());
@@ -744,6 +765,7 @@ async fn classify_request_error(
     if !matches!(
         error,
         GatewayClientError::DisconnectedNotReplayed
+            | GatewayClientError::ConnectionChanged { .. }
             | GatewayClientError::NotReady
             | GatewayClientError::Cancelled
             | GatewayClientError::RequestTimedOut(_)
@@ -753,10 +775,10 @@ async fn classify_request_error(
     let mut states = client.subscribe_state();
     loop {
         let state = states.borrow().clone();
-        if let Some(failure) = terminal_state_failure(state) {
+        if let Some(failure) = terminal_state_failure(state.clone()) {
             return failure;
         }
-        match states.borrow().clone() {
+        match state {
             ConnectionState::Starting
             | ConnectionState::Connecting
             | ConnectionState::Authenticating
@@ -1180,6 +1202,7 @@ fn map_client_error(error: &GatewayClientError) -> DiagnosticFailure {
         }
         GatewayClientError::Transport(_)
         | GatewayClientError::DisconnectedNotReplayed
+        | GatewayClientError::ConnectionChanged { .. }
         | GatewayClientError::ReconnectExhausted => DiagnosticFailure {
             category: ExitCategory::TransportTransient,
             status: "transport_failure",
@@ -1351,7 +1374,11 @@ impl RenderedResult {
 mod tests {
     use std::cell::Cell;
     use std::fmt::{self, Display, Formatter};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     use super::*;
 
@@ -1387,6 +1414,44 @@ mod tests {
             self.calls.set(self.calls.get() + 1);
             destination.fill(0x5a);
             Ok(())
+        }
+    }
+
+    struct TerminalOnPoll {
+        states: watch::Sender<ConnectionState>,
+        dropped: Arc<AtomicBool>,
+        sent: bool,
+    }
+
+    impl Future for TerminalOnPoll {
+        type Output = Result<u8, DiagnosticFailure>;
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.sent {
+                self.states.send_replace(ConnectionState::Stopped);
+                self.sent = true;
+                context.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for TerminalOnPoll {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct ResponseAndTerminal {
+        states: watch::Sender<ConnectionState>,
+    }
+
+    impl Future for ResponseAndTerminal {
+        type Output = Result<u8, DiagnosticFailure>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            self.states.send_replace(ConnectionState::Stopped);
+            Poll::Ready(Ok(7))
         }
     }
 
@@ -1439,6 +1504,47 @@ mod tests {
             || Err(io::Error::other("injected runtime initialization failure")),
         );
         assert_eq!(exit, ExitCode::from(8));
+    }
+
+    #[tokio::test]
+    async fn terminal_state_prevents_request_creation() {
+        let (_states, receiver) = watch::channel(ConnectionState::Stopped);
+        let called = Cell::new(false);
+        let result = race_operation_against_state(receiver, || {
+            called.set(true);
+            async { Ok::<u8, DiagnosticFailure>(1) }
+        })
+        .await;
+        assert!(!called.get());
+        assert!(matches!(
+            result,
+            Err(failure) if failure.category.code() == 3
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_cancels_in_flight_operation() {
+        let (states, receiver) = watch::channel(ConnectionState::Starting);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = race_operation_against_state(receiver, || TerminalOnPoll {
+            states,
+            dropped: Arc::clone(&dropped),
+            sent: false,
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(failure) if failure.category.code() == 3
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ready_response_wins_simultaneous_terminal_transition() {
+        let (states, receiver) = watch::channel(ConnectionState::Starting);
+        let result =
+            race_operation_against_state(receiver, || ResponseAndTerminal { states }).await;
+        assert_eq!(result.ok(), Some(7));
     }
 
     #[test]

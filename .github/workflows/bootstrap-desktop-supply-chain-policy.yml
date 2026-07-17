@@ -1,0 +1,46 @@
+name: GTA Claw non-authoritative desktop policy bootstrap
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: non-authoritative-desktop-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  candidate-validator-bootstrap:
+    name: "[NON-AUTHORITATIVE] Candidate desktop policy validator CI"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout candidate validator
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+          clean: true
+          set-safe-directory: false
+          show-progress: false
+
+      - name: Run non-authoritative candidate validator CI
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          echo "This check compiles pull request code and is not a supply-chain authority."
+          /bin/bash \
+            "${{ github.workspace }}/candidate/.github/trusted/desktop-supply-chain-policy/scripts/bootstrap-tools.sh" \
+            "${{ runner.temp }}/gta-claw-non-authoritative-policy-tools" \
+            "${{ github.workspace }}/candidate" \
+            "/home/runner/.cargo/bin/rustup"

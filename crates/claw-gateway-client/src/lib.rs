@@ -11,12 +11,12 @@ mod transport;
 
 pub use client::{GatewayClient, GatewayEventStream};
 pub use config::{
-    ClientLimits, ClientMetadata, ClientTimeouts, ConfigurationError, GatewayClientConfig,
-    GatewayCredential, ReconnectPolicy,
+    AuthorizationExpectation, ClientLimits, ClientMetadata, ClientTimeouts, ConfigurationError,
+    GatewayClientConfig, GatewayCredential, ReconnectPolicy,
 };
 pub use error::{
-    AuthenticationFailure, BackpressureError, ConnectionInfo, ConnectionState, FailureClass,
-    GatewayClientError, GatewayEvent, IssuedDeviceToken, ProtocolFailure, ResyncRequired,
-    TransportFailure,
+    AuthenticationFailure, BackpressureError, ConnectionEpoch, ConnectionInfo, ConnectionState,
+    FailureClass, GatewayClientError, GatewayEvent, IssuedDeviceToken, ProtocolFailure,
+    ReadyConnection, ResyncRequired, TransportFailure,
 };
 pub use runtime::{ClientRuntime, SystemRuntime};

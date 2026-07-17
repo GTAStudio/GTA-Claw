@@ -30,6 +30,8 @@ fi
 submission="$artifact"
 temporary_zip=""
 if [[ -d "$artifact" && "$artifact" == *.app ]]; then
+  assert_app_executable_contract "$artifact"
+  codesign --verify --deep --strict --verbose=2 "$artifact"
   temporary_zip="$OUTPUT_ROOT/notarization/$(basename "$artifact").zip"
   assert_output_path "$temporary_zip"
   ensure_output_directory "$(dirname "$temporary_zip")"
@@ -70,6 +72,10 @@ fi
 
 xcrun stapler staple "$artifact"
 xcrun stapler validate "$artifact"
+if [[ -d "$artifact" && "$artifact" == *.app ]]; then
+  assert_app_executable_contract "$artifact"
+  codesign --verify --deep --strict --verbose=2 "$artifact"
+fi
 if [[ "$(dirname "$artifact")" == "$OUTPUT_ROOT/distribution" &&
   -f "$OUTPUT_ROOT/distribution/SHA256SUMS" ]]; then
   write_sha256_manifest "$OUTPUT_ROOT/distribution" "$OUTPUT_ROOT/distribution/SHA256SUMS"

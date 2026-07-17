@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 
 : "${APP_NAME:=GTA Claw}"
-: "${EXECUTABLE_NAME:=gta-claw-desktop}"
+if [[ "${EXECUTABLE_NAME:-gta-claw-desktop}" != "gta-claw-desktop" ]]; then
+  die "EXECUTABLE_NAME must be exactly gta-claw-desktop"
+fi
+EXECUTABLE_NAME="gta-claw-desktop"
 : "${BUNDLE_ID:=com.gtastudio.gta-claw}"
 : "${MINIMUM_MACOS_VERSION:=14.0}"
 : "${APP_CATEGORY:=public.app-category.developer-tools}"
