@@ -824,7 +824,8 @@ fn immutable_bootstrap_snapshot_matches_the_transition_fingerprint() {
 
 #[test]
 fn immutable_bootstrap_snapshot_is_canonical_validator_output() {
-    let root = SafeRoot::new(repo_root()).expect("open live repository");
+    let tree = bootstrap_tree("canonical-bootstrap");
+    let root = SafeRoot::new(&tree.path).expect("open immutable bootstrap fixture");
     let expected = bootstrap_snapshot(&root).expect("generate canonical Bootstrap snapshot");
     let actual = fs::read(
         repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
