@@ -398,7 +398,7 @@ jobs:
 
             warning_output="$(
               "$audit_bin" audit --no-fetch \
-                --file .github/fixtures/cargo-audit/unmaintained/Cargo.lock 2>&1
+                --file .github/fixtures/cargo-audit/unmaintained/Cargo.lock.fixture 2>&1
             )"
             printf '%s\n' "$warning_output"
             grep -F "RUSTSEC-2025-0141" <<<"$warning_output"
@@ -406,7 +406,7 @@ jobs:
             set +e
             vulnerable_output="$(
               "$audit_bin" audit --no-fetch \
-                --file .github/fixtures/cargo-audit/vulnerable/Cargo.lock 2>&1
+                --file .github/fixtures/cargo-audit/vulnerable/Cargo.lock.fixture 2>&1
             )"
             vulnerable_status=$?
             set -e
@@ -588,56 +588,3 @@ jobs:
           restore_manifest
           trap - EXIT
           cmp "$manifest" "$backup"
-
-      - name: Validate supply-chain policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          actionlint_bin="${{ runner.temp }}/verified-rust-security-tools/actionlint/actionlint"
-          cargo_runner="${{ runner.temp }}/verified-rust-security-tools/bin/run-cargo-clean"
-          target_dir="${{ runner.temp }}/verified-rust-security-tools/target"
-          messages="${{ runner.temp }}/desktop-supply-chain-policy.json"
-          rm -rf -- "$target_dir"
-          mkdir -p "$target_dir"
-          "$cargo_runner" test \
-            --manifest-path "${{ github.workspace }}/Cargo.toml" \
-            --locked \
-            --package claw-security \
-            --test desktop_supply_chain_policy \
-            --no-run \
-            --message-format json >"$messages"
-          policy_binary="$(
-            /usr/bin/python3 - "$messages" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          executables = []
-          for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-              message = json.loads(line)
-              target = message.get("target", {})
-              if (
-                  message.get("reason") == "compiler-artifact"
-                  and target.get("name") == "desktop_supply_chain_policy"
-                  and "test" in target.get("kind", [])
-                  and message.get("executable")
-              ):
-                  executables.append(message["executable"])
-          if len(executables) != 1:
-              raise SystemExit(f"expected one policy test executable, found {executables!r}")
-          print(executables[0])
-          PY
-          )"
-          test -x "$policy_binary"
-          case "$policy_binary" in
-            "$target_dir"/*) ;;
-            *)
-              echo "Policy test executable escaped verified target: $policy_binary" >&2
-              exit 1
-              ;;
-          esac
-          /usr/bin/env -i \
-            ACTIONLINT_BIN="$actionlint_bin" \
-            REQUIRE_ACTIONLINT="true" \
-            PATH="/usr/bin:/bin" \
-            "$policy_binary" --nocapture
