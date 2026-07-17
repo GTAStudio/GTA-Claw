@@ -2546,7 +2546,14 @@ mod tests {
             .await
             .err()
             .expect("published backup remains writer-excluded");
-        assert!(matches!(competing, StateError::StoreLocked { .. }));
+        assert!(
+            matches!(competing, StateError::StoreLocked { .. })
+                || matches!(
+                    competing,
+                    StateError::InvalidBackup { ref reason, .. }
+                        if reason.contains("restore_backup")
+                )
+        );
         assert!(!sidecar(&backup_path, "-wal").exists());
         assert!(!sidecar(&backup_path, "-shm").exists());
         release.notify_one();
@@ -2568,6 +2575,51 @@ mod tests {
             .close()
             .await
             .expect("handoff source closes");
+    }
+
+    #[tokio::test]
+    async fn opening_standalone_backup_is_rejected_without_invalidating_restore() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "sealed-open-source.sqlite");
+        let backup_path = database_path(&directory, "sealed-open-backup.sqlite");
+        let restored_path = database_path(&directory, "sealed-open-restored.sqlite");
+        let source = open(&source_path).await;
+        let record = session("sealed-open-record", 1);
+        source
+            .sessions()
+            .create(&record)
+            .await
+            .expect("seed sealed-open source");
+        source
+            .backup_to(&backup_path)
+            .await
+            .expect("create sealed-open backup");
+        let error = StateStore::open(StoreConfig::new(&backup_path))
+            .await
+            .err()
+            .expect("standalone backup rejects live open");
+        assert!(matches!(
+            error,
+            StateError::InvalidBackup { reason, .. }
+                if reason.contains("restore_backup")
+        ));
+        StateStore::restore_backup(&backup_path, &restored_path)
+            .await
+            .expect("rejected live open preserves backup seal");
+        let restored = open(&restored_path).await;
+        assert_eq!(
+            restored
+                .sessions()
+                .get(&record.id)
+                .await
+                .expect("read restored sealed-open record"),
+            Some(record)
+        );
+        restored
+            .close()
+            .await
+            .expect("sealed-open restored store closes");
+        source.close().await.expect("sealed-open source closes");
     }
 
     #[cfg(unix)]
@@ -2604,6 +2656,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "publication-source.sqlite");
         let destination = database_path(&directory, "publication-destination.sqlite");
+        let restored = database_path(&directory, "publication-restored.sqlite");
         let source = open(&source_path).await;
         test_support::fail_after_publication_once(&destination);
 
@@ -2619,7 +2672,10 @@ mod tests {
         assert!(!sidecar(&destination, "-wal").exists());
         assert!(!sidecar(&destination, "-shm").exists());
         assert!(!sidecar(&destination, "-journal").exists());
-        open(&destination)
+        StateStore::restore_backup(&destination, &restored)
+            .await
+            .expect("published destination remains restorable");
+        open(&restored)
             .await
             .close()
             .await
@@ -2865,6 +2921,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "windows-publication-source.sqlite");
         let destination = database_path(&directory, "windows-publication-destination.sqlite");
+        let restored = database_path(&directory, "windows-publication-restored.sqlite");
         let source = open(&source_path).await;
         test_support::fail_windows_source_removal_once(&destination);
 
@@ -2877,7 +2934,10 @@ mod tests {
         assert!(!sidecar(&destination, "-wal").exists());
         assert!(!sidecar(&destination, "-shm").exists());
         assert!(!sidecar(&destination, "-journal").exists());
-        open(&destination)
+        StateStore::restore_backup(&destination, &restored)
+            .await
+            .expect("Windows published destination remains restorable");
+        open(&restored)
             .await
             .close()
             .await
