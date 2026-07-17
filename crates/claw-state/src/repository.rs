@@ -1,7 +1,8 @@
 use claw_domain::SessionId;
-use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 #[cfg(test)]
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{database, database_code};
 use crate::model::{finish_page, invalid_stored, validate_text};
@@ -15,36 +16,55 @@ use crate::{
 const APPLICATION_ID: i64 = 0x4754_4143;
 
 struct VerifiedWriteTransaction {
-    connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
     token: Option<claw_sqlite_file_control::ManualTransactionToken>,
+    runtime: Option<tokio::runtime::Handle>,
+    #[cfg(test)]
+    owner_key: String,
 }
 
 impl VerifiedWriteTransaction {
-    fn new(connection: sqlx::pool::PoolConnection<Sqlite>) -> Self {
+    fn new(connection: sqlx::pool::PoolConnection<sqlx::Sqlite>, _owner: &str) -> Self {
         Self {
             connection: Some(connection),
             token: None,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            #[cfg(test)]
+            owner_key: _owner.to_owned(),
         }
     }
 
-    fn set_token(&mut self, token: claw_sqlite_file_control::ManualTransactionToken) {
+    fn set_active(
+        &mut self,
+        connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+        token: claw_sqlite_file_control::ManualTransactionToken,
+    ) {
+        self.connection = Some(connection);
         self.token = Some(token);
     }
 
     async fn commit(mut self, operation: &'static str) -> Result<(), StateError> {
-        let token = self
-            .token
-            .take()
-            .expect("manual transaction token remains live");
-        let result = claw_sqlite_file_control::commit_synchronously(&mut self, token).await;
+        let result = {
+            let connection = self
+                .connection
+                .as_mut()
+                .expect("verified write connection remains live");
+            let token = self
+                .token
+                .as_mut()
+                .expect("manual transaction token remains live");
+            claw_sqlite_file_control::commit_synchronously(connection, token).await
+        };
         match result {
             Ok(()) => {
+                self.token.take();
                 drop(self.connection.take());
                 Ok(())
             }
             Err(error) => {
+                self.token.take();
                 if let Some(connection) = self.connection.take() {
-                    drop(connection.detach());
+                    let _ = connection.close().await;
                 }
                 Err(error.code().map_or_else(
                     || database(operation, sqlx::Error::Protocol(error.to_string())),
@@ -60,7 +80,7 @@ impl std::ops::Deref for VerifiedWriteTransaction {
 
     fn deref(&self) -> &Self::Target {
         self.connection
-            .as_deref()
+            .as_ref()
             .expect("verified write connection remains live")
     }
 }
@@ -68,15 +88,103 @@ impl std::ops::Deref for VerifiedWriteTransaction {
 impl std::ops::DerefMut for VerifiedWriteTransaction {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.connection
-            .as_deref_mut()
+            .as_mut()
             .expect("verified write connection remains live")
     }
+}
+
+fn schedule_rollback_cleanup(
+    runtime: &tokio::runtime::Handle,
+    mut connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    mut token: claw_sqlite_file_control::ManualTransactionToken,
+) {
+    runtime.spawn(async move {
+        let rollback =
+            claw_sqlite_file_control::rollback_synchronously(&mut connection, &mut token).await;
+        if rollback.is_err() {
+            let _ = connection.close().await;
+        } else {
+            drop(connection);
+        }
+    });
 }
 
 impl Drop for VerifiedWriteTransaction {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {
-            drop(connection.detach());
+            if let Some(token) = self.token.take() {
+                let Some(runtime) = self.runtime.clone() else {
+                    std::mem::forget(connection);
+                    return;
+                };
+                let connection = connection;
+                #[cfg(test)]
+                let failure = {
+                    let mut failures = ROLLBACK_CLEANUP_FAILURES
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let failure = failures
+                        .get_mut(&self.owner_key)
+                        .and_then(std::collections::VecDeque::pop_front)
+                        .unwrap_or(0);
+                    if failures
+                        .get(&self.owner_key)
+                        .is_some_and(std::collections::VecDeque::is_empty)
+                    {
+                        failures.remove(&self.owner_key);
+                    }
+                    failure
+                };
+                #[cfg(not(test))]
+                let failure = 0_u8;
+                if failure != 0 {
+                    schedule_rollback_cleanup(&runtime, connection, token);
+                    return;
+                }
+                let cleanup = Arc::new(Mutex::new(Some((connection, token))));
+                let worker_cleanup = Arc::clone(&cleanup);
+                let worker_runtime = runtime.clone();
+                let worker = std::thread::Builder::new()
+                    .name("claw-state-rollback".to_owned())
+                    .spawn(move || {
+                        let cleanup = worker_cleanup
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        let Some((mut connection, mut token)) = cleanup else {
+                            return;
+                        };
+                        let rollback_and_close = async move {
+                            let rollback = claw_sqlite_file_control::rollback_synchronously(
+                                &mut connection,
+                                &mut token,
+                            )
+                            .await;
+                            if rollback.is_err() {
+                                let _ = connection.close().await;
+                            } else {
+                                drop(connection);
+                            }
+                        };
+                        worker_runtime.block_on(rollback_and_close);
+                    });
+                if let Ok(worker) = worker {
+                    let _ = worker.join();
+                } else if let Some((connection, token)) = cleanup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    schedule_rollback_cleanup(&runtime, connection, token);
+                }
+            } else {
+                if let Some(runtime) = &self.runtime {
+                    let _runtime_context = runtime.enter();
+                    drop(connection);
+                } else {
+                    std::mem::forget(connection);
+                }
+            }
         }
     }
 }
@@ -90,6 +198,10 @@ static COMMIT_TEST_TAMPERS: LazyLock<Mutex<std::collections::HashSet<String>>> =
 #[cfg(test)]
 static COMMIT_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static ROLLBACK_CLEANUP_FAILURES: LazyLock<
+    Mutex<std::collections::HashMap<String, std::collections::VecDeque<u8>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
 struct WriteTestBarrier {
@@ -700,9 +812,18 @@ async fn begin_verified_write(
         .acquire()
         .await
         .map_err(|error| database(operation, error))?;
-    let mut transaction = VerifiedWriteTransaction::new(connection);
-    let token = match claw_sqlite_file_control::begin_manual_transaction(&mut transaction).await {
-        Ok(token) => token,
+    let mut transaction = VerifiedWriteTransaction::new(connection, owner);
+    let connection = transaction
+        .connection
+        .take()
+        .expect("verified write connection is owned before BEGIN");
+    let (connection, token) = match claw_sqlite_file_control::begin_manual_pool_transaction(
+        connection,
+        identity.busy_timeout,
+    )
+    .await
+    {
+        Ok(active) => active,
         Err(error) => {
             let begin_operation = "lock and verify application writer";
             return Err(error.code().map_or_else(
@@ -711,7 +832,7 @@ async fn begin_verified_write(
             ));
         }
     };
-    transaction.set_token(token);
+    transaction.set_active(connection, token);
     let ownership = sqlx::query(
         "UPDATE claw_writer_lock
          SET owner = owner
@@ -1291,7 +1412,10 @@ fn conflict(entity: &'static str, id: &str, expected_version: i64) -> StateError
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Arc, COMMIT_TEST_BARRIERS, WriteTestBarrier};
+    use super::{
+        Arc, COMMIT_TEST_BARRIERS, ROLLBACK_CLEANUP_FAILURES, VerifiedWriteTransaction,
+        WriteTestBarrier,
+    };
     #[cfg(unix)]
     use super::{COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS};
 
@@ -1338,5 +1462,44 @@ pub(crate) mod test_support {
                 },
             );
         (entered, release)
+    }
+
+    pub(crate) fn fail_next_rollback_cleanup(owner: &str, mode: u8) {
+        ROLLBACK_CLEANUP_FAILURES
+            .lock()
+            .expect("rollback cleanup failures lock poisoned")
+            .entry(owner.to_owned())
+            .or_default()
+            .push_back(mode);
+    }
+
+    pub(crate) fn pending_rollback_cleanup_failures(owner: &str) -> usize {
+        ROLLBACK_CLEANUP_FAILURES
+            .lock()
+            .expect("rollback cleanup failures lock poisoned")
+            .get(owner)
+            .map_or(0, std::collections::VecDeque::len)
+    }
+
+    pub(crate) async fn drop_transaction_without_runtime(pool: &sqlx::SqlitePool) {
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire no-runtime rollback connection");
+        let mut transaction = VerifiedWriteTransaction::new(connection, "no-runtime-test");
+        let connection = transaction
+            .connection
+            .take()
+            .expect("own no-runtime rollback connection");
+        let (connection, token) = claw_sqlite_file_control::begin_manual_pool_transaction(
+            connection,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("begin no-runtime rollback transaction");
+        transaction.set_active(connection, token);
+        std::thread::spawn(move || drop(transaction))
+            .join()
+            .expect("no-runtime drop thread joins");
     }
 }
