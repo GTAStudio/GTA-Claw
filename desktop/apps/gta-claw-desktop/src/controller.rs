@@ -7,7 +7,7 @@ use std::time::Duration;
 use claw_gateway_client::{
     AuthorizationExpectation, ClientLimits, ClientRuntime, ClientTimeouts, ConnectionEpoch,
     ConnectionState, GatewayClient, GatewayClientConfig, GatewayClientError, GatewayCredential,
-    ReadyConnection, ReconnectPolicy,
+    GatewayEvent, GatewayEventStream, ReadyConnection, ReconnectPolicy,
 };
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, GatewayMethodName, RequestId, resolve_core_method,
@@ -17,7 +17,7 @@ use claw_security::identity::DeviceIdentity;
 use getrandom::{SysRng, rand_core::UnwrapErr};
 use serde_json::json;
 use tokio::runtime::Builder;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +32,7 @@ const ATTEMPT_STOP_TIMEOUT: Duration = Duration::from_millis(2_500);
 const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 
 type ViewSink = Arc<dyn Fn(ViewSnapshot) + Send + Sync + 'static>;
-type GatewayEventObserver = Arc<dyn Fn() + Send + Sync + 'static>;
+type GatewayEventObserver = Arc<dyn Fn(&GatewayEvent) + Send + Sync + 'static>;
 type AttemptStopObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 type GatewayRuntime = Arc<dyn ClientRuntime>;
 
@@ -199,7 +199,7 @@ impl DesktopController {
     #[cfg(test)]
     fn spawn_with_event_observer(
         sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
-        event_observer: impl Fn() + Send + Sync + 'static,
+        event_observer: impl Fn(&GatewayEvent) + Send + Sync + 'static,
     ) -> Result<Self, ControllerStartError> {
         Self::spawn_inner(Arc::new(sink), Some(Arc::new(event_observer)), None, None)
     }
@@ -478,60 +478,42 @@ async fn run_attempt(
         }
     };
     let mut states = client.subscribe_state();
-    let mut last_ready_epoch = None;
-    let mut issued_tokens = Vec::new();
     let mut event_stream_open = true;
-
-    let initial_state = states.borrow_and_update().clone();
-    let mut terminal = apply_client_state(
+    let context = AttemptContext {
         generation,
-        &client,
-        &updates,
-        initial_state,
-        &mut last_ready_epoch,
-        &mut issued_tokens,
-        &cancellation,
-    )
-    .await;
+        client: &client,
+        updates: &updates,
+        cancellation: &cancellation,
+    };
+    let mut progress = AttemptProgress {
+        last_ready_epoch: None,
+        issued_tokens: Vec::new(),
+    };
+
+    let mut pending_state = Some(states.borrow_and_update().clone());
+    let mut terminal = false;
     while !terminal {
+        if let Some(state) = pending_state.take() {
+            let mut streams = AttemptStreams {
+                states: &mut states,
+                gateway_events: &mut gateway_events,
+                event_stream_open: &mut event_stream_open,
+                event_observer: event_observer.as_ref(),
+            };
+            match apply_client_state(&context, state, &mut progress, &mut streams).await {
+                StateApplication::Continue => {}
+                StateApplication::ContinueWith(state) => pending_state = Some(state),
+                StateApplication::Terminal => terminal = true,
+            }
+            continue;
+        }
         tokio::select! {
             () = cancellation.cancelled() => break,
-            changed = states.changed() => {
-                if changed.is_err() {
-                    let final_state = states.borrow_and_update().clone();
-                    let _ = apply_client_state(
-                        generation,
-                        &client,
-                        &updates,
-                        final_state,
-                        &mut last_ready_epoch,
-                        &mut issued_tokens,
-                        &cancellation,
-                    )
-                    .await;
-                    break;
-                }
-                let state = states.borrow_and_update().clone();
-                terminal = apply_client_state(
-                    generation,
-                    &client,
-                    &updates,
-                    state,
-                    &mut last_ready_epoch,
-                    &mut issued_tokens,
-                    &cancellation,
-                )
-                .await;
+            _ = states.changed() => {
+                pending_state = Some(states.borrow_and_update().clone());
             }
             event = gateway_events.recv(), if event_stream_open => {
-                match event {
-                    Some(_) => {
-                        if let Some(observer) = &event_observer {
-                            observer();
-                        }
-                    }
-                    None => event_stream_open = false,
-                }
+                observe_gateway_event(event, &mut event_stream_open, event_observer.as_ref());
             }
         }
     }
@@ -546,18 +528,46 @@ async fn run_attempt(
         )
         .await;
     }
-    drop(issued_tokens);
+    drop(progress.issued_tokens);
+}
+
+enum StateApplication {
+    Continue,
+    ContinueWith(ConnectionState),
+    Terminal,
+}
+
+enum HealthWait {
+    Completed(Result<(), GatewayClientError>),
+    StateChanged(ConnectionState),
+    Cancelled,
+}
+
+struct AttemptContext<'a> {
+    generation: u64,
+    client: &'a GatewayClient,
+    updates: &'a mpsc::Sender<(u64, AttemptUpdate)>,
+    cancellation: &'a CancellationToken,
+}
+
+struct AttemptProgress {
+    last_ready_epoch: Option<ConnectionEpoch>,
+    issued_tokens: Vec<claw_gateway_client::IssuedDeviceToken>,
+}
+
+struct AttemptStreams<'a> {
+    states: &'a mut watch::Receiver<ConnectionState>,
+    gateway_events: &'a mut GatewayEventStream,
+    event_stream_open: &'a mut bool,
+    event_observer: Option<&'a GatewayEventObserver>,
 }
 
 async fn apply_client_state(
-    generation: u64,
-    client: &GatewayClient,
-    updates: &mpsc::Sender<(u64, AttemptUpdate)>,
+    context: &AttemptContext<'_>,
     state: ConnectionState,
-    last_ready_epoch: &mut Option<ConnectionEpoch>,
-    issued_tokens: &mut Vec<claw_gateway_client::IssuedDeviceToken>,
-    cancellation: &CancellationToken,
-) -> bool {
+    progress: &mut AttemptProgress,
+    streams: &mut AttemptStreams<'_>,
+) -> StateApplication {
     let terminal = matches!(
         &state,
         ConnectionState::ResyncRequired(_)
@@ -574,7 +584,7 @@ async fn apply_client_state(
             Some(AttemptUpdate::Reconnecting { attempt })
         }
         ConnectionState::Ready(ready) => {
-            if *last_ready_epoch == Some(ready.epoch) {
+            if progress.last_ready_epoch == Some(ready.epoch) {
                 None
             } else if !has_exact_read_scope(&ready) {
                 health_failure = true;
@@ -584,34 +594,33 @@ async fn apply_client_state(
                     ),
                 )))
             } else {
-                *last_ready_epoch = Some(ready.epoch);
+                progress.last_ready_epoch = Some(ready.epoch);
                 if send_update(
-                    updates,
-                    generation,
+                    context.updates,
+                    context.generation,
                     AttemptUpdate::Ready(ready.info.clone()),
                 )
                 .await
                 .is_err()
                 {
-                    return true;
+                    return StateApplication::Terminal;
                 }
-                let mut newly_issued = client.take_issued_device_tokens().await;
-                issued_tokens.append(&mut newly_issued);
-                issued_tokens.truncate(MAX_SESSION_DEVICE_TOKENS);
-                let health = run_health_probe(client, generation, ready.epoch);
-                let result = tokio::select! {
-                    () = cancellation.cancelled() => return true,
-                    result = health => result,
-                };
-                match result {
-                    Ok(()) => Some(AttemptUpdate::Healthy),
-                    Err(
+                let mut newly_issued = context.client.take_issued_device_tokens().await;
+                progress.issued_tokens.append(&mut newly_issued);
+                progress.issued_tokens.truncate(MAX_SESSION_DEVICE_TOKENS);
+                match wait_for_health_while_draining(context, ready.epoch, streams).await {
+                    HealthWait::Cancelled => return StateApplication::Terminal,
+                    HealthWait::StateChanged(state) => {
+                        return StateApplication::ContinueWith(state);
+                    }
+                    HealthWait::Completed(Ok(())) => Some(AttemptUpdate::Healthy),
+                    HealthWait::Completed(Err(
                         GatewayClientError::DisconnectedNotReplayed
                         | GatewayClientError::ConnectionChanged { .. }
                         | GatewayClientError::NotReady
                         | GatewayClientError::Cancelled,
-                    ) => None,
-                    Err(error) => {
+                    )) => None,
+                    HealthWait::Completed(Err(error)) => {
                         health_failure = true;
                         Some(AttemptUpdate::Failed(UserError::from_gateway(&error)))
                     }
@@ -639,9 +648,69 @@ async fn apply_client_state(
         ))),
     };
     if let Some(update) = update {
-        let _ = send_update(updates, generation, update).await;
+        let _ = send_update(context.updates, context.generation, update).await;
     }
-    terminal || health_failure
+    if terminal || health_failure {
+        StateApplication::Terminal
+    } else {
+        StateApplication::Continue
+    }
+}
+
+async fn wait_for_health_while_draining(
+    context: &AttemptContext<'_>,
+    epoch: ConnectionEpoch,
+    streams: &mut AttemptStreams<'_>,
+) -> HealthWait {
+    let health = run_health_probe(context.client, context.generation, epoch);
+    tokio::pin!(health);
+    loop {
+        tokio::select! {
+            biased;
+            () = context.cancellation.cancelled() => return HealthWait::Cancelled,
+            result = &mut health => {
+                let current = streams.states.borrow().clone();
+                if !is_ready_epoch(&current, epoch) {
+                    return HealthWait::StateChanged(
+                        streams.states.borrow_and_update().clone()
+                    );
+                }
+                return HealthWait::Completed(result);
+            }
+            changed = streams.states.changed() => {
+                let state = streams.states.borrow_and_update().clone();
+                if changed.is_err() || !is_ready_epoch(&state, epoch) {
+                    return HealthWait::StateChanged(state);
+                }
+            }
+            event = streams.gateway_events.recv(), if *streams.event_stream_open => {
+                observe_gateway_event(
+                    event,
+                    streams.event_stream_open,
+                    streams.event_observer,
+                );
+            }
+        }
+    }
+}
+
+fn observe_gateway_event(
+    event: Option<GatewayEvent>,
+    event_stream_open: &mut bool,
+    event_observer: Option<&GatewayEventObserver>,
+) {
+    match event {
+        Some(event) => {
+            if let Some(observer) = event_observer {
+                observer(&event);
+            }
+        }
+        None => *event_stream_open = false,
+    }
+}
+
+fn is_ready_epoch(state: &ConnectionState, epoch: ConnectionEpoch) -> bool {
+    matches!(state, ConnectionState::Ready(ready) if ready.epoch == epoch)
 }
 
 fn has_exact_read_scope(ready: &ReadyConnection) -> bool {
@@ -1234,25 +1303,35 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn normal_peer_close_cannot_leave_a_stale_ready_snapshot() {
-        let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
-            send_challenge(&mut socket).await;
-            let (connect, params) = receive_connect(&mut socket).await;
-            send_hello(
-                &mut socket,
-                &connect,
-                &params,
-                4,
-                "desktop-normal-close",
-                false,
-            )
-            .await;
-            let health = receive_request(&mut socket).await;
-            send_health(&mut socket, &health).await;
-            socket
-                .write_frame(Frame::close(1000, b"normal close"))
-                .await
-                .expect("close");
-            socket.flush().await.expect("flush");
+        let ready_to_close = Arc::new(Semaphore::new(0));
+        let server_close_gate = Arc::clone(&ready_to_close);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let server_close_gate = Arc::clone(&server_close_gate);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                send_hello(
+                    &mut socket,
+                    &connect,
+                    &params,
+                    4,
+                    "desktop-normal-close",
+                    false,
+                )
+                .await;
+                let health = receive_request(&mut socket).await;
+                send_health(&mut socket, &health).await;
+                tokio::time::timeout(Duration::from_secs(2), server_close_gate.acquire())
+                    .await
+                    .expect("Ready observation releases normal close")
+                    .expect("normal close semaphore remains open")
+                    .forget();
+                socket
+                    .write_frame(Frame::close(1000, b"normal close"))
+                    .await
+                    .expect("close");
+                socket.flush().await.expect("flush");
+            }
         }))
         .await;
         let (controller, snapshots) = controller_with_snapshots();
@@ -1264,6 +1343,7 @@ mod tests {
             snapshot.phase() == OnboardingPhase::Ready
         })
         .await;
+        ready_to_close.add_permits(1);
         let failed = wait_snapshot(&snapshots, |snapshot| {
             snapshot.phase() == OnboardingPhase::Failed
         })
@@ -1396,7 +1476,7 @@ mod tests {
             move |snapshot| {
                 sink.lock().expect("snapshots").push(snapshot);
             },
-            move || {
+            move |_| {
                 if let Some(observed) = event_observer.lock().expect("event observer").take() {
                     let _ = observed.send(());
                 }
@@ -1418,6 +1498,118 @@ mod tests {
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
         assert_eq!(additional_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_probe_drains_sequenced_event_burst_before_ready() {
+        const EVENT_COUNT: u64 = 32;
+
+        let event_acks = Arc::new(Semaphore::new(0));
+        let server_acks = Arc::clone(&event_acks);
+        let health_ids = Arc::new(Mutex::new(Vec::new()));
+        let server_health_ids = Arc::clone(&health_ids);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let server_acks = Arc::clone(&server_acks);
+            let server_health_ids = Arc::clone(&server_health_ids);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                send_hello(
+                    &mut socket,
+                    &connect,
+                    &params,
+                    4,
+                    "desktop-event-burst",
+                    false,
+                )
+                .await;
+                let health = receive_request(&mut socket).await;
+                server_health_ids
+                    .lock()
+                    .expect("health ids")
+                    .push(health.id().as_str().to_owned());
+                for sequence in 1..=EVENT_COUNT {
+                    send_json(
+                        &mut socket,
+                        serde_json::json!({
+                            "type": "event",
+                            "event": "tick",
+                            "payload": {"ts": 1_700_000_000_100_u64 + sequence},
+                            "seq": sequence
+                        }),
+                    )
+                    .await;
+                    tokio::time::timeout(Duration::from_secs(2), server_acks.acquire())
+                        .await
+                        .expect("desktop must drain events while health is pending")
+                        .expect("event acknowledgement semaphore remains open")
+                        .forget();
+                }
+                send_health(&mut socket, &health).await;
+                wait_for_close(&mut socket).await;
+            }
+        }))
+        .await;
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&snapshots);
+        let observed_sequences = Arc::new(Mutex::new(Vec::new()));
+        let recorded_sequences = Arc::clone(&observed_sequences);
+        let observer_acks = Arc::clone(&event_acks);
+        let controller = DesktopController::spawn_with_event_observer(
+            move |snapshot| {
+                sink.lock().expect("snapshots").push(snapshot);
+            },
+            move |event| {
+                let sequence = event
+                    .frame()
+                    .sequence()
+                    .expect("test sends sequenced broadcasts")
+                    .get();
+                recorded_sequences
+                    .lock()
+                    .expect("event sequences")
+                    .push(sequence);
+                observer_acks.add_permits(1);
+            },
+        )
+        .expect("controller");
+        controller
+            .sender()
+            .connect(request(&gateway.url))
+            .expect("connect");
+        let ready = wait_snapshot(&snapshots, |snapshot| {
+            snapshot.phase() == OnboardingPhase::Ready
+        })
+        .await;
+        assert_eq!(ready.health(), "Healthy - safe RPC completed");
+        assert_eq!(
+            observed_sequences
+                .lock()
+                .expect("event sequences")
+                .as_slice(),
+            &(1..=EVENT_COUNT).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            health_ids.lock().expect("health ids").as_slice(),
+            &["desktop-health-1-epoch-1"]
+        );
+        {
+            let snapshots = snapshots.lock().expect("snapshots");
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
+                    .count(),
+                1
+            );
+            assert!(
+                snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.phase() != OnboardingPhase::Failed)
+            );
+        }
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1472,7 +1664,18 @@ mod tests {
         let ids = health_ids.lock().expect("health ids").clone();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
+        assert!(ids[0].contains("-epoch-1"));
+        assert!(ids[1].contains("-epoch-2"));
         assert!(gateway.connections.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            snapshots
+                .lock()
+                .expect("snapshots")
+                .iter()
+                .filter(|snapshot| snapshot.phase() == OnboardingPhase::Ready)
+                .count(),
+            1
+        );
         controller.shutdown().expect("shutdown");
         gateway.shutdown().await;
     }
