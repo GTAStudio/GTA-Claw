@@ -24,16 +24,23 @@ unused-allowed-license = "allow"
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
+# Gateway onboarding adds getrandom 0.4 directly while ring retains 0.2.
+# Ed25519/fastwebsockets retain rand_core 0.6 while getrandom uses 0.10.
+# Slint retains thiserror 1 while the Gateway transport graph uses thiserror 2.
 skip = [
   { name = "bitflags", version = "=1.3.2" },
   { name = "block2", version = "=0.5.1" },
   { name = "core-foundation", version = "=0.9.4" },
+  { name = "getrandom", version = "=0.2.17" },
   { name = "hashbrown", version = "=0.14.5" },
   { name = "hashbrown", version = "=0.16.1" },
   { name = "objc2", version = "=0.5.2" },
   { name = "objc2-app-kit", version = "=0.2.2" },
   { name = "objc2-foundation", version = "=0.2.2" },
+  { name = "rand_core", version = "=0.6.4" },
   { name = "smol_str", version = "=0.2.2" },
+  { name = "thiserror", version = "=1.0.69" },
+  { name = "thiserror-impl", version = "=1.0.69" },
   { name = "windows-sys", version = "=0.52.0" },
 ]
 skip-tree = []

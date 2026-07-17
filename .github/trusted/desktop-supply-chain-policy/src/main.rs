@@ -9,7 +9,9 @@ use std::process::ExitCode;
 use desktop_supply_chain_policy::changes::{compute_manifest, write_manifest};
 use desktop_supply_chain_policy::input::SafeRoot;
 use desktop_supply_chain_policy::metadata::linux_tools;
-use desktop_supply_chain_policy::policy::{bootstrap_fingerprint, write_bootstrap_snapshot};
+use desktop_supply_chain_policy::policy::{
+    bootstrap_fingerprint, write_bootstrap_snapshot, write_final_dependency_fixtures,
+};
 use desktop_supply_chain_policy::validation::{ValidationRequest, validate_request};
 use desktop_supply_chain_policy::workflows::linux_actionlint;
 use desktop_supply_chain_policy::{PolicyError, PolicyResult};
@@ -99,6 +101,13 @@ fn snapshot(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     write_bootstrap_snapshot(&SafeRoot::new(root)?, &output)
 }
 
+fn final_dependency_fixtures(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
+    let mut options = parse_options(values)?;
+    let root = required(&mut options, "root")?;
+    reject_unknown(&options)?;
+    write_final_dependency_fixtures(&SafeRoot::new(root)?)
+}
+
 fn validate(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     let mut options = parse_options(values)?;
     let trusted_root = required(&mut options, "trusted-root")?;
@@ -139,6 +148,7 @@ fn run() -> PolicyResult<()> {
         Some("diff-manifest") => diff_manifest(arguments),
         Some("bootstrap-fingerprint") => fingerprint(arguments),
         Some("write-bootstrap-snapshot") => snapshot(arguments),
+        Some("write-final-dependency-fixtures") => final_dependency_fixtures(arguments),
         Some("validate") => validate(arguments),
         Some(other) => Err(PolicyError::new(format!(
             "unknown validator command: {other}"
