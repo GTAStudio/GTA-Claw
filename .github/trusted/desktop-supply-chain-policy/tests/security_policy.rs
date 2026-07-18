@@ -440,7 +440,7 @@ const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
 ];
 
 const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
-    "1ef27d2e3ddc7444397d9aa2efb5ceaa4a58412b1d73c921a094104eefe70860";
+    "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const P03B_ROOT_DENY_SHA256: &str =
     "f5c7a2a654d35d14aa4b7a277f457c67d85e4364f30fefa858a0bb3d489aa065";
@@ -456,6 +456,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-core = "=0.3.32"
 libsqlite3-sys = "0.37.0"
 sqlx.workspace = true
 tokio.workspace = true
@@ -1799,6 +1800,55 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
                 manifest_before.expect("present manifest snapshot")
             );
         }
+    }
+
+    for (label, from, to) in [
+        ("dependency-removed", "futures-core = \"=0.3.32\"\n", ""),
+        (
+            "version-drift",
+            "futures-core = \"=0.3.32\"",
+            "futures-core = \"=0.3.31\"",
+        ),
+        (
+            "name-drift",
+            "futures-core = \"=0.3.32\"",
+            "futures-util = \"=0.3.32\"",
+        ),
+        (
+            "broader-extra-dependency",
+            "futures-core = \"=0.3.32\"\n",
+            "futures-core = \"=0.3.32\"\nfutures-util = \"=0.3.32\"\n",
+        ),
+    ] {
+        let drifted = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(from, to, 1);
+        assert_ne!(
+            sha256(drifted.as_bytes()),
+            P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256,
+            "unauthorized helper manifest drift matched the reviewed digest: {label}"
+        );
+        let tree = final_tree(label);
+        add_root_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        fs::write(
+            tree.join(P03B_SQLITE_FILE_CONTROL_MEMBER)
+                .join("Cargo.toml"),
+            drifted,
+        )
+        .expect("write unauthorized helper manifest drift");
+        let rejection = std::panic::catch_unwind(|| {
+            add_root_member(
+                &tree,
+                P03B_SQLITE_FILE_CONTROL_MEMBER,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+            );
+        });
+        assert!(
+            rejection.is_err(),
+            "unauthorized helper manifest drift escaped the exact fixture: {label}"
+        );
     }
 }
 

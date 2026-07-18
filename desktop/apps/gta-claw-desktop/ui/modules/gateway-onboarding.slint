@@ -1,0 +1,457 @@
+import { CheckBox, ScrollView } from "std-widgets.slint";
+import {
+    Card,
+    DangerButton,
+    Divider,
+    LoadingIndicator,
+    PrimaryButton,
+    ResettableTextField,
+    SecureTextField,
+    SecondaryButton,
+    StatusBadge,
+    TextField,
+    ToastBanner,
+} from "./primitives.slint";
+import { DesignTokens, Metrics, StatusKind } from "./tokens.slint";
+
+component SummaryRow {
+    in property <string> label;
+    in property <string> value;
+
+    min-height: Metrics.line-body;
+    accessible-role: text;
+    accessible-label: root.label + ": " + root.value;
+
+    HorizontalLayout {
+        spacing: Metrics.space-3;
+
+        Text {
+            text: root.label;
+            color: DesignTokens.text-muted;
+            font-size: Metrics.type-caption;
+            font-weight: 700;
+            width: 112px;
+            horizontal-stretch: 0;
+            accessible-role: none;
+        }
+
+        Text {
+            text: root.value;
+            color: DesignTokens.text-primary;
+            font-size: Metrics.type-small;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+            accessible-role: none;
+        }
+    }
+}
+
+component ConnectionSummary {
+    in property <string> endpoint;
+    in property <string> server;
+    in property <string> protocol;
+    in property <string> role;
+    in property <string> scopes;
+    in property <string> health;
+    in property <string> identity;
+
+    Card {
+        accessible-name: "Safe Gateway connection summary";
+
+        Text {
+            text: "Connection summary";
+            color: DesignTokens.text-primary;
+            font-size: Metrics.type-title;
+            font-weight: 750;
+            accessible-role: none;
+        }
+
+        Text {
+            text: "Only bounded non-secret fields are shown.";
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-caption;
+            accessible-role: none;
+        }
+
+        Divider { }
+        SummaryRow { label: "Endpoint"; value: root.endpoint; }
+        SummaryRow { label: "Server"; value: root.server; }
+        SummaryRow { label: "Protocol"; value: root.protocol; }
+        SummaryRow { label: "Role"; value: root.role; }
+        SummaryRow { label: "Effective scopes"; value: root.scopes; }
+        SummaryRow { label: "Health"; value: root.health; }
+        SummaryRow { label: "Device identity"; value: root.identity; }
+    }
+}
+
+component ConnectionForm {
+    in-out property <string> endpoint-input;
+    in property <bool> endpoint-reset-selector;
+    in property <bool> endpoint-preserve-focus;
+    in-out property <string> token-input;
+    in property <bool> token-reset-selector;
+    in property <bool> token-preserve-focus;
+    in-out property <bool> consent-checked;
+    in property <bool> busy;
+    in property <bool> can-connect;
+    in property <bool> can-cancel;
+    in property <bool> can-disconnect;
+    in property <bool> can-retry;
+    out property <bool> endpoint-has-focus: endpoint-field.has-focus;
+    out property <bool> token-has-focus: token-field.has-focus;
+    callback connect-requested(string, string, bool);
+    callback retry-requested(string, string, bool);
+    callback cancel-requested;
+    callback disconnect-requested;
+
+    function submit-form() {
+        if (root.can-retry) {
+            root.retry-requested(root.endpoint-input, root.token-input, root.consent-checked);
+        } else if (root.can-connect) {
+            root.connect-requested(root.endpoint-input, root.token-input, root.consent-checked);
+        }
+    }
+
+    accessible-role: form;
+    accessible-label: "Gateway connection form";
+
+    Card {
+        accessible-name: "Connect to a Gateway";
+
+        Text {
+            text: "Gateway connection";
+            color: DesignTokens.text-primary;
+            font-size: Metrics.type-title;
+            font-weight: 750;
+            accessible-role: none;
+        }
+
+        Text {
+            text: "Connect performs the real challenge, connect, hello, and safe health flow.";
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-small;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+
+        endpoint-field := ResettableTextField {
+            label: "Gateway WebSocket address";
+            accessible-name: "Gateway WebSocket address";
+            placeholder: "wss://gateway.example";
+            text <=> root.endpoint-input;
+            reset-selector: root.endpoint-reset-selector;
+            preserve-focus-on-reset: root.endpoint-preserve-focus;
+            enabled: !root.busy && !root.can-disconnect;
+            accepted => { root.submit-form(); }
+        }
+
+        token-field := SecureTextField {
+            label: "Session token";
+            accessible-name: "Session-only Gateway token";
+            placeholder: "Optional when Gateway policy allows";
+            text <=> root.token-input;
+            reset-selector: root.token-reset-selector;
+            preserve-focus-on-reset: root.token-preserve-focus;
+            enabled: !root.busy && !root.can-disconnect;
+            accepted => { root.submit-form(); }
+        }
+
+        Text {
+            text: "Session only. The field is cleared immediately when submitted and is never persisted.";
+            color: DesignTokens.text-muted;
+            font-size: Metrics.type-caption;
+            wrap: word-wrap;
+            accessible-role: text;
+            accessible-label: "Session token is cleared immediately and is never persisted.";
+        }
+
+        CheckBox {
+            text: "I consent to a new ephemeral device identity for this diagnostic session.";
+            checked <=> root.consent-checked;
+            enabled: !root.busy && !root.can-disconnect;
+        }
+
+        Rectangle {
+            min-height: pairing-copy.min-height + 2 * Metrics.space-3;
+            background: DesignTokens.warning-surface;
+            border-width: 1px;
+            border-color: DesignTokens.warning;
+            border-radius: Metrics.radius-medium;
+            accessible-role: text;
+            accessible-label: pairing-copy.text;
+
+            pairing-copy := Text {
+                x: Metrics.space-3;
+                y: Metrics.space-3;
+                width: parent.width - 2 * Metrics.space-3;
+                text: "Pairing may be required. This identity and any issued device token remain in bounded memory only and are discarded on disconnect or app exit.";
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-caption;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+        }
+
+        if (root.busy) : LoadingIndicator {
+            accessible-name: "Gateway operation in progress";
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.space-2;
+
+            if (root.can-connect && !root.can-retry) : PrimaryButton {
+                text: "Connect";
+                accessible-name: "Connect to Gateway";
+                clicked => { root.submit-form(); }
+            }
+
+            if (root.can-retry) : PrimaryButton {
+                text: "Retry";
+                accessible-name: "Retry Gateway connection";
+                clicked => { root.submit-form(); }
+            }
+
+            if (root.can-cancel) : SecondaryButton {
+                text: "Cancel";
+                accessible-name: "Cancel Gateway connection attempt";
+                clicked => { root.cancel-requested(); }
+            }
+
+            if (root.can-disconnect) : DangerButton {
+                text: "Disconnect";
+                accessible-name: "Disconnect from Gateway";
+                clicked => { root.disconnect-requested(); }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}
+
+export component GatewayOnboardingSurface inherits FocusScope {
+    in property <length> available-width;
+    in property <string> state-title;
+    in property <string> state-detail;
+    in property <string> status-text;
+    in property <string> status-label;
+    in property <string> status-icon;
+    in property <StatusKind> status-kind;
+    in property <string> endpoint-summary;
+    in property <string> server-summary;
+    in property <string> protocol-summary;
+    in property <string> role-summary;
+    in property <string> scopes-summary;
+    in property <string> health-summary;
+    in property <string> identity-summary;
+    in property <string> error-message;
+    in property <string> error-action;
+    in property <bool> busy;
+    in property <bool> can-connect;
+    in property <bool> can-cancel;
+    in property <bool> can-disconnect;
+    in property <bool> can-retry;
+    in-out property <string> endpoint-input;
+    in property <bool> endpoint-reset-selector;
+    in property <bool> endpoint-preserve-focus;
+    in-out property <string> token-input;
+    in property <bool> token-reset-selector;
+    in property <bool> token-preserve-focus;
+    in-out property <bool> consent-checked;
+    out property <bool> narrow-layout: root.available-width < 900px;
+    out property <bool> endpoint-has-focus: connection-form.endpoint-has-focus;
+    out property <bool> token-has-focus: connection-form.token-has-focus;
+
+    callback connect-requested(string, string, bool);
+    callback retry-requested(string, string, bool);
+    callback cancel-requested;
+    callback disconnect-requested;
+    callback error-dismiss-requested;
+
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            if (root.can-cancel) {
+                root.cancel-requested();
+                return accept;
+            }
+            if (root.can-disconnect) {
+                root.disconnect-requested();
+                return accept;
+            }
+        }
+        return reject;
+    }
+
+    accessible-role: main;
+    accessible-label: "Gateway onboarding and connection";
+
+    Rectangle {
+        background: DesignTokens.surface-app;
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            min-height: 68px;
+            max-height: 68px;
+            vertical-stretch: 0;
+            background: DesignTokens.surface-pane;
+            border-width: 1px;
+            border-color: DesignTokens.border-default;
+
+            HorizontalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                Rectangle {
+                    width: Metrics.control-large;
+                    height: Metrics.control-large;
+                    horizontal-stretch: 0;
+                    background: DesignTokens.accent;
+                    border-radius: Metrics.radius-large;
+
+                    Text {
+                        text: "GC";
+                        color: DesignTokens.accent-on;
+                        font-size: Metrics.type-small;
+                        font-weight: 850;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    Text {
+                        text: "GTA Claw";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-title;
+                        font-weight: 800;
+                        accessible-role: none;
+                    }
+
+                    Text {
+                        text: "Gateway diagnostic";
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        accessible-role: none;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                StatusBadge {
+                    kind: root.status-kind;
+                    text: root.status-text;
+                    semantic-label: root.status-label;
+                    icon-text: root.status-icon;
+                }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: body.min-height;
+
+            body := VerticalLayout {
+                width: parent.width;
+                padding: root.narrow-layout ? Metrics.space-4 : Metrics.space-6;
+                spacing: Metrics.space-4;
+
+                VerticalLayout {
+                    spacing: Metrics.space-1;
+
+                    Text {
+                        text: root.state-title;
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-display;
+                        font-weight: 800;
+                        wrap: word-wrap;
+                        accessible-role: text;
+                        accessible-label: root.state-title;
+                    }
+
+                    Text {
+                        text: root.state-detail;
+                        color: DesignTokens.text-secondary;
+                        font-size: Metrics.type-body;
+                        wrap: word-wrap;
+                        accessible-role: text;
+                        accessible-label: root.state-detail;
+                    }
+                }
+
+                if (root.error-message != "") : ToastBanner {
+                    kind: StatusKind.danger;
+                    message: root.error-message + " " + root.error-action;
+                    dismissible: true;
+                    dismiss-requested => { root.error-dismiss-requested(); }
+                }
+
+                responsive-content := Rectangle {
+                    min-height: root.narrow-layout
+                        ? connection-form.min-height + Metrics.space-4 + connection-summary.min-height
+                        : max(connection-form.min-height, connection-summary.min-height);
+                    background: transparent;
+
+                    connection-form := ConnectionForm {
+                        x: 0px;
+                        y: 0px;
+                        width: root.narrow-layout
+                            ? parent.width
+                            : max(0px, parent.width - Metrics.space-4 - 420px);
+                        height: self.min-height;
+                        endpoint-input <=> root.endpoint-input;
+                        endpoint-reset-selector: root.endpoint-reset-selector;
+                        endpoint-preserve-focus: root.endpoint-preserve-focus;
+                        token-input <=> root.token-input;
+                        token-reset-selector: root.token-reset-selector;
+                        token-preserve-focus: root.token-preserve-focus;
+                        consent-checked <=> root.consent-checked;
+                        busy: root.busy;
+                        can-connect: root.can-connect;
+                        can-cancel: root.can-cancel;
+                        can-disconnect: root.can-disconnect;
+                        can-retry: root.can-retry;
+                        connect-requested(endpoint, token, consent) => {
+                            root.connect-requested(endpoint, token, consent);
+                        }
+                        retry-requested(endpoint, token, consent) => {
+                            root.retry-requested(endpoint, token, consent);
+                        }
+                        cancel-requested => { root.cancel-requested(); }
+                        disconnect-requested => { root.disconnect-requested(); }
+                    }
+
+                    connection-summary := ConnectionSummary {
+                        x: root.narrow-layout ? 0px : parent.width - self.width;
+                        y: root.narrow-layout ? connection-form.min-height + Metrics.space-4 : 0px;
+                        width: root.narrow-layout ? parent.width : 420px;
+                        height: self.min-height;
+                        endpoint: root.endpoint-summary;
+                        server: root.server-summary;
+                        protocol: root.protocol-summary;
+                        role: root.role-summary;
+                        scopes: root.scopes-summary;
+                        health: root.health-summary;
+                        identity: root.identity-summary;
+                    }
+                }
+
+                Text {
+                    text: "This diagnostic does not enroll a persistent device, store credentials, or enable chat and account features.";
+                    color: DesignTokens.text-muted;
+                    font-size: Metrics.type-caption;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    accessible-role: text;
+                }
+            }
+        }
+    }
+}
