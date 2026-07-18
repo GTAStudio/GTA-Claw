@@ -399,6 +399,20 @@ mod tests {
             .expect("state store opens")
     }
 
+    async fn wait_for_cleanup_absence(paths: &[&Path]) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while paths.iter().any(|path| match path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) if matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33)) => true,
+                Err(error) => panic!("inspect cleanup artifact {}: {error}", path.display()),
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup removes staging artifacts");
+    }
+
     #[tokio::test]
     async fn fresh_database_applies_migrations_and_pragmas_on_unicode_path() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -2926,7 +2940,7 @@ mod tests {
         let source = open(&source_path).await;
         source.backup_to(&destination).await.expect("create backup");
         let before = fs::read(&destination).expect("read published backup");
-        test_support::drop_disarmed_snapshot_guard(&destination);
+        test_support::drop_disarmed_snapshot_guard(&destination).await;
         assert_eq!(
             fs::read(&destination).expect("reread published backup"),
             before
@@ -3268,6 +3282,35 @@ mod tests {
             .close()
             .await
             .expect("restored publication-fence store closes");
+        for (stage, name) in [(3_u8, "durable-sync"), (4_u8, "final-handoff")] {
+            let published = database_path(&directory, &format!("publication-fence-{name}.sqlite"));
+            let restored = database_path(
+                &directory,
+                &format!("publication-fence-{name}-restored.sqlite"),
+            );
+            test_support::expire_publication_deadline_once(&published, stage);
+            let error = source
+                .backup_to(&published)
+                .await
+                .expect_err("late durable publication stage cannot report success");
+            assert!(matches!(
+                error,
+                StateError::PublicationUncertain { ref reason, .. }
+                    if reason.contains("deadline") || reason.contains("validation")
+            ));
+            assert!(
+                published.exists(),
+                "late durable publication remains preserved"
+            );
+            StateStore::restore_backup(&published, &restored)
+                .await
+                .expect("late durable publication remains restorable");
+            open(&restored)
+                .await
+                .close()
+                .await
+                .expect("late durable publication restore closes");
+        }
         source
             .close()
             .await
@@ -3304,8 +3347,7 @@ mod tests {
                 .is_cancelled()
         );
         test_support::clear_snapshot_barrier(&backup_path);
-        assert!(!backup_path.exists());
-        assert!(!backup_temporary.exists());
+        wait_for_cleanup_absence(&[&backup_path, &backup_temporary]).await;
         source
             .sessions()
             .create(&session("post-cancel-backup", 1))
@@ -3339,8 +3381,7 @@ mod tests {
                 .is_cancelled()
         );
         test_support::clear_snapshot_barrier(&restore_path);
-        assert!(!restore_path.exists());
-        assert!(!restore_temporary.exists());
+        wait_for_cleanup_absence(&[&restore_path, &restore_temporary]).await;
 
         let source = std::sync::Arc::try_unwrap(source)
             .unwrap_or_else(|_| panic!("cancelled operations retained source store"));
@@ -3967,6 +4008,185 @@ mod tests {
             .close()
             .await
             .expect("read pool-deadline fixture closes");
+    }
+
+    #[tokio::test]
+    async fn administrative_operations_use_the_absolute_pool_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "administrative-pool-deadline.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path)
+                .with_max_connections(1)
+                .with_acquire_timeout(Duration::from_secs(2))
+                .with_operation_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect("administrative deadline fixture opens");
+        let held = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("hold the only administrative pool connection");
+        for (operation, result) in [
+            (
+                "inspect SQLite settings",
+                store.settings().await.map(|_| ()),
+            ),
+            ("inspect SQLite health", store.health().await.map(|_| ())),
+            (
+                "checkpoint SQLite WAL",
+                store.checkpoint().await.map(|_| ()),
+            ),
+        ] {
+            assert_eq!(
+                result.expect_err("pool-blocked administrative operation times out"),
+                StateError::OperationTimedOut {
+                    operation,
+                    timeout_ms: 100,
+                }
+            );
+        }
+        drop(held);
+        store
+            .settings()
+            .await
+            .expect("settings recover after admission timeout");
+        store
+            .health()
+            .await
+            .expect("health recovers after admission timeout");
+        store
+            .checkpoint()
+            .await
+            .expect("checkpoint recovers after admission timeout");
+        store
+            .close()
+            .await
+            .expect("administrative deadline fixture closes");
+    }
+
+    #[tokio::test]
+    async fn health_progress_timeout_keeps_the_runtime_responsive() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "health-progress-deadline.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path).with_operation_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect("health progress fixture opens");
+        test_support::stall_health_progress_once(&path);
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat_running = std::sync::Arc::clone(&running);
+        let heartbeat_ticks = std::sync::Arc::clone(&ticks);
+        let heartbeat = tokio::spawn(async move {
+            while heartbeat_running.load(std::sync::atomic::Ordering::Acquire) {
+                heartbeat_ticks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(
+            store
+                .health()
+                .await
+                .expect_err("infinite health query reaches operation deadline"),
+            StateError::OperationTimedOut {
+                operation: "inspect SQLite health",
+                timeout_ms: 100,
+            }
+        );
+        running.store(false, std::sync::atomic::Ordering::Release);
+        heartbeat.await.expect("health heartbeat task joins");
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::Acquire) > 10,
+            "health progress cancellation must not block Tokio"
+        );
+        store
+            .health()
+            .await
+            .expect("health connection generation recovers after timeout");
+        store.close().await.expect("health progress fixture closes");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_busy_wait_obeys_operation_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "checkpoint-operation-deadline.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path)
+                .with_max_connections(2)
+                .with_busy_timeout(Duration::from_secs(5))
+                .with_operation_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .expect("checkpoint deadline fixture opens");
+        store
+            .sessions()
+            .create(&session("checkpoint-before-reader", 1))
+            .await
+            .expect("seed checkpoint reader snapshot");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(5));
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open checkpoint deadline reader");
+        reader
+            .execute("BEGIN")
+            .await
+            .expect("begin checkpoint deadline reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish checkpoint deadline snapshot");
+        store
+            .sessions()
+            .create(&session("checkpoint-after-reader", 2))
+            .await
+            .expect("create WAL frame behind reader");
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            store
+                .checkpoint()
+                .await
+                .expect_err("busy checkpoint reaches operation deadline"),
+            StateError::OperationCleanupFailed {
+                operation: "checkpoint SQLite WAL",
+                primary,
+                ref cleanup,
+            } if *primary == StateError::OperationTimedOut {
+                operation: "checkpoint SQLite WAL",
+                timeout_ms: 500,
+            } && cleanup.contains("Quarantined")
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        reader
+            .execute("ROLLBACK")
+            .await
+            .expect("release checkpoint deadline reader");
+        reader
+            .close()
+            .await
+            .expect("close checkpoint deadline reader");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store
+                    .checkpoint()
+                    .await
+                    .is_ok_and(|report| report.busy == 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("checkpoint recovers after busy deadline");
+        store
+            .close()
+            .await
+            .expect("checkpoint deadline fixture closes");
     }
 
     #[tokio::test]
