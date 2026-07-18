@@ -1,13 +1,12 @@
 //! Minimal audited access to SQLite file-control operations.
 
-#[cfg(windows)]
 use sha2::{Digest as _, Sha256};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::ptr::NonNull;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 /// Failure returned by SQLite while inspecting its open main database file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +24,28 @@ pub fn windows_sidecar_generation_record(identity: &[u8]) -> [u8; 52] {
     let mut record = [0_u8; 52];
     record[..20].copy_from_slice(b"GTA-CLAW-SIDECAR-V1\0");
     record[20..].copy_from_slice(&digest);
+    record
+}
+
+/// Builds the authenticated fixed-format Unix sidecar generation record.
+#[cfg(unix)]
+pub fn unix_sidecar_generation_record(
+    database_path: &std::path::Path,
+    sidecar_path: &std::path::Path,
+    identity: &[u8],
+) -> [u8; 52] {
+    let mut digest = Sha256::new();
+    for value in [
+        identity,
+        database_path.as_os_str().as_encoded_bytes(),
+        sidecar_path.as_os_str().as_encoded_bytes(),
+    ] {
+        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(value);
+    }
+    let mut record = [0_u8; 52];
+    record[..20].copy_from_slice(b"GTA-CLAW-SIDECAR-U1\0");
+    record[20..].copy_from_slice(&digest.finalize());
     record
 }
 
@@ -55,128 +76,52 @@ impl Display for FileControlError {
 
 impl Error for FileControlError {}
 
-/// Outcome of one deadline-bound SQLite VACUUM.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VacuumDeadlineOutcome {
-    /// SQLite completed and the destination is ready for validation.
-    Completed,
-    /// The deadline elapsed; SQLite was interrupted and joined before return.
-    TimedOut,
+#[derive(Clone, Copy)]
+struct LiveInterruptPointer(NonNull<libsqlite3_sys::sqlite3>);
+
+struct LiveBackupPointer(Option<NonNull<libsqlite3_sys::sqlite3_backup>>);
+
+#[cfg(test)]
+#[derive(Clone)]
+struct BackupTestControl {
+    interrupt_at_step: Option<usize>,
+    observed_steps: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Optional execution-boundary gate used by deterministic cross-thread tests.
-pub struct VacuumExecutionGate {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<std::sync::atomic::AtomicBool>,
-    observed: std::sync::atomic::AtomicBool,
-}
+#[cfg(test)]
+static BACKUP_TEST_CONTROLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, BackupTestControl>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-impl VacuumExecutionGate {
-    /// Creates a gate backed by caller-observable synchronization primitives.
-    pub fn new(
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
-        Self {
-            entered,
-            release,
-            observed: std::sync::atomic::AtomicBool::new(false),
-        }
+// SAFETY: the backup handle is exclusively owned and both SQLite connections
+// remain mutably borrowed until it is finished.
+unsafe impl Send for LiveBackupPointer {}
+
+impl LiveBackupPointer {
+    fn as_ptr(&self) -> *mut libsqlite3_sys::sqlite3_backup {
+        self.0.expect("live SQLite backup pointer").as_ptr()
     }
 
-    fn wait_at_execution_boundary(
-        &self,
-        expired: &std::sync::atomic::AtomicBool,
-        cancelled: &std::sync::atomic::AtomicBool,
-    ) {
-        if !self
-            .observed
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.entered.notify_one();
-            while !self.release.load(std::sync::atomic::Ordering::Acquire)
-                && !expired.load(std::sync::atomic::Ordering::Acquire)
-                && !cancelled.load(std::sync::atomic::Ordering::Acquire)
-            {
-                std::thread::yield_now();
+    fn finish(mut self) -> std::ffi::c_int {
+        let pointer = self.0.take().expect("live SQLite backup pointer");
+        // SAFETY: this consumes the unique live backup handle.
+        unsafe { libsqlite3_sys::sqlite3_backup_finish(pointer.as_ptr()) }
+    }
+}
+
+impl Drop for LiveBackupPointer {
+    fn drop(&mut self) {
+        if let Some(pointer) = self.0.take() {
+            // SAFETY: cancellation still owns the unique backup handle.
+            unsafe {
+                libsqlite3_sys::sqlite3_backup_finish(pointer.as_ptr());
             }
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct LiveInterruptPointer(NonNull<libsqlite3_sys::sqlite3>);
-
-#[cfg(test)]
-struct VacuumTestGate {
-    entered: std::sync::Arc<tokio::sync::Notify>,
-    release: std::sync::Arc<tokio::sync::Notify>,
-    interrupted: std::sync::Arc<tokio::sync::Notify>,
-    interrupts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    progress_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    panic_after_release: bool,
-}
-
-#[cfg(test)]
-fn record_vacuum_test_progress(destination: &str) {
-    if let Some(progress_hits) = VACUUM_TEST_GATE
-        .lock()
-        .expect("vacuum test gate lock poisoned")
-        .get(destination)
-        .map(|gate| std::sync::Arc::clone(&gate.progress_hits))
-    {
-        progress_hits.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-#[cfg(test)]
-static VACUUM_TEST_GATE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, VacuumTestGate>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(test)]
-async fn wait_at_vacuum_test_gate(destination: &str) {
-    let gate = VACUUM_TEST_GATE
-        .lock()
-        .expect("vacuum test gate lock poisoned")
-        .get(destination)
-        .map(|gate| {
-            (
-                std::sync::Arc::clone(&gate.entered),
-                std::sync::Arc::clone(&gate.release),
-                gate.panic_after_release,
-            )
-        });
-    if let Some((entered, release, panic_after_release)) = gate {
-        entered.notify_one();
-        release.notified().await;
-        assert!(
-            !panic_after_release,
-            "injected VACUUM panic after pointer publication"
-        );
-    }
-}
-
-#[cfg(test)]
-fn record_vacuum_test_interrupt(destination: &str) {
-    if let Some((interrupts, interrupted)) = VACUUM_TEST_GATE
-        .lock()
-        .expect("vacuum test gate lock poisoned")
-        .get(destination)
-        .map(|gate| {
-            (
-                std::sync::Arc::clone(&gate.interrupts),
-                std::sync::Arc::clone(&gate.interrupted),
-            )
-        })
-    {
-        interrupts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        interrupted.notify_one();
-    }
-}
-
-// SAFETY: SQLite permits sqlite3_interrupt() from another thread, and this
-// pointer never outlives the connection borrowed by vacuum_into_with_deadline.
+// SAFETY: SQLite permits sqlite3_interrupt() from another thread, and every
+// registration is cleared before the owning connection can be closed.
 unsafe impl Send for LiveInterruptPointer {}
 // SAFETY: sqlite3_interrupt() is concurrency-safe.
 unsafe impl Sync for LiveInterruptPointer {}
@@ -189,6 +134,27 @@ impl LiveInterruptPointer {
 
 struct LiveInterruptRegistration {
     slot: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
+}
+
+struct SqliteAllocation(*mut u8);
+
+impl SqliteAllocation {
+    fn into_raw(mut self) -> *mut u8 {
+        let pointer = self.0;
+        self.0 = std::ptr::null_mut();
+        pointer
+    }
+}
+
+impl Drop for SqliteAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this pointer is owned by Rust until `into_raw`.
+            unsafe {
+                libsqlite3_sys::sqlite3_free(self.0.cast());
+            }
+        }
+    }
 }
 
 impl LiveInterruptRegistration {
@@ -214,279 +180,194 @@ impl Drop for LiveInterruptRegistration {
 
 type BlockingCleanupJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
 
-struct BlockingCleanupOwner {
-    sender: Option<std::sync::mpsc::SyncSender<Option<BlockingCleanupJob>>>,
-    owner: Option<std::thread::JoinHandle<()>>,
+const MAX_CLEANUP_JOBS: usize = 64;
+const CLEANUP_THREADS: usize = 16;
+static ACTIVE_CLEANUP_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+struct CleanupReservation;
+
+impl Drop for CleanupReservation {
+    fn drop(&mut self) {
+        ACTIVE_CLEANUP_JOBS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct CleanupEnvelope {
+    job: BlockingCleanupJob,
+    _reservation: CleanupReservation,
+}
+
+struct CleanupExecutor {
+    sender: std::sync::mpsc::SyncSender<CleanupEnvelope>,
+}
+
+static CLEANUP_EXECUTOR: std::sync::LazyLock<Result<CleanupExecutor, String>> =
+    std::sync::LazyLock::new(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<CleanupEnvelope>(MAX_CLEANUP_JOBS);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(CLEANUP_THREADS);
+        for index in 0..CLEANUP_THREADS {
+            let receiver = Arc::clone(&receiver);
+            let ready_tx = ready_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("claw-sqlite-cleanup-{index}"))
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => {
+                            let _ = ready_tx.send(Ok(()));
+                            runtime
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                    loop {
+                        let envelope = receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        let Ok(envelope) = envelope else {
+                            return;
+                        };
+                        let CleanupEnvelope { job, _reservation } = envelope;
+                        job(&runtime);
+                        drop(_reservation);
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        drop(ready_tx);
+        for _ in 0..CLEANUP_THREADS {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    format!("cleanup executor readiness acknowledgement: {error}")
+                })??;
+        }
+        Ok(CleanupExecutor { sender })
+    });
+
+/// Pre-acquired dedicated owner for cancellation-safe blocking cleanup.
+pub struct BlockingCleanupOwner {
+    reservation: Option<CleanupReservation>,
 }
 
 impl BlockingCleanupOwner {
-    fn spawn(
-        thread_name: &str,
-    ) -> Result<(Self, std::sync::mpsc::Receiver<Result<(), String>>), String> {
+    fn validate_executor(thread_name: &str) -> Result<&'static CleanupExecutor, String> {
         if thread_name.contains('\0') {
             return Err("blocking cleanup owner name contains a NUL byte".to_owned());
         }
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<Option<BlockingCleanupJob>>(1);
-        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
-        let owner = std::thread::Builder::new()
-            .name(thread_name.to_owned())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready_sender.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                if ready_sender.send(Ok(())).is_err() {
-                    return;
-                }
-                if let Ok(Some(cleanup)) = receiver.recv() {
-                    cleanup(&runtime);
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        Ok((
-            Self {
-                sender: Some(sender),
-                owner: Some(owner),
-            },
-            ready_receiver,
-        ))
+        CLEANUP_EXECUTOR.as_ref().map_err(Clone::clone)
     }
 
-    async fn acquire(thread_name: &str) -> Result<Self, String> {
-        let (owner, ready) = Self::spawn(thread_name)?;
+    /// Acquires and readies a dedicated cleanup runtime without blocking Tokio.
+    pub async fn acquire(thread_name: &str) -> Result<Self, String> {
+        let mut owners = Self::acquire_many_until(thread_name, 1, None).await?;
+        Ok(owners.pop().expect("one cleanup owner was reserved"))
+    }
+
+    /// Atomically reserves a complete owner set before an operation acquires resources.
+    pub async fn acquire_set(
+        thread_name: &str,
+        count: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<Self>, String> {
+        Self::acquire_many_until(thread_name, count, Some(deadline)).await
+    }
+
+    async fn acquire_many_until(
+        thread_name: &str,
+        count: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Self>, String> {
+        let _ = Self::validate_executor(thread_name)?;
+        if count == 0 || count > MAX_CLEANUP_JOBS {
+            return Err("blocking cleanup owner count is out of range".to_owned());
+        }
         loop {
-            match ready.try_recv() {
-                Ok(ready) => {
-                    ready?;
-                    return Ok(owner);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("blocking cleanup owner stopped before readiness".to_owned());
-                }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err("blocking cleanup owner admission timed out".to_owned());
             }
+            let active = ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire);
+            if active <= MAX_CLEANUP_JOBS - count
+                && ACTIVE_CLEANUP_JOBS
+                    .compare_exchange_weak(
+                        active,
+                        active + count,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                let mut owners = Vec::new();
+                if let Err(error) = owners.try_reserve_exact(count) {
+                    ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
+                    return Err(format!("reserve cleanup owner set: {error}"));
+                }
+                owners.extend((0..count).map(|_| Self {
+                    reservation: Some(CleanupReservation),
+                }));
+                return Ok(owners);
+            }
+            tokio::task::yield_now().await;
         }
     }
 
     #[cfg(test)]
     fn acquire_without_runtime(thread_name: &str) -> Result<Self, String> {
-        let (owner, ready) = Self::spawn(thread_name)?;
-        ready
-            .recv()
-            .map_err(|_| "blocking cleanup owner stopped before readiness".to_owned())??;
-        Ok(owner)
+        let _ = Self::validate_executor(thread_name)?;
+        let active = ACTIVE_CLEANUP_JOBS.fetch_add(1, Ordering::AcqRel);
+        if active >= MAX_CLEANUP_JOBS {
+            ACTIVE_CLEANUP_JOBS.fetch_sub(1, Ordering::AcqRel);
+            return Err("blocking cleanup owner capacity is exhausted".to_owned());
+        }
+        Ok(Self {
+            reservation: Some(CleanupReservation),
+        })
     }
 
-    fn handoff(&mut self, cleanup: BlockingCleanupJob) {
-        let sender = self
-            .sender
+    /// Transfers terminal cleanup to the dedicated runtime.
+    pub fn handoff<Cleanup>(&mut self, cleanup: Cleanup)
+    where
+        Cleanup: FnOnce(&tokio::runtime::Runtime) + Send + 'static,
+    {
+        let reservation = self
+            .reservation
             .take()
             .expect("blocking cleanup handoff is single-use");
-        if sender.try_send(Some(cleanup)).is_err() {
+        let executor = CLEANUP_EXECUTOR
+            .as_ref()
+            .unwrap_or_else(|error| panic!("cleanup executor unavailable: {error}"));
+        if executor
+            .sender
+            .try_send(CleanupEnvelope {
+                job: Box::new(cleanup),
+                _reservation: reservation,
+            })
+            .is_err()
+        {
             // The owner acknowledges readiness before any SQLite worker starts,
             // so losing it would leave live native state without an owner.
             std::process::abort();
         }
-        self.owner.take();
     }
 
-    fn shutdown(mut self) -> Result<(), String> {
-        let sender = self
-            .sender
+    /// Shuts down an unused cleanup owner without waiting on a runtime thread.
+    pub fn shutdown(mut self) -> Result<(), String> {
+        self.reservation
             .take()
             .ok_or_else(|| "blocking cleanup owner is missing".to_owned())?;
-        sender
-            .try_send(None)
-            .map_err(|_| "blocking cleanup owner rejected shutdown".to_owned())?;
-        self.owner.take();
         Ok(())
     }
 }
 
 impl Drop for BlockingCleanupOwner {
     fn drop(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.try_send(None);
-        }
-    }
-}
-
-struct VacuumBusyState {
-    deadline: std::time::Instant,
-    expired: Arc<std::sync::atomic::AtomicBool>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-}
-
-unsafe extern "C" fn vacuum_busy_handler(
-    context: *mut std::ffi::c_void,
-    _prior_calls: std::ffi::c_int,
-) -> std::ffi::c_int {
-    // SAFETY: the callback context is retained until the handler is restored.
-    let state = unsafe { &*context.cast::<VacuumBusyState>() };
-    if std::time::Instant::now() >= state.deadline {
-        state.expired.store(true, Ordering::Release);
-    }
-    if state.expired.load(Ordering::Acquire) || state.cancelled.load(Ordering::Acquire) {
-        0
-    } else {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        1
-    }
-}
-
-struct VacuumWorkerContext {
-    destination: String,
-    deadline: tokio::time::Instant,
-    deadline_expired: Arc<std::sync::atomic::AtomicBool>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    pointer: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
-    execution_gate: Option<Arc<VacuumExecutionGate>>,
-    restore_busy_timeout: std::time::Duration,
-}
-
-async fn vacuum_into_borrowed(
-    connection: &mut sqlx::SqliteConnection,
-    context: &VacuumWorkerContext,
-) -> Result<VacuumDeadlineOutcome, sqlx::Error> {
-    let destination = context.destination.as_str();
-    let deadline = context.deadline;
-    let deadline_expired = Arc::clone(&context.deadline_expired);
-    let cancelled = Arc::clone(&context.cancelled);
-    let pointer_slot = Arc::clone(&context.pointer);
-    let execution_gate = context.execution_gate.clone();
-    let restore_busy_timeout = context.restore_busy_timeout;
-    let busy_state = VacuumBusyState {
-        deadline: deadline.into_std(),
-        expired: Arc::clone(&deadline_expired),
-        cancelled: Arc::clone(&cancelled),
-    };
-    let (database, _interrupt_registration) =
-        match tokio::time::timeout_at(deadline, connection.lock_handle()).await {
-            Ok(handle) => {
-                let mut handle = handle?;
-                let database = LiveInterruptPointer(handle.as_raw_handle());
-                // SAFETY: `busy_state` remains live until the handler is restored.
-                let busy_result = unsafe {
-                    libsqlite3_sys::sqlite3_busy_handler(
-                        database.as_ptr(),
-                        Some(vacuum_busy_handler),
-                        std::ptr::from_ref(&busy_state).cast_mut().cast(),
-                    )
-                };
-                if busy_result != libsqlite3_sys::SQLITE_OK {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "install VACUUM busy handler failed with SQLite code {busy_result}"
-                    )));
-                }
-                let progress_expired = std::sync::Arc::clone(&deadline_expired);
-                let progress_cancelled = Arc::clone(&cancelled);
-                let progress_execution_gate = execution_gate;
-                #[cfg(test)]
-                let progress_destination = destination.to_owned();
-                handle.set_progress_handler(1, move || {
-                    if let Some(gate) = &progress_execution_gate {
-                        gate.wait_at_execution_boundary(&progress_expired, &progress_cancelled);
-                    }
-                    let expired = progress_expired.load(std::sync::atomic::Ordering::Acquire)
-                        || progress_cancelled.load(std::sync::atomic::Ordering::Acquire);
-                    #[cfg(test)]
-                    if expired {
-                        record_vacuum_test_progress(&progress_destination);
-                    }
-                    !expired
-                });
-                let registration =
-                    LiveInterruptRegistration::publish(Arc::clone(&pointer_slot), database);
-                (database, registration)
-            }
-            Err(_) => {
-                deadline_expired.store(true, std::sync::atomic::Ordering::Release);
-                return Ok(VacuumDeadlineOutcome::TimedOut);
-            }
-        };
-    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let query_started = std::sync::Arc::clone(&started);
-    let query_deadline_expired = std::sync::Arc::clone(&deadline_expired);
-    let operation = {
-        let query = async {
-            if tokio::time::Instant::now() >= deadline
-                || query_deadline_expired.load(std::sync::atomic::Ordering::Acquire)
-                || cancelled.load(std::sync::atomic::Ordering::Acquire)
-            {
-                query_deadline_expired.store(true, std::sync::atomic::Ordering::Release);
-                return None;
-            }
-            query_started.store(true, std::sync::atomic::Ordering::Release);
-            #[cfg(test)]
-            wait_at_vacuum_test_gate(destination).await;
-            Some(
-                sqlx::query("VACUUM main INTO ?")
-                    .bind(destination)
-                    .execute(&mut *connection)
-                    .await,
-            )
-        };
-        tokio::pin!(query);
-        tokio::select! {
-        biased;
-        () = tokio::time::sleep_until(deadline) => {
-            deadline_expired.store(true, std::sync::atomic::Ordering::Release);
-            if started.load(std::sync::atomic::Ordering::Acquire) {
-                let mut interrupt = tokio::time::interval(std::time::Duration::from_millis(1));
-                interrupt.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    // SAFETY: `connection` remains mutably borrowed by `query`, so its
-                    // SQLite handle stays live until the interrupted query is joined.
-                    unsafe {
-                        libsqlite3_sys::sqlite3_interrupt(database.0.as_ptr());
-                    }
-                    #[cfg(test)]
-                    record_vacuum_test_interrupt(destination);
-                    tokio::select! {
-                        biased;
-                        _ = &mut query => break,
-                        _ = interrupt.tick() => {}
-                    }
-                }
-            }
-            Ok(VacuumDeadlineOutcome::TimedOut)
-        }
-        result = &mut query => {
-            if tokio::time::Instant::now() >= deadline {
-                deadline_expired.store(true, std::sync::atomic::Ordering::Release);
-            }
-            if deadline_expired.load(std::sync::atomic::Ordering::Acquire)
-                || cancelled.load(std::sync::atomic::Ordering::Acquire)
-            {
-                Ok(VacuumDeadlineOutcome::TimedOut)
-            } else {
-                match result {
-                    Some(Ok(_)) => Ok(VacuumDeadlineOutcome::Completed),
-                    Some(Err(error)) => Err(error),
-                    None => Ok(VacuumDeadlineOutcome::TimedOut),
-                }
-            }
-        }
-        }
-    };
-    let clear = connection.lock_handle().await.map(|mut handle| {
-        handle.set_progress_handler(0, || true);
-        let restore_ms = i32::try_from(restore_busy_timeout.as_millis()).unwrap_or(i32::MAX);
-        // SAFETY: the locked SQLite handle is live and exclusively held.
-        unsafe {
-            libsqlite3_sys::sqlite3_busy_timeout(handle.as_raw_handle().as_ptr(), restore_ms);
-        }
-    });
-    match (operation, clear) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(outcome), Ok(())) => Ok(outcome),
+        self.reservation.take();
     }
 }
 
@@ -624,11 +505,451 @@ pub async fn main_database_has_moved(
     }
 }
 
-/// Proof that this crate started a manual transaction on one SQLite connection.
-pub struct ManualTransactionToken {
+/// Replaces a connection's main schema with an immutable SQLite-owned copy of
+/// authenticated database bytes.
+pub async fn deserialize_readonly(
+    connection: &mut sqlx::SqliteConnection,
+    bytes: &[u8],
+) -> Result<(), FileControlError> {
+    if bytes.is_empty() {
+        return Err(FileControlError::Handle(
+            "serialized database must not be empty".to_owned(),
+        ));
+    }
+    let size = i64::try_from(bytes.len())
+        .map_err(|_| FileControlError::Handle("serialized database is too large".to_owned()))?;
+    let mut handle = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    // SAFETY: sqlite3_malloc64 returns SQLite-owned suitably aligned storage.
+    let allocation = SqliteAllocation(
+        unsafe {
+            libsqlite3_sys::sqlite3_malloc64(
+                u64::try_from(bytes.len())
+                    .map_err(|_| FileControlError::Handle("database size overflow".to_owned()))?,
+            )
+        }
+        .cast::<u8>(),
+    );
+    if allocation.0.is_null() {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_NOMEM));
+    }
+    // SAFETY: allocation has exactly bytes.len() writable bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), allocation.0, bytes.len());
+    }
+    let allocation = allocation.into_raw();
+    // SAFETY: the locked SQLite handle is live; on success SQLite owns allocation.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_deserialize(
+            handle.as_raw_handle().as_ptr(),
+            c"main".as_ptr(),
+            allocation,
+            size,
+            size,
+            libsqlite3_sys::SQLITE_DESERIALIZE_FREEONCLOSE
+                | libsqlite3_sys::SQLITE_DESERIALIZE_READONLY,
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    Ok(())
+}
+
+/// Copies the complete main database between two exclusively borrowed SQLite connections.
+pub async fn backup_main_database(
+    source: &mut sqlx::SqliteConnection,
+    destination: &mut sqlx::SqliteConnection,
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+    max_pages: std::ffi::c_int,
+) -> Result<(), FileControlError> {
+    let mut source_handle = source
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut destination_handle = destination
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    // SAFETY: both SQLx handles are exclusively locked for the backup lifetime.
+    let backup = LiveBackupPointer(NonNull::new(unsafe {
+        libsqlite3_sys::sqlite3_backup_init(
+            destination_handle.as_raw_handle().as_ptr(),
+            c"main".as_ptr(),
+            source_handle.as_raw_handle().as_ptr(),
+            c"main".as_ptr(),
+        )
+    }));
+    if backup.0.is_none() {
+        // SAFETY: destination handle is live.
+        let destination_code =
+            unsafe { libsqlite3_sys::sqlite3_errcode(destination_handle.as_raw_handle().as_ptr()) };
+        let source_code =
+            unsafe { libsqlite3_sys::sqlite3_errcode(source_handle.as_raw_handle().as_ptr()) };
+        return Err(FileControlError::Handle(format!(
+            "initialize SQLite backup: destination code {destination_code}, source code {source_code}"
+        )));
+    }
+    #[cfg(test)]
+    let test_control = BACKUP_TEST_CONTROLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(source_handle.as_raw_handle().as_ptr() as usize))
+        .cloned();
+
+    drop((source_handle, destination_handle));
+    let step = loop {
+        #[cfg(test)]
+        if let Some(control) = &test_control {
+            let step = control.observed_steps.fetch_add(1, Ordering::AcqRel);
+            if control.interrupt_at_step == Some(step) {
+                break libsqlite3_sys::SQLITE_INTERRUPT;
+            }
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= deadline
+        {
+            break libsqlite3_sys::SQLITE_INTERRUPT;
+        }
+        // SAFETY: backup is live until sqlite3_backup_finish below.
+        let step = unsafe { libsqlite3_sys::sqlite3_backup_step(backup.as_ptr(), 128) };
+        // SAFETY: backup remains live during the bounded step loop.
+        if unsafe { libsqlite3_sys::sqlite3_backup_pagecount(backup.as_ptr()) } > max_pages {
+            break libsqlite3_sys::SQLITE_TOOBIG;
+        }
+        match step {
+            libsqlite3_sys::SQLITE_OK
+            | libsqlite3_sys::SQLITE_BUSY
+            | libsqlite3_sys::SQLITE_LOCKED => tokio::task::yield_now().await,
+            _ => break step,
+        }
+    };
+    // SAFETY: finish consumes the live backup handle exactly once.
+    let finish = backup.finish();
+    if step != libsqlite3_sys::SQLITE_DONE {
+        Err(FileControlError::SQLite(step))
+    } else if finish != libsqlite3_sys::SQLITE_OK {
+        Err(FileControlError::SQLite(finish))
+    } else {
+        Ok(())
+    }
+}
+
+/// Runs a logical SQLite backup on the bounded native executor while retaining
+/// exclusive ownership of both connections through terminal result delivery.
+pub async fn backup_owned_main_database<Source, Destination, Reservation>(
+    mut worker_owner: BlockingCleanupOwner,
+    mut source: Source,
+    mut destination: Destination,
+    reservation: Reservation,
+    deadline: std::time::Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    max_pages: std::ffi::c_int,
+) -> Result<(Source, Destination, Reservation), FileControlError>
+where
+    Source: BeginOwnedConnection,
+    Destination: BeginOwnedConnection,
+    Reservation: Send + 'static,
+{
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    worker_owner.handoff(move |runtime| {
+        let result = runtime.block_on(backup_main_database(
+            source.sqlite(),
+            destination.sqlite(),
+            deadline,
+            cancelled.as_ref(),
+            max_pages,
+        ));
+        match result {
+            Ok(()) => {
+                if let Err(error) = result_tx.send(Ok((source, destination, reservation)))
+                    && let Ok((source, destination, reservation)) = error.0
+                {
+                    source.close_owned(runtime);
+                    destination.close_owned(runtime);
+                    drop(reservation);
+                }
+            }
+            Err(error) => {
+                source.close_owned(runtime);
+                destination.close_owned(runtime);
+                drop(reservation);
+                let _ = result_tx.send(Err(error));
+            }
+        }
+    });
+    let cleanup_cutoff = deadline + std::time::Duration::from_secs(5);
+    loop {
+        match result_rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if std::time::Instant::now() < cleanup_cutoff =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                return Err(FileControlError::Handle(
+                    "logical backup cleanup exceeded its fixed cutoff".to_owned(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(FileControlError::Handle(
+                    "logical backup owner stopped without a result".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+/// Copies SQLite's current main database image from its internal contiguous
+/// backing into one fallibly allocated bounded byte vector.
+pub async fn serialize_main_database(
+    connection: &mut sqlx::SqliteConnection,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, FileControlError> {
+    let mut handle = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut size = 0_i64;
+    // SAFETY: the handle is exclusively locked and NOCOPY retains SQLite ownership.
+    let mut pointer = unsafe {
+        libsqlite3_sys::sqlite3_serialize(
+            handle.as_raw_handle().as_ptr(),
+            c"main".as_ptr(),
+            &raw mut size,
+            libsqlite3_sys::SQLITE_SERIALIZE_NOCOPY,
+        )
+    };
+    let mut sqlite_owned = None;
+    if pointer.is_null() {
+        // SAFETY: fallback asks SQLite for one owned contiguous serialization.
+        pointer = unsafe {
+            libsqlite3_sys::sqlite3_serialize(
+                handle.as_raw_handle().as_ptr(),
+                c"main".as_ptr(),
+                &raw mut size,
+                0,
+            )
+        };
+        sqlite_owned = Some(SqliteAllocation(pointer));
+    }
+    let size = usize::try_from(size)
+        .map_err(|_| FileControlError::Handle("serialized database size is invalid".to_owned()))?;
+    if pointer.is_null() || size == 0 {
+        return Err(FileControlError::Handle(
+            "SQLite main database is not contiguously serializable".to_owned(),
+        ));
+    }
+    if size > maximum_bytes {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_TOOBIG));
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(|error| {
+        FileControlError::Handle(format!("serialize allocation failed: {error}"))
+    })?;
+    // SAFETY: SQLite retains at least `size` immutable bytes while the handle is locked.
+    bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(pointer, size) });
+    drop(sqlite_owned);
+    Ok(bytes)
+}
+
+/// Cleanup capability retained through snapshot finalization and result delivery.
+pub trait SnapshotCleanupLease: Send + 'static {
+    /// Reclaims an unpublished snapshot or leaves it quarantined on failure.
+    fn cleanup(&mut self) -> Result<(), String>;
+}
+
+/// Verified result of writing one serialized logical snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotWriteReceipt {
+    /// Exact number of bytes written and verified through the held handle.
+    pub byte_count: u64,
+    /// SHA-256 digest of the exact serialized bytes.
+    pub digest: [u8; 32],
+}
+
+/// Deadline, cancellation, path diagnostics, and size cap for snapshot finalization.
+pub struct SnapshotFinalizeContext {
+    /// Diagnostic path for held-handle I/O failures.
+    pub output_path: String,
+    /// Absolute operation deadline.
+    pub deadline: std::time::Instant,
+    /// Shared operation cancellation state.
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Maximum serialized byte count.
+    pub maximum_bytes: usize,
+}
+
+/// Serializes an owned in-memory SQLite image, closes SQLite, and writes only
+/// through the supplied precreated held file on the bounded native executor.
+pub async fn finalize_owned_snapshot<Cleanup>(
+    mut worker_owner: BlockingCleanupOwner,
+    mut connection: sqlx::SqliteConnection,
+    mut output: std::fs::File,
+    mut cleanup: Cleanup,
+    context: SnapshotFinalizeContext,
+) -> Result<(SnapshotWriteReceipt, Cleanup), FileControlError>
+where
+    Cleanup: SnapshotCleanupLease,
+{
+    let SnapshotFinalizeContext {
+        output_path,
+        deadline,
+        cancelled,
+        maximum_bytes,
+    } = context;
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    worker_owner.handoff(move |runtime| {
+        let operation = (|| {
+            if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+            }
+            let serialization = runtime.block_on(async {
+                sqlx::query("PRAGMA journal_mode = DELETE")
+                    .execute(&mut connection)
+                    .await
+                    .map_err(|error| FileControlError::Handle(error.to_string()))?;
+                serialize_main_database(&mut connection, maximum_bytes).await
+            });
+            let mut bytes = match serialization {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = runtime.block_on(sqlx::Connection::close(connection));
+                    return Err(error);
+                }
+            };
+            if bytes.len() > 19 {
+                bytes[18] = 1;
+                bytes[19] = 1;
+            }
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            runtime
+                .block_on(sqlx::Connection::close(connection))
+                .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+            }
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+            output
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| output.set_len(0))
+                .map_err(|error| {
+                    FileControlError::Handle(format!(
+                        "prepare held snapshot output {output_path}: {error}"
+                    ))
+                })?;
+            for chunk in bytes.chunks(64 * 1024) {
+                if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                    return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+                }
+                output.write_all(chunk).map_err(|error| {
+                    FileControlError::Handle(format!(
+                        "write held snapshot output {output_path}: {error}"
+                    ))
+                })?;
+            }
+            output.sync_all().map_err(|error| {
+                FileControlError::Handle(format!(
+                    "sync held snapshot output {output_path}: {error}"
+                ))
+            })?;
+            if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+            }
+            output.seek(SeekFrom::Start(0)).map_err(|error| {
+                FileControlError::Handle(format!(
+                    "rewind held snapshot output {output_path}: {error}"
+                ))
+            })?;
+            let mut verified_digest = Sha256::new();
+            let mut verified_bytes = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                    return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+                }
+                let read = output.read(&mut buffer).map_err(|error| {
+                    FileControlError::Handle(format!(
+                        "verify held snapshot output {output_path}: {error}"
+                    ))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                verified_digest.update(&buffer[..read]);
+                verified_bytes = verified_bytes
+                    .checked_add(u64::try_from(read).expect("buffer length fits u64"))
+                    .ok_or_else(|| {
+                        FileControlError::Handle(
+                            "held snapshot byte-count verification overflowed".to_owned(),
+                        )
+                    })?;
+            }
+            let verified_digest: [u8; 32] = verified_digest.finalize().into();
+            let expected_bytes = u64::try_from(bytes.len()).map_err(|_| {
+                FileControlError::Handle("serialized snapshot size does not fit u64".to_owned())
+            })?;
+            if verified_bytes != expected_bytes || verified_digest != digest {
+                return Err(FileControlError::Handle(
+                    "held snapshot output failed exact size/digest verification".to_owned(),
+                ));
+            }
+            Ok(SnapshotWriteReceipt {
+                byte_count: verified_bytes,
+                digest,
+            })
+        })();
+        drop(output);
+        let delivered = match operation {
+            Ok(receipt) => result_tx.send(Ok((receipt, cleanup))),
+            Err(primary) => {
+                let primary = match cleanup.cleanup() {
+                    Ok(()) => primary,
+                    Err(cleanup_error) => FileControlError::Handle(format!(
+                        "{primary}; snapshot cleanup failed: {cleanup_error}"
+                    )),
+                };
+                result_tx.send(Err(primary))
+            }
+        };
+        if let Err(error) = delivered
+            && let Ok((_, mut cleanup)) = error.0
+        {
+            let _ = cleanup.cleanup();
+        }
+    });
+    let cleanup_cutoff = deadline + std::time::Duration::from_secs(5);
+    loop {
+        match result_rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if std::time::Instant::now() < cleanup_cutoff =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                return Err(FileControlError::Handle(
+                    "snapshot finalization cleanup exceeded its fixed cutoff".to_owned(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(FileControlError::Handle(
+                    "snapshot finalization owner stopped without a result".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+struct ManualTransactionToken {
     database_address: usize,
     connection_nonce: u64,
     generation: u64,
+    authorizer_address: usize,
     active: bool,
 }
 
@@ -672,12 +993,13 @@ impl ActiveTransactionRegistration {
         })
     }
 
-    fn into_token(mut self) -> ManualTransactionToken {
+    fn into_token(mut self, authorizer_address: usize) -> ManualTransactionToken {
         self.armed = false;
         ManualTransactionToken {
             database_address: self.key.0,
             connection_nonce: self.key.1,
             generation: self.generation,
+            authorizer_address,
             active: true,
         }
     }
@@ -769,18 +1091,478 @@ impl Drop for ManualTransactionToken {
     }
 }
 
+/// Linear owner of one physical SQLite connection and its active manual transaction.
+pub struct ManualTransaction<Connection: BeginOwnedConnection> {
+    connection: Option<TransactionConnection<Connection>>,
+    token: Option<ManualTransactionToken>,
+    cleanup_owner: Option<BlockingCleanupOwner>,
+}
+
+struct TransactionConnection<Connection: BeginOwnedConnection> {
+    inner: Connection,
+}
+
+async fn cleanup_late_writer_claim<Connection: BeginOwnedConnection>(
+    connection: &mut Connection,
+    owner: Option<&str>,
+    cleanup_deadline: std::time::Instant,
+) -> Result<(), FileControlError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let remaining = cleanup_deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(FileControlError::Handle(
+            "late writer claim cleanup cutoff elapsed".to_owned(),
+        ));
+    }
+    set_busy_timeout(connection.sqlite(), remaining).await?;
+    tokio::time::timeout(remaining, async {
+        sqlx::query(
+            "DELETE FROM claw_writer_lock
+             WHERE singleton = 1 AND owner = ?",
+        )
+        .bind(owner)
+        .execute(connection.sqlite())
+        .await?;
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM claw_writer_lock
+             WHERE singleton = 1 AND owner = ?",
+        )
+        .bind(owner)
+        .fetch_one(connection.sqlite())
+        .await?;
+        if remaining != 0 {
+            return Err(sqlx::Error::Protocol(
+                "late writer claim cleanup was not verified".to_owned(),
+            ));
+        }
+        Ok::<(), sqlx::Error>(())
+    })
+    .await
+    .map_err(|_| FileControlError::Handle("late writer claim cleanup timed out".to_owned()))?
+    .map_err(|error| FileControlError::Handle(error.to_string()))
+}
+
+impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
+    #[cfg(test)]
+    fn into_test_parts(mut self) -> (Connection, ManualTransactionToken) {
+        self.cleanup_owner.take();
+        (
+            self.connection
+                .take()
+                .expect("test transaction connection remains owned")
+                .inner,
+            self.token
+                .take()
+                .expect("test transaction token remains owned"),
+        )
+    }
+
+    /// Commits and returns the owned connection only after SQLite reaches autocommit.
+    pub async fn commit(mut self) -> Result<Connection, FileControlError> {
+        let result = commit_synchronously(
+            self.connection
+                .as_mut()
+                .expect("manual transaction connection remains owned")
+                .inner
+                .sqlite(),
+            self.token
+                .as_mut()
+                .expect("manual transaction token remains owned"),
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                self.token.take();
+                self.cleanup_owner.take();
+                Ok(self
+                    .connection
+                    .take()
+                    .expect("committed connection remains owned")
+                    .inner)
+            }
+            Err(commit_error) => {
+                let rollback = if self.token.as_ref().is_some_and(|token| token.active) {
+                    rollback_synchronously(
+                        self.connection
+                            .as_mut()
+                            .expect("failed commit connection remains owned")
+                            .inner
+                            .sqlite(),
+                        self.token
+                            .as_mut()
+                            .expect("failed commit token remains owned"),
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                let connection = self
+                    .connection
+                    .take()
+                    .expect("failed commit connection remains owned");
+                self.token.take();
+                let cleanup_owner = self.cleanup_owner.take();
+                if let Some(mut owner) = cleanup_owner {
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                    owner.handoff(move |runtime| {
+                        connection.inner.close_owned(runtime);
+                        let _ = done_tx.send(());
+                    });
+                    let _ = done_rx.await;
+                }
+                Err(match rollback {
+                    Ok(()) => commit_error,
+                    Err(rollback_error) => FileControlError::Handle(format!(
+                        "COMMIT failed: {commit_error}; terminal ROLLBACK failed: {rollback_error}"
+                    )),
+                })
+            }
+        }
+    }
+
+    /// Checks whether SQLite reports that this transaction's main file moved.
+    #[cfg(unix)]
+    pub async fn main_database_has_moved(&mut self) -> Result<bool, FileControlError> {
+        main_database_has_moved(
+            self.connection
+                .as_mut()
+                .expect("manual transaction connection remains owned")
+                .inner
+                .sqlite(),
+        )
+        .await
+    }
+
+    /// Commits on the dedicated cleanup runtime with one immutable deadline and
+    /// cancellation-aware SQLite busy handler.
+    pub async fn commit_with_deadline(
+        mut self,
+        deadline: std::time::Instant,
+        cleanup_deadline: std::time::Instant,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        restore_busy_timeout: std::time::Duration,
+        late_writer_owner: Option<String>,
+    ) -> Result<Connection, FileControlError> {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= deadline
+        {
+            let _ = self.rollback().await;
+            return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+        }
+        let mut connection = self
+            .connection
+            .take()
+            .expect("bounded commit connection remains owned");
+        let mut token = self
+            .token
+            .take()
+            .expect("bounded commit token remains owned");
+        let mut cleanup_owner = self
+            .cleanup_owner
+            .take()
+            .expect("bounded commit cleanup owner remains owned");
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        cleanup_owner.handoff(move |runtime| {
+            let cancellation = Arc::new(BeginCancellation {
+                local: std::sync::atomic::AtomicBool::new(false),
+                external: Some(cancelled),
+                deadline,
+                #[cfg(test)]
+                busy_entered: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                test_key: std::sync::Mutex::new(None),
+            });
+            let result = runtime.block_on(async {
+                let pointer = {
+                    let mut handle = connection
+                        .inner
+                        .sqlite()
+                        .lock_handle()
+                        .await
+                        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+                    let pointer = LiveInterruptPointer(handle.as_raw_handle());
+                    // SAFETY: cancellation remains alive until the handler is restored below.
+                    let result = unsafe {
+                        libsqlite3_sys::sqlite3_busy_handler(
+                            pointer.as_ptr(),
+                            Some(begin_busy_handler),
+                            Arc::as_ptr(&cancellation).cast_mut().cast(),
+                        )
+                    };
+                    if result != libsqlite3_sys::SQLITE_OK {
+                        return Err(FileControlError::SQLite(result));
+                    }
+                    pointer
+                };
+                let commit = if cancellation.is_expired() {
+                    Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
+                } else {
+                    commit_synchronously(connection.inner.sqlite(), &mut token).await
+                };
+                let restore_ms =
+                    i32::try_from(restore_busy_timeout.as_millis()).unwrap_or(i32::MAX);
+                let _handle = connection
+                    .inner
+                    .sqlite()
+                    .lock_handle()
+                    .await
+                    .map_err(|error| FileControlError::Handle(error.to_string()))?;
+                // SAFETY: the same locked SQLite handle remains live.
+                unsafe {
+                    libsqlite3_sys::sqlite3_busy_timeout(pointer.as_ptr(), restore_ms);
+                }
+                commit
+            });
+            match result {
+                Ok(()) => {
+                    let _runtime = runtime.enter();
+                    let mut connection = connection.inner;
+                    #[cfg(test)]
+                    wait_at_commit_result_test_gate(late_writer_owner.as_deref());
+                    if cancellation.is_expired() {
+                        let cleanup = runtime.block_on(cleanup_late_writer_claim(
+                            &mut connection,
+                            late_writer_owner.as_deref(),
+                            cleanup_deadline,
+                        ));
+                        connection.close_owned(runtime);
+                        let error = cleanup
+                            .err()
+                            .unwrap_or(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+                        let _ = result_tx.send(Err(error));
+                    } else if let Err(error) = result_tx.send(Ok(connection))
+                        && let Ok(mut connection) = error.0
+                    {
+                        let _ = runtime.block_on(cleanup_late_writer_claim(
+                            &mut connection,
+                            late_writer_owner.as_deref(),
+                            cleanup_deadline,
+                        ));
+                        connection.close_owned(runtime);
+                    }
+                }
+                Err(error) => {
+                    let rollback = if token.active {
+                        runtime.block_on(rollback_synchronously(
+                            connection.inner.sqlite(),
+                            &mut token,
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                    connection.inner.close_owned(runtime);
+                    let error = match rollback {
+                        Ok(()) => error,
+                        Err(rollback_error) => FileControlError::Handle(format!(
+                            "{error}; terminal rollback failed: {rollback_error}"
+                        )),
+                    };
+                    let _ = result_tx.send(Err(error));
+                }
+            }
+        });
+        loop {
+            match result_rx.try_recv() {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= cleanup_deadline {
+                        return Err(FileControlError::Handle(
+                            "bounded COMMIT exceeded its cleanup cutoff".to_owned(),
+                        ));
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(FileControlError::Handle(
+                        "bounded COMMIT cleanup owner stopped without a result".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Rolls back and returns the owned connection only after SQLite reaches autocommit.
+    pub async fn rollback(mut self) -> Result<Connection, FileControlError> {
+        let result = rollback_synchronously(
+            self.connection
+                .as_mut()
+                .expect("manual transaction connection remains owned")
+                .inner
+                .sqlite(),
+            self.token
+                .as_mut()
+                .expect("manual transaction token remains owned"),
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                self.token.take();
+                self.cleanup_owner.take();
+                Ok(self
+                    .connection
+                    .take()
+                    .expect("rolled-back connection remains owned")
+                    .inner)
+            }
+            Err(error) => {
+                let connection = self
+                    .connection
+                    .take()
+                    .expect("failed rollback connection remains owned");
+                self.token.take();
+                if let Some(mut owner) = self.cleanup_owner.take() {
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                    owner.handoff(move |runtime| {
+                        connection.inner.close_owned(runtime);
+                        let _ = done_tx.send(());
+                    });
+                    let _ = done_rx.await;
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<Connection: BeginOwnedConnection> std::fmt::Debug for ManualTransaction<Connection> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManualTransaction")
+            .field(
+                "active",
+                &self.token.as_ref().is_some_and(|token| token.active),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Connection: BeginOwnedConnection> std::fmt::Debug for TransactionConnection<Connection> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransactionConnection")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'connection, Connection: BeginOwnedConnection> sqlx::Executor<'connection>
+    for &'connection mut ManualTransaction<Connection>
+{
+    type Database = sqlx::Sqlite;
+
+    fn fetch_many<'executor, 'query: 'executor, Execute>(
+        self,
+        query: Execute,
+    ) -> futures_core::stream::BoxStream<
+        'executor,
+        Result<sqlx::Either<sqlx::sqlite::SqliteQueryResult, sqlx::sqlite::SqliteRow>, sqlx::Error>,
+    >
+    where
+        'connection: 'executor,
+        Execute: 'query + sqlx::Execute<'query, sqlx::Sqlite>,
+    {
+        sqlx::Executor::fetch_many(
+            self.connection
+                .as_mut()
+                .expect("manual transaction connection remains owned")
+                .inner
+                .sqlite(),
+            query,
+        )
+    }
+
+    fn fetch_optional<'executor, 'query: 'executor, Execute>(
+        self,
+        query: Execute,
+    ) -> futures_core::future::BoxFuture<
+        'executor,
+        Result<Option<sqlx::sqlite::SqliteRow>, sqlx::Error>,
+    >
+    where
+        'connection: 'executor,
+        Execute: 'query + sqlx::Execute<'query, sqlx::Sqlite>,
+    {
+        sqlx::Executor::fetch_optional(
+            self.connection
+                .as_mut()
+                .expect("manual transaction connection remains owned")
+                .inner
+                .sqlite(),
+            query,
+        )
+    }
+
+    fn prepare_with<'executor>(
+        self,
+        sql: sqlx::SqlStr,
+        parameters: &'executor [sqlx::sqlite::SqliteTypeInfo],
+    ) -> futures_core::future::BoxFuture<
+        'executor,
+        Result<sqlx::sqlite::SqliteStatement, sqlx::Error>,
+    >
+    where
+        'connection: 'executor,
+    {
+        sqlx::Executor::prepare_with(
+            self.connection
+                .as_mut()
+                .expect("manual transaction connection remains owned")
+                .inner
+                .sqlite(),
+            sql,
+            parameters,
+        )
+    }
+}
+
+impl<Connection: BeginOwnedConnection> Drop for ManualTransaction<Connection> {
+    fn drop(&mut self) {
+        let (Some(mut connection), Some(mut token), Some(mut cleanup_owner)) = (
+            self.connection.take(),
+            self.token.take(),
+            self.cleanup_owner.take(),
+        ) else {
+            return;
+        };
+        cleanup_owner.handoff(move |runtime| {
+            let rollback = runtime.block_on(rollback_synchronously(
+                connection.inner.sqlite(),
+                &mut token,
+            ));
+            let _ = rollback;
+            connection.inner.close_owned(runtime);
+        });
+    }
+}
 enum BeginWorkerCommand {
-    Accept,
+    Accept(u64),
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum BeginTestStage {
     BeforeDispatch,
     AfterBegin,
     AfterAccept,
     AfterFailureOutcome,
     PanicAfterPointerPublication,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum BeginTestOperation {
+    Stage(BeginTestStage),
+    BusyObserver,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BeginTestKey {
+    path: String,
+    connection_nonce: u64,
+    operation_generation: u64,
+    operation: BeginTestOperation,
 }
 
 #[cfg(test)]
@@ -793,51 +1575,68 @@ struct BeginTestGate {
 
 #[cfg(test)]
 static BEGIN_TEST_GATE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, BeginTestGate>>,
+    std::sync::Mutex<std::collections::HashMap<BeginTestKey, BeginTestGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static BEGIN_BUSY_OBSERVERS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    std::sync::Mutex<std::collections::HashMap<BeginTestKey, Arc<tokio::sync::Notify>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static PENDING_BEGIN_TEST_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, BeginTestKey>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static NEXT_BEGIN_TEST_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
-fn begin_test_key(path: &str) -> String {
-    #[cfg(windows)]
-    {
-        path.replace('\\', "/").to_ascii_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        path.to_owned()
-    }
+struct CommitResultTestGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
-fn begin_database_path(database: LiveInterruptPointer) -> Option<String> {
-    // SAFETY: callers hold SQLx's locked live SQLite handle.
-    unsafe {
-        let path = libsqlite3_sys::sqlite3_db_filename(database.as_ptr(), c"main".as_ptr());
-        (!path.is_null()).then(|| {
-            std::ffi::CStr::from_ptr(path)
-                .to_string_lossy()
-                .into_owned()
-        })
+static COMMIT_RESULT_TEST_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, CommitResultTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn wait_at_commit_result_test_gate(owner: Option<&str>) {
+    let Some(owner) = owner else {
+        return;
+    };
+    let gate = COMMIT_RESULT_TEST_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(owner)
+        .map(|gate| (Arc::clone(&gate.entered), Arc::clone(&gate.release)));
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        while !release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
     }
 }
 
 #[cfg(test)]
 fn wait_at_begin_test_gate(
     stage: BeginTestStage,
-    database: LiveInterruptPointer,
+    cancellation: &BeginCancellation,
     command: &std::sync::mpsc::Receiver<BeginWorkerCommand>,
 ) -> bool {
-    let database_path = begin_database_path(database);
+    let key = cancellation
+        .test_key
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let gate = BEGIN_TEST_GATE
         .lock()
-        .expect("BEGIN test gate lock poisoned")
-        .get(&begin_test_key(
-            database_path.as_deref().unwrap_or_default(),
-        ))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key.as_ref().unwrap_or(&BeginTestKey {
+            path: String::new(),
+            connection_nonce: 0,
+            operation_generation: 0,
+            operation: BeginTestOperation::Stage(stage),
+        }))
         .filter(|gate| gate.stage == stage)
         .map(|gate| {
             (
@@ -852,48 +1651,79 @@ fn wait_at_begin_test_gate(
     entered.notify_one();
     while !release.load(std::sync::atomic::Ordering::Acquire) {
         if hold_after_cancellation {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
             continue;
         }
         match command.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::yield_now();
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
-            Ok(BeginWorkerCommand::Accept) => return false,
+            Ok(BeginWorkerCommand::Accept(_)) => return false,
         }
     }
     true
 }
 
 #[cfg(test)]
-fn wait_at_begin_failure_cleanup_gate(cancellation: &BeginCancellation) {
-    let path = cancellation
-        .database_path
+fn begin_test_gate_is_configured(stage: BeginTestStage, cancellation: &BeginCancellation) -> bool {
+    let key = cancellation
+        .test_key
         .lock()
-        .expect("BEGIN database path lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    key.is_some_and(|key| {
+        BEGIN_TEST_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|gate| gate.stage == stage)
+    })
+}
+
+#[cfg(test)]
+fn wait_at_begin_failure_cleanup_gate(cancellation: &BeginCancellation) {
+    let key = cancellation
+        .test_key
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let gate = BEGIN_TEST_GATE
         .lock()
-        .expect("BEGIN test gate lock poisoned")
-        .get(&begin_test_key(path.as_deref().unwrap_or_default()))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key.as_ref().unwrap_or(&BeginTestKey {
+            path: String::new(),
+            connection_nonce: 0,
+            operation_generation: 0,
+            operation: BeginTestOperation::Stage(BeginTestStage::AfterFailureOutcome),
+        }))
         .filter(|gate| gate.stage == BeginTestStage::AfterFailureOutcome)
         .map(|gate| (Arc::clone(&gate.entered), Arc::clone(&gate.release)));
     if let Some((entered, release)) = gate {
         entered.notify_one();
         while !release.load(Ordering::Acquire) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
         }
     }
 }
 
-trait BeginOwnedConnection: Send + 'static {
+/// Connection ownership supported by [`ManualTransaction`].
+pub trait BeginOwnedConnection: Send + 'static {
+    /// Borrows the underlying SQLite connection.
+    fn sqlite_ref(&self) -> &sqlx::SqliteConnection;
+
+    /// Mutably borrows the underlying SQLite connection.
     fn sqlite(&mut self) -> &mut sqlx::SqliteConnection;
 
+    /// Closes the owned physical connection on the supplied cleanup runtime.
     fn close_owned(self, runtime: &tokio::runtime::Runtime);
 }
 
 impl BeginOwnedConnection for sqlx::SqliteConnection {
+    fn sqlite_ref(&self) -> &sqlx::SqliteConnection {
+        self
+    }
+
     fn sqlite(&mut self) -> &mut sqlx::SqliteConnection {
         self
     }
@@ -904,6 +1734,10 @@ impl BeginOwnedConnection for sqlx::SqliteConnection {
 }
 
 impl BeginOwnedConnection for sqlx::pool::PoolConnection<sqlx::Sqlite> {
+    fn sqlite_ref(&self) -> &sqlx::SqliteConnection {
+        self
+    }
+
     fn sqlite(&mut self) -> &mut sqlx::SqliteConnection {
         self
     }
@@ -913,391 +1747,7 @@ impl BeginOwnedConnection for sqlx::pool::PoolConnection<sqlx::Sqlite> {
     }
 }
 
-type VacuumWorkerOutput<Connection, Cleanup> =
-    Option<Result<(Connection, VacuumDeadlineOutcome, Cleanup), (sqlx::Error, Cleanup)>>;
-
-/// VACUUM failure with an optional operation cleanup lease returned only after
-/// the native worker and connection teardown are terminal.
-pub struct VacuumCleanupError<Cleanup> {
-    primary: sqlx::Error,
-    cleanup: Option<Cleanup>,
-}
-
-impl<Cleanup> VacuumCleanupError<Cleanup> {
-    /// Splits the primary SQLite failure from a terminally returned cleanup lease.
-    #[must_use]
-    pub fn into_parts(self) -> (sqlx::Error, Option<Cleanup>) {
-        (self.primary, self.cleanup)
-    }
-}
-
-struct OwnedVacuumGuard<Connection: BeginOwnedConnection, Cleanup: Send + 'static> {
-    worker: Option<std::thread::JoinHandle<VacuumWorkerOutput<Connection, Cleanup>>>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    pointer: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
-    cleanup_owner: Option<BlockingCleanupOwner>,
-    armed: bool,
-}
-
-impl<Connection: BeginOwnedConnection, Cleanup: Send + 'static>
-    OwnedVacuumGuard<Connection, Cleanup>
-{
-    fn request_cancellation(&mut self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-        if self
-            .worker
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
-        {
-            return;
-        }
-        let pointer = self
-            .pointer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pointer) = pointer.as_ref() {
-            // SAFETY: the worker clears this slot under the same mutex before
-            // it may close the owned SQLite connection.
-            unsafe {
-                libsqlite3_sys::sqlite3_interrupt(pointer.as_ptr());
-            }
-        }
-    }
-
-    fn finish(
-        mut self,
-    ) -> Result<(Connection, VacuumDeadlineOutcome, Cleanup), VacuumCleanupError<Cleanup>> {
-        let result = self
-            .worker
-            .take()
-            .ok_or_else(|| VacuumCleanupError {
-                primary: sqlx::Error::Protocol("VACUUM worker is missing".to_owned()),
-                cleanup: None,
-            })?
-            .join()
-            .map_err(|_| VacuumCleanupError {
-                primary: sqlx::Error::Protocol("VACUUM worker panicked".to_owned()),
-                cleanup: None,
-            })?
-            .ok_or_else(|| VacuumCleanupError {
-                primary: sqlx::Error::Protocol("VACUUM worker was cancelled".to_owned()),
-                cleanup: None,
-            })?
-            .map_err(|(primary, cleanup)| VacuumCleanupError {
-                primary,
-                cleanup: Some(cleanup),
-            });
-        self.cleanup_owner
-            .take()
-            .ok_or_else(|| VacuumCleanupError {
-                primary: sqlx::Error::Protocol("VACUUM cleanup owner is missing".to_owned()),
-                cleanup: None,
-            })?
-            .shutdown()
-            .map_err(|error| VacuumCleanupError {
-                primary: sqlx::Error::Protocol(error),
-                cleanup: None,
-            })?;
-        self.armed = false;
-        result
-    }
-}
-
-impl<Connection: BeginOwnedConnection, Cleanup: Send + 'static> Drop
-    for OwnedVacuumGuard<Connection, Cleanup>
-{
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.request_cancellation();
-        let Some(worker) = self.worker.take() else {
-            return;
-        };
-        let cancelled = Arc::clone(&self.cancelled);
-        let pointer = Arc::clone(&self.pointer);
-        self.cleanup_owner
-            .as_mut()
-            .expect("VACUUM cleanup owner exists while armed")
-            .handoff(Box::new(move |runtime| {
-                cancelled.store(true, std::sync::atomic::Ordering::Release);
-                while !worker.is_finished() {
-                    let pointer = pointer
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(pointer) = pointer.as_ref() {
-                        // SAFETY: registration keeps the pointer live under this mutex.
-                        unsafe {
-                            libsqlite3_sys::sqlite3_interrupt(pointer.as_ptr());
-                        }
-                    }
-                    drop(pointer);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                if let Ok(Some(result)) = worker.join() {
-                    match result {
-                        Ok((connection, _, cleanup)) => {
-                            connection.close_owned(runtime);
-                            drop(cleanup);
-                        }
-                        Err((_, cleanup)) => drop(cleanup),
-                    }
-                }
-            }));
-    }
-}
-
-fn run_owned_vacuum_worker<Connection: BeginOwnedConnection, Cleanup: Send + 'static>(
-    mut connection: Connection,
-    cleanup: Cleanup,
-    runtime: tokio::runtime::Runtime,
-    context: VacuumWorkerContext,
-) -> VacuumWorkerOutput<Connection, Cleanup> {
-    let cancelled = Arc::clone(&context.cancelled);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(vacuum_into_borrowed(connection.sqlite(), &context))
-    }));
-    let result = match result {
-        Ok(result) => result,
-        Err(panic) => {
-            connection.close_owned(&runtime);
-            drop(cleanup);
-            std::panic::resume_unwind(panic);
-        }
-    };
-    match result {
-        Ok(outcome) if !cancelled.load(std::sync::atomic::Ordering::Acquire) => {
-            Some(Ok((connection, outcome, cleanup)))
-        }
-        Ok(_) => {
-            connection.close_owned(&runtime);
-            drop(cleanup);
-            None
-        }
-        Err(error) => {
-            connection.close_owned(&runtime);
-            Some(Err((error, cleanup)))
-        }
-    }
-}
-
-async fn vacuum_owned_into_with_deadline<
-    Connection: BeginOwnedConnection,
-    Cleanup: Send + 'static,
->(
-    ownership: (Connection, Cleanup),
-    context: VacuumWorkerContext,
-) -> Result<(Connection, VacuumDeadlineOutcome, Cleanup), VacuumCleanupError<Cleanup>> {
-    let (connection, cleanup) = ownership;
-    let VacuumWorkerContext {
-        destination,
-        deadline,
-        deadline_expired,
-        cancelled,
-        pointer: _,
-        execution_gate,
-        restore_busy_timeout,
-    } = context;
-    let cleanup_owner = match BlockingCleanupOwner::acquire("claw-sqlite-vacuum-cleanup").await {
-        Ok(owner) => owner,
-        Err(error) => {
-            drop(connection);
-            return Err(VacuumCleanupError {
-                primary: sqlx::Error::Protocol(format!("acquire VACUUM cleanup owner: {error}")),
-                cleanup: Some(cleanup),
-            });
-        }
-    };
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            drop(connection);
-            return Err(VacuumCleanupError {
-                primary: sqlx::Error::Protocol(format!("build VACUUM worker runtime: {error}")),
-                cleanup: Some(cleanup),
-            });
-        }
-    };
-    let runtime_slot = Arc::new(std::sync::Mutex::new(Some(runtime)));
-    let worker_runtime_slot = Arc::clone(&runtime_slot);
-    let pointer = Arc::new(std::sync::Mutex::new(None));
-    let worker_pointer = Arc::clone(&pointer);
-    let worker_cancelled = Arc::clone(&cancelled);
-    let ownership = Arc::new(std::sync::Mutex::new(Some((connection, cleanup))));
-    let worker_ownership = Arc::clone(&ownership);
-    let worker = std::thread::Builder::new()
-        .name("claw-sqlite-vacuum".to_owned())
-        .spawn(move || {
-            let runtime = worker_runtime_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let runtime = runtime?;
-            let (connection, cleanup) = worker_ownership
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()?;
-            run_owned_vacuum_worker(
-                connection,
-                cleanup,
-                runtime,
-                VacuumWorkerContext {
-                    destination,
-                    deadline,
-                    deadline_expired,
-                    cancelled: worker_cancelled,
-                    pointer: worker_pointer,
-                    execution_gate,
-                    restore_busy_timeout,
-                },
-            )
-        });
-    let worker = match worker {
-        Ok(worker) => worker,
-        Err(error) => {
-            if let Some(runtime) = runtime_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                runtime.shutdown_background();
-            }
-            let cleanup = ownership
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                .map(|(connection, cleanup)| {
-                    drop(connection);
-                    cleanup
-                });
-            return Err(VacuumCleanupError {
-                primary: sqlx::Error::Protocol(format!("spawn VACUUM worker: {error}")),
-                cleanup,
-            });
-        }
-    };
-    let guard = OwnedVacuumGuard {
-        worker: Some(worker),
-        cancelled: Arc::clone(&cancelled),
-        pointer,
-        cleanup_owner: Some(cleanup_owner),
-        armed: true,
-    };
-    while !guard
-        .worker
-        .as_ref()
-        .is_none_or(std::thread::JoinHandle::is_finished)
-    {
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            drop(guard);
-            return Err(VacuumCleanupError {
-                primary: sqlx::Error::Protocol("VACUUM cancelled".to_owned()),
-                cleanup: None,
-            });
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
-    guard.finish()
-}
-
-/// Runs deadline-bound VACUUM while retaining the SQLx pool connection lease.
-pub async fn vacuum_pool_into_with_deadline(
-    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
-    destination: String,
-    deadline: tokio::time::Instant,
-    deadline_expired: Arc<std::sync::atomic::AtomicBool>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    execution_gate: Option<Arc<VacuumExecutionGate>>,
-    restore_busy_timeout: std::time::Duration,
-) -> Result<
-    (
-        sqlx::pool::PoolConnection<sqlx::Sqlite>,
-        VacuumDeadlineOutcome,
-    ),
-    sqlx::Error,
-> {
-    let (connection, outcome, ()) = vacuum_owned_into_with_deadline(
-        (connection, ()),
-        VacuumWorkerContext {
-            destination,
-            deadline,
-            deadline_expired,
-            cancelled,
-            pointer: Arc::new(std::sync::Mutex::new(None)),
-            execution_gate,
-            restore_busy_timeout,
-        },
-    )
-    .await
-    .map_err(|error| error.into_parts().0)?;
-    Ok((connection, outcome))
-}
-
-/// Runs deadline-bound VACUUM while transferring an operation-owned cleanup
-/// lease through the worker and returning it only after successful handoff.
-pub async fn vacuum_pool_into_with_deadline_and_cleanup<Cleanup: Send + 'static>(
-    ownership: (sqlx::pool::PoolConnection<sqlx::Sqlite>, Cleanup),
-    destination: String,
-    deadline: tokio::time::Instant,
-    deadline_expired: Arc<std::sync::atomic::AtomicBool>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    execution_gate: Option<Arc<VacuumExecutionGate>>,
-    restore_busy_timeout: std::time::Duration,
-) -> Result<
-    (
-        sqlx::pool::PoolConnection<sqlx::Sqlite>,
-        VacuumDeadlineOutcome,
-        Cleanup,
-    ),
-    VacuumCleanupError<Cleanup>,
-> {
-    vacuum_owned_into_with_deadline(
-        ownership,
-        VacuumWorkerContext {
-            destination,
-            deadline,
-            deadline_expired,
-            cancelled,
-            pointer: Arc::new(std::sync::Mutex::new(None)),
-            execution_gate,
-            restore_busy_timeout,
-        },
-    )
-    .await
-}
-
-/// Runs deadline-bound VACUUM on an owned standalone SQLite connection.
-pub async fn vacuum_into_with_deadline(
-    connection: sqlx::SqliteConnection,
-    destination: String,
-    deadline: tokio::time::Instant,
-    deadline_expired: Arc<std::sync::atomic::AtomicBool>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    execution_gate: Option<Arc<VacuumExecutionGate>>,
-    restore_busy_timeout: std::time::Duration,
-) -> Result<(sqlx::SqliteConnection, VacuumDeadlineOutcome), sqlx::Error> {
-    let (connection, outcome, ()) = vacuum_owned_into_with_deadline(
-        (connection, ()),
-        VacuumWorkerContext {
-            destination,
-            deadline,
-            deadline_expired,
-            cancelled,
-            pointer: Arc::new(std::sync::Mutex::new(None)),
-            execution_gate,
-            restore_busy_timeout,
-        },
-    )
-    .await
-    .map_err(|error| error.into_parts().0)?;
-    Ok((connection, outcome))
-}
-
-type BeginWorkerOutput<Connection> = Option<(Connection, ManualTransactionIdentity)>;
+type BeginWorkerOutput<Connection> = Option<(Connection, ManualTransactionIdentity, usize)>;
 
 struct BeginCancellation {
     local: std::sync::atomic::AtomicBool,
@@ -1306,7 +1756,7 @@ struct BeginCancellation {
     #[cfg(test)]
     busy_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
-    database_path: std::sync::Mutex<Option<String>>,
+    test_key: std::sync::Mutex<Option<BeginTestKey>>,
 }
 
 impl BeginCancellation {
@@ -1347,8 +1797,128 @@ unsafe extern "C" fn begin_busy_handler(
     }
 }
 
+unsafe extern "C" fn deny_transaction_control(
+    context: *mut std::ffi::c_void,
+    action: std::ffi::c_int,
+    _detail_one: *const std::ffi::c_char,
+    _detail_two: *const std::ffi::c_char,
+    _database: *const std::ffi::c_char,
+    _trigger: *const std::ffi::c_char,
+) -> std::ffi::c_int {
+    if action != libsqlite3_sys::SQLITE_TRANSACTION && action != libsqlite3_sys::SQLITE_SAVEPOINT {
+        return libsqlite3_sys::SQLITE_OK;
+    }
+    if context.is_null() {
+        return libsqlite3_sys::SQLITE_DENY;
+    }
+    // SAFETY: the context remains owned by the active transaction token until
+    // the authorizer is removed from this exact connection.
+    let context = unsafe { &*context.cast::<TransactionAuthorizerContext>() };
+    let active = ACTIVE_MANUAL_TRANSACTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(context.database_address, context.connection_nonce))
+        == Some(&context.generation);
+    if active && context.internal_permit.load(Ordering::Acquire) {
+        libsqlite3_sys::SQLITE_OK
+    } else {
+        libsqlite3_sys::SQLITE_DENY
+    }
+}
+
+struct TransactionAuthorizerContext {
+    database_address: usize,
+    connection_nonce: u64,
+    generation: u64,
+    internal_permit: std::sync::atomic::AtomicBool,
+}
+
+fn install_transaction_authorizer(
+    database: LiveInterruptPointer,
+    identity: ManualTransactionIdentity,
+    generation: u64,
+) -> Result<usize, FileControlError> {
+    let context = Box::new(TransactionAuthorizerContext {
+        database_address: identity.database_address,
+        connection_nonce: identity.connection_nonce,
+        generation,
+        internal_permit: std::sync::atomic::AtomicBool::new(false),
+    });
+    let context = Box::into_raw(context);
+    // SAFETY: `context` stays allocated until the owner clears this authorizer.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_set_authorizer(
+            database.as_ptr(),
+            Some(deny_transaction_control),
+            context.cast(),
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        // SAFETY: SQLite rejected the registration and cannot retain the context.
+        drop(unsafe { Box::from_raw(context) });
+        return Err(FileControlError::SQLite(result));
+    }
+    Ok(context as usize)
+}
+
+struct InternalTransactionPermit<'context> {
+    context: &'context TransactionAuthorizerContext,
+}
+
+impl InternalTransactionPermit<'_> {
+    fn activate(token: &ManualTransactionToken) -> Result<Self, FileControlError> {
+        if token.authorizer_address == 0 {
+            return Err(FileControlError::Handle(
+                "manual transaction authorizer context is missing".to_owned(),
+            ));
+        }
+        // SAFETY: an active token exclusively owns this installed context.
+        let context =
+            unsafe { &*(token.authorizer_address as *const TransactionAuthorizerContext) };
+        if (
+            context.database_address,
+            context.connection_nonce,
+            context.generation,
+        ) != (
+            token.database_address,
+            token.connection_nonce,
+            token.generation,
+        ) {
+            return Err(FileControlError::Handle(
+                "manual transaction authorizer generation is stale".to_owned(),
+            ));
+        }
+        if context.internal_permit.swap(true, Ordering::AcqRel) {
+            return Err(FileControlError::Handle(
+                "manual transaction internal permit is already active".to_owned(),
+            ));
+        }
+        Ok(Self { context })
+    }
+}
+
+impl Drop for InternalTransactionPermit<'_> {
+    fn drop(&mut self) {
+        self.context.internal_permit.store(false, Ordering::Release);
+    }
+}
+
+fn clear_transaction_authorizer(database: LiveInterruptPointer, authorizer_address: &mut usize) {
+    if *authorizer_address == 0 {
+        return;
+    }
+    // SAFETY: the locked handle owns this exact callback registration.
+    unsafe {
+        libsqlite3_sys::sqlite3_set_authorizer(database.as_ptr(), None, std::ptr::null_mut());
+        drop(Box::from_raw(
+            *authorizer_address as *mut TransactionAuthorizerContext,
+        ));
+    }
+    *authorizer_address = 0;
+}
+
 struct OwnedBeginGuard<Connection: BeginOwnedConnection> {
-    worker: Option<std::thread::JoinHandle<BeginWorkerOutput<Connection>>>,
+    worker_result: Option<std::sync::mpsc::Receiver<BeginWorkerOutput<Connection>>>,
     command: Option<std::sync::mpsc::Sender<BeginWorkerCommand>>,
     database: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
     cancellation: Arc<BeginCancellation>,
@@ -1361,13 +1931,6 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
             .local
             .store(true, std::sync::atomic::Ordering::Release);
         self.command.take();
-        if self
-            .worker
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
-        {
-            return;
-        }
         let database = self
             .database
             .lock()
@@ -1381,46 +1944,73 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
         }
     }
 
-    fn join(&mut self) -> Result<BeginWorkerOutput<Connection>, FileControlError> {
-        self.worker
-            .take()
-            .ok_or_else(|| FileControlError::Handle("BEGIN worker is missing".to_owned()))?
-            .join()
-            .map_err(|_| FileControlError::Handle("BEGIN worker panicked".to_owned()))
+    async fn receive_worker_result(
+        &mut self,
+    ) -> Result<BeginWorkerOutput<Connection>, FileControlError> {
+        let cutoff = self.cancellation.deadline + std::time::Duration::from_secs(5);
+        loop {
+            let received = self
+                .worker_result
+                .as_ref()
+                .ok_or_else(|| {
+                    FileControlError::Handle("BEGIN worker result owner is missing".to_owned())
+                })?
+                .try_recv();
+            match received {
+                Ok(result) => {
+                    self.worker_result.take();
+                    return Ok(result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) if std::time::Instant::now() < cutoff => {
+                    tokio::task::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return Err(FileControlError::Handle(
+                        "BEGIN terminal cleanup exceeded its fixed cutoff".to_owned(),
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.worker_result.take();
+                    return Err(FileControlError::Handle(
+                        "BEGIN owner stopped without a terminal result".to_owned(),
+                    ));
+                }
+            }
+        }
     }
 
-    async fn accept(mut self) -> Result<(Connection, ManualTransactionIdentity), FileControlError> {
+    async fn accept(
+        mut self,
+        generation: u64,
+    ) -> Result<
+        (
+            Connection,
+            ManualTransactionIdentity,
+            usize,
+            BlockingCleanupOwner,
+        ),
+        FileControlError,
+    > {
         self.command
             .take()
             .ok_or_else(|| FileControlError::Handle("BEGIN command channel is missing".to_owned()))?
-            .send(BeginWorkerCommand::Accept)
+            .send(BeginWorkerCommand::Accept(generation))
             .map_err(|_| {
                 FileControlError::Handle("BEGIN worker stopped before accept".to_owned())
             })?;
-        while !self
-            .worker
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
-        {
-            tokio::task::yield_now().await;
-        }
-        let result = self.join()?.ok_or_else(|| {
+        let result = self.receive_worker_result().await?.ok_or_else(|| {
             FileControlError::Handle("BEGIN worker discarded the connection".to_owned())
         })?;
-        self.shutdown_cleanup_owner()?;
-        Ok(result)
+        let cleanup_owner = self
+            .cleanup_owner
+            .take()
+            .ok_or_else(|| FileControlError::Handle("BEGIN cleanup owner is missing".to_owned()))?;
+        Ok((result.0, result.1, result.2, cleanup_owner))
     }
 
     async fn join_failure(mut self) -> Result<(), FileControlError> {
         self.command.take();
-        while !self
-            .worker
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
-        {
-            tokio::task::yield_now().await;
-        }
-        let _ = self.join()?;
+        let _ = self.receive_worker_result().await?;
         self.shutdown_cleanup_owner()?;
         Ok(())
     }
@@ -1437,37 +2027,6 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
 impl<Connection: BeginOwnedConnection> Drop for OwnedBeginGuard<Connection> {
     fn drop(&mut self) {
         self.request_cancellation();
-        let Some(worker) = self.worker.take() else {
-            return;
-        };
-        let command = self.command.take();
-        let database = Arc::clone(&self.database);
-        let cancellation = Arc::clone(&self.cancellation);
-        self.cleanup_owner
-            .as_mut()
-            .expect("BEGIN cleanup owner exists while worker is live")
-            .handoff(Box::new(move |runtime| {
-                cancellation
-                    .local
-                    .store(true, std::sync::atomic::Ordering::Release);
-                drop(command);
-                while !worker.is_finished() {
-                    let database = database
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(database) = database.as_ref() {
-                        // SAFETY: registration keeps the pointer live under this mutex.
-                        unsafe {
-                            libsqlite3_sys::sqlite3_interrupt(database.as_ptr());
-                        }
-                    }
-                    drop(database);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                if let Ok(Some((connection, _))) = worker.join() {
-                    connection.close_owned(runtime);
-                }
-            }));
     }
 }
 
@@ -1479,7 +2038,7 @@ fn close_owned_begin_connection<Connection: BeginOwnedConnection>(
 }
 
 enum LockedBeginOutcome {
-    Accepted(ManualTransactionIdentity),
+    Accepted(ManualTransactionIdentity, usize),
     Failed(FileControlError),
     Cancelled,
 }
@@ -1505,19 +2064,25 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
         Err(error) => return LockedBeginOutcome::Failed(error),
     };
     #[cfg(test)]
-    if let Some(path) = begin_database_path(pointer) {
+    {
+        let key = PENDING_BEGIN_TEST_KEYS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&connection_nonce);
         *cancellation
-            .database_path
+            .test_key
             .lock()
-            .expect("BEGIN database path lock poisoned") = Some(path.clone());
-        *cancellation
-            .busy_entered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = BEGIN_BUSY_OBSERVERS
-            .lock()
-            .expect("BEGIN busy observers lock poisoned")
-            .get(&begin_test_key(&path))
-            .cloned();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = key.clone();
+        if let Some(key) = key {
+            *cancellation
+                .busy_entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = BEGIN_BUSY_OBSERVERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+        }
     }
     let restore_busy_timeout_ms =
         i32::try_from(restore_busy_timeout.as_millis()).unwrap_or(i32::MAX);
@@ -1538,22 +2103,18 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
     #[cfg(test)]
     if !wait_at_begin_test_gate(
         BeginTestStage::PanicAfterPointerPublication,
-        pointer,
+        cancellation,
         command,
     ) {
         return LockedBeginOutcome::Cancelled;
-    } else if BEGIN_TEST_GATE
-        .lock()
-        .expect("BEGIN test gate lock poisoned")
-        .get(&begin_test_key(
-            begin_database_path(pointer).as_deref().unwrap_or_default(),
-        ))
-        .is_some_and(|gate| gate.stage == BeginTestStage::PanicAfterPointerPublication)
-    {
+    } else if begin_test_gate_is_configured(
+        BeginTestStage::PanicAfterPointerPublication,
+        cancellation,
+    ) {
         panic!("injected BEGIN panic after pointer publication");
     }
     #[cfg(test)]
-    if !wait_at_begin_test_gate(BeginTestStage::BeforeDispatch, pointer, command) {
+    if !wait_at_begin_test_gate(BeginTestStage::BeforeDispatch, cancellation, command) {
         return LockedBeginOutcome::Cancelled;
     }
     let mut message = std::ptr::null_mut();
@@ -1582,7 +2143,7 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
         return LockedBeginOutcome::Failed(FileControlError::SQLite(result));
     }
     #[cfg(test)]
-    if !wait_at_begin_test_gate(BeginTestStage::AfterBegin, pointer, command) {
+    if !wait_at_begin_test_gate(BeginTestStage::AfterBegin, cancellation, command) {
         let mut rollback_message = std::ptr::null_mut();
         // SAFETY: cancellation is handled by the same locked worker.
         unsafe {
@@ -1603,15 +2164,26 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
         database_address: pointer.as_ptr() as usize,
         connection_nonce,
     };
-    let accepted = outcome.send(Ok(identity)).is_ok()
-        && matches!(command.recv(), Ok(BeginWorkerCommand::Accept));
+    let accepted_generation = if outcome.send(Ok(identity)).is_ok() {
+        match command.recv() {
+            Ok(BeginWorkerCommand::Accept(generation)) => Some(generation),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     #[cfg(test)]
-    let accept_gate_open =
-        !accepted || wait_at_begin_test_gate(BeginTestStage::AfterAccept, pointer, command);
+    let accept_gate_open = accepted_generation.is_none()
+        || wait_at_begin_test_gate(BeginTestStage::AfterAccept, cancellation, command);
     #[cfg(not(test))]
     let accept_gate_open = true;
-    if accepted && accept_gate_open {
-        return LockedBeginOutcome::Accepted(identity);
+    if let Some(generation) = accepted_generation
+        && accept_gate_open
+    {
+        return match install_transaction_authorizer(pointer, identity, generation) {
+            Ok(authorizer_address) => LockedBeginOutcome::Accepted(identity, authorizer_address),
+            Err(error) => LockedBeginOutcome::Failed(error),
+        };
     }
 
     let mut rollback_message = std::ptr::null_mut();
@@ -1632,27 +2204,17 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
 }
 
 fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
-    connection_slot: Arc<std::sync::Mutex<Option<Connection>>>,
+    mut connection: Connection,
     outcome: std::sync::mpsc::SyncSender<Result<ManualTransactionIdentity, FileControlError>>,
     command: std::sync::mpsc::Receiver<BeginWorkerCommand>,
     database_slot: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
     restore_busy_timeout: std::time::Duration,
     cancellation: Arc<BeginCancellation>,
-    runtime: tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Runtime,
 ) -> BeginWorkerOutput<Connection> {
-    let connection = connection_slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    let Some(mut connection) = connection else {
-        let _ = outcome.send(Err(FileControlError::Handle(
-            "BEGIN worker connection is missing".to_owned(),
-        )));
-        return None;
-    };
     let begin = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_locked_begin(
-            &runtime,
+            runtime,
             &mut connection,
             &outcome,
             &command,
@@ -1663,22 +2225,27 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
     }));
     let begin = match begin {
         Ok(begin) => begin,
-        Err(panic) => {
-            close_owned_begin_connection(&runtime, connection);
-            std::panic::resume_unwind(panic);
+        Err(_) => {
+            let _ = outcome.send(Err(FileControlError::Handle(
+                "BEGIN worker panicked after taking connection ownership".to_owned(),
+            )));
+            close_owned_begin_connection(runtime, connection);
+            return None;
         }
     };
     match begin {
-        LockedBeginOutcome::Accepted(identity) => Some((connection, identity)),
+        LockedBeginOutcome::Accepted(identity, authorizer_address) => {
+            Some((connection, identity, authorizer_address))
+        }
         LockedBeginOutcome::Failed(error) => {
             let _ = outcome.send(Err(error));
             #[cfg(test)]
             wait_at_begin_failure_cleanup_gate(&cancellation);
-            close_owned_begin_connection(&runtime, connection);
+            close_owned_begin_connection(runtime, connection);
             None
         }
         LockedBeginOutcome::Cancelled => {
-            close_owned_begin_connection(&runtime, connection);
+            close_owned_begin_connection(runtime, connection);
             None
         }
     }
@@ -1689,85 +2256,63 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     busy_timeout: std::time::Duration,
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<(Connection, ManualTransactionToken), FileControlError> {
-    let cleanup_owner = BlockingCleanupOwner::acquire("claw-sqlite-begin-cleanup")
-        .await
-        .map_err(|error| {
-            FileControlError::Handle(format!("acquire BEGIN cleanup owner: {error}"))
-        })?;
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            drop(connection);
-            return Err(FileControlError::Handle(format!(
-                "build BEGIN worker runtime: {error}"
-            )));
-        }
-    };
-    let runtime_slot = Arc::new(std::sync::Mutex::new(Some(runtime)));
-    let worker_runtime_slot = Arc::clone(&runtime_slot);
-    let connection_slot = Arc::new(std::sync::Mutex::new(Some(connection)));
-    let worker_connection = Arc::clone(&connection_slot);
+) -> Result<ManualTransaction<Connection>, FileControlError> {
+    let operation_deadline = std::time::Instant::now()
+        .checked_add(busy_timeout)
+        .unwrap_or(std::time::Instant::now());
+    let mut owners = BlockingCleanupOwner::acquire_many_until(
+        "claw-sqlite-begin-owner",
+        2,
+        Some(operation_deadline),
+    )
+    .await
+    .map_err(|error| {
+        FileControlError::Handle(format!("acquire BEGIN worker and cleanup owners: {error}"))
+    })?;
+    let cleanup_owner = owners.pop().expect("terminal BEGIN cleanup owner");
+    let mut worker_owner = owners.pop().expect("BEGIN worker owner");
     let database = Arc::new(std::sync::Mutex::new(None));
     let worker_database = Arc::clone(&database);
     let cancellation = Arc::new(BeginCancellation {
         local: std::sync::atomic::AtomicBool::new(false),
         external: external_cancellation,
-        deadline: std::time::Instant::now()
-            .checked_add(busy_timeout)
-            .unwrap_or(std::time::Instant::now()),
+        deadline: operation_deadline,
         #[cfg(test)]
         busy_entered: std::sync::Mutex::new(None),
         #[cfg(test)]
-        database_path: std::sync::Mutex::new(None),
+        test_key: std::sync::Mutex::new(None),
     });
     let worker_cancellation = Arc::clone(&cancellation);
     let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
     let (command_tx, command_rx) = std::sync::mpsc::channel();
-    let worker = match std::thread::Builder::new()
-        .name("claw-sqlite-begin".to_owned())
-        .spawn(move || {
-            let runtime = worker_runtime_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let runtime = runtime?;
-            run_owned_begin_worker(
-                worker_connection,
-                outcome_tx,
-                command_rx,
-                worker_database,
-                restore_busy_timeout,
-                worker_cancellation,
-                runtime,
-            )
-        }) {
-        Ok(worker) => worker,
-        Err(error) => {
-            if let Some(runtime) = runtime_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                runtime.shutdown_background();
-            }
-            let connection = connection_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(connection) = connection {
-                drop(connection);
-            }
-            return Err(FileControlError::Handle(format!(
-                "spawn BEGIN worker: {error}"
-            )));
+    let (worker_result_tx, worker_result_rx) = std::sync::mpsc::sync_channel(1);
+    worker_owner.handoff(move |runtime| {
+        let result = run_owned_begin_worker(
+            connection,
+            outcome_tx,
+            command_rx,
+            worker_database,
+            restore_busy_timeout,
+            worker_cancellation,
+            runtime,
+        );
+        if let Err(error) = worker_result_tx.send(result)
+            && let Some((mut connection, _, authorizer_address)) = error.0
+        {
+            let _ = runtime.block_on(async {
+                let mut handle = connection.sqlite().lock_handle().await?;
+                let mut authorizer_address = authorizer_address;
+                clear_transaction_authorizer(
+                    LiveInterruptPointer(handle.as_raw_handle()),
+                    &mut authorizer_address,
+                );
+                Ok::<(), sqlx::Error>(())
+            });
+            connection.close_owned(runtime);
         }
-    };
+    });
     let guard = OwnedBeginGuard {
-        worker: Some(worker),
+        worker_result: Some(worker_result_rx),
         command: Some(command_tx),
         database,
         cancellation: Arc::clone(&cancellation),
@@ -1805,9 +2350,14 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let generation = NEXT_MANUAL_TRANSACTION_GENERATION.fetch_add(1, Ordering::Relaxed);
     let generation = generation.max(1);
     let registration = ActiveTransactionRegistration::register(identity, generation)?;
-    let (connection, worker_identity) = guard.accept().await?;
+    let (connection, worker_identity, authorizer_address, cleanup_owner) =
+        guard.accept(generation).await?;
     debug_assert_eq!(worker_identity, identity);
-    Ok((connection, registration.into_token()))
+    Ok(ManualTransaction {
+        connection: Some(TransactionConnection { inner: connection }),
+        token: Some(registration.into_token(authorizer_address)),
+        cleanup_owner: Some(cleanup_owner),
+    })
 }
 
 /// Starts a manual immediate transaction on an owned, non-pool-returnable connection.
@@ -1815,7 +2365,7 @@ pub async fn begin_manual_transaction(
     connection: sqlx::SqliteConnection,
     busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<(sqlx::SqliteConnection, ManualTransactionToken), FileControlError> {
+) -> Result<ManualTransaction<sqlx::SqliteConnection>, FileControlError> {
     begin_manual_transaction_inner(
         connection,
         busy_timeout,
@@ -1829,13 +2379,7 @@ pub async fn begin_manual_transaction(
 pub async fn begin_manual_pool_transaction(
     connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
     busy_timeout: std::time::Duration,
-) -> Result<
-    (
-        sqlx::pool::PoolConnection<sqlx::Sqlite>,
-        ManualTransactionToken,
-    ),
-    FileControlError,
-> {
+) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
     begin_manual_transaction_inner(connection, busy_timeout, busy_timeout, None).await
 }
 
@@ -1845,13 +2389,7 @@ pub async fn begin_manual_pool_transaction_with_restore(
     begin_busy_timeout: std::time::Duration,
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<
-    (
-        sqlx::pool::PoolConnection<sqlx::Sqlite>,
-        ManualTransactionToken,
-    ),
-    FileControlError,
-> {
+) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
     begin_manual_transaction_inner(
         connection,
         begin_busy_timeout,
@@ -1863,7 +2401,7 @@ pub async fn begin_manual_pool_transaction_with_restore(
 
 /// Commits a transaction created by [`begin_manual_transaction`] synchronously
 /// while holding SQLx's connection lock.
-pub async fn commit_synchronously(
+async fn commit_synchronously(
     connection: &mut sqlx::SqliteConnection,
     token: &mut ManualTransactionToken,
 ) -> Result<(), FileControlError> {
@@ -1899,7 +2437,7 @@ pub async fn commit_synchronously(
             "manual transaction token generation is stale".to_owned(),
         ));
     }
-
+    let internal_permit = InternalTransactionPermit::activate(token)?;
     let mut message = std::ptr::null_mut();
     // SAFETY: The SQL string is static and NUL-terminated. SQLx's locked handle
     // prevents concurrent worker access for the duration of sqlite3_exec.
@@ -1912,11 +2450,16 @@ pub async fn commit_synchronously(
             &raw mut message,
         )
     };
+    drop(internal_permit);
     // A failed COMMIT can leave the transaction active (notably SQLITE_BUSY).
     // Invalidate the linear token only once SQLite confirms autocommit.
-    if result == libsqlite3_sys::SQLITE_OK
-        || unsafe { libsqlite3_sys::sqlite3_get_autocommit(database.as_raw_handle().as_ptr()) } != 0
-    {
+    let autocommit =
+        unsafe { libsqlite3_sys::sqlite3_get_autocommit(database.as_raw_handle().as_ptr()) } != 0;
+    if result == libsqlite3_sys::SQLITE_OK || autocommit {
+        clear_transaction_authorizer(
+            LiveInterruptPointer(database.as_raw_handle()),
+            &mut token.authorizer_address,
+        );
         unregister_manual_transaction(token);
     }
     if !message.is_null() {
@@ -1934,7 +2477,7 @@ pub async fn commit_synchronously(
 
 /// Rolls back a transaction created by [`begin_manual_transaction`] while
 /// holding SQLx's connection lock.
-pub async fn rollback_synchronously(
+async fn rollback_synchronously(
     connection: &mut sqlx::SqliteConnection,
     token: &mut ManualTransactionToken,
 ) -> Result<(), FileControlError> {
@@ -1970,7 +2513,7 @@ pub async fn rollback_synchronously(
             "manual transaction token generation is stale".to_owned(),
         ));
     }
-
+    let internal_permit = InternalTransactionPermit::activate(token)?;
     let mut message = std::ptr::null_mut();
     // SAFETY: The static SQL is NUL-terminated and the handle is exclusively locked.
     let result = unsafe {
@@ -1982,9 +2525,14 @@ pub async fn rollback_synchronously(
             &raw mut message,
         )
     };
-    if result == libsqlite3_sys::SQLITE_OK
-        || unsafe { libsqlite3_sys::sqlite3_get_autocommit(database.as_raw_handle().as_ptr()) } != 0
-    {
+    drop(internal_permit);
+    let autocommit =
+        unsafe { libsqlite3_sys::sqlite3_get_autocommit(database.as_raw_handle().as_ptr()) } != 0;
+    if result == libsqlite3_sys::SQLITE_OK || autocommit {
+        clear_transaction_authorizer(
+            LiveInterruptPointer(database.as_raw_handle()),
+            &mut token.authorizer_address,
+        );
         unregister_manual_transaction(token);
     }
     if !message.is_null() {
@@ -2215,6 +2763,11 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
         return false;
     }
     for sidecar in &context.sidecars {
+        let expected_generation = unix_sidecar_generation_record(
+            &context.database_path,
+            &sidecar.path,
+            &context.expected_identity,
+        );
         if !unix_path_matches_private_file(
             &sidecar.path,
             &sidecar.file,
@@ -2224,7 +2777,7 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
             sidecar
                 .file
                 .get_xattr("user.gta-claw.sidecar-generation"),
-            Ok(Some(generation)) if generation == context.expected_identity
+            Ok(Some(generation)) if generation == expected_generation
         ) {
             return false;
         }
@@ -2232,6 +2785,7 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
     let mut journal = context.database_path.as_os_str().to_owned();
     journal.push("-journal");
     if !unix_sidecar_matches_generation(
+        &context.database_path,
         std::path::Path::new(&journal),
         context.expected_uid,
         &context.expected_identity,
@@ -2271,6 +2825,7 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
 
     #[cfg(unix)]
     fn unix_sidecar_matches_generation(
+        database_path: &std::path::Path,
         path: &std::path::Path,
         expected_uid: u32,
         expected_identity: &[u8],
@@ -2305,9 +2860,11 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
         {
             return false;
         }
+        let expected_generation =
+            unix_sidecar_generation_record(database_path, path, expected_identity);
         matches!(
             file.get_xattr("user.gta-claw.sidecar-generation"),
-            Ok(Some(generation)) if generation == expected_identity
+            Ok(Some(generation)) if generation == expected_generation
         )
     }
     let mut contents = vec![0_u8; context.expected_identity.len()];
@@ -2345,12 +2902,14 @@ fn unix_pinned_sidecars(
             let metadata = file
                 .metadata()
                 .map_err(|error| FileControlError::Handle(error.to_string()))?;
+            let expected_generation =
+                unix_sidecar_generation_record(database_path, &path, expected_identity);
             if !metadata.file_type().is_file()
                 || !unix_file_is_service_private(&file, expected_uid, 0o600).unwrap_or(false)
                 || metadata.nlink() != 1
                 || !matches!(
                     file.get_xattr("user.gta-claw.sidecar-generation"),
-                    Ok(Some(generation)) if generation == expected_identity
+                    Ok(Some(generation)) if generation == expected_generation
                 )
             {
                 return Err(FileControlError::Handle(
@@ -3156,19 +3715,11 @@ pub fn secure_new_windows_file(file: &std::fs::File) -> Result<(), FileControlEr
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
-    use sqlx::{Connection as _, Executor as _};
+    use sqlx::{Connection as _, Executor as _, Row as _};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
-
-    struct TestCleanupLease(std::path::PathBuf);
-
-    impl Drop for TestCleanupLease {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
 
     async fn manual_transaction_connection(path: &std::path::Path) -> sqlx::SqliteConnection {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
@@ -3180,17 +3731,183 @@ mod deadline_tests {
             .expect("open manual transaction fixture")
     }
 
-    fn install_begin_gate(
-        stage: BeginTestStage,
+    async fn commit_delivery_fixture(
         path: &std::path::Path,
-    ) -> (Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicBool>) {
+        owner: &str,
+        max_connections: u32,
+    ) -> (
+        sqlx::SqlitePool,
+        ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+    ) {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_millis(500));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(options)
+            .await
+            .expect("open COMMIT delivery pool");
+        sqlx::raw_sql(
+            "CREATE TABLE claw_writer_lock(
+               singleton INTEGER PRIMARY KEY,
+               owner TEXT NOT NULL,
+               acquired_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE payload(value INTEGER NOT NULL);",
+        )
+        .execute(&pool)
+        .await
+        .expect("create COMMIT delivery fixture");
+        sqlx::query(
+            "INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, ?, 0)",
+        )
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("seed COMMIT delivery owner");
+        let connection = pool.acquire().await.expect("acquire COMMIT delivery owner");
+        let mut transaction =
+            begin_manual_pool_transaction(connection, std::time::Duration::from_secs(1))
+                .await
+                .expect("begin COMMIT delivery transaction");
+        transaction
+            .execute("INSERT INTO payload VALUES (1)")
+            .await
+            .expect("stage COMMIT delivery row");
+        (pool, transaction)
+    }
+
+    struct CommitResultTestRegistration {
+        owner: String,
+    }
+
+    impl Drop for CommitResultTestRegistration {
+        fn drop(&mut self) {
+            COMMIT_RESULT_TEST_GATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.owner);
+        }
+    }
+
+    fn install_commit_result_gate(
+        owner: &str,
+    ) -> (
+        CommitResultTestRegistration,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicBool>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(AtomicBool::new(false));
+        let replaced = COMMIT_RESULT_TEST_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                owner.to_owned(),
+                CommitResultTestGate {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        assert!(replaced.is_none(), "COMMIT result gate must be unique");
+        (
+            CommitResultTestRegistration {
+                owner: owner.to_owned(),
+            },
+            entered,
+            release,
+        )
+    }
+
+    struct BeginTestRegistration {
+        key: BeginTestKey,
+    }
+
+    impl Drop for BeginTestRegistration {
+        fn drop(&mut self) {
+            BEGIN_TEST_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.key);
+            BEGIN_BUSY_OBSERVERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.key);
+            let mut pending = PENDING_BEGIN_TEST_KEYS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.get(&self.key.connection_nonce) == Some(&self.key) {
+                pending.remove(&self.key.connection_nonce);
+            }
+        }
+    }
+
+    fn normalize_begin_test_path(path: &std::path::Path) -> String {
+        #[cfg(windows)]
+        {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    async fn register_begin_test<Connection: BeginOwnedConnection>(
+        connection: &mut Connection,
+        path: &std::path::Path,
+        operation: BeginTestOperation,
+    ) -> BeginTestRegistration {
+        let connection_nonce = {
+            let mut handle = connection
+                .sqlite()
+                .lock_handle()
+                .await
+                .expect("lock predispatch BEGIN test connection");
+            connection_lifetime_nonce(LiveInterruptPointer(handle.as_raw_handle()))
+                .expect("register predispatch BEGIN connection nonce")
+        };
+        let key = BeginTestKey {
+            path: normalize_begin_test_path(path),
+            connection_nonce,
+            operation_generation: NEXT_BEGIN_TEST_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .max(1),
+            operation,
+        };
+        let replaced = PENDING_BEGIN_TEST_KEYS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(connection_nonce, key.clone());
+        assert!(
+            replaced.is_none(),
+            "BEGIN test registration must be unique per connection"
+        );
+        BeginTestRegistration { key }
+    }
+
+    async fn install_begin_gate<Connection: BeginOwnedConnection>(
+        stage: BeginTestStage,
+        connection: &mut Connection,
+        path: &std::path::Path,
+    ) -> (
+        BeginTestRegistration,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let registration =
+            register_begin_test(connection, path, BeginTestOperation::Stage(stage)).await;
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         BEGIN_TEST_GATE
             .lock()
-            .expect("BEGIN test gate lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
-                begin_test_key(&path.to_string_lossy()),
+                registration.key.clone(),
                 BeginTestGate {
                     stage,
                     entered: Arc::clone(&entered),
@@ -3198,7 +3915,57 @@ mod deadline_tests {
                     hold_after_cancellation: true,
                 },
             );
-        (entered, release)
+        (registration, entered, release)
+    }
+
+    async fn install_begin_busy_observer<Connection: BeginOwnedConnection>(
+        connection: &mut Connection,
+        path: &std::path::Path,
+    ) -> (BeginTestRegistration, Arc<tokio::sync::Notify>) {
+        let registration =
+            register_begin_test(connection, path, BeginTestOperation::BusyObserver).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        BEGIN_BUSY_OBSERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(registration.key.clone(), Arc::clone(&entered));
+        (registration, entered)
+    }
+
+    struct BackupTestRegistration {
+        database_address: usize,
+    }
+
+    impl Drop for BackupTestRegistration {
+        fn drop(&mut self) {
+            BACKUP_TEST_CONTROLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.database_address);
+        }
+    }
+
+    async fn install_backup_control(
+        source: &mut sqlx::SqliteConnection,
+        interrupt_at_step: Option<usize>,
+    ) -> (BackupTestRegistration, Arc<AtomicUsize>) {
+        let database_address = {
+            let mut handle = source.lock_handle().await.expect("lock backup test source");
+            handle.as_raw_handle().as_ptr() as usize
+        };
+        let observed_steps = Arc::new(AtomicUsize::new(0));
+        let replaced = BACKUP_TEST_CONTROLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                database_address,
+                BackupTestControl {
+                    interrupt_at_step,
+                    observed_steps: Arc::clone(&observed_steps),
+                },
+            );
+        assert!(replaced.is_none(), "backup test control must be unique");
+        (BackupTestRegistration { database_address }, observed_steps)
     }
 
     #[tokio::test]
@@ -3213,8 +3980,9 @@ mod deadline_tests {
             .connect_with(options)
             .await
             .expect("open pre-dispatch cancellation pool");
-        let connection = pool.acquire().await.expect("acquire sole pool connection");
-        let (entered, release) = install_begin_gate(BeginTestStage::BeforeDispatch, &path);
+        let mut connection = pool.acquire().await.expect("acquire sole pool connection");
+        let (_registration, entered, release) =
+            install_begin_gate(BeginTestStage::BeforeDispatch, &mut connection, &path).await;
         let begin = tokio::spawn(async move {
             begin_manual_pool_transaction(connection, std::time::Duration::from_millis(500)).await
         });
@@ -3233,10 +4001,6 @@ mod deadline_tests {
             "cleanup owner must retain the sole pool permit before worker release"
         );
         release.store(true, Ordering::Release);
-        BEGIN_TEST_GATE
-            .lock()
-            .expect("BEGIN test gate lock poisoned")
-            .remove(&begin_test_key(&path.to_string_lossy()));
 
         let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
             .await
@@ -3245,7 +4009,8 @@ mod deadline_tests {
         let (mut replacement, mut token) =
             begin_manual_pool_transaction(replacement, std::time::Duration::from_millis(500))
                 .await
-                .expect("pre-dispatch cancellation leaves no transaction");
+                .expect("pre-dispatch cancellation leaves no transaction")
+                .into_test_parts();
         rollback_synchronously(&mut replacement, &mut token)
             .await
             .expect("replacement transaction rolls back");
@@ -3264,8 +4029,9 @@ mod deadline_tests {
                 .connect_with(options)
                 .await
                 .expect("open post-BEGIN cancellation pool");
-            let connection = pool.acquire().await.expect("acquire sole pool connection");
-            let (entered, release) = install_begin_gate(BeginTestStage::AfterBegin, &path);
+            let mut connection = pool.acquire().await.expect("acquire sole pool connection");
+            let (_registration, entered, release) =
+                install_begin_gate(BeginTestStage::AfterBegin, &mut connection, &path).await;
             let begin = tokio::spawn(async move {
                 begin_manual_pool_transaction(connection, std::time::Duration::from_millis(500))
                     .await
@@ -3285,10 +4051,6 @@ mod deadline_tests {
                 "cleanup owner must retain capacity while rollback is gated"
             );
             release.store(true, Ordering::Release);
-            BEGIN_TEST_GATE
-                .lock()
-                .expect("BEGIN test gate lock poisoned")
-                .remove(&begin_test_key(&path.to_string_lossy()));
 
             let replacement =
                 tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
@@ -3298,7 +4060,8 @@ mod deadline_tests {
             let (mut replacement, mut token) =
                 begin_manual_pool_transaction(replacement, std::time::Duration::from_millis(500))
                     .await
-                    .expect("post-BEGIN cancellation rolled back before close");
+                    .expect("post-BEGIN cancellation rolled back before close")
+                    .into_test_parts();
             rollback_synchronously(&mut replacement, &mut token)
                 .await
                 .expect("replacement transaction rolls back");
@@ -3329,7 +4092,9 @@ mod deadline_tests {
                 connection_lifetime_nonce(pointer).expect("register connection nonce"),
             )
         };
-        let (entered, release) = install_begin_gate(BeginTestStage::AfterAccept, &path);
+
+        let (_registration, entered, release) =
+            install_begin_gate(BeginTestStage::AfterAccept, &mut connection, &path).await;
         let begin = tokio::spawn(async move {
             begin_manual_pool_transaction(connection, std::time::Duration::from_millis(500)).await
         });
@@ -3362,10 +4127,6 @@ mod deadline_tests {
             "armed registration is removed when the accepting future is dropped"
         );
         release.store(true, Ordering::Release);
-        BEGIN_TEST_GATE
-            .lock()
-            .expect("BEGIN test gate lock poisoned")
-            .remove(&begin_test_key(&path.to_string_lossy()));
         tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
             .await
             .expect("terminal cleanup restores pool capacity")
@@ -3384,9 +4145,13 @@ mod deadline_tests {
             .connect_with(options)
             .await
             .expect("open BEGIN panic pool");
-        let connection = pool.acquire().await.expect("acquire BEGIN panic owner");
-        let (entered, release) =
-            install_begin_gate(BeginTestStage::PanicAfterPointerPublication, &path);
+        let mut connection = pool.acquire().await.expect("acquire BEGIN panic owner");
+        let (_registration, entered, release) = install_begin_gate(
+            BeginTestStage::PanicAfterPointerPublication,
+            &mut connection,
+            &path,
+        )
+        .await;
         let begin = tokio::spawn(async move {
             begin_manual_pool_transaction(connection, std::time::Duration::from_millis(500)).await
         });
@@ -3410,10 +4175,6 @@ mod deadline_tests {
             Ok(_) => panic!("injected BEGIN worker panic must be reported"),
         };
         assert!(matches!(error, FileControlError::Handle(message) if message.contains("panicked")));
-        BEGIN_TEST_GATE
-            .lock()
-            .expect("BEGIN test gate lock poisoned")
-            .remove(&begin_test_key(&path.to_string_lossy()));
         let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
             .await
             .expect("panicked worker releases quarantined capacity")
@@ -3421,7 +4182,8 @@ mod deadline_tests {
         let (mut replacement, mut token) =
             begin_manual_pool_transaction(replacement, std::time::Duration::from_millis(500))
                 .await
-                .expect("cleared pointer cannot affect the replacement connection");
+                .expect("cleared pointer cannot affect the replacement connection")
+                .into_test_parts();
         rollback_synchronously(&mut replacement, &mut token)
             .await
             .expect("replacement transaction rolls back");
@@ -3439,7 +4201,8 @@ mod deadline_tests {
         let (returned_locker, mut locker_token) =
             begin_manual_transaction(locker, std::time::Duration::from_millis(500), None)
                 .await
-                .expect("start locking transaction");
+                .expect("start locking transaction")
+                .into_test_parts();
         locker = returned_locker;
         let waiter = manual_transaction_connection(&path).await;
         let ticks = Arc::new(AtomicUsize::new(0));
@@ -3464,7 +4227,8 @@ mod deadline_tests {
         let (mut waiter, mut waiter_token) = begin
             .await
             .expect("waiting BEGIN task joins")
-            .expect("waiting BEGIN eventually starts");
+            .expect("waiting BEGIN eventually starts")
+            .into_test_parts();
         rollback_synchronously(&mut waiter, &mut waiter_token)
             .await
             .expect("rollback waiting transaction");
@@ -3483,17 +4247,11 @@ mod deadline_tests {
         let (returned_locker, mut locker_token) =
             begin_manual_transaction(locker, std::time::Duration::from_millis(500), None)
                 .await
-                .expect("start locking transaction");
+                .expect("start locking transaction")
+                .into_test_parts();
         locker = returned_locker;
-        let waiter = manual_transaction_connection(&path).await;
-        let busy_entered = Arc::new(tokio::sync::Notify::new());
-        BEGIN_BUSY_OBSERVERS
-            .lock()
-            .expect("BEGIN busy observers lock poisoned")
-            .insert(
-                begin_test_key(&path.to_string_lossy()),
-                Arc::clone(&busy_entered),
-            );
+        let mut waiter = manual_transaction_connection(&path).await;
+        let (_registration, busy_entered) = install_begin_busy_observer(&mut waiter, &path).await;
         let begin = tokio::spawn(async move {
             begin_manual_transaction(waiter, std::time::Duration::from_secs(5), None).await
         });
@@ -3510,10 +4268,6 @@ mod deadline_tests {
             cancelled_at.elapsed() < std::time::Duration::from_secs(1),
             "custom busy handler must observe cancellation without waiting for busy_timeout"
         );
-        BEGIN_BUSY_OBSERVERS
-            .lock()
-            .expect("BEGIN busy observers lock poisoned")
-            .remove(&begin_test_key(&path.to_string_lossy()));
         rollback_synchronously(&mut locker, &mut locker_token)
             .await
             .expect("release locking transaction");
@@ -3522,7 +4276,8 @@ mod deadline_tests {
         let (mut replacement, mut replacement_token) =
             begin_manual_transaction(replacement, std::time::Duration::from_millis(500), None)
                 .await
-                .expect("replacement connection starts a transaction");
+                .expect("replacement connection starts a transaction")
+                .into_test_parts();
         rollback_synchronously(&mut replacement, &mut replacement_token)
             .await
             .expect("replacement transaction rolls back");
@@ -3540,17 +4295,11 @@ mod deadline_tests {
         let (returned_locker, mut locker_token) =
             begin_manual_transaction(locker, std::time::Duration::from_secs(5), None)
                 .await
-                .expect("start locking transaction");
+                .expect("start locking transaction")
+                .into_test_parts();
         locker = returned_locker;
-        let waiter = manual_transaction_connection(&path).await;
-        let busy_entered = Arc::new(tokio::sync::Notify::new());
-        BEGIN_BUSY_OBSERVERS
-            .lock()
-            .expect("BEGIN busy observers lock poisoned")
-            .insert(
-                begin_test_key(&path.to_string_lossy()),
-                Arc::clone(&busy_entered),
-            );
+        let mut waiter = manual_transaction_connection(&path).await;
+        let (_registration, busy_entered) = install_begin_busy_observer(&mut waiter, &path).await;
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
         let begin = tokio::spawn(async move {
@@ -3572,10 +4321,6 @@ mod deadline_tests {
             .expect("BEGIN cancellation task joins");
         assert!(result.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        BEGIN_BUSY_OBSERVERS
-            .lock()
-            .expect("BEGIN busy observers lock poisoned")
-            .remove(&begin_test_key(&path.to_string_lossy()));
         rollback_synchronously(&mut locker, &mut locker_token)
             .await
             .expect("release external cancellation locker");
@@ -3593,7 +4338,8 @@ mod deadline_tests {
         let (returned_locker, mut locker_token) =
             begin_manual_transaction(locker, std::time::Duration::from_secs(1), None)
                 .await
-                .expect("start worker-error locking transaction");
+                .expect("start worker-error locking transaction")
+                .into_test_parts();
         locker = returned_locker;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&path)
@@ -3603,8 +4349,9 @@ mod deadline_tests {
             .connect_with(options)
             .await
             .expect("open worker-error waiter pool");
-        let waiter = pool.acquire().await.expect("acquire worker-error waiter");
-        let (entered, release) = install_begin_gate(BeginTestStage::AfterFailureOutcome, &path);
+        let mut waiter = pool.acquire().await.expect("acquire worker-error waiter");
+        let (_registration, entered, release) =
+            install_begin_gate(BeginTestStage::AfterFailureOutcome, &mut waiter, &path).await;
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
         let begin = tokio::spawn(async move {
@@ -3635,10 +4382,6 @@ mod deadline_tests {
             "cleanup owner retains capacity while terminal close is gated"
         );
         release.store(true, Ordering::Release);
-        BEGIN_TEST_GATE
-            .lock()
-            .expect("BEGIN test gate lock poisoned")
-            .remove(&begin_test_key(&path.to_string_lossy()));
         tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
             .await
             .expect("terminal cleanup restores worker-error pool capacity")
@@ -3646,54 +4389,6 @@ mod deadline_tests {
         rollback_synchronously(&mut locker, &mut locker_token)
             .await
             .expect("release worker-error locker");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn vacuum_busy_wait_obeys_deadline_and_restores_connection() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let source = directory.path().join("busy-vacuum.sqlite");
-        let destination = directory.path().join("busy-vacuum-snapshot.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&source)
-            .create_if_missing(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
-        let mut locker = sqlx::SqliteConnection::connect_with(&options)
-            .await
-            .expect("open VACUUM busy locker");
-        locker
-            .execute("CREATE TABLE value(id INTEGER)")
-            .await
-            .expect("create VACUUM busy fixture");
-        locker
-            .execute("BEGIN EXCLUSIVE")
-            .await
-            .expect("hold exclusive VACUUM lock");
-        let connection = sqlx::SqliteConnection::connect_with(&options)
-            .await
-            .expect("open deadline-bound VACUUM connection");
-        let started = std::time::Instant::now();
-        let (mut connection, outcome) = vacuum_into_with_deadline(
-            connection,
-            destination.to_string_lossy().into_owned(),
-            tokio::time::Instant::now() + std::time::Duration::from_millis(50),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("busy VACUUM returns its owned connection");
-        assert_eq!(outcome, VacuumDeadlineOutcome::TimedOut);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert!(!destination.exists());
-        locker
-            .execute("ROLLBACK")
-            .await
-            .expect("release exclusive VACUUM lock");
-        connection
-            .execute("SELECT 1")
-            .await
-            .expect("VACUUM busy handler and progress handler were restored");
     }
 
     #[tokio::test]
@@ -3715,7 +4410,8 @@ mod deadline_tests {
         let (mut writer, mut token) =
             begin_manual_transaction(writer, std::time::Duration::from_millis(20), None)
                 .await
-                .expect("begin busy commit writer");
+                .expect("begin busy commit writer")
+                .into_test_parts();
         writer
             .execute("INSERT INTO value VALUES (1)")
             .await
@@ -3748,6 +4444,124 @@ mod deadline_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_commit_result_delivery_cleans_claim_and_closes_connection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("cancelled-commit-delivery.sqlite");
+        let owner = "cancelled-result-owner";
+        let (pool, transaction) = commit_delivery_fixture(&path, owner, 1).await;
+        let (_registration, entered, release) = install_commit_result_gate(owner);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let commit = tokio::spawn(transaction.commit_with_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            cancelled,
+            std::time::Duration::from_millis(500),
+            Some(owner.to_owned()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("COMMIT reaches result-delivery gate");
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("COMMIT result receiver is cancelled")
+                .is_cancelled()
+        );
+        release.store(true, Ordering::Release);
+        let mut replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                .await
+                .expect("undelivered COMMIT closes its connection")
+                .expect("replacement connection opens");
+        let claims =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM claw_writer_lock WHERE owner = ?")
+                .bind(owner)
+                .fetch_one(&mut *replacement)
+                .await
+                .expect("verify cancelled result claim cleanup");
+        assert_eq!(claims, 0);
+    }
+
+    #[tokio::test]
+    async fn late_commit_cannot_deliver_connection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("late-commit-delivery.sqlite");
+        let owner = "late-result-owner";
+        let (pool, transaction) = commit_delivery_fixture(&path, owner, 1).await;
+        let (_registration, entered, release) = install_commit_result_gate(owner);
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let commit = tokio::spawn(transaction.commit_with_deadline(
+            work_deadline,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_millis(500),
+            Some(owner.to_owned()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("late COMMIT reaches result gate");
+        tokio::time::sleep_until(tokio::time::Instant::from_std(work_deadline)).await;
+        release.store(true, Ordering::Release);
+        assert!(commit.await.expect("late COMMIT task joins").is_err());
+        let mut replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                .await
+                .expect("late COMMIT closes its connection")
+                .expect("replacement connection opens");
+        let claims =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM claw_writer_lock WHERE owner = ?")
+                .bind(owner)
+                .fetch_one(&mut *replacement)
+                .await
+                .expect("verify late COMMIT claim cleanup");
+        assert_eq!(claims, 0);
+    }
+
+    #[tokio::test]
+    async fn late_claim_delete_cutoff_quarantines_connection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("late-delete-cutoff.sqlite");
+        let owner = "delete-cutoff-owner";
+        let (pool, transaction) = commit_delivery_fixture(&path, owner, 2).await;
+        let (_registration, entered, release) = install_commit_result_gate(owner);
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let commit = tokio::spawn(transaction.commit_with_deadline(
+            work_deadline,
+            cleanup_deadline,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_millis(500),
+            Some(owner.to_owned()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("cutoff COMMIT reaches result gate");
+        tokio::time::sleep_until(tokio::time::Instant::from_std(cleanup_deadline)).await;
+        release.store(true, Ordering::Release);
+        let error = commit
+            .await
+            .expect("cutoff COMMIT task joins")
+            .expect_err("expired DELETE cleanup cannot deliver a connection");
+        assert!(
+            error.to_string().contains("cutoff"),
+            "unexpected cutoff error: {error}"
+        );
+        let mut replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                .await
+                .expect("cutoff path closes its connection")
+                .expect("replacement connection opens");
+        let claims =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM claw_writer_lock WHERE owner = ?")
+                .bind(owner)
+                .fetch_one(&mut *replacement)
+                .await
+                .expect("inspect quarantined claim");
+        assert_eq!(claims, 1);
+    }
+
+    #[tokio::test]
     async fn pool_owned_begin_retains_actual_connection_capacity() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("pool-capacity.sqlite");
@@ -3760,7 +4574,7 @@ mod deadline_tests {
             .await
             .expect("open capacity pool");
         let connection = pool.acquire().await.expect("acquire capacity owner");
-        let (mut connection, mut token) =
+        let transaction =
             begin_manual_pool_transaction(connection, std::time::Duration::from_millis(100))
                 .await
                 .expect("begin pool-owned transaction");
@@ -3770,7 +4584,8 @@ mod deadline_tests {
                 .is_err(),
             "manual transaction must retain SQLx's sole pool permit"
         );
-        rollback_synchronously(&mut connection, &mut token)
+        let connection = transaction
+            .rollback()
             .await
             .expect("rollback pool-owned transaction");
         drop(connection);
@@ -3781,6 +4596,250 @@ mod deadline_tests {
     }
 
     #[tokio::test]
+    async fn dropping_active_owner_rolls_back_before_pool_reuse() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("drop-owner.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open drop-owner pool");
+        let mut connection = pool.acquire().await.expect("acquire drop-owner connection");
+        connection
+            .execute("CREATE TABLE value(id INTEGER)")
+            .await
+            .expect("create drop-owner fixture");
+        let mut transaction =
+            begin_manual_pool_transaction(connection, std::time::Duration::from_secs(1))
+                .await
+                .expect("begin drop-owner transaction");
+        transaction
+            .execute("INSERT INTO value VALUES (1)")
+            .await
+            .expect("stage drop-owner row");
+        drop(transaction);
+        let mut replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                .await
+                .expect("durable rollback restores pool capacity")
+                .expect("replacement connection");
+        assert!(
+            is_autocommit(&mut replacement)
+                .await
+                .expect("read autocommit")
+        );
+        let count = replacement
+            .fetch_one("SELECT COUNT(*) FROM value")
+            .await
+            .expect("count rolled-back rows")
+            .get::<i64, _>(0);
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn transaction_control_sql_cannot_escape_owner() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("transaction-authorizer.sqlite");
+        let mut connection = manual_transaction_connection(&path).await;
+        connection
+            .execute("CREATE TABLE value(id INTEGER)")
+            .await
+            .expect("create authorizer fixture");
+        let mut transaction =
+            begin_manual_transaction(connection, std::time::Duration::from_secs(1), None)
+                .await
+                .expect("begin authorizer transaction");
+        for statement in [
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "END",
+            "SAVEPOINT nested",
+            "RELEASE nested",
+            "ROLLBACK TO nested",
+        ] {
+            let error = transaction
+                .execute(statement)
+                .await
+                .expect_err("transaction control must be denied by the native authorizer");
+            assert!(
+                matches!(
+                    error,
+                    sqlx::Error::Database(ref database)
+                        if database.code().as_deref() == Some("23")
+                ),
+                "{statement} returned {error:?} instead of SQLITE_AUTH"
+            );
+        }
+        transaction
+            .execute("INSERT INTO value VALUES (1)")
+            .await
+            .expect("transaction remains active after denied COMMIT");
+        let mut connection = transaction
+            .rollback()
+            .await
+            .expect("owned rollback remains authoritative");
+        let count = connection
+            .fetch_one("SELECT COUNT(*) FROM value")
+            .await
+            .expect("count authorizer rows")
+            .get::<i64, _>(0);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn source_contains_no_filesystem_sqlite_backup_output() {
+        let helper = include_str!("lib.rs");
+        let state = include_str!("../../claw-state/src/store.rs");
+        let forbidden = [
+            ["sqlite3_db_", "filename"].concat(),
+            ["VACUUM", " INTO"].concat(),
+            [".filename(", "destination)"].concat(),
+            [".filename(&", "temporary)"].concat(),
+            [".gta-claw-", "restore-"].concat(),
+            ["backup-", "stage"].concat(),
+        ];
+        for needle in forbidden {
+            assert!(
+                !helper.contains(&needle) && !state.contains(&needle),
+                "forbidden SQLite output-path source pattern remains"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_interrupts_at_first_middle_and_final_batch() {
+        let mut source = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open backup source");
+        sqlx::raw_sql(
+            "CREATE TABLE payload(value BLOB);
+             WITH RECURSIVE n(value) AS (
+               VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < 400
+             )
+             INSERT INTO payload SELECT randomblob(4096) FROM n;",
+        )
+        .execute(&mut source)
+        .await
+        .expect("seed multi-batch backup source");
+
+        let mut baseline_destination = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open baseline backup destination");
+        let (_baseline_registration, baseline_steps) =
+            install_backup_control(&mut source, None).await;
+        backup_main_database(
+            &mut source,
+            &mut baseline_destination,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            &AtomicBool::new(false),
+            10_000,
+        )
+        .await
+        .expect("complete baseline incremental backup");
+        let total_steps = baseline_steps.load(Ordering::Acquire);
+        assert!(
+            total_steps >= 3,
+            "fixture must span first, middle, and final batches"
+        );
+        drop(_baseline_registration);
+
+        for target in [0, total_steps / 2, total_steps - 1] {
+            let mut destination = sqlx::SqliteConnection::connect("sqlite::memory:")
+                .await
+                .expect("open interrupted backup destination");
+            let (_registration, observed) = install_backup_control(&mut source, Some(target)).await;
+            assert!(matches!(
+                backup_main_database(
+                    &mut source,
+                    &mut destination,
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    &AtomicBool::new(false),
+                    10_000,
+                )
+                .await,
+                Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
+            ));
+            assert_eq!(observed.load(Ordering::Acquire), target + 1);
+            let rows = source
+                .fetch_one("SELECT COUNT(*) FROM payload")
+                .await
+                .expect("interrupted backup leaves source usable")
+                .get::<i64, _>(0);
+            assert_eq!(rows, 400);
+        }
+    }
+
+    #[tokio::test]
+    async fn deserialize_transfer_keeps_ffi_ownership_one_way() {
+        let mut source = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open deserialize source");
+        source
+            .execute("CREATE TABLE payload(value INTEGER)")
+            .await
+            .expect("create deserialize source schema");
+        let bytes = serialize_main_database(&mut source, 1024 * 1024)
+            .await
+            .expect("serialize deserialize source");
+
+        let mut destination = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open deserialize destination");
+        deserialize_readonly(&mut destination, &bytes)
+            .await
+            .expect("transfer authenticated bytes to SQLite");
+        drop(bytes);
+        assert_eq!(
+            destination
+                .fetch_one("SELECT COUNT(*) FROM payload")
+                .await
+                .expect("query deserialized image")
+                .get::<i64, _>(0),
+            0
+        );
+        destination
+            .close()
+            .await
+            .expect("SQLite releases deserialized ownership on close");
+    }
+
+    #[tokio::test]
+    async fn serialization_and_backup_enforce_batch_size_caps() {
+        let mut source = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open size-cap source");
+        sqlx::raw_sql(
+            "CREATE TABLE payload(value BLOB);
+             INSERT INTO payload VALUES (randomblob(8192));",
+        )
+        .execute(&mut source)
+        .await
+        .expect("seed size-cap source");
+        assert!(matches!(
+            serialize_main_database(&mut source, 1).await,
+            Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_TOOBIG))
+        ));
+        let mut destination = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open size-cap destination");
+        assert!(matches!(
+            backup_main_database(
+                &mut source,
+                &mut destination,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                &AtomicBool::new(false),
+                1,
+            )
+            .await,
+            Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_TOOBIG))
+        ));
+    }
+
+    #[tokio::test]
     async fn stale_manual_token_cannot_control_later_same_handle_transaction() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("token-generation.sqlite");
@@ -3788,18 +4847,21 @@ mod deadline_tests {
         let (mut connection, mut first) =
             begin_manual_transaction(connection, std::time::Duration::from_millis(100), None)
                 .await
-                .expect("begin first generation");
+                .expect("begin first generation")
+                .into_test_parts();
         rollback_synchronously(&mut connection, &mut first)
             .await
             .expect("finish first generation");
         let (mut connection, mut current) =
             begin_manual_transaction(connection, std::time::Duration::from_millis(100), None)
                 .await
-                .expect("begin current generation");
+                .expect("begin current generation")
+                .into_test_parts();
         let mut stale = ManualTransactionToken {
             database_address: current.database_address,
             connection_nonce: current.connection_nonce,
             generation: current.generation.wrapping_sub(1),
+            authorizer_address: current.authorizer_address,
             active: true,
         };
         assert!(matches!(
@@ -3810,6 +4872,7 @@ mod deadline_tests {
             database_address: current.database_address,
             connection_nonce: current.connection_nonce.wrapping_add(1),
             generation: current.generation,
+            authorizer_address: current.authorizer_address,
             active: true,
         };
         assert!(matches!(
@@ -3821,373 +4884,6 @@ mod deadline_tests {
             .expect("stale token did not affect current transaction");
     }
 
-    #[tokio::test]
-    async fn queued_vacuum_is_repeatedly_interrupted_and_joined_after_expiry() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let source = directory.path().join("source.sqlite");
-        let destination = directory.path().join("snapshot.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&source)
-            .create_if_missing(true);
-        let mut connection = sqlx::SqliteConnection::connect_with(&options)
-            .await
-            .expect("open tiny SQLite source");
-        connection
-            .execute("CREATE TABLE tiny(value INTEGER)")
-            .await
-            .expect("create tiny SQLite schema");
-
-        let expired = Arc::new(AtomicBool::new(false));
-        let progress_hits = Arc::new(AtomicUsize::new(0));
-
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let interrupted = Arc::new(tokio::sync::Notify::new());
-        let interrupts = Arc::new(AtomicUsize::new(0));
-        let destination_text = destination
-            .to_str()
-            .expect("snapshot path is Unicode")
-            .to_owned();
-        VACUUM_TEST_GATE
-            .lock()
-            .expect("vacuum test gate lock poisoned")
-            .insert(
-                destination_text.clone(),
-                VacuumTestGate {
-                    entered: Arc::clone(&entered),
-                    release: Arc::clone(&release),
-                    interrupted: Arc::clone(&interrupted),
-                    interrupts: Arc::clone(&interrupts),
-                    progress_hits: Arc::clone(&progress_hits),
-                    panic_after_release: false,
-                },
-            );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
-        let gate_key = destination_text.clone();
-        let task_expired = Arc::clone(&expired);
-        let task = tokio::spawn(async move {
-            vacuum_into_with_deadline(
-                connection,
-                destination_text,
-                deadline,
-                task_expired,
-                Arc::new(AtomicBool::new(false)),
-                None,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
-            .await
-            .expect("VACUUM future reaches queued gate");
-        tokio::time::timeout(std::time::Duration::from_secs(1), interrupted.notified())
-            .await
-            .expect("deadline loop issues its first queued interrupt");
-        assert!(
-            interrupts.load(Ordering::Acquire) > 0,
-            "the first queued interrupt must occur before execution is released"
-        );
-        assert!(!destination.exists());
-        release.notify_one();
-        let (mut connection, outcome) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), task)
-                .await
-                .expect("interrupted VACUUM joins")
-                .expect("VACUUM task joins")
-                .expect("VACUUM returns owned connection");
-        VACUUM_TEST_GATE
-            .lock()
-            .expect("vacuum test gate lock poisoned")
-            .remove(&gate_key);
-        assert_eq!(outcome, VacuumDeadlineOutcome::TimedOut);
-        assert!(
-            progress_hits.load(Ordering::Acquire) > 0,
-            "expired progress callback must reach the worker after the queued no-op interrupt"
-        );
-        assert!(!destination.exists());
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(!destination.exists());
-        connection
-            .execute("SELECT 1")
-            .await
-            .expect("VACUUM helper clears its own progress handler");
-        connection.close().await.expect("close tiny source");
-    }
-
-    #[tokio::test]
-    async fn cancelled_queued_vacuum_does_not_block_runtime_and_leaves_no_output() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let source = directory.path().join("cancel-source.sqlite");
-        let destination = directory.path().join("cancel-snapshot.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&source)
-            .create_if_missing(true);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
-            .await
-            .expect("open cancellation pool");
-        let mut connection = pool.acquire().await.expect("acquire cancellation source");
-        connection
-            .execute("CREATE TABLE tiny(value INTEGER)")
-            .await
-            .expect("create cancellation schema");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let interrupted = Arc::new(tokio::sync::Notify::new());
-        let interrupts = Arc::new(AtomicUsize::new(0));
-        let progress_hits = Arc::new(AtomicUsize::new(0));
-        let destination_text = destination.to_string_lossy().into_owned();
-        VACUUM_TEST_GATE
-            .lock()
-            .expect("vacuum test gate lock poisoned")
-            .insert(
-                destination_text.clone(),
-                VacuumTestGate {
-                    entered: Arc::clone(&entered),
-                    release: Arc::clone(&release),
-                    interrupted,
-                    interrupts,
-                    progress_hits,
-                    panic_after_release: false,
-                },
-            );
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let task_cancellation = Arc::clone(&cancellation);
-        let gate_key = destination_text.clone();
-        let task = tokio::spawn(async move {
-            vacuum_pool_into_with_deadline(
-                connection,
-                destination_text,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-                Arc::new(AtomicBool::new(false)),
-                task_cancellation,
-                None,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
-            .await
-            .expect("VACUUM reaches queued cancellation gate");
-        task.abort();
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("cancelled VACUUM leaves the runtime responsive");
-        assert!(joined.expect_err("VACUUM task is cancelled").is_cancelled());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire())
-                .await
-                .is_err(),
-            "cleanup owner must retain VACUUM pool capacity before worker release"
-        );
-        assert!(!destination.exists());
-        release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while Arc::strong_count(&cancellation) > 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached VACUUM worker reaches terminal cleanup");
-        VACUUM_TEST_GATE
-            .lock()
-            .expect("vacuum test gate lock poisoned")
-            .remove(&gate_key);
-        assert!(cancellation.load(Ordering::Acquire));
-        assert!(!destination.exists());
-        let mut replacement =
-            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
-                .await
-                .expect("VACUUM cleanup restores pool capacity")
-                .expect("reacquire source after cancelled VACUUM");
-        replacement
-            .execute("SELECT 1")
-            .await
-            .expect("cancelled VACUUM leaves no poisoned handler");
-    }
-
-    #[tokio::test]
-    async fn vacuum_panic_after_pointer_publication_quarantines_connection() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let source = directory.path().join("panic-vacuum-source.sqlite");
-        let destination = directory.path().join("panic-vacuum-destination.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&source)
-            .create_if_missing(true);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open VACUUM panic pool");
-        let mut connection = pool.acquire().await.expect("acquire VACUUM panic owner");
-        connection
-            .execute("CREATE TABLE tiny(value INTEGER)")
-            .await
-            .expect("create VACUUM panic fixture");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let destination_text = destination.to_string_lossy().into_owned();
-        VACUUM_TEST_GATE
-            .lock()
-            .expect("VACUUM test gate lock poisoned")
-            .insert(
-                destination_text.clone(),
-                VacuumTestGate {
-                    entered: Arc::clone(&entered),
-                    release: Arc::clone(&release),
-                    interrupted: Arc::new(tokio::sync::Notify::new()),
-                    interrupts: Arc::new(AtomicUsize::new(0)),
-                    progress_hits: Arc::new(AtomicUsize::new(0)),
-                    panic_after_release: true,
-                },
-            );
-        let task_destination = destination_text.clone();
-        let vacuum = tokio::spawn(async move {
-            vacuum_pool_into_with_deadline(
-                connection,
-                task_destination,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-                None,
-                std::time::Duration::from_millis(500),
-            )
-            .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
-            .await
-            .expect("VACUUM publishes its interrupt pointer");
-        let heartbeat = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        tokio::time::timeout(std::time::Duration::from_millis(100), heartbeat)
-            .await
-            .expect("VACUUM pointer barrier does not block the runtime")
-            .expect("heartbeat joins");
-        release.notify_one();
-        let error = tokio::time::timeout(std::time::Duration::from_secs(1), vacuum)
-            .await
-            .expect("panicked VACUUM returns promptly")
-            .expect("VACUUM task itself joins")
-            .expect_err("injected VACUUM worker panic is reported");
-        assert!(matches!(error, sqlx::Error::Protocol(message) if message.contains("panicked")));
-        VACUUM_TEST_GATE
-            .lock()
-            .expect("VACUUM test gate lock poisoned")
-            .remove(&destination_text);
-        assert!(!destination.exists());
-        let mut replacement =
-            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
-                .await
-                .expect("panicked VACUUM releases quarantined capacity")
-                .expect("replacement pool connection");
-        replacement
-            .execute("SELECT 1")
-            .await
-            .expect("cleared VACUUM pointer cannot affect replacement connection");
-    }
-
-    #[tokio::test]
-    async fn completed_pooled_workers_are_closed_by_owned_cleanup_runtime() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("completed-worker-cleanup.sqlite");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true);
-        let begin_pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options.clone())
-            .await
-            .expect("open completed BEGIN worker pool");
-        let mut begin_connection = begin_pool
-            .acquire()
-            .await
-            .expect("acquire completed BEGIN connection");
-        begin_connection
-            .execute("BEGIN IMMEDIATE")
-            .await
-            .expect("start raw transaction deposited by completed worker");
-        let begin_worker = std::thread::spawn(move || {
-            Some((
-                begin_connection,
-                ManualTransactionIdentity {
-                    database_address: 1,
-                    connection_nonce: 1,
-                },
-            ))
-        });
-        while !begin_worker.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        let begin_guard = OwnedBeginGuard {
-            worker: Some(begin_worker),
-            command: None,
-            database: Arc::new(std::sync::Mutex::new(None)),
-            cancellation: Arc::new(BeginCancellation {
-                local: AtomicBool::new(false),
-                external: None,
-                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-                busy_entered: std::sync::Mutex::new(None),
-                database_path: std::sync::Mutex::new(None),
-            }),
-            cleanup_owner: Some(
-                BlockingCleanupOwner::acquire("completed-begin-cleanup")
-                    .await
-                    .expect("acquire completed BEGIN cleanup owner"),
-            ),
-        };
-        drop(begin_guard);
-        tokio::time::timeout(std::time::Duration::from_secs(1), begin_pool.acquire())
-            .await
-            .expect("cleanup runtime restores BEGIN pool capacity")
-            .expect("replacement BEGIN pool connection");
-
-        let vacuum_pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open completed VACUUM worker pool");
-        let vacuum_connection = vacuum_pool
-            .acquire()
-            .await
-            .expect("acquire completed VACUUM connection");
-        let destination = directory.path().join("completed-vacuum-staging.sqlite");
-        std::fs::write(&destination, b"owned").expect("create owned staging artifact");
-        let cleanup = TestCleanupLease(destination.clone());
-        let vacuum_worker = std::thread::spawn(move || {
-            Some(Ok((
-                vacuum_connection,
-                VacuumDeadlineOutcome::Completed,
-                cleanup,
-            )))
-        });
-        while !vacuum_worker.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        let vacuum_guard = OwnedVacuumGuard {
-            worker: Some(vacuum_worker),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            pointer: Arc::new(std::sync::Mutex::new(None)),
-            cleanup_owner: Some(
-                BlockingCleanupOwner::acquire("completed-vacuum-cleanup")
-                    .await
-                    .expect("acquire completed VACUUM cleanup owner"),
-            ),
-            armed: true,
-        };
-        drop(vacuum_guard);
-        tokio::time::timeout(std::time::Duration::from_secs(1), vacuum_pool.acquire())
-            .await
-            .expect("cleanup runtime restores VACUUM pool capacity")
-            .expect("replacement VACUUM pool connection");
-        let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        while destination.exists() && tokio::time::Instant::now() < cleanup_deadline {
-            tokio::task::yield_now().await;
-        }
-        assert!(!destination.exists());
-    }
-
     #[test]
     fn blocking_cleanup_handoff_is_guaranteed_without_a_tokio_runtime() {
         assert!(
@@ -4195,80 +4891,93 @@ mod deadline_tests {
             "invalid cleanup capability must fail before a SQLite worker starts"
         );
 
-        let begin_release = Arc::new(AtomicBool::new(false));
-        let begin_done = Arc::new(AtomicBool::new(false));
-        let worker_release = Arc::clone(&begin_release);
-        let worker_done = Arc::clone(&begin_done);
-        let begin_worker = std::thread::spawn(move || {
+        let release = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let worker_entered = Arc::clone(&entered);
+        let worker_done = Arc::clone(&done);
+        let mut owner = BlockingCleanupOwner::acquire_without_runtime("handoff-outside-runtime")
+            .expect("acquire cleanup capability");
+        let started = std::time::Instant::now();
+        owner.handoff(move |_| {
+            worker_entered.store(true, Ordering::Release);
             while !worker_release.load(Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::yield_now();
             }
             worker_done.store(true, Ordering::Release);
-            None
         });
-        let begin_guard = OwnedBeginGuard::<sqlx::SqliteConnection> {
-            worker: Some(begin_worker),
-            command: None,
-            database: Arc::new(std::sync::Mutex::new(None)),
-            cancellation: Arc::new(BeginCancellation {
-                local: AtomicBool::new(false),
-                external: None,
-                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-                busy_entered: std::sync::Mutex::new(None),
-                database_path: std::sync::Mutex::new(None),
-            }),
-            cleanup_owner: Some(
-                BlockingCleanupOwner::acquire_without_runtime("begin-drop-outside-runtime")
-                    .expect("acquire BEGIN cleanup capability"),
-            ),
-        };
-        let started = std::time::Instant::now();
-        drop(begin_guard);
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        assert!(!begin_done.load(Ordering::Acquire));
-        begin_release.store(true, Ordering::Release);
-        while !begin_done.load(Ordering::Acquire) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        while !entered.load(Ordering::Acquire) {
+            std::thread::yield_now();
         }
+        assert!(!done.load(Ordering::Acquire));
+        release.store(true, Ordering::Release);
+        while !done.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
 
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let destination = directory.path().join("outside-runtime.sqlite");
-        std::fs::write(&destination, b"staging").expect("create VACUUM staging artifact");
-        let vacuum_release = Arc::new(AtomicBool::new(false));
-        let vacuum_done = Arc::new(AtomicBool::new(false));
-        let worker_release = Arc::clone(&vacuum_release);
-        let worker_done = Arc::clone(&vacuum_done);
-        let cleanup = TestCleanupLease(destination.clone());
-        let vacuum_worker = std::thread::spawn(move || {
-            while !worker_release.load(Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            worker_done.store(true, Ordering::Release);
-            drop(cleanup);
-            None
-        });
-        let vacuum_guard = OwnedVacuumGuard::<sqlx::SqliteConnection, TestCleanupLease> {
-            worker: Some(vacuum_worker),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            pointer: Arc::new(std::sync::Mutex::new(None)),
-            cleanup_owner: Some(
-                BlockingCleanupOwner::acquire_without_runtime("vacuum-drop-outside-runtime")
-                    .expect("acquire VACUUM cleanup capability"),
-            ),
-            armed: true,
+    #[tokio::test]
+    async fn concurrent_cleanup_saturation_reserves_atomically() {
+        let owners = BlockingCleanupOwner::acquire_set(
+            "cleanup-saturation-fixture",
+            MAX_CLEANUP_JOBS,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("reserve the complete cleanup capacity atomically");
+        assert_eq!(
+            ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire),
+            MAX_CLEANUP_JOBS
+        );
+        let error = match BlockingCleanupOwner::acquire_set(
+            "cleanup-saturation-contender",
+            2,
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("contender cannot partially reserve a saturated owner set"),
         };
-        let started = std::time::Instant::now();
-        drop(vacuum_guard);
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        assert!(!vacuum_done.load(Ordering::Acquire));
-        assert!(destination.exists());
-        vacuum_release.store(true, Ordering::Release);
-        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while destination.exists() && std::time::Instant::now() < cleanup_deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(vacuum_done.load(Ordering::Acquire));
-        assert!(!destination.exists());
+        assert!(error.contains("timed out"));
+        assert_eq!(
+            ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire),
+            MAX_CLEANUP_JOBS
+        );
+        drop(owners);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn unix_sidecar_generation_record_binds_path_and_store_generation() {
+        let database = std::path::Path::new("/private/state.sqlite");
+        let wal = std::path::Path::new("/private/state.sqlite-wal");
+        let shm = std::path::Path::new("/private/state.sqlite-shm");
+        let first = unix_sidecar_generation_record(database, wal, b"generation-one");
+        assert_eq!(first.len(), 52);
+        assert_eq!(&first[..20], b"GTA-CLAW-SIDECAR-U1\0");
+        assert_ne!(
+            first,
+            unix_sidecar_generation_record(database, shm, b"generation-one")
+        );
+        assert_ne!(
+            first,
+            unix_sidecar_generation_record(database, wal, b"generation-two")
+        );
+        assert_ne!(
+            first,
+            unix_sidecar_generation_record(
+                std::path::Path::new("/private/other.sqlite"),
+                wal,
+                b"generation-one",
+            )
+        );
     }
 }
 

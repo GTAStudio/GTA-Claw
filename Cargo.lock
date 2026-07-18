@@ -162,6 +162,7 @@ dependencies = [
 name = "claw-sqlite-file-control"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
  "libsqlite3-sys",
  "rustix",
  "sha2 0.11.0",
