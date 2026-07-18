@@ -15,6 +15,8 @@ pub enum FileControlError {
     Handle(String),
     /// SQLite rejected the file-control request.
     SQLite(i32),
+    /// COMMIT became durable after its delivery deadline and was quarantined.
+    CommittedAfterDeadline(Option<String>),
 }
 
 /// Builds the fixed-format record stored in Windows sidecar generation ADS.
@@ -56,6 +58,7 @@ impl FileControlError {
         match self {
             Self::Handle(_) => None,
             Self::SQLite(code) => Some(*code),
+            Self::CommittedAfterDeadline(_) => None,
         }
     }
 }
@@ -70,6 +73,13 @@ impl Display for FileControlError {
                     "SQLite file-control operation failed with code {code}"
                 )
             }
+            Self::CommittedAfterDeadline(cleanup) => {
+                write!(formatter, "SQLite COMMIT became durable after its deadline")?;
+                if let Some(cleanup) = cleanup {
+                    write!(formatter, "; late writer-claim cleanup failed: {cleanup}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -80,6 +90,39 @@ impl Error for FileControlError {}
 struct LiveInterruptPointer(NonNull<libsqlite3_sys::sqlite3>);
 
 struct LiveBackupPointer(Option<NonNull<libsqlite3_sys::sqlite3_backup>>);
+
+struct BackupBusyState {
+    deadline: std::time::Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+unsafe extern "C" fn backup_busy_handler(
+    context: *mut std::ffi::c_void,
+    _prior_calls: std::ffi::c_int,
+) -> std::ffi::c_int {
+    // SAFETY: the backup function retains this context until both handlers are restored.
+    let state = unsafe { &*context.cast::<BackupBusyState>() };
+    if state.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= state.deadline {
+        0
+    } else {
+        std::thread::yield_now();
+        1
+    }
+}
+
+struct BackupBusyRegistration {
+    database: LiveInterruptPointer,
+    restore_milliseconds: i32,
+}
+
+impl Drop for BackupBusyRegistration {
+    fn drop(&mut self) {
+        // SAFETY: both connections remain exclusively borrowed until registration drop.
+        unsafe {
+            libsqlite3_sys::sqlite3_busy_timeout(self.database.as_ptr(), self.restore_milliseconds);
+        }
+    }
+}
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -558,13 +601,24 @@ pub async fn deserialize_readonly(
     Ok(())
 }
 
-/// Copies the complete main database between two exclusively borrowed SQLite connections.
-pub async fn backup_main_database(
+/// Absolute deadline, cancellation, size, and handler restoration for logical backup.
+pub struct BackupExecutionContext {
+    /// Absolute operation deadline.
+    pub deadline: std::time::Instant,
+    /// Shared operation cancellation state.
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Maximum permitted SQLite page count.
+    pub max_pages: std::ffi::c_int,
+    /// Busy timeout restored on the source connection.
+    pub source_busy_timeout: std::time::Duration,
+    /// Busy timeout restored on the destination connection.
+    pub destination_busy_timeout: std::time::Duration,
+}
+
+async fn backup_main_database(
     source: &mut sqlx::SqliteConnection,
     destination: &mut sqlx::SqliteConnection,
-    deadline: std::time::Instant,
-    cancelled: &std::sync::atomic::AtomicBool,
-    max_pages: std::ffi::c_int,
+    context: &BackupExecutionContext,
 ) -> Result<(), FileControlError> {
     let mut source_handle = source
         .lock_handle()
@@ -574,6 +628,46 @@ pub async fn backup_main_database(
         .lock_handle()
         .await
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let busy_state = BackupBusyState {
+        deadline: context.deadline,
+        cancelled: Arc::clone(&context.cancelled),
+    };
+    let source_database = LiveInterruptPointer(source_handle.as_raw_handle());
+    let destination_database = LiveInterruptPointer(destination_handle.as_raw_handle());
+    let source_restore_milliseconds =
+        i32::try_from(context.source_busy_timeout.as_millis()).unwrap_or(i32::MAX);
+    let destination_restore_milliseconds =
+        i32::try_from(context.destination_busy_timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `busy_state` and both exclusive connection borrows outlive the registrations.
+    let source_busy = unsafe {
+        libsqlite3_sys::sqlite3_busy_handler(
+            source_database.as_ptr(),
+            Some(backup_busy_handler),
+            std::ptr::from_ref(&busy_state).cast_mut().cast(),
+        )
+    };
+    if source_busy != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(source_busy));
+    }
+    let _source_busy_registration = BackupBusyRegistration {
+        database: source_database,
+        restore_milliseconds: source_restore_milliseconds,
+    };
+    // SAFETY: same lifetime argument as the source registration.
+    let destination_busy = unsafe {
+        libsqlite3_sys::sqlite3_busy_handler(
+            destination_database.as_ptr(),
+            Some(backup_busy_handler),
+            std::ptr::from_ref(&busy_state).cast_mut().cast(),
+        )
+    };
+    if destination_busy != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(destination_busy));
+    }
+    let _destination_busy_registration = BackupBusyRegistration {
+        database: destination_database,
+        restore_milliseconds: destination_restore_milliseconds,
+    };
     // SAFETY: both SQLx handles are exclusively locked for the backup lifetime.
     let backup = LiveBackupPointer(NonNull::new(unsafe {
         libsqlite3_sys::sqlite3_backup_init(
@@ -609,16 +703,22 @@ pub async fn backup_main_database(
                 break libsqlite3_sys::SQLITE_INTERRUPT;
             }
         }
-        if cancelled.load(std::sync::atomic::Ordering::Acquire)
-            || std::time::Instant::now() >= deadline
+        if context.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= context.deadline
         {
             break libsqlite3_sys::SQLITE_INTERRUPT;
         }
         // SAFETY: backup is live until sqlite3_backup_finish below.
         let step = unsafe { libsqlite3_sys::sqlite3_backup_step(backup.as_ptr(), 128) };
         // SAFETY: backup remains live during the bounded step loop.
-        if unsafe { libsqlite3_sys::sqlite3_backup_pagecount(backup.as_ptr()) } > max_pages {
+        if unsafe { libsqlite3_sys::sqlite3_backup_pagecount(backup.as_ptr()) } > context.max_pages
+        {
             break libsqlite3_sys::SQLITE_TOOBIG;
+        }
+        if context.cancelled.load(Ordering::Acquire)
+            || std::time::Instant::now() >= context.deadline
+        {
+            break libsqlite3_sys::SQLITE_INTERRUPT;
         }
         match step {
             libsqlite3_sys::SQLITE_OK
@@ -645,23 +745,20 @@ pub async fn backup_owned_main_database<Source, Destination, Reservation>(
     mut source: Source,
     mut destination: Destination,
     reservation: Reservation,
-    deadline: std::time::Instant,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    max_pages: std::ffi::c_int,
+    context: BackupExecutionContext,
 ) -> Result<(Source, Destination, Reservation), FileControlError>
 where
     Source: BeginOwnedConnection,
     Destination: BeginOwnedConnection,
     Reservation: Send + 'static,
 {
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let deadline = context.deadline;
     worker_owner.handoff(move |runtime| {
         let result = runtime.block_on(backup_main_database(
             source.sqlite(),
             destination.sqlite(),
-            deadline,
-            cancelled.as_ref(),
-            max_pages,
+            &context,
         ));
         match result {
             Ok(()) => {
@@ -724,6 +821,11 @@ pub async fn serialize_main_database(
             libsqlite3_sys::SQLITE_SERIALIZE_NOCOPY,
         )
     };
+    let probe_size = usize::try_from(size)
+        .map_err(|_| FileControlError::Handle("serialized database size is invalid".to_owned()))?;
+    if probe_size > maximum_bytes {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_TOOBIG));
+    }
     let mut sqlite_owned = None;
     if pointer.is_null() {
         // SAFETY: fallback asks SQLite for one owned contiguous serialization.
@@ -1102,6 +1204,110 @@ struct TransactionConnection<Connection: BeginOwnedConnection> {
     inner: Connection,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CommitDeliveryDisposition {
+    Pending,
+    CleanupRequested,
+    Accepted,
+    Closed,
+}
+
+struct CommitDeliveryState<Connection: BeginOwnedConnection> {
+    connection: Option<Connection>,
+    disposition: CommitDeliveryDisposition,
+    cleanup_error: Option<String>,
+}
+
+struct CommitDeliveryShared<Connection: BeginOwnedConnection> {
+    state: std::sync::Mutex<CommitDeliveryState<Connection>>,
+    changed: std::sync::Condvar,
+}
+
+struct CommitDelivery<Connection: BeginOwnedConnection> {
+    shared: Arc<CommitDeliveryShared<Connection>>,
+    armed: bool,
+}
+
+impl<Connection: BeginOwnedConnection> CommitDelivery<Connection> {
+    fn new(shared: Arc<CommitDeliveryShared<Connection>>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    fn accept(mut self) -> Result<Connection, FileControlError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.disposition {
+            CommitDeliveryDisposition::Pending => {
+                let connection = state
+                    .connection
+                    .take()
+                    .expect("pending COMMIT delivery retains its connection");
+                state.disposition = CommitDeliveryDisposition::Accepted;
+                self.shared.changed.notify_one();
+                self.armed = false;
+                Ok(connection)
+            }
+            CommitDeliveryDisposition::Closed => Err(FileControlError::CommittedAfterDeadline(
+                state.cleanup_error.clone(),
+            )),
+            CommitDeliveryDisposition::CleanupRequested => Err(FileControlError::Handle(
+                "COMMIT delivery cleanup is already in progress".to_owned(),
+            )),
+            CommitDeliveryDisposition::Accepted => Err(FileControlError::Handle(
+                "COMMIT connection was already accepted".to_owned(),
+            )),
+        }
+    }
+
+    fn request_cleanup(mut self) -> Arc<CommitDeliveryShared<Connection>> {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.disposition == CommitDeliveryDisposition::Pending {
+                state.disposition = CommitDeliveryDisposition::CleanupRequested;
+                self.shared.changed.notify_one();
+            }
+        }
+        self.armed = false;
+        Arc::clone(&self.shared)
+    }
+
+    fn cleanup_result(shared: &CommitDeliveryShared<Connection>) -> Option<Option<String>> {
+        let state = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.disposition == CommitDeliveryDisposition::Closed)
+            .then(|| state.cleanup_error.clone())
+    }
+}
+
+impl<Connection: BeginOwnedConnection> Drop for CommitDelivery<Connection> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.disposition == CommitDeliveryDisposition::Pending {
+            state.disposition = CommitDeliveryDisposition::CleanupRequested;
+            self.shared.changed.notify_one();
+        }
+    }
+}
+
 async fn cleanup_late_writer_claim<Connection: BeginOwnedConnection>(
     connection: &mut Connection,
     owner: Option<&str>,
@@ -1144,6 +1350,58 @@ async fn cleanup_late_writer_claim<Connection: BeginOwnedConnection>(
     .map_err(|error| FileControlError::Handle(error.to_string()))
 }
 
+fn drive_commit_delivery<Connection: BeginOwnedConnection>(
+    shared: Arc<CommitDeliveryShared<Connection>>,
+    runtime: &tokio::runtime::Runtime,
+    owner: Option<&str>,
+    cleanup_deadline: std::time::Instant,
+) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        match state.disposition {
+            CommitDeliveryDisposition::Accepted | CommitDeliveryDisposition::Closed => return,
+            CommitDeliveryDisposition::CleanupRequested => break,
+            CommitDeliveryDisposition::Pending => {
+                let remaining =
+                    cleanup_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    state.disposition = CommitDeliveryDisposition::CleanupRequested;
+                    break;
+                }
+                let (next, timeout) = shared
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if timeout.timed_out() && state.disposition == CommitDeliveryDisposition::Pending {
+                    state.disposition = CommitDeliveryDisposition::CleanupRequested;
+                }
+            }
+        }
+    }
+    let mut connection = state
+        .connection
+        .take()
+        .expect("cleanup-requested COMMIT delivery retains its connection");
+    drop(state);
+    let cleanup = runtime.block_on(cleanup_late_writer_claim(
+        &mut connection,
+        owner,
+        cleanup_deadline,
+    ));
+    connection.close_owned(runtime);
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.cleanup_error = cleanup.err().map(|error| error.to_string());
+    state.disposition = CommitDeliveryDisposition::Closed;
+    shared.changed.notify_all();
+}
+
 impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
     #[cfg(test)]
     fn into_test_parts(mut self) -> (Connection, ManualTransactionToken) {
@@ -1170,6 +1428,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
             self.token
                 .as_mut()
                 .expect("manual transaction token remains owned"),
+            None,
         )
         .await;
         match result {
@@ -1263,7 +1522,8 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
             .cleanup_owner
             .take()
             .expect("bounded commit cleanup owner remains owned");
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        let delivery_cancelled = Arc::clone(&cancelled);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         cleanup_owner.handoff(move |runtime| {
             let cancellation = Arc::new(BeginCancellation {
                 local: std::sync::atomic::AtomicBool::new(false),
@@ -1299,7 +1559,8 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                 let commit = if cancellation.is_expired() {
                     Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
                 } else {
-                    commit_synchronously(connection.inner.sqlite(), &mut token).await
+                    commit_synchronously(connection.inner.sqlite(), &mut token, Some(&cancellation))
+                        .await
                 };
                 let restore_ms =
                     i32::try_from(restore_busy_timeout.as_millis()).unwrap_or(i32::MAX);
@@ -1328,19 +1589,26 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                             cleanup_deadline,
                         ));
                         connection.close_owned(runtime);
-                        let error = cleanup
-                            .err()
-                            .unwrap_or(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
-                        let _ = result_tx.send(Err(error));
-                    } else if let Err(error) = result_tx.send(Ok(connection))
-                        && let Ok(mut connection) = error.0
-                    {
-                        let _ = runtime.block_on(cleanup_late_writer_claim(
-                            &mut connection,
+                        let _ = result_tx.send(Err(FileControlError::CommittedAfterDeadline(
+                            cleanup.err().map(|error| error.to_string()),
+                        )));
+                    } else {
+                        let shared = Arc::new(CommitDeliveryShared {
+                            state: std::sync::Mutex::new(CommitDeliveryState {
+                                connection: Some(connection),
+                                disposition: CommitDeliveryDisposition::Pending,
+                                cleanup_error: None,
+                            }),
+                            changed: std::sync::Condvar::new(),
+                        });
+                        let delivery = CommitDelivery::new(Arc::clone(&shared));
+                        let _ = result_tx.send(Ok(delivery));
+                        drive_commit_delivery(
+                            shared,
+                            runtime,
                             late_writer_owner.as_deref(),
                             cleanup_deadline,
-                        ));
-                        connection.close_owned(runtime);
+                        );
                     }
                 }
                 Err(error) => {
@@ -1365,7 +1633,29 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         });
         loop {
             match result_rx.try_recv() {
-                Ok(result) => return result,
+                Ok(Ok(delivery))
+                    if delivery_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        || std::time::Instant::now() >= deadline =>
+                {
+                    let cleanup = delivery.request_cleanup();
+                    loop {
+                        match CommitDelivery::cleanup_result(&cleanup) {
+                            Some(cleanup) => {
+                                return Err(FileControlError::CommittedAfterDeadline(cleanup));
+                            }
+                            None if std::time::Instant::now() < cleanup_deadline => {
+                                tokio::task::yield_now().await;
+                            }
+                            None => {
+                                return Err(FileControlError::Handle(
+                                    "late COMMIT result cleanup exceeded its cutoff".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(delivery)) => return delivery.accept(),
+                Ok(Err(error)) => return Err(error),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= cleanup_deadline {
                         return Err(FileControlError::Handle(
@@ -1923,6 +2213,7 @@ struct OwnedBeginGuard<Connection: BeginOwnedConnection> {
     database: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
     cancellation: Arc<BeginCancellation>,
     cleanup_owner: Option<BlockingCleanupOwner>,
+    armed: bool,
 }
 
 impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
@@ -1947,7 +2238,7 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
     async fn receive_worker_result(
         &mut self,
     ) -> Result<BeginWorkerOutput<Connection>, FileControlError> {
-        let cutoff = self.cancellation.deadline + std::time::Duration::from_secs(5);
+        let cutoff = self.cancellation.deadline + std::time::Duration::from_secs(1);
         loop {
             let received = self
                 .worker_result
@@ -2005,6 +2296,7 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
             .cleanup_owner
             .take()
             .ok_or_else(|| FileControlError::Handle("BEGIN cleanup owner is missing".to_owned()))?;
+        self.armed = false;
         Ok((result.0, result.1, result.2, cleanup_owner))
     }
 
@@ -2012,6 +2304,7 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
         self.command.take();
         let _ = self.receive_worker_result().await?;
         self.shutdown_cleanup_owner()?;
+        self.armed = false;
         Ok(())
     }
 
@@ -2026,7 +2319,9 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
 
 impl<Connection: BeginOwnedConnection> Drop for OwnedBeginGuard<Connection> {
     fn drop(&mut self) {
-        self.request_cancellation();
+        if self.armed {
+            self.request_cancellation();
+        }
     }
 }
 
@@ -2117,6 +2412,9 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
     if !wait_at_begin_test_gate(BeginTestStage::BeforeDispatch, cancellation, command) {
         return LockedBeginOutcome::Cancelled;
     }
+    if cancellation.is_expired() {
+        return LockedBeginOutcome::Cancelled;
+    }
     let mut message = std::ptr::null_mut();
     // SAFETY: the dedicated worker owns the connection, retains SQLx's locked
     // handle for the complete raw operation, and joins before ownership moves.
@@ -2179,6 +2477,7 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
     let accept_gate_open = true;
     if let Some(generation) = accepted_generation
         && accept_gate_open
+        && !cancellation.is_expired()
     {
         return match install_transaction_authorizer(pointer, identity, generation) {
             Ok(authorizer_address) => LockedBeginOutcome::Accepted(identity, authorizer_address),
@@ -2226,7 +2525,7 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
     let begin = match begin {
         Ok(begin) => begin,
         Err(_) => {
-            let _ = outcome.send(Err(FileControlError::Handle(
+            let _ = outcome.try_send(Err(FileControlError::Handle(
                 "BEGIN worker panicked after taking connection ownership".to_owned(),
             )));
             close_owned_begin_connection(runtime, connection);
@@ -2238,13 +2537,16 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
             Some((connection, identity, authorizer_address))
         }
         LockedBeginOutcome::Failed(error) => {
-            let _ = outcome.send(Err(error));
+            let _ = outcome.try_send(Err(error));
             #[cfg(test)]
             wait_at_begin_failure_cleanup_gate(&cancellation);
             close_owned_begin_connection(runtime, connection);
             None
         }
         LockedBeginOutcome::Cancelled => {
+            let _ = outcome.try_send(Err(FileControlError::SQLite(
+                libsqlite3_sys::SQLITE_INTERRUPT,
+            )));
             close_owned_begin_connection(runtime, connection);
             None
         }
@@ -2285,7 +2587,7 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let worker_cancellation = Arc::clone(&cancellation);
     let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
     let (command_tx, command_rx) = std::sync::mpsc::channel();
-    let (worker_result_tx, worker_result_rx) = std::sync::mpsc::sync_channel(1);
+    let (worker_result_tx, worker_result_rx) = std::sync::mpsc::sync_channel(0);
     worker_owner.handoff(move |runtime| {
         let result = run_owned_begin_worker(
             connection,
@@ -2311,19 +2613,24 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
             connection.close_owned(runtime);
         }
     });
-    let guard = OwnedBeginGuard {
+    let mut guard = OwnedBeginGuard {
         worker_result: Some(worker_result_rx),
         command: Some(command_tx),
         database,
         cancellation: Arc::clone(&cancellation),
         cleanup_owner: Some(cleanup_owner),
+        armed: true,
     };
     let outcome = loop {
         match outcome_rx.try_recv() {
             Ok(outcome) => break outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if cancellation.is_cancelled() {
-                    drop(guard);
+                if cancellation.is_cancelled()
+                    || std::time::Instant::now()
+                        >= cancellation.deadline + std::time::Duration::from_secs(1)
+                {
+                    guard.request_cancellation();
+                    guard.join_failure().await?;
                     return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -2336,28 +2643,37 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
             }
         }
     };
-    if cancellation.is_cancelled() {
-        drop(guard);
-        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
-    }
     let identity = match outcome {
         Ok(identity) => identity,
         Err(error) => {
+            if cancellation.is_cancelled() {
+                drop(guard);
+                return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+            }
             guard.join_failure().await?;
             return Err(error);
         }
     };
+    if cancellation.is_expired() {
+        drop(guard);
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+    }
     let generation = NEXT_MANUAL_TRANSACTION_GENERATION.fetch_add(1, Ordering::Relaxed);
     let generation = generation.max(1);
     let registration = ActiveTransactionRegistration::register(identity, generation)?;
     let (connection, worker_identity, authorizer_address, cleanup_owner) =
         guard.accept(generation).await?;
     debug_assert_eq!(worker_identity, identity);
-    Ok(ManualTransaction {
+    let transaction = ManualTransaction {
         connection: Some(TransactionConnection { inner: connection }),
         token: Some(registration.into_token(authorizer_address)),
         cleanup_owner: Some(cleanup_owner),
-    })
+    };
+    if cancellation.is_expired() {
+        let _ = transaction.rollback().await;
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+    }
+    Ok(transaction)
 }
 
 /// Starts a manual immediate transaction on an owned, non-pool-returnable connection.
@@ -2404,6 +2720,7 @@ pub async fn begin_manual_pool_transaction_with_restore(
 async fn commit_synchronously(
     connection: &mut sqlx::SqliteConnection,
     token: &mut ManualTransactionToken,
+    cancellation: Option<&BeginCancellation>,
 ) -> Result<(), FileControlError> {
     let mut database = connection
         .lock_handle()
@@ -2436,6 +2753,9 @@ async fn commit_synchronously(
         return Err(FileControlError::Handle(
             "manual transaction token generation is stale".to_owned(),
         ));
+    }
+    if cancellation.is_some_and(BeginCancellation::is_expired) {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
     }
     let internal_permit = InternalTransactionPermit::activate(token)?;
     let mut message = std::ptr::null_mut();
@@ -3423,6 +3743,26 @@ pub fn windows_file_identity(file: &std::fs::File) -> Result<[u8; 24], FileContr
     Ok(identity)
 }
 
+/// Tries to lock a private marker byte outside ordinary file contents.
+#[cfg(windows)]
+pub fn windows_try_lock_writer_marker(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::LockFile;
+
+    // SAFETY: The borrowed file handle remains live for the call. The
+    // one-byte range ends at u64::MAX and is intentionally beyond file data.
+    let locked = unsafe { LockFile(file.as_raw_handle(), u32::MAX - 1, u32::MAX, 1, 0) };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(33) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
 /// Returns whether a Windows file is owned by the current service identity and
 /// grants no write/delete authority to other non-administrative principals.
 #[cfg(windows)]
@@ -3437,6 +3777,7 @@ pub fn windows_file_is_service_private(file: &std::fs::File) -> Result<bool, Fil
         OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token = std::ptr::null_mut();
@@ -3539,16 +3880,9 @@ pub fn windows_file_is_service_private(file: &std::fs::File) -> Result<bool, Fil
                     std::io::Error::last_os_error()
                 )));
             }
-            const WRITE_AUTHORITY: u32 = 0x0000_0002
-                | 0x0000_0004
-                | 0x0000_0010
-                | 0x0000_0040
-                | 0x0000_0100
-                | 0x0001_0000
-                | 0x0004_0000
-                | 0x0008_0000
-                | 0x1000_0000
-                | 0x4000_0000;
+            let mut current_seen = false;
+            let mut system_seen = false;
+            let mut administrators_seen = false;
             for index in 0..acl_info.AceCount {
                 let mut ace = std::ptr::null_mut();
                 // SAFETY: index is within AceCount and ace is writable.
@@ -3561,29 +3895,37 @@ pub fn windows_file_is_service_private(file: &std::fs::File) -> Result<bool, Fil
                 // Standard access-allowed ACE type is zero.
                 // SAFETY: GetAce returned a valid ACE pointer.
                 let header = unsafe { &*(ace.cast::<windows_sys::Win32::Security::ACE_HEADER>()) };
-                if matches!(header.AceType, 5 | 9 | 11) {
+                if header.AceType != 0 || header.AceFlags != 0 {
                     return Ok(false);
-                }
-                if header.AceType != 0 {
-                    continue;
                 }
                 // SAFETY: A type-zero ACE has ACCESS_ALLOWED_ACE layout.
                 let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
-                if allowed.Mask & WRITE_AUTHORITY == 0 {
-                    continue;
+                if allowed.Mask != FILE_ALL_ACCESS {
+                    return Ok(false);
                 }
                 let sid = (&raw const allowed.SidStart).cast_mut().cast();
                 // SAFETY: sid points into the live ACE and current_sid is live.
-                let trusted = unsafe {
-                    EqualSid(sid, current_sid) != 0
-                        || IsWellKnownSid(sid, WinLocalSystemSid) != 0
-                        || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                let (is_current, is_system, is_administrators) = unsafe {
+                    (
+                        EqualSid(sid, current_sid) != 0,
+                        IsWellKnownSid(sid, WinLocalSystemSid) != 0,
+                        IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0,
+                    )
                 };
-                if !trusted {
+                if !is_current && !is_system && !is_administrators {
                     return Ok(false);
                 }
+                if (is_current && current_seen)
+                    || (is_system && system_seen)
+                    || (is_administrators && administrators_seen)
+                {
+                    return Ok(false);
+                }
+                current_seen |= is_current;
+                system_seen |= is_system;
+                administrators_seen |= is_administrators;
             }
-            Ok(true)
+            Ok(current_seen && system_seen && administrators_seen)
         })();
         // SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc.
         unsafe {
@@ -3607,9 +3949,9 @@ pub fn secure_new_windows_file(file: &std::fs::File) -> Result<(), FileControlEr
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
-        TOKEN_QUERY, TOKEN_USER, TokenUser,
+        TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -3666,7 +4008,14 @@ pub fn secure_new_windows_file(file: &std::fs::File) -> Result<(), FileControlEr
         }
         let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_string, length) })
             .map_err(|_| FileControlError::Handle("current SID is not valid UTF-16".to_owned()))?;
-        let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)");
+        let mut aces = format!("(A;;FA;;;{sid})");
+        if unsafe { IsWellKnownSid(current_sid, WinLocalSystemSid) } == 0 {
+            aces.push_str("(A;;FA;;;SY)");
+        }
+        if unsafe { IsWellKnownSid(current_sid, WinBuiltinAdministratorsSid) } == 0 {
+            aces.push_str("(A;;FA;;;BA)");
+        }
+        let sddl = format!("O:{sid}D:P{aces}");
         let mut encoded = sddl.encode_utf16().collect::<Vec<_>>();
         encoded.push(0);
         if unsafe {
@@ -4408,7 +4757,7 @@ mod deadline_tests {
             .await
             .expect("create busy commit table");
         let (mut writer, mut token) =
-            begin_manual_transaction(writer, std::time::Duration::from_millis(20), None)
+            begin_manual_transaction(writer, std::time::Duration::from_millis(250), None)
                 .await
                 .expect("begin busy commit writer")
                 .into_test_parts();
@@ -4429,7 +4778,7 @@ mod deadline_tests {
             .expect("hold rollback-journal read lock");
 
         assert_eq!(
-            commit_synchronously(&mut writer, &mut token)
+            commit_synchronously(&mut writer, &mut token, None)
                 .await
                 .expect_err("reader makes COMMIT busy"),
             FileControlError::SQLite(libsqlite3_sys::SQLITE_BUSY)
@@ -4441,6 +4790,51 @@ mod deadline_tests {
             .execute("ROLLBACK")
             .await
             .expect("release blocking reader");
+    }
+
+    #[tokio::test]
+    async fn commit_rechecks_cancellation_immediately_before_native_dispatch() {
+        let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open commit-fence connection");
+        connection
+            .execute("CREATE TABLE value(id INTEGER)")
+            .await
+            .expect("create commit-fence table");
+        let (mut connection, mut token) =
+            begin_manual_transaction(connection, std::time::Duration::from_millis(250), None)
+                .await
+                .expect("begin commit-fence transaction")
+                .into_test_parts();
+        connection
+            .execute("INSERT INTO value VALUES (1)")
+            .await
+            .expect("stage commit-fence row");
+        let cancellation = BeginCancellation {
+            local: AtomicBool::new(true),
+            external: None,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            busy_entered: std::sync::Mutex::new(None),
+            test_key: std::sync::Mutex::new(None),
+        };
+
+        assert_eq!(
+            commit_synchronously(&mut connection, &mut token, Some(&cancellation))
+                .await
+                .expect_err("cancelled precommit fence rejects native COMMIT"),
+            FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)
+        );
+        rollback_synchronously(&mut connection, &mut token)
+            .await
+            .expect("cancelled precommit fence leaves transaction rollbackable");
+        assert_eq!(
+            connection
+                .fetch_one("SELECT COUNT(*) FROM value")
+                .await
+                .expect("query commit-fence row count")
+                .get::<i64, _>(0),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4734,9 +5128,13 @@ mod deadline_tests {
         backup_main_database(
             &mut source,
             &mut baseline_destination,
-            std::time::Instant::now() + std::time::Duration::from_secs(2),
-            &AtomicBool::new(false),
-            10_000,
+            &BackupExecutionContext {
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                max_pages: 10_000,
+                source_busy_timeout: std::time::Duration::ZERO,
+                destination_busy_timeout: std::time::Duration::ZERO,
+            },
         )
         .await
         .expect("complete baseline incremental backup");
@@ -4756,9 +5154,13 @@ mod deadline_tests {
                 backup_main_database(
                     &mut source,
                     &mut destination,
-                    std::time::Instant::now() + std::time::Duration::from_secs(2),
-                    &AtomicBool::new(false),
-                    10_000,
+                    &BackupExecutionContext {
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        max_pages: 10_000,
+                        source_busy_timeout: std::time::Duration::ZERO,
+                        destination_busy_timeout: std::time::Duration::ZERO,
+                    },
                 )
                 .await,
                 Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
@@ -4830,9 +5232,13 @@ mod deadline_tests {
             backup_main_database(
                 &mut source,
                 &mut destination,
-                std::time::Instant::now() + std::time::Duration::from_secs(1),
-                &AtomicBool::new(false),
-                1,
+                &BackupExecutionContext {
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    max_pages: 1,
+                    source_busy_timeout: std::time::Duration::ZERO,
+                    destination_busy_timeout: std::time::Duration::ZERO,
+                },
             )
             .await,
             Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_TOOBIG))
@@ -4865,7 +5271,7 @@ mod deadline_tests {
             active: true,
         };
         assert!(matches!(
-            commit_synchronously(&mut connection, &mut stale).await,
+            commit_synchronously(&mut connection, &mut stale, None).await,
             Err(FileControlError::Handle(message)) if message.contains("generation is stale")
         ));
         let mut wrong_lifetime = ManualTransactionToken {
@@ -4876,7 +5282,7 @@ mod deadline_tests {
             active: true,
         };
         assert!(matches!(
-            commit_synchronously(&mut connection, &mut wrong_lifetime).await,
+            commit_synchronously(&mut connection, &mut wrong_lifetime, None).await,
             Err(FileControlError::Handle(message)) if message.contains("connection lifetime")
         ));
         rollback_synchronously(&mut connection, &mut current)
@@ -4897,8 +5303,16 @@ mod deadline_tests {
         let worker_release = Arc::clone(&release);
         let worker_entered = Arc::clone(&entered);
         let worker_done = Arc::clone(&done);
-        let mut owner = BlockingCleanupOwner::acquire_without_runtime("handoff-outside-runtime")
-            .expect("acquire cleanup capability");
+        let admission_started = std::time::Instant::now();
+        let mut owner = loop {
+            match BlockingCleanupOwner::acquire_without_runtime("handoff-outside-runtime") {
+                Ok(owner) => break owner,
+                Err(_) if admission_started.elapsed() < std::time::Duration::from_secs(1) => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("acquire cleanup capability: {error}"),
+            }
+        };
         let started = std::time::Instant::now();
         owner.handoff(move |_| {
             worker_entered.store(true, Ordering::Release);
@@ -5029,6 +5443,20 @@ mod windows_tests {
                 .expect("protected child remains independently service-private"),
             "an ancestor DACL change must not be inherited by a secured child"
         );
+        let status = Command::new("icacls.exe")
+            .arg(&path)
+            .arg("/grant")
+            .arg("*S-1-1-0:R")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("add read-only untrusted ACE");
+        assert!(status.success());
+        assert!(
+            !windows_file_is_service_private(&file)
+                .expect("validate file with untrusted read-only ACE"),
+            "service-private files must reject untrusted read authority"
+        );
     }
 
     #[test]
@@ -5063,6 +5491,22 @@ mod windows_tests {
             .status()
             .expect("secure Windows callback fixture");
         assert!(status.success());
+        let directory_security = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(
+                windows_sys::Win32::Foundation::GENERIC_READ
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
+            )
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(directory.path())
+            .expect("open callback fixture directory for exact DACL");
+        secure_new_windows_file(&directory_security)
+            .expect("apply exact protected callback directory DACL");
+        drop(directory_security);
 
         let database_path = directory.path().join("state.sqlite");
         let lock_path = directory.path().join("state.sqlite.writer.lock");

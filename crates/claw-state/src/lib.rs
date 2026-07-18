@@ -1410,7 +1410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_cleanup_failures_never_panic_or_poison_the_pool() {
+    async fn rollback_cleanup_disruptions_never_panic_or_poison_the_pool() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = StateStore::open(
             StoreConfig::new(database_path(&directory, "rollback-cleanup.sqlite"))
@@ -1427,11 +1427,12 @@ mod tests {
         let owner = test_support::owner(&store).to_owned();
 
         for mode in 1..=3 {
-            crate::repository::test_support::fail_next_rollback_cleanup(&owner, mode);
+            crate::repository::test_support::disrupt_next_rollback_cleanup(&owner, mode);
             assert!(matches!(
                 store.sessions().create(&duplicate).await,
                 Err(StateError::AlreadyExists { .. })
             ));
+            crate::repository::test_support::assert_rollback_cleanup_disruption_consumed(&owner);
             store
                 .sessions()
                 .create(&session(&format!("rollback-recovery-{mode}"), mode.into()))
@@ -3178,7 +3179,7 @@ mod tests {
         let source_path = database_path(&directory, "backup-timeout-source.sqlite");
         let destination = database_path(&directory, "backup-timeout.sqlite");
         let source = StateStore::open(
-            StoreConfig::new(&source_path).with_open_timeout(Duration::from_millis(500)),
+            StoreConfig::new(&source_path).with_operation_timeout(Duration::from_millis(500)),
         )
         .await
         .expect("backup timeout source opens");
@@ -3210,6 +3211,67 @@ mod tests {
         assert!(!destination.exists());
         assert!(!temporary.exists());
         source.close().await.expect("backup timeout source closes");
+    }
+
+    #[tokio::test]
+    async fn publication_deadline_is_fenced_immediately_before_and_after_marker_removal() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = database_path(&directory, "publication-fence-source.sqlite");
+        let prepublication = database_path(&directory, "publication-fence-before.sqlite");
+        let postpublication = database_path(&directory, "publication-fence-after.sqlite");
+        let restored = database_path(&directory, "publication-fence-restored.sqlite");
+        let source = StateStore::open(
+            StoreConfig::new(&source_path).with_operation_timeout(Duration::from_secs(2)),
+        )
+        .await
+        .expect("publication fence source opens");
+
+        test_support::expire_publication_deadline_once(&prepublication, 1);
+        assert_eq!(
+            source
+                .backup_to(&prepublication)
+                .await
+                .expect_err("prepublication deadline fence rejects publication"),
+            StateError::OperationTimedOut {
+                operation: "SQLite backup",
+                timeout_ms: 2_000,
+            }
+        );
+        assert!(
+            !prepublication.exists(),
+            "prepublication expiry reclaims the exact staging object"
+        );
+
+        test_support::expire_publication_deadline_once(&postpublication, 2);
+        let error = source
+            .backup_to(&postpublication)
+            .await
+            .expect_err("postpublication deadline fence cannot report success");
+        assert!(
+            matches!(
+                error,
+                StateError::PublicationUncertain { ref path, ref reason }
+                    if path.file_name() == postpublication.file_name()
+                        && reason.contains("deadline expired")
+            ),
+            "unexpected postpublication deadline error: {error:?}"
+        );
+        assert!(
+            postpublication.exists(),
+            "postpublication expiry never truncates the published object"
+        );
+        StateStore::restore_backup(&postpublication, &restored)
+            .await
+            .expect("deadline-published snapshot remains a valid exact backup");
+        open(&restored)
+            .await
+            .close()
+            .await
+            .expect("restored publication-fence store closes");
+        source
+            .close()
+            .await
+            .expect("publication fence source closes");
     }
 
     #[tokio::test]
@@ -3829,9 +3891,11 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "repository-precommit-deadline.sqlite");
         let store = std::sync::Arc::new(
-            StateStore::open(StoreConfig::new(&path).with_open_timeout(Duration::from_millis(250)))
-                .await
-                .expect("deadline fixture store opens"),
+            StateStore::open(
+                StoreConfig::new(&path).with_operation_timeout(Duration::from_millis(250)),
+            )
+            .await
+            .expect("deadline fixture store opens"),
         );
         let owner = test_support::owner(&store).to_owned();
         let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
@@ -3864,6 +3928,99 @@ mod tests {
         let store = std::sync::Arc::try_unwrap(store)
             .unwrap_or_else(|_| panic!("deadline writer retained store"));
         store.close().await.expect("deadline fixture store closes");
+    }
+
+    #[tokio::test]
+    async fn repository_reads_use_the_absolute_operation_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "repository-read-pool-deadline.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path)
+                .with_max_connections(1)
+                .with_acquire_timeout(Duration::from_secs(2))
+                .with_operation_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect("read pool-deadline fixture opens");
+        let held = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("hold the only read pool connection");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            store
+                .sessions()
+                .get(&SessionId::new("pool-blocked-read").expect("valid read id"))
+                .await
+                .expect_err("pool-blocked read reaches its operation deadline"),
+            StateError::OperationTimedOut {
+                operation: "read session",
+                timeout_ms: 100,
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "pool acquire timeout must not extend the repository read deadline"
+        );
+        drop(held);
+        store
+            .close()
+            .await
+            .expect("read pool-deadline fixture closes");
+    }
+
+    #[tokio::test]
+    async fn repository_update_deadline_includes_preliminary_read() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "repository-read-deadline.sqlite");
+        let store = std::sync::Arc::new(
+            StateStore::open(
+                StoreConfig::new(&path).with_operation_timeout(Duration::from_millis(250)),
+            )
+            .await
+            .expect("read deadline fixture opens"),
+        );
+        let record = session("read-deadline-row", 1);
+        store
+            .sessions()
+            .create(&record)
+            .await
+            .expect("seed read deadline row");
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_read_barrier(&owner);
+        let update_store = std::sync::Arc::clone(&store);
+        let id = record.id.clone();
+        let update = tokio::spawn(async move {
+            update_store
+                .sessions()
+                .update_status(&id, 1, SessionStatus::Archived, timestamp(2))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("update reaches preliminary read barrier");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release.notify_one();
+        assert!(matches!(
+            update.await.expect("read deadline update joins"),
+            Err(StateError::OperationTimedOut {
+                operation: "begin session update",
+                timeout_ms: 250,
+            })
+        ));
+        assert_eq!(
+            store
+                .sessions()
+                .get(&record.id)
+                .await
+                .expect("read deadline row remains readable")
+                .expect("read deadline row remains present")
+                .status,
+            SessionStatus::Active
+        );
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("read deadline update retained store"));
+        store.close().await.expect("read deadline fixture closes");
     }
 
     #[cfg(unix)]
@@ -5348,7 +5505,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_world_writable_empty_database_is_not_adopted() {
+    async fn windows_cross_principal_empty_database_is_not_adopted() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "world-writable-empty.sqlite");
         fs::write(&path, b"").expect("precreate empty Windows database");
@@ -5379,7 +5536,7 @@ mod tests {
         assert!(matches!(
             error,
             StateError::InvalidPath {
-                reason: "state database grants write or delete access outside the service identity",
+                reason: "state database does not have the exact protected service DACL",
                 ..
             }
         ));
@@ -5410,11 +5567,24 @@ mod tests {
             .open(&readonly_path)
             .expect("open readable Windows database");
         assert!(
-            claw_sqlite_file_control::windows_file_is_service_private(&readonly_file)
-                .expect("read-only cross-principal ACL remains private for mutation")
+            !claw_sqlite_file_control::windows_file_is_service_private(&readonly_file)
+                .expect("read-only cross-principal ACL is not service-private")
         );
-        let store = open(&readonly_path).await;
-        store.close().await.expect("readable private store closes");
+        let error = StateStore::open(StoreConfig::new(&readonly_path))
+            .await
+            .err()
+            .expect("world-readable empty database is rejected");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath {
+                reason: "state database does not have the exact protected service DACL",
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(&readonly_path).expect("read unchanged readable database"),
+            b""
+        );
     }
 
     #[cfg(windows)]
@@ -5442,7 +5612,7 @@ mod tests {
         assert!(matches!(
             error,
             StateError::InvalidPath {
-                reason: "state directory grants write or delete access outside the service identity",
+                reason: "state directory does not have the exact protected service DACL",
                 ..
             }
         ));

@@ -20,6 +20,62 @@ const APPLICATION_ID: i64 = 0x4754_4143;
 type PoolManualTransaction =
     claw_sqlite_file_control::ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>;
 
+struct RepositoryDeadline {
+    deadline: std::time::Instant,
+    cleanup_deadline: std::time::Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    timeout_ms: u64,
+}
+
+impl RepositoryDeadline {
+    fn new(identity: OperationalIdentity<'_>) -> Result<Self, StateError> {
+        let timeout_ms = u64::try_from(identity.operation_timeout.as_millis()).unwrap_or(u64::MAX);
+        let deadline = std::time::Instant::now()
+            .checked_add(identity.operation_timeout)
+            .ok_or(StateError::InvalidValue {
+                field: "repository operation timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+        let cleanup_deadline =
+            deadline
+                .checked_add(identity.cleanup_timeout)
+                .ok_or(StateError::InvalidValue {
+                    field: "repository cleanup timeout",
+                    reason: "is too large for the monotonic clock",
+                })?;
+        Ok(Self {
+            deadline,
+            cleanup_deadline,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timeout_ms,
+        })
+    }
+
+    fn timeout_error(&self, operation: &'static str) -> StateError {
+        StateError::OperationTimedOut {
+            operation,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+async fn read_with_deadline<T>(
+    identity: OperationalIdentity<'_>,
+    operation: &'static str,
+    future: impl std::future::Future<Output = Result<T, StateError>>,
+) -> Result<T, StateError> {
+    let timing = RepositoryDeadline::new(identity)?;
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(timing.deadline), future).await {
+        Ok(result) => result,
+        Err(_) => {
+            timing
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(timing.timeout_error(operation))
+        }
+    }
+}
+
 struct VerifiedWriteTransaction {
     transaction: Option<PoolManualTransaction>,
     deadline: std::time::Instant,
@@ -27,6 +83,8 @@ struct VerifiedWriteTransaction {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     restore_busy_timeout: std::time::Duration,
     timeout_ms: u64,
+    #[cfg(test)]
+    rollback_cleanup_test_mode: Option<u8>,
 }
 
 impl VerifiedWriteTransaction {
@@ -78,6 +136,23 @@ impl Drop for VerifiedWriteTransaction {
     fn drop(&mut self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(test)]
+        if let Some(mode) = self.rollback_cleanup_test_mode.take()
+            && let Some(transaction) = self.transaction.take()
+        {
+            match mode {
+                1 => drop(transaction),
+                2 => {
+                    std::thread::spawn(move || drop(transaction))
+                        .join()
+                        .expect("no-runtime rollback cleanup thread joins");
+                }
+                3 => {
+                    std::thread::spawn(move || drop(transaction));
+                }
+                _ => unreachable!("validated rollback cleanup test mode"),
+            }
+        }
     }
 }
 
@@ -85,10 +160,16 @@ impl Drop for VerifiedWriteTransaction {
 static WRITE_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
+static READ_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
 static COMMIT_TEST_TAMPERS: LazyLock<Mutex<std::collections::HashSet<String>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
 static COMMIT_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static ROLLBACK_CLEANUP_TEST_MODES: LazyLock<Mutex<std::collections::HashMap<String, u8>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 struct WriteTestBarrier {
@@ -146,41 +227,47 @@ impl<'store> SessionRepository<'store> {
 
     /// Reads one session.
     pub async fn get(&self, id: &SessionId) -> Result<Option<SessionRecord>, StateError> {
-        let row = sqlx::query(
-            "SELECT id, status, created_at_ms, updated_at_ms, version
-             FROM sessions WHERE id = ?",
-        )
-        .bind(id.as_str())
-        .fetch_optional(self.pool)
+        read_with_deadline(self.identity, "read session", async {
+            let row = sqlx::query(
+                "SELECT id, status, created_at_ms, updated_at_ms, version
+                 FROM sessions WHERE id = ?",
+            )
+            .bind(id.as_str())
+            .fetch_optional(self.pool)
+            .await
+            .map_err(|error| database("read session", error))?;
+            row.map(session_from_row).transpose()
+        })
         .await
-        .map_err(|error| database("read session", error))?;
-        row.map(session_from_row).transpose()
     }
 
     /// Lists sessions in stable creation-time and identifier order.
     pub async fn list(&self, request: &PageRequest) -> Result<Page<SessionRecord>, StateError> {
-        let (after_time, after_id) = request.after_parts();
-        let rows = sqlx::query(
-            "SELECT id, status, created_at_ms, updated_at_ms, version
-             FROM sessions
-             WHERE (created_at_ms, id) > (?, ?)
-             ORDER BY created_at_ms, id
-             LIMIT ?",
-        )
-        .bind(after_time)
-        .bind(after_id)
-        .bind(request.query_limit())
-        .fetch_all(self.pool)
+        read_with_deadline(self.identity, "list sessions", async {
+            let (after_time, after_id) = request.after_parts();
+            let rows = sqlx::query(
+                "SELECT id, status, created_at_ms, updated_at_ms, version
+                 FROM sessions
+                 WHERE (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id
+                 LIMIT ?",
+            )
+            .bind(after_time)
+            .bind(after_id)
+            .bind(request.query_limit())
+            .fetch_all(self.pool)
+            .await
+            .map_err(|error| database("list sessions", error))?;
+            let items = rows
+                .into_iter()
+                .map(session_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(finish_page(items, request.limit(), |record| {
+                PageCursor::new(record.created_at, record.id.as_str())
+                    .expect("persisted session id is a valid cursor")
+            }))
+        })
         .await
-        .map_err(|error| database("list sessions", error))?;
-        let items = rows
-            .into_iter()
-            .map(session_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(finish_page(items, request.limit(), |record| {
-            PageCursor::new(record.created_at, record.id.as_str())
-                .expect("persisted session id is a valid cursor")
-        }))
     }
 
     /// Applies a valid lifecycle transition with optimistic concurrency.
@@ -191,9 +278,16 @@ impl<'store> SessionRepository<'store> {
         status: SessionStatus,
         updated_at: TimestampMs,
     ) -> Result<SessionRecord, StateError> {
-        let current = self
-            .get(id)
-            .await?
+        let operation = "begin session update";
+        let timing = RepositoryDeadline::new(self.identity)?;
+        let current =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(timing.deadline), async {
+                #[cfg(test)]
+                wait_at_read_test_barrier(self.owner).await;
+                self.get(id).await
+            })
+            .await
+            .map_err(|_| timing.timeout_error(operation))??
             .ok_or_else(|| not_found("session", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("session", id.as_str(), expected_version));
@@ -209,9 +303,14 @@ impl<'store> SessionRepository<'store> {
             });
         }
         validate_update_time(current.updated_at, updated_at)?;
-        let mut transaction =
-            begin_verified_write(self.pool, self.owner, self.identity, "begin session update")
-                .await?;
+        let mut transaction = begin_verified_write_with_deadline(
+            self.pool,
+            self.owner,
+            self.identity,
+            operation,
+            timing,
+        )
+        .await?;
         let row = sqlx::query(
             "UPDATE sessions
              SET status = ?, updated_at_ms = ?, version = version + 1
@@ -312,41 +411,47 @@ impl<'store> DeviceRepository<'store> {
 
     /// Reads one device.
     pub async fn get(&self, id: &DeviceId) -> Result<Option<DeviceRecord>, StateError> {
-        let row = sqlx::query(
-            "SELECT id, display_name, created_at_ms, updated_at_ms, version
-             FROM devices WHERE id = ?",
-        )
-        .bind(id.as_str())
-        .fetch_optional(self.pool)
+        read_with_deadline(self.identity, "read device", async {
+            let row = sqlx::query(
+                "SELECT id, display_name, created_at_ms, updated_at_ms, version
+                 FROM devices WHERE id = ?",
+            )
+            .bind(id.as_str())
+            .fetch_optional(self.pool)
+            .await
+            .map_err(|error| database("read device", error))?;
+            row.map(device_from_row).transpose()
+        })
         .await
-        .map_err(|error| database("read device", error))?;
-        row.map(device_from_row).transpose()
     }
 
     /// Lists devices in stable creation-time and identifier order.
     pub async fn list(&self, request: &PageRequest) -> Result<Page<DeviceRecord>, StateError> {
-        let (after_time, after_id) = request.after_parts();
-        let rows = sqlx::query(
-            "SELECT id, display_name, created_at_ms, updated_at_ms, version
-             FROM devices
-             WHERE (created_at_ms, id) > (?, ?)
-             ORDER BY created_at_ms, id
-             LIMIT ?",
-        )
-        .bind(after_time)
-        .bind(after_id)
-        .bind(request.query_limit())
-        .fetch_all(self.pool)
+        read_with_deadline(self.identity, "list devices", async {
+            let (after_time, after_id) = request.after_parts();
+            let rows = sqlx::query(
+                "SELECT id, display_name, created_at_ms, updated_at_ms, version
+                 FROM devices
+                 WHERE (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id
+                 LIMIT ?",
+            )
+            .bind(after_time)
+            .bind(after_id)
+            .bind(request.query_limit())
+            .fetch_all(self.pool)
+            .await
+            .map_err(|error| database("list devices", error))?;
+            let items = rows
+                .into_iter()
+                .map(device_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(finish_page(items, request.limit(), |record| {
+                PageCursor::new(record.created_at, record.id.as_str())
+                    .expect("persisted device id is a valid cursor")
+            }))
+        })
         .await
-        .map_err(|error| database("list devices", error))?;
-        let items = rows
-            .into_iter()
-            .map(device_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(finish_page(items, request.limit(), |record| {
-            PageCursor::new(record.created_at, record.id.as_str())
-                .expect("persisted device id is a valid cursor")
-        }))
     }
 
     /// Renames a device with optimistic concurrency.
@@ -357,18 +462,28 @@ impl<'store> DeviceRepository<'store> {
         display_name: impl Into<String>,
         updated_at: TimestampMs,
     ) -> Result<DeviceRecord, StateError> {
+        let operation = "begin device rename";
+        let timing = RepositoryDeadline::new(self.identity)?;
         let display_name = validate_text("device display name", display_name.into())?;
-        let current = self
-            .get(id)
-            .await?
-            .ok_or_else(|| not_found("device", id.as_str()))?;
+        let current = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(timing.deadline),
+            self.get(id),
+        )
+        .await
+        .map_err(|_| timing.timeout_error(operation))??
+        .ok_or_else(|| not_found("device", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("device", id.as_str(), expected_version));
         }
         validate_update_time(current.updated_at, updated_at)?;
-        let mut transaction =
-            begin_verified_write(self.pool, self.owner, self.identity, "begin device rename")
-                .await?;
+        let mut transaction = begin_verified_write_with_deadline(
+            self.pool,
+            self.owner,
+            self.identity,
+            operation,
+            timing,
+        )
+        .await?;
         let row = sqlx::query(
             "UPDATE devices
              SET display_name = ?, updated_at_ms = ?, version = version + 1
@@ -443,15 +558,18 @@ impl<'store> AuthenticationRepository<'store> {
         &self,
         id: &AuthenticationId,
     ) -> Result<Option<AuthenticationRecord>, StateError> {
-        let row = sqlx::query(
-            "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
-             FROM authentication_records WHERE id = ?",
-        )
-        .bind(id.as_str())
-        .fetch_optional(self.pool)
+        read_with_deadline(self.identity, "read authentication", async {
+            let row = sqlx::query(
+                "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
+                 FROM authentication_records WHERE id = ?",
+            )
+            .bind(id.as_str())
+            .fetch_optional(self.pool)
+            .await
+            .map_err(|error| database("read authentication", error))?;
+            row.map(authentication_from_row).transpose()
+        })
         .await
-        .map_err(|error| database("read authentication", error))?;
-        row.map(authentication_from_row).transpose()
     }
 
     /// Lists a device's authentications in stable creation-time and identifier order.
@@ -460,30 +578,33 @@ impl<'store> AuthenticationRepository<'store> {
         device_id: &DeviceId,
         request: &PageRequest,
     ) -> Result<Page<AuthenticationRecord>, StateError> {
-        let (after_time, after_id) = request.after_parts();
-        let rows = sqlx::query(
-            "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
-             FROM authentication_records
-             WHERE device_id = ?
-               AND (created_at_ms, id) > (?, ?)
-             ORDER BY created_at_ms, id
-             LIMIT ?",
-        )
-        .bind(device_id.as_str())
-        .bind(after_time)
-        .bind(after_id)
-        .bind(request.query_limit())
-        .fetch_all(self.pool)
+        read_with_deadline(self.identity, "list authentications", async {
+            let (after_time, after_id) = request.after_parts();
+            let rows = sqlx::query(
+                "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
+                 FROM authentication_records
+                 WHERE device_id = ?
+                   AND (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id
+                 LIMIT ?",
+            )
+            .bind(device_id.as_str())
+            .bind(after_time)
+            .bind(after_id)
+            .bind(request.query_limit())
+            .fetch_all(self.pool)
+            .await
+            .map_err(|error| database("list authentications", error))?;
+            let items = rows
+                .into_iter()
+                .map(authentication_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(finish_page(items, request.limit(), |record| {
+                PageCursor::new(record.created_at, record.id.as_str())
+                    .expect("persisted authentication id is a valid cursor")
+            }))
+        })
         .await
-        .map_err(|error| database("list authentications", error))?;
-        let items = rows
-            .into_iter()
-            .map(authentication_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(finish_page(items, request.limit(), |record| {
-            PageCursor::new(record.created_at, record.id.as_str())
-                .expect("persisted authentication id is a valid cursor")
-        }))
     }
 
     /// Applies a valid lifecycle transition with optimistic concurrency.
@@ -495,11 +616,16 @@ impl<'store> AuthenticationRepository<'store> {
         subject: Option<String>,
         updated_at: TimestampMs,
     ) -> Result<AuthenticationRecord, StateError> {
+        let operation = "begin authentication update";
+        let timing = RepositoryDeadline::new(self.identity)?;
         let subject = validate_auth_subject(status, subject)?;
-        let current = self
-            .get(id)
-            .await?
-            .ok_or_else(|| not_found("authentication", id.as_str()))?;
+        let current = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(timing.deadline),
+            self.get(id),
+        )
+        .await
+        .map_err(|_| timing.timeout_error(operation))??
+        .ok_or_else(|| not_found("authentication", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("authentication", id.as_str(), expected_version));
         }
@@ -522,11 +648,12 @@ impl<'store> AuthenticationRepository<'store> {
             });
         }
         validate_update_time(current.updated_at, updated_at)?;
-        let mut transaction = begin_verified_write(
+        let mut transaction = begin_verified_write_with_deadline(
             self.pool,
             self.owner,
             self.identity,
-            "begin authentication update",
+            operation,
+            timing,
         )
         .await?;
         let row = sqlx::query(
@@ -590,15 +717,18 @@ impl<'store> TaskRepository<'store> {
 
     /// Reads one task.
     pub async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, StateError> {
-        let row = sqlx::query(
-            "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
-             FROM tasks WHERE id = ?",
-        )
-        .bind(id.as_str())
-        .fetch_optional(self.pool)
+        read_with_deadline(self.identity, "read task", async {
+            let row = sqlx::query(
+                "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
+                 FROM tasks WHERE id = ?",
+            )
+            .bind(id.as_str())
+            .fetch_optional(self.pool)
+            .await
+            .map_err(|error| database("read task", error))?;
+            row.map(task_from_row).transpose()
+        })
         .await
-        .map_err(|error| database("read task", error))?;
-        row.map(task_from_row).transpose()
     }
 
     /// Lists a session's tasks in stable creation-time and identifier order.
@@ -607,30 +737,33 @@ impl<'store> TaskRepository<'store> {
         session_id: &SessionId,
         request: &PageRequest,
     ) -> Result<Page<TaskRecord>, StateError> {
-        let (after_time, after_id) = request.after_parts();
-        let rows = sqlx::query(
-            "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
-             FROM tasks
-             WHERE session_id = ?
-               AND (created_at_ms, id) > (?, ?)
-             ORDER BY created_at_ms, id
-             LIMIT ?",
-        )
-        .bind(session_id.as_str())
-        .bind(after_time)
-        .bind(after_id)
-        .bind(request.query_limit())
-        .fetch_all(self.pool)
+        read_with_deadline(self.identity, "list tasks", async {
+            let (after_time, after_id) = request.after_parts();
+            let rows = sqlx::query(
+                "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
+                 FROM tasks
+                 WHERE session_id = ?
+                   AND (created_at_ms, id) > (?, ?)
+                 ORDER BY created_at_ms, id
+                 LIMIT ?",
+            )
+            .bind(session_id.as_str())
+            .bind(after_time)
+            .bind(after_id)
+            .bind(request.query_limit())
+            .fetch_all(self.pool)
+            .await
+            .map_err(|error| database("list tasks", error))?;
+            let items = rows
+                .into_iter()
+                .map(task_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(finish_page(items, request.limit(), |record| {
+                PageCursor::new(record.created_at, record.id.as_str())
+                    .expect("persisted task id is a valid cursor")
+            }))
+        })
         .await
-        .map_err(|error| database("list tasks", error))?;
-        let items = rows
-            .into_iter()
-            .map(task_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(finish_page(items, request.limit(), |record| {
-            PageCursor::new(record.created_at, record.id.as_str())
-                .expect("persisted task id is a valid cursor")
-        }))
     }
 
     /// Applies a valid lifecycle transition with optimistic concurrency.
@@ -641,10 +774,15 @@ impl<'store> TaskRepository<'store> {
         status: TaskStatus,
         updated_at: TimestampMs,
     ) -> Result<TaskRecord, StateError> {
-        let current = self
-            .get(id)
-            .await?
-            .ok_or_else(|| not_found("task", id.as_str()))?;
+        let operation = "begin task update";
+        let timing = RepositoryDeadline::new(self.identity)?;
+        let current = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(timing.deadline),
+            self.get(id),
+        )
+        .await
+        .map_err(|_| timing.timeout_error(operation))??
+        .ok_or_else(|| not_found("task", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("task", id.as_str(), expected_version));
         }
@@ -664,8 +802,14 @@ impl<'store> TaskRepository<'store> {
             });
         }
         validate_update_time(current.updated_at, updated_at)?;
-        let mut transaction =
-            begin_verified_write(self.pool, self.owner, self.identity, "begin task update").await?;
+        let mut transaction = begin_verified_write_with_deadline(
+            self.pool,
+            self.owner,
+            self.identity,
+            operation,
+            timing,
+        )
+        .await?;
         let row = sqlx::query(
             "UPDATE tasks
              SET status = ?, updated_at_ms = ?, version = version + 1
@@ -695,20 +839,23 @@ async fn begin_verified_write(
     identity: OperationalIdentity<'_>,
     operation: &'static str,
 ) -> Result<VerifiedWriteTransaction, StateError> {
-    let timeout_ms = u64::try_from(identity.operation_timeout.as_millis()).unwrap_or(u64::MAX);
-    let deadline = std::time::Instant::now()
-        .checked_add(identity.operation_timeout)
-        .ok_or(StateError::InvalidValue {
-            field: "repository operation timeout",
-            reason: "is too large for the monotonic clock",
-        })?;
-    let cleanup_deadline =
-        deadline
-            .checked_add(identity.cleanup_timeout)
-            .ok_or(StateError::InvalidValue {
-                field: "repository cleanup timeout",
-                reason: "is too large for the monotonic clock",
-            })?;
+    let deadline = RepositoryDeadline::new(identity)?;
+    begin_verified_write_with_deadline(pool, owner, identity, operation, deadline).await
+}
+
+async fn begin_verified_write_with_deadline(
+    pool: &SqlitePool,
+    owner: &str,
+    identity: OperationalIdentity<'_>,
+    operation: &'static str,
+    timing: RepositoryDeadline,
+) -> Result<VerifiedWriteTransaction, StateError> {
+    let RepositoryDeadline {
+        deadline,
+        cleanup_deadline,
+        cancelled,
+        timeout_ms,
+    } = timing;
     let connection =
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), pool.acquire())
             .await
@@ -717,7 +864,6 @@ async fn begin_verified_write(
                 timeout_ms,
             })?
             .map_err(|error| database(operation, error))?;
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let begin_timeout = identity
         .busy_timeout
         .min(deadline.saturating_duration_since(std::time::Instant::now()));
@@ -751,6 +897,11 @@ async fn begin_verified_write(
         cancelled,
         restore_busy_timeout: identity.busy_timeout,
         timeout_ms,
+        #[cfg(test)]
+        rollback_cleanup_test_mode: ROLLBACK_CLEANUP_TEST_MODES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(owner),
     };
     let ownership = sqlx::query(
         "UPDATE claw_writer_lock
@@ -782,6 +933,28 @@ async fn begin_verified_write(
     #[cfg(test)]
     wait_at_write_test_barrier(owner).await;
     Ok(transaction)
+}
+
+#[cfg(test)]
+async fn wait_at_read_test_barrier(owner: &str) {
+    let barrier = READ_TEST_BARRIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(owner)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        READ_TEST_BARRIERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(owner);
+    }
 }
 
 #[cfg(test)]
@@ -1350,7 +1523,10 @@ fn conflict(entity: &'static str, id: &str, expected_version: i64) -> StateError
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Arc, COMMIT_TEST_BARRIERS, WriteTestBarrier};
+    use super::{
+        Arc, COMMIT_TEST_BARRIERS, READ_TEST_BARRIERS, ROLLBACK_CLEANUP_TEST_MODES,
+        WriteTestBarrier,
+    };
     #[cfg(unix)]
     use super::{COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS};
 
@@ -1363,6 +1539,24 @@ pub(crate) mod test_support {
         WRITE_TEST_BARRIERS
             .lock()
             .expect("write test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    pub(crate) fn set_read_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        READ_TEST_BARRIERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 owner.to_owned(),
                 WriteTestBarrier {
@@ -1399,8 +1593,26 @@ pub(crate) mod test_support {
         (entered, release)
     }
 
-    pub(crate) fn fail_next_rollback_cleanup(owner: &str, mode: u8) {
-        let _ = (owner, mode);
+    pub(crate) fn disrupt_next_rollback_cleanup(owner: &str, mode: u8) {
+        assert!((1..=3).contains(&mode));
+        assert!(
+            ROLLBACK_CLEANUP_TEST_MODES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(owner.to_owned(), mode)
+                .is_none(),
+            "rollback cleanup disruption must be consumed before replacement"
+        );
+    }
+
+    pub(crate) fn assert_rollback_cleanup_disruption_consumed(owner: &str) {
+        assert!(
+            !ROLLBACK_CLEANUP_TEST_MODES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(owner),
+            "rollback cleanup disruption was not consumed"
+        );
     }
 
     pub(crate) async fn drop_transaction_without_runtime(pool: &sqlx::SqlitePool) {

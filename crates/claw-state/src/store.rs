@@ -94,6 +94,10 @@ static FAIL_AFTER_PUBLICATION: std::sync::LazyLock<Mutex<std::collections::HashS
 static CREATE_DESTINATION_BEFORE_PUBLICATION: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static EXPIRE_PUBLICATION_DEADLINE: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, u8>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(all(test, windows))]
 static FAIL_WINDOWS_SOURCE_REMOVAL: std::sync::LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
@@ -244,6 +248,7 @@ pub struct StoreConfig {
     busy_timeout: Duration,
     acquire_timeout: Duration,
     open_timeout: Duration,
+    operation_timeout: Duration,
     close_timeout: Duration,
     synchronous: SynchronousPolicy,
 }
@@ -263,6 +268,7 @@ impl StoreConfig {
             busy_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
             open_timeout: Duration::from_secs(30),
+            operation_timeout: Duration::from_secs(30),
             close_timeout: Duration::from_millis(1_500),
             synchronous: SynchronousPolicy::Full,
         }
@@ -293,6 +299,13 @@ impl StoreConfig {
     #[must_use]
     pub const fn with_open_timeout(mut self, open_timeout: Duration) -> Self {
         self.open_timeout = open_timeout;
+        self
+    }
+
+    /// Sets one overall deadline for each post-open state operation.
+    #[must_use]
+    pub const fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.operation_timeout = operation_timeout;
         self
     }
 
@@ -447,6 +460,8 @@ static PROCESS_IDENTITIES: LazyLock<StdMutex<std::collections::HashSet<(u64, u64
 struct ProcessIdentityGuard {
     #[cfg(unix)]
     identity: Option<(u64, u64)>,
+    #[cfg(windows)]
+    lock_file: Option<File>,
 }
 
 struct OpenDeadlineState {
@@ -585,6 +600,10 @@ impl Drop for ProcessIdentityGuard {
                 .expect("process identity registry lock poisoned")
                 .remove(&identity);
         }
+        #[cfg(windows)]
+        if let Some(lock_file) = self.lock_file.take() {
+            let _ = File::unlock(&lock_file);
+        }
     }
 }
 
@@ -703,6 +722,26 @@ async fn open_timeout_error(
             operation: "state store open",
             primary: Box::new(primary),
             cleanup: format!("open cleanup lifecycle failed to join: {cleanup}"),
+        },
+    }
+}
+
+async fn close_pool_after_open_failure(
+    pool: &SqlitePool,
+    deadline_state: &OpenDeadlineState,
+    primary: StateError,
+) -> StateError {
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline_state.deadline),
+        pool.close(),
+    )
+    .await
+    {
+        Ok(()) => primary,
+        Err(_) => StateError::OperationCleanupFailed {
+            operation: "state store open",
+            primary: Box::new(primary),
+            cleanup: "pre-claim pool close exceeded the cleanup deadline".to_owned(),
         },
     }
 }
@@ -1124,34 +1163,48 @@ impl StateStore {
             .await
         }
 
-        let initial = pool
-            .acquire()
-            .await
-            .map_err(|error| database("acquire initial state connection", error))?;
+        let initial = match pool.acquire().await {
+            Ok(initial) => initial,
+            Err(error) => {
+                let primary = database("acquire initial state connection", error);
+                return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
+            }
+        };
         let initial_busy_timeout = configured_busy_timeout.min(
             deadline_state
                 .deadline
                 .saturating_duration_since(std::time::Instant::now()),
         );
-        let mut initial = claw_sqlite_file_control::begin_manual_pool_transaction_with_restore(
-            initial,
-            initial_busy_timeout,
-            initial_busy_timeout,
-            Some(Arc::clone(&deadline_state.cancelled)),
-        )
-        .await
-        .map_err(|error| file_control_database("begin SQLite sidecar initialization", error))?;
+        let mut initial =
+            match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore(
+                initial,
+                initial_busy_timeout,
+                initial_busy_timeout,
+                Some(Arc::clone(&deadline_state.cancelled)),
+            )
+            .await
+            {
+                Ok(initial) => initial,
+                Err(error) => {
+                    let primary =
+                        file_control_database("begin SQLite sidecar initialization", error);
+                    return Err(
+                        close_pool_after_open_failure(&pool, &deadline_state, primary).await,
+                    );
+                }
+            };
         if let Err(error) = initialize_connection_sidecars(&mut initial).await {
             let primary = database("initialize SQLite sidecars", error);
             let rollback = initial.rollback().await;
-            return Err(match rollback {
+            let primary = match rollback {
                 Ok(_) => primary,
                 Err(cleanup) => StateError::OperationCleanupFailed {
                     operation: "initialize SQLite sidecars",
                     primary: Box::new(primary),
                     cleanup: cleanup.to_string(),
                 },
-            });
+            };
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
         }
         let mut initial = initial
             .commit_with_deadline(
@@ -1259,7 +1312,7 @@ impl StateStore {
             _database_parent: database_parent.file,
             writer_generation,
             max_connections: config.max_connections,
-            operation_timeout: config.open_timeout,
+            operation_timeout: config.operation_timeout,
             busy_timeout: config.busy_timeout,
             close_timeout: config.close_timeout,
         })
@@ -1834,6 +1887,12 @@ impl StateStore {
             ));
         }
         let pool_closed = final_connection_closed && pool_drain_completed;
+        #[cfg(windows)]
+        let os_lock_released = {
+            drop(self._process_identity);
+            true
+        };
+        #[cfg(not(windows))]
         let os_lock_released = match File::unlock(&self.lock_file) {
             Ok(()) => true,
             Err(error) => {
@@ -2127,6 +2186,11 @@ fn validate_config(config: &StoreConfig) -> Result<(), StateError> {
     )?;
     validate_duration("open timeout", config.open_timeout, MAX_CONFIGURED_TIMEOUT)?;
     validate_duration(
+        "operation timeout",
+        config.operation_timeout,
+        MAX_CONFIGURED_TIMEOUT,
+    )?;
+    validate_duration(
         "close timeout",
         config.close_timeout,
         Duration::from_millis(1_500),
@@ -2282,7 +2346,7 @@ fn validate_state_directory(path: &Path) -> Result<(), StateError> {
     })? {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
-            reason: "state directory grants write or delete access outside the service identity",
+            reason: "state directory does not have the exact protected service DACL",
         });
     }
     Ok(())
@@ -2413,7 +2477,7 @@ fn validate_private_database_file(path: &Path, file: &File) -> Result<(), StateE
     })? {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
-            reason: "state database grants write or delete access outside the service identity",
+            reason: "state database does not have the exact protected service DACL",
         });
     }
     Ok(())
@@ -3486,45 +3550,35 @@ impl SnapshotCleanupGuard {
             self.state = SnapshotPublicationState::Reclaimed;
             return Ok(());
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        for artifact in artifacts.into_iter().take(1) {
-            loop {
-                #[cfg(unix)]
-                let removal = if let Some(parent) = self.pinned_parent.as_ref() {
-                    artifact
-                        .file_name()
-                        .ok_or_else(|| std::io::Error::other("artifact has no file name"))
-                        .and_then(|name| {
-                            rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty())
-                                .map_err(std::io::Error::from)
-                        })
-                } else {
-                    std::fs::remove_file(&artifact)
-                };
-                #[cfg(not(unix))]
-                let removal = std::fs::remove_file(&artifact);
-                match removal {
-                    Ok(()) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(error)
-                        if std::time::Instant::now() < deadline
-                            && (matches!(error.raw_os_error(), Some(32) | Some(33))
-                                || error.kind() == std::io::ErrorKind::PermissionDenied) =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => {
-                        return Err(file_error(
-                            "remove snapshot cleanup artifact",
-                            &artifact,
-                            error,
-                        ));
+        #[cfg(not(unix))]
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            for artifact in artifacts.into_iter().take(1) {
+                loop {
+                    let removal = std::fs::remove_file(&artifact);
+                    match removal {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(error)
+                            if std::time::Instant::now() < deadline
+                                && (matches!(error.raw_os_error(), Some(32) | Some(33))
+                                    || error.kind() == std::io::ErrorKind::PermissionDenied) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            return Err(file_error(
+                                "remove snapshot cleanup artifact",
+                                &artifact,
+                                error,
+                            ));
+                        }
                     }
                 }
             }
+            self.state = SnapshotPublicationState::Reclaimed;
+            Ok(())
         }
-        self.state = SnapshotPublicationState::Reclaimed;
-        Ok(())
     }
 }
 
@@ -3945,21 +3999,38 @@ impl SidecarReservations {
             _shm_file,
             _journal_file,
         } = self;
-        verify_path_identity(&wal_path, &_wal_file)?;
-        verify_path_identity(&shm_path, &_shm_file)?;
-        verify_path_identity(&journal_path, &_journal_file)?;
-        drop((_wal_file, _shm_file, _journal_file));
-        std::fs::remove_file(&wal_path)
-            .map_err(|error| file_error("release destination WAL reservation", &wal_path, error))?;
-        std::fs::remove_file(&shm_path)
-            .map_err(|error| file_error("release destination SHM reservation", &shm_path, error))?;
-        std::fs::remove_file(&journal_path).map_err(|error| {
-            file_error(
+        let mut failure = None;
+        for (path, file, operation) in [
+            (wal_path, _wal_file, "release destination WAL reservation"),
+            (shm_path, _shm_file, "release destination SHM reservation"),
+            (
+                journal_path,
+                _journal_file,
                 "release destination journal reservation",
-                &journal_path,
-                error,
-            )
-        })
+            ),
+        ] {
+            let release = match verify_path_identity(&path, &file) {
+                Ok(()) => {
+                    drop(file);
+                    std::fs::remove_file(&path).map_err(|error| file_error(operation, &path, error))
+                }
+                Err(error) => {
+                    drop(file);
+                    Err(error)
+                }
+            };
+            if let Err(error) = release {
+                failure = Some(match failure {
+                    None => error,
+                    Some(primary) => append_operation_cleanup(
+                        "release destination sidecar reservations",
+                        primary,
+                        error.to_string(),
+                    ),
+                });
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -4118,7 +4189,8 @@ fn publish_bound_snapshot(
     snapshot.verify()?;
     verify_directory_path_identity(&destination_directory.path, &destination_directory.file)?;
     if let Some((deadline, timeout_ms)) = publication_deadline
-        && tokio::time::Instant::now() >= deadline
+        && (tokio::time::Instant::now() >= deadline
+            || take_publication_deadline_expiration(destination, 0))
     {
         return Err(StateError::OperationTimedOut {
             operation,
@@ -4137,7 +4209,6 @@ fn publish_bound_snapshot(
             ),
         ));
     }
-    cleanup.begin_publication();
     if let Err(error) = reservations.release() {
         cleanup.mark_publication_uncertain();
         return Err(StateError::PublicationUncertain {
@@ -4145,11 +4216,31 @@ fn publish_bound_snapshot(
             reason: format!("bound snapshot sidecar reservation release failed: {error}"),
         });
     }
+    if let Some((deadline, timeout_ms)) = publication_deadline
+        && (tokio::time::Instant::now() >= deadline
+            || take_publication_deadline_expiration(destination, 1))
+    {
+        return Err(StateError::OperationTimedOut {
+            operation,
+            timeout_ms,
+        });
+    }
+    cleanup.begin_publication();
     if let Err(error) = cleanup.clear_staging_marker() {
         cleanup.mark_publication_uncertain();
         return Err(StateError::PublicationUncertain {
             path: destination.to_owned(),
             reason: format!("bound snapshot staging marker removal failed: {error}"),
+        });
+    }
+    if publication_deadline.is_some_and(|(deadline, _)| {
+        tokio::time::Instant::now() >= deadline
+            || take_publication_deadline_expiration(destination, 2)
+    }) {
+        cleanup.mark_publication_uncertain();
+        return Err(StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!("{operation} deadline expired immediately after publication"),
         });
     }
     cleanup.disarm();
@@ -4185,6 +4276,24 @@ fn publish_bound_snapshot(
         path: destination.to_owned(),
         reason: format!("bound snapshot was published but sync failed: {error}"),
     })
+}
+
+#[cfg(test)]
+fn take_publication_deadline_expiration(destination: &Path, stage: u8) -> bool {
+    let mut expirations = EXPIRE_PUBLICATION_DEADLINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if expirations.get(destination) == Some(&stage) {
+        expirations.remove(destination);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn take_publication_deadline_expiration(_destination: &Path, _stage: u8) -> bool {
+    false
 }
 
 struct PinnedPrivateDirectory {
@@ -4312,7 +4421,7 @@ fn validate_pinned_state_directory(path: &Path, file: &File) -> Result<(), State
     })? {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
-            reason: "state directory grants write or delete access outside the service identity",
+            reason: "state directory does not have the exact protected service DACL",
         });
     }
     Ok(())
@@ -4807,7 +4916,7 @@ fn writer_identity_path_for(database: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
+fn open_writer_lock(path: &Path) -> Result<File, StateError> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, WRITE_DAC, WRITE_OWNER};
@@ -4844,15 +4953,25 @@ fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
             }
         })?;
     }
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(StateError::StoreLocked {
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn lock_writer_file(path: &Path, file: File) -> Result<File, StateError> {
+    if !claw_sqlite_file_control::windows_try_lock_writer_marker(&file)
+        .map_err(|error| file_error("acquire writer lock", path, error))?
+    {
+        Err(StateError::StoreLocked {
             path: path.to_owned(),
-        }),
-        Err(std::fs::TryLockError::Error(error)) => {
-            Err(file_error("acquire writer lock", path, error))
-        }
+        })
+    } else {
+        Ok(file)
     }
+}
+
+#[cfg(windows)]
+fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
+    lock_writer_file(path, open_writer_lock(path)?)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -4913,24 +5032,24 @@ fn acquire_store_lock(
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
     let lock_path = lock_path_for(path);
-    let mut lock_file = acquire_writer_lock(&lock_path)?;
-    validate_private_database_file(&lock_path, &lock_file)?;
+    let mut lock_guard = open_writer_lock(&lock_path)?;
+    validate_private_database_file(&lock_path, &lock_guard)?;
     let database_identity = claw_sqlite_file_control::windows_file_identity(database_file)
         .map_err(|_| StateError::InvalidPath {
             path: path.to_owned(),
             reason: "stable Windows database identity is unavailable",
         })?;
     let lock_identity =
-        claw_sqlite_file_control::windows_file_identity(&lock_file).map_err(|_| {
+        claw_sqlite_file_control::windows_file_identity(&lock_guard).map_err(|_| {
             StateError::InvalidPath {
                 path: lock_path.clone(),
                 reason: "stable Windows lock identity is unavailable",
             }
         })?;
     let mut contents = String::new();
-    lock_file
+    lock_guard
         .seek(SeekFrom::Start(0))
-        .and_then(|_| lock_file.read_to_string(&mut contents))
+        .and_then(|_| lock_guard.read_to_string(&mut contents))
         .map_err(|error| file_error("read Windows writer-lock header", &lock_path, error))?;
     let header_prefix = format!(
         "v2\n{}\n{}\n",
@@ -4939,10 +5058,10 @@ fn acquire_store_lock(
     );
     if contents.is_empty() {
         contents = format!("{header_prefix}{}", writer_owner()?);
-        lock_file
+        lock_guard
             .seek(SeekFrom::Start(0))
-            .and_then(|_| lock_file.write_all(contents.as_bytes()))
-            .and_then(|_| lock_file.sync_all())
+            .and_then(|_| lock_guard.write_all(contents.as_bytes()))
+            .and_then(|_| lock_guard.sync_all())
             .map_err(|error| {
                 file_error("initialize Windows writer-lock header", &lock_path, error)
             })?;
@@ -4955,7 +5074,28 @@ fn acquire_store_lock(
             reason: "Windows writer-lock header does not match held file identities",
         });
     }
-    Ok((lock_path, lock_file, ProcessIdentityGuard {}))
+    let lock_file = open_windows_file_no_follow(&lock_path, false, false)?;
+    validate_private_database_file(&lock_path, &lock_file)?;
+    if claw_sqlite_file_control::windows_file_identity(&lock_file).map_err(|_| {
+        StateError::InvalidPath {
+            path: lock_path.clone(),
+            reason: "stable Windows lock identity is unavailable",
+        }
+    })? != lock_identity
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path,
+            reason: "Windows writer-lock identity changed while acquiring ownership",
+        });
+    }
+    let lock_guard = lock_writer_file(&lock_path, lock_guard)?;
+    Ok((
+        lock_path,
+        lock_file,
+        ProcessIdentityGuard {
+            lock_file: Some(lock_guard),
+        },
+    ))
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -5818,8 +5958,8 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
             .and_then(|_| identity_file.sync_all())
             .map_err(|error| file_error("persist writer lock identity", &identity_path, error))?;
     }
-    File::unlock(&identity_file)
-        .map_err(|error| file_error("release writer identity lock", &identity_path, error))
+    drop(identity_file);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5946,9 +6086,13 @@ async fn inspect_database(
             source,
             inspection,
             snapshot_memory,
-            deadline,
-            cancelled,
-            max_pages,
+            claw_sqlite_file_control::BackupExecutionContext {
+                deadline,
+                cancelled,
+                max_pages,
+                source_busy_timeout: Duration::ZERO,
+                destination_busy_timeout: Duration::ZERO,
+            },
         )
         .await
         .map_err(|error| file_control_database("copy database for inspection", error))?;
@@ -7115,9 +7259,13 @@ async fn materialize_authenticated_snapshot(
             source_connection,
             destination_connection,
             operation_reservation,
-            deadline,
-            Arc::clone(&cancelled),
-            max_pages,
+            claw_sqlite_file_control::BackupExecutionContext {
+                deadline,
+                cancelled: Arc::clone(&cancelled),
+                max_pages,
+                source_busy_timeout: Duration::ZERO,
+                destination_busy_timeout: Duration::ZERO,
+            },
         )
         .await
         .map_err(|error| file_control_database("copy authenticated restore image", error))?;
@@ -7907,6 +8055,8 @@ async fn backup_pool(
         operation: "SQLite backup",
         timeout_ms,
     };
+    let source_busy_timeout =
+        operational_identity.map_or(MAX_CONFIGURED_TIMEOUT, |identity| identity.busy_timeout);
     let snapshot_memory = reserve_snapshot_memory(deadline, "SQLite backup", timeout_ms).await?;
     let deadline_state = Arc::new(OpenDeadlineState {
         work_cutoff: deadline.into_std(),
@@ -8020,9 +8170,13 @@ async fn backup_pool(
         connection,
         destination_connection,
         operation_reservation,
-        deadline.into_std(),
-        Arc::clone(&deadline_state.cancelled),
-        max_pages,
+        claw_sqlite_file_control::BackupExecutionContext {
+            deadline: deadline.into_std(),
+            cancelled: Arc::clone(&deadline_state.cancelled),
+            max_pages,
+            source_busy_timeout,
+            destination_busy_timeout: Duration::ZERO,
+        },
     )
     .await
     .map_err(|error| {
@@ -8613,13 +8767,15 @@ fn file_error(operation: &'static str, path: &Path, error: std::io::Error) -> St
 pub(crate) mod test_support {
     use std::path::Path;
 
+    #[cfg(unix)]
+    use sqlx::SqliteConnection;
     use sqlx::SqlitePool;
 
     #[cfg(unix)]
     use super::verify_sqlite_connection_identity;
     use super::{
-        FAIL_AFTER_PUBLICATION, PinnedSnapshot, StateStore, create_trusted_backup_seal,
-        migration_checksum,
+        EXPIRE_PUBLICATION_DEADLINE, FAIL_AFTER_PUBLICATION, PinnedSnapshot, StateStore,
+        create_trusted_backup_seal, migration_checksum,
     };
     use crate::StateError;
 
@@ -8695,8 +8851,14 @@ pub(crate) mod test_support {
         let (_lock_path, lock_file, process_identity) =
             super::acquire_store_lock(&path, &database_file, true)
                 .expect("initialize store identity fixture");
-        std::fs::File::unlock(&lock_file).expect("unlock store identity fixture");
-        drop((lock_file, process_identity, database_file));
+        #[cfg(windows)]
+        drop(process_identity);
+        #[cfg(not(windows))]
+        {
+            std::fs::File::unlock(&lock_file).expect("unlock store identity fixture");
+            drop(process_identity);
+        }
+        drop((lock_file, database_file));
     }
 
     pub(crate) fn fail_after_publication_once(destination: &Path) {
@@ -8706,6 +8868,23 @@ pub(crate) mod test_support {
             .lock()
             .expect("publication failpoint lock poisoned")
             .insert(destination);
+    }
+
+    pub(crate) fn expire_publication_deadline_once(destination: &Path, stage: u8) {
+        assert!(
+            matches!(stage, 0..=2),
+            "publication deadline stage is valid"
+        );
+        let destination =
+            super::resolve_database_path(destination).expect("resolve publication deadline path");
+        let previous = EXPIRE_PUBLICATION_DEADLINE
+            .lock()
+            .expect("publication deadline failpoint lock poisoned")
+            .insert(destination, stage);
+        assert!(
+            previous.is_none(),
+            "publication deadline failpoint must be unique"
+        );
     }
 
     pub(crate) fn fail_final_connection_close_once(path: &Path, timeout: bool) {
