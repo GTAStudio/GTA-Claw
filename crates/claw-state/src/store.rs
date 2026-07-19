@@ -10,7 +10,6 @@ use std::sync::{
 use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
-use claw_sqlite_file_control::BeginOwnedConnection as _;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -99,27 +98,58 @@ where
     T: Send + 'static,
     Operation: FnOnce() -> Result<T, StateError> + Send + 'static,
 {
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    struct FilesystemPayload<T, Operation> {
+        work: Option<Operation>,
+        result: Option<std::sync::mpsc::SyncSender<Result<T, StateError>>>,
+        undelivered: Option<Result<T, StateError>>,
+    }
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
     owner
-        .handoff(move |_, _| {
-            let _ = result_tx.send(work());
-        })
+        .handoff_payload(
+            FilesystemPayload {
+                work: Some(work),
+                result: Some(result_tx),
+                undelivered: None,
+            },
+            |_, _, payload| {
+                let result = payload.work.take().expect("filesystem work is single-use")();
+                let sender = payload
+                    .result
+                    .take()
+                    .expect("filesystem result is single-use");
+                if let Err(result) = sender.send(result) {
+                    payload.undelivered = Some(result.0);
+                }
+            },
+        )
         .map_err(|error| {
             database(
                 "submit bounded filesystem operation",
                 sqlx::Error::Protocol(error),
             )
         })?;
-    match tokio::time::timeout_at(deadline, result_rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(database(
-            "receive bounded filesystem operation",
-            sqlx::Error::Protocol("filesystem operation owner stopped without a result".to_owned()),
-        )),
-        Err(_) => Err(StateError::OperationTimedOut {
-            operation,
-            timeout_ms,
-        }),
+    loop {
+        match result_rx.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Empty) if tokio::time::Instant::now() < deadline => {
+                tokio::task::yield_now().await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                return Err(StateError::OperationTimedOut {
+                    operation,
+                    timeout_ms,
+                });
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(database(
+                    "receive bounded filesystem operation",
+                    sqlx::Error::Protocol(
+                        "filesystem operation owner stopped without a result".to_owned(),
+                    ),
+                ));
+            }
+        }
     }
 }
 
@@ -1227,29 +1257,86 @@ impl StateStore {
                     .await
                     .map_err(sqlx::Error::Protocol)?;
                     let (verified_tx, verified_rx) = tokio::sync::oneshot::channel();
+                    struct IdentityVerificationPayload {
+                        parent_path: PathBuf,
+                        parent: Arc<File>,
+                        path: PathBuf,
+                        file: Arc<File>,
+                        lock_path: PathBuf,
+                        lock_file: Arc<File>,
+                        lock_identity: Option<Vec<u8>>,
+                        ready: Arc<std::sync::atomic::AtomicBool>,
+                        result: Option<tokio::sync::oneshot::Sender<Result<(), StateError>>>,
+                    }
                     owner
-                        .handoff(move |_, _| {
-                            let verified = verify_directory_path_identity(&parent_path, &parent)
-                                .and_then(|()| verify_path_identity(&path, &file))
-                                .and_then(|()| verify_path_identity(&lock_path, &lock_file))
-                                .and_then(|()| {
-                                    verify_store_lock_binding(
-                                        &path,
-                                        &file,
-                                        &lock_path,
-                                        &lock_file,
-                                        lock_identity.as_deref(),
-                                    )
-                                })
-                                .and_then(|()| {
-                                    if ready.load(std::sync::atomic::Ordering::Acquire) {
-                                        validate_sqlite_sidecars(&path, lock_identity.as_deref())
-                                    } else {
-                                        Ok(())
-                                    }
-                                });
-                            let _ = verified_tx.send(verified);
-                        })
+                        .handoff_payload(
+                            IdentityVerificationPayload {
+                                parent_path,
+                                parent,
+                                path,
+                                file,
+                                lock_path,
+                                lock_file,
+                                lock_identity,
+                                ready,
+                                result: Some(verified_tx),
+                            },
+                            |_, _, payload| {
+                                let verified =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        verify_directory_path_identity(
+                                            &payload.parent_path,
+                                            &payload.parent,
+                                        )
+                                        .and_then(|()| {
+                                            verify_path_identity(&payload.path, &payload.file)
+                                        })
+                                        .and_then(|()| {
+                                            verify_path_identity(
+                                                &payload.lock_path,
+                                                &payload.lock_file,
+                                            )
+                                        })
+                                        .and_then(|()| {
+                                            verify_store_lock_binding(
+                                                &payload.path,
+                                                &payload.file,
+                                                &payload.lock_path,
+                                                &payload.lock_file,
+                                                payload.lock_identity.as_deref(),
+                                            )
+                                        })
+                                        .and_then(|()| {
+                                            if payload
+                                                .ready
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                            {
+                                                validate_sqlite_sidecars(
+                                                    &payload.path,
+                                                    payload.lock_identity.as_deref(),
+                                                )
+                                            } else {
+                                                Ok(())
+                                            }
+                                        })
+                                    }))
+                                    .unwrap_or_else(
+                                        |panic| {
+                                            std::mem::forget(panic);
+                                            Err(database(
+                                                "verify before-acquire filesystem identity",
+                                                sqlx::Error::Protocol(
+                                                    "filesystem identity verification panicked"
+                                                        .to_owned(),
+                                                ),
+                                            ))
+                                        },
+                                    );
+                                if let Some(result) = payload.result.take() {
+                                    let _ = result.send(verified);
+                                }
+                            },
+                        )
                         .map_err(sqlx::Error::Protocol)?;
                     verified_rx
                         .await
@@ -4054,9 +4141,11 @@ impl SnapshotCleanupGuard {
         let guard = payload.into_guard();
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         owner
-            .handoff_payload(guard, move |_, _, guard| {
-                let result = guard.cleanup_now();
-                let _ = result_tx.send(result);
+            .handoff_payload((guard, Some(result_tx)), |_, _, payload| {
+                let result = payload.0.cleanup_now();
+                if let Some(result_tx) = payload.1.take() {
+                    let _ = result_tx.send(result);
+                }
             })
             .map_err(|error| {
                 database(
@@ -7302,7 +7391,11 @@ async fn reject_late_open_claim(
 ) -> StateError {
     struct LateClaimCleanupPayload {
         connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
-        close_future: Option<claw_sqlite_file_control::TerminalCloseFuture>,
+        close: Option<
+            claw_sqlite_file_control::RetainedTerminalClose<
+                sqlx::pool::PoolConnection<sqlx::Sqlite>,
+            >,
+        >,
         owner: String,
         deadline: std::time::Instant,
         result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -7314,7 +7407,7 @@ async fn reject_late_open_claim(
         terminal_permit,
         LateClaimCleanupPayload {
             connection: Some(connection),
-            close_future: None,
+            close: None,
             owner: owner.to_owned(),
             deadline: deadline_state.deadline,
             result: Some(result_tx),
@@ -7359,36 +7452,30 @@ async fn reject_late_open_claim(
                     .map_err(|_| "late writer-claim cleanup timed out".to_owned())?
                 })
             };
-            payload
-                .connection
-                .as_mut()
-                .expect("late-claim connection remains owned")
-                .prepare_terminal_close();
             let connection = payload
                 .connection
                 .take()
                 .expect("late-claim close is single-use");
-            let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                connection.into_close_future()
-            }));
-            let close = match future {
-                Ok(future) => {
-                    payload.close_future = Some(future);
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        runtime.block_on(
-                            payload
-                                .close_future
-                                .as_mut()
-                                .expect("late-claim close future remains owned")
-                                .as_mut(),
-                        )
-                    })) {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(error)) => Err(format!("terminal close failed: {error}")),
-                        Err(_) => Err("terminal close panicked".to_owned()),
-                    }
+            payload.close = Some(claw_sqlite_file_control::RetainedTerminalClose::new(
+                connection,
+            ));
+            let close = match payload
+                .close
+                .as_mut()
+                .expect("late-claim close remains owned")
+                .run(runtime)
+            {
+                claw_sqlite_file_control::TerminalCloseOutcome::Closed => payload
+                    .close
+                    .as_mut()
+                    .expect("late-claim close remains owned")
+                    .finish_success()
+                    .then_some(())
+                    .ok_or_else(|| "terminal close future destruction panicked".to_owned()),
+                claw_sqlite_file_control::TerminalCloseOutcome::Failed(error) => {
+                    Err(format!("terminal close failed: {error}"))
                 }
-                Err(_) => Err("terminal close callback panicked".to_owned()),
+                outcome => Err(format!("terminal close did not complete: {outcome:?}")),
             };
             let close_succeeded = close.is_ok();
             let outcome = match (cleanup, close) {
@@ -7492,8 +7579,8 @@ async fn initialize_fresh_database(
         .await
         .map_err(|error| database("create migration table", error))?;
     for migration in MIGRATIONS {
-        sqlx::raw_sql(migration.sql)
-            .execute(&mut connection)
+        connection
+            .execute_script(migration.sql)
             .await
             .map_err(|error| database("apply bootstrap migration", error))?;
         sqlx::query(
@@ -8023,8 +8110,8 @@ async fn apply_migrations(
                 continue;
             }
 
-            sqlx::raw_sql(migration.sql)
-                .execute(&mut connection)
+            connection
+                .execute_script(migration.sql)
                 .await
                 .map_err(|error| database("apply schema migration", error))?;
             sqlx::query(
