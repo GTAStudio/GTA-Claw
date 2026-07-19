@@ -118,7 +118,8 @@ impl VerifiedWriteTransaction {
         mut self,
     ) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, claw_sqlite_file_control::FileControlError>
     {
-        self.transaction
+        let (connection, post_commit_owner) = self
+            .transaction
             .take()
             .expect("verified write transaction remains owned")
             .commit_with_deadline(
@@ -128,7 +129,11 @@ impl VerifiedWriteTransaction {
                 self.restore_busy_timeout,
                 None,
             )
-            .await
+            .await?;
+        post_commit_owner
+            .shutdown()
+            .map_err(claw_sqlite_file_control::FileControlError::Handle)?;
+        Ok(connection)
     }
 }
 

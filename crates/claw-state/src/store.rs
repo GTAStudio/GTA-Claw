@@ -10,6 +10,7 @@ use std::sync::{
 use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
+use claw_sqlite_file_control::BeginOwnedConnection as _;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -99,9 +100,16 @@ where
     Operation: FnOnce() -> Result<T, StateError> + Send + 'static,
 {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    owner.handoff(move |_, _| {
-        let _ = result_tx.send(work());
-    });
+    owner
+        .handoff(move |_, _| {
+            let _ = result_tx.send(work());
+        })
+        .map_err(|error| {
+            database(
+                "submit bounded filesystem operation",
+                sqlx::Error::Protocol(error),
+            )
+        })?;
     match tokio::time::timeout_at(deadline, result_rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(database(
@@ -1219,28 +1227,30 @@ impl StateStore {
                     .await
                     .map_err(sqlx::Error::Protocol)?;
                     let (verified_tx, verified_rx) = tokio::sync::oneshot::channel();
-                    owner.handoff(move |_, _| {
-                        let verified = verify_directory_path_identity(&parent_path, &parent)
-                            .and_then(|()| verify_path_identity(&path, &file))
-                            .and_then(|()| verify_path_identity(&lock_path, &lock_file))
-                            .and_then(|()| {
-                                verify_store_lock_binding(
-                                    &path,
-                                    &file,
-                                    &lock_path,
-                                    &lock_file,
-                                    lock_identity.as_deref(),
-                                )
-                            })
-                            .and_then(|()| {
-                                if ready.load(std::sync::atomic::Ordering::Acquire) {
-                                    validate_sqlite_sidecars(&path, lock_identity.as_deref())
-                                } else {
-                                    Ok(())
-                                }
-                            });
-                        let _ = verified_tx.send(verified);
-                    });
+                    owner
+                        .handoff(move |_, _| {
+                            let verified = verify_directory_path_identity(&parent_path, &parent)
+                                .and_then(|()| verify_path_identity(&path, &file))
+                                .and_then(|()| verify_path_identity(&lock_path, &lock_file))
+                                .and_then(|()| {
+                                    verify_store_lock_binding(
+                                        &path,
+                                        &file,
+                                        &lock_path,
+                                        &lock_file,
+                                        lock_identity.as_deref(),
+                                    )
+                                })
+                                .and_then(|()| {
+                                    if ready.load(std::sync::atomic::Ordering::Acquire) {
+                                        validate_sqlite_sidecars(&path, lock_identity.as_deref())
+                                    } else {
+                                        Ok(())
+                                    }
+                                });
+                            let _ = verified_tx.send(verified);
+                        })
+                        .map_err(sqlx::Error::Protocol)?;
                     verified_rx
                         .await
                         .map_err(|_| {
@@ -1343,7 +1353,7 @@ impl StateStore {
             };
             return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
         }
-        let mut initial = initial
+        let (mut initial, post_commit_owner) = initial
             .commit_with_deadline(
                 deadline_state.work_cutoff,
                 deadline_state.deadline,
@@ -1367,6 +1377,12 @@ impl StateStore {
         .await
         .map_err(|error| database("install initial commit guard", error))?;
         drop(initial);
+        post_commit_owner.shutdown().map_err(|error| {
+            database(
+                "release initial post-COMMIT cleanup owner",
+                sqlx::Error::Protocol(error),
+            )
+        })?;
         #[cfg(test)]
         wait_at_open_initialization_test_barrier(&path).await;
 
@@ -4023,8 +4039,8 @@ impl SnapshotCleanupGuard {
         else {
             return;
         };
-        owner.handoff(move |_, _| {
-            let mut guard = payload.into_guard();
+        let guard = payload.into_guard();
+        let _ = owner.handoff_payload(guard, |_, _, guard| {
             let _ = guard.cleanup_now();
         });
     }
@@ -4035,13 +4051,19 @@ impl SnapshotCleanupGuard {
         else {
             return Ok(());
         };
+        let guard = payload.into_guard();
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-        owner.handoff(move |_, _| {
-            let mut guard = payload.into_guard();
-            let result = guard.cleanup_now();
-            drop(guard);
-            let _ = result_tx.send(result);
-        });
+        owner
+            .handoff_payload(guard, move |_, _, guard| {
+                let result = guard.cleanup_now();
+                let _ = result_tx.send(result);
+            })
+            .map_err(|error| {
+                database(
+                    "submit SQLite snapshot cleanup",
+                    sqlx::Error::Protocol(error),
+                )
+            })?;
         let cutoff = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             match result_rx.try_recv() {
@@ -4403,10 +4425,24 @@ impl BackupConnectionGuard {
             (self.connection.take(), self.cleanup_owner.take())
         {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            cleanup_owner.handoff(move |_runtime, mut terminal_closes| {
-                let result = terminal_closes.close(connection);
-                let _ = done_tx.send(result);
-            });
+            if cleanup_owner
+                .handoff_payload(
+                    (Some(connection), Some(done_tx)),
+                    |_runtime, terminal_closes, payload| {
+                        let permit = terminal_closes
+                            .take_permit()
+                            .expect("discard close capacity was pre-reserved");
+                        let connection =
+                            payload.0.take().expect("discard connection remains owned");
+                        let done_tx = payload.1.take().expect("discard result remains owned");
+                        let result = permit.close(connection);
+                        let _ = done_tx.send(result);
+                    },
+                )
+                .is_err()
+            {
+                return claw_sqlite_file_control::TerminalCloseOutcome::Quarantined;
+            }
             return tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
                 .await
                 .ok()
@@ -4447,9 +4483,19 @@ impl Drop for BackupConnectionGuard {
                     .cancelled
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            cleanup_owner.handoff(move |_runtime, mut terminal_closes| {
-                let _ = terminal_closes.close(connection);
-            });
+            let _ = cleanup_owner.handoff_payload(
+                Some(connection),
+                |_runtime, terminal_closes, connection| {
+                    let permit = terminal_closes
+                        .take_permit()
+                        .expect("backup drop close capacity was pre-reserved");
+                    let _ = permit.close(
+                        connection
+                            .take()
+                            .expect("dropped backup connection remains owned"),
+                    );
+                },
+            );
         }
     }
 }
@@ -4712,6 +4758,43 @@ struct OwnedSqliteConnectionGuard {
     shared_terminal_retention: Option<SharedSnapshotRetention>,
 }
 
+struct OwnedConnectionClosePayload {
+    connection: Option<SqliteConnection>,
+    backup_lease: Option<BackupStagingLease>,
+    backup_output: Option<File>,
+    shared_terminal_retention: Option<SharedSnapshotRetention>,
+    result: Option<
+        tokio::sync::oneshot::Sender<(
+            claw_sqlite_file_control::TerminalCloseOutcome,
+            Option<BackupStagingLease>,
+        )>,
+    >,
+}
+
+fn close_owned_connection_payload(
+    payload: &mut OwnedConnectionClosePayload,
+    terminal_closes: &mut claw_sqlite_file_control::TerminalCloseBatch,
+) -> claw_sqlite_file_control::TerminalCloseOutcome {
+    let permit = terminal_closes
+        .take_permit()
+        .expect("owned connection close capacity was pre-reserved");
+    let connection = payload
+        .connection
+        .take()
+        .expect("owned close connection remains live");
+    let result = if let Some(retention) = payload.shared_terminal_retention.take() {
+        permit.close_with_shared_retention(connection, retention)
+    } else {
+        permit.close_with_quarantine_retention(connection, || {
+            payload.backup_lease.as_mut().and_then(|lease| {
+                claw_sqlite_file_control::SnapshotCleanupLease::take_terminal_retention(lease)
+            })
+        })
+    };
+    payload.backup_output.take();
+    result
+}
+
 impl OwnedSqliteConnectionGuard {
     fn new_cancellable_with_owner(
         connection: SqliteConnection,
@@ -4792,25 +4875,26 @@ impl OwnedSqliteConnectionGuard {
             .cleanup_owner
             .take()
             .expect("owned cleanup owner remains live");
-        let mut backup_lease = self.backup_lease.take();
-        let shared_terminal_retention = self.shared_terminal_retention.take();
-        let backup_output = self.backup_output.take();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        cleanup_owner.handoff(move |_runtime, mut terminal_closes| {
-            let result = if let Some(retention) = shared_terminal_retention {
-                terminal_closes.close_with_shared_retention(connection, retention)
-            } else {
-                terminal_closes.close_with_quarantine_retention(connection, || {
-                    backup_lease.as_mut().and_then(|lease| {
-                        claw_sqlite_file_control::SnapshotCleanupLease::take_terminal_retention(
-                            lease,
-                        )
-                    })
-                })
-            };
-            drop(backup_output);
-            let _ = done_tx.send((result, backup_lease));
-        });
+        cleanup_owner
+            .handoff_payload(
+                OwnedConnectionClosePayload {
+                    connection: Some(connection),
+                    backup_lease: self.backup_lease.take(),
+                    backup_output: self.backup_output.take(),
+                    shared_terminal_retention: self.shared_terminal_retention.take(),
+                    result: Some(done_tx),
+                },
+                |_runtime, terminal_closes, payload| {
+                    let result = close_owned_connection_payload(payload, terminal_closes);
+                    let done_tx = payload
+                        .result
+                        .take()
+                        .expect("owned close result remains owned");
+                    let _ = done_tx.send((result, payload.backup_lease.take()));
+                },
+            )
+            .map_err(sqlx::Error::Protocol)?;
         self.cancellation = None;
         let (close, mut backup_lease) =
             tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
@@ -4868,24 +4952,19 @@ impl Drop for OwnedSqliteConnectionGuard {
         if let Some(connection) = self.connection.take()
             && let Some(mut cleanup_owner) = self.cleanup_owner.take()
         {
-            let mut backup_lease = self.backup_lease.take();
-            let shared_terminal_retention = self.shared_terminal_retention.take();
-            let backup_output = self.backup_output.take();
-            cleanup_owner.handoff(move |_runtime, mut terminal_closes| {
-                let _ = if let Some(retention) = shared_terminal_retention {
-                    terminal_closes.close_with_shared_retention(connection, retention)
-                } else {
-                    terminal_closes.close_with_quarantine_retention(connection, || {
-                        backup_lease.as_mut().and_then(|lease| {
-                            claw_sqlite_file_control::SnapshotCleanupLease::take_terminal_retention(
-                                lease,
-                            )
-                        })
-                    })
-                };
-                drop(backup_output);
-                drop(backup_lease);
-            });
+            let _ = cleanup_owner.handoff_payload(
+                OwnedConnectionClosePayload {
+                    connection: Some(connection),
+                    backup_lease: self.backup_lease.take(),
+                    backup_output: self.backup_output.take(),
+                    shared_terminal_retention: self.shared_terminal_retention.take(),
+                    result: None,
+                },
+                |_runtime, terminal_closes, payload| {
+                    let _ = close_owned_connection_payload(payload, terminal_closes);
+                    payload.backup_lease.take();
+                },
+            );
         }
     }
 }
@@ -7214,56 +7293,143 @@ async fn initialize_database(
 }
 
 async fn reject_late_open_claim(
-    mut connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    mut cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    terminal_permit: claw_sqlite_file_control::TerminalClosePermit,
     owner: &str,
     deadline_state: &OpenDeadlineState,
     cleanup_operation: &'static str,
 ) -> StateError {
+    struct LateClaimCleanupPayload {
+        connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+        close_future: Option<claw_sqlite_file_control::TerminalCloseFuture>,
+        owner: String,
+        deadline: std::time::Instant,
+        result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    }
+
     let primary = deadline_state.timeout_error();
-    let remaining = deadline_state
-        .deadline
-        .saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        let _ = connection.close().await;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let handoff = cleanup_owner.handoff_terminal_payload(
+        terminal_permit,
+        LateClaimCleanupPayload {
+            connection: Some(connection),
+            close_future: None,
+            owner: owner.to_owned(),
+            deadline: deadline_state.deadline,
+            result: Some(result_tx),
+        },
+        |runtime, payload| {
+            let remaining = payload
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            let cleanup = if remaining.is_zero() {
+                Err("late writer-claim cleanup cutoff elapsed".to_owned())
+            } else {
+                runtime.block_on(async {
+                    let connection = payload
+                        .connection
+                        .as_mut()
+                        .expect("late-claim connection remains owned");
+                    claw_sqlite_file_control::set_busy_timeout(connection, remaining)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tokio::time::timeout(remaining, async {
+                        sqlx::query(
+                            "DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?",
+                        )
+                        .bind(&payload.owner)
+                        .execute(&mut **connection)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let claims = sqlx::query_scalar::<_, i64>(
+                            "SELECT COUNT(*) FROM claw_writer_lock
+                                 WHERE singleton = 1 AND owner = ?",
+                        )
+                        .bind(&payload.owner)
+                        .fetch_one(&mut **connection)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        if claims != 0 {
+                            return Err("late writer claim cleanup was not verified".to_owned());
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|_| "late writer-claim cleanup timed out".to_owned())?
+                })
+            };
+            payload
+                .connection
+                .as_mut()
+                .expect("late-claim connection remains owned")
+                .prepare_terminal_close();
+            let connection = payload
+                .connection
+                .take()
+                .expect("late-claim close is single-use");
+            let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                connection.into_close_future()
+            }));
+            let close = match future {
+                Ok(future) => {
+                    payload.close_future = Some(future);
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(
+                            payload
+                                .close_future
+                                .as_mut()
+                                .expect("late-claim close future remains owned")
+                                .as_mut(),
+                        )
+                    })) {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(format!("terminal close failed: {error}")),
+                        Err(_) => Err("terminal close panicked".to_owned()),
+                    }
+                }
+                Err(_) => Err("terminal close callback panicked".to_owned()),
+            };
+            let close_succeeded = close.is_ok();
+            let outcome = match (cleanup, close) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(cleanup), Ok(())) => Err(cleanup),
+                (Ok(()), Err(close)) => Err(close),
+                (Err(cleanup), Err(close)) => Err(format!("{cleanup}; {close}")),
+            };
+            if let Some(result) = payload.result.take() {
+                let _ = result.send(outcome.clone());
+            }
+            if close_succeeded {
+                Ok(())
+            } else {
+                Err(outcome.expect_err("failed close reports a terminal error"))
+            }
+        },
+    );
+    if let Err(error) = handoff {
         return StateError::OperationCleanupFailed {
             operation: cleanup_operation,
             primary: Box::new(primary),
-            cleanup: "late writer-claim cleanup cutoff elapsed".to_owned(),
+            cleanup: format!("late writer-claim terminal handoff failed: {error}"),
         };
     }
-    let cleanup = tokio::time::timeout(remaining, async {
-        claw_sqlite_file_control::set_busy_timeout(&mut connection, remaining)
-            .await
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
-            .bind(owner)
-            .execute(&mut *connection)
-            .await?;
-        let claims = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM claw_writer_lock WHERE singleton = 1 AND owner = ?",
-        )
-        .bind(owner)
-        .fetch_one(&mut *connection)
-        .await?;
-        if claims != 0 {
-            return Err(sqlx::Error::Protocol(
-                "late writer claim cleanup was not verified".to_owned(),
-            ));
-        }
-        connection.close().await
-    })
-    .await;
-    match cleanup {
-        Ok(Ok(())) => primary,
-        Ok(Err(error)) => StateError::OperationCleanupFailed {
+    match tokio::time::timeout(Duration::from_secs(1), result_rx).await {
+        Ok(Ok(Ok(()))) => primary,
+        Ok(Ok(Err(error))) => StateError::OperationCleanupFailed {
             operation: cleanup_operation,
             primary: Box::new(primary),
-            cleanup: error.to_string(),
+            cleanup: error,
+        },
+        Ok(Err(_)) => StateError::OperationCleanupFailed {
+            operation: cleanup_operation,
+            primary: Box::new(primary),
+            cleanup: "late writer-claim terminal owner stopped without result".to_owned(),
         },
         Err(_) => StateError::OperationCleanupFailed {
             operation: cleanup_operation,
             primary: Box::new(primary),
-            cleanup: "late writer-claim cleanup timed out".to_owned(),
+            cleanup: "late writer-claim terminal cleanup exceeded its fixed cutoff".to_owned(),
         },
     }
 }
@@ -7366,18 +7532,33 @@ async fn initialize_fresh_database(
         )
         .await;
     let commit_eligible = deadline_state.finish_final_commit();
-    let connection =
+    let (connection, mut cleanup_owner) =
         commit.map_err(|error| file_control_database("commit state database bootstrap", error))?;
+    let terminal_permit = cleanup_owner.take_terminal_permit().map_err(|error| {
+        database(
+            "reserve late bootstrap cleanup",
+            sqlx::Error::Protocol(error),
+        )
+    })?;
     if !commit_eligible || !deadline_state.permits_sqlite_work() {
         return Err(reject_late_open_claim(
             connection,
+            cleanup_owner,
+            terminal_permit,
             owner,
             &deadline_state,
             "remove late bootstrap writer claim",
         )
         .await);
     }
+    drop(terminal_permit);
     drop(connection);
+    cleanup_owner.shutdown().map_err(|error| {
+        database(
+            "release bootstrap post-COMMIT cleanup owner",
+            sqlx::Error::Protocol(error),
+        )
+    })?;
     Ok(recovered_writer)
 }
 
@@ -7886,19 +8067,34 @@ async fn apply_migrations(
         )
         .await;
     let commit_eligible = deadline_state.finish_final_commit();
-    let connection = commit.map_err(|error| {
+    let (connection, mut cleanup_owner) = commit.map_err(|error| {
         file_control_database("commit schema migration and writer claim", error)
+    })?;
+    let terminal_permit = cleanup_owner.take_terminal_permit().map_err(|error| {
+        database(
+            "reserve late migration cleanup",
+            sqlx::Error::Protocol(error),
+        )
     })?;
     if !commit_eligible || !deadline_state.permits_sqlite_work() {
         return Err(reject_late_open_claim(
             connection,
+            cleanup_owner,
+            terminal_permit,
             owner,
             &deadline_state,
             "remove late migration writer claim",
         )
         .await);
     }
+    drop(terminal_permit);
     drop(connection);
+    cleanup_owner.shutdown().map_err(|error| {
+        database(
+            "release migration post-COMMIT cleanup owner",
+            sqlx::Error::Protocol(error),
+        )
+    })?;
     Ok(recovered_writer)
 }
 
@@ -8441,12 +8637,41 @@ async fn materialize_authenticated_snapshot(
         let primary = invalid_backup(source, "clear restored writer ownership", error);
         let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let close_retention = Arc::clone(&operation_reservation);
-        finalization_worker_owner.handoff(move |_, mut terminal_closes| {
-            let _ = close_tx.send(
-                terminal_closes
-                    .close_with_shared_retention(destination_connection, close_retention),
-            );
-        });
+        finalization_worker_owner
+            .handoff_payload(
+                (
+                    Some(destination_connection),
+                    Some(close_retention),
+                    Some(close_tx),
+                ),
+                |_, terminal_closes, payload| {
+                    let permit = terminal_closes
+                        .take_permit()
+                        .expect("restore destination close capacity was pre-reserved");
+                    let destination_connection = payload
+                        .0
+                        .take()
+                        .expect("restore destination connection remains owned");
+                    let close_retention = payload
+                        .1
+                        .take()
+                        .expect("restore close retention remains owned");
+                    let close_tx = payload
+                        .2
+                        .take()
+                        .expect("restore close result remains owned");
+                    let _ = close_tx.send(
+                        permit.close_with_shared_retention(destination_connection, close_retention),
+                    );
+                },
+            )
+            .map_err(|handoff| {
+                append_operation_cleanup(
+                    "SQLite restore",
+                    primary.clone(),
+                    format!("destination terminal close handoff: {handoff}"),
+                )
+            })?;
         let close = tokio::time::timeout(std::time::Duration::from_secs(1), close_rx)
             .await
             .ok()
@@ -9502,9 +9727,27 @@ async fn backup_pool(
         Err(error) => {
             let mut owner = validation_cleanup_owner;
             let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-            owner.handoff(move |_, mut terminal_closes| {
-                let _ = close_tx.send(terminal_closes.close(destination_connection));
-            });
+            if let Err(handoff) = owner.handoff_payload(
+                (Some(destination_connection), Some(close_tx)),
+                |_, terminal_closes, payload| {
+                    let permit = terminal_closes
+                        .take_permit()
+                        .expect("backup destination close capacity was pre-reserved");
+                    let connection = payload
+                        .0
+                        .take()
+                        .expect("backup destination connection remains owned");
+                    let close_tx = payload.1.take().expect("backup close result remains owned");
+                    let _ = close_tx.send(permit.close(connection));
+                },
+            ) {
+                drop(backup_output);
+                return Err(append_operation_cleanup(
+                    "SQLite backup",
+                    error,
+                    format!("destination terminal close handoff: {handoff}"),
+                ));
+            }
             let close = tokio::time::timeout(std::time::Duration::from_secs(1), close_rx)
                 .await
                 .ok()
