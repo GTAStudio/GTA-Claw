@@ -1018,6 +1018,20 @@ mod tests {
 
     #[tokio::test]
     async fn competing_sqlite_writer_cannot_extend_open_past_absolute_deadline() {
+        const CHILD_ENV: &str = "GTA_CLAW_COMPETING_WRITER_DEADLINE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::competing_sqlite_writer_cannot_extend_open_past_absolute_deadline")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated competing writer deadline test");
+            assert!(status.success(), "isolated competing writer test failed");
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "open-busy-deadline.sqlite");
         open(&path)
@@ -1261,6 +1275,20 @@ mod tests {
 
     #[tokio::test]
     async fn open_timeout_after_commit_handoffs_claim_cleanup_before_return() {
+        const CHILD_ENV: &str = "GTA_CLAW_POSTCOMMIT_HANDOFF_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::open_timeout_after_commit_handoffs_claim_cleanup_before_return")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated postcommit handoff test");
+            assert!(status.success(), "isolated postcommit handoff test failed");
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "timeout-after-commit.sqlite");
         let (entered, _release) = test_support::set_open_postcommit_barrier(&path);
