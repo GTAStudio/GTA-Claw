@@ -5809,6 +5809,12 @@ mod tests {
             !test_support::sqlite_identity_is_valid(&mut connection).await,
             "SQLite VFS must report the opened file was moved"
         );
+        fs::rename(&path, &replacement_path).expect("move replacement pathname away");
+        fs::rename(&detached, &path).expect("restore original SQLite pathname");
+        assert!(
+            !test_support::sqlite_identity_is_valid(&mut connection).await,
+            "SQLite identity invalidation must survive an ABA swap-back"
+        );
         connection.close().await.expect("direct handle closes");
     }
 
@@ -5818,9 +5824,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "active-write.sqlite");
         let detached = database_path(&directory, "active-write-detached.sqlite");
+        let replacement_path = database_path(&directory, "active-write-replacement.sqlite");
         let store = std::sync::Arc::new(open(&path).await);
         let owner = test_support::owner(&store).to_owned();
         let (entered, release) = crate::repository::test_support::set_write_barrier(&owner);
+        let (identity_invalidated, identity_release) =
+            crate::repository::test_support::set_identity_invalidation_barrier(&owner);
         let record = session("must-not-commit-after-replacement", 1);
         let record_id = record.id.clone();
         let writer_store = std::sync::Arc::clone(&store);
@@ -5838,7 +5847,29 @@ mod tests {
             }
         }
         let replacement = open(&path).await;
+        replacement
+            .close()
+            .await
+            .expect("replacement closes before swap-back");
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), identity_invalidated.notified())
+            .await
+            .expect("transaction observes replacement before swap-back");
+        fs::rename(&path, &replacement_path).expect("move replacement database away");
+        for suffix in ["-wal", "-shm"] {
+            let source = sidecar(&path, suffix);
+            if source.exists() {
+                fs::rename(&source, sidecar(&replacement_path, suffix))
+                    .expect("move replacement sidecar away");
+            }
+            let original = sidecar(&detached, suffix);
+            if original.exists() {
+                fs::rename(&original, sidecar(&path, suffix))
+                    .expect("restore original database sidecar");
+            }
+        }
+        fs::rename(&detached, &path).expect("restore original database pathname");
+        identity_release.notify_one();
         let write_result = match tokio::time::timeout(Duration::from_secs(2), &mut writer).await {
             Ok(join) => join.expect("repository write task joins"),
             Err(_) => {
@@ -5851,6 +5882,7 @@ mod tests {
             write_result.is_err(),
             "repository write must not report success after path replacement"
         );
+        let replacement = open(&replacement_path).await;
         assert!(
             replacement
                 .sessions()
@@ -5865,18 +5897,18 @@ mod tests {
             Ok(store) => store,
             Err(_) => panic!("writer task retained the state store"),
         };
-        let close = store
-            .close()
-            .await
-            .expect_err("detached path degrades original close");
-        assert!(matches!(
-            close,
-            StateError::CloseDegraded {
-                os_lock_released: true,
-                ..
-            }
-        ));
-        let detached_store = open(&detached).await;
+        let close = store.close().await;
+        assert!(
+            close.is_ok()
+                || matches!(
+                    close,
+                    Err(StateError::CloseDegraded {
+                        os_lock_released: true,
+                        ..
+                    })
+                )
+        );
+        let detached_store = open(&path).await;
         assert!(
             detached_store
                 .sessions()

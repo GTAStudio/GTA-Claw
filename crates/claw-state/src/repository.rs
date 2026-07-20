@@ -85,6 +85,8 @@ struct VerifiedWriteTransaction {
     timeout_ms: u64,
     #[cfg(test)]
     rollback_cleanup_test_mode: Option<u8>,
+    #[cfg(all(test, unix))]
+    test_owner: String,
 }
 
 #[derive(Clone)]
@@ -101,16 +103,28 @@ impl WriteDeadline {
         future: impl std::future::Future<Output = Result<T, E>>,
         map_error: impl FnOnce(E) -> StateError,
     ) -> Result<T, StateError> {
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), future).await {
-            Ok(result) => result.map_err(map_error),
-            Err(_) => {
+        let timeout = || StateError::OperationTimedOut {
+            operation,
+            timeout_ms: self.timeout_ms,
+        };
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= self.deadline
+        {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(timeout());
+        }
+        let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline));
+        tokio::pin!(timer);
+        tokio::pin!(future);
+        tokio::select! {
+            biased;
+            () = &mut timer => {
                 self.cancelled
                     .store(true, std::sync::atomic::Ordering::Release);
-                Err(StateError::OperationTimedOut {
-                    operation,
-                    timeout_ms: self.timeout_ms,
-                })
+                Err(timeout())
             }
+            result = &mut future => result.map_err(map_error),
         }
     }
 }
@@ -147,7 +161,12 @@ impl VerifiedWriteTransaction {
     async fn main_database_has_moved(
         &mut self,
     ) -> Result<bool, claw_sqlite_file_control::FileControlError> {
-        self.executor().main_database_has_moved().await
+        let moved = self.executor().main_database_has_moved().await?;
+        #[cfg(test)]
+        if moved {
+            wait_at_identity_invalidation_test_barrier(&self.test_owner).await;
+        }
+        Ok(moved)
     }
 
     async fn commit(
@@ -209,6 +228,10 @@ static COMMIT_TEST_TAMPERS: LazyLock<Mutex<std::collections::HashSet<String>>> =
 #[cfg(test)]
 static COMMIT_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, unix))]
+static IDENTITY_INVALIDATION_TEST_BARRIERS: LazyLock<
+    Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static ROLLBACK_CLEANUP_TEST_MODES: LazyLock<Mutex<std::collections::HashMap<String, u8>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -968,6 +991,8 @@ async fn begin_verified_write_with_deadline(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(owner),
+        #[cfg(all(test, unix))]
+        test_owner: owner.to_owned(),
     };
     let deadline = transaction.operation_deadline();
     let ownership = deadline
@@ -1079,6 +1104,28 @@ async fn wait_at_commit_test_barrier(owner: &str) {
         COMMIT_TEST_BARRIERS
             .lock()
             .expect("commit test barriers lock poisoned")
+            .remove(owner);
+    }
+}
+
+#[cfg(all(test, unix))]
+async fn wait_at_identity_invalidation_test_barrier(owner: &str) {
+    let barrier = IDENTITY_INVALIDATION_TEST_BARRIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(owner)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        IDENTITY_INVALIDATION_TEST_BARRIERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(owner);
     }
 }
@@ -1659,13 +1706,50 @@ fn conflict(entity: &'static str, id: &str, expected_version: i64) -> StateError
 }
 
 #[cfg(test)]
+mod deadline_tests {
+    use super::WriteDeadline;
+    use crate::StateError;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn expired_write_deadline_never_polls_statement_future() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = WriteDeadline {
+            deadline: std::time::Instant::now(),
+            cancelled: Arc::clone(&cancelled),
+            timeout_ms: 1,
+        };
+        let polled = Arc::new(AtomicBool::new(false));
+        let future_polled = Arc::clone(&polled);
+        let future = std::future::poll_fn(move |_| {
+            future_polled.store(true, Ordering::Release);
+            std::task::Poll::Ready(Ok::<(), ()>(()))
+        });
+        assert_eq!(
+            deadline
+                .run("expired test write", future, |_| unreachable!())
+                .await,
+            Err(StateError::OperationTimedOut {
+                operation: "expired test write",
+                timeout_ms: 1,
+            })
+        );
+        assert!(!polled.load(Ordering::Acquire));
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
-    #[cfg(unix)]
-    use super::COMMIT_TEST_TAMPERS;
     use super::{
         Arc, COMMIT_TEST_BARRIERS, READ_TEST_BARRIERS, ROLLBACK_CLEANUP_TEST_MODES,
         WRITE_TEST_BARRIERS, WriteTestBarrier,
     };
+    #[cfg(unix)]
+    use super::{COMMIT_TEST_TAMPERS, IDENTITY_INVALIDATION_TEST_BARRIERS};
 
     pub(crate) fn set_write_barrier(
         owner: &str,
@@ -1719,6 +1803,25 @@ pub(crate) mod test_support {
         COMMIT_TEST_BARRIERS
             .lock()
             .expect("commit test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_identity_invalidation_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        IDENTITY_INVALIDATION_TEST_BARRIERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 owner.to_owned(),
                 WriteTestBarrier {

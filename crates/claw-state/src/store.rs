@@ -10180,8 +10180,11 @@ fn create_bound_snapshot_output(
     if let Some(guard) = output_guard {
         guard.bind_file(&file)?;
     }
+    ensure_creation_allowed()?;
     secure_private_snapshot_file(destination)?;
+    ensure_creation_allowed()?;
     mark_snapshot_staging(destination, &file)?;
+    ensure_creation_allowed()?;
     drop(creation_lock);
     Ok(file)
 }

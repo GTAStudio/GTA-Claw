@@ -771,6 +771,13 @@ struct TerminalCloseReceipt {
 
 impl TerminalCloseReceipt {
     fn wait(self, cutoff: std::time::Instant) -> TerminalCloseOutcome {
+        match self.result.try_recv() {
+            Ok(outcome) => return outcome,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return TerminalCloseOutcome::Quarantined;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
         let remaining = cutoff.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return TerminalCloseOutcome::Quarantined;
@@ -1495,7 +1502,49 @@ fn apple_file_acl_is_trivial(file: &std::fs::File) -> Result<bool, FileControlEr
     }
 }
 
+#[cfg(unix)]
+unsafe extern "C" fn drop_unix_identity_invalidation(value: *mut std::ffi::c_void) {
+    if !value.is_null() {
+        // SAFETY: this key is exclusively registered with a Box<AtomicBool>.
+        drop(unsafe { Box::from_raw(value.cast::<AtomicBool>()) });
+    }
+}
+
+#[cfg(unix)]
+fn unix_identity_invalidation(
+    database: LiveInterruptPointer,
+) -> Result<NonNull<AtomicBool>, FileControlError> {
+    // SAFETY: the caller holds SQLx's locked live SQLite handle.
+    let existing = unsafe {
+        libsqlite3_sys::sqlite3_get_clientdata(
+            database.as_ptr(),
+            c"gta-claw-unix-identity-invalidated".as_ptr(),
+        )
+    };
+    if let Some(existing) = NonNull::new(existing.cast::<AtomicBool>()) {
+        return Ok(existing);
+    }
+    let state = Box::into_raw(Box::new(AtomicBool::new(false)));
+    // SAFETY: SQLite owns `state` after registration.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_set_clientdata(
+            database.as_ptr(),
+            c"gta-claw-unix-identity-invalidated".as_ptr(),
+            state.cast(),
+            Some(drop_unix_identity_invalidation),
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    NonNull::new(state).ok_or_else(|| {
+        FileControlError::Handle("Unix identity invalidation state is null".to_owned())
+    })
+}
+
 /// Returns whether SQLite reports that its open main database was moved or replaced.
+///
+/// Once observed, invalidation remains latched for the connection lifetime.
 #[cfg(unix)]
 pub async fn main_database_has_moved(
     connection: &mut sqlx::SqliteConnection,
@@ -1504,18 +1553,28 @@ pub async fn main_database_has_moved(
         .lock_handle()
         .await
         .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let database_pointer = LiveInterruptPointer(database.as_raw_handle());
+    let invalidated = unix_identity_invalidation(database_pointer)?;
+    // SAFETY: SQLite client data retains this AtomicBool for the connection lifetime.
+    if unsafe { invalidated.as_ref() }.load(Ordering::Acquire) {
+        return Ok(true);
+    }
     let mut moved = 0_i32;
     // SAFETY: SQLx's locked handle guarantees a live SQLite connection for this
     // call. The schema name is NUL-terminated and `moved` remains valid.
     let result = unsafe {
         libsqlite3_sys::sqlite3_file_control(
-            database.as_raw_handle().as_ptr(),
+            database_pointer.as_ptr(),
             c"main".as_ptr(),
             libsqlite3_sys::SQLITE_FCNTL_HAS_MOVED,
             (&raw mut moved).cast(),
         )
     };
     if result == libsqlite3_sys::SQLITE_OK {
+        if moved != 0 {
+            // SAFETY: SQLite client data retains this AtomicBool for the connection lifetime.
+            unsafe { invalidated.as_ref() }.store(true, Ordering::Release);
+        }
         Ok(moved != 0)
     } else {
         Err(FileControlError::SQLite(result))
@@ -1726,8 +1785,16 @@ where
     Destination: BeginOwnedConnection,
     Reservation: Send + 'static,
 {
-    type BackupWorkerResult<Source, Destination, Reservation> =
-        Result<(Source, Destination, Reservation), FileControlError>;
+    type BackupWorkerResult<Source, Destination, Reservation> = Result<
+        (
+            Source,
+            Destination,
+            Reservation,
+            TerminalClosePermit,
+            TerminalClosePermit,
+        ),
+        FileControlError,
+    >;
 
     struct BackupWorkerPayload<Source, Destination, Reservation> {
         source: Option<Source>,
@@ -1741,6 +1808,7 @@ where
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
     let deadline = context.deadline;
+    let delivery_cancelled = Arc::clone(&context.cancelled);
     worker_owner
         .handoff_payload_internal(
         std::sync::Mutex::new(BackupWorkerPayload {
@@ -1799,17 +1867,30 @@ where
                     .take()
                     .expect("backup reservation remains owned");
                 let result_tx = payload.result.take().expect("backup result remains owned");
-                if let Err(error) = result_tx.send(Ok((source, destination, reservation)))
-                    && let Ok((source, destination, reservation)) = error.0
+                let source_close_permit = source_close_permit
+                    .take()
+                    .expect("backup source close permit remains owned");
+                let destination_close_permit = destination_close_permit
+                    .take()
+                    .expect("backup destination close permit remains owned");
+                if let Err(error) = result_tx.send(Ok((
+                    source,
+                    destination,
+                    reservation,
+                    source_close_permit,
+                    destination_close_permit,
+                ))) && let Ok((
+                    source,
+                    destination,
+                    reservation,
+                    source_close_permit,
+                    destination_close_permit,
+                )) = error.0
                 {
                     let retention = Arc::new(std::sync::Mutex::new(Some(reservation)));
-                    let source_close = source_close_permit
-                        .take()
-                        .expect("backup source close permit remains owned")
-                        .submit_retaining(source, Arc::clone(&retention));
+                    let source_close =
+                        source_close_permit.submit_retaining(source, Arc::clone(&retention));
                     let destination_close = destination_close_permit
-                        .take()
-                        .expect("backup destination close permit remains owned")
                         .submit_retaining(destination, Arc::clone(&retention));
                     payload.close_retention = Some(retention);
                     let cutoff = std::time::Instant::now() + TERMINAL_CLOSE_TIMEOUT;
@@ -1859,7 +1940,30 @@ where
     let cleanup_cutoff = deadline + std::time::Duration::from_secs(5);
     loop {
         match result_rx.try_recv() {
-            Ok(result) => return result,
+            Ok(Ok((
+                source,
+                destination,
+                reservation,
+                source_close_permit,
+                destination_close_permit,
+            ))) => {
+                if delivery_cancelled.load(Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline
+                {
+                    let retention = Arc::new(std::sync::Mutex::new(Some(reservation)));
+                    let source_close =
+                        source_close_permit.submit_retaining(source, Arc::clone(&retention));
+                    let destination_close = destination_close_permit
+                        .submit_retaining(destination, Arc::clone(&retention));
+                    let cutoff = std::time::Instant::now() + TERMINAL_CLOSE_TIMEOUT;
+                    let _ = source_close.wait(cutoff);
+                    let _ = destination_close.wait(cutoff);
+                    return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+                }
+                drop((source_close_permit, destination_close_permit));
+                return Ok((source, destination, reservation));
+            }
+            Ok(Err(error)) => return Err(error),
             Err(std::sync::mpsc::TryRecvError::Empty)
                 if std::time::Instant::now() < cleanup_cutoff =>
             {
@@ -7345,6 +7449,18 @@ mod deadline_tests {
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn queued_terminal_close_result_wins_over_elapsed_cutoff() {
+        let (result, receiver) = std::sync::mpsc::sync_channel(1);
+        result
+            .send(TerminalCloseOutcome::Closed)
+            .expect("queue completed terminal close");
+        assert_eq!(
+            TerminalCloseReceipt { result: receiver }.wait(std::time::Instant::now()),
+            TerminalCloseOutcome::Closed
+        );
+    }
 
     #[derive(Debug)]
     struct StallingPoolConnection {
