@@ -991,10 +991,33 @@ struct OpenDeadlineState {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     finished: std::sync::atomic::AtomicBool,
     final_commit_state: std::sync::atomic::AtomicU8,
-    delivered_writer_claim: std::sync::atomic::AtomicBool,
+    open_cleanup_state: std::sync::atomic::AtomicU8,
 }
 
 impl OpenDeadlineState {
+    fn retain_open_cleanup(&self) -> bool {
+        match self.open_cleanup_state.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) | Err(1) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn authorize_open_abort(&self) -> bool {
+        self.open_cleanup_state
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1275,10 +1298,7 @@ async fn open_timeout_error(
     let lifecycle_result = match lifecycle_result {
         Ok(result) => result,
         Err(_) => {
-            if deadline_state
-                .delivered_writer_claim
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if !deadline_state.authorize_open_abort() {
                 return StateError::OperationCleanupFailed {
                     operation: "state store open",
                     primary: Box::new(primary),
@@ -1311,6 +1331,9 @@ async fn close_pool_after_open_failure(
     deadline_state: &OpenDeadlineState,
     primary: StateError,
 ) -> StateError {
+    if !deadline_state.retain_open_cleanup() {
+        return primary;
+    }
     match tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.deadline),
         pool.close(),
@@ -1318,11 +1341,10 @@ async fn close_pool_after_open_failure(
     .await
     {
         Ok(()) => primary,
-        Err(_) => StateError::OperationCleanupFailed {
-            operation: "state store open",
-            primary: Box::new(primary),
-            cleanup: "pre-claim pool close exceeded the cleanup deadline".to_owned(),
-        },
+        Err(_) => {
+            std::future::pending::<()>().await;
+            unreachable!("failed-open pool ownership remains retained by the open lifecycle");
+        }
     }
 }
 
@@ -1365,7 +1387,7 @@ impl StateStore {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: std::sync::atomic::AtomicBool::new(false),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
-            delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
+            open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
         let mut undelivered_cleanup_owners =
             claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
@@ -1416,9 +1438,7 @@ impl StateStore {
                     Ok(())
                 }
                 Ok(store) => {
-                    task_deadline_state
-                        .delivered_writer_claim
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    let _ = task_deadline_state.retain_open_cleanup();
                     #[cfg(test)]
                     wait_at_open_postcommit_test_barrier(store.path(), &task_deadline_state).await;
                     *task_delivered_store
@@ -1580,6 +1600,9 @@ impl StateStore {
             );
         let (lock_path, lock_file, process_identity) =
             acquire_store_lock(&path, &database_file, allow_identity_initialization)?;
+        if !deadline_state.retain_open_cleanup() {
+            return Err(deadline_state.timeout_error());
+        }
         drop(creation_lock);
         let lock_identity =
             capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?;
@@ -2384,7 +2407,7 @@ impl StateStore {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: std::sync::atomic::AtomicBool::new(false),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
-            delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
+            open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
         let requested_backup = backup.as_ref().to_owned();
         let (backup, backup_snapshot) = run_bounded_filesystem(
@@ -3089,6 +3112,7 @@ impl StateStore {
         } else {
             None
         };
+        let final_connection_required = connection.is_some();
 
         let closing_pool = self.pool.clone();
         let mut close_future = Box::pin(closing_pool.close());
@@ -3228,7 +3252,8 @@ impl StateStore {
                 self.close_timeout.as_millis()
             ));
         }
-        let pool_closed = final_connection_closed && pool_drain_completed;
+        let pool_closed =
+            pool_drain_completed && (!final_connection_required || final_connection_closed);
         let os_lock_released = if pool_closed {
             #[cfg(windows)]
             {
@@ -5258,9 +5283,22 @@ fn snapshot_quarantine_usage(parent: &Path) -> Result<(usize, u64), StateError> 
 }
 
 #[cfg(unix)]
+fn ensure_snapshot_quarantine_deadline(
+    deadline_state: Option<&OpenDeadlineState>,
+) -> Result<(), StateError> {
+    if let Some(deadline_state) = deadline_state
+        && !deadline_state.permits_sqlite_work()
+    {
+        return Err(deadline_state.timeout_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn claim_reusable_snapshot_quarantine_slot(
     parent: &PinnedPrivateDirectory,
     name: &str,
+    deadline_state: Option<&OpenDeadlineState>,
 ) -> Result<Option<File>, StateError> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -5311,6 +5349,7 @@ fn claim_reusable_snapshot_quarantine_slot(
         })?;
         return Ok(None);
     }
+    ensure_snapshot_quarantine_deadline(deadline_state)?;
     file.set_len(1)
         .and_then(|()| file.sync_all())
         .map_err(|error| {
@@ -5385,6 +5424,7 @@ fn lock_snapshot_quarantine_quota(
             }
         }
     }
+    ensure_snapshot_quarantine_deadline(deadline_state)?;
     let metadata = file.metadata().map_err(|error| {
         file_error(
             "inspect snapshot quarantine quota lock",
@@ -5410,7 +5450,9 @@ fn reserve_snapshot_quarantine(
     const MAX_QUARANTINE_RESIDUAL_BYTES: u64 = MAX_AUTHENTICATED_SNAPSHOT_BYTES;
 
     let _quota_lock = lock_snapshot_quarantine_quota(parent, deadline_state)?;
+    ensure_snapshot_quarantine_deadline(deadline_state)?;
     let (entries, residual_bytes) = snapshot_quarantine_usage(&parent.path)?;
+    ensure_snapshot_quarantine_deadline(deadline_state)?;
     if entries >= MAX_QUARANTINE_ENTRIES || residual_bytes > MAX_QUARANTINE_RESIDUAL_BYTES {
         return Err(StateError::InvalidPath {
             path: parent.path.clone(),
@@ -5418,6 +5460,7 @@ fn reserve_snapshot_quarantine(
         });
     }
     for index in 0..MAX_QUARANTINE_ENTRIES {
+        ensure_snapshot_quarantine_deadline(deadline_state)?;
         let name = format!(".gta-claw-quarantine-slot-{index:02}");
         match rustix::fs::openat(
             &parent.file,
@@ -5431,6 +5474,14 @@ fn reserve_snapshot_quarantine(
         ) {
             Ok(file) => {
                 let file = File::from(file);
+                if let Err(error) = ensure_snapshot_quarantine_deadline(deadline_state) {
+                    let _ = rustix::fs::unlinkat(
+                        &parent.file,
+                        name.as_str(),
+                        rustix::fs::AtFlags::empty(),
+                    );
+                    return Err(error);
+                }
                 file.try_lock().map_err(|error| match error {
                     std::fs::TryLockError::WouldBlock => StateError::InvalidPath {
                         path: parent.path.clone(),
@@ -5440,6 +5491,15 @@ fn reserve_snapshot_quarantine(
                         file_error("lock snapshot quarantine reservation", &parent.path, error)
                     }
                 })?;
+                if let Err(error) = ensure_snapshot_quarantine_deadline(deadline_state) {
+                    let _ = File::unlock(&file);
+                    let _ = rustix::fs::unlinkat(
+                        &parent.file,
+                        name.as_str(),
+                        rustix::fs::AtFlags::empty(),
+                    );
+                    return Err(error);
+                }
                 file.set_len(1)
                     .and_then(|()| file.sync_all())
                     .map_err(|error| {
@@ -5455,7 +5515,9 @@ fn reserve_snapshot_quarantine(
                 return Ok((name, file));
             }
             Err(rustix::io::Errno::EXIST) => {
-                if let Some(file) = claim_reusable_snapshot_quarantine_slot(parent, &name)? {
+                if let Some(file) =
+                    claim_reusable_snapshot_quarantine_slot(parent, &name, deadline_state)?
+                {
                     return Ok((name, file));
                 }
             }
@@ -5796,7 +5858,7 @@ impl<'store> StoreOperationConnection<'store> {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: std::sync::atomic::AtomicBool::new(false),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
-            delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
+            open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
         let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "claw-state-operation-connection",
@@ -6171,7 +6233,11 @@ impl OwnedSqliteConnectionGuard {
                     .take()
                     .expect("owned close result remains owned");
                 if let Err(error) = done_tx.send((result, payload.backup_lease.take())) {
-                    payload.backup_lease = error.0.1;
+                    let mut backup_lease = error.0.1;
+                    if let Some(lease) = backup_lease.as_mut() {
+                        claw_sqlite_file_control::SnapshotCleanupLease::detach_cleanup(lease);
+                    }
+                    payload.backup_lease = backup_lease;
                 }
             },
         )
@@ -8741,9 +8807,7 @@ async fn reject_late_open_claim(
         result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     }
 
-    deadline_state
-        .delivered_writer_claim
-        .store(true, std::sync::atomic::Ordering::Release);
+    let _ = deadline_state.retain_open_cleanup();
     let primary = deadline_state.timeout_error();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let handoff = handoff_state_payload_decide(
@@ -11096,7 +11160,7 @@ async fn backup_pool(
         cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         finished: std::sync::atomic::AtomicBool::new(false),
         final_commit_state: std::sync::atomic::AtomicU8::new(0),
-        delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
+        open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
     });
     let backup_cleanup_permit =
         tokio::time::timeout_at(deadline, BACKUP_CLEANUP_ADMISSION.acquire())

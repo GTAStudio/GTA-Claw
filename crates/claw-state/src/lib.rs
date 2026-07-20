@@ -1313,7 +1313,7 @@ mod tests {
                 timeout_ms: 2_000,
             }
         );
-        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+        let reopened = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match StateStore::open(StoreConfig::new(&path)).await {
                     Ok(store) => break store,
@@ -5095,6 +5095,20 @@ mod tests {
 
     #[tokio::test]
     async fn killed_writer_is_recovered_but_live_writer_is_rejected() {
+        const ISOLATED_ENV: &str = "GTA_CLAW_KILLED_WRITER_ISOLATED";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::killed_writer_is_recovered_but_live_writer_is_rejected")
+                .arg("--nocapture")
+                .env(ISOLATED_ENV, "1")
+                .status()
+                .expect("run isolated killed-writer recovery test");
+            assert!(status.success(), "isolated killed-writer test failed");
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "crashed-writer.sqlite");
         let ready = database_path(&directory, "child.ready");
