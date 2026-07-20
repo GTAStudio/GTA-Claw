@@ -407,6 +407,12 @@ impl TaskRecord {
 }
 
 pub(crate) fn validate_text(field: &'static str, value: String) -> Result<String, StateError> {
+    if value.contains('\0') {
+        return Err(StateError::InvalidValue {
+            field,
+            reason: "must not contain NUL characters",
+        });
+    }
     if value.trim().is_empty() {
         return Err(StateError::InvalidValue {
             field,

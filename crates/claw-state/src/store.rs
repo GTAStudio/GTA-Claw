@@ -193,6 +193,28 @@ async fn ensure_state_cleanup_executor(deadline: tokio::time::Instant) -> Result
     .map_err(|error| format!("state cleanup executor readiness task: {error}"))?
 }
 
+async fn deadline_first<T>(
+    deadline: tokio::time::Instant,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(());
+    }
+    let timer = tokio::time::sleep_until(deadline);
+    tokio::pin!(timer);
+    tokio::pin!(future);
+    let result = tokio::select! {
+        biased;
+        () = &mut timer => return Err(()),
+        result = &mut future => result,
+    };
+    if tokio::time::Instant::now() >= deadline {
+        Err(())
+    } else {
+        Ok(result)
+    }
+}
+
 fn handoff_state_payload<Payload>(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     payload: Payload,
@@ -2014,7 +2036,7 @@ impl StateStore {
             "inspect SQLite settings",
         )
         .await?;
-        let row = tokio::time::timeout_at(
+        let row = deadline_first(
             operation.deadline,
             sqlx::query(
                 "SELECT
@@ -2416,6 +2438,7 @@ impl StateStore {
                     &publication_destination,
                     "SQLite restore",
                     Some((deadline, timeout_ms)),
+                    Some(&publication_deadline_state),
                     &destination_directory,
                 );
                 Ok(match result {
@@ -2723,7 +2746,7 @@ impl StateStore {
             "inspect SQLite health",
         )
         .await?;
-        let result = tokio::time::timeout_at(operation.deadline, async {
+        let result = deadline_first(operation.deadline, async {
             sqlx::query("BEGIN")
                 .execute(&mut *operation.sqlite())
                 .await
@@ -2830,7 +2853,7 @@ impl StateStore {
             "checkpoint SQLite WAL",
         )
         .await?;
-        let row = tokio::time::timeout_at(operation.deadline, async {
+        let row = deadline_first(operation.deadline, async {
             let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(&mut *operation.sqlite())
                 .await
@@ -6272,6 +6295,7 @@ fn publish_bound_snapshot(
     destination: &Path,
     operation: &'static str,
     publication_deadline: Option<(tokio::time::Instant, u64)>,
+    publication_state: Option<&OpenDeadlineState>,
     destination_directory: &PinnedPrivateDirectory,
 ) -> Result<(), StateError> {
     snapshot.verify()?;
@@ -6313,12 +6337,25 @@ fn publish_bound_snapshot(
             timeout_ms,
         });
     }
+    if let Some(publication_state) = publication_state {
+        publication_state.begin_final_commit()?;
+    }
     cleanup.begin_publication();
     if let Err(error) = cleanup.clear_staging_marker() {
+        if let Some(publication_state) = publication_state {
+            let _ = publication_state.finish_final_commit();
+        }
         cleanup.mark_publication_uncertain();
         return Err(StateError::PublicationUncertain {
             path: destination.to_owned(),
             reason: format!("bound snapshot staging marker removal failed: {error}"),
+        });
+    }
+    if publication_state.is_some_and(|state| !state.finish_final_commit()) {
+        cleanup.mark_publication_uncertain();
+        return Err(StateError::PublicationUncertain {
+            path: destination.to_owned(),
+            reason: format!("{operation} cancellation raced with publication"),
         });
     }
     if publication_deadline.is_some_and(|(deadline, _)| {
@@ -11444,6 +11481,7 @@ async fn backup_pool(
                 &publication_destination,
                 "SQLite backup",
                 Some((deadline, timeout_ms)),
+                Some(&publication_deadline_state),
                 &destination_directory,
             );
             Ok(match result {

@@ -57,6 +57,39 @@ impl RepositoryDeadline {
             timeout_ms: self.timeout_ms,
         }
     }
+
+    async fn run<T>(
+        &self,
+        operation: &'static str,
+        future: impl std::future::Future<Output = Result<T, StateError>>,
+    ) -> Result<T, StateError> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= self.deadline
+        {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(self.timeout_error(operation));
+        }
+        let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline));
+        tokio::pin!(timer);
+        tokio::pin!(future);
+        let result = tokio::select! {
+            biased;
+            () = &mut timer => {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(self.timeout_error(operation));
+            }
+            result = &mut future => result,
+        };
+        if std::time::Instant::now() >= self.deadline {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(self.timeout_error(operation))
+        } else {
+            result
+        }
+    }
 }
 
 async fn read_with_deadline<T>(
@@ -65,15 +98,7 @@ async fn read_with_deadline<T>(
     future: impl std::future::Future<Output = Result<T, StateError>>,
 ) -> Result<T, StateError> {
     let timing = RepositoryDeadline::new(identity)?;
-    match tokio::time::timeout_at(tokio::time::Instant::from_std(timing.deadline), future).await {
-        Ok(result) => result,
-        Err(_) => {
-            timing
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::Release);
-            Err(timing.timeout_error(operation))
-        }
-    }
+    timing.run(operation, future).await
 }
 
 struct VerifiedWriteTransaction {
@@ -349,14 +374,13 @@ impl<'store> SessionRepository<'store> {
     ) -> Result<SessionRecord, StateError> {
         let operation = "begin session update";
         let timing = RepositoryDeadline::new(self.identity)?;
-        let current =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(timing.deadline), async {
+        let current = timing
+            .run(operation, async {
                 #[cfg(test)]
                 wait_at_read_test_barrier(self.owner).await;
                 self.get(id).await
             })
-            .await
-            .map_err(|_| timing.timeout_error(operation))??
+            .await?
             .ok_or_else(|| not_found("session", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("session", id.as_str(), expected_version));
@@ -539,13 +563,10 @@ impl<'store> DeviceRepository<'store> {
         let operation = "begin device rename";
         let timing = RepositoryDeadline::new(self.identity)?;
         let display_name = validate_text("device display name", display_name.into())?;
-        let current = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(timing.deadline),
-            self.get(id),
-        )
-        .await
-        .map_err(|_| timing.timeout_error(operation))??
-        .ok_or_else(|| not_found("device", id.as_str()))?;
+        let current = timing
+            .run(operation, self.get(id))
+            .await?
+            .ok_or_else(|| not_found("device", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("device", id.as_str(), expected_version));
         }
@@ -698,13 +719,10 @@ impl<'store> AuthenticationRepository<'store> {
         let operation = "begin authentication update";
         let timing = RepositoryDeadline::new(self.identity)?;
         let subject = validate_auth_subject(status, subject)?;
-        let current = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(timing.deadline),
-            self.get(id),
-        )
-        .await
-        .map_err(|_| timing.timeout_error(operation))??
-        .ok_or_else(|| not_found("authentication", id.as_str()))?;
+        let current = timing
+            .run(operation, self.get(id))
+            .await?
+            .ok_or_else(|| not_found("authentication", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("authentication", id.as_str(), expected_version));
         }
@@ -860,13 +878,10 @@ impl<'store> TaskRepository<'store> {
     ) -> Result<TaskRecord, StateError> {
         let operation = "begin task update";
         let timing = RepositoryDeadline::new(self.identity)?;
-        let current = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(timing.deadline),
-            self.get(id),
-        )
-        .await
-        .map_err(|_| timing.timeout_error(operation))??
-        .ok_or_else(|| not_found("task", id.as_str()))?;
+        let current = timing
+            .run(operation, self.get(id))
+            .await?
+            .ok_or_else(|| not_found("task", id.as_str()))?;
         if current.version != expected_version {
             return Err(conflict("task", id.as_str(), expected_version));
         }
@@ -939,20 +954,19 @@ async fn begin_verified_write_with_deadline(
     operation: &'static str,
     timing: RepositoryDeadline,
 ) -> Result<VerifiedWriteTransaction, StateError> {
+    let connection = timing
+        .run(operation, async {
+            pool.acquire()
+                .await
+                .map_err(|error| database(operation, error))
+        })
+        .await?;
     let RepositoryDeadline {
         deadline,
         cleanup_deadline,
         cancelled,
         timeout_ms,
     } = timing;
-    let connection =
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), pool.acquire())
-            .await
-            .map_err(|_| StateError::OperationTimedOut {
-                operation,
-                timeout_ms,
-            })?
-            .map_err(|error| database(operation, error))?;
     let begin_timeout = identity
         .busy_timeout
         .min(deadline.saturating_duration_since(std::time::Instant::now()));

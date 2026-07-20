@@ -145,8 +145,13 @@ unsafe extern "C" fn backup_busy_handler(
     if state.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= state.deadline {
         0
     } else {
-        std::thread::yield_now();
-        1
+        let remaining = state
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+        i32::from(
+            !state.cancelled.load(Ordering::Acquire) && std::time::Instant::now() < state.deadline,
+        )
     }
 }
 
@@ -1756,7 +1761,12 @@ async fn backup_main_database(
         match step {
             libsqlite3_sys::SQLITE_OK
             | libsqlite3_sys::SQLITE_BUSY
-            | libsqlite3_sys::SQLITE_LOCKED => tokio::task::yield_now().await,
+            | libsqlite3_sys::SQLITE_LOCKED => {
+                let remaining = context
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(1))).await;
+            }
             _ => break step,
         }
     };

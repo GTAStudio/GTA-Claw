@@ -399,6 +399,34 @@ mod tests {
             .expect("state store opens")
     }
 
+    #[test]
+    fn public_text_fields_reject_nul_characters() {
+        assert_eq!(
+            DeviceRecord::new(
+                DeviceId::new("nul-device").expect("valid device id"),
+                "\0display",
+                timestamp(1),
+            ),
+            Err(StateError::InvalidValue {
+                field: "device display name",
+                reason: "must not contain NUL characters",
+            })
+        );
+        assert_eq!(
+            TaskRecord::new(
+                TaskId::new("nul-task").expect("valid task id"),
+                SessionId::new("nul-session").expect("valid session id"),
+                "\0kind",
+                "payload",
+                timestamp(1),
+            ),
+            Err(StateError::InvalidValue {
+                field: "task kind",
+                reason: "must not contain NUL characters",
+            })
+        );
+    }
+
     async fn wait_for_cleanup_absence(paths: &[&Path]) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while paths.iter().any(|path| match path.try_exists() {
