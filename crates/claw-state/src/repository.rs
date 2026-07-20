@@ -87,6 +87,34 @@ struct VerifiedWriteTransaction {
     rollback_cleanup_test_mode: Option<u8>,
 }
 
+#[derive(Clone)]
+struct WriteDeadline {
+    deadline: std::time::Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    timeout_ms: u64,
+}
+
+impl WriteDeadline {
+    async fn run<T, E>(
+        &self,
+        operation: &'static str,
+        future: impl std::future::Future<Output = Result<T, E>>,
+        map_error: impl FnOnce(E) -> StateError,
+    ) -> Result<T, StateError> {
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(self.deadline), future).await {
+            Ok(result) => result.map_err(map_error),
+            Err(_) => {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(StateError::OperationTimedOut {
+                    operation,
+                    timeout_ms: self.timeout_ms,
+                })
+            }
+        }
+    }
+}
+
 impl VerifiedWriteTransaction {
     fn executor(&mut self) -> &mut PoolManualTransaction {
         self.transaction
@@ -104,6 +132,14 @@ impl VerifiedWriteTransaction {
             })
         } else {
             Ok(())
+        }
+    }
+
+    fn operation_deadline(&self) -> WriteDeadline {
+        WriteDeadline {
+            deadline: self.deadline,
+            cancelled: Arc::clone(&self.cancelled),
+            timeout_ms: self.timeout_ms,
         }
     }
 
@@ -208,18 +244,23 @@ impl<'store> SessionRepository<'store> {
         let mut transaction =
             begin_verified_write(self.pool, self.owner, self.identity, "begin session create")
                 .await?;
-        sqlx::query(
-            "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(record.id.as_str())
-        .bind(record.status.as_db())
-        .bind(record.created_at.get())
-        .bind(record.updated_at.get())
-        .bind(record.version)
-        .execute(transaction.executor())
-        .await
-        .map_err(|error| create_error(error, "session", record.id.as_str(), None))?;
+        let deadline = transaction.operation_deadline();
+        deadline
+            .run(
+                "insert session",
+                sqlx::query(
+                    "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(record.id.as_str())
+                .bind(record.status.as_db())
+                .bind(record.created_at.get())
+                .bind(record.updated_at.get())
+                .bind(record.version)
+                .execute(transaction.executor()),
+                |error| create_error(error, "session", record.id.as_str(), None),
+            )
+            .await?;
         commit_verified(
             transaction,
             self.owner,
@@ -316,19 +357,24 @@ impl<'store> SessionRepository<'store> {
             timing,
         )
         .await?;
-        let row = sqlx::query(
-            "UPDATE sessions
-             SET status = ?, updated_at_ms = ?, version = version + 1
-             WHERE id = ? AND version = ?
-             RETURNING id, status, created_at_ms, updated_at_ms, version",
-        )
-        .bind(status.as_db())
-        .bind(updated_at.get())
-        .bind(id.as_str())
-        .bind(expected_version)
-        .fetch_optional(transaction.executor())
-        .await
-        .map_err(|error| database("update session", error))?;
+        let deadline = transaction.operation_deadline();
+        let row = deadline
+            .run(
+                "update session",
+                sqlx::query(
+                    "UPDATE sessions
+                     SET status = ?, updated_at_ms = ?, version = version + 1
+                     WHERE id = ? AND version = ?
+                     RETURNING id, status, created_at_ms, updated_at_ms, version",
+                )
+                .bind(status.as_db())
+                .bind(updated_at.get())
+                .bind(id.as_str())
+                .bind(expected_version)
+                .fetch_optional(transaction.executor()),
+                |error| database("update session", error),
+            )
+            .await?;
         let record = row
             .map(session_from_row)
             .transpose()?
@@ -489,19 +535,24 @@ impl<'store> DeviceRepository<'store> {
             timing,
         )
         .await?;
-        let row = sqlx::query(
-            "UPDATE devices
-             SET display_name = ?, updated_at_ms = ?, version = version + 1
-             WHERE id = ? AND version = ?
-             RETURNING id, display_name, created_at_ms, updated_at_ms, version",
-        )
-        .bind(display_name)
-        .bind(updated_at.get())
-        .bind(id.as_str())
-        .bind(expected_version)
-        .fetch_optional(transaction.executor())
-        .await
-        .map_err(|error| database("rename device", error))?;
+        let deadline = transaction.operation_deadline();
+        let row = deadline
+            .run(
+                "rename device",
+                sqlx::query(
+                    "UPDATE devices
+                     SET display_name = ?, updated_at_ms = ?, version = version + 1
+                     WHERE id = ? AND version = ?
+                     RETURNING id, display_name, created_at_ms, updated_at_ms, version",
+                )
+                .bind(display_name)
+                .bind(updated_at.get())
+                .bind(id.as_str())
+                .bind(expected_version)
+                .fetch_optional(transaction.executor()),
+                |error| database("rename device", error),
+            )
+            .await?;
         let record = row
             .map(device_from_row)
             .transpose()?
@@ -661,21 +712,26 @@ impl<'store> AuthenticationRepository<'store> {
             timing,
         )
         .await?;
-        let row = sqlx::query(
-            "UPDATE authentication_records
-             SET status = ?, subject = ?, updated_at_ms = ?, version = version + 1
-             WHERE id = ? AND version = ?
-             RETURNING id, device_id, provider, subject, status,
-                       created_at_ms, updated_at_ms, version",
-        )
-        .bind(status.as_db())
-        .bind(subject)
-        .bind(updated_at.get())
-        .bind(id.as_str())
-        .bind(expected_version)
-        .fetch_optional(transaction.executor())
-        .await
-        .map_err(|error| database("update authentication", error))?;
+        let deadline = transaction.operation_deadline();
+        let row = deadline
+            .run(
+                "update authentication",
+                sqlx::query(
+                    "UPDATE authentication_records
+                     SET status = ?, subject = ?, updated_at_ms = ?, version = version + 1
+                     WHERE id = ? AND version = ?
+                     RETURNING id, device_id, provider, subject, status,
+                               created_at_ms, updated_at_ms, version",
+                )
+                .bind(status.as_db())
+                .bind(subject)
+                .bind(updated_at.get())
+                .bind(id.as_str())
+                .bind(expected_version)
+                .fetch_optional(transaction.executor()),
+                |error| database("update authentication", error),
+            )
+            .await?;
         let record = row
             .map(authentication_from_row)
             .transpose()?
@@ -815,20 +871,25 @@ impl<'store> TaskRepository<'store> {
             timing,
         )
         .await?;
-        let row = sqlx::query(
-            "UPDATE tasks
-             SET status = ?, updated_at_ms = ?, version = version + 1
-             WHERE id = ? AND version = ?
-             RETURNING id, session_id, kind, payload, status,
-                       created_at_ms, updated_at_ms, version",
-        )
-        .bind(status.as_db())
-        .bind(updated_at.get())
-        .bind(id.as_str())
-        .bind(expected_version)
-        .fetch_optional(transaction.executor())
-        .await
-        .map_err(|error| database("update task", error))?;
+        let deadline = transaction.operation_deadline();
+        let row = deadline
+            .run(
+                "update task",
+                sqlx::query(
+                    "UPDATE tasks
+                     SET status = ?, updated_at_ms = ?, version = version + 1
+                     WHERE id = ? AND version = ?
+                     RETURNING id, session_id, kind, payload, status,
+                               created_at_ms, updated_at_ms, version",
+                )
+                .bind(status.as_db())
+                .bind(updated_at.get())
+                .bind(id.as_str())
+                .bind(expected_version)
+                .fetch_optional(transaction.executor()),
+                |error| database("update task", error),
+            )
+            .await?;
         let record = row
             .map(task_from_row)
             .transpose()?
@@ -908,31 +969,47 @@ async fn begin_verified_write_with_deadline(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(owner),
     };
-    let ownership = sqlx::query(
-        "UPDATE claw_writer_lock
-         SET owner = owner
-         WHERE singleton = 1 AND owner = ?",
-    )
-    .bind(owner)
-    .execute(transaction.executor())
-    .await
-    .map_err(|error| database("lock and verify application writer", error))?;
+    let deadline = transaction.operation_deadline();
+    let ownership = deadline
+        .run(
+            "lock and verify application writer",
+            sqlx::query(
+                "UPDATE claw_writer_lock
+                 SET owner = owner
+                 WHERE singleton = 1 AND owner = ?",
+            )
+            .bind(owner)
+            .execute(transaction.executor()),
+            |error| database("lock and verify application writer", error),
+        )
+        .await?;
     if ownership.rows_affected() != 1 {
         return Err(StateError::InvalidMigrationHistory {
             reason: "application writer ownership changed before repository write".to_owned(),
         });
     }
-    let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
-        .fetch_one(transaction.executor())
-        .await
-        .map_err(|error| database("verify repository application id", error))?;
+    let deadline = transaction.operation_deadline();
+    let application_id = deadline
+        .run(
+            "verify repository application id",
+            sqlx::query_scalar::<_, i64>("PRAGMA application_id").fetch_one(transaction.executor()),
+            |error| database("verify repository application id", error),
+        )
+        .await?;
     if application_id != APPLICATION_ID {
         return Err(StateError::InvalidValue {
             field: "SQLite application id",
             reason: "database ownership changed before repository write",
         });
     }
-    validate_operational_schema(transaction.executor()).await?;
+    let deadline = transaction.operation_deadline();
+    deadline
+        .run(
+            "validate repository schema",
+            validate_operational_schema(transaction.executor()),
+            std::convert::identity,
+        )
+        .await?;
     identity.verify()?;
     transaction.ensure_within_deadline(operation)?;
     #[cfg(test)]
@@ -1015,34 +1092,53 @@ async fn commit_verified(
     transaction.ensure_within_deadline(operation)?;
     #[cfg(test)]
     apply_commit_test_tamper(&mut transaction, owner).await?;
-    let persisted_owner =
-        sqlx::query_scalar::<_, String>("SELECT owner FROM claw_writer_lock WHERE singleton = 1")
-            .fetch_optional(transaction.executor())
-            .await
-            .map_err(|error| database("reverify repository writer owner", error))?;
+    let deadline_guard = transaction.operation_deadline();
+    let persisted_owner = deadline_guard
+        .run(
+            "reverify repository writer owner",
+            sqlx::query_scalar::<_, String>(
+                "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
+            )
+            .fetch_optional(transaction.executor()),
+            |error| database("reverify repository writer owner", error),
+        )
+        .await?;
     if persisted_owner.as_deref() != Some(owner) {
         return Err(StateError::InvalidMigrationHistory {
             reason: "application writer ownership changed before repository commit".to_owned(),
         });
     }
-    let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
-        .fetch_one(transaction.executor())
-        .await
-        .map_err(|error| database("reverify repository application id", error))?;
+    let deadline_guard = transaction.operation_deadline();
+    let application_id = deadline_guard
+        .run(
+            "reverify repository application id",
+            sqlx::query_scalar::<_, i64>("PRAGMA application_id").fetch_one(transaction.executor()),
+            |error| database("reverify repository application id", error),
+        )
+        .await?;
     if application_id != APPLICATION_ID {
         return Err(StateError::InvalidValue {
             field: "SQLite application id",
             reason: "database ownership changed before repository commit",
         });
     }
-    validate_operational_schema(transaction.executor()).await?;
+    let deadline_guard = transaction.operation_deadline();
+    deadline_guard
+        .run(
+            "revalidate repository schema",
+            validate_operational_schema(transaction.executor()),
+            std::convert::identity,
+        )
+        .await?;
     identity.verify()?;
     #[cfg(unix)]
     {
-        let moved = transaction
-            .main_database_has_moved()
-            .await
-            .map_err(|error| database(operation, sqlx::Error::Protocol(error.to_string())))?;
+        let deadline_guard = transaction.operation_deadline();
+        let moved = deadline_guard
+            .run(operation, transaction.main_database_has_moved(), |error| {
+                database(operation, sqlx::Error::Protocol(error.to_string()))
+            })
+            .await?;
         if moved {
             return Err(database(
                 operation,
@@ -1058,19 +1154,35 @@ async fn commit_verified(
     transaction.ensure_within_deadline(operation)?;
     let deadline = transaction.deadline;
     let timeout_ms = transaction.timeout_ms;
-    transaction.commit().await.map(drop).map_err(|error| {
-        if error.code() == Some(9) && std::time::Instant::now() >= deadline {
-            StateError::OperationTimedOut {
-                operation,
-                timeout_ms,
+    transaction
+        .commit()
+        .await
+        .map(drop)
+        .map_err(|error| match error {
+            claw_sqlite_file_control::FileControlError::CommittedAfterDeadline(cleanup) => {
+                StateError::CommittedAfterDeadline { operation, cleanup }
             }
-        } else {
-            error.code().map_or_else(
-                || database(operation, sqlx::Error::Protocol(error.to_string())),
-                |code| database_code(operation, code, error.to_string()),
-            )
-        }
-    })
+            claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure(cleanup) => {
+                StateError::CommittedWithCleanupFailure { operation, cleanup }
+            }
+            claw_sqlite_file_control::FileControlError::CommitOutcomeUncertain(code, message) => {
+                StateError::CommitOutcomeUncertain {
+                    operation,
+                    code,
+                    message,
+                }
+            }
+            other if other.code() == Some(9) && std::time::Instant::now() >= deadline => {
+                StateError::OperationTimedOut {
+                    operation,
+                    timeout_ms,
+                }
+            }
+            other => other.code().map_or_else(
+                || database(operation, sqlx::Error::Protocol(other.to_string())),
+                |code| database_code(operation, code, other.to_string()),
+            ),
+        })
 }
 
 #[cfg(test)]
@@ -1101,18 +1213,23 @@ async fn insert_device(
     transaction: &mut VerifiedWriteTransaction,
     record: &DeviceRecord,
 ) -> Result<(), StateError> {
-    sqlx::query(
-        "INSERT INTO devices(id, display_name, created_at_ms, updated_at_ms, version)
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(record.id.as_str())
-    .bind(&record.display_name)
-    .bind(record.created_at.get())
-    .bind(record.updated_at.get())
-    .bind(record.version)
-    .execute(transaction.executor())
-    .await
-    .map_err(|error| create_error(error, "device", record.id.as_str(), None))?;
+    let deadline = transaction.operation_deadline();
+    deadline
+        .run(
+            "insert device",
+            sqlx::query(
+                "INSERT INTO devices(id, display_name, created_at_ms, updated_at_ms, version)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(record.id.as_str())
+            .bind(&record.display_name)
+            .bind(record.created_at.get())
+            .bind(record.updated_at.get())
+            .bind(record.version)
+            .execute(transaction.executor()),
+            |error| create_error(error, "device", record.id.as_str(), None),
+        )
+        .await?;
     Ok(())
 }
 
@@ -1120,29 +1237,34 @@ async fn insert_authentication(
     transaction: &mut VerifiedWriteTransaction,
     record: &AuthenticationRecord,
 ) -> Result<(), StateError> {
-    sqlx::query(
-        "INSERT INTO authentication_records(
-            id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(record.id.as_str())
-    .bind(record.device_id.as_str())
-    .bind(&record.provider)
-    .bind(&record.subject)
-    .bind(record.status.as_db())
-    .bind(record.created_at.get())
-    .bind(record.updated_at.get())
-    .bind(record.version)
-    .execute(transaction.executor())
-    .await
-    .map_err(|error| {
-        create_error(
-            error,
-            "authentication",
-            record.id.as_str(),
-            Some(("device", record.device_id.as_str())),
+    let deadline = transaction.operation_deadline();
+    deadline
+        .run(
+            "insert authentication",
+            sqlx::query(
+                "INSERT INTO authentication_records(
+                    id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(record.id.as_str())
+            .bind(record.device_id.as_str())
+            .bind(&record.provider)
+            .bind(&record.subject)
+            .bind(record.status.as_db())
+            .bind(record.created_at.get())
+            .bind(record.updated_at.get())
+            .bind(record.version)
+            .execute(transaction.executor()),
+            |error| {
+                create_error(
+                    error,
+                    "authentication",
+                    record.id.as_str(),
+                    Some(("device", record.device_id.as_str())),
+                )
+            },
         )
-    })?;
+        .await?;
     Ok(())
 }
 
@@ -1150,40 +1272,50 @@ async fn insert_task(
     transaction: &mut VerifiedWriteTransaction,
     record: &TaskRecord,
 ) -> Result<(), StateError> {
-    let result = sqlx::query(
-        "INSERT INTO tasks(
-            id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
-         )
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE EXISTS (
-             SELECT 1 FROM sessions WHERE id = ? AND status = 'active'
-         )",
-    )
-    .bind(record.id.as_str())
-    .bind(record.session_id.as_str())
-    .bind(&record.kind)
-    .bind(&record.payload)
-    .bind(record.status.as_db())
-    .bind(record.created_at.get())
-    .bind(record.updated_at.get())
-    .bind(record.version)
-    .bind(record.session_id.as_str())
-    .execute(transaction.executor())
-    .await
-    .map_err(|error| {
-        create_error(
-            error,
-            "task",
-            record.id.as_str(),
-            Some(("session", record.session_id.as_str())),
-        )
-    })?;
-    if result.rows_affected() == 0 {
-        let status = sqlx::query_scalar::<_, String>("SELECT status FROM sessions WHERE id = ?")
+    let deadline = transaction.operation_deadline();
+    let result = deadline
+        .run(
+            "insert task",
+            sqlx::query(
+                "INSERT INTO tasks(
+                    id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
+                 )
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE EXISTS (
+                     SELECT 1 FROM sessions WHERE id = ? AND status = 'active'
+                 )",
+            )
+            .bind(record.id.as_str())
             .bind(record.session_id.as_str())
-            .fetch_optional(transaction.executor())
-            .await
-            .map_err(|error| database("inspect task parent session", error))?;
+            .bind(&record.kind)
+            .bind(&record.payload)
+            .bind(record.status.as_db())
+            .bind(record.created_at.get())
+            .bind(record.updated_at.get())
+            .bind(record.version)
+            .bind(record.session_id.as_str())
+            .execute(transaction.executor()),
+            |error| {
+                create_error(
+                    error,
+                    "task",
+                    record.id.as_str(),
+                    Some(("session", record.session_id.as_str())),
+                )
+            },
+        )
+        .await?;
+    if result.rows_affected() == 0 {
+        let deadline = transaction.operation_deadline();
+        let status = deadline
+            .run(
+                "inspect task parent session",
+                sqlx::query_scalar::<_, String>("SELECT status FROM sessions WHERE id = ?")
+                    .bind(record.session_id.as_str())
+                    .fetch_optional(transaction.executor()),
+                |error| database("inspect task parent session", error),
+            )
+            .await?;
         return match status.as_deref() {
             None => Err(StateError::ForeignKeyViolation {
                 entity: "session",
@@ -1528,14 +1660,13 @@ fn conflict(entity: &'static str, id: &str, expected_version: i64) -> StateError
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(unix)]
+    use super::COMMIT_TEST_TAMPERS;
     use super::{
         Arc, COMMIT_TEST_BARRIERS, READ_TEST_BARRIERS, ROLLBACK_CLEANUP_TEST_MODES,
-        WriteTestBarrier,
+        WRITE_TEST_BARRIERS, WriteTestBarrier,
     };
-    #[cfg(unix)]
-    use super::{COMMIT_TEST_TAMPERS, WRITE_TEST_BARRIERS};
 
-    #[cfg(unix)]
     pub(crate) fn set_write_barrier(
         owner: &str,
     ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {

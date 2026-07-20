@@ -69,6 +69,17 @@ impl Display for DatabaseFailure {
 
 impl Error for DatabaseFailure {}
 
+/// The durability semantics of a failed repository write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteOutcome {
+    /// The write did not commit and may be retried according to normal error policy.
+    NotCommitted,
+    /// The write is known to be durable and must not be retried automatically.
+    Committed,
+    /// The write may be durable and must be reconciled before any retry.
+    Uncertain,
+}
+
 /// Failures surfaced by the durable state boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateError {
@@ -212,6 +223,29 @@ pub enum StateError {
         /// Stable rejection reason.
         reason: &'static str,
     },
+    /// A write committed after its delivery deadline.
+    CommittedAfterDeadline {
+        /// Write operation whose result arrived late.
+        operation: &'static str,
+        /// Optional late cleanup degradation.
+        cleanup: Option<String>,
+    },
+    /// A write committed, but terminal connection cleanup degraded.
+    CommittedWithCleanupFailure {
+        /// Write operation that became durable.
+        operation: &'static str,
+        /// Terminal cleanup diagnostic.
+        cleanup: String,
+    },
+    /// SQLite reported an error after durability became uncertain.
+    CommitOutcomeUncertain {
+        /// Write operation with an uncertain outcome.
+        operation: &'static str,
+        /// SQLite result code.
+        code: i32,
+        /// Stable diagnostic.
+        message: String,
+    },
     /// A bounded store lifecycle operation exceeded its configured deadline.
     OperationTimedOut {
         /// Bounded operation name.
@@ -228,6 +262,21 @@ pub enum StateError {
         /// Cleanup/close diagnostic.
         cleanup: String,
     },
+}
+
+impl StateError {
+    /// Returns whether a failed write is known not to have committed, committed, or uncertain.
+    #[must_use]
+    pub fn write_outcome(&self) -> WriteOutcome {
+        match self {
+            Self::CommittedAfterDeadline { .. } | Self::CommittedWithCleanupFailure { .. } => {
+                WriteOutcome::Committed
+            }
+            Self::CommitOutcomeUncertain { .. } => WriteOutcome::Uncertain,
+            Self::OperationCleanupFailed { primary, .. } => primary.write_outcome(),
+            _ => WriteOutcome::NotCommitted,
+        }
+    }
 }
 
 impl Display for StateError {
@@ -326,6 +375,27 @@ impl Display for StateError {
             Self::InvalidValue { field, reason } => {
                 write!(formatter, "invalid {field}: {reason}")
             }
+            Self::CommittedAfterDeadline { operation, cleanup } => {
+                write!(formatter, "{operation} committed after its deadline")?;
+                if let Some(cleanup) = cleanup {
+                    write!(formatter, "; late cleanup failed: {cleanup}")?;
+                }
+                Ok(())
+            }
+            Self::CommittedWithCleanupFailure { operation, cleanup } => {
+                write!(
+                    formatter,
+                    "{operation} committed; terminal cleanup failed: {cleanup}"
+                )
+            }
+            Self::CommitOutcomeUncertain {
+                operation,
+                code,
+                message,
+            } => write!(
+                formatter,
+                "{operation} may have committed (SQLite code {code}): {message}"
+            ),
             Self::OperationTimedOut {
                 operation,
                 timeout_ms,

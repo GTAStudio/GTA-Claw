@@ -8,7 +8,7 @@ mod model;
 mod repository;
 mod store;
 
-pub use error::{DatabaseFailure, StateError};
+pub use error::{DatabaseFailure, StateError, WriteOutcome};
 pub use model::{
     AuthenticationId, AuthenticationRecord, AuthenticationStatus, DeviceId, DeviceRecord, Page,
     PageCursor, PageRequest, SessionRecord, SessionStatus, TaskId, TaskRecord, TaskStatus,
@@ -1232,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_timeout_after_commit_waits_for_claim_cleanup_before_return() {
+    async fn open_timeout_after_commit_handoffs_claim_cleanup_before_return() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "timeout-after-commit.sqlite");
         let (entered, _release) = test_support::set_open_postcommit_barrier(&path);
@@ -1257,14 +1257,91 @@ mod tests {
                 timeout_ms: 2_000,
             }
         );
-        let reopened = StateStore::open(StoreConfig::new(&path))
-            .await
-            .expect("timeout returned only after writer claim cleanup");
+        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("post-timeout reopen failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("detached writer-claim cleanup eventually completes");
         assert!(reopened.recovered_writer().is_none());
         reopened
             .close()
             .await
             .expect("postcommit-timeout store closes");
+    }
+
+    #[tokio::test]
+    async fn stalled_postcommit_cleanup_cannot_extend_the_open_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "stalled-postcommit-cleanup.sqlite");
+        let (postcommit_entered, _postcommit_release) =
+            test_support::set_open_postcommit_barrier(&path);
+        let (cleanup_entered, cleanup_release) = test_support::set_open_cleanup_barrier(&path);
+        let open_path = path.clone();
+        let started = Instant::now();
+        let opening = tokio::spawn(async move {
+            StateStore::open(
+                StoreConfig::new(open_path).with_open_timeout(Duration::from_millis(300)),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), postcommit_entered.notified())
+            .await
+            .expect("open reaches postcommit cleanup fixture");
+        tokio::time::timeout(Duration::from_secs(1), cleanup_entered.notified())
+            .await
+            .expect("cancelled open starts writer-claim cleanup");
+        let result = tokio::time::timeout(Duration::from_secs(1), opening)
+            .await
+            .expect("stalled open cleanup remains externally bounded")
+            .expect("stalled open task joins");
+        let error = match result {
+            Err(error) => error,
+            Ok(store) => {
+                let close = store.close().await;
+                panic!("stalled postcommit cleanup returned a store; close result: {close:?}");
+            }
+        };
+        assert_eq!(
+            error,
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 300,
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            StateStore::open(StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)))
+                .await
+                .is_err(),
+            "detached cleanup retains exclusive store ownership"
+        );
+        cleanup_release.notify_one();
+        test_support::clear_open_cleanup_barrier(&path);
+        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("reopen after detached cleanup failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("detached cleanup eventually releases store ownership");
+        reopened
+            .close()
+            .await
+            .expect("store closes after detached cleanup");
     }
 
     #[cfg(unix)]
@@ -3305,8 +3382,8 @@ mod tests {
             fs::write(
                 directory
                     .path()
-                    .join(format!(".gta-claw-quarantine-existing-{index:02}")),
-                b"",
+                    .join(format!(".gta-claw-quarantine-slot-{index:02}")),
+                b"active",
             )
             .expect("create quarantine tombstone");
         }
@@ -3320,6 +3397,45 @@ mod tests {
             assert!(!sidecar(&destination, suffix).exists());
         }
         source.close().await.expect("close quarantine source");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reclaimed_quarantine_slots_survive_more_than_capacity_failures() {
+        let directory = tempfile::tempdir().expect("quarantine reuse directory");
+        let source_path = database_path(&directory, "quarantine-reuse-source.sqlite");
+        let destination = database_path(&directory, "quarantine-reuse-destination.sqlite");
+        let source = StateStore::open(
+            StoreConfig::new(&source_path).with_operation_timeout(Duration::from_secs(2)),
+        )
+        .await
+        .expect("quarantine reuse source opens");
+        for _ in 0..70 {
+            test_support::expire_publication_deadline_once(&destination, 1);
+            assert!(matches!(
+                source
+                    .backup_to(&destination)
+                    .await
+                    .expect_err("prepublication failure is injected"),
+                StateError::OperationTimedOut {
+                    operation: "SQLite backup",
+                    timeout_ms: 2_000,
+                }
+            ));
+            assert!(!destination.exists());
+        }
+        let tombstones = fs::read_dir(directory.path())
+            .expect("read quarantine reuse directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gta-claw-quarantine-slot-")
+            })
+            .count();
+        assert!(tombstones <= 1, "completed tombstones must be reused");
+        source.close().await.expect("close quarantine reuse source");
     }
 
     #[tokio::test]
@@ -3828,11 +3944,18 @@ mod tests {
             .expect("sidecar commit rejection remains bounded")
             .expect("sidecar writer task joins")
             .expect_err("commit hook rejects recreated WAL generation");
-        let StateError::Database(failure) = error else {
-            panic!("expected commit-hook constraint, received {error:?}");
+        let StateError::CommitOutcomeUncertain {
+            operation,
+            code,
+            message,
+        } = &error
+        else {
+            panic!("expected typed uncertain commit outcome, received {error:?}");
         };
-        assert_eq!(failure.operation(), "commit session create");
-        assert_eq!(failure.code(), Some("531"));
+        assert_eq!(*operation, "commit session create");
+        assert_eq!(*code, 531);
+        assert!(message.contains("autocommit was restored"));
+        assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
         assert!(
             live.sessions()
                 .get(&record_id)
@@ -3927,11 +4050,18 @@ mod tests {
             .expect("missing-WAL rejection remains bounded")
             .expect("missing-WAL writer joins")
             .expect_err("commit hook rejects missing WAL pathname");
-        let StateError::Database(failure) = error else {
-            panic!("expected commit-hook constraint, received {error:?}");
+        let StateError::CommitOutcomeUncertain {
+            operation,
+            code,
+            message,
+        } = &error
+        else {
+            panic!("expected typed uncertain commit outcome, received {error:?}");
         };
-        assert_eq!(failure.operation(), "commit session create");
-        assert_eq!(failure.code(), Some("531"));
+        assert_eq!(*operation, "commit session create");
+        assert_eq!(*code, 531);
+        assert!(message.contains("autocommit was restored"));
+        assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
         assert!(
             store
                 .sessions()
@@ -3971,11 +4101,18 @@ mod tests {
             .expect("invalidated-generation rejection remains bounded")
             .expect("invalidated-generation writer joins")
             .expect_err("commit hook rejects an invalidated writer generation");
-        let StateError::Database(failure) = error else {
-            panic!("expected commit-hook constraint, received {error:?}");
+        let StateError::CommitOutcomeUncertain {
+            operation,
+            code,
+            message,
+        } = &error
+        else {
+            panic!("expected typed uncertain commit outcome, received {error:?}");
         };
-        assert_eq!(failure.operation(), "commit session create");
-        assert_eq!(failure.code(), Some("531"));
+        assert_eq!(*operation, "commit session create");
+        assert_eq!(*code, 531);
+        assert!(message.contains("autocommit was restored"));
+        assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
@@ -4064,6 +4201,87 @@ mod tests {
         let store = std::sync::Arc::try_unwrap(store)
             .unwrap_or_else(|_| panic!("deadline writer retained store"));
         store.close().await.expect("deadline fixture store closes");
+    }
+
+    #[tokio::test]
+    async fn repository_statement_dispatch_obeys_the_absolute_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "repository-statement-deadline.sqlite");
+        let store = std::sync::Arc::new(
+            StateStore::open(
+                StoreConfig::new(&path).with_operation_timeout(Duration::from_millis(200)),
+            )
+            .await
+            .expect("statement deadline fixture opens"),
+        );
+        let owner = test_support::owner(&store).to_owned();
+        let (entered, release) = crate::repository::test_support::set_write_barrier(&owner);
+        let writer_store = std::sync::Arc::clone(&store);
+        let writer = tokio::spawn(async move {
+            writer_store
+                .sessions()
+                .create(&session("statement-deadline-row", 1))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("repository write reaches pre-statement barrier");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        release.notify_one();
+        assert_eq!(
+            writer
+                .await
+                .expect("statement deadline writer joins")
+                .expect_err("late statement dispatch is rejected"),
+            StateError::OperationTimedOut {
+                operation: "insert session",
+                timeout_ms: 200,
+            }
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'statement-deadline-row'"
+            )
+            .fetch_one(test_support::pool(&store))
+            .await
+            .expect("inspect statement deadline rollback"),
+            0
+        );
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("statement deadline writer retained store"));
+        store
+            .close()
+            .await
+            .expect("statement deadline fixture closes");
+    }
+
+    #[test]
+    fn durable_write_errors_expose_non_retryable_outcomes() {
+        assert_eq!(
+            StateError::CommittedAfterDeadline {
+                operation: "commit test write",
+                cleanup: None,
+            }
+            .write_outcome(),
+            WriteOutcome::Committed
+        );
+        assert_eq!(
+            StateError::CommittedWithCleanupFailure {
+                operation: "commit test write",
+                cleanup: "close failed".to_owned(),
+            }
+            .write_outcome(),
+            WriteOutcome::Committed
+        );
+        assert_eq!(
+            StateError::CommitOutcomeUncertain {
+                operation: "commit test write",
+                code: 9,
+                message: "interrupted after autocommit".to_owned(),
+            }
+            .write_outcome(),
+            WriteOutcome::Uncertain
+        );
     }
 
     #[tokio::test]
@@ -4896,12 +5114,12 @@ mod tests {
                 | StateError::StoreLocked { .. }
                 | StateError::FileSystem { .. }
         ));
-        #[cfg(unix)]
-        fs::remove_file(&alias).expect("remove rejected Unix hard-link alias before close");
+        fs::remove_file(&alias).expect("remove rejected hard-link alias before close");
         owner.close().await.expect("lock owner closes");
 
         #[cfg(not(unix))]
         {
+            fs::hard_link(&path, &alias).expect("recreate Windows hard-link alias");
             let error = StateStore::open(StoreConfig::new(&alias))
                 .await
                 .err()

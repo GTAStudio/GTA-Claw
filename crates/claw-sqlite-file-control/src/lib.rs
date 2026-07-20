@@ -3178,8 +3178,20 @@ async fn cleanup_late_writer_claim<Connection: BeginOwnedConnection>(
             "late writer claim cleanup cutoff elapsed".to_owned(),
         ));
     }
-    set_busy_timeout(connection.sqlite(), remaining).await?;
-    tokio::time::timeout(remaining, async {
+    let deadline = tokio::time::Instant::from_std(cleanup_deadline);
+    tokio::time::timeout_at(deadline, set_busy_timeout(connection.sqlite(), remaining))
+        .await
+        .map_err(|_| {
+            FileControlError::Handle(
+                "late writer claim busy-timeout setup exceeded its cutoff".to_owned(),
+            )
+        })??;
+    if std::time::Instant::now() >= cleanup_deadline {
+        return Err(FileControlError::Handle(
+            "late writer claim cleanup cutoff elapsed after busy-timeout setup".to_owned(),
+        ));
+    }
+    tokio::time::timeout_at(deadline, async {
         sqlx::query(
             "DELETE FROM claw_writer_lock
              WHERE singleton = 1 AND owner = ?",
@@ -3202,7 +3214,11 @@ async fn cleanup_late_writer_claim<Connection: BeginOwnedConnection>(
         Ok::<(), sqlx::Error>(())
     })
     .await
-    .map_err(|_| FileControlError::Handle("late writer claim cleanup timed out".to_owned()))?
+    .map_err(|_| {
+        FileControlError::Handle(
+            "late writer claim cleanup timed out; connection requires terminal close".to_owned(),
+        )
+    })?
     .map_err(|error| FileControlError::Handle(error.to_string()))
 }
 
@@ -6640,6 +6656,10 @@ fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
     if parent_expected != parent_actual
         || database_expected != database_actual
         || lock_expected != lock_actual
+        || windows_file_link_count(&context.database_file).ok() != Some(1)
+        || windows_file_link_count(&database_current).ok() != Some(1)
+        || windows_file_link_count(&context.lock_file).ok() != Some(1)
+        || windows_file_link_count(&lock_current).ok() != Some(1)
         || !windows_file_is_service_private(&context.database_parent).unwrap_or(false)
         || !windows_file_is_service_private(&context.database_file).unwrap_or(false)
         || !windows_file_is_service_private(&context.lock_file).unwrap_or(false)
@@ -6671,6 +6691,8 @@ fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
             return false;
         };
         if current_identity != expected_identity
+            || windows_file_link_count(&sidecar.file).ok() != Some(1)
+            || windows_file_link_count(&current).ok() != Some(1)
             || !windows_file_is_service_private(&sidecar.file).unwrap_or(false)
         {
             return false;
@@ -6694,6 +6716,7 @@ fn windows_identity_matches(context: &WindowsIdentityCommitContext) -> bool {
     match open_current(&journal_path, false) {
         Ok(journal) => {
             if windows_file_identity(&journal).is_err()
+                || windows_file_link_count(&journal).ok() != Some(1)
                 || !windows_file_is_service_private(&journal).unwrap_or(false)
             {
                 return false;
@@ -11040,6 +11063,50 @@ mod windows_tests {
             writer_generation: std::sync::Arc::new(AtomicU64::new(1)),
             expected_writer_generation: 1,
         };
+        assert!(windows_identity_matches(&context));
+
+        for (label, path) in [
+            ("database", &database_path),
+            ("lock", &context.lock_path),
+            ("wal", &wal_path),
+            ("shm", &shm_path),
+        ] {
+            let alias = directory.path().join(format!("{label}-hard-link"));
+            std::fs::hard_link(path, &alias).expect("create commit-identity hard link");
+            assert!(
+                !windows_identity_matches(&context),
+                "{label} hard link must veto commit"
+            );
+            std::fs::remove_file(alias).expect("remove commit-identity hard link");
+            assert!(windows_identity_matches(&context));
+        }
+
+        let journal_path = directory.path().join("state.sqlite-journal");
+        std::fs::write(&journal_path, b"journal").expect("create journal fixture");
+        let journal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(
+                windows_sys::Win32::Foundation::GENERIC_READ
+                    | windows_sys::Win32::Foundation::GENERIC_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
+            )
+            .open(&journal_path)
+            .expect("open journal security fixture");
+        secure_new_windows_file(&journal).expect("protect journal fixture");
+        let mut journal_generation = journal_path.as_os_str().to_owned();
+        journal_generation.push(":gta-claw-generation");
+        std::fs::File::create(std::path::PathBuf::from(journal_generation))
+            .and_then(|mut file| file.write_all(&generation_record))
+            .expect("attach journal generation");
+        drop(journal);
+        assert!(windows_identity_matches(&context));
+        let journal_alias = directory.path().join("journal-hard-link");
+        std::fs::hard_link(&journal_path, &journal_alias).expect("create journal hard link");
+        assert!(!windows_identity_matches(&context));
+        std::fs::remove_file(journal_alias).expect("remove journal hard link");
+        std::fs::remove_file(journal_path).expect("remove journal fixture");
         assert!(windows_identity_matches(&context));
 
         std::fs::remove_file(&wal_path).expect("remove live WAL fixture path");

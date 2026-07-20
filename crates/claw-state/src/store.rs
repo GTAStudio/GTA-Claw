@@ -388,6 +388,10 @@ static OPEN_PRECOMMIT_TEST_BARRIER: std::sync::LazyLock<
 static OPEN_POSTCOMMIT_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static OPEN_CLEANUP_TEST_BARRIER: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(all(test, unix))]
 static CHECKPOINT_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
@@ -806,6 +810,7 @@ struct OpenDeadlineState {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     finished: std::sync::atomic::AtomicBool,
     final_commit_state: std::sync::atomic::AtomicU8,
+    delivered_writer_claim: std::sync::atomic::AtomicBool,
 }
 
 impl OpenDeadlineState {
@@ -939,11 +944,59 @@ impl Drop for ProcessIdentityGuard {
     }
 }
 
-async fn close_undelivered_store(
-    mut store: StateStore,
+struct UndeliveredStoreCleanup {
+    store: StateStore,
+    deadline: tokio::time::Instant,
+    deadline_state: Arc<OpenDeadlineState>,
+}
+
+fn handoff_undelivered_store(
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    store: StateStore,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 ) -> Result<(), StateError> {
+    handoff_state_payload(
+        owner,
+        std::sync::Mutex::new(UndeliveredStoreCleanup {
+            store,
+            deadline,
+            deadline_state,
+        }),
+        |runtime, _, payload| {
+            let mut payload = payload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let deadline = payload.deadline;
+            let cleanup = runtime.block_on(async {
+                tokio::time::timeout_at(
+                    deadline,
+                    close_undelivered_writer_claim(&mut payload.store, deadline),
+                )
+                .await
+            });
+            if matches!(cleanup, Ok(Ok(()))) {
+                payload
+                    .deadline_state
+                    .finished
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        },
+    )
+    .map_err(|error| {
+        database(
+            "handoff undelivered state store cleanup",
+            sqlx::Error::Protocol(error),
+        )
+    })
+}
+
+async fn close_undelivered_writer_claim(
+    store: &mut StateStore,
+    deadline: tokio::time::Instant,
+) -> Result<(), StateError> {
+    #[cfg(test)]
+    wait_at_open_cleanup_test_barrier(store.path()).await;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
     let connection = tokio::time::timeout_at(deadline, store.pool.acquire())
@@ -1021,29 +1074,40 @@ async fn close_undelivered_store(
         .close()
         .await
         .map_err(|error| database("close undelivered claim cleanup connection", error))?;
-    deadline_state
-        .finished
-        .store(true, std::sync::atomic::Ordering::Release);
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    store.close_timeout = remaining;
-    tokio::time::timeout_at(deadline, store.close_inner(true))
-        .await
-        .map_err(|_| StateError::OperationTimedOut {
-            operation: "close undelivered state store",
-            timeout_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
-        })?
-        .map(|_| ())
+    Ok(())
 }
 
 async fn open_timeout_error(
-    lifecycle: tokio::task::JoinHandle<Result<(), StateError>>,
+    mut lifecycle: tokio::task::JoinHandle<Result<(), StateError>>,
+    deadline: tokio::time::Instant,
+    deadline_state: &OpenDeadlineState,
     timeout_ms: u64,
 ) -> StateError {
     let primary = StateError::OperationTimedOut {
         operation: "state store open",
         timeout_ms,
     };
-    match lifecycle.await {
+    let lifecycle_result = tokio::time::timeout_at(deadline, &mut lifecycle).await;
+    let lifecycle_result = match lifecycle_result {
+        Ok(result) => result,
+        Err(_) => {
+            if deadline_state
+                .delivered_writer_claim
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return StateError::OperationCleanupFailed {
+                    operation: "state store open",
+                    primary: Box::new(primary),
+                    cleanup:
+                        "open cleanup lifecycle retained ownership beyond the absolute open deadline"
+                            .to_owned(),
+                };
+            }
+            lifecycle.abort();
+            return primary;
+        }
+    };
+    match lifecycle_result {
         Ok(Ok(())) => primary,
         Ok(Err(cleanup)) => StateError::OperationCleanupFailed {
             operation: "state store open",
@@ -1112,7 +1176,31 @@ impl StateStore {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: std::sync::atomic::AtomicBool::new(false),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
+            delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
         });
+        let mut undelivered_cleanup_owners =
+            claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+                "state-open-undelivered-cleanup",
+                1,
+                cancel_at.into_std(),
+            )
+            .await
+            .map_err(|error| {
+                if tokio::time::Instant::now() >= cancel_at || error.contains("timed out") {
+                    StateError::OperationTimedOut {
+                        operation: "state store open",
+                        timeout_ms,
+                    }
+                } else {
+                    database(
+                        "reserve undelivered state-store cleanup",
+                        sqlx::Error::Protocol(error),
+                    )
+                }
+            })?;
+        let undelivered_cleanup_owner = undelivered_cleanup_owners
+            .pop()
+            .expect("one undelivered cleanup owner was reserved");
         let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
         let (delivery_ack_tx, delivery_ack_rx) = tokio::sync::oneshot::channel();
         let mut delivery_ack_tx = Some(delivery_ack_tx);
@@ -1120,12 +1208,28 @@ impl StateStore {
         let task_delivered_store = Arc::clone(&delivered_store);
         let task_deadline_state = Arc::clone(&deadline_state);
         let lifecycle = tokio::spawn(async move {
+            let mut undelivered_cleanup_owner = Some(undelivered_cleanup_owner);
             match Self::open_inner(config, Arc::clone(&task_deadline_state)).await {
                 Err(error) => {
-                    let _ = ready_tx.send(Err(error));
+                    let delivered_error = match undelivered_cleanup_owner
+                        .take()
+                        .expect("undelivered cleanup owner remains reserved")
+                        .shutdown()
+                    {
+                        Ok(()) => error,
+                        Err(cleanup) => StateError::OperationCleanupFailed {
+                            operation: "state store open",
+                            primary: Box::new(error),
+                            cleanup,
+                        },
+                    };
+                    let _ = ready_tx.send(Err(delivered_error));
                     Ok(())
                 }
                 Ok(store) => {
+                    task_deadline_state
+                        .delivered_writer_claim
+                        .store(true, std::sync::atomic::Ordering::Release);
                     #[cfg(test)]
                     wait_at_open_postcommit_test_barrier(store.path(), &task_deadline_state).await;
                     *task_delivered_store
@@ -1139,12 +1243,14 @@ impl StateStore {
                                 .take()
                         };
                         if let Some(store) = store {
-                            return close_undelivered_store(
+                            return handoff_undelivered_store(
+                                undelivered_cleanup_owner
+                                    .take()
+                                    .expect("undelivered cleanup owner remains reserved"),
                                 store,
                                 deadline,
                                 Arc::clone(&task_deadline_state),
-                            )
-                            .await;
+                            );
                         }
                         return Ok(());
                     }
@@ -1156,14 +1262,26 @@ impl StateStore {
                                 .take()
                         };
                         if let Some(store) = store {
-                            return close_undelivered_store(
+                            return handoff_undelivered_store(
+                                undelivered_cleanup_owner
+                                    .take()
+                                    .expect("undelivered cleanup owner remains reserved"),
                                 store,
                                 deadline,
                                 Arc::clone(&task_deadline_state),
-                            )
-                            .await;
+                            );
                         }
                     }
+                    undelivered_cleanup_owner
+                        .take()
+                        .expect("undelivered cleanup owner remains reserved")
+                        .shutdown()
+                        .map_err(|error| {
+                            database(
+                                "release undelivered state-store cleanup owner",
+                                sqlx::Error::Protocol(error),
+                            )
+                        })?;
                     Ok(())
                 }
             }
@@ -1180,7 +1298,9 @@ impl StateStore {
                                 .store(true, std::sync::atomic::Ordering::Release);
                             deadline_state.cancel();
                             drop(delivery_ack_tx.take());
-                            let error = open_timeout_error(lifecycle, timeout_ms).await;
+                            let error =
+                                open_timeout_error(lifecycle, deadline, &deadline_state, timeout_ms)
+                                    .await;
                             cancellation_guard.disarm();
                             return Err(error);
                         }
@@ -1233,7 +1353,8 @@ impl StateStore {
                     .store(true, std::sync::atomic::Ordering::Release);
                 deadline_state.cancel();
                 drop(delivery_ack_tx.take());
-                let error = open_timeout_error(lifecycle, timeout_ms).await;
+                let error =
+                    open_timeout_error(lifecycle, deadline, &deadline_state, timeout_ms).await;
                 cancellation_guard.disarm();
                 Err(error)
             }
@@ -2074,6 +2195,7 @@ impl StateStore {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: std::sync::atomic::AtomicBool::new(false),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
+            delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
         });
         let requested_backup = backup.as_ref().to_owned();
         let (backup, backup_snapshot) = run_bounded_filesystem(
@@ -4300,6 +4422,8 @@ struct SnapshotCleanupGuard {
     cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
     #[cfg(unix)]
     quarantine_name: Option<String>,
+    #[cfg(unix)]
+    quarantine_reservation: Option<File>,
 }
 
 struct SnapshotCleanupPayload {
@@ -4312,6 +4436,8 @@ struct SnapshotCleanupPayload {
     shared_retention: Option<SharedSnapshotRetention>,
     #[cfg(unix)]
     quarantine_name: Option<String>,
+    #[cfg(unix)]
+    quarantine_reservation: Option<File>,
 }
 
 impl SnapshotCleanupPayload {
@@ -4327,6 +4453,8 @@ impl SnapshotCleanupPayload {
             cleanup_owner: None,
             #[cfg(unix)]
             quarantine_name: self.quarantine_name,
+            #[cfg(unix)]
+            quarantine_reservation: self.quarantine_reservation,
         }
     }
 }
@@ -4420,7 +4548,7 @@ impl SnapshotCleanupGuard {
             .try_clone()
             .map_err(|error| file_error("clone cleanup directory handle", &parent.path, error))?;
         #[cfg(unix)]
-        let quarantine_name = reserve_snapshot_quarantine(parent)?;
+        let (quarantine_name, quarantine_reservation) = reserve_snapshot_quarantine(parent)?;
         Ok(Self {
             path: path.to_owned(),
             pinned_parent: Some(pinned_parent),
@@ -4432,6 +4560,8 @@ impl SnapshotCleanupGuard {
             cleanup_owner: Some(cleanup_owner),
             #[cfg(unix)]
             quarantine_name: Some(quarantine_name),
+            #[cfg(unix)]
+            quarantine_reservation: Some(quarantine_reservation),
         })
     }
 
@@ -4518,6 +4648,13 @@ impl SnapshotCleanupGuard {
         let Some(name) = self.quarantine_name.take() else {
             return Ok(());
         };
+        let reservation =
+            self.quarantine_reservation
+                .take()
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "snapshot quarantine reservation handle is missing",
+                })?;
         let parent = self
             .pinned_parent
             .as_ref()
@@ -4525,6 +4662,9 @@ impl SnapshotCleanupGuard {
                 path: self.path.clone(),
                 reason: "snapshot quarantine parent is not pinned",
             })?;
+        File::unlock(&reservation).map_err(|error| {
+            file_error("unlock snapshot quarantine reservation", &self.path, error)
+        })?;
         rustix::fs::unlinkat(parent, name.as_str(), rustix::fs::AtFlags::empty()).map_err(
             |error| {
                 file_error(
@@ -4559,6 +4699,8 @@ impl SnapshotCleanupGuard {
             shared_retention: self.shared_retention.take(),
             #[cfg(unix)]
             quarantine_name: self.quarantine_name.take(),
+            #[cfg(unix)]
+            quarantine_reservation: self.quarantine_reservation.take(),
         })
     }
 
@@ -4704,6 +4846,12 @@ impl SnapshotCleanupGuard {
                     reason: "snapshot quarantine capacity was not pre-reserved",
                 })?
                 .clone();
+            expected
+                .set_len(1)
+                .and_then(|()| expected.sync_all())
+                .map_err(|error| {
+                    file_error("mark active snapshot quarantine", &self.path, error)
+                })?;
             rustix::fs::renameat(parent, name, parent, quarantine.as_str()).map_err(|error| {
                 file_error(
                     "quarantine pinned snapshot through held parent",
@@ -4714,7 +4862,7 @@ impl SnapshotCleanupGuard {
             let quarantined = rustix::fs::openat(
                 parent,
                 quarantine.as_str(),
-                rustix::fs::OFlags::RDONLY
+                rustix::fs::OFlags::RDWR
                     | rustix::fs::OFlags::CLOEXEC
                     | rustix::fs::OFlags::NOFOLLOW
                     | rustix::fs::OFlags::NONBLOCK,
@@ -4728,12 +4876,29 @@ impl SnapshotCleanupGuard {
                     error.into(),
                 )
             })?;
+            quarantined.try_lock().map_err(|error| {
+                file_error("lock quarantined snapshot identity", &self.path, error)
+            })?;
             if !files_share_identity_from_handles_portable(expected, &quarantined)? {
                 return Err(StateError::InvalidPath {
                     path: self.path.clone(),
                     reason: "quarantined snapshot did not match the bound identity",
                 });
             }
+            let reservation =
+                self.quarantine_reservation
+                    .take()
+                    .ok_or_else(|| StateError::InvalidPath {
+                        path: self.path.clone(),
+                        reason: "snapshot quarantine reservation handle is missing",
+                    })?;
+            File::unlock(&reservation).map_err(|error| {
+                file_error(
+                    "unlock replaced snapshot quarantine reservation",
+                    &self.path,
+                    error,
+                )
+            })?;
             expected
                 .set_len(0)
                 .and_then(|()| expected.sync_all())
@@ -4746,6 +4911,9 @@ impl SnapshotCleanupGuard {
                     &self.path,
                     error,
                 )
+            })?;
+            File::unlock(&quarantined).map_err(|error| {
+                file_error("unlock reclaimed snapshot quarantine", &self.path, error)
             })?;
             self.quarantine_name.take();
             self.state = SnapshotPublicationState::Reclaimed;
@@ -4799,34 +4967,146 @@ fn snapshot_quarantine_usage(parent: &Path) -> Result<(usize, u64), StateError> 
         {
             continue;
         }
+        let length = entry
+            .metadata()
+            .map_err(|error| file_error("inspect snapshot quarantine entry", &entry.path(), error))?
+            .len();
+        if length == 0 {
+            continue;
+        }
         entries = entries
             .checked_add(1)
             .ok_or_else(|| StateError::InvalidPath {
                 path: parent.to_owned(),
                 reason: "snapshot quarantine entry count overflowed",
             })?;
-        residual_bytes = residual_bytes
-            .checked_add(
-                entry
-                    .metadata()
-                    .map_err(|error| {
-                        file_error("inspect snapshot quarantine entry", &entry.path(), error)
-                    })?
-                    .len(),
-            )
-            .ok_or_else(|| StateError::InvalidPath {
-                path: parent.to_owned(),
-                reason: "snapshot quarantine residual byte count overflowed",
-            })?;
+        residual_bytes =
+            residual_bytes
+                .checked_add(length)
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: parent.to_owned(),
+                    reason: "snapshot quarantine residual byte count overflowed",
+                })?;
     }
     Ok((entries, residual_bytes))
 }
 
 #[cfg(unix)]
-fn reserve_snapshot_quarantine(parent: &PinnedPrivateDirectory) -> Result<String, StateError> {
+fn claim_reusable_snapshot_quarantine_slot(
+    parent: &PinnedPrivateDirectory,
+    name: &str,
+) -> Result<Option<File>, StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let file = match rustix::fs::openat(
+        &parent.file,
+        name,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(file) => File::from(file),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => {
+            return Err(file_error(
+                "open reusable snapshot quarantine slot",
+                &parent.path,
+                error.into(),
+            ));
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => {
+            return Err(file_error(
+                "lock reusable snapshot quarantine slot",
+                &parent.path,
+                error,
+            ));
+        }
+    }
+    let metadata = file.metadata().map_err(|error| {
+        file_error(
+            "inspect reusable snapshot quarantine slot",
+            &parent.path,
+            error,
+        )
+    })?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != 0 {
+        File::unlock(&file).map_err(|error| {
+            file_error(
+                "unlock rejected snapshot quarantine slot",
+                &parent.path,
+                error,
+            )
+        })?;
+        return Ok(None);
+    }
+    file.set_len(1)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            file_error(
+                "claim reusable snapshot quarantine slot",
+                &parent.path,
+                error,
+            )
+        })?;
+    parent.file.sync_all().map_err(|error| {
+        file_error("sync claimed snapshot quarantine slot", &parent.path, error)
+    })?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn lock_snapshot_quarantine_quota(parent: &PinnedPrivateDirectory) -> Result<File, StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let file = rustix::fs::openat(
+        &parent.file,
+        ".gta-claw-quarantine-reservation.lock",
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CREATE,
+        rustix::fs::Mode::from_bits_retain(0o600),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        file_error(
+            "open snapshot quarantine quota lock",
+            &parent.path,
+            error.into(),
+        )
+    })?;
+    file.try_lock()
+        .map_err(|error| file_error("lock snapshot quarantine quota", &parent.path, error))?;
+    let metadata = file.metadata().map_err(|error| {
+        file_error(
+            "inspect snapshot quarantine quota lock",
+            &parent.path,
+            error,
+        )
+    })?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(StateError::InvalidPath {
+            path: parent.path.clone(),
+            reason: "snapshot quarantine quota lock identity is unsafe",
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn reserve_snapshot_quarantine(
+    parent: &PinnedPrivateDirectory,
+) -> Result<(String, File), StateError> {
     const MAX_QUARANTINE_ENTRIES: usize = 64;
     const MAX_QUARANTINE_RESIDUAL_BYTES: u64 = MAX_AUTHENTICATED_SNAPSHOT_BYTES;
 
+    let _quota_lock = lock_snapshot_quarantine_quota(parent)?;
     let (entries, residual_bytes) = snapshot_quarantine_usage(&parent.path)?;
     if entries >= MAX_QUARANTINE_ENTRIES || residual_bytes > MAX_QUARANTINE_RESIDUAL_BYTES {
         return Err(StateError::InvalidPath {
@@ -4834,12 +5114,12 @@ fn reserve_snapshot_quarantine(parent: &PinnedPrivateDirectory) -> Result<String
             reason: "snapshot quarantine quota is exhausted",
         });
     }
-    for index in entries..MAX_QUARANTINE_ENTRIES {
+    for index in 0..MAX_QUARANTINE_ENTRIES {
         let name = format!(".gta-claw-quarantine-slot-{index:02}");
         match rustix::fs::openat(
             &parent.file,
             name.as_str(),
-            rustix::fs::OFlags::WRONLY
+            rustix::fs::OFlags::RDWR
                 | rustix::fs::OFlags::CLOEXEC
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CREATE
@@ -4848,9 +5128,14 @@ fn reserve_snapshot_quarantine(parent: &PinnedPrivateDirectory) -> Result<String
         ) {
             Ok(file) => {
                 let file = File::from(file);
-                file.sync_all().map_err(|error| {
-                    file_error("sync snapshot quarantine reservation", &parent.path, error)
+                file.try_lock().map_err(|error| {
+                    file_error("lock snapshot quarantine reservation", &parent.path, error)
                 })?;
+                file.set_len(1)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| {
+                        file_error("sync snapshot quarantine reservation", &parent.path, error)
+                    })?;
                 parent.file.sync_all().map_err(|error| {
                     file_error(
                         "sync snapshot quarantine reservation directory",
@@ -4858,9 +5143,13 @@ fn reserve_snapshot_quarantine(parent: &PinnedPrivateDirectory) -> Result<String
                         error,
                     )
                 })?;
-                return Ok(name);
+                return Ok((name, file));
             }
-            Err(rustix::io::Errno::EXIST) => {}
+            Err(rustix::io::Errno::EXIST) => {
+                if let Some(file) = claim_reusable_snapshot_quarantine_slot(parent, &name)? {
+                    return Ok((name, file));
+                }
+            }
             Err(error) => {
                 return Err(file_error(
                     "reserve snapshot quarantine capacity",
@@ -4874,6 +5163,48 @@ fn reserve_snapshot_quarantine(parent: &PinnedPrivateDirectory) -> Result<String
         path: parent.path.clone(),
         reason: "snapshot quarantine quota is exhausted",
     })
+}
+
+#[cfg(all(test, unix))]
+mod snapshot_quarantine_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_reservations_cannot_exceed_residual_quota() {
+        let directory = tempfile::tempdir().expect("quarantine quota directory");
+        let database = directory.path().join("state.sqlite");
+        let parent = pin_private_directory(&database).expect("pin quarantine quota directory");
+        for index in 0..63 {
+            std::fs::write(
+                directory
+                    .path()
+                    .join(format!(".gta-claw-quarantine-legacy-{index:02}")),
+                b"active",
+            )
+            .expect("create active quarantine residual");
+        }
+        let start = std::sync::Barrier::new(3);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+                reserve_snapshot_quarantine(&parent)
+            });
+            let second = scope.spawn(|| {
+                start.wait();
+                reserve_snapshot_quarantine(&parent)
+            });
+            start.wait();
+            (
+                first.join().expect("first reservation thread joins"),
+                second.join().expect("second reservation thread joins"),
+            )
+        });
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "only one reservation may consume the final quarantine slot"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -5156,6 +5487,7 @@ impl<'store> StoreOperationConnection<'store> {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: std::sync::atomic::AtomicBool::new(false),
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
+            delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
         });
         let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "claw-state-operation-connection",
@@ -8957,6 +9289,28 @@ async fn wait_at_open_postcommit_test_barrier(path: &Path, deadline_state: &Open
     }
 }
 
+#[cfg(test)]
+async fn wait_at_open_cleanup_test_barrier(path: &Path) {
+    let barrier = OPEN_CLEANUP_TEST_BARRIER
+        .lock()
+        .expect("open cleanup test barrier lock poisoned")
+        .get(path)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        OPEN_CLEANUP_TEST_BARRIER
+            .lock()
+            .expect("open cleanup test barrier lock poisoned")
+            .remove(path);
+    }
+}
+
 #[cfg(all(test, unix))]
 async fn wait_at_checkpoint_test_barrier(path: &Path) {
     let barrier = CHECKPOINT_TEST_BARRIER
@@ -10339,6 +10693,7 @@ async fn backup_pool(
         cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         finished: std::sync::atomic::AtomicBool::new(false),
         final_commit_state: std::sync::atomic::AtomicU8::new(0),
+        delivered_writer_claim: std::sync::atomic::AtomicBool::new(false),
     });
     let backup_cleanup_permit =
         tokio::time::timeout_at(deadline, BACKUP_CLEANUP_ADMISSION.acquire())
@@ -11948,6 +12303,36 @@ pub(crate) mod test_support {
                 },
             );
         (entered, release)
+    }
+
+    pub(crate) fn set_open_cleanup_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let path = super::resolve_database_path(path).expect("resolve open cleanup barrier path");
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        super::OPEN_CLEANUP_TEST_BARRIER
+            .lock()
+            .expect("open cleanup test barrier lock poisoned")
+            .insert(
+                path,
+                super::MigrationTestBarrier {
+                    entered: std::sync::Arc::clone(&entered),
+                    release: std::sync::Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    pub(crate) fn clear_open_cleanup_barrier(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve open cleanup barrier path");
+        super::OPEN_CLEANUP_TEST_BARRIER
+            .lock()
+            .expect("open cleanup test barrier lock poisoned")
+            .remove(&path);
     }
 
     #[cfg(unix)]
