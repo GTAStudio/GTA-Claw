@@ -66,7 +66,10 @@ type SharedSnapshotRetention = Arc<
 type SharedTerminalRetention = Arc<std::sync::Mutex<Option<Box<dyn Send>>>>;
 
 type StateCleanupJob = Box<
-    dyn FnMut(&tokio::runtime::Runtime, &mut claw_sqlite_file_control::ExternalCleanupPermit)
+    dyn FnMut(
+            &tokio::runtime::Runtime,
+            &mut claw_sqlite_file_control::ExternalCleanupPermit,
+        ) -> bool
         + Send
         + 'static,
 >;
@@ -139,10 +142,10 @@ static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, 
                                 .permit
                                 .as_mut()
                                 .expect("state cleanup permit remains owned");
-                            job(&runtime, permit);
+                            job(&runtime, permit)
                         }));
                         match result {
-                            Ok(()) => {
+                            Ok(true) => {
                                 let job = envelope
                                     .job
                                     .take()
@@ -153,6 +156,7 @@ static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, 
                                     .expect("completed state cleanup permit remains owned");
                                 let _ = permit.retire(Box::new(job));
                             }
+                            Ok(false) => retain_state_cleanup(envelope),
                             Err(panic) => {
                                 std::mem::forget(panic);
                                 retain_state_cleanup(envelope);
@@ -201,10 +205,31 @@ fn handoff_state_payload<Payload>(
 where
     Payload: Send + 'static,
 {
+    handoff_state_payload_decide(owner, payload, move |runtime, terminal_closes, payload| {
+        cleanup(runtime, terminal_closes, payload);
+        true
+    })
+}
+
+fn handoff_state_payload_decide<Payload, Cleanup>(
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    payload: Payload,
+    mut cleanup: Cleanup,
+) -> Result<(), String>
+where
+    Payload: Send + 'static,
+    Cleanup: FnMut(
+            &tokio::runtime::Runtime,
+            &mut claw_sqlite_file_control::TerminalCloseBatch,
+            &Payload,
+        ) -> bool
+        + Send
+        + 'static,
+{
     let permit = owner.into_external_cleanup()?;
     let envelope = StateCleanupEnvelope {
         job: Some(Box::new(move |runtime, permit| {
-            cleanup(runtime, permit.terminal_closes(), &payload);
+            cleanup(runtime, permit.terminal_closes(), &payload)
         })),
         permit: Some(permit),
     };
@@ -369,6 +394,10 @@ static STALL_HEALTH_PROGRESS: std::sync::LazyLock<Mutex<std::collections::HashSe
 static EXPIRE_PUBLICATION_DEADLINE: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, u8>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static EXPIRE_OUTPUT_CREATION_DEADLINE: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(all(test, windows))]
 static FAIL_WINDOWS_SOURCE_REMOVAL: std::sync::LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
@@ -956,7 +985,7 @@ fn handoff_undelivered_store(
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 ) -> Result<(), StateError> {
-    handoff_state_payload(
+    handoff_state_payload_decide(
         owner,
         std::sync::Mutex::new(UndeliveredStoreCleanup {
             store,
@@ -980,6 +1009,9 @@ fn handoff_undelivered_store(
                     .deadline_state
                     .finished
                     .store(true, std::sync::atomic::Ordering::Release);
+                true
+            } else {
+                false
             }
         },
     )
@@ -8404,9 +8436,12 @@ async fn reject_late_open_claim(
         result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     }
 
+    deadline_state
+        .delivered_writer_claim
+        .store(true, std::sync::atomic::Ordering::Release);
     let primary = deadline_state.timeout_error();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let handoff = handoff_state_payload(
+    let handoff = handoff_state_payload_decide(
         cleanup_owner,
         std::sync::Mutex::new(LateClaimCleanupPayload {
             connection: Some(connection),
@@ -8419,46 +8454,56 @@ async fn reject_late_open_claim(
             let mut payload = payload
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let remaining = payload
-                .deadline
-                .saturating_duration_since(std::time::Instant::now());
-            let cleanup = if remaining.is_zero() {
-                Err("late writer-claim cleanup cutoff elapsed".to_owned())
-            } else {
-                runtime.block_on(async {
+            let cleanup_deadline = payload.deadline;
+            let deadline = tokio::time::Instant::from_std(cleanup_deadline);
+            let cleanup = runtime.block_on(async {
+                tokio::time::timeout_at(deadline, async {
                     let owner = payload.owner.clone();
                     let connection = payload
                         .connection
                         .as_mut()
                         .expect("late-claim connection remains owned");
+                    {
+                        let mut handle = connection
+                            .lock_handle()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        handle.set_progress_handler(0, || true);
+                    }
+                    let remaining =
+                        cleanup_deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("late writer-claim cleanup cutoff elapsed".to_owned());
+                    }
                     claw_sqlite_file_control::set_busy_timeout(connection, remaining)
                         .await
                         .map_err(|error| error.to_string())?;
-                    tokio::time::timeout(remaining, async {
-                        sqlx::query(
-                            "DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?",
-                        )
+                    if std::time::Instant::now() >= cleanup_deadline {
+                        return Err(
+                            "late writer-claim cutoff elapsed after busy-timeout setup".to_owned()
+                        );
+                    }
+                    sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
                         .bind(&owner)
                         .execute(&mut **connection)
                         .await
                         .map_err(|error| error.to_string())?;
-                        let claims = sqlx::query_scalar::<_, i64>(
-                            "SELECT COUNT(*) FROM claw_writer_lock
-                                 WHERE singleton = 1 AND owner = ?",
-                        )
-                        .bind(&owner)
-                        .fetch_one(&mut **connection)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                        if claims != 0 {
-                            return Err("late writer claim cleanup was not verified".to_owned());
-                        }
-                        Ok(())
-                    })
+                    let claims = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM claw_writer_lock
+                     WHERE singleton = 1 AND owner = ?",
+                    )
+                    .bind(&owner)
+                    .fetch_one(&mut **connection)
                     .await
-                    .map_err(|_| "late writer-claim cleanup timed out".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                    if claims != 0 {
+                        return Err("late writer claim cleanup was not verified".to_owned());
+                    }
+                    Ok(())
                 })
-            };
+                .await
+                .map_err(|_| "late writer-claim cleanup timed out".to_owned())?
+            });
             let connection = payload
                 .connection
                 .take()
@@ -8478,34 +8523,32 @@ async fn reject_late_open_claim(
                 (Ok(()), Err(close)) => Err(close),
                 (Err(cleanup), Err(close)) => Err(format!("{cleanup}; {close}")),
             };
-            if let Some(result) = payload.result.take() {
-                let _ = result.send(outcome.clone());
+            if outcome.is_ok() {
+                if let Some(result) = payload.result.take() {
+                    let _ = result.send(Ok(()));
+                }
+                true
+            } else {
+                false
             }
         },
     );
     if let Err(error) = handoff {
-        return StateError::OperationCleanupFailed {
-            operation: cleanup_operation,
-            primary: Box::new(primary),
-            cleanup: format!("late writer-claim terminal handoff failed: {error}"),
-        };
+        let _ = error;
+        std::future::pending::<()>().await;
+        unreachable!("failed late-claim handoff retains lifecycle ownership");
     }
-    match tokio::time::timeout(Duration::from_secs(1), result_rx).await {
-        Ok(Ok(Ok(()))) => primary,
-        Ok(Ok(Err(error))) => StateError::OperationCleanupFailed {
+    match result_rx.await {
+        Ok(Ok(())) => primary,
+        Ok(Err(error)) => StateError::OperationCleanupFailed {
             operation: cleanup_operation,
             primary: Box::new(primary),
             cleanup: error,
         },
-        Ok(Err(_)) => StateError::OperationCleanupFailed {
-            operation: cleanup_operation,
-            primary: Box::new(primary),
-            cleanup: "late writer-claim terminal owner stopped without result".to_owned(),
-        },
         Err(_) => StateError::OperationCleanupFailed {
             operation: cleanup_operation,
             primary: Box::new(primary),
-            cleanup: "late writer-claim terminal cleanup exceeded its fixed cutoff".to_owned(),
+            cleanup: "late writer-claim terminal owner stopped without result".to_owned(),
         },
     }
 }
@@ -9538,6 +9581,8 @@ async fn materialize_authenticated_snapshot(
     }
     let output_destination = destination.to_owned();
     let mut output_guard = Some(output_guard);
+    let output_creation_deadline = deadline;
+    let output_creation_state = deadline_state.clone();
     let output = run_bounded_filesystem(
         output_creation_owner,
         tokio::time::Instant::from_std(deadline) + Duration::from_secs(1),
@@ -9546,6 +9591,31 @@ async fn materialize_authenticated_snapshot(
             .as_ref()
             .map_or(u64::MAX, |state| state.timeout_ms),
         move || {
+            #[cfg(test)]
+            let injected_expiration =
+                take_publication_failpoint(&EXPIRE_OUTPUT_CREATION_DEADLINE, &output_destination);
+            #[cfg(not(test))]
+            let injected_expiration = false;
+            if injected_expiration
+                || std::time::Instant::now() >= output_creation_deadline
+                || output_creation_state
+                    .as_ref()
+                    .is_some_and(|state| !state.permits_sqlite_work())
+            {
+                let error = output_creation_state.as_ref().map_or(
+                    StateError::OperationTimedOut {
+                        operation: "SQLite restore",
+                        timeout_ms: u64::MAX,
+                    },
+                    |state| state.timeout_error(),
+                );
+                return Ok(Err((
+                    error,
+                    output_guard
+                        .take()
+                        .expect("expired restore output guard is delivered once"),
+                )));
+            }
             let result = create_bound_snapshot_output(
                 &output_destination,
                 Some(
@@ -9553,6 +9623,12 @@ async fn materialize_authenticated_snapshot(
                         .as_mut()
                         .expect("restore output guard remains owned"),
                 ),
+                output_creation_deadline,
+                output_creation_state.as_deref(),
+                "SQLite restore",
+                output_creation_state
+                    .as_ref()
+                    .map_or(u64::MAX, |state| state.timeout_ms),
             );
             Ok(match result {
                 Ok(output) => Ok((
@@ -10075,8 +10151,26 @@ fn reject_snapshot_staging_marker(path: &Path, file: &File) -> Result<(), StateE
 fn create_bound_snapshot_output(
     destination: &Path,
     output_guard: Option<&mut SnapshotCleanupGuard>,
+    deadline: std::time::Instant,
+    deadline_state: Option<&OpenDeadlineState>,
+    operation: &'static str,
+    timeout_ms: u64,
 ) -> Result<File, StateError> {
+    let ensure_creation_allowed = || {
+        if std::time::Instant::now() >= deadline
+            || deadline_state.is_some_and(|state| !state.permits_sqlite_work())
+        {
+            Err(StateError::OperationTimedOut {
+                operation,
+                timeout_ms,
+            })
+        } else {
+            Ok(())
+        }
+    };
+    ensure_creation_allowed()?;
     let creation_lock = acquire_creation_lock(destination)?;
+    ensure_creation_allowed()?;
     let file = OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -10805,12 +10899,26 @@ async fn backup_pool(
     let mut cancellation_guard = OperationCancellationGuard::new(Arc::clone(&deadline_state));
     let output_temporary = temporary.clone();
     let mut temporary_guard = Some(temporary_guard);
+    let output_creation_state = Arc::clone(&deadline_state);
     let output = run_bounded_filesystem(
         output_creation_owner,
         deadline + Duration::from_secs(1),
         "SQLite backup",
         timeout_ms,
         move || {
+            #[cfg(test)]
+            let injected_expiration =
+                take_publication_failpoint(&EXPIRE_OUTPUT_CREATION_DEADLINE, &output_temporary);
+            #[cfg(not(test))]
+            let injected_expiration = false;
+            if injected_expiration || !output_creation_state.permits_sqlite_work() {
+                return Ok(Err((
+                    output_creation_state.timeout_error(),
+                    temporary_guard
+                        .take()
+                        .expect("expired backup staging guard is delivered once"),
+                )));
+            }
             let result = create_bound_snapshot_output(
                 &output_temporary,
                 Some(
@@ -10819,6 +10927,10 @@ async fn backup_pool(
                         .expect("backup staging guard remains owned")
                         .snapshot,
                 ),
+                output_creation_state.work_cutoff,
+                Some(&output_creation_state),
+                "SQLite backup",
+                timeout_ms,
             );
             Ok(match result {
                 Ok(output) => Ok((
@@ -11956,8 +12068,9 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::verify_sqlite_connection_identity;
     use super::{
-        EXPIRE_PUBLICATION_DEADLINE, FAIL_AFTER_PUBLICATION, PinnedSnapshot, STALL_HEALTH_PROGRESS,
-        StateStore, create_trusted_backup_seal, migration_checksum,
+        EXPIRE_OUTPUT_CREATION_DEADLINE, EXPIRE_PUBLICATION_DEADLINE, FAIL_AFTER_PUBLICATION,
+        PinnedSnapshot, STALL_HEALTH_PROGRESS, StateStore, create_trusted_backup_seal,
+        migration_checksum,
     };
     use crate::StateError;
 
@@ -12067,6 +12180,16 @@ pub(crate) mod test_support {
             previous.is_none(),
             "publication deadline failpoint must be unique"
         );
+    }
+
+    pub(crate) fn expire_output_creation_deadline_once(destination: &Path) {
+        let destination =
+            super::resolve_database_path(destination).expect("resolve output creation path");
+        let inserted = EXPIRE_OUTPUT_CREATION_DEADLINE
+            .lock()
+            .expect("output creation deadline failpoint lock poisoned")
+            .insert(destination);
+        assert!(inserted, "output creation expiration is registered once");
     }
 
     pub(crate) fn stall_health_progress_once(path: &Path) {
@@ -12325,14 +12448,6 @@ pub(crate) mod test_support {
                 },
             );
         (entered, release)
-    }
-
-    pub(crate) fn clear_open_cleanup_barrier(path: &Path) {
-        let path = super::resolve_database_path(path).expect("resolve open cleanup barrier path");
-        super::OPEN_CLEANUP_TEST_BARRIER
-            .lock()
-            .expect("open cleanup test barrier lock poisoned")
-            .remove(&path);
     }
 
     #[cfg(unix)]

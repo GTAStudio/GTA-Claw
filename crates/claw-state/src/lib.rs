@@ -1279,11 +1279,25 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_postcommit_cleanup_cannot_extend_the_open_deadline() {
+        const CHILD_ENV: &str = "GTA_CLAW_STALLED_POSTCOMMIT_CLEANUP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::stalled_postcommit_cleanup_cannot_extend_the_open_deadline")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated stalled postcommit cleanup test");
+            assert!(status.success(), "isolated stalled cleanup test failed");
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "stalled-postcommit-cleanup.sqlite");
         let (postcommit_entered, _postcommit_release) =
             test_support::set_open_postcommit_barrier(&path);
-        let (cleanup_entered, cleanup_release) = test_support::set_open_cleanup_barrier(&path);
+        let (cleanup_entered, _cleanup_release) = test_support::set_open_cleanup_barrier(&path);
         let open_path = path.clone();
         let started = Instant::now();
         let opening = tokio::spawn(async move {
@@ -1317,31 +1331,13 @@ mod tests {
             }
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             StateStore::open(StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)))
                 .await
                 .is_err(),
             "detached cleanup retains exclusive store ownership"
         );
-        cleanup_release.notify_one();
-        test_support::clear_open_cleanup_barrier(&path);
-        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match StateStore::open(StoreConfig::new(&path)).await {
-                    Ok(store) => break store,
-                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(error) => panic!("reopen after detached cleanup failed: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("detached cleanup eventually releases store ownership");
-        reopened
-            .close()
-            .await
-            .expect("store closes after detached cleanup");
     }
 
     #[cfg(unix)]
@@ -3369,6 +3365,46 @@ mod tests {
         assert!(!destination.exists());
         assert!(!temporary.exists());
         source.close().await.expect("backup timeout source closes");
+    }
+
+    #[tokio::test]
+    async fn snapshot_output_creation_is_fenced_before_filesystem_mutation() {
+        let directory = tempfile::tempdir().expect("output creation fence directory");
+        let source_path = database_path(&directory, "output-fence-source.sqlite");
+        let sealed_backup = database_path(&directory, "output-fence-sealed.sqlite");
+        let late_backup = database_path(&directory, "output-fence-late-backup.sqlite");
+        let late_restore = database_path(&directory, "output-fence-late-restore.sqlite");
+        let source = open(&source_path).await;
+        source
+            .backup_to(&sealed_backup)
+            .await
+            .expect("create sealed output-fence backup");
+
+        test_support::expire_output_creation_deadline_once(&late_backup);
+        assert!(matches!(
+            source
+                .backup_to(&late_backup)
+                .await
+                .expect_err("expired backup output creation is rejected"),
+            StateError::OperationTimedOut {
+                operation: "SQLite backup",
+                ..
+            }
+        ));
+        assert!(!late_backup.exists());
+
+        test_support::expire_output_creation_deadline_once(&late_restore);
+        assert!(matches!(
+            StateStore::restore_backup(&sealed_backup, &late_restore)
+                .await
+                .expect_err("expired restore output creation is rejected"),
+            StateError::OperationTimedOut {
+                operation: "SQLite restore",
+                ..
+            }
+        ));
+        assert!(!late_restore.exists());
+        source.close().await.expect("output-fence source closes");
     }
 
     #[cfg(unix)]

@@ -3781,9 +3781,9 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                 tokio::task::yield_now().await;
                             }
                             None => {
-                                return Err(FileControlError::Handle(
+                                return Err(FileControlError::CommittedAfterDeadline(Some(
                                     "late COMMIT result cleanup exceeded its cutoff".to_owned(),
-                                ));
+                                )));
                             }
                         }
                     }
@@ -3801,14 +3801,16 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                 Ok(Err(error)) => return Err(error),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= cleanup_deadline {
-                        return Err(FileControlError::Handle(
+                        return Err(FileControlError::CommitOutcomeUncertain(
+                            libsqlite3_sys::SQLITE_INTERRUPT,
                             "bounded COMMIT exceeded its cleanup cutoff".to_owned(),
                         ));
                     }
                     tokio::task::yield_now().await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(FileControlError::Handle(
+                    return Err(FileControlError::CommitOutcomeUncertain(
+                        libsqlite3_sys::SQLITE_ABORT,
                         "bounded COMMIT cleanup owner stopped without a result".to_owned(),
                     ));
                 }
@@ -8802,10 +8804,13 @@ mod deadline_tests {
             .await
             .expect("cutoff COMMIT task joins")
             .expect_err("expired DELETE cleanup cannot deliver a connection");
-        assert!(
-            error.to_string().contains("cutoff"),
-            "unexpected cutoff error: {error}"
-        );
+        assert!(matches!(
+            error,
+            FileControlError::CommitOutcomeUncertain(
+                libsqlite3_sys::SQLITE_INTERRUPT,
+                ref message,
+            ) if message.contains("cleanup cutoff")
+        ));
         let mut replacement =
             tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
                 .await
