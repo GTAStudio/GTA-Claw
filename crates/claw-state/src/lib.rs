@@ -2343,6 +2343,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_retention_capacity_is_bounded_and_reusable() {
+        const CHILD_ENV: &str = "GTA_CLAW_CLOSE_RETENTION_CAPACITY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::close_retention_capacity_is_bounded_and_reusable")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated close retention capacity test");
+            assert!(
+                status.success(),
+                "isolated close retention capacity test failed"
+            );
+            return;
+        }
+
+        let capacity = test_support::close_retention_capacity();
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            capacity,
+            "isolated process starts with all close-retention slots available"
+        );
+        let directory = tempfile::tempdir().expect("close retention capacity directory");
+        let clean_path = database_path(&directory, "clean-close.sqlite");
+        let clean = open(&clean_path).await;
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            capacity - 1,
+            "live store owns one pre-reserved close-retention slot"
+        );
+        clean.close().await.expect("confirmed close succeeds");
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            capacity,
+            "confirmed terminal close returns its reservation"
+        );
+
+        let dropped_path = database_path(&directory, "implicitly-dropped.sqlite");
+        drop(open(&dropped_path).await);
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            capacity - 1,
+            "implicit store drop retains terminal ownership"
+        );
+
+        let unpolled_path = database_path(&directory, "unpolled-close.sqlite");
+        let unpolled_close = open(&unpolled_path).await.close();
+        drop(unpolled_close);
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            capacity - 2,
+            "dropping an unpolled close future retains terminal ownership"
+        );
+
+        let panic_path = database_path(&directory, "panicking-close.sqlite");
+        let panicking = open(&panic_path).await;
+        test_support::panic_close_after_ownership_guard_once(&panic_path);
+        let panic = tokio::spawn(panicking.close())
+            .await
+            .expect_err("injected close panic unwinds the close task");
+        assert!(panic.is_panic());
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            capacity - 3,
+            "panic after ownership transfer consumes the reserved slot"
+        );
+
+        #[cfg(unix)]
+        {
+            let cancelled_path = database_path(&directory, "cancelled-close.sqlite");
+            let cancelled = open(&cancelled_path).await;
+            let (entered, _release) = test_support::set_checkpoint_barrier(&cancelled_path);
+            let close = tokio::spawn(cancelled.close());
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("close reaches cancellation barrier");
+            close.abort();
+            assert!(
+                close
+                    .await
+                    .expect_err("aborted close task reports cancellation")
+                    .is_cancelled()
+            );
+            assert_eq!(
+                test_support::available_close_retention_slots(),
+                capacity - 4,
+                "cancelled polled close consumes the reserved slot"
+            );
+        }
+
+        let remaining = test_support::available_close_retention_slots();
+        for index in 0..remaining {
+            let path = database_path(&directory, &format!("failed-close-{index:02}.sqlite"));
+            let store = StateStore::open(StoreConfig::new(&path))
+                .await
+                .expect("pre-reserved failed-close store opens");
+            test_support::fail_final_connection_close_once(&path, true);
+            assert!(matches!(
+                store
+                    .close()
+                    .await
+                    .expect_err("unconfirmed terminal close is retained"),
+                StateError::CloseDegraded {
+                    final_connection_closed: false,
+                    pool_closed: false,
+                    os_lock_released: false,
+                    ..
+                }
+            ));
+            assert_eq!(
+                test_support::available_close_retention_slots(),
+                remaining - index - 1,
+                "each unconfirmed close consumes exactly one bounded slot"
+            );
+        }
+
+        let rejected = database_path(&directory, "capacity-rejected.sqlite");
+        let error = StateStore::open(StoreConfig::new(&rejected))
+            .await
+            .err()
+            .expect("exhausted close retention rejects open admission");
+        match error {
+            StateError::Database(failure) => {
+                assert_eq!(failure.operation(), "reserve state close retention");
+                assert!(
+                    failure
+                        .message()
+                        .contains("state close retention capacity is exhausted")
+                );
+            }
+            other => panic!("unexpected close retention admission error: {other:?}"),
+        }
+        assert!(
+            !rejected.exists(),
+            "capacity exhaustion rejects before database creation"
+        );
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            0,
+            "failed admission cannot overcommit retained-close capacity"
+        );
+    }
+
+    #[tokio::test]
     async fn migration_checksum_drift_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "checksum.sqlite");

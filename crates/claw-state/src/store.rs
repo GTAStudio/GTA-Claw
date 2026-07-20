@@ -88,6 +88,7 @@ struct StateCleanupExecutor {
 
 const STATE_CLEANUP_THREADS: usize = 16;
 const MAX_STATE_CLEANUP_JOBS: usize = 64;
+const MAX_STATE_CLOSE_RETENTIONS: usize = 64;
 const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
 static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<
     std::sync::Mutex<[Option<StateCleanupEnvelope>; MAX_STATE_CLEANUP_JOBS]>,
@@ -101,19 +102,86 @@ struct StateCloseRetention {
     _database_parent: File,
 }
 
-static STATE_CLOSE_OWNERSHIP_QUARANTINE: std::sync::LazyLock<
-    std::sync::Mutex<[Option<StateCloseRetention>; MAX_STATE_CLEANUP_JOBS]>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
+struct StateStoreOwnership {
+    pool: SqlitePool,
+    lock_file: File,
+    process_identity: ProcessIdentityGuard,
+    database_file: File,
+    database_parent: File,
+    close_retention: StateCloseRetentionReservation,
+}
 
-fn retain_state_close_ownership(retention: StateCloseRetention) {
-    let mut quarantine = STATE_CLOSE_OWNERSHIP_QUARANTINE
+impl StateStoreOwnership {
+    fn retain(self) {
+        self.close_retention.retain(StateCloseRetention {
+            _pool: self.pool,
+            _lock_file: self.lock_file,
+            _process_identity: self.process_identity,
+            _database_file: self.database_file,
+            _database_parent: self.database_parent,
+        });
+    }
+}
+
+struct StateCloseRetentionSlot {
+    reserved: bool,
+    retention: Option<StateCloseRetention>,
+}
+
+static STATE_CLOSE_RETENTION_SLOTS: std::sync::LazyLock<
+    std::sync::Mutex<[StateCloseRetentionSlot; MAX_STATE_CLOSE_RETENTIONS]>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(std::array::from_fn(|_| StateCloseRetentionSlot {
+        reserved: false,
+        retention: None,
+    }))
+});
+
+struct StateCloseRetentionReservation {
+    slot: usize,
+    armed: bool,
+}
+
+impl StateCloseRetentionReservation {
+    fn retain(mut self, retention: StateCloseRetention) {
+        let mut slots = STATE_CLOSE_RETENTION_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots[self.slot].retention = Some(retention);
+        self.armed = false;
+    }
+}
+
+impl Drop for StateCloseRetentionReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut slots = STATE_CLOSE_RETENTION_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = &mut slots[self.slot];
+        if slot.retention.is_none() {
+            slot.reserved = false;
+        }
+    }
+}
+
+fn reserve_state_close_retention() -> Result<StateCloseRetentionReservation, StateError> {
+    let mut slots = STATE_CLOSE_RETENTION_SLOTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(slot) = quarantine.iter_mut().find(|slot| slot.is_none()) {
-        *slot = Some(retention);
-    } else {
-        std::mem::forget(retention);
-    }
+    let slot = slots
+        .iter()
+        .position(|slot| !slot.reserved)
+        .ok_or_else(|| {
+            database(
+                "reserve state close retention",
+                sqlx::Error::Protocol("state close retention capacity is exhausted".to_owned()),
+            )
+        })?;
+    slots[slot].reserved = true;
+    Ok(StateCloseRetentionReservation { slot, armed: true })
 }
 
 fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
@@ -597,6 +665,10 @@ static BACKUP_CAPTURE_TEST_BARRIER: std::sync::LazyLock<
 static FINAL_CONNECTION_CLOSE_FAILURES: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, FinalConnectionCloseFailure>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static PANIC_CLOSE_AFTER_OWNERSHIP_GUARD: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 struct MigrationTestBarrier {
@@ -857,17 +929,48 @@ pub struct StateStore {
     lock_path: PathBuf,
     owner: String,
     recovered_writer: Option<RecoveredWriterLock>,
-    pool: SqlitePool,
-    lock_file: File,
     lock_identity: Option<Vec<u8>>,
-    _process_identity: ProcessIdentityGuard,
-    _database_file: File,
-    _database_parent: File,
+    ownership: Option<StateStoreOwnership>,
     writer_generation: Arc<AtomicU64>,
     max_connections: u32,
     operation_timeout: Duration,
     busy_timeout: Duration,
     close_timeout: Duration,
+}
+
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        if let Some(ownership) = self.ownership.take() {
+            ownership.retain();
+        }
+    }
+}
+
+struct StateStoreCloseGuard {
+    ownership: Option<StateStoreOwnership>,
+    terminal_confirmed: bool,
+}
+
+impl StateStoreCloseGuard {
+    fn ownership(&self) -> &StateStoreOwnership {
+        self.ownership
+            .as_ref()
+            .expect("close guard retains state store ownership")
+    }
+
+    fn confirm_terminal_close(&mut self) {
+        self.terminal_confirmed = true;
+    }
+}
+
+impl Drop for StateStoreCloseGuard {
+    fn drop(&mut self) {
+        if !self.terminal_confirmed
+            && let Some(ownership) = self.ownership.take()
+        {
+            ownership.retain();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1149,7 +1252,7 @@ impl Drop for ProcessIdentityGuard {
 }
 
 struct UndeliveredStoreCleanup {
-    store: StateStore,
+    store: Option<StateStore>,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 }
@@ -1163,7 +1266,7 @@ fn handoff_undelivered_store(
     handoff_state_payload_decide(
         owner,
         std::sync::Mutex::new(UndeliveredStoreCleanup {
-            store,
+            store: Some(store),
             deadline,
             deadline_state,
         }),
@@ -1175,13 +1278,25 @@ fn handoff_undelivered_store(
             let cleanup = runtime.block_on(async {
                 tokio::time::timeout_at(
                     deadline,
-                    close_undelivered_writer_claim(&mut payload.store, deadline),
+                    close_undelivered_writer_claim(
+                        payload
+                            .store
+                            .as_mut()
+                            .expect("undelivered store remains owned"),
+                        deadline,
+                    ),
                 )
                 .await
             });
             if matches!(cleanup, Ok(Ok(()))) {
-                payload
-                    .deadline_state
+                let store = payload
+                    .store
+                    .take()
+                    .expect("undelivered store is consumed once");
+                let deadline_state = Arc::clone(&payload.deadline_state);
+                drop(payload);
+                let _ = runtime.block_on(store.close_inner(true));
+                deadline_state
                     .finished
                     .store(true, std::sync::atomic::Ordering::Release);
                 true
@@ -1206,7 +1321,7 @@ async fn close_undelivered_writer_claim(
     wait_at_open_cleanup_test_barrier(store.path()).await;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-    let connection = tokio::time::timeout_at(deadline, store.pool.acquire())
+    let connection = tokio::time::timeout_at(deadline, store.pool().acquire())
         .await
         .map_err(|_| StateError::OperationTimedOut {
             operation: "acquire undelivered claim cleanup connection",
@@ -1357,6 +1472,7 @@ impl StateStore {
             .await
             .expect("test open concurrency semaphore remains live");
         validate_config(&config)?;
+        let close_retention = reserve_state_close_retention()?;
         let timeout_ms = u64::try_from(config.open_timeout.as_millis()).map_err(|_| {
             StateError::InvalidValue {
                 field: "open timeout",
@@ -1420,7 +1536,8 @@ impl StateStore {
         let task_deadline_state = Arc::clone(&deadline_state);
         let lifecycle = tokio::spawn(async move {
             let mut undelivered_cleanup_owner = Some(undelivered_cleanup_owner);
-            match Self::open_inner(config, Arc::clone(&task_deadline_state)).await {
+            match Self::open_inner(config, Arc::clone(&task_deadline_state), close_retention).await
+            {
                 Err(error) => {
                     let delivered_error = match undelivered_cleanup_owner
                         .take()
@@ -1573,6 +1690,7 @@ impl StateStore {
     async fn open_inner(
         config: StoreConfig,
         deadline_state: Arc<OpenDeadlineState>,
+        close_retention: StateCloseRetentionReservation,
     ) -> Result<Self, StateError> {
         let path = resolve_database_path(&config.path)?;
         let database_parent = pin_private_directory(&path)?;
@@ -2014,36 +2132,42 @@ impl StateStore {
             };
             return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
         }
-        let (mut initial, post_commit_owner) = initial
-            .commit_with_deadline(
-                deadline_state.work_cutoff,
-                deadline_state.deadline,
-                Arc::clone(&deadline_state.cancelled),
-                initial_busy_timeout,
-                None,
+        let initialized = async {
+            let (mut initial, post_commit_owner) = initial
+                .commit_with_deadline(
+                    deadline_state.work_cutoff,
+                    deadline_state.deadline,
+                    Arc::clone(&deadline_state.cancelled),
+                    initial_busy_timeout,
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    file_control_database("commit SQLite sidecar initialization", error)
+                })?;
+            secure_sqlite_sidecars(&path, lock_identity.as_deref())?;
+            install_store_commit_guard(
+                &mut initial,
+                (&database_parent_path, &database_parent.file),
+                (&path, &database_file),
+                (&lock_path, &lock_file),
+                lock_identity.as_deref(),
+                (Arc::clone(&writer_generation), 1),
             )
             .await
-            .map_err(|error| {
-                file_control_database("commit SQLite sidecar initialization", error)
-            })?;
-        secure_sqlite_sidecars(&path, lock_identity.as_deref())?;
-        install_store_commit_guard(
-            &mut initial,
-            (&database_parent_path, &database_parent.file),
-            (&path, &database_file),
-            (&lock_path, &lock_file),
-            lock_identity.as_deref(),
-            (Arc::clone(&writer_generation), 1),
-        )
-        .await
-        .map_err(|error| database("install initial commit guard", error))?;
-        drop(initial);
-        post_commit_owner.shutdown().map_err(|error| {
-            database(
-                "release initial post-COMMIT cleanup owner",
-                sqlx::Error::Protocol(error),
-            )
-        })?;
+            .map_err(|error| database("install initial commit guard", error))?;
+            drop(initial);
+            post_commit_owner.shutdown().map_err(|error| {
+                database(
+                    "release initial post-COMMIT cleanup owner",
+                    sqlx::Error::Protocol(error),
+                )
+            })
+        }
+        .await;
+        if let Err(error) = initialized {
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+        }
         #[cfg(test)]
         wait_at_open_initialization_test_barrier(&path).await;
 
@@ -2081,23 +2205,7 @@ impl StateStore {
         }
         .await;
         if let Err(error) = configured {
-            return Err(
-                if tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline_state.deadline),
-                    pool.close(),
-                )
-                .await
-                .is_ok()
-                {
-                    error
-                } else {
-                    StateError::OperationCleanupFailed {
-                        operation: "state store open",
-                        primary: Box::new(error),
-                        cleanup: "pre-claim pool close exceeded the open deadline".to_owned(),
-                    }
-                },
-            );
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
         }
         let recovered_writer = match initialize_database(
             &pool,
@@ -2120,12 +2228,15 @@ impl StateStore {
             lock_path,
             owner,
             recovered_writer,
-            pool,
-            lock_file,
             lock_identity,
-            _process_identity: process_identity,
-            _database_file: database_file,
-            _database_parent: database_parent.file,
+            ownership: Some(StateStoreOwnership {
+                pool,
+                lock_file,
+                process_identity,
+                database_file,
+                database_parent: database_parent.file,
+                close_retention,
+            }),
             writer_generation,
             max_connections: config.max_connections,
             operation_timeout: config.operation_timeout,
@@ -2146,38 +2257,49 @@ impl StateStore {
         self.recovered_writer.as_ref()
     }
 
+    fn ownership(&self) -> &StateStoreOwnership {
+        self.ownership
+            .as_ref()
+            .expect("live state store retains ownership")
+    }
+
+    fn pool(&self) -> &SqlitePool {
+        &self.ownership().pool
+    }
+
     /// Returns the session repository.
     #[must_use]
     pub fn sessions(&self) -> SessionRepository<'_> {
-        SessionRepository::new(&self.pool, &self.owner, self.operational_identity())
+        SessionRepository::new(self.pool(), &self.owner, self.operational_identity())
     }
 
     /// Returns the device repository.
     #[must_use]
     pub fn devices(&self) -> DeviceRepository<'_> {
-        DeviceRepository::new(&self.pool, &self.owner, self.operational_identity())
+        DeviceRepository::new(self.pool(), &self.owner, self.operational_identity())
     }
 
     /// Returns the authentication repository.
     #[must_use]
     pub fn authentications(&self) -> AuthenticationRepository<'_> {
-        AuthenticationRepository::new(&self.pool, &self.owner, self.operational_identity())
+        AuthenticationRepository::new(self.pool(), &self.owner, self.operational_identity())
     }
 
     /// Returns the task repository.
     #[must_use]
     pub fn tasks(&self) -> TaskRepository<'_> {
-        TaskRepository::new(&self.pool, &self.owner, self.operational_identity())
+        TaskRepository::new(self.pool(), &self.owner, self.operational_identity())
     }
 
     fn operational_identity(&self) -> OperationalIdentity<'_> {
+        let ownership = self.ownership();
         OperationalIdentity {
             database_parent_path: &self.database_parent_path,
-            database_parent: &self._database_parent,
+            database_parent: &ownership.database_parent,
             database_path: &self.path,
-            database_file: &self._database_file,
+            database_file: &ownership.database_file,
             lock_path: &self.lock_path,
-            lock_file: &self.lock_file,
+            lock_file: &ownership.lock_file,
             lock_identity: self.lock_identity.as_deref(),
             writer_generation: &self.writer_generation,
             busy_timeout: self.busy_timeout,
@@ -2189,7 +2311,7 @@ impl StateStore {
     /// Reads the effective connection and durability settings.
     pub async fn settings(&self) -> Result<StoreSettings, StateError> {
         let mut operation = StoreOperationConnection::acquire(
-            &self.pool,
+            self.pool(),
             self.operational_identity(),
             "inspect SQLite settings",
         )
@@ -2281,7 +2403,7 @@ impl StateStore {
             },
         )
         .await?;
-        let expected_version = tokio::time::timeout_at(deadline, schema_version(&self.pool))
+        let expected_version = tokio::time::timeout_at(deadline, schema_version(self.pool()))
             .await
             .map_err(|_| StateError::OperationTimedOut {
                 operation: "SQLite backup",
@@ -2300,7 +2422,7 @@ impl StateStore {
                 "SELECT page_count * page_size
                  FROM pragma_page_count, pragma_page_size",
             )
-            .fetch_one(&self.pool),
+            .fetch_one(self.pool()),
         )
         .await
         .map_err(|_| StateError::OperationTimedOut {
@@ -2320,7 +2442,7 @@ impl StateStore {
             });
         }
         backup_pool(
-            &self.pool,
+            self.pool(),
             &destination,
             BackupValidationMode::LatestSource,
             deadline,
@@ -2903,7 +3025,7 @@ impl StateStore {
     /// Runs SQLite structural and referential integrity checks.
     pub async fn health(&self) -> Result<HealthReport, StateError> {
         let mut operation = StoreOperationConnection::acquire(
-            &self.pool,
+            self.pool(),
             self.operational_identity(),
             "inspect SQLite health",
         )
@@ -3010,7 +3132,7 @@ impl StateStore {
     /// Checkpoints and truncates the WAL.
     pub async fn checkpoint(&self) -> Result<CheckpointReport, StateError> {
         let mut operation = StoreOperationConnection::acquire(
-            &self.pool,
+            self.pool(),
             self.operational_identity(),
             "checkpoint SQLite WAL",
         )
@@ -3068,22 +3190,34 @@ impl StateStore {
     }
 
     async fn close_inner(
-        self,
+        mut self,
         application_lock_already_released: bool,
     ) -> Result<CheckpointReport, StateError> {
         let deadline = tokio::time::Instant::now() + self.close_timeout;
+        let mut ownership = StateStoreCloseGuard {
+            ownership: self.ownership.take(),
+            terminal_confirmed: false,
+        };
+        #[cfg(test)]
+        if PANIC_CLOSE_AFTER_OWNERSHIP_GUARD
+            .lock()
+            .expect("close panic failpoint lock poisoned")
+            .remove(&self.path)
+        {
+            panic!("injected panic after state close ownership guard");
+        }
         let mut reasons = Vec::new();
         let identity_valid = match verify_directory_path_identity(
             &self.database_parent_path,
-            &self._database_parent,
+            &ownership.ownership().database_parent,
         )
-        .and_then(|()| verify_path_identity(&self.path, &self._database_file))
+        .and_then(|()| verify_path_identity(&self.path, &ownership.ownership().database_file))
         .and_then(|()| {
             verify_store_lock_binding(
                 &self.path,
-                &self._database_file,
+                &ownership.ownership().database_file,
                 &self.lock_path,
-                &self.lock_file,
+                &ownership.ownership().lock_file,
                 self.lock_identity.as_deref(),
             )
         }) {
@@ -3094,7 +3228,7 @@ impl StateStore {
             }
         };
         let mut connection = if identity_valid {
-            match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
+            match tokio::time::timeout_at(deadline, ownership.ownership().pool.acquire()).await {
                 Ok(Ok(connection)) => Some(connection),
                 Ok(Err(error)) => {
                     reasons.push(format!(
@@ -3114,7 +3248,7 @@ impl StateStore {
         };
         let final_connection_required = connection.is_some();
 
-        let closing_pool = self.pool.clone();
+        let closing_pool = ownership.ownership().pool.clone();
         let mut close_future = Box::pin(closing_pool.close());
         let pool_closed_immediately = std::future::poll_fn(|context| {
             use std::future::Future as _;
@@ -3257,12 +3391,11 @@ impl StateStore {
         let os_lock_released = if pool_closed {
             #[cfg(windows)]
             {
-                drop(self._process_identity);
                 true
             }
             #[cfg(not(windows))]
             {
-                match File::unlock(&self.lock_file) {
+                match File::unlock(&ownership.ownership().lock_file) {
                     Ok(()) => true,
                     Err(error) => {
                         reasons.push(format!(
@@ -3278,15 +3411,11 @@ impl StateStore {
                 "OS identity ownership retained because terminal pool completion was not confirmed"
                     .to_owned(),
             );
-            retain_state_close_ownership(StateCloseRetention {
-                _pool: self.pool,
-                _lock_file: self.lock_file,
-                _process_identity: self._process_identity,
-                _database_file: self._database_file,
-                _database_parent: self._database_parent,
-            });
             false
         };
+        if pool_closed {
+            ownership.confirm_terminal_close();
+        }
         match (
             checkpoint,
             application_lock_released,
@@ -12453,7 +12582,7 @@ pub(crate) mod test_support {
     use crate::StateError;
 
     pub(crate) fn pool(store: &StateStore) -> &SqlitePool {
-        &store.pool
+        store.pool()
     }
 
     #[cfg(windows)]
@@ -12593,6 +12722,28 @@ pub(crate) mod test_support {
                     super::FinalConnectionCloseFailure::Error
                 },
             );
+    }
+
+    pub(crate) fn panic_close_after_ownership_guard_once(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve close panic failpoint path");
+        let inserted = super::PANIC_CLOSE_AFTER_OWNERSHIP_GUARD
+            .lock()
+            .expect("close panic failpoint lock poisoned")
+            .insert(path);
+        assert!(inserted, "close panic failpoint is registered once");
+    }
+
+    pub(crate) fn close_retention_capacity() -> usize {
+        super::MAX_STATE_CLOSE_RETENTIONS
+    }
+
+    pub(crate) fn available_close_retention_slots() -> usize {
+        super::STATE_CLOSE_RETENTION_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|slot| !slot.reserved)
+            .count()
     }
 
     pub(crate) fn reseal_backup_fixture(path: &Path) {
