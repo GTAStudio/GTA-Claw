@@ -88,32 +88,187 @@ struct StateCleanupExecutor {
 
 const STATE_CLEANUP_THREADS: usize = 16;
 const MAX_STATE_CLEANUP_JOBS: usize = 64;
+const MAX_STATE_CLOSE_RETENTIONS: usize = 64;
 const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
 static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<
     std::sync::Mutex<[Option<StateCleanupEnvelope>; MAX_STATE_CLEANUP_JOBS]>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
 
-struct StateCloseRetention {
-    _pool: SqlitePool,
+static STATE_CLOSE_RETENTION_ADMISSION: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_STATE_CLOSE_RETENTIONS);
+static STATE_CLOSE_OWNERSHIP_SLOTS: std::sync::LazyLock<
+    std::sync::Mutex<[StateCloseOwnershipSlot; MAX_STATE_CLOSE_RETENTIONS]>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(std::array::from_fn(|_| StateCloseOwnershipSlot::Available))
+});
+
+enum StateCloseOwnershipSlot {
+    Available,
+    Reserved,
+    Retained { _retention: StateCloseRetention },
+}
+
+struct StateCloseReservation {
+    slot: usize,
+    permit: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+struct StateCloseOwnership {
+    _pool: Option<SqlitePool>,
     _lock_file: File,
     _process_identity: ProcessIdentityGuard,
     _database_file: File,
     _database_parent: File,
 }
 
-static STATE_CLOSE_OWNERSHIP_QUARANTINE: std::sync::LazyLock<
-    std::sync::Mutex<[Option<StateCloseRetention>; MAX_STATE_CLEANUP_JOBS]>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
+struct StateStoreOwnership {
+    pool: Option<SqlitePool>,
+    lock_file: File,
+    process_identity: ProcessIdentityGuard,
+    database_file: File,
+    database_parent: File,
+    writer_generation: Arc<AtomicU64>,
+    close_reservation: StateCloseReservation,
+}
 
-fn retain_state_close_ownership(retention: StateCloseRetention) {
-    let mut quarantine = STATE_CLOSE_OWNERSHIP_QUARANTINE
+struct PendingStateStoreOwnership {
+    ownership: Option<StateStoreOwnership>,
+}
+
+struct StateCloseRetention {
+    _ownership: StateCloseOwnership,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl StateCloseReservation {
+    fn retain(mut self, ownership: StateCloseOwnership) {
+        let permit = self
+            .permit
+            .take()
+            .expect("state close reservation permit remains owned");
+        let mut slots = STATE_CLOSE_OWNERSHIP_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            matches!(slots[self.slot], StateCloseOwnershipSlot::Reserved),
+            "state close reservation retains its exact reserved slot"
+        );
+        slots[self.slot] = StateCloseOwnershipSlot::Retained {
+            _retention: StateCloseRetention {
+                _ownership: ownership,
+                _permit: permit,
+            },
+        };
+    }
+}
+
+impl Drop for StateCloseReservation {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        {
+            let mut slots = STATE_CLOSE_OWNERSHIP_SLOTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                matches!(slots[self.slot], StateCloseOwnershipSlot::Reserved),
+                "state close reservation releases its exact reserved slot"
+            );
+            slots[self.slot] = StateCloseOwnershipSlot::Available;
+        }
+        drop(permit);
+    }
+}
+
+impl PendingStateStoreOwnership {
+    fn new(ownership: StateStoreOwnership) -> Self {
+        Self {
+            ownership: Some(ownership),
+        }
+    }
+
+    fn into_ownership(mut self) -> StateStoreOwnership {
+        self.ownership
+            .take()
+            .expect("pending state store ownership remains live")
+    }
+
+    fn install_pool(&mut self, pool: SqlitePool) {
+        let ownership = self
+            .ownership
+            .as_mut()
+            .expect("pending state store ownership remains live");
+        assert!(
+            ownership.pool.replace(pool).is_none(),
+            "pending state store installs its pool once"
+        );
+    }
+
+    fn pool(&self) -> &SqlitePool {
+        self.ownership
+            .as_ref()
+            .and_then(|ownership| ownership.pool.as_ref())
+            .expect("pending state store pool is installed")
+    }
+
+    fn release_without_pool(self) {
+        let ownership = self.into_ownership();
+        assert!(
+            ownership.pool.is_none(),
+            "pre-pool state store release cannot own a pool"
+        );
+        drop(ownership);
+    }
+}
+
+impl std::ops::Deref for PendingStateStoreOwnership {
+    type Target = StateStoreOwnership;
+
+    fn deref(&self) -> &Self::Target {
+        self.ownership
+            .as_ref()
+            .expect("pending state store ownership remains live")
+    }
+}
+
+impl Drop for PendingStateStoreOwnership {
+    fn drop(&mut self) {
+        if let Some(ownership) = self.ownership.take() {
+            retain_state_store_ownership(ownership);
+        }
+    }
+}
+
+async fn reserve_state_close_ownership(
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
+) -> Result<StateCloseReservation, StateError> {
+    let permit = deadline_first(deadline, STATE_CLOSE_RETENTION_ADMISSION.acquire())
+        .await
+        .map_err(|()| StateError::OperationTimedOut {
+            operation: "state store open",
+            timeout_ms,
+        })?
+        .map_err(|_| {
+            database(
+                "reserve state close retention",
+                sqlx::Error::Protocol("state close retention admission closed".to_owned()),
+            )
+        })?;
+    let mut slots = STATE_CLOSE_OWNERSHIP_SLOTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(slot) = quarantine.iter_mut().find(|slot| slot.is_none()) {
-        *slot = Some(retention);
-    } else {
-        std::mem::forget(retention);
-    }
+    let slot = slots
+        .iter()
+        .position(|slot| matches!(slot, StateCloseOwnershipSlot::Available))
+        .expect("an admitted state close reservation has an available slot");
+    slots[slot] = StateCloseOwnershipSlot::Reserved;
+    drop(slots);
+    Ok(StateCloseReservation {
+        slot,
+        permit: Some(permit),
+    })
 }
 
 fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
@@ -597,6 +752,18 @@ static BACKUP_CAPTURE_TEST_BARRIER: std::sync::LazyLock<
 static FINAL_CONNECTION_CLOSE_FAILURES: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, FinalConnectionCloseFailure>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static CLOSE_TEST_BARRIER: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static OPEN_POST_POOL_FAILURES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, OpenPostPoolFailure>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static OPEN_BOOTSTRAP_FAILURES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, OpenBootstrapFailure>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
 struct MigrationTestBarrier {
@@ -640,6 +807,21 @@ impl BackupCaptureTestBarrier {
 enum FinalConnectionCloseFailure {
     Error,
     Timeout,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum OpenPostPoolFailure {
+    Error,
+    UnconfirmedClose,
+    Panic,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum OpenBootstrapFailure {
+    Error,
+    Panic,
 }
 const MIGRATION_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS claw_schema_migrations (
@@ -852,6 +1034,12 @@ pub struct RecoveredWriterLock {
 
 /// Exclusive writer access to one durable SQLite database.
 pub struct StateStore {
+    data: Option<StateStoreData>,
+}
+
+/// Internal ownership data exposed only as the target of [`StateStore`]'s dereference.
+#[doc(hidden)]
+pub struct StateStoreData {
     path: PathBuf,
     database_parent_path: PathBuf,
     lock_path: PathBuf,
@@ -868,6 +1056,67 @@ pub struct StateStore {
     operation_timeout: Duration,
     busy_timeout: Duration,
     close_timeout: Duration,
+    close_reservation: StateCloseReservation,
+}
+
+impl std::ops::Deref for StateStore {
+    type Target = StateStoreData;
+
+    fn deref(&self) -> &Self::Target {
+        self.data
+            .as_ref()
+            .expect("live state store retains its ownership data")
+    }
+}
+
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            retain_state_store_data(data);
+        }
+    }
+}
+
+fn retain_state_store_data(data: StateStoreData) {
+    let StateStoreData {
+        pool,
+        lock_file,
+        _process_identity,
+        _database_file,
+        _database_parent,
+        writer_generation,
+        close_reservation,
+        ..
+    } = data;
+    retain_state_store_ownership(StateStoreOwnership {
+        pool: Some(pool),
+        lock_file,
+        process_identity: _process_identity,
+        database_file: _database_file,
+        database_parent: _database_parent,
+        writer_generation,
+        close_reservation,
+    });
+}
+
+fn retain_state_store_ownership(ownership: StateStoreOwnership) {
+    ownership.writer_generation.store(0, Ordering::Release);
+    let StateStoreOwnership {
+        pool,
+        lock_file,
+        process_identity,
+        database_file,
+        database_parent,
+        writer_generation: _,
+        close_reservation,
+    } = ownership;
+    close_reservation.retain(StateCloseOwnership {
+        _pool: pool,
+        _lock_file: lock_file,
+        _process_identity: process_identity,
+        _database_file: database_file,
+        _database_parent: database_parent,
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -1149,7 +1398,7 @@ impl Drop for ProcessIdentityGuard {
 }
 
 struct UndeliveredStoreCleanup {
-    store: StateStore,
+    store: Option<StateStore>,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 }
@@ -1163,7 +1412,7 @@ fn handoff_undelivered_store(
     handoff_state_payload_decide(
         owner,
         std::sync::Mutex::new(UndeliveredStoreCleanup {
-            store,
+            store: Some(store),
             deadline,
             deadline_state,
         }),
@@ -1171,11 +1420,14 @@ fn handoff_undelivered_store(
             let mut payload = payload
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(mut store) = payload.store.take() else {
+                return true;
+            };
             let deadline = payload.deadline;
             let cleanup = runtime.block_on(async {
                 tokio::time::timeout_at(
                     deadline,
-                    close_undelivered_writer_claim(&mut payload.store, deadline),
+                    close_undelivered_writer_claim(&mut store, deadline),
                 )
                 .await
             });
@@ -1184,8 +1436,10 @@ fn handoff_undelivered_store(
                     .deadline_state
                     .finished
                     .store(true, std::sync::atomic::Ordering::Release);
+                let _ = runtime.block_on(store.close_inner(true));
                 true
             } else {
+                payload.store = Some(store);
                 false
             }
         },
@@ -1327,23 +1581,33 @@ async fn open_timeout_error(
 }
 
 async fn close_pool_after_open_failure(
-    pool: &SqlitePool,
+    ownership: PendingStateStoreOwnership,
     deadline_state: &OpenDeadlineState,
     primary: StateError,
+    force_unconfirmed_for_test: bool,
 ) -> StateError {
     if !deadline_state.retain_open_cleanup() {
         return primary;
     }
-    match tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline_state.deadline),
-        pool.close(),
-    )
-    .await
-    {
-        Ok(()) => primary,
-        Err(_) => {
-            std::future::pending::<()>().await;
-            unreachable!("failed-open pool ownership remains retained by the open lifecycle");
+    let pool_closed = if force_unconfirmed_for_test {
+        false
+    } else {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline_state.deadline),
+            ownership.pool().close(),
+        )
+        .await
+        .is_ok()
+    };
+    if pool_closed {
+        drop(ownership.into_ownership());
+        primary
+    } else {
+        retain_state_store_ownership(ownership.into_ownership());
+        StateError::OperationCleanupFailed {
+            operation: "state store open",
+            primary: Box::new(primary),
+            cleanup: "pre-claim pool close exceeded the open deadline".to_owned(),
         }
     }
 }
@@ -1377,6 +1641,7 @@ impl StateStore {
         let cancel_at = deadline
             .checked_sub(cleanup_budget)
             .unwrap_or(tokio::time::Instant::now());
+        let close_reservation = reserve_state_close_ownership(deadline, timeout_ms).await?;
         let deadline_state = Arc::new(OpenDeadlineState {
             work_cutoff: cancel_at.into_std(),
             deadline: deadline.into_std(),
@@ -1420,7 +1685,9 @@ impl StateStore {
         let task_deadline_state = Arc::clone(&deadline_state);
         let lifecycle = tokio::spawn(async move {
             let mut undelivered_cleanup_owner = Some(undelivered_cleanup_owner);
-            match Self::open_inner(config, Arc::clone(&task_deadline_state)).await {
+            match Self::open_inner(config, Arc::clone(&task_deadline_state), close_reservation)
+                .await
+            {
                 Err(error) => {
                     let delivered_error = match undelivered_cleanup_owner
                         .take()
@@ -1573,6 +1840,7 @@ impl StateStore {
     async fn open_inner(
         config: StoreConfig,
         deadline_state: Arc<OpenDeadlineState>,
+        close_reservation: StateCloseReservation,
     ) -> Result<Self, StateError> {
         let path = resolve_database_path(&config.path)?;
         let database_parent = pin_private_directory(&path)?;
@@ -1603,24 +1871,59 @@ impl StateStore {
         if !deadline_state.retain_open_cleanup() {
             return Err(deadline_state.timeout_error());
         }
+        let mut pending_ownership = PendingStateStoreOwnership::new(StateStoreOwnership {
+            pool: None,
+            lock_file,
+            process_identity,
+            database_file,
+            database_parent: database_parent.file,
+            writer_generation: Arc::new(AtomicU64::new(1)),
+            close_reservation,
+        });
         drop(creation_lock);
-        let lock_identity =
-            capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?;
-        let owner = writer_owner()?;
-        let writer_generation = Arc::new(AtomicU64::new(1));
-        verify_path_identity(&path, &database_file)?;
-        let locked_state = inspect_database(
+        let lock_identity = match capture_store_lock_identity(
             &path,
-            &database_file,
+            &pending_ownership.database_file,
+            &lock_path,
+            &pending_ownership.lock_file,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                pending_ownership.release_without_pool();
+                return Err(error);
+            }
+        };
+        let owner = match writer_owner() {
+            Ok(owner) => owner,
+            Err(error) => {
+                pending_ownership.release_without_pool();
+                return Err(error);
+            }
+        };
+        if let Err(error) = verify_path_identity(&path, &pending_ownership.database_file) {
+            pending_ownership.release_without_pool();
+            return Err(error);
+        }
+        let locked_state = match inspect_database(
+            &path,
+            &pending_ownership.database_file,
             false,
             Some(Arc::clone(&deadline_state)),
         )
-        .await?;
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                pending_ownership.release_without_pool();
+                return Err(error);
+            }
+        };
 
         let remaining = deadline_state
             .deadline
             .saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            pending_ownership.release_without_pool();
             return Err(deadline_state.timeout_error());
         }
         let options = SqliteConnectOptions::new()
@@ -1633,22 +1936,34 @@ impl StateStore {
         let configured_busy_timeout = config.busy_timeout;
         let verified_path = path.clone();
         let verified_parent_path = database_parent_path.clone();
-        let verified_parent = Arc::new(database_parent.file.try_clone().map_err(|error| {
-            file_error("clone state directory handle", &database_parent_path, error)
-        })?);
-        let verified_file = Arc::new(
-            database_file
-                .try_clone()
-                .map_err(|error| file_error("clone connection identity handle", &path, error))?,
-        );
+        let verified_parent = match pending_ownership.database_parent.try_clone() {
+            Ok(parent) => Arc::new(parent),
+            Err(error) => {
+                let error =
+                    file_error("clone state directory handle", &database_parent_path, error);
+                pending_ownership.release_without_pool();
+                return Err(error);
+            }
+        };
+        let verified_file = match pending_ownership.database_file.try_clone() {
+            Ok(file) => Arc::new(file),
+            Err(error) => {
+                let error = file_error("clone connection identity handle", &path, error);
+                pending_ownership.release_without_pool();
+                return Err(error);
+            }
+        };
         let verified_lock_path = lock_path.clone();
-        let verified_lock_file = Arc::new(
-            lock_file
-                .try_clone()
-                .map_err(|error| file_error("clone writer lock handle", &lock_path, error))?,
-        );
+        let verified_lock_file = match pending_ownership.lock_file.try_clone() {
+            Ok(lock_file) => Arc::new(lock_file),
+            Err(error) => {
+                let error = file_error("clone writer lock handle", &lock_path, error);
+                pending_ownership.release_without_pool();
+                return Err(error);
+            }
+        };
         let verified_lock_identity = lock_identity.clone();
-        let verified_writer_generation = Arc::clone(&writer_generation);
+        let verified_writer_generation = Arc::clone(&pending_ownership.writer_generation);
         let connections_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connect_ready = Arc::clone(&connections_ready);
         let connect_deadline_state = Arc::clone(&deadline_state);
@@ -1663,264 +1978,351 @@ impl StateStore {
         let acquire_ready = Arc::clone(&connections_ready);
         let acquire_deadline_state = Arc::clone(&deadline_state);
         let live_acquire_timeout = config.acquire_timeout;
-        let pool = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline_state.deadline),
-            SqlitePoolOptions::new()
-                .min_connections(1)
-                .max_connections(config.max_connections)
-                .acquire_timeout(config.acquire_timeout)
-                .after_connect(move |connection, _metadata| {
-                    let path = verified_path.clone();
-                    let parent_path = verified_parent_path.clone();
-                    let parent = Arc::clone(&verified_parent);
-                    let file = Arc::clone(&verified_file);
-                    let lock_path = verified_lock_path.clone();
-                    let lock_file = Arc::clone(&verified_lock_file);
-                    let lock_identity = verified_lock_identity.clone();
-                    let writer_generation = Arc::clone(&verified_writer_generation);
-                    let ready = Arc::clone(&connect_ready);
-                    let deadline_state = Arc::clone(&connect_deadline_state);
-                    Box::pin(async move {
-                        let busy_timeout = if ready.load(std::sync::atomic::Ordering::Acquire) {
-                            configured_busy_timeout
-                        } else {
-                            let remaining = deadline_state
-                                .deadline
-                                .saturating_duration_since(std::time::Instant::now());
-                            if remaining.is_zero() {
-                                return Err(sqlx::Error::Protocol(
-                                    "state store open deadline expired before connection bootstrap"
-                                        .to_owned(),
-                                ));
-                            }
-                            configured_busy_timeout.min(remaining)
-                        };
-                        claw_sqlite_file_control::set_busy_timeout(connection, busy_timeout)
-                            .await
-                            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-                        {
-                            let mut handle = connection.lock_handle().await?;
-                            handle.set_progress_handler(1_000, move || {
-                                deadline_state.permits_sqlite_work()
-                            });
+        let pool = SqlitePoolOptions::new()
+            .min_connections(0)
+            .max_connections(config.max_connections)
+            .acquire_timeout(config.acquire_timeout)
+            .after_connect(move |connection, _metadata| {
+                let path = verified_path.clone();
+                let parent_path = verified_parent_path.clone();
+                let parent = Arc::clone(&verified_parent);
+                let file = Arc::clone(&verified_file);
+                let lock_path = verified_lock_path.clone();
+                let lock_file = Arc::clone(&verified_lock_file);
+                let lock_identity = verified_lock_identity.clone();
+                let writer_generation = Arc::clone(&verified_writer_generation);
+                let ready = Arc::clone(&connect_ready);
+                let deadline_state = Arc::clone(&connect_deadline_state);
+                Box::pin(async move {
+                    #[cfg(test)]
+                    let injected_bootstrap_failure = {
+                        let mut failures = OPEN_BOOTSTRAP_FAILURES
+                            .lock()
+                            .expect("open bootstrap failures lock poisoned");
+                        match failures.get(&path).copied() {
+                            Some(OpenBootstrapFailure::Panic) => failures.remove(&path),
+                            failure => failure,
                         }
-                        if writer_generation.load(Ordering::Acquire) != 1 {
+                    };
+                    #[cfg(test)]
+                    match injected_bootstrap_failure {
+                        Some(OpenBootstrapFailure::Error) => {
                             return Err(sqlx::Error::Protocol(
-                                "state writer generation is no longer live".to_owned(),
+                                "injected open bootstrap failure".to_owned(),
                             ));
                         }
-                        verify_directory_path_identity(&parent_path, &parent)
-                            .and_then(|()| verify_path_identity(&path, &file))
-                            .and_then(|()| verify_path_identity(&lock_path, &lock_file))
-                            .and_then(|()| {
-                                verify_store_lock_binding(
-                                    &path,
-                                    &file,
-                                    &lock_path,
-                                    &lock_file,
-                                    lock_identity.as_deref(),
-                                )
-                            })
-                            .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        verify_sqlite_connection_identity(connection).await?;
-                        if ready.load(std::sync::atomic::Ordering::Acquire) {
-                            claw_sqlite_file_control::set_busy_timeout(
-                                connection,
-                                configured_busy_timeout,
-                            )
-                            .await
-                            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-                            secure_sqlite_sidecars(&path, lock_identity.as_deref())
-                                .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                            install_store_commit_guard(
-                                connection,
-                                (&parent_path, &parent),
-                                (&path, &file),
-                                (&lock_path, &lock_file),
-                                lock_identity.as_deref(),
-                                (Arc::clone(&writer_generation), 1),
-                            )
-                            .await?;
+                        Some(OpenBootstrapFailure::Panic) => {
+                            panic!("injected open bootstrap panic");
                         }
-                        Ok(())
-                    })
-                })
-                .before_acquire(move |connection, _metadata| {
-                    let path = acquire_path.clone();
-                    let parent_path = acquire_parent_path.clone();
-                    let parent = Arc::clone(&acquire_parent);
-                    let file = Arc::clone(&acquire_file);
-                    let lock_path = acquire_lock_path.clone();
-                    let lock_file = Arc::clone(&acquire_lock_file);
-                    let lock_identity = acquire_lock_identity.clone();
-                    let writer_generation = Arc::clone(&acquire_writer_generation);
-                    let ready = Arc::clone(&acquire_ready);
-                    let deadline_state = Arc::clone(&acquire_deadline_state);
-                    Box::pin(async move {
-                        if writer_generation.load(Ordering::Acquire) != 1 {
+                        None => {}
+                    }
+                    let busy_timeout = if ready.load(std::sync::atomic::Ordering::Acquire) {
+                        configured_busy_timeout
+                    } else {
+                        let remaining = deadline_state
+                            .deadline
+                            .saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
                             return Err(sqlx::Error::Protocol(
-                                "state writer generation is no longer live".to_owned(),
-                            ));
-                        }
-                        if !deadline_state.permits_sqlite_work() {
-                            return Err(sqlx::Error::Protocol(
-                                "state store open deadline expired before cleanup admission"
+                                "state store open deadline expired before connection bootstrap"
                                     .to_owned(),
                             ));
                         }
-                        let admission_deadline = if deadline_state
-                            .finished
-                            .load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            std::time::Instant::now()
-                                .checked_add(live_acquire_timeout)
-                                .ok_or_else(|| {
-                                    sqlx::Error::Protocol(
-                                        "state connection acquire deadline overflowed".to_owned(),
-                                    )
-                                })?
-                        } else {
-                            deadline_state.deadline
-                        };
-                        ensure_state_cleanup_executor(tokio::time::Instant::from_std(
-                            admission_deadline,
-                        ))
+                        configured_busy_timeout.min(remaining)
+                    };
+                    claw_sqlite_file_control::set_busy_timeout(connection, busy_timeout)
                         .await
-                        .map_err(sqlx::Error::Protocol)?;
-                        let mut owners =
-                            claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
-                                "claw-state-before-acquire-identity",
-                                1,
-                                admission_deadline,
+                        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+                    {
+                        let mut handle = connection.lock_handle().await?;
+                        handle.set_progress_handler(1_000, move || {
+                            deadline_state.permits_sqlite_work()
+                        });
+                    }
+                    if writer_generation.load(Ordering::Acquire) != 1 {
+                        return Err(sqlx::Error::Protocol(
+                            "state writer generation is no longer live".to_owned(),
+                        ));
+                    }
+                    verify_directory_path_identity(&parent_path, &parent)
+                        .and_then(|()| verify_path_identity(&path, &file))
+                        .and_then(|()| verify_path_identity(&lock_path, &lock_file))
+                        .and_then(|()| {
+                            verify_store_lock_binding(
+                                &path,
+                                &file,
+                                &lock_path,
+                                &lock_file,
+                                lock_identity.as_deref(),
                             )
-                            .await
-                            .map_err(sqlx::Error::Protocol)?;
-                        let owner = owners
-                            .pop()
-                            .expect("one before-acquire cleanup owner was reserved");
-                        let (verified_tx, verified_rx) = std::sync::mpsc::sync_channel(0);
-                        struct IdentityVerificationPayload {
-                            parent_path: PathBuf,
-                            parent: Arc<File>,
-                            path: PathBuf,
-                            file: Arc<File>,
-                            lock_path: PathBuf,
-                            lock_file: Arc<File>,
-                            lock_identity: Option<Vec<u8>>,
-                            ready: Arc<std::sync::atomic::AtomicBool>,
-                            result: std::sync::mpsc::SyncSender<Result<(), StateError>>,
-                            undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
-                        }
-                        handoff_state_payload(
-                            owner,
-                            IdentityVerificationPayload {
-                                parent_path,
-                                parent,
-                                path,
-                                file,
-                                lock_path,
-                                lock_file,
-                                lock_identity,
-                                ready,
-                                result: verified_tx,
-                                undelivered: std::sync::Mutex::new(None),
-                            },
-                            |_, _, payload| {
-                                let verified =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        verify_directory_path_identity(
-                                            &payload.parent_path,
-                                            &payload.parent,
+                        })
+                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                    verify_sqlite_connection_identity(connection).await?;
+                    if ready.load(std::sync::atomic::Ordering::Acquire) {
+                        claw_sqlite_file_control::set_busy_timeout(
+                            connection,
+                            configured_busy_timeout,
+                        )
+                        .await
+                        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+                        secure_sqlite_sidecars(&path, lock_identity.as_deref())
+                            .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                        install_store_commit_guard(
+                            connection,
+                            (&parent_path, &parent),
+                            (&path, &file),
+                            (&lock_path, &lock_file),
+                            lock_identity.as_deref(),
+                            (Arc::clone(&writer_generation), 1),
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .before_acquire(move |connection, _metadata| {
+                let path = acquire_path.clone();
+                let parent_path = acquire_parent_path.clone();
+                let parent = Arc::clone(&acquire_parent);
+                let file = Arc::clone(&acquire_file);
+                let lock_path = acquire_lock_path.clone();
+                let lock_file = Arc::clone(&acquire_lock_file);
+                let lock_identity = acquire_lock_identity.clone();
+                let writer_generation = Arc::clone(&acquire_writer_generation);
+                let ready = Arc::clone(&acquire_ready);
+                let deadline_state = Arc::clone(&acquire_deadline_state);
+                Box::pin(async move {
+                    if writer_generation.load(Ordering::Acquire) != 1 {
+                        return Err(sqlx::Error::Protocol(
+                            "state writer generation is no longer live".to_owned(),
+                        ));
+                    }
+                    if !deadline_state.permits_sqlite_work() {
+                        return Err(sqlx::Error::Protocol(
+                            "state store open deadline expired before cleanup admission".to_owned(),
+                        ));
+                    }
+                    let admission_deadline = if deadline_state
+                        .finished
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        std::time::Instant::now()
+                            .checked_add(live_acquire_timeout)
+                            .ok_or_else(|| {
+                                sqlx::Error::Protocol(
+                                    "state connection acquire deadline overflowed".to_owned(),
+                                )
+                            })?
+                    } else {
+                        deadline_state.deadline
+                    };
+                    ensure_state_cleanup_executor(tokio::time::Instant::from_std(
+                        admission_deadline,
+                    ))
+                    .await
+                    .map_err(sqlx::Error::Protocol)?;
+                    let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+                        "claw-state-before-acquire-identity",
+                        1,
+                        admission_deadline,
+                    )
+                    .await
+                    .map_err(sqlx::Error::Protocol)?;
+                    let owner = owners
+                        .pop()
+                        .expect("one before-acquire cleanup owner was reserved");
+                    let (verified_tx, verified_rx) = std::sync::mpsc::sync_channel(0);
+                    struct IdentityVerificationPayload {
+                        parent_path: PathBuf,
+                        parent: Arc<File>,
+                        path: PathBuf,
+                        file: Arc<File>,
+                        lock_path: PathBuf,
+                        lock_file: Arc<File>,
+                        lock_identity: Option<Vec<u8>>,
+                        ready: Arc<std::sync::atomic::AtomicBool>,
+                        result: std::sync::mpsc::SyncSender<Result<(), StateError>>,
+                        undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
+                    }
+                    handoff_state_payload(
+                        owner,
+                        IdentityVerificationPayload {
+                            parent_path,
+                            parent,
+                            path,
+                            file,
+                            lock_path,
+                            lock_file,
+                            lock_identity,
+                            ready,
+                            result: verified_tx,
+                            undelivered: std::sync::Mutex::new(None),
+                        },
+                        |_, _, payload| {
+                            let verified =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    verify_directory_path_identity(
+                                        &payload.parent_path,
+                                        &payload.parent,
+                                    )
+                                    .and_then(|()| {
+                                        verify_path_identity(&payload.path, &payload.file)
+                                    })
+                                    .and_then(|()| {
+                                        verify_path_identity(&payload.lock_path, &payload.lock_file)
+                                    })
+                                    .and_then(|()| {
+                                        verify_store_lock_binding(
+                                            &payload.path,
+                                            &payload.file,
+                                            &payload.lock_path,
+                                            &payload.lock_file,
+                                            payload.lock_identity.as_deref(),
                                         )
-                                        .and_then(|()| {
-                                            verify_path_identity(&payload.path, &payload.file)
-                                        })
-                                        .and_then(|()| {
-                                            verify_path_identity(
-                                                &payload.lock_path,
-                                                &payload.lock_file,
-                                            )
-                                        })
-                                        .and_then(|()| {
-                                            verify_store_lock_binding(
+                                    })
+                                    .and_then(|()| {
+                                        if payload.ready.load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            validate_sqlite_sidecars(
                                                 &payload.path,
-                                                &payload.file,
-                                                &payload.lock_path,
-                                                &payload.lock_file,
                                                 payload.lock_identity.as_deref(),
                                             )
-                                        })
-                                        .and_then(|()| {
-                                            if payload
-                                                .ready
-                                                .load(std::sync::atomic::Ordering::Acquire)
-                                            {
-                                                validate_sqlite_sidecars(
-                                                    &payload.path,
-                                                    payload.lock_identity.as_deref(),
-                                                )
-                                            } else {
-                                                Ok(())
-                                            }
-                                        })
-                                    }))
-                                    .unwrap_or_else(
-                                        |panic| {
-                                            std::mem::forget(panic);
-                                            Err(database(
-                                                "verify before-acquire filesystem identity",
-                                                sqlx::Error::Protocol(
-                                                    "filesystem identity verification panicked"
-                                                        .to_owned(),
-                                                ),
-                                            ))
-                                        },
-                                    );
-                                if let Err(verified) = payload.result.send(verified) {
-                                    *payload
-                                        .undelivered
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(verified.0);
-                                }
-                            },
-                        )
-                        .map_err(sqlx::Error::Protocol)?;
-                        let verified = loop {
-                            match verified_rx.try_recv() {
-                                Ok(verified) => break verified,
-                                Err(std::sync::mpsc::TryRecvError::Empty)
-                                    if deadline_state.permits_sqlite_work()
-                                        && std::time::Instant::now() < admission_deadline =>
-                                {
-                                    tokio::task::yield_now().await;
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    return Err(sqlx::Error::Protocol(
+                                        } else {
+                                            Ok(())
+                                        }
+                                    })
+                                }))
+                                .unwrap_or_else(|panic| {
+                                    std::mem::forget(panic);
+                                    Err(database(
+                                        "verify before-acquire filesystem identity",
+                                        sqlx::Error::Protocol(
+                                            "filesystem identity verification panicked".to_owned(),
+                                        ),
+                                    ))
+                                });
+                            if let Err(verified) = payload.result.send(verified) {
+                                *payload
+                                    .undelivered
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(verified.0);
+                            }
+                        },
+                    )
+                    .map_err(sqlx::Error::Protocol)?;
+                    let verified = loop {
+                        match verified_rx.try_recv() {
+                            Ok(verified) => break verified,
+                            Err(std::sync::mpsc::TryRecvError::Empty)
+                                if deadline_state.permits_sqlite_work()
+                                    && std::time::Instant::now() < admission_deadline =>
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                return Err(sqlx::Error::Protocol(
                                     "state store open deadline expired during identity verification"
                                         .to_owned(),
                                 ));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    return Err(sqlx::Error::Protocol(
-                                        "before-acquire identity owner stopped without result"
-                                            .to_owned(),
-                                    ));
-                                }
                             }
-                        };
-                        verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        verify_sqlite_connection_identity(connection).await?;
-                        Ok(true)
-                    })
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Err(sqlx::Error::Protocol(
+                                    "before-acquire identity owner stopped without result"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                    };
+                    verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                    verify_sqlite_connection_identity(connection).await?;
+                    Ok(true)
                 })
-                .connect_with(options),
+            })
+            .connect_lazy_with(options);
+        pending_ownership.install_pool(pool);
+        let pool = pending_ownership.pool().clone();
+        let mut bootstrap = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline_state.deadline),
+            pool.acquire(),
         )
         .await
-        .map_err(|_| deadline_state.timeout_error())?
-        .map_err(|error| database("open state database", error))?;
-        if let Err(error) = verify_path_identity(&path, &database_file) {
-            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                let primary = database("open state database", error);
+                return Err(close_pool_after_open_failure(
+                    pending_ownership,
+                    &deadline_state,
+                    primary,
+                    false,
+                )
+                .await);
+            }
+            Err(_) => {
+                let primary = deadline_state.timeout_error();
+                return Err(close_pool_after_open_failure(
+                    pending_ownership,
+                    &deadline_state,
+                    primary,
+                    false,
+                )
+                .await);
+            }
+        };
+        if tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline_state.deadline),
+            bootstrap.return_to_pool(),
+        )
+        .await
+        .is_err()
+        {
+            let primary = deadline_state.timeout_error();
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                primary,
+                false,
+            )
+            .await);
+        }
+        drop(bootstrap);
+        #[cfg(test)]
+        let injected_post_pool_failure = OPEN_POST_POOL_FAILURES
+            .lock()
+            .expect("post-pool open failures lock poisoned")
+            .remove(&path);
+        #[cfg(test)]
+        if let Some(failure) = injected_post_pool_failure {
+            match failure {
+                OpenPostPoolFailure::Error | OpenPostPoolFailure::UnconfirmedClose => {
+                    let force_unconfirmed =
+                        matches!(failure, OpenPostPoolFailure::UnconfirmedClose);
+                    let primary = database(
+                        "injected post-pool open failure",
+                        sqlx::Error::Protocol("injected post-pool open failure".to_owned()),
+                    );
+                    return Err(close_pool_after_open_failure(
+                        pending_ownership,
+                        &deadline_state,
+                        primary,
+                        force_unconfirmed,
+                    )
+                    .await);
+                }
+                OpenPostPoolFailure::Panic => {
+                    panic!("injected post-pool open lifecycle panic");
+                }
+            }
+        }
+        if let Err(error) = verify_path_identity(&path, &pending_ownership.database_file) {
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                error,
+                false,
+            )
+            .await);
         }
 
         async fn initialize_connection_sidecars(
@@ -1971,11 +2373,23 @@ impl StateStore {
             Ok(Ok(initial)) => initial,
             Ok(Err(error)) => {
                 let primary = database("acquire initial state connection", error);
-                return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
+                return Err(close_pool_after_open_failure(
+                    pending_ownership,
+                    &deadline_state,
+                    primary,
+                    false,
+                )
+                .await);
             }
             Err(_) => {
                 let primary = deadline_state.timeout_error();
-                return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
+                return Err(close_pool_after_open_failure(
+                    pending_ownership,
+                    &deadline_state,
+                    primary,
+                    false,
+                )
+                .await);
             }
         };
         let initial_busy_timeout = configured_busy_timeout.min(
@@ -1996,9 +2410,13 @@ impl StateStore {
                 Err(error) => {
                     let primary =
                         file_control_database("begin SQLite sidecar initialization", error);
-                    return Err(
-                        close_pool_after_open_failure(&pool, &deadline_state, primary).await,
-                    );
+                    return Err(close_pool_after_open_failure(
+                        pending_ownership,
+                        &deadline_state,
+                        primary,
+                        false,
+                    )
+                    .await);
                 }
             };
         if let Err(error) = initialize_connection_sidecars(&mut initial).await {
@@ -2012,9 +2430,15 @@ impl StateStore {
                     cleanup: cleanup.to_string(),
                 },
             };
-            return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                primary,
+                false,
+            )
+            .await);
         }
-        let (mut initial, post_commit_owner) = initial
+        let (mut initial, post_commit_owner) = match initial
             .commit_with_deadline(
                 deadline_state.work_cutoff,
                 deadline_state.deadline,
@@ -2023,27 +2447,62 @@ impl StateStore {
                 None,
             )
             .await
-            .map_err(|error| {
-                file_control_database("commit SQLite sidecar initialization", error)
-            })?;
-        secure_sqlite_sidecars(&path, lock_identity.as_deref())?;
-        install_store_commit_guard(
+            .map_err(|error| file_control_database("commit SQLite sidecar initialization", error))
+        {
+            Ok(committed) => committed,
+            Err(primary) => {
+                return Err(close_pool_after_open_failure(
+                    pending_ownership,
+                    &deadline_state,
+                    primary,
+                    false,
+                )
+                .await);
+            }
+        };
+        if let Err(primary) = secure_sqlite_sidecars(&path, lock_identity.as_deref()) {
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                primary,
+                false,
+            )
+            .await);
+        }
+        if let Err(error) = install_store_commit_guard(
             &mut initial,
-            (&database_parent_path, &database_parent.file),
-            (&path, &database_file),
-            (&lock_path, &lock_file),
+            (&database_parent_path, &pending_ownership.database_parent),
+            (&path, &pending_ownership.database_file),
+            (&lock_path, &pending_ownership.lock_file),
             lock_identity.as_deref(),
-            (Arc::clone(&writer_generation), 1),
+            (Arc::clone(&pending_ownership.writer_generation), 1),
         )
         .await
-        .map_err(|error| database("install initial commit guard", error))?;
+        {
+            let primary = database("install initial commit guard", error);
+            drop(initial);
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                primary,
+                false,
+            )
+            .await);
+        }
         drop(initial);
-        post_commit_owner.shutdown().map_err(|error| {
-            database(
+        if let Err(error) = post_commit_owner.shutdown() {
+            let primary = database(
                 "release initial post-COMMIT cleanup owner",
                 sqlx::Error::Protocol(error),
+            );
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                primary,
+                false,
             )
-        })?;
+            .await);
+        }
         #[cfg(test)]
         wait_at_open_initialization_test_barrier(&path).await;
 
@@ -2069,11 +2528,11 @@ impl StateStore {
             secure_sqlite_sidecars(&path, lock_identity.as_deref())?;
             install_store_commit_guard(
                 &mut configured_connection,
-                (&database_parent_path, &database_parent.file),
-                (&path, &database_file),
-                (&lock_path, &lock_file),
+                (&database_parent_path, &pending_ownership.database_parent),
+                (&path, &pending_ownership.database_file),
+                (&lock_path, &pending_ownership.lock_file),
                 lock_identity.as_deref(),
-                (Arc::clone(&writer_generation), 1),
+                (Arc::clone(&pending_ownership.writer_generation), 1),
             )
             .await
             .map_err(|error| database("install configured commit guard", error))?;
@@ -2081,23 +2540,13 @@ impl StateStore {
         }
         .await;
         if let Err(error) = configured {
-            return Err(
-                if tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline_state.deadline),
-                    pool.close(),
-                )
-                .await
-                .is_ok()
-                {
-                    error
-                } else {
-                    StateError::OperationCleanupFailed {
-                        operation: "state store open",
-                        primary: Box::new(error),
-                        cleanup: "pre-claim pool close exceeded the open deadline".to_owned(),
-                    }
-                },
-            );
+            return Err(close_pool_after_open_failure(
+                pending_ownership,
+                &deadline_state,
+                error,
+                false,
+            )
+            .await);
         }
         let recovered_writer = match initialize_database(
             &pool,
@@ -2110,27 +2559,45 @@ impl StateStore {
         {
             Ok(recovered_writer) => recovered_writer,
             Err(error) => {
-                return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+                return Err(close_pool_after_open_failure(
+                    pending_ownership,
+                    &deadline_state,
+                    error,
+                    false,
+                )
+                .await);
             }
         };
         connections_ready.store(true, std::sync::atomic::Ordering::Release);
-        Ok(Self {
-            path,
-            database_parent_path,
-            lock_path,
-            owner,
-            recovered_writer,
+        let StateStoreOwnership {
             pool,
             lock_file,
-            lock_identity,
-            _process_identity: process_identity,
-            _database_file: database_file,
-            _database_parent: database_parent.file,
+            process_identity,
+            database_file,
+            database_parent,
             writer_generation,
-            max_connections: config.max_connections,
-            operation_timeout: config.operation_timeout,
-            busy_timeout: config.busy_timeout,
-            close_timeout: config.close_timeout,
+            close_reservation,
+        } = pending_ownership.into_ownership();
+        Ok(Self {
+            data: Some(StateStoreData {
+                path,
+                database_parent_path,
+                lock_path,
+                owner,
+                recovered_writer,
+                pool: pool.expect("completed state store owns its installed pool"),
+                lock_file,
+                lock_identity,
+                _process_identity: process_identity,
+                _database_file: database_file,
+                _database_parent: database_parent,
+                writer_generation,
+                max_connections: config.max_connections,
+                operation_timeout: config.operation_timeout,
+                busy_timeout: config.busy_timeout,
+                close_timeout: config.close_timeout,
+                close_reservation,
+            }),
         })
     }
 
@@ -3068,9 +3535,11 @@ impl StateStore {
     }
 
     async fn close_inner(
-        self,
+        mut self,
         application_lock_already_released: bool,
     ) -> Result<CheckpointReport, StateError> {
+        #[cfg(test)]
+        wait_at_close_test_barrier(&self.path).await;
         let deadline = tokio::time::Instant::now() + self.close_timeout;
         let mut reasons = Vec::new();
         let identity_valid = match verify_directory_path_identity(
@@ -3257,7 +3726,6 @@ impl StateStore {
         let os_lock_released = if pool_closed {
             #[cfg(windows)]
             {
-                drop(self._process_identity);
                 true
             }
             #[cfg(not(windows))]
@@ -3278,15 +3746,17 @@ impl StateStore {
                 "OS identity ownership retained because terminal pool completion was not confirmed"
                     .to_owned(),
             );
-            retain_state_close_ownership(StateCloseRetention {
-                _pool: self.pool,
-                _lock_file: self.lock_file,
-                _process_identity: self._process_identity,
-                _database_file: self._database_file,
-                _database_parent: self._database_parent,
-            });
             false
         };
+        let data = self
+            .data
+            .take()
+            .expect("closing state store retains its ownership data");
+        if pool_closed {
+            drop(data);
+        } else {
+            retain_state_store_data(data);
+        }
         match (
             checkpoint,
             application_lock_released,
@@ -9640,6 +10110,28 @@ async fn wait_at_open_initialization_test_barrier(path: &Path) {
 }
 
 #[cfg(test)]
+async fn wait_at_close_test_barrier(path: &Path) {
+    let barrier = CLOSE_TEST_BARRIER
+        .lock()
+        .expect("close test barrier lock poisoned")
+        .get(path)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        CLOSE_TEST_BARRIER
+            .lock()
+            .expect("close test barrier lock poisoned")
+            .remove(path);
+    }
+}
+
+#[cfg(test)]
 async fn wait_at_open_precommit_test_barrier(path: &Path, deadline_state: &OpenDeadlineState) {
     let barrier = OPEN_PRECOMMIT_TEST_BARRIER
         .lock()
@@ -12595,6 +13087,111 @@ pub(crate) mod test_support {
             );
     }
 
+    fn set_open_post_pool_failure(path: &Path, failure: super::OpenPostPoolFailure) {
+        let path = super::resolve_database_path(path).expect("resolve post-pool open failure path");
+        let previous = super::OPEN_POST_POOL_FAILURES
+            .lock()
+            .expect("post-pool open failures lock poisoned")
+            .insert(path, failure);
+        assert!(
+            previous.is_none(),
+            "post-pool open failure must be registered once"
+        );
+    }
+
+    pub(crate) fn fail_open_after_pool_once(path: &Path) {
+        set_open_post_pool_failure(path, super::OpenPostPoolFailure::Error);
+    }
+
+    pub(crate) fn fail_open_after_pool_with_unconfirmed_close_once(path: &Path) {
+        set_open_post_pool_failure(path, super::OpenPostPoolFailure::UnconfirmedClose);
+    }
+
+    pub(crate) fn panic_open_after_pool_once(path: &Path) {
+        set_open_post_pool_failure(path, super::OpenPostPoolFailure::Panic);
+    }
+
+    fn set_open_bootstrap_failure(path: &Path, failure: super::OpenBootstrapFailure) {
+        let path = super::resolve_database_path(path).expect("resolve open bootstrap failure path");
+        let previous = super::OPEN_BOOTSTRAP_FAILURES
+            .lock()
+            .expect("open bootstrap failures lock poisoned")
+            .insert(path, failure);
+        assert!(
+            previous.is_none(),
+            "open bootstrap failure must be registered once"
+        );
+    }
+
+    pub(crate) fn fail_open_bootstrap(path: &Path) {
+        set_open_bootstrap_failure(path, super::OpenBootstrapFailure::Error);
+    }
+
+    pub(crate) fn panic_open_bootstrap_once(path: &Path) {
+        set_open_bootstrap_failure(path, super::OpenBootstrapFailure::Panic);
+    }
+
+    pub(crate) fn clear_open_bootstrap_failure(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve open bootstrap failure path");
+        super::OPEN_BOOTSTRAP_FAILURES
+            .lock()
+            .expect("open bootstrap failures lock poisoned")
+            .remove(&path);
+    }
+
+    pub(crate) const fn state_close_retention_capacity() -> usize {
+        super::MAX_STATE_CLOSE_RETENTIONS
+    }
+
+    pub(crate) fn state_close_available_capacity() -> usize {
+        super::STATE_CLOSE_RETENTION_ADMISSION.available_permits()
+    }
+
+    pub(crate) fn state_close_reserved_count() -> usize {
+        super::STATE_CLOSE_OWNERSHIP_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|slot| matches!(slot, super::StateCloseOwnershipSlot::Reserved))
+            .count()
+    }
+
+    pub(crate) fn state_close_retained_count() -> usize {
+        super::STATE_CLOSE_OWNERSHIP_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|slot| matches!(slot, super::StateCloseOwnershipSlot::Retained { .. }))
+            .count()
+    }
+
+    pub(crate) fn release_injected_state_close_retentions() {
+        let retentions = {
+            let mut slots = super::STATE_CLOSE_OWNERSHIP_SLOTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut retentions = Vec::new();
+            for slot in slots.iter_mut() {
+                let retained = matches!(slot, super::StateCloseOwnershipSlot::Retained { .. });
+                if retained {
+                    let super::StateCloseOwnershipSlot::Retained { _retention } =
+                        std::mem::replace(slot, super::StateCloseOwnershipSlot::Available)
+                    else {
+                        unreachable!("retained state close slot was matched above");
+                    };
+                    retentions.push(_retention);
+                } else {
+                    assert!(
+                        matches!(slot, super::StateCloseOwnershipSlot::Available),
+                        "all live state close reservations must finish before test release"
+                    );
+                }
+            }
+            retentions
+        };
+        drop(retentions);
+    }
+
     pub(crate) fn reseal_backup_fixture(path: &Path) {
         let path = super::resolve_database_path(path).expect("resolve backup fixture path");
         #[cfg(unix)]
@@ -12760,6 +13357,36 @@ pub(crate) mod test_support {
                 },
             );
         (entered, release)
+    }
+
+    pub(crate) fn set_close_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let path = super::resolve_database_path(path).expect("resolve close barrier path");
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        super::CLOSE_TEST_BARRIER
+            .lock()
+            .expect("close test barrier lock poisoned")
+            .insert(
+                path,
+                super::MigrationTestBarrier {
+                    entered: std::sync::Arc::clone(&entered),
+                    release: std::sync::Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    pub(crate) fn clear_close_barrier(path: &Path) {
+        let path = super::resolve_database_path(path).expect("resolve close barrier path");
+        super::CLOSE_TEST_BARRIER
+            .lock()
+            .expect("close test barrier lock poisoned")
+            .remove(&path);
     }
 
     pub(crate) fn set_open_precommit_barrier(

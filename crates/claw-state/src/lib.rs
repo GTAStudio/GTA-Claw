@@ -399,6 +399,23 @@ mod tests {
             .expect("state store opens")
     }
 
+    async fn retain_unconfirmed_close(path: &Path) {
+        let store =
+            StateStore::open(StoreConfig::new(path).with_open_timeout(Duration::from_secs(5)))
+                .await
+                .expect("open retained-close fixture");
+        test_support::fail_final_connection_close_once(path, false);
+        assert!(matches!(
+            store.close().await,
+            Err(StateError::CloseDegraded {
+                final_connection_closed: false,
+                pool_closed: false,
+                os_lock_released: false,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn public_text_fields_reject_nul_characters() {
         assert_eq!(
@@ -1394,6 +1411,11 @@ mod tests {
                 .is_err(),
             "detached cleanup retains exclusive store ownership"
         );
+        assert_eq!(
+            test_support::state_close_available_capacity(),
+            test_support::state_close_retention_capacity() - 1
+        );
+        assert_eq!(test_support::state_close_reserved_count(), 1);
     }
 
     #[cfg(unix)]
@@ -2340,6 +2362,330 @@ mod tests {
             .close()
             .await
             .expect("observed final connection close remains clean");
+    }
+
+    #[tokio::test]
+    async fn close_retention_capacity_rejects_before_store_creation() {
+        const CHILD_ENV: &str = "GTA_CLAW_CLOSE_RETENTION_CAPACITY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::close_retention_capacity_rejects_before_store_creation")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated close-retention capacity test");
+            assert!(
+                status.success(),
+                "isolated close-retention capacity test failed"
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("close-retention capacity directory");
+        let capacity = test_support::state_close_retention_capacity();
+        assert_eq!(test_support::state_close_available_capacity(), capacity);
+        for index in 0..capacity {
+            let path = database_path(&directory, &format!("retained-close-{index}.sqlite"));
+            retain_unconfirmed_close(&path).await;
+            assert_eq!(test_support::state_close_retained_count(), index + 1);
+            assert_eq!(
+                test_support::state_close_available_capacity(),
+                capacity - index - 1
+            );
+        }
+
+        let rejected = database_path(&directory, "capacity-rejected.sqlite");
+        let started = Instant::now();
+        assert_eq!(
+            StateStore::open(
+                StoreConfig::new(&rejected).with_open_timeout(Duration::from_millis(200))
+            )
+            .await
+            .err()
+            .expect("exhausted close retention rejects the next open"),
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 200,
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!rejected.exists());
+        assert!(
+            database_artifact_bytes(&rejected)
+                .iter()
+                .all(|(_, bytes)| bytes.is_none())
+        );
+        assert_eq!(test_support::state_close_retained_count(), capacity);
+        assert_eq!(test_support::state_close_available_capacity(), 0);
+
+        test_support::release_injected_state_close_retentions();
+        assert_eq!(test_support::state_close_retained_count(), 0);
+        assert_eq!(test_support::state_close_available_capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn close_retention_reservations_release_and_cannot_overbook() {
+        const CHILD_ENV: &str = "GTA_CLAW_CLOSE_RETENTION_LIFECYCLE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::close_retention_reservations_release_and_cannot_overbook")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated close-retention lifecycle test");
+            assert!(
+                status.success(),
+                "isolated close-retention lifecycle test failed"
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("close-retention lifecycle directory");
+        let capacity = test_support::state_close_retention_capacity();
+        let clean_path = database_path(&directory, "confirmed-close.sqlite");
+        let clean = open(&clean_path).await;
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 1);
+        clean.close().await.expect("confirmed close succeeds");
+        assert_eq!(test_support::state_close_available_capacity(), capacity);
+
+        for index in 0..capacity - 1 {
+            let path = database_path(&directory, &format!("contender-retained-{index}.sqlite"));
+            retain_unconfirmed_close(&path).await;
+        }
+        assert_eq!(test_support::state_close_retained_count(), capacity - 1);
+        assert_eq!(test_support::state_close_available_capacity(), 1);
+
+        let first_path = database_path(&directory, "concurrent-first.sqlite");
+        let second_path = database_path(&directory, "concurrent-second.sqlite");
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let first_start = std::sync::Arc::clone(&start);
+        let first_open_path = first_path.clone();
+        let first = tokio::spawn(async move {
+            first_start.wait().await;
+            StateStore::open(
+                StoreConfig::new(first_open_path).with_open_timeout(Duration::from_millis(2_000)),
+            )
+            .await
+        });
+        let second_start = std::sync::Arc::clone(&start);
+        let second_open_path = second_path.clone();
+        let second = tokio::spawn(async move {
+            second_start.wait().await;
+            StateStore::open(
+                StoreConfig::new(second_open_path).with_open_timeout(Duration::from_millis(2_000)),
+            )
+            .await
+        });
+        start.wait().await;
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first capacity contender joins");
+        let second = second.expect("second capacity contender joins");
+        let (winner, rejected_path, rejected_error) = match (first, second) {
+            (Ok(store), Err(error)) => (store, second_path, error),
+            (Err(error), Ok(store)) => (store, first_path, error),
+            _ => panic!("exactly one close-capacity contender must open"),
+        };
+        assert_eq!(
+            rejected_error,
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 2_000,
+            }
+        );
+        assert!(!rejected_path.exists());
+        assert_eq!(test_support::state_close_available_capacity(), 0);
+        winner.close().await.expect("winning contender closes");
+        assert_eq!(test_support::state_close_available_capacity(), 1);
+
+        let missing_parent = directory.path().join("missing").join("failure.sqlite");
+        assert!(
+            StateStore::open(
+                StoreConfig::new(&missing_parent).with_open_timeout(Duration::from_millis(500))
+            )
+            .await
+            .is_err()
+        );
+        assert!(!missing_parent.exists());
+        assert_eq!(test_support::state_close_available_capacity(), 1);
+
+        let cancelled_path = database_path(&directory, "cancelled-reservation.sqlite");
+        let (entered, release) = test_support::set_open_initialization_barrier(&cancelled_path);
+        let cancelled_open_path = cancelled_path.clone();
+        let opener = tokio::spawn(async move {
+            StateStore::open(
+                StoreConfig::new(cancelled_open_path).with_open_timeout(Duration::from_secs(5)),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("cancellable open reaches initialization barrier");
+        opener.abort();
+        let cancellation = match opener.await {
+            Err(error) => error,
+            Ok(Ok(store)) => {
+                let close = store.close().await;
+                panic!("cancelled capacity opener returned a store; close result: {close:?}");
+            }
+            Ok(Err(error)) => panic!("cancelled capacity opener returned an error: {error}"),
+        };
+        assert!(cancellation.is_cancelled());
+        release.notify_one();
+
+        let probe_path = database_path(&directory, "cancelled-reservation-probe.sqlite");
+        let probe = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match StateStore::open(
+                    StoreConfig::new(&probe_path).with_open_timeout(Duration::from_millis(500)),
+                )
+                .await
+                {
+                    Ok(store) => break store,
+                    Err(StateError::OperationTimedOut { .. }) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("reservation probe failed unexpectedly: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled open returns its close reservation");
+        probe.close().await.expect("reservation probe closes");
+        assert_eq!(test_support::state_close_available_capacity(), 1);
+
+        test_support::release_injected_state_close_retentions();
+        assert_eq!(test_support::state_close_retained_count(), 0);
+        assert_eq!(test_support::state_close_available_capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn post_pool_failure_panic_drop_and_close_cancellation_stay_accounted() {
+        const CHILD_ENV: &str = "GTA_CLAW_POST_POOL_RETENTION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::post_pool_failure_panic_drop_and_close_cancellation_stay_accounted")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated post-pool retention test");
+            assert!(status.success(), "isolated post-pool retention test failed");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("post-pool retention directory");
+        let capacity = test_support::state_close_retention_capacity();
+        assert_eq!(test_support::state_close_available_capacity(), capacity);
+
+        let bootstrap_error_path = database_path(&directory, "bootstrap-error.sqlite");
+        test_support::fail_open_bootstrap(&bootstrap_error_path);
+        assert!(
+            StateStore::open(
+                StoreConfig::new(&bootstrap_error_path)
+                    .with_open_timeout(Duration::from_millis(200)),
+            )
+            .await
+            .is_err()
+        );
+        test_support::clear_open_bootstrap_failure(&bootstrap_error_path);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while test_support::state_close_reserved_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed bootstrap reaches a terminal reservation decision");
+        assert_eq!(test_support::state_close_available_capacity(), capacity);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 0);
+
+        let bootstrap_panic_path = database_path(&directory, "bootstrap-panic.sqlite");
+        test_support::panic_open_bootstrap_once(&bootstrap_panic_path);
+        assert!(
+            StateStore::open(StoreConfig::new(&bootstrap_panic_path))
+                .await
+                .is_err()
+        );
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 1);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 1);
+
+        let failed_path = database_path(&directory, "post-pool-error.sqlite");
+        test_support::fail_open_after_pool_once(&failed_path);
+        assert!(
+            StateStore::open(StoreConfig::new(&failed_path))
+                .await
+                .is_err()
+        );
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 1);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 1);
+        open(&failed_path)
+            .await
+            .close()
+            .await
+            .expect("confirmed failed-open cleanup returns its reservation");
+
+        let unconfirmed_path = database_path(&directory, "post-pool-unconfirmed.sqlite");
+        test_support::fail_open_after_pool_with_unconfirmed_close_once(&unconfirmed_path);
+        assert!(matches!(
+            StateStore::open(StoreConfig::new(&unconfirmed_path)).await,
+            Err(StateError::OperationCleanupFailed { .. })
+        ));
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 2);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 2);
+
+        let panic_path = database_path(&directory, "post-pool-panic.sqlite");
+        test_support::panic_open_after_pool_once(&panic_path);
+        assert!(
+            StateStore::open(StoreConfig::new(&panic_path))
+                .await
+                .is_err()
+        );
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 3);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 3);
+
+        let dropped_path = database_path(&directory, "dropped-store.sqlite");
+        let dropped = open(&dropped_path).await;
+        assert_eq!(test_support::state_close_reserved_count(), 1);
+        drop(dropped);
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 4);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 4);
+
+        let cancelled_close_path = database_path(&directory, "cancelled-close.sqlite");
+        let cancelled_close = open(&cancelled_close_path).await;
+        let (entered, _release) = test_support::set_close_barrier(&cancelled_close_path);
+        let closing = tokio::spawn(async move { cancelled_close.close().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("close reaches cancellation barrier");
+        closing.abort();
+        assert!(
+            closing
+                .await
+                .expect_err("cancelled close task reports cancellation")
+                .is_cancelled()
+        );
+        test_support::clear_close_barrier(&cancelled_close_path);
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 5);
+        assert_eq!(test_support::state_close_reserved_count(), 0);
+        assert_eq!(test_support::state_close_retained_count(), 5);
+
+        let clean_path = database_path(&directory, "post-pool-clean.sqlite");
+        open(&clean_path)
+            .await
+            .close()
+            .await
+            .expect("remaining accounted capacity stays usable");
+        assert_eq!(test_support::state_close_available_capacity(), capacity - 5);
     }
 
     #[tokio::test]
