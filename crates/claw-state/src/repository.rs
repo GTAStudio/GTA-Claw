@@ -212,7 +212,7 @@ impl VerifiedWriteTransaction {
             .await?;
         post_commit_owner
             .shutdown()
-            .map_err(claw_sqlite_file_control::FileControlError::Handle)?;
+            .map_err(claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure)?;
         Ok(connection)
     }
 }

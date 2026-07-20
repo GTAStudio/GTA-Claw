@@ -1094,7 +1094,7 @@ impl BlockingCleanupOwner {
 
     /// Acquires and readies a dedicated cleanup runtime without blocking Tokio.
     pub async fn acquire(thread_name: &str) -> Result<Self, String> {
-        let mut owners = Self::acquire_many_until(thread_name, 1, None).await?;
+        let mut owners = Self::acquire_many_until(thread_name, 1, None, false).await?;
         Ok(owners.pop().expect("one cleanup owner was reserved"))
     }
 
@@ -1104,39 +1104,49 @@ impl BlockingCleanupOwner {
         count: usize,
         deadline: std::time::Instant,
     ) -> Result<Vec<Self>, String> {
-        Self::acquire_many_until(thread_name, count, Some(deadline)).await
+        Self::acquire_many_until(thread_name, count, Some(deadline), false).await
     }
 
     async fn acquire_many_until(
         thread_name: &str,
         count: usize,
         deadline: Option<std::time::Instant>,
+        allow_expired_first_attempt: bool,
     ) -> Result<Vec<Self>, String> {
         if count == 0 || count > MAX_CLEANUP_JOBS {
             return Err("blocking cleanup owner count is out of range".to_owned());
         }
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        let deadline_expired =
+            deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if deadline_expired && !allow_expired_first_attempt {
             return Err("blocking cleanup owner admission timed out".to_owned());
         }
         if let Some(deadline) = deadline {
-            let thread_name = thread_name.to_owned();
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                tokio::task::spawn_blocking(move || {
-                    Self::validate_executor(&thread_name).map(|_| ())
-                }),
-            )
-            .await
-            .map_err(|_| "blocking cleanup executor readiness timed out".to_owned())?
-            .map_err(|error| format!("blocking cleanup executor readiness task: {error}"))??;
+            if deadline_expired {
+                let _ = Self::validate_executor(thread_name)?;
+            } else {
+                let thread_name = thread_name.to_owned();
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    tokio::task::spawn_blocking(move || {
+                        Self::validate_executor(&thread_name).map(|_| ())
+                    }),
+                )
+                .await
+                .map_err(|_| "blocking cleanup executor readiness timed out".to_owned())?
+                .map_err(|error| format!("blocking cleanup executor readiness task: {error}"))??;
+            }
         } else {
             let _ = Self::validate_executor(thread_name)?;
         }
         let health_generation = EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire);
+        let mut first_attempt = true;
         loop {
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            let expired = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+            if expired && !(first_attempt && allow_expired_first_attempt) {
                 return Err("blocking cleanup owner admission timed out".to_owned());
             }
+            first_attempt = false;
             let _ = Self::validate_executor(thread_name)?;
             if EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire) != health_generation {
                 return Err("cleanup executor health changed during admission".to_owned());
@@ -1149,12 +1159,7 @@ impl BlockingCleanupOwner {
             if active <= MAX_CLEANUP_JOBS - count
                 && active_terminal <= MAX_TERMINAL_CLOSE_JOBS - terminal_count
                 && ACTIVE_CLEANUP_JOBS
-                    .compare_exchange_weak(
-                        active,
-                        active + count,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+                    .compare_exchange(active, active + count, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
                 if ACTIVE_TERMINAL_CLOSE_JOBS
@@ -1176,6 +1181,13 @@ impl BlockingCleanupOwner {
                     ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
                     ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
                     return Err("cleanup executor became unhealthy during admission".to_owned());
+                }
+                if !allow_expired_first_attempt
+                    && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
+                    ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
+                    return Err("blocking cleanup owner admission timed out".to_owned());
                 }
                 let mut owners = Vec::new();
                 if let Err(error) = owners.try_reserve_exact(count) {
@@ -3664,7 +3676,10 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     let cancellation = Arc::new(BeginCancellation {
                         local: std::sync::atomic::AtomicBool::new(false),
                         external: Some(Arc::clone(&cancelled)),
-                        deadline,
+                        deadline: Some(deadline),
+                        cleanup_cutoff: deadline
+                            .checked_add(std::time::Duration::from_secs(1))
+                            .unwrap_or(deadline),
                         #[cfg(test)]
                         busy_entered: std::sync::Mutex::new(None),
                         #[cfg(test)]
@@ -5119,7 +5134,8 @@ enum BeginWorkerOutput<Connection> {
 struct BeginCancellation {
     local: std::sync::atomic::AtomicBool,
     external: Option<Arc<std::sync::atomic::AtomicBool>>,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
+    cleanup_cutoff: std::time::Instant,
     #[cfg(test)]
     busy_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
@@ -5151,7 +5167,14 @@ impl BeginCancellation {
     }
 
     fn is_expired(&self) -> bool {
-        self.is_cancelled() || std::time::Instant::now() >= self.deadline
+        self.is_cancelled()
+            || self
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    fn cleanup_cutoff(&self) -> std::time::Instant {
+        self.cleanup_cutoff
     }
 }
 
@@ -5171,7 +5194,12 @@ unsafe extern "C" fn begin_busy_handler(
     {
         entered.notify_one();
     }
-    if cancellation.is_expired() {
+    if cancellation.is_cancelled()
+        || cancellation.deadline.is_none()
+        || cancellation
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
         0
     } else {
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -5399,7 +5427,7 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
     async fn receive_worker_result(
         &mut self,
     ) -> Result<BeginWorkerOutput<Connection>, FileControlError> {
-        let cutoff = self.cancellation.deadline + std::time::Duration::from_secs(1);
+        let cutoff = self.cancellation.cleanup_cutoff();
         loop {
             let received = self
                 .worker_result
@@ -5747,10 +5775,12 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let operation_deadline = std::time::Instant::now()
         .checked_add(busy_timeout)
         .unwrap_or(std::time::Instant::now());
+    let zero_busy_timeout = busy_timeout.is_zero();
     let mut owners = BlockingCleanupOwner::acquire_many_until(
         "claw-sqlite-begin-owner",
         3,
         Some(operation_deadline),
+        zero_busy_timeout,
     )
     .await
     .map_err(|error| {
@@ -5764,7 +5794,10 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let cancellation = Arc::new(BeginCancellation {
         local: std::sync::atomic::AtomicBool::new(false),
         external: external_cancellation,
-        deadline: operation_deadline,
+        deadline: (!zero_busy_timeout).then_some(operation_deadline),
+        cleanup_cutoff: operation_deadline
+            .checked_add(std::time::Duration::from_secs(1))
+            .unwrap_or(operation_deadline),
         #[cfg(test)]
         busy_entered: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -5830,8 +5863,7 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
             Ok(outcome) => break outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if cancellation.is_cancelled()
-                    || std::time::Instant::now()
-                        >= cancellation.deadline + std::time::Duration::from_secs(1)
+                    || std::time::Instant::now() >= cancellation.cleanup_cutoff()
                 {
                     guard.request_cancellation();
                     if let Err(cleanup) = guard.join_failure().await {
@@ -5888,9 +5920,7 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         post_commit_owner: Some(post_commit_owner),
     };
     if cancellation.is_expired() {
-        let cleanup_cutoff = tokio::time::Instant::from_std(
-            cancellation.deadline + std::time::Duration::from_secs(1),
-        );
+        let cleanup_cutoff = tokio::time::Instant::from_std(cancellation.cleanup_cutoff());
         let rollback = tokio::time::timeout_at(cleanup_cutoff, transaction.rollback()).await;
         return Err(match rollback {
             Ok(Ok(_)) => FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT),
@@ -8361,6 +8391,51 @@ mod deadline_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_busy_timeout_attempts_once_without_retrying() {
+        if run_in_isolated_child(
+            "deadline_tests::zero_busy_timeout_attempts_once_without_retrying",
+            "GTA_CLAW_ZERO_BUSY_TIMEOUT_CHILD",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("zero-busy-begin.sqlite");
+        let mut uncontended = manual_transaction_connection(&path).await;
+        uncontended
+            .execute("CREATE TABLE value(id INTEGER)")
+            .await
+            .expect("create zero-timeout fixture");
+        let (mut uncontended, mut uncontended_token) =
+            begin_manual_transaction(uncontended, std::time::Duration::ZERO, None)
+                .await
+                .expect("zero busy timeout performs one uncontended BEGIN")
+                .into_test_parts();
+        rollback_synchronously(&mut uncontended, &mut uncontended_token)
+            .await
+            .expect("rollback zero-timeout transaction");
+
+        let locker = manual_transaction_connection(&path).await;
+        let (mut locker, mut locker_token) =
+            begin_manual_transaction(locker, std::time::Duration::from_secs(1), None)
+                .await
+                .expect("start contending transaction")
+                .into_test_parts();
+        let waiter = manual_transaction_connection(&path).await;
+        let started = std::time::Instant::now();
+        let error = begin_manual_transaction(waiter, std::time::Duration::ZERO, None)
+            .await
+            .expect_err("zero busy timeout rejects a contended BEGIN");
+        assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_BUSY));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "zero busy timeout cannot retry a contended BEGIN"
+        );
+        rollback_synchronously(&mut locker, &mut locker_token)
+            .await
+            .expect("release contending transaction");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_contended_manual_begin_interrupts_and_joins_worker() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("cancelled-begin.sqlite");
@@ -8807,7 +8882,8 @@ mod deadline_tests {
         let cancellation = BeginCancellation {
             local: AtomicBool::new(true),
             external: None,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            cleanup_cutoff: std::time::Instant::now() + std::time::Duration::from_secs(2),
             busy_entered: std::sync::Mutex::new(None),
             test_key: std::sync::Mutex::new(None),
         };
