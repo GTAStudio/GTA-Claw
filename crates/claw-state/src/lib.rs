@@ -1636,6 +1636,20 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_cleanup_is_isolated_under_parallel_writes() {
+        const CHILD_ENV: &str = "GTA_CLAW_ROLLBACK_ISOLATION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::rollback_cleanup_is_isolated_under_parallel_writes")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated rollback cleanup test");
+            assert!(status.success(), "isolated rollback cleanup test failed");
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let first = open(&database_path(&directory, "rollback-key-first.sqlite")).await;
         let second = open(&database_path(&directory, "rollback-key-second.sqlite")).await;
@@ -2229,15 +2243,18 @@ mod tests {
             .await
             .expect("busy close completes within its bound")
             .expect_err("busy checkpoint degrades close");
-        assert!(matches!(
-            error,
-            StateError::CloseDegraded {
-                checkpoint_completed: false,
-                application_lock_released: true,
-                os_lock_released: true,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &error,
+                StateError::CloseDegraded {
+                    checkpoint_completed: false,
+                    application_lock_released: true,
+                    os_lock_released: true,
+                    ..
+                }
+            ),
+            "unexpected busy close result: {error:?}"
+        );
         reader
             .execute("ROLLBACK")
             .await
@@ -2277,16 +2294,16 @@ mod tests {
                     application_lock_released: true,
                     final_connection_closed: false,
                     pool_closed: false,
-                    os_lock_released: true,
-                    reason: reason.to_owned(),
+                    os_lock_released: false,
+                    reason: format!(
+                        "{reason}; OS identity ownership retained because terminal pool completion was not confirmed"
+                    ),
                 }
             );
-            let reopened = open(&path).await;
-            assert!(reopened.recovered_writer().is_none());
-            reopened
-                .close()
-                .await
-                .expect("degraded store reopens cleanly");
+            assert!(
+                StateStore::open(StoreConfig::new(&path)).await.is_err(),
+                "unconfirmed terminal close must retain exclusive ownership"
+            );
         }
 
         let clean_path = database_path(&directory, "final-close-clean.sqlite");

@@ -2331,7 +2331,8 @@ where
                 };
                 if let Err(error) = delivered {
                     match error.0 {
-                        Ok((_, cleanup)) | Err((_, cleanup)) => {
+                        Ok((_, mut cleanup)) | Err((_, mut cleanup)) => {
+                            cleanup.detach_cleanup();
                             payload.cleanup = Some(cleanup);
                         }
                     }

@@ -44,6 +44,8 @@ static BACKUP_CLEANUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore
 static RESTORE_CLEANUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 static SNAPSHOT_MEMORY_ADMISSION: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(PROCESS_SNAPSHOT_PEAK_UNITS);
+#[cfg(test)]
+static TEST_OPEN_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 struct SnapshotMemoryReservation {
     _permit: tokio::sync::SemaphorePermit<'static>,
@@ -90,6 +92,29 @@ const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
 static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<
     std::sync::Mutex<[Option<StateCleanupEnvelope>; MAX_STATE_CLEANUP_JOBS]>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
+
+struct StateCloseRetention {
+    _pool: SqlitePool,
+    _lock_file: File,
+    _process_identity: ProcessIdentityGuard,
+    _database_file: File,
+    _database_parent: File,
+}
+
+static STATE_CLOSE_OWNERSHIP_QUARANTINE: std::sync::LazyLock<
+    std::sync::Mutex<[Option<StateCloseRetention>; MAX_STATE_CLEANUP_JOBS]>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
+
+fn retain_state_close_ownership(retention: StateCloseRetention) {
+    let mut quarantine = STATE_CLOSE_OWNERSHIP_QUARANTINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(slot) = quarantine.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(retention);
+    } else {
+        std::mem::forget(retention);
+    }
+}
 
 fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
     let mut quarantine = STATE_CLEANUP_QUARANTINE
@@ -308,10 +333,55 @@ where
     T: Send + 'static,
     Operation: FnMut() -> Result<T, StateError> + Send + 'static,
 {
+    run_bounded_filesystem_with_acceptance(owner, deadline, deadline, operation, timeout_ms, work)
+        .await
+}
+
+async fn run_bounded_filesystem_with_acceptance<T, Operation>(
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    deadline: tokio::time::Instant,
+    acceptance_deadline: tokio::time::Instant,
+    operation: &'static str,
+    timeout_ms: u64,
+    work: Operation,
+) -> Result<T, StateError>
+where
+    T: Send + 'static,
+    Operation: FnMut() -> Result<T, StateError> + Send + 'static,
+{
+    struct FilesystemDelivery<T> {
+        result: std::sync::Mutex<Option<Result<T, StateError>>>,
+    }
+
+    struct DeliveryDecisionGuard {
+        decision: Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>,
+        decided: bool,
+    }
+
+    impl DeliveryDecisionGuard {
+        fn decide(&mut self, accepted: bool) {
+            let (decision, changed) = &*self.decision;
+            *decision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(accepted);
+            changed.notify_all();
+            self.decided = true;
+        }
+    }
+
+    impl Drop for DeliveryDecisionGuard {
+        fn drop(&mut self) {
+            if !self.decided {
+                self.decide(false);
+            }
+        }
+    }
+
     struct FilesystemPayload<T, Operation> {
         work: std::sync::Mutex<Operation>,
-        result: std::sync::mpsc::SyncSender<Result<T, StateError>>,
-        undelivered: std::sync::Mutex<Option<Result<T, StateError>>>,
+        result: std::sync::mpsc::SyncSender<Arc<FilesystemDelivery<T>>>,
+        delivery_retention: std::sync::Mutex<Option<Arc<FilesystemDelivery<T>>>>,
+        decision: Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>,
     }
 
     ensure_state_cleanup_executor(deadline)
@@ -322,24 +392,41 @@ where
                 sqlx::Error::Protocol(error),
             )
         })?;
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let decision = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+    let mut decision_guard = DeliveryDecisionGuard {
+        decision: Arc::clone(&decision),
+        decided: false,
+    };
     handoff_state_payload(
         owner,
         FilesystemPayload {
             work: std::sync::Mutex::new(work),
             result: result_tx,
-            undelivered: std::sync::Mutex::new(None),
+            delivery_retention: std::sync::Mutex::new(None),
+            decision,
         },
         |_, _, payload| {
             let result = payload
                 .work
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)();
-            if let Err(result) = payload.result.send(result) {
-                *payload
-                    .undelivered
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.0);
+            let delivery = Arc::new(FilesystemDelivery {
+                result: std::sync::Mutex::new(Some(result)),
+            });
+            *payload
+                .delivery_retention
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&delivery));
+            let _ = payload.result.send(delivery);
+            let (decision, changed) = &*payload.decision;
+            let mut decision = decision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while decision.is_none() {
+                decision = changed
+                    .wait(decision)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         },
     )
@@ -351,17 +438,44 @@ where
     })?;
     loop {
         match result_rx.try_recv() {
-            Ok(result) => return result,
+            Ok(delivery) => {
+                if tokio::time::Instant::now() >= acceptance_deadline {
+                    decision_guard.decide(false);
+                    return Err(StateError::OperationTimedOut {
+                        operation,
+                        timeout_ms,
+                    });
+                }
+                let mut delivery = delivery
+                    .result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result = delivery
+                    .take()
+                    .expect("bounded filesystem result is delivered once");
+                if tokio::time::Instant::now() >= acceptance_deadline {
+                    *delivery = Some(result);
+                    decision_guard.decide(false);
+                    return Err(StateError::OperationTimedOut {
+                        operation,
+                        timeout_ms,
+                    });
+                }
+                decision_guard.decide(true);
+                return result;
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) if tokio::time::Instant::now() < deadline => {
                 tokio::task::yield_now().await;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
+                decision_guard.decide(false);
                 return Err(StateError::OperationTimedOut {
                     operation,
                     timeout_ms,
                 });
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                decision_guard.decide(false);
                 return Err(database(
                     "receive bounded filesystem operation",
                     sqlx::Error::Protocol(
@@ -377,6 +491,22 @@ fn file_control_database(
     operation: &'static str,
     error: claw_sqlite_file_control::FileControlError,
 ) -> StateError {
+    let error = match error {
+        claw_sqlite_file_control::FileControlError::CommittedAfterDeadline(cleanup) => {
+            return StateError::CommittedAfterDeadline { operation, cleanup };
+        }
+        claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure(cleanup) => {
+            return StateError::CommittedWithCleanupFailure { operation, cleanup };
+        }
+        claw_sqlite_file_control::FileControlError::CommitOutcomeUncertain(code, message) => {
+            return StateError::CommitOutcomeUncertain {
+                operation,
+                code,
+                message,
+            };
+        }
+        other => other,
+    };
     error.code().map_or_else(
         || database(operation, sqlx::Error::Protocol(error.to_string())),
         |code| database_code(operation, code, error.to_string()),
@@ -1199,6 +1329,11 @@ async fn close_pool_after_open_failure(
 impl StateStore {
     /// Opens an explicit on-disk database, acquires its writer lock, and migrates forward.
     pub async fn open(config: StoreConfig) -> Result<Self, StateError> {
+        #[cfg(test)]
+        let _test_open_permit = TEST_OPEN_CONCURRENCY
+            .acquire()
+            .await
+            .expect("test open concurrency semaphore remains live");
         validate_config(&config)?;
         let timeout_ms = u64::try_from(config.open_timeout.as_millis()).map_err(|_| {
             StateError::InvalidValue {
@@ -2292,6 +2427,7 @@ impl StateStore {
         .await?;
         let requested_destination = destination.as_ref().to_owned();
         let mut snapshot_cleanup_owner = Some(snapshot_cleanup_owner);
+        let destination_deadline_state = Arc::clone(&deadline_state);
         let (destination, destination_directory, temporary_guard) = run_bounded_filesystem(
             destination_preflight_owner,
             deadline,
@@ -2308,6 +2444,7 @@ impl StateStore {
                     snapshot_cleanup_owner
                         .take()
                         .expect("restore snapshot cleanup owner is consumed once"),
+                    Some(&destination_deadline_state),
                 )?;
                 Ok((destination, destination_directory, guard))
             },
@@ -2422,9 +2559,10 @@ impl StateStore {
         let mut pinned = Some(pinned);
         let mut temporary_guard = Some(temporary_guard);
         let mut identity_guard = Some(identity_guard);
-        let publication = run_bounded_filesystem(
+        let publication = run_bounded_filesystem_with_acceptance(
             publication_owner,
             deadline + Duration::from_secs(1),
+            deadline,
             "SQLite restore",
             timeout_ms,
             move || {
@@ -2624,9 +2762,10 @@ impl StateStore {
         let mut pinned = Some(pinned);
         let mut temporary_guard = Some(temporary_guard);
         let mut identity_guard = Some(identity_guard);
-        let final_handoff = run_bounded_filesystem(
+        let final_handoff = run_bounded_filesystem_with_acceptance(
             final_handoff_owner,
             deadline + Duration::from_secs(1),
+            deadline,
             "SQLite restore",
             timeout_ms,
             move || {
@@ -2853,6 +2992,13 @@ impl StateStore {
             "checkpoint SQLite WAL",
         )
         .await?;
+        let remaining = operation
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(operation.identity.busy_timeout);
+        if let Err(error) = operation.configure_busy_timeout(remaining).await {
+            return Err(operation.fail(error).await);
+        }
         let row = deadline_first(operation.deadline, async {
             let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(&mut *operation.sqlite())
@@ -2883,6 +3029,12 @@ impl StateStore {
             log_frames: row.get(1),
             checkpointed_frames: row.get(2),
         };
+        if let Err(error) = operation
+            .configure_busy_timeout(operation.identity.busy_timeout)
+            .await
+        {
+            return Err(operation.fail(error).await);
+        }
         operation.finish().await?;
         Ok(report)
     }
@@ -2951,39 +3103,69 @@ impl StateStore {
         })
         .await;
 
+        let mut checkpoint_expired = false;
         let checkpoint = if let Some(connection) = connection.as_mut() {
-            let checkpoint_result = tokio::time::timeout_at(
-                deadline,
-                sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").fetch_one(&mut **connection),
-            )
+            let remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(self.busy_timeout);
+            let progress_deadline = deadline.into_std();
+            let setup = deadline_first(deadline, async {
+                claw_sqlite_file_control::set_busy_timeout(connection, remaining)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut handle = connection
+                    .lock_handle()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                handle.set_progress_handler(100, move || {
+                    std::time::Instant::now() < progress_deadline
+                });
+                Ok::<(), String>(())
+            })
             .await;
-            match checkpoint_result {
-                Ok(Ok(row)) => {
-                    let report = CheckpointReport {
-                        busy: row.get(0),
-                        log_frames: row.get(1),
-                        checkpointed_frames: row.get(2),
-                    };
-                    if report.busy == 0 {
-                        Some(report)
-                    } else {
-                        reasons.push(format!(
+            if !matches!(setup, Ok(Ok(()))) {
+                checkpoint_expired = matches!(setup, Err(()));
+                reasons.push(match setup {
+                    Ok(Err(error)) => format!("configure bounded checkpoint: {error}"),
+                    Err(()) => "checkpoint setup exceeded close deadline".to_owned(),
+                    Ok(Ok(())) => unreachable!(),
+                });
+                None
+            } else {
+                let checkpoint_result = deadline_first(
+                    deadline,
+                    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").fetch_one(&mut **connection),
+                )
+                .await;
+                match checkpoint_result {
+                    Ok(Ok(row)) => {
+                        let report = CheckpointReport {
+                            busy: row.get(0),
+                            log_frames: row.get(1),
+                            checkpointed_frames: row.get(2),
+                        };
+                        if report.busy == 0 {
+                            Some(report)
+                        } else {
+                            reasons.push(format!(
                             "checkpoint remained busy with {} WAL frames and {} checkpointed frames",
                             report.log_frames, report.checkpointed_frames
                         ));
+                            None
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        reasons.push(format!(
+                            "checkpoint failed: {}",
+                            database("checkpoint SQLite WAL", error)
+                        ));
                         None
                     }
-                }
-                Ok(Err(error)) => {
-                    reasons.push(format!(
-                        "checkpoint failed: {}",
-                        database("checkpoint SQLite WAL", error)
-                    ));
-                    None
-                }
-                Err(_) => {
-                    reasons.push("checkpoint exceeded close deadline".to_owned());
-                    None
+                    Err(()) => {
+                        checkpoint_expired = true;
+                        reasons.push("checkpoint exceeded close deadline".to_owned());
+                        None
+                    }
                 }
             }
         } else {
@@ -2991,8 +3173,10 @@ impl StateStore {
         };
         let application_lock_released = if application_lock_already_released {
             true
+        } else if checkpoint_expired {
+            false
         } else if let Some(connection) = connection.as_mut() {
-            let release_result = tokio::time::timeout_at(
+            let release_result = deadline_first(
                 deadline,
                 sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
                     .bind(&self.owner)
@@ -3013,7 +3197,7 @@ impl StateStore {
                     ));
                     false
                 }
-                Err(_) => {
+                Err(()) => {
                     reasons.push("application writer release exceeded close deadline".to_owned());
                     false
                 }
@@ -3045,21 +3229,38 @@ impl StateStore {
             ));
         }
         let pool_closed = final_connection_closed && pool_drain_completed;
-        #[cfg(windows)]
-        let os_lock_released = {
-            drop(self._process_identity);
-            true
-        };
-        #[cfg(not(windows))]
-        let os_lock_released = match File::unlock(&self.lock_file) {
-            Ok(()) => true,
-            Err(error) => {
-                reasons.push(format!(
-                    "OS identity lock release failed: {}",
-                    file_error("release writer lock", &self.lock_path, error)
-                ));
-                false
+        let os_lock_released = if pool_closed {
+            #[cfg(windows)]
+            {
+                drop(self._process_identity);
+                true
             }
+            #[cfg(not(windows))]
+            {
+                match File::unlock(&self.lock_file) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        reasons.push(format!(
+                            "OS identity lock release failed: {}",
+                            file_error("release writer lock", &self.lock_path, error)
+                        ));
+                        false
+                    }
+                }
+            }
+        } else {
+            reasons.push(
+                "OS identity ownership retained because terminal pool completion was not confirmed"
+                    .to_owned(),
+            );
+            retain_state_close_ownership(StateCloseRetention {
+                _pool: self.pool,
+                _lock_file: self.lock_file,
+                _process_identity: self._process_identity,
+                _database_file: self._database_file,
+                _database_parent: self._database_parent,
+            });
+            false
         };
         match (
             checkpoint,
@@ -4597,13 +4798,17 @@ impl SnapshotCleanupGuard {
         path: &Path,
         parent: &PinnedPrivateDirectory,
         cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
+        deadline_state: Option<&OpenDeadlineState>,
     ) -> Result<Self, StateError> {
+        #[cfg(not(unix))]
+        let _ = deadline_state;
         let pinned_parent = parent
             .file
             .try_clone()
             .map_err(|error| file_error("clone cleanup directory handle", &parent.path, error))?;
         #[cfg(unix)]
-        let (quarantine_name, quarantine_reservation) = reserve_snapshot_quarantine(parent)?;
+        let (quarantine_name, quarantine_reservation) =
+            reserve_snapshot_quarantine(parent, deadline_state)?;
         Ok(Self {
             path: path.to_owned(),
             pinned_parent: Some(pinned_parent),
@@ -4931,8 +5136,14 @@ impl SnapshotCleanupGuard {
                     error.into(),
                 )
             })?;
-            quarantined.try_lock().map_err(|error| {
-                file_error("lock quarantined snapshot identity", &self.path, error)
+            quarantined.try_lock().map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "quarantined snapshot identity is already locked",
+                },
+                std::fs::TryLockError::Error(error) => {
+                    file_error("lock quarantined snapshot identity", &self.path, error)
+                }
             })?;
             if !files_share_identity_from_handles_portable(expected, &quarantined)? {
                 return Err(StateError::InvalidPath {
@@ -5074,8 +5285,8 @@ fn claim_reusable_snapshot_quarantine_slot(
     };
     match file.try_lock() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(error) => {
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
             return Err(file_error(
                 "lock reusable snapshot quarantine slot",
                 &parent.path,
@@ -5116,7 +5327,10 @@ fn claim_reusable_snapshot_quarantine_slot(
 }
 
 #[cfg(unix)]
-fn lock_snapshot_quarantine_quota(parent: &PinnedPrivateDirectory) -> Result<File, StateError> {
+fn lock_snapshot_quarantine_quota(
+    parent: &PinnedPrivateDirectory,
+    deadline_state: Option<&OpenDeadlineState>,
+) -> Result<File, StateError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let file = rustix::fs::openat(
@@ -5136,8 +5350,41 @@ fn lock_snapshot_quarantine_quota(parent: &PinnedPrivateDirectory) -> Result<Fil
             error.into(),
         )
     })?;
-    file.try_lock()
-        .map_err(|error| file_error("lock snapshot quarantine quota", &parent.path, error))?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some(deadline_state) = deadline_state
+                    && !deadline_state.permits_sqlite_work()
+                {
+                    return Err(deadline_state.timeout_error());
+                }
+                let remaining = deadline_state.map_or(MAX_CONFIGURED_TIMEOUT, |state| {
+                    state
+                        .work_cutoff
+                        .saturating_duration_since(std::time::Instant::now())
+                });
+                if remaining.is_zero() {
+                    return Err(deadline_state.map_or(
+                        StateError::OperationTimedOut {
+                            operation: "reserve snapshot quarantine",
+                            timeout_ms: u64::try_from(MAX_CONFIGURED_TIMEOUT.as_millis())
+                                .expect("timeout fits u64"),
+                        },
+                        OpenDeadlineState::timeout_error,
+                    ));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(file_error(
+                    "lock snapshot quarantine quota",
+                    &parent.path,
+                    error,
+                ));
+            }
+        }
+    }
     let metadata = file.metadata().map_err(|error| {
         file_error(
             "inspect snapshot quarantine quota lock",
@@ -5157,11 +5404,12 @@ fn lock_snapshot_quarantine_quota(parent: &PinnedPrivateDirectory) -> Result<Fil
 #[cfg(unix)]
 fn reserve_snapshot_quarantine(
     parent: &PinnedPrivateDirectory,
+    deadline_state: Option<&OpenDeadlineState>,
 ) -> Result<(String, File), StateError> {
     const MAX_QUARANTINE_ENTRIES: usize = 64;
     const MAX_QUARANTINE_RESIDUAL_BYTES: u64 = MAX_AUTHENTICATED_SNAPSHOT_BYTES;
 
-    let _quota_lock = lock_snapshot_quarantine_quota(parent)?;
+    let _quota_lock = lock_snapshot_quarantine_quota(parent, deadline_state)?;
     let (entries, residual_bytes) = snapshot_quarantine_usage(&parent.path)?;
     if entries >= MAX_QUARANTINE_ENTRIES || residual_bytes > MAX_QUARANTINE_RESIDUAL_BYTES {
         return Err(StateError::InvalidPath {
@@ -5183,8 +5431,14 @@ fn reserve_snapshot_quarantine(
         ) {
             Ok(file) => {
                 let file = File::from(file);
-                file.try_lock().map_err(|error| {
-                    file_error("lock snapshot quarantine reservation", &parent.path, error)
+                file.try_lock().map_err(|error| match error {
+                    std::fs::TryLockError::WouldBlock => StateError::InvalidPath {
+                        path: parent.path.clone(),
+                        reason: "snapshot quarantine reservation is already locked",
+                    },
+                    std::fs::TryLockError::Error(error) => {
+                        file_error("lock snapshot quarantine reservation", &parent.path, error)
+                    }
                 })?;
                 file.set_len(1)
                     .and_then(|()| file.sync_all())
@@ -5242,11 +5496,11 @@ mod snapshot_quarantine_tests {
         let (first, second) = std::thread::scope(|scope| {
             let first = scope.spawn(|| {
                 start.wait();
-                reserve_snapshot_quarantine(&parent)
+                reserve_snapshot_quarantine(&parent, None)
             });
             let second = scope.spawn(|| {
                 start.wait();
-                reserve_snapshot_quarantine(&parent)
+                reserve_snapshot_quarantine(&parent, None)
             });
             start.wait();
             (
@@ -5638,6 +5892,20 @@ impl<'store> StoreOperationConnection<'store> {
             .store(true, std::sync::atomic::Ordering::Release);
         self.deadline_state.cancel();
         self.deadline_state.timeout_error()
+    }
+
+    async fn configure_busy_timeout(&mut self, timeout: Duration) -> Result<(), StateError> {
+        let operation = self.deadline_state.operation;
+        match deadline_first(
+            self.deadline,
+            claw_sqlite_file_control::set_busy_timeout(self.sqlite(), timeout),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(file_control_database(operation, error)),
+            Err(()) => Err(self.expire()),
+        }
     }
 
     async fn discard(
@@ -9620,9 +9888,10 @@ async fn materialize_authenticated_snapshot(
     let mut output_guard = Some(output_guard);
     let output_creation_deadline = deadline;
     let output_creation_state = deadline_state.clone();
-    let output = run_bounded_filesystem(
+    let output = run_bounded_filesystem_with_acceptance(
         output_creation_owner,
         tokio::time::Instant::from_std(deadline) + Duration::from_secs(1),
+        tokio::time::Instant::from_std(deadline),
         "SQLite restore",
         deadline_state
             .as_ref()
@@ -10888,6 +11157,7 @@ async fn backup_pool(
         .expect("logical backup source cleanup owner");
     let preflight_destination = destination.to_owned();
     let mut snapshot_cleanup_owner = Some(snapshot_cleanup_owner);
+    let preflight_deadline_state = Arc::clone(&deadline_state);
     let (destination_directory, temporary, snapshot_guard) = run_bounded_filesystem(
         destination_preflight_owner,
         deadline,
@@ -10916,6 +11186,7 @@ async fn backup_pool(
                 snapshot_cleanup_owner
                     .take()
                     .expect("backup snapshot cleanup owner is consumed once"),
+                Some(&preflight_deadline_state),
             )?;
             Ok((destination_directory, preflight_destination.clone(), guard))
         },
@@ -11464,9 +11735,10 @@ async fn backup_pool(
     let mut temporary_guard = Some(temporary_guard);
     let mut identity_guard = Some(identity_guard);
     let mut seal = Some(seal);
-    let publication = run_bounded_filesystem(
+    let publication = run_bounded_filesystem_with_acceptance(
         publication_owner,
         deadline + Duration::from_secs(1),
+        deadline,
         "SQLite backup",
         timeout_ms,
         move || {
@@ -11690,9 +11962,10 @@ async fn backup_pool(
     let mut pinned = Some(pinned);
     let mut temporary_guard = Some(temporary_guard);
     let mut identity_guard = Some(identity_guard);
-    let final_handoff = run_bounded_filesystem(
+    let final_handoff = run_bounded_filesystem_with_acceptance(
         final_handoff_owner,
         deadline + Duration::from_secs(1),
+        deadline,
         "SQLite backup",
         timeout_ms,
         move || {
@@ -12368,8 +12641,9 @@ pub(crate) mod test_support {
             claw_sqlite_file_control::BlockingCleanupOwner::acquire("test snapshot cleanup owner")
                 .await
                 .expect("reserve test snapshot cleanup owner");
-        let mut guard = super::SnapshotCleanupGuard::new_pinned(&path, &parent, cleanup_owner)
-            .expect("create snapshot guard");
+        let mut guard =
+            super::SnapshotCleanupGuard::new_pinned(&path, &parent, cleanup_owner, None)
+                .expect("create snapshot guard");
         let file =
             super::open_existing_file_no_follow(&path).expect("open published snapshot identity");
         guard
