@@ -42,11 +42,18 @@ Internet → Reverse Proxy (:443 HTTPS) → GTA-Claw Engine (:3978)
                                        │ ToolExecutor              │
                                        │ isolated-vm sandbox       │
                                        └─────────────────────────┘
+                                       ┌─────────────────────────┐
+                                       │ Optional persistent state │
+                                       │ memory + session recall   │
+                                       └─────────────────────────┘
 ```
 
 **Core Principle**: The engine is an empty shell. All intelligence comes from:
 - **Role** (`AGENT_ROLE_URL`): System prompt + model selection loaded from a remote URL
 - **Skills** (`ENABLED_SKILLS`): Tool definitions + sandboxed code loaded from remote URLs
+
+The runtime can also provide opt-in, conversation-scoped state primitives. These
+do not define the agent's persona or domain behavior.
 
 ## Configuration
 
@@ -81,6 +88,13 @@ Authentication now supports two modes:
 | `LOG_LEVEL` | `info` | Logging level |
 | `MAX_SESSIONS` | `100` | Max concurrent sessions |
 | `SESSION_TTL_MS` | `3600000` | Session idle timeout (1 hour) |
+| `STATE_DIR` | `./data` | Root directory for persistent runtime state |
+| `MEMORY_ENABLED` | `false` | Enable bounded persistent memory and user profile |
+| `MEMORY_CHAR_LIMIT` | `2200` | Character budget for agent/environment memory |
+| `USER_PROFILE_CHAR_LIMIT` | `1375` | Character budget for user preferences/profile |
+| `TRANSCRIPT_ENABLED` | `false` | Enable durable transcripts and `session_search` |
+| `TRANSCRIPT_MAX_MESSAGES` | `2000` | Retained messages per conversation |
+| `TRANSCRIPT_CONTENT_CHAR_LIMIT` | `20000` | Maximum stored characters per message |
 | `SKILL_EXEC_TIMEOUT_MS` | `30000` | Skill execution timeout |
 | `SDK_REQUEST_TIMEOUT_MS` | `120000` | SDK request timeout |
 | `RATE_LIMIT_PER_MIN` | `30` | Per-IP rate limit for `/api/messages` |
@@ -140,6 +154,34 @@ Skills execute in an isolated V8 sandbox with these bridges:
 - `api.httpGet(url)` — HTTP GET (domain whitelisted)
 - `api.httpPost(url, body, headers)` — HTTP POST (domain whitelisted)
 - `api.log(message)` — Log to host
+
+## Persistent Memory and Session Recall
+
+These native capabilities are disabled by default. Enable either one
+independently:
+
+```env
+STATE_DIR=./data
+MEMORY_ENABLED=true
+TRANSCRIPT_ENABLED=true
+```
+
+- `memory` maintains separate bounded stores for durable project/environment
+  facts and user preferences. Exact duplicates are ignored, ambiguous updates
+  are rejected, unsafe prompt-like content is blocked, and writes are atomic.
+- `session_search` searches or browses the retained transcript without another
+  model call. Unsafe historical content is replaced with a blocked marker.
+- Both stores are isolated by conversation ID. Memory is injected as a frozen,
+  untrusted-data snapshot only when a new Copilot session starts.
+- Invalid state files are moved aside with a `.corrupt-*` suffix before an
+  empty store is created, preserving the original bytes for recovery.
+
+HTTP callers still supply the conversation ID, so this isolation is not tenant
+authentication. Multi-tenant deployments must authenticate callers and bind
+conversation IDs to the authenticated principal.
+
+Docker deployments use the persistent `gta-claw-data` volume mounted at
+`/data`, so state survives container replacement and image updates.
 
 ## Deployment
 
@@ -232,6 +274,8 @@ Recommended auth strategy:
 - Skills run in V8 isolate sandbox (`isolated-vm`) with memory limits when available
 - If `isolated-vm` is unavailable, engine falls back to Node `vm` sandbox mode (reduced isolation)
 - Domain whitelist for skill HTTP calls
+- Persistent memory is bounded, conversation-scoped, threat-scanned, and atomically written
+- Transcript search never crosses the current conversation boundary
 - Rate limiting on bot endpoint (30 req/min per IP)
 - Non-root Docker user
 - HTTPS via reverse proxy (Caddy/Nginx/Traefik)

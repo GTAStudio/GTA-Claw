@@ -20,6 +20,7 @@
 - [4. Daily Usage](#4-daily-usage)
   - [4.1 Conversation Examples](#41-conversation-examples)
   - [4.2 Built-in Skills](#42-built-in-skills)
+  - [4.3 Persistent Memory and Session Recall](#43-persistent-memory-and-session-recall)
 - [5. Customizing Roles & Skills](#5-customizing-roles--skills)
   - [5.1 Role Configuration](#51-role-configuration)
   - [5.2 Skill Modules](#52-skill-modules)
@@ -243,6 +244,37 @@ Once connected to a chat channel, just talk naturally:
 | `marp_slides` | Generate Marp-format slide decks | "Make a PPT / slides" |
 
 > All skills run in an isolated V8 sandbox, interacting with the outside world through `httpGet`/`httpPost`/`log` APIs.
+
+### 4.3 Persistent Memory and Session Recall
+
+GTA-Claw provides two opt-in native tools:
+
+```env
+STATE_DIR=/data
+MEMORY_ENABLED=true
+MEMORY_CHAR_LIMIT=2200
+USER_PROFILE_CHAR_LIMIT=1375
+TRANSCRIPT_ENABLED=true
+TRANSCRIPT_MAX_MESSAGES=2000
+TRANSCRIPT_CONTENT_CHAR_LIMIT=20000
+```
+
+- `memory` lets the agent keep bounded project/environment facts separately
+  from user preferences. Writes are deduplicated, capacity checked, scanned for
+  prompt-injection patterns, and stored atomically.
+- `session_search` searches or browses the durable transcript without spending
+  another model call. Unsafe historical content is returned as a blocked
+  marker instead of being replayed into model context.
+
+State is isolated by `conversation_id`; one conversation cannot search or load
+another conversation's state. A memory snapshot is frozen when a Copilot
+session starts, while tool responses show the live state immediately. Invalid
+state files are preserved with a `.corrupt-*` suffix and replaced by an empty
+store. Docker deployments retain `/data` in the `gta-claw-data` named volume.
+
+HTTP callers still choose the `conversation_id`, so this isolation is not an
+authorization boundary. Multi-tenant deployments must authenticate callers and
+bind conversation IDs to the authenticated principal.
 
 ---
 

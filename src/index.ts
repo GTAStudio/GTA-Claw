@@ -13,6 +13,8 @@ import { processIncomingMessage } from "./channels/messageProcessor.js";
 import { TelegramPollingClient } from "./channels/telegramPolling.js";
 import { DiscordGatewayClient } from "./channels/discordGateway.js";
 import { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
+import { MemoryStore } from "./state/memoryStore.js";
+import { TranscriptStore } from "./state/transcriptStore.js";
 
 async function main(): Promise<void> {
   logger.info("=== GTA-Claw Engine Starting ===");
@@ -22,6 +24,21 @@ async function main(): Promise<void> {
 
   // 1. Load and validate configuration
   const config = loadConfig();
+  const memoryStore = config.MEMORY_ENABLED
+    ? new MemoryStore({
+        rootDir: config.STATE_DIR,
+        memoryCharLimit: config.MEMORY_CHAR_LIMIT,
+        userCharLimit: config.USER_PROFILE_CHAR_LIMIT,
+      })
+    : undefined;
+  const transcriptStore = config.TRANSCRIPT_ENABLED
+    ? new TranscriptStore({
+        rootDir: config.STATE_DIR,
+        maxMessages: config.TRANSCRIPT_MAX_MESSAGES,
+        contentCharLimit: config.TRANSCRIPT_CONTENT_CHAR_LIMIT,
+      })
+    : undefined;
+  const engineServices = { memoryStore, transcriptStore };
 
   // 2. Load role + skills in parallel
   const [roleResult, skillsResult] = await Promise.allSettled([
@@ -76,6 +93,7 @@ async function main(): Promise<void> {
         skills,
         toolExecutor,
         githubToken,
+        engineServices,
       );
       await nextEngine.start();
 
@@ -161,6 +179,9 @@ async function main(): Promise<void> {
     whatsappHandler,
     getRuntimeStatus: () => ({
       skillCount: skills.length,
+      nativeToolCount:
+        engine?.nativeToolCount ??
+        Number(config.MEMORY_ENABLED) + Number(config.TRANSCRIPT_ENABLED),
       activeModel: roleConfig.model ?? config.COPILOT_MODEL,
     }),
     reloadFn: async () => {

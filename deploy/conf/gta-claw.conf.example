@@ -46,6 +46,19 @@ MAX_SESSIONS=100
 # 会话过期时间 (毫秒)
 SESSION_TTL_MS=3600000
 
+# 持久状态目录 (Docker 部署请保持 /data，由 gta-claw-data 卷持久化)
+STATE_DIR=/data
+
+# 有界持久记忆与用户画像 (按 conversation ID 隔离)
+MEMORY_ENABLED=false
+MEMORY_CHAR_LIMIT=2200
+USER_PROFILE_CHAR_LIMIT=1375
+
+# 持久会话记录与零 LLM 检索 (按 conversation ID 隔离)
+TRANSCRIPT_ENABLED=false
+TRANSCRIPT_MAX_MESSAGES=2000
+TRANSCRIPT_CONTENT_CHAR_LIMIT=20000
+
 # Skill 执行超时 (毫秒)
 SKILL_EXEC_TIMEOUT_MS=30000
 

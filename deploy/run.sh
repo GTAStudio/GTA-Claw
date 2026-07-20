@@ -67,6 +67,8 @@ msg() {
     ask_trust_proxy) if is_en; then echo "Trust proxy headers (true/false)"; else echo "信任反向代理头 (true/false)"; fi ;;
     ask_admin_token) if is_en; then echo "Admin API token (empty to disable)"; else echo "Admin API 令牌 (留空禁用)"; fi ;;
     ask_proxy) if is_en; then echo "HTTP proxy (e.g. http://127.0.0.1:7890, empty to skip)"; else echo "HTTP 代理 (如 http://127.0.0.1:7890, 留空跳过)"; fi ;;
+    ask_memory) if is_en; then echo "Enable persistent memory (true/false)"; else echo "启用持久记忆 (true/false)"; fi ;;
+    ask_transcript) if is_en; then echo "Enable durable session search (true/false)"; else echo "启用持久会话检索 (true/false)"; fi ;;
     ask_enable_teams) if is_en; then echo "Enable Teams channel (true/false)"; else echo "启用 Teams 通道 (true/false)"; fi ;;
     ask_enable_telegram) if is_en; then echo "Enable Telegram polling channel (true/false)"; else echo "启用 Telegram Polling 通道 (true/false)"; fi ;;
     ask_enable_discord) if is_en; then echo "Enable Discord gateway channel (true/false)"; else echo "启用 Discord Gateway 通道 (true/false)"; fi ;;
@@ -373,6 +375,8 @@ do_config() {
   validate_positive_integer "$(grep '^RATE_LIMIT_PER_MIN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo '30')" "RATE_LIMIT_PER_MIN"
   validate_boolean "$(grep '^AUTO_UPDATE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "AUTO_UPDATE"
   validate_boolean "$(grep '^TRUST_PROXY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "TRUST_PROXY"
+  validate_boolean "$(grep '^MEMORY_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "MEMORY_ENABLED"
+  validate_boolean "$(grep '^TRANSCRIPT_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "TRANSCRIPT_ENABLED"
   validate_boolean "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "DEVICE_FLOW_ENABLED"
   validate_url "$(grep '^AGENT_ROLE_URL=' "$ENV_FILE" | cut -d'=' -f2-)" "AGENT_ROLE_URL"
   validate_skills_urls "$(grep '^ENABLED_SKILLS=' "$ENV_FILE" | cut -d'=' -f2-)"
@@ -516,12 +520,14 @@ do_interactive() {
 
   log_step "$(msg step_advanced)"
   echo -e "  ${CYAN}$(msg domain_hint)${NC}"
-  local domain docker_image rate_limit admin_token auto_update trust_proxy http_proxy
+  local domain docker_image rate_limit admin_token auto_update trust_proxy http_proxy memory_enabled transcript_enabled
   domain=$(prompt_optional "$(msg ask_domain)" "localhost")
   docker_image=$(prompt_optional "$(msg ask_image)" "aizhihuxiao/gta-claw:latest")
   rate_limit=$(prompt_optional "$(msg ask_rate)" "30")
   auto_update=$(prompt_optional "$(msg ask_auto_update)" "false")
   trust_proxy=$(prompt_optional "$(msg ask_trust_proxy)" "false")
+  memory_enabled=$(prompt_optional "$(msg ask_memory)" "false")
+  transcript_enabled=$(prompt_optional "$(msg ask_transcript)" "false")
   admin_token=$(prompt_optional "$(msg ask_admin_token)" "")
   http_proxy=$(prompt_optional "$(msg ask_proxy)" "")
 
@@ -529,6 +535,8 @@ do_interactive() {
   validate_positive_integer "$rate_limit" "RATE_LIMIT_PER_MIN"
   validate_boolean "$auto_update" "AUTO_UPDATE"
   validate_boolean "$trust_proxy" "TRUST_PROXY"
+  validate_boolean "$memory_enabled" "MEMORY_ENABLED"
+  validate_boolean "$transcript_enabled" "TRANSCRIPT_ENABLED"
   validate_auth_mode "$github_token" "$device_flow_enabled" "$github_client_id"
 
   log_step "$(msg step_write)"
@@ -551,6 +559,13 @@ DOMAIN=${domain}
 LOG_LEVEL=info
 MAX_SESSIONS=100
 SESSION_TTL_MS=3600000
+STATE_DIR=/data
+MEMORY_ENABLED=${memory_enabled}
+MEMORY_CHAR_LIMIT=2200
+USER_PROFILE_CHAR_LIMIT=1375
+TRANSCRIPT_ENABLED=${transcript_enabled}
+TRANSCRIPT_MAX_MESSAGES=2000
+TRANSCRIPT_CONTENT_CHAR_LIMIT=20000
 SKILL_EXEC_TIMEOUT_MS=30000
 SDK_REQUEST_TIMEOUT_MS=120000
 RATE_LIMIT_PER_MIN=${rate_limit}
@@ -619,6 +634,7 @@ do_deploy() {
     --name gta-claw \
     --restart unless-stopped \
     --env-file "$ENV_FILE" \
+    -v gta-claw-data:/data \
     -p 3978:3978 \
     "$image" >/dev/null
 
@@ -689,6 +705,7 @@ do_update() {
     --name gta-claw \
     --restart unless-stopped \
     --env-file "$ENV_FILE" \
+    -v gta-claw-data:/data \
     -p 3978:3978 \
     "$image" >/dev/null
   docker ps --filter "name=^/gta-claw$"

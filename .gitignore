@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+/data/
 /target/
 /desktop/target/
 

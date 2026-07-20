@@ -13,6 +13,7 @@ import type { WhatsAppWebhookHandler } from "./channels/whatsappWebhook.js";
 
 interface RuntimeStatus {
   skillCount: number;
+  nativeToolCount: number;
   activeModel: string;
 }
 
@@ -159,11 +160,21 @@ export function createServer(deps: ServerDeps): restify.Server {
       status: "ok",
       uptime: Math.floor((Date.now() - startTime) / 1000),
       skills: status.skillCount,
+      tools: {
+        remote: status.skillCount,
+        native: status.nativeToolCount,
+        total: status.skillCount + status.nativeToolCount,
+      },
       sessions: engine?.sessionCount ?? 0,
       model: status.activeModel,
       authenticated: Boolean(engine),
       deviceFlowEnabled: config.DEVICE_FLOW_ENABLED,
       channels: channelStatus,
+      features: {
+        persistentMemory: config.MEMORY_ENABLED,
+        sessionSearch: config.TRANSCRIPT_ENABLED,
+        persistenceScope: "conversation",
+      },
     });
     next();
   });

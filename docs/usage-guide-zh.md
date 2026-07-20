@@ -20,6 +20,7 @@
 - [四、日常使用](#四日常使用)
   - [4.1 对话示例](#41-对话示例)
   - [4.2 内置技能一览](#42-内置技能一览)
+  - [4.3 持久记忆与会话检索](#43-持久记忆与会话检索)
 - [五、角色与技能自定义](#五角色与技能自定义)
   - [5.1 角色配置](#51-角色配置)
   - [5.2 技能模块](#52-技能模块)
@@ -243,6 +244,34 @@ GTA-Claw 支持四个聊天频道，可同时启用多个。
 | `marp_slides` | 生成 Marp 格式幻灯片 | "做 PPT / 幻灯片" |
 
 > 所有技能在 V8 沙箱中隔离运行，通过 `httpGet`/`httpPost`/`log` API 与外部交互。
+
+### 4.3 持久记忆与会话检索
+
+GTA-Claw 提供两个默认关闭、可独立启用的原生工具：
+
+```env
+STATE_DIR=/data
+MEMORY_ENABLED=true
+MEMORY_CHAR_LIMIT=2200
+USER_PROFILE_CHAR_LIMIT=1375
+TRANSCRIPT_ENABLED=true
+TRANSCRIPT_MAX_MESSAGES=2000
+TRANSCRIPT_CONTENT_CHAR_LIMIT=20000
+```
+
+- `memory` 将项目/环境事实与用户偏好分开保存，并执行去重、容量检查、
+  Prompt Injection 特征扫描和原子写入。
+- `session_search` 无需额外调用模型，即可搜索或向前浏览持久会话记录；
+  检出的危险历史内容会替换成阻断标记，不会原样送回模型上下文。
+
+状态按 `conversation_id` 隔离，一个会话不能读取或检索另一个会话的数据。
+记忆只在新建 Copilot Session 时作为冻结快照注入；写入后工具返回值会立即展示
+最新状态。损坏的状态文件会以 `.corrupt-*` 后缀保留，再用空存储恢复会话。
+Docker 部署会把 `/data` 挂载到 `gta-claw-data` 命名卷，替换容器或更新镜像后
+数据仍然保留。
+
+HTTP 调用方仍可自行提交 `conversation_id`，因此该隔离不能代替租户鉴权。
+多租户部署必须验证调用方身份，并在服务端把会话 ID 绑定到已认证主体。
 
 ---
 

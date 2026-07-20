@@ -47,6 +47,7 @@ RUN if [ -n "$COPILOT_CLI_VERSION" ]; then \
     fi
 
 WORKDIR /app
+RUN mkdir -p /data && chown node:node /data
 
 # Copy built artifacts and production dependencies
 COPY --from=builder /app/dist ./dist
@@ -56,6 +57,9 @@ COPY --from=builder /app/package.json ./
 # Required for isolated-vm on Node 20+
 ENV NODE_OPTIONS="--no-node-snapshot"
 ENV COPILOT_CLI_PATH="/usr/local/bin/copilot"
+ENV STATE_DIR="/data"
+
+VOLUME ["/data"]
 
 # Run as non-root
 USER node

@@ -38,6 +38,13 @@ export interface AppConfig {
   LOG_LEVEL: string;
   SESSION_TTL_MS: number;
   MAX_SESSIONS: number;
+  STATE_DIR: string;
+  MEMORY_ENABLED: boolean;
+  MEMORY_CHAR_LIMIT: number;
+  USER_PROFILE_CHAR_LIMIT: number;
+  TRANSCRIPT_ENABLED: boolean;
+  TRANSCRIPT_MAX_MESSAGES: number;
+  TRANSCRIPT_CONTENT_CHAR_LIMIT: number;
   COPILOT_MODEL: string;
   SKILL_EXEC_TIMEOUT_MS: number;
   SDK_REQUEST_TIMEOUT_MS: number;
@@ -264,6 +271,26 @@ export function loadConfig(): AppConfig {
     LOG_LEVEL: logLevel,
     SESSION_TTL_MS: parseIntegerEnv("SESSION_TTL_MS", 3_600_000, { min: 1_000 }),
     MAX_SESSIONS: parseIntegerEnv("MAX_SESSIONS", 100, { min: 1 }),
+    STATE_DIR: process.env["STATE_DIR"]?.trim() || "./data",
+    MEMORY_ENABLED: parseBooleanEnv("MEMORY_ENABLED", false),
+    MEMORY_CHAR_LIMIT: parseIntegerEnv("MEMORY_CHAR_LIMIT", 2200, {
+      min: 256,
+      max: 100_000,
+    }),
+    USER_PROFILE_CHAR_LIMIT: parseIntegerEnv("USER_PROFILE_CHAR_LIMIT", 1375, {
+      min: 256,
+      max: 100_000,
+    }),
+    TRANSCRIPT_ENABLED: parseBooleanEnv("TRANSCRIPT_ENABLED", false),
+    TRANSCRIPT_MAX_MESSAGES: parseIntegerEnv("TRANSCRIPT_MAX_MESSAGES", 2000, {
+      min: 10,
+      max: 100_000,
+    }),
+    TRANSCRIPT_CONTENT_CHAR_LIMIT: parseIntegerEnv(
+      "TRANSCRIPT_CONTENT_CHAR_LIMIT",
+      20_000,
+      { min: 1_000, max: 1_000_000 },
+    ),
     COPILOT_MODEL: process.env["COPILOT_MODEL"] ?? "gpt-4o",
     SKILL_EXEC_TIMEOUT_MS: parseIntegerEnv("SKILL_EXEC_TIMEOUT_MS", 30_000, {
       min: 100,
@@ -278,6 +305,15 @@ export function loadConfig(): AppConfig {
     ADMIN_TOKEN: process.env["ADMIN_TOKEN"],
     TRUST_PROXY: parseBooleanEnv("TRUST_PROXY", false),
   };
+
+  if (
+    config.TRANSCRIPT_MAX_MESSAGES * config.TRANSCRIPT_CONTENT_CHAR_LIMIT >
+    50_000_000
+  ) {
+    throw new Error(
+      "TRANSCRIPT_MAX_MESSAGES * TRANSCRIPT_CONTENT_CHAR_LIMIT must not exceed 50000000",
+    );
+  }
 
   logger.info(
     {
@@ -296,6 +332,11 @@ export function loadConfig(): AppConfig {
         telegram: config.ENABLE_TELEGRAM,
         discord: config.ENABLE_DISCORD,
         whatsapp: config.ENABLE_WHATSAPP,
+      },
+      persistence: {
+        stateDir: config.STATE_DIR,
+        memory: config.MEMORY_ENABLED,
+        transcripts: config.TRANSCRIPT_ENABLED,
       },
       trustProxy: config.TRUST_PROXY,
       autoUpdate: config.AUTO_UPDATE,
