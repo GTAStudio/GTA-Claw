@@ -922,6 +922,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_admission_cannot_extend_the_open_deadline() {
+        const CHILD_ENV: &str = "GTA_CLAW_OPEN_ADMISSION_DEADLINE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::cleanup_admission_cannot_extend_the_open_deadline")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated cleanup admission test");
+            assert!(status.success(), "isolated cleanup admission test failed");
+            return;
+        }
+
+        let owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "state-open-admission-saturation",
+            64,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("saturate bounded cleanup admission");
+        let directory = tempfile::tempdir().expect("cleanup admission directory");
+        let path = database_path(&directory, "cleanup-admission.sqlite");
+        let started = std::time::Instant::now();
+        let error = StateStore::open(
+            StoreConfig::new(&path)
+                .with_open_timeout(Duration::from_millis(200))
+                .with_acquire_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .err()
+        .expect("cleanup admission saturation reaches the open deadline");
+        assert_eq!(
+            error,
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 200,
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cleanup admission must not inherit the longer pool acquire timeout"
+        );
+        drop(owners);
+    }
+
+    #[tokio::test]
+    async fn live_checkouts_do_not_reuse_the_expired_open_deadline() {
+        let directory = tempfile::tempdir().expect("live checkout directory");
+        let path = database_path(&directory, "live-checkout-deadline.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path)
+                .with_open_timeout(Duration::from_secs(1))
+                .with_acquire_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect("open live checkout fixture");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        store
+            .settings()
+            .await
+            .expect("live checkout uses configured acquire timeout");
+        store.close().await.expect("close live checkout fixture");
+    }
+
+    #[tokio::test]
     async fn competing_sqlite_writer_cannot_extend_open_past_absolute_deadline() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "open-busy-deadline.sqlite");
@@ -3227,6 +3294,34 @@ mod tests {
         source.close().await.expect("backup timeout source closes");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exhausted_quarantine_rejects_before_backup_output_creation() {
+        let directory = tempfile::tempdir().expect("quarantine capacity directory");
+        let source_path = database_path(&directory, "quarantine-source.sqlite");
+        let destination = database_path(&directory, "quarantine-destination.sqlite");
+        let source = open(&source_path).await;
+        for index in 0..64 {
+            fs::write(
+                directory
+                    .path()
+                    .join(format!(".gta-claw-quarantine-existing-{index:02}")),
+                b"",
+            )
+            .expect("create quarantine tombstone");
+        }
+        let error = source
+            .backup_to(&destination)
+            .await
+            .expect_err("exhausted quarantine rejects backup");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(!destination.exists());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!sidecar(&destination, suffix).exists());
+        }
+        source.close().await.expect("close quarantine source");
+    }
+
     #[tokio::test]
     async fn publication_deadline_is_fenced_immediately_before_and_after_marker_removal() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -4815,12 +4910,29 @@ mod tests {
                 matches!(error, StateError::InvalidPath { .. }),
                 "hard-link alias returned unexpected error: {error:?}"
             );
+            fs::remove_file(&alias).expect("remove rejected Windows hard-link alias");
         }
         open(&path)
             .await
             .close()
             .await
             .expect("canonical database name still opens");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn oversized_writer_lock_is_rejected_without_unbounded_read() {
+        let directory = tempfile::tempdir().expect("oversized lock directory");
+        let path = database_path(&directory, "oversized-lock.sqlite");
+        let store = open(&path).await;
+        let lock_path = test_support::lock_path(&store).to_owned();
+        store.close().await.expect("close oversized lock fixture");
+        fs::write(&lock_path, vec![b'x'; 4097]).expect("write oversized writer lock");
+        let error = StateStore::open(StoreConfig::new(&path))
+            .await
+            .err()
+            .expect("oversized writer lock is rejected");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
     }
 
     #[cfg(unix)]

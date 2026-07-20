@@ -63,6 +63,169 @@ type SharedSnapshotRetention = Arc<
         )>,
     >,
 >;
+type SharedTerminalRetention = Arc<std::sync::Mutex<Option<Box<dyn Send>>>>;
+
+type StateCleanupJob = Box<
+    dyn FnMut(&tokio::runtime::Runtime, &mut claw_sqlite_file_control::ExternalCleanupPermit)
+        + Send
+        + 'static,
+>;
+
+struct StateCleanupEnvelope {
+    job: Option<StateCleanupJob>,
+    permit: Option<claw_sqlite_file_control::ExternalCleanupPermit>,
+}
+
+struct StateCleanupExecutor {
+    sender: std::sync::mpsc::SyncSender<StateCleanupEnvelope>,
+    _receiver: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<StateCleanupEnvelope>>>,
+}
+
+const STATE_CLEANUP_THREADS: usize = 16;
+const MAX_STATE_CLEANUP_JOBS: usize = 64;
+const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
+static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<
+    std::sync::Mutex<[Option<StateCleanupEnvelope>; MAX_STATE_CLEANUP_JOBS]>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
+
+fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
+    let mut quarantine = STATE_CLEANUP_QUARANTINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(slot) = quarantine.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(envelope);
+    } else {
+        std::mem::forget(envelope);
+    }
+}
+
+static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, String>> =
+    std::sync::LazyLock::new(|| {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<StateCleanupEnvelope>(MAX_STATE_CLEANUP_JOBS);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(STATE_CLEANUP_THREADS);
+        for index in 0..STATE_CLEANUP_THREADS {
+            let receiver = Arc::clone(&receiver);
+            let ready_tx = ready_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("claw-state-cleanup-{index}"))
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                    let _ = ready_tx.send(Ok(()));
+                    loop {
+                        let envelope = receiver
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        let Ok(mut envelope) = envelope else {
+                            return;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let job = envelope
+                                .job
+                                .as_mut()
+                                .expect("state cleanup job remains owned");
+                            let permit = envelope
+                                .permit
+                                .as_mut()
+                                .expect("state cleanup permit remains owned");
+                            job(&runtime, permit);
+                        }));
+                        match result {
+                            Ok(()) => {
+                                let job = envelope
+                                    .job
+                                    .take()
+                                    .expect("completed state cleanup job remains owned");
+                                let permit = envelope
+                                    .permit
+                                    .take()
+                                    .expect("completed state cleanup permit remains owned");
+                                let _ = permit.retire(Box::new(job));
+                            }
+                            Err(panic) => {
+                                std::mem::forget(panic);
+                                retain_state_cleanup(envelope);
+                            }
+                        }
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        drop(ready_tx);
+        for _ in 0..STATE_CLEANUP_THREADS {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("state cleanup executor readiness: {error}"))??;
+        }
+        Ok(StateCleanupExecutor {
+            sender,
+            _receiver: receiver,
+        })
+    });
+
+async fn ensure_state_cleanup_executor(deadline: tokio::time::Instant) -> Result<(), String> {
+    tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(|| {
+            STATE_CLEANUP_EXECUTOR
+                .as_ref()
+                .map(|_| ())
+                .map_err(Clone::clone)
+        }),
+    )
+    .await
+    .map_err(|_| "state cleanup executor readiness timed out".to_owned())?
+    .map_err(|error| format!("state cleanup executor readiness task: {error}"))?
+}
+
+fn handoff_state_payload<Payload>(
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    payload: Payload,
+    cleanup: fn(
+        &tokio::runtime::Runtime,
+        &mut claw_sqlite_file_control::TerminalCloseBatch,
+        &Payload,
+    ),
+) -> Result<(), String>
+where
+    Payload: Send + 'static,
+{
+    let permit = owner.into_external_cleanup()?;
+    let envelope = StateCleanupEnvelope {
+        job: Some(Box::new(move |runtime, permit| {
+            cleanup(runtime, permit.terminal_closes(), &payload);
+        })),
+        permit: Some(permit),
+    };
+    let executor = match STATE_CLEANUP_EXECUTOR.as_ref() {
+        Ok(executor) => executor,
+        Err(error) => {
+            retain_state_cleanup(envelope);
+            return Err(format!("state cleanup executor unavailable: {error}"));
+        }
+    };
+    match executor.sender.try_send(envelope) {
+        Ok(()) => Ok(()),
+        Err(
+            std::sync::mpsc::TrySendError::Full(envelope)
+            | std::sync::mpsc::TrySendError::Disconnected(envelope),
+        ) => {
+            retain_state_cleanup(envelope);
+            Err("state cleanup executor rejected a pre-reserved job".to_owned())
+        }
+    }
+}
 
 async fn reserve_snapshot_memory(
     deadline: tokio::time::Instant,
@@ -88,7 +251,7 @@ async fn reserve_snapshot_memory(
 }
 
 async fn run_bounded_filesystem<T, Operation>(
-    mut owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
     deadline: tokio::time::Instant,
     operation: &'static str,
     timeout_ms: u64,
@@ -96,39 +259,49 @@ async fn run_bounded_filesystem<T, Operation>(
 ) -> Result<T, StateError>
 where
     T: Send + 'static,
-    Operation: FnOnce() -> Result<T, StateError> + Send + 'static,
+    Operation: FnMut() -> Result<T, StateError> + Send + 'static,
 {
     struct FilesystemPayload<T, Operation> {
-        work: Option<Operation>,
-        result: Option<std::sync::mpsc::SyncSender<Result<T, StateError>>>,
-        undelivered: Option<Result<T, StateError>>,
+        work: std::sync::Mutex<Operation>,
+        result: std::sync::mpsc::SyncSender<Result<T, StateError>>,
+        undelivered: std::sync::Mutex<Option<Result<T, StateError>>>,
     }
 
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
-    owner
-        .handoff_payload(
-            FilesystemPayload {
-                work: Some(work),
-                result: Some(result_tx),
-                undelivered: None,
-            },
-            |_, _, payload| {
-                let result = payload.work.take().expect("filesystem work is single-use")();
-                let sender = payload
-                    .result
-                    .take()
-                    .expect("filesystem result is single-use");
-                if let Err(result) = sender.send(result) {
-                    payload.undelivered = Some(result.0);
-                }
-            },
-        )
+    ensure_state_cleanup_executor(deadline)
+        .await
         .map_err(|error| {
             database(
-                "submit bounded filesystem operation",
+                "prepare bounded filesystem executor",
                 sqlx::Error::Protocol(error),
             )
         })?;
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    handoff_state_payload(
+        owner,
+        FilesystemPayload {
+            work: std::sync::Mutex::new(work),
+            result: result_tx,
+            undelivered: std::sync::Mutex::new(None),
+        },
+        |_, _, payload| {
+            let result = payload
+                .work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)();
+            if let Err(result) = payload.result.send(result) {
+                *payload
+                    .undelivered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.0);
+            }
+        },
+    )
+    .map_err(|error| {
+        database(
+            "submit bounded filesystem operation",
+            sqlx::Error::Protocol(error),
+        )
+    })?;
     loop {
         match result_rx.try_recv() {
             Ok(result) => return result,
@@ -1155,121 +1328,158 @@ impl StateStore {
         let acquire_lock_identity = verified_lock_identity.clone();
         let acquire_writer_generation = Arc::clone(&verified_writer_generation);
         let acquire_ready = Arc::clone(&connections_ready);
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(config.max_connections)
-            .acquire_timeout(config.acquire_timeout)
-            .after_connect(move |connection, _metadata| {
-                let path = verified_path.clone();
-                let parent_path = verified_parent_path.clone();
-                let parent = Arc::clone(&verified_parent);
-                let file = Arc::clone(&verified_file);
-                let lock_path = verified_lock_path.clone();
-                let lock_file = Arc::clone(&verified_lock_file);
-                let lock_identity = verified_lock_identity.clone();
-                let writer_generation = Arc::clone(&verified_writer_generation);
-                let ready = Arc::clone(&connect_ready);
-                let deadline_state = Arc::clone(&connect_deadline_state);
-                Box::pin(async move {
-                    let busy_timeout = if ready.load(std::sync::atomic::Ordering::Acquire) {
-                        configured_busy_timeout
-                    } else {
-                        let remaining = deadline_state
-                            .deadline
-                            .saturating_duration_since(std::time::Instant::now());
-                        if remaining.is_zero() {
+        let acquire_deadline_state = Arc::clone(&deadline_state);
+        let live_acquire_timeout = config.acquire_timeout;
+        let pool = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline_state.deadline),
+            SqlitePoolOptions::new()
+                .min_connections(1)
+                .max_connections(config.max_connections)
+                .acquire_timeout(config.acquire_timeout)
+                .after_connect(move |connection, _metadata| {
+                    let path = verified_path.clone();
+                    let parent_path = verified_parent_path.clone();
+                    let parent = Arc::clone(&verified_parent);
+                    let file = Arc::clone(&verified_file);
+                    let lock_path = verified_lock_path.clone();
+                    let lock_file = Arc::clone(&verified_lock_file);
+                    let lock_identity = verified_lock_identity.clone();
+                    let writer_generation = Arc::clone(&verified_writer_generation);
+                    let ready = Arc::clone(&connect_ready);
+                    let deadline_state = Arc::clone(&connect_deadline_state);
+                    Box::pin(async move {
+                        let busy_timeout = if ready.load(std::sync::atomic::Ordering::Acquire) {
+                            configured_busy_timeout
+                        } else {
+                            let remaining = deadline_state
+                                .deadline
+                                .saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                return Err(sqlx::Error::Protocol(
+                                    "state store open deadline expired before connection bootstrap"
+                                        .to_owned(),
+                                ));
+                            }
+                            configured_busy_timeout.min(remaining)
+                        };
+                        claw_sqlite_file_control::set_busy_timeout(connection, busy_timeout)
+                            .await
+                            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+                        {
+                            let mut handle = connection.lock_handle().await?;
+                            handle.set_progress_handler(1_000, move || {
+                                deadline_state.permits_sqlite_work()
+                            });
+                        }
+                        if writer_generation.load(Ordering::Acquire) != 1 {
                             return Err(sqlx::Error::Protocol(
-                                "state store open deadline expired before connection bootstrap"
+                                "state writer generation is no longer live".to_owned(),
+                            ));
+                        }
+                        verify_directory_path_identity(&parent_path, &parent)
+                            .and_then(|()| verify_path_identity(&path, &file))
+                            .and_then(|()| verify_path_identity(&lock_path, &lock_file))
+                            .and_then(|()| {
+                                verify_store_lock_binding(
+                                    &path,
+                                    &file,
+                                    &lock_path,
+                                    &lock_file,
+                                    lock_identity.as_deref(),
+                                )
+                            })
+                            .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                        verify_sqlite_connection_identity(connection).await?;
+                        if ready.load(std::sync::atomic::Ordering::Acquire) {
+                            claw_sqlite_file_control::set_busy_timeout(
+                                connection,
+                                configured_busy_timeout,
+                            )
+                            .await
+                            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+                            secure_sqlite_sidecars(&path, lock_identity.as_deref())
+                                .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                            install_store_commit_guard(
+                                connection,
+                                (&parent_path, &parent),
+                                (&path, &file),
+                                (&lock_path, &lock_file),
+                                lock_identity.as_deref(),
+                                (Arc::clone(&writer_generation), 1),
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .before_acquire(move |connection, _metadata| {
+                    let path = acquire_path.clone();
+                    let parent_path = acquire_parent_path.clone();
+                    let parent = Arc::clone(&acquire_parent);
+                    let file = Arc::clone(&acquire_file);
+                    let lock_path = acquire_lock_path.clone();
+                    let lock_file = Arc::clone(&acquire_lock_file);
+                    let lock_identity = acquire_lock_identity.clone();
+                    let writer_generation = Arc::clone(&acquire_writer_generation);
+                    let ready = Arc::clone(&acquire_ready);
+                    let deadline_state = Arc::clone(&acquire_deadline_state);
+                    Box::pin(async move {
+                        if writer_generation.load(Ordering::Acquire) != 1 {
+                            return Err(sqlx::Error::Protocol(
+                                "state writer generation is no longer live".to_owned(),
+                            ));
+                        }
+                        if !deadline_state.permits_sqlite_work() {
+                            return Err(sqlx::Error::Protocol(
+                                "state store open deadline expired before cleanup admission"
                                     .to_owned(),
                             ));
                         }
-                        configured_busy_timeout.min(remaining)
-                    };
-                    claw_sqlite_file_control::set_busy_timeout(connection, busy_timeout)
+                        let admission_deadline = if deadline_state
+                            .finished
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            std::time::Instant::now()
+                                .checked_add(live_acquire_timeout)
+                                .ok_or_else(|| {
+                                    sqlx::Error::Protocol(
+                                        "state connection acquire deadline overflowed".to_owned(),
+                                    )
+                                })?
+                        } else {
+                            deadline_state.deadline
+                        };
+                        ensure_state_cleanup_executor(tokio::time::Instant::from_std(
+                            admission_deadline,
+                        ))
                         .await
-                        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-                    {
-                        let mut handle = connection.lock_handle().await?;
-                        handle.set_progress_handler(1_000, move || {
-                            deadline_state.permits_sqlite_work()
-                        });
-                    }
-                    if writer_generation.load(Ordering::Acquire) != 1 {
-                        return Err(sqlx::Error::Protocol(
-                            "state writer generation is no longer live".to_owned(),
-                        ));
-                    }
-                    verify_directory_path_identity(&parent_path, &parent)
-                        .and_then(|()| verify_path_identity(&path, &file))
-                        .and_then(|()| verify_path_identity(&lock_path, &lock_file))
-                        .and_then(|()| {
-                            verify_store_lock_binding(
-                                &path,
-                                &file,
-                                &lock_path,
-                                &lock_file,
-                                lock_identity.as_deref(),
+                        .map_err(sqlx::Error::Protocol)?;
+                        let mut owners =
+                            claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+                                "claw-state-before-acquire-identity",
+                                1,
+                                admission_deadline,
                             )
-                        })
-                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                    verify_sqlite_connection_identity(connection).await?;
-                    if ready.load(std::sync::atomic::Ordering::Acquire) {
-                        claw_sqlite_file_control::set_busy_timeout(
-                            connection,
-                            configured_busy_timeout,
-                        )
-                        .await
-                        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-                        secure_sqlite_sidecars(&path, lock_identity.as_deref())
-                            .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        install_store_commit_guard(
-                            connection,
-                            (&parent_path, &parent),
-                            (&path, &file),
-                            (&lock_path, &lock_file),
-                            lock_identity.as_deref(),
-                            (Arc::clone(&writer_generation), 1),
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                })
-            })
-            .before_acquire(move |connection, _metadata| {
-                let path = acquire_path.clone();
-                let parent_path = acquire_parent_path.clone();
-                let parent = Arc::clone(&acquire_parent);
-                let file = Arc::clone(&acquire_file);
-                let lock_path = acquire_lock_path.clone();
-                let lock_file = Arc::clone(&acquire_lock_file);
-                let lock_identity = acquire_lock_identity.clone();
-                let writer_generation = Arc::clone(&acquire_writer_generation);
-                let ready = Arc::clone(&acquire_ready);
-                Box::pin(async move {
-                    if writer_generation.load(Ordering::Acquire) != 1 {
-                        return Err(sqlx::Error::Protocol(
-                            "state writer generation is no longer live".to_owned(),
-                        ));
-                    }
-                    let mut owner = claw_sqlite_file_control::BlockingCleanupOwner::acquire(
-                        "claw-state-before-acquire-identity",
-                    )
-                    .await
-                    .map_err(sqlx::Error::Protocol)?;
-                    let (verified_tx, verified_rx) = tokio::sync::oneshot::channel();
-                    struct IdentityVerificationPayload {
-                        parent_path: PathBuf,
-                        parent: Arc<File>,
-                        path: PathBuf,
-                        file: Arc<File>,
-                        lock_path: PathBuf,
-                        lock_file: Arc<File>,
-                        lock_identity: Option<Vec<u8>>,
-                        ready: Arc<std::sync::atomic::AtomicBool>,
-                        result: Option<tokio::sync::oneshot::Sender<Result<(), StateError>>>,
-                    }
-                    owner
-                        .handoff_payload(
+                            .await
+                            .map_err(sqlx::Error::Protocol)?;
+                        let owner = owners
+                            .pop()
+                            .expect("one before-acquire cleanup owner was reserved");
+                        let (verified_tx, verified_rx) = std::sync::mpsc::sync_channel(0);
+                        struct IdentityVerificationPayload {
+                            parent_path: PathBuf,
+                            parent: Arc<File>,
+                            path: PathBuf,
+                            file: Arc<File>,
+                            lock_path: PathBuf,
+                            lock_file: Arc<File>,
+                            lock_identity: Option<Vec<u8>>,
+                            ready: Arc<std::sync::atomic::AtomicBool>,
+                            result: std::sync::mpsc::SyncSender<Result<(), StateError>>,
+                            undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
+                        }
+                        handoff_state_payload(
+                            owner,
                             IdentityVerificationPayload {
                                 parent_path,
                                 parent,
@@ -1279,7 +1489,8 @@ impl StateStore {
                                 lock_file,
                                 lock_identity,
                                 ready,
-                                result: Some(verified_tx),
+                                result: verified_tx,
+                                undelivered: std::sync::Mutex::new(None),
                             },
                             |_, _, payload| {
                                 let verified =
@@ -1332,30 +1543,51 @@ impl StateStore {
                                             ))
                                         },
                                     );
-                                if let Some(result) = payload.result.take() {
-                                    let _ = result.send(verified);
+                                if let Err(verified) = payload.result.send(verified) {
+                                    *payload
+                                        .undelivered
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(verified.0);
                                 }
                             },
                         )
                         .map_err(sqlx::Error::Protocol)?;
-                    verified_rx
-                        .await
-                        .map_err(|_| {
-                            sqlx::Error::Protocol(
-                                "before-acquire identity owner stopped without result".to_owned(),
-                            )
-                        })?
-                        .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                    verify_sqlite_connection_identity(connection).await?;
-                    Ok(true)
+                        let verified = loop {
+                            match verified_rx.try_recv() {
+                                Ok(verified) => break verified,
+                                Err(std::sync::mpsc::TryRecvError::Empty)
+                                    if deadline_state.permits_sqlite_work()
+                                        && std::time::Instant::now() < admission_deadline =>
+                                {
+                                    tokio::task::yield_now().await;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    return Err(sqlx::Error::Protocol(
+                                    "state store open deadline expired during identity verification"
+                                        .to_owned(),
+                                ));
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    return Err(sqlx::Error::Protocol(
+                                        "before-acquire identity owner stopped without result"
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
+                        };
+                        verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+                        verify_sqlite_connection_identity(connection).await?;
+                        Ok(true)
+                    })
                 })
-            })
-            .connect_with(options)
-            .await
-            .map_err(|error| database("open state database", error))?;
+                .connect_with(options),
+        )
+        .await
+        .map_err(|_| deadline_state.timeout_error())?
+        .map_err(|error| database("open state database", error))?;
         if let Err(error) = verify_path_identity(&path, &database_file) {
-            pool.close().await;
-            return Err(error);
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
         }
 
         async fn initialize_connection_sidecars(
@@ -1397,10 +1629,19 @@ impl StateStore {
             .await
         }
 
-        let initial = match pool.acquire().await {
-            Ok(initial) => initial,
-            Err(error) => {
+        let initial = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline_state.deadline),
+            pool.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(initial)) => initial,
+            Ok(Err(error)) => {
                 let primary = database("acquire initial state connection", error);
+                return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
+            }
+            Err(_) => {
+                let primary = deadline_state.timeout_error();
                 return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
             }
         };
@@ -1474,10 +1715,13 @@ impl StateStore {
         wait_at_open_initialization_test_barrier(&path).await;
 
         let configured = async {
-            let mut configured_connection = pool
-                .acquire()
-                .await
-                .map_err(|error| database("acquire configured state connection", error))?;
+            let mut configured_connection = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline_state.deadline),
+                pool.acquire(),
+            )
+            .await
+            .map_err(|_| deadline_state.timeout_error())?
+            .map_err(|error| database("acquire configured state connection", error))?;
             claw_sqlite_file_control::set_busy_timeout(
                 &mut configured_connection,
                 configured_busy_timeout,
@@ -1533,8 +1777,7 @@ impl StateStore {
         {
             Ok(recovered_writer) => recovered_writer,
             Err(error) => {
-                pool.close().await;
-                return Err(error);
+                return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
             }
         };
         connections_ready.store(true, std::sync::atomic::Ordering::Release);
@@ -1849,6 +2092,7 @@ impl StateStore {
         )
         .await?;
         let validation_deadline_state = Arc::clone(&deadline_state);
+        let mut backup_snapshot = Some(backup_snapshot);
         let (backup_snapshot, sealed_digest) = run_bounded_filesystem(
             source_validation_owner,
             deadline,
@@ -1856,14 +2100,22 @@ impl StateStore {
             timeout_ms,
             move || {
                 let digest = validate_standalone_snapshot_source_pinned(
-                    &backup_snapshot,
-                    Some(validation_deadline_state),
+                    backup_snapshot
+                        .as_ref()
+                        .expect("restore source snapshot remains owned"),
+                    Some(Arc::clone(&validation_deadline_state)),
                 )?;
-                Ok((backup_snapshot, digest))
+                Ok((
+                    backup_snapshot
+                        .take()
+                        .expect("restore source snapshot is delivered once"),
+                    digest,
+                ))
             },
         )
         .await?;
         let requested_destination = destination.as_ref().to_owned();
+        let mut snapshot_cleanup_owner = Some(snapshot_cleanup_owner);
         let (destination, destination_directory, temporary_guard) = run_bounded_filesystem(
             destination_preflight_owner,
             deadline,
@@ -1877,7 +2129,9 @@ impl StateStore {
                 let guard = SnapshotCleanupGuard::new_pinned(
                     &destination,
                     &destination_directory,
-                    snapshot_cleanup_owner,
+                    snapshot_cleanup_owner
+                        .take()
+                        .expect("restore snapshot cleanup owner is consumed once"),
                 )?;
                 Ok((destination, destination_directory, guard))
             },
@@ -1928,6 +2182,8 @@ impl StateStore {
         }
         let durability_destination = destination.clone();
         let durability_temporary = temporary.clone();
+        let mut pinned = Some(pinned);
+        let mut temporary_guard = Some(temporary_guard);
         let durability = run_bounded_filesystem(
             durability_owner,
             deadline,
@@ -1937,43 +2193,72 @@ impl StateStore {
                 let result = (|| {
                     let identity_guard = initialize_restored_store_identity(
                         &durability_temporary,
-                        &pinned.file,
+                        &pinned
+                            .as_ref()
+                            .expect("restore durability snapshot remains owned")
+                            .file,
                         &durability_destination,
                     )?;
-                    pinned.sync()?;
+                    pinned
+                        .as_ref()
+                        .expect("restore durability snapshot remains owned")
+                        .sync()?;
                     if tokio::time::Instant::now() >= deadline {
                         return Err(StateError::OperationTimedOut {
                             operation: "SQLite restore",
                             timeout_ms,
                         });
                     }
-                    Ok((pinned, identity_guard))
+                    Ok(identity_guard)
                 })();
                 Ok(match result {
-                    Ok((pinned, identity_guard)) => Ok((pinned, identity_guard, temporary_guard)),
-                    Err(error) => Err((error, temporary_guard)),
+                    Ok(identity_guard) => Ok((
+                        pinned
+                            .take()
+                            .expect("restore durability snapshot is delivered once"),
+                        identity_guard,
+                        temporary_guard
+                            .take()
+                            .expect("restore durability guard is delivered once"),
+                    )),
+                    Err(error) => Err((
+                        error,
+                        pinned
+                            .take()
+                            .expect("failed restore durability snapshot is delivered once"),
+                        temporary_guard
+                            .take()
+                            .expect("failed restore durability guard is delivered once"),
+                    )),
                 })
             },
         )
         .await?;
-        let (pinned, identity_guard, mut temporary_guard) = match durability {
+        let (pinned, identity_guard, temporary_guard) = match durability {
             Ok(durable) => durable,
-            Err((error, mut guard)) => {
+            Err((error, pinned, mut guard)) => {
+                drop(pinned);
                 return Err(cleanup_snapshot_guard_or_error(&mut guard, error).await);
             }
         };
         let publication_destination = destination.clone();
         let publication_deadline_state = Arc::clone(&deadline_state);
+        let mut pinned = Some(pinned);
+        let mut temporary_guard = Some(temporary_guard);
+        let mut identity_guard = Some(identity_guard);
         let publication = run_bounded_filesystem(
             publication_owner,
             deadline + Duration::from_secs(1),
             "SQLite restore",
             timeout_ms,
             move || {
-                let mut identity_guard = identity_guard;
                 let result = publish_bound_snapshot(
-                    &pinned,
-                    &mut temporary_guard,
+                    pinned
+                        .as_ref()
+                        .expect("restore publication snapshot remains owned"),
+                    temporary_guard
+                        .as_mut()
+                        .expect("restore publication guard remains owned"),
                     &publication_destination,
                     "SQLite restore",
                     Some((deadline, timeout_ms)),
@@ -1984,12 +2269,20 @@ impl StateStore {
                         let handoff =
                             validate_published_snapshot_handoff(
                                 &publication_destination,
-                                &pinned.file,
+                                &pinned
+                                    .as_ref()
+                                    .expect("restore publication snapshot remains owned")
+                                    .file,
                             )
                             .and_then(
                                 |()| {
-                                    pinned.verify()?;
+                                    pinned
+                                        .as_ref()
+                                        .expect("restore publication snapshot remains owned")
+                                        .verify()?;
                                     if pinned
+                                        .as_ref()
+                                        .expect("restore publication snapshot remains owned")
                                         .file
                                         .metadata()
                                         .map_err(|error| {
@@ -2002,12 +2295,18 @@ impl StateStore {
                                         .len()
                                         != restore_receipt.byte_count
                                         || file_digest_with_deadline(
-                                            &pinned.file,
+                                            &pinned
+                                                .as_ref()
+                                                .expect("restore publication snapshot remains owned")
+                                                .file,
                                             Some(&publication_deadline_state),
                                         )? != restore_receipt.digest
                                         || snapshot_is_staging(
                                             &publication_destination,
-                                            &pinned.file,
+                                            &pinned
+                                                .as_ref()
+                                                .expect("restore publication snapshot remains owned")
+                                                .file,
                                         )?
                                     {
                                         return Err(StateError::InvalidBackup {
@@ -2033,31 +2332,69 @@ impl StateStore {
                             );
                         match handoff {
                             Ok(()) => {
-                                identity_guard.mark_published();
-                                Ok((pinned, temporary_guard, identity_guard))
+                                identity_guard
+                                    .as_mut()
+                                    .expect("restore identity guard remains owned")
+                                    .mark_published();
+                                Ok((
+                                    pinned
+                                        .take()
+                                        .expect("published restore snapshot is delivered once"),
+                                    temporary_guard
+                                        .take()
+                                        .expect("published restore guard is delivered once"),
+                                    identity_guard
+                                        .take()
+                                        .expect("published restore identity is delivered once"),
+                                ))
                             }
                             Err(error) => {
-                                identity_guard.mark_published();
-                                temporary_guard.mark_publication_uncertain();
+                                identity_guard
+                                    .as_mut()
+                                    .expect("restore identity guard remains owned")
+                                    .mark_published();
+                                temporary_guard
+                                    .as_mut()
+                                    .expect("restore publication guard remains owned")
+                                    .mark_publication_uncertain();
                                 Err((
                                     StateError::PublicationUncertain {
-                                        path: publication_destination,
+                                        path: publication_destination.clone(),
                                         reason: format!(
                                             "published restore failed final identity/deadline validation: {error}"
                                         ),
                                     },
-                                    pinned,
-                                    temporary_guard,
+                                    pinned
+                                        .take()
+                                        .expect("uncertain restore snapshot is delivered once"),
+                                    temporary_guard
+                                        .take()
+                                        .expect("uncertain restore guard is delivered once"),
                                 ))
                             }
                         }
                     }
                     Err(error @ StateError::PublicationUncertain { .. }) => {
-                        identity_guard.mark_published();
-                        Err((error, pinned, temporary_guard))
+                        identity_guard
+                            .as_mut()
+                            .expect("restore identity guard remains owned")
+                            .mark_published();
+                        Err((
+                            error,
+                            pinned
+                                .take()
+                                .expect("uncertain restore snapshot is delivered once"),
+                            temporary_guard
+                                .take()
+                                .expect("uncertain restore guard is delivered once"),
+                        ))
                     }
                     Err(error) => {
-                        let error = match identity_guard.cleanup() {
+                        let error = match identity_guard
+                            .as_mut()
+                            .expect("restore identity guard remains owned")
+                            .cleanup()
+                        {
                             Ok(()) => error,
                             Err(cleanup) => append_operation_cleanup(
                                 "SQLite restore",
@@ -2065,7 +2402,15 @@ impl StateStore {
                                 format!("restored lock cleanup failed: {cleanup}"),
                             ),
                         };
-                        Err((error, pinned, temporary_guard))
+                        Err((
+                            error,
+                            pinned
+                                .take()
+                                .expect("failed restore publication snapshot is delivered once"),
+                            temporary_guard
+                                .take()
+                                .expect("failed restore publication guard is delivered once"),
+                        ))
                     }
                 })
             },
@@ -2099,47 +2444,99 @@ impl StateStore {
         wait_at_published_handoff_test_barrier(&destination).await;
         let final_destination = destination.clone();
         let final_deadline_state = Arc::clone(&deadline_state);
+        let mut pinned = Some(pinned);
+        let mut temporary_guard = Some(temporary_guard);
+        let mut identity_guard = Some(identity_guard);
         let final_handoff = run_bounded_filesystem(
             final_handoff_owner,
             deadline + Duration::from_secs(1),
             "SQLite restore",
             timeout_ms,
             move || {
-                let result = validate_published_snapshot_handoff(&final_destination, &pinned.file)
-                    .and_then(|()| {
-                        pinned.verify()?;
-                        if pinned
-                            .file
-                            .metadata()
-                            .map_err(|error| {
-                                file_error(
-                                    "inspect final restored snapshot size",
-                                    &final_destination,
-                                    error,
-                                )
-                            })?
-                            .len()
-                            != restore_receipt.byte_count
-                            || file_digest_with_deadline(&pinned.file, Some(&final_deadline_state))?
-                                != restore_receipt.digest
-                            || snapshot_is_staging(&final_destination, &pinned.file)?
-                            || tokio::time::Instant::now() >= deadline
-                        {
-                            return Err(StateError::OperationTimedOut {
-                                operation: "SQLite restore",
-                                timeout_ms,
-                            });
-                        }
-                        Ok(())
-                    });
+                let result = validate_published_snapshot_handoff(
+                    &final_destination,
+                    &pinned
+                        .as_ref()
+                        .expect("final restore snapshot remains owned")
+                        .file,
+                )
+                .and_then(|()| {
+                    pinned
+                        .as_ref()
+                        .expect("final restore snapshot remains owned")
+                        .verify()?;
+                    if pinned
+                        .as_ref()
+                        .expect("final restore snapshot remains owned")
+                        .file
+                        .metadata()
+                        .map_err(|error| {
+                            file_error(
+                                "inspect final restored snapshot size",
+                                &final_destination,
+                                error,
+                            )
+                        })?
+                        .len()
+                        != restore_receipt.byte_count
+                        || file_digest_with_deadline(
+                            &pinned
+                                .as_ref()
+                                .expect("final restore snapshot remains owned")
+                                .file,
+                            Some(&final_deadline_state),
+                        )? != restore_receipt.digest
+                        || snapshot_is_staging(
+                            &final_destination,
+                            &pinned
+                                .as_ref()
+                                .expect("final restore snapshot remains owned")
+                                .file,
+                        )?
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        return Err(StateError::OperationTimedOut {
+                            operation: "SQLite restore",
+                            timeout_ms,
+                        });
+                    }
+                    Ok(())
+                });
+                let result = result.and_then(|()| {
+                    temporary_guard
+                        .as_mut()
+                        .expect("final restore guard remains owned")
+                        .disarm()
+                });
                 Ok(match result {
-                    Ok(()) => Ok((pinned, temporary_guard, identity_guard)),
-                    Err(error) => Err((error, pinned, temporary_guard, identity_guard)),
+                    Ok(()) => Ok((
+                        pinned
+                            .take()
+                            .expect("final restore snapshot is delivered once"),
+                        temporary_guard
+                            .take()
+                            .expect("final restore guard is delivered once"),
+                        identity_guard
+                            .take()
+                            .expect("final restore identity is delivered once"),
+                    )),
+                    Err(error) => Err((
+                        error,
+                        pinned
+                            .take()
+                            .expect("failed final restore snapshot is delivered once"),
+                        temporary_guard
+                            .take()
+                            .expect("failed final restore guard is delivered once"),
+                        identity_guard
+                            .take()
+                            .expect("failed final restore identity is delivered once"),
+                    )),
                 })
             },
         )
         .await;
-        let (pinned, mut temporary_guard, mut identity_guard) = match final_handoff {
+        let (pinned, _temporary_guard, mut identity_guard) = match final_handoff {
             Ok(Ok(result)) => result,
             Ok(Err((error, pinned, mut guard, identity_guard))) => {
                 guard.mark_publication_uncertain();
@@ -2160,7 +2557,6 @@ impl StateStore {
         };
         drop(pinned);
         cancellation_guard.disarm();
-        temporary_guard.disarm();
         identity_guard.disarm();
         Ok(())
     }
@@ -3902,6 +4298,8 @@ struct SnapshotCleanupGuard {
     operation_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     shared_retention: Option<SharedSnapshotRetention>,
     cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    #[cfg(unix)]
+    quarantine_name: Option<String>,
 }
 
 struct SnapshotCleanupPayload {
@@ -3912,6 +4310,8 @@ struct SnapshotCleanupPayload {
     memory_reservation: Option<SnapshotMemoryReservation>,
     operation_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     shared_retention: Option<SharedSnapshotRetention>,
+    #[cfg(unix)]
+    quarantine_name: Option<String>,
 }
 
 impl SnapshotCleanupPayload {
@@ -3925,6 +4325,8 @@ impl SnapshotCleanupPayload {
             operation_admission: self.operation_admission,
             shared_retention: self.shared_retention,
             cleanup_owner: None,
+            #[cfg(unix)]
+            quarantine_name: self.quarantine_name,
         }
     }
 }
@@ -3955,8 +4357,7 @@ impl BackupStagingLease {
     }
 
     fn disarm_published(&mut self) -> Result<(), StateError> {
-        self.snapshot.disarm();
-        Ok(())
+        self.snapshot.disarm()
     }
 
     fn mark_publication_uncertain(&mut self) {
@@ -4014,17 +4415,23 @@ impl SnapshotCleanupGuard {
         parent: &PinnedPrivateDirectory,
         cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
     ) -> Result<Self, StateError> {
+        let pinned_parent = parent
+            .file
+            .try_clone()
+            .map_err(|error| file_error("clone cleanup directory handle", &parent.path, error))?;
+        #[cfg(unix)]
+        let quarantine_name = reserve_snapshot_quarantine(parent)?;
         Ok(Self {
             path: path.to_owned(),
-            pinned_parent: Some(parent.file.try_clone().map_err(|error| {
-                file_error("clone cleanup directory handle", &parent.path, error)
-            })?),
+            pinned_parent: Some(pinned_parent),
             expected_file: None,
             state: SnapshotPublicationState::StagingBound,
             memory_reservation: None,
             operation_admission: None,
             shared_retention: None,
             cleanup_owner: Some(cleanup_owner),
+            #[cfg(unix)]
+            quarantine_name: Some(quarantine_name),
         })
     }
 
@@ -4079,8 +4486,11 @@ impl SnapshotCleanupGuard {
         Ok(())
     }
 
-    fn disarm(&mut self) {
+    fn disarm(&mut self) -> Result<(), StateError> {
         self.state = SnapshotPublicationState::Published;
+        #[cfg(unix)]
+        self.release_quarantine_reservation()?;
+        Ok(())
     }
 
     fn begin_publication(&mut self) {
@@ -4103,6 +4513,36 @@ impl SnapshotCleanupGuard {
         self.state = SnapshotPublicationState::PublicationUncertain;
     }
 
+    #[cfg(unix)]
+    fn release_quarantine_reservation(&mut self) -> Result<(), StateError> {
+        let Some(name) = self.quarantine_name.take() else {
+            return Ok(());
+        };
+        let parent = self
+            .pinned_parent
+            .as_ref()
+            .ok_or_else(|| StateError::InvalidPath {
+                path: self.path.clone(),
+                reason: "snapshot quarantine parent is not pinned",
+            })?;
+        rustix::fs::unlinkat(parent, name.as_str(), rustix::fs::AtFlags::empty()).map_err(
+            |error| {
+                file_error(
+                    "release snapshot quarantine reservation",
+                    &self.path,
+                    error.into(),
+                )
+            },
+        )?;
+        parent.sync_all().map_err(|error| {
+            file_error(
+                "sync released snapshot quarantine reservation",
+                &self.path,
+                error,
+            )
+        })
+    }
+
     fn take_cleanup_payload(&mut self) -> Option<SnapshotCleanupPayload> {
         if self.state != SnapshotPublicationState::StagingBound {
             self.cleanup_owner.take();
@@ -4117,42 +4557,63 @@ impl SnapshotCleanupGuard {
             memory_reservation: self.memory_reservation.take(),
             operation_admission: self.operation_admission.take(),
             shared_retention: self.shared_retention.take(),
+            #[cfg(unix)]
+            quarantine_name: self.quarantine_name.take(),
         })
     }
 
     fn detach_cleanup(&mut self) {
-        let (Some(payload), Some(mut owner)) =
-            (self.take_cleanup_payload(), self.cleanup_owner.take())
+        let (Some(payload), Some(owner)) = (self.take_cleanup_payload(), self.cleanup_owner.take())
         else {
             return;
         };
         let guard = payload.into_guard();
-        let _ = owner.handoff_payload(guard, |_, _, guard| {
-            let _ = guard.cleanup_now();
+        let _ = handoff_state_payload(owner, std::sync::Mutex::new(guard), |_, _, guard| {
+            let _ = guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cleanup_now();
         });
     }
 
     async fn cleanup(&mut self) -> Result<(), StateError> {
-        let (Some(payload), Some(mut owner)) =
-            (self.take_cleanup_payload(), self.cleanup_owner.take())
+        let (Some(payload), Some(owner)) = (self.take_cleanup_payload(), self.cleanup_owner.take())
         else {
             return Ok(());
         };
-        let guard = payload.into_guard();
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-        owner
-            .handoff_payload((guard, Some(result_tx)), |_, _, payload| {
-                let result = payload.0.cleanup_now();
-                if let Some(result_tx) = payload.1.take() {
-                    let _ = result_tx.send(result);
+        struct SnapshotCleanupWorker {
+            guard: std::sync::Mutex<SnapshotCleanupGuard>,
+            result: std::sync::mpsc::SyncSender<Result<(), StateError>>,
+            undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
+        }
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        handoff_state_payload(
+            owner,
+            SnapshotCleanupWorker {
+                guard: std::sync::Mutex::new(payload.into_guard()),
+                result: result_tx,
+                undelivered: std::sync::Mutex::new(None),
+            },
+            |_, _, payload| {
+                let result = payload
+                    .guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .cleanup_now();
+                if let Err(result) = payload.result.send(result) {
+                    *payload
+                        .undelivered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.0);
                 }
-            })
-            .map_err(|error| {
-                database(
-                    "submit SQLite snapshot cleanup",
-                    sqlx::Error::Protocol(error),
-                )
-            })?;
+            },
+        )
+        .map_err(|error| {
+            database(
+                "submit SQLite snapshot cleanup",
+                sqlx::Error::Protocol(error),
+            )
+        })?;
         let cutoff = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             match result_rx.try_recv() {
@@ -4187,6 +4648,8 @@ impl SnapshotCleanupGuard {
                 .into_iter()
                 .all(|artifact| !path_entry_exists(&artifact).unwrap_or(true))
             {
+                #[cfg(unix)]
+                self.release_quarantine_reservation()?;
                 self.state = SnapshotPublicationState::Reclaimed;
                 return Ok(());
             }
@@ -4233,10 +4696,14 @@ impl SnapshotCleanupGuard {
                     path: self.path.clone(),
                     reason: "snapshot cleanup child has no file name",
                 })?;
-            enforce_snapshot_quarantine_quota(
-                self.path.parent().unwrap_or_else(|| Path::new(".")),
-            )?;
-            let quarantine = format!(".gta-claw-quarantine-{}", writer_owner()?);
+            let quarantine = self
+                .quarantine_name
+                .as_ref()
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "snapshot quarantine capacity was not pre-reserved",
+                })?
+                .clone();
             rustix::fs::renameat(parent, name, parent, quarantine.as_str()).map_err(|error| {
                 file_error(
                     "quarantine pinned snapshot through held parent",
@@ -4280,6 +4747,7 @@ impl SnapshotCleanupGuard {
                     error,
                 )
             })?;
+            self.quarantine_name.take();
             self.state = SnapshotPublicationState::Reclaimed;
             return Ok(());
         }
@@ -4316,10 +4784,7 @@ impl SnapshotCleanupGuard {
 }
 
 #[cfg(unix)]
-fn enforce_snapshot_quarantine_quota(parent: &Path) -> Result<(), StateError> {
-    const MAX_QUARANTINE_ENTRIES: usize = 64;
-    const MAX_QUARANTINE_RESIDUAL_BYTES: u64 = MAX_AUTHENTICATED_SNAPSHOT_BYTES;
-
+fn snapshot_quarantine_usage(parent: &Path) -> Result<(usize, u64), StateError> {
     let mut entries = 0_usize;
     let mut residual_bytes = 0_u64;
     for entry in std::fs::read_dir(parent)
@@ -4354,13 +4819,61 @@ fn enforce_snapshot_quarantine_quota(parent: &Path) -> Result<(), StateError> {
                 reason: "snapshot quarantine residual byte count overflowed",
             })?;
     }
+    Ok((entries, residual_bytes))
+}
+
+#[cfg(unix)]
+fn reserve_snapshot_quarantine(parent: &PinnedPrivateDirectory) -> Result<String, StateError> {
+    const MAX_QUARANTINE_ENTRIES: usize = 64;
+    const MAX_QUARANTINE_RESIDUAL_BYTES: u64 = MAX_AUTHENTICATED_SNAPSHOT_BYTES;
+
+    let (entries, residual_bytes) = snapshot_quarantine_usage(&parent.path)?;
     if entries >= MAX_QUARANTINE_ENTRIES || residual_bytes > MAX_QUARANTINE_RESIDUAL_BYTES {
         return Err(StateError::InvalidPath {
-            path: parent.to_owned(),
+            path: parent.path.clone(),
             reason: "snapshot quarantine quota is exhausted",
         });
     }
-    Ok(())
+    for index in entries..MAX_QUARANTINE_ENTRIES {
+        let name = format!(".gta-claw-quarantine-slot-{index:02}");
+        match rustix::fs::openat(
+            &parent.file,
+            name.as_str(),
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL,
+            rustix::fs::Mode::from_bits_retain(0o600),
+        ) {
+            Ok(file) => {
+                let file = File::from(file);
+                file.sync_all().map_err(|error| {
+                    file_error("sync snapshot quarantine reservation", &parent.path, error)
+                })?;
+                parent.file.sync_all().map_err(|error| {
+                    file_error(
+                        "sync snapshot quarantine reservation directory",
+                        &parent.path,
+                        error,
+                    )
+                })?;
+                return Ok(name);
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => {
+                return Err(file_error(
+                    "reserve snapshot quarantine capacity",
+                    &parent.path,
+                    error.into(),
+                ));
+            }
+        }
+    }
+    Err(StateError::InvalidPath {
+        path: parent.path.clone(),
+        reason: "snapshot quarantine quota is exhausted",
+    })
 }
 
 #[cfg(unix)]
@@ -4510,25 +5023,27 @@ impl BackupConnectionGuard {
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        if let (Some(connection), Some(mut cleanup_owner)) =
+        if let (Some(connection), Some(cleanup_owner)) =
             (self.connection.take(), self.cleanup_owner.take())
         {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            if cleanup_owner
-                .handoff_payload(
-                    (Some(connection), Some(done_tx)),
-                    |_runtime, terminal_closes, payload| {
-                        let permit = terminal_closes
-                            .take_permit()
-                            .expect("discard close capacity was pre-reserved");
-                        let connection =
-                            payload.0.take().expect("discard connection remains owned");
-                        let done_tx = payload.1.take().expect("discard result remains owned");
-                        let result = permit.close(connection);
-                        let _ = done_tx.send(result);
-                    },
-                )
-                .is_err()
+            if handoff_state_payload(
+                cleanup_owner,
+                std::sync::Mutex::new((Some(connection), Some(done_tx))),
+                |_runtime, terminal_closes, payload| {
+                    let mut payload = payload
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let permit = terminal_closes
+                        .take_permit()
+                        .expect("discard close capacity was pre-reserved");
+                    let connection = payload.0.take().expect("discard connection remains owned");
+                    let done_tx = payload.1.take().expect("discard result remains owned");
+                    let result = permit.close(connection);
+                    let _ = done_tx.send(result);
+                },
+            )
+            .is_err()
             {
                 return claw_sqlite_file_control::TerminalCloseOutcome::Quarantined;
             }
@@ -4565,16 +5080,20 @@ impl std::ops::DerefMut for BackupConnectionGuard {
 impl Drop for BackupConnectionGuard {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take()
-            && let Some(mut cleanup_owner) = self.cleanup_owner.take()
+            && let Some(cleanup_owner) = self.cleanup_owner.take()
         {
             if let Some(cancellation) = &self.cancellation {
                 cancellation
                     .cancelled
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            let _ = cleanup_owner.handoff_payload(
-                Some(connection),
+            let _ = handoff_state_payload(
+                cleanup_owner,
+                std::sync::Mutex::new(Some(connection)),
                 |_runtime, terminal_closes, connection| {
+                    let mut connection = connection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let permit = terminal_closes
                         .take_permit()
                         .expect("backup drop close capacity was pre-reserved");
@@ -4852,8 +5371,9 @@ struct OwnedConnectionClosePayload {
     backup_lease: Option<BackupStagingLease>,
     backup_output: Option<File>,
     shared_terminal_retention: Option<SharedSnapshotRetention>,
+    terminal_retention: Option<SharedTerminalRetention>,
     result: Option<
-        tokio::sync::oneshot::Sender<(
+        std::sync::mpsc::SyncSender<(
             claw_sqlite_file_control::TerminalCloseOutcome,
             Option<BackupStagingLease>,
         )>,
@@ -4874,11 +5394,13 @@ fn close_owned_connection_payload(
     let result = if let Some(retention) = payload.shared_terminal_retention.take() {
         permit.close_with_shared_retention(connection, retention)
     } else {
-        permit.close_with_quarantine_retention(connection, || {
-            payload.backup_lease.as_mut().and_then(|lease| {
-                claw_sqlite_file_control::SnapshotCleanupLease::take_terminal_retention(lease)
-            })
-        })
+        permit.close_with_shared_retention(
+            connection,
+            payload
+                .terminal_retention
+                .take()
+                .expect("owned close terminal retention remains owned"),
+        )
     };
     payload.backup_output.take();
     result
@@ -4960,44 +5482,65 @@ impl OwnedSqliteConnectionGuard {
             .connection
             .take()
             .expect("owned SQLite connection remains live");
-        let mut cleanup_owner = self
+        let cleanup_owner = self
             .cleanup_owner
             .take()
             .expect("owned cleanup owner remains live");
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        cleanup_owner
-            .handoff_payload(
-                OwnedConnectionClosePayload {
-                    connection: Some(connection),
-                    backup_lease: self.backup_lease.take(),
-                    backup_output: self.backup_output.take(),
-                    shared_terminal_retention: self.shared_terminal_retention.take(),
-                    result: Some(done_tx),
+        let mut backup_lease = self.backup_lease.take();
+        let shared_terminal_retention = self.shared_terminal_retention.take();
+        let terminal_retention = shared_terminal_retention.is_none().then(|| {
+            Arc::new(std::sync::Mutex::new(backup_lease.as_mut().and_then(
+                |lease| {
+                    claw_sqlite_file_control::SnapshotCleanupLease::take_terminal_retention(lease)
                 },
-                |_runtime, terminal_closes, payload| {
-                    let result = close_owned_connection_payload(payload, terminal_closes);
-                    let done_tx = payload
-                        .result
-                        .take()
-                        .expect("owned close result remains owned");
-                    let _ = done_tx.send((result, payload.backup_lease.take()));
-                },
-            )
-            .map_err(sqlx::Error::Protocol)?;
+            )))
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        handoff_state_payload(
+            cleanup_owner,
+            std::sync::Mutex::new(OwnedConnectionClosePayload {
+                connection: Some(connection),
+                backup_lease,
+                backup_output: self.backup_output.take(),
+                shared_terminal_retention,
+                terminal_retention,
+                result: Some(done_tx),
+            }),
+            |_runtime, terminal_closes, payload| {
+                let mut payload = payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result = close_owned_connection_payload(&mut payload, terminal_closes);
+                let done_tx = payload
+                    .result
+                    .take()
+                    .expect("owned close result remains owned");
+                if let Err(error) = done_tx.send((result, payload.backup_lease.take())) {
+                    payload.backup_lease = error.0.1;
+                }
+            },
+        )
+        .map_err(sqlx::Error::Protocol)?;
         self.cancellation = None;
-        let (close, mut backup_lease) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
-                .await
-                .map_err(|_| {
-                    sqlx::Error::Protocol(
+        let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let (close, mut backup_lease) = loop {
+            match done_rx.try_recv() {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::TryRecvError::Empty) if std::time::Instant::now() < cutoff => {
+                    tokio::task::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return Err(sqlx::Error::Protocol(
                         "owned connection cleanup exceeded its fixed cutoff".to_owned(),
-                    )
-                })?
-                .map_err(|_| {
-                    sqlx::Error::Protocol(
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(sqlx::Error::Protocol(
                         "owned connection cleanup stopped without result".to_owned(),
-                    )
-                })?;
+                    ));
+                }
+            }
+        };
         if let Some(lease) = backup_lease.as_mut() {
             lease
                 .cleanup()
@@ -5039,19 +5582,34 @@ impl Drop for OwnedSqliteConnectionGuard {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         if let Some(connection) = self.connection.take()
-            && let Some(mut cleanup_owner) = self.cleanup_owner.take()
+            && let Some(cleanup_owner) = self.cleanup_owner.take()
         {
-            let _ = cleanup_owner.handoff_payload(
-                OwnedConnectionClosePayload {
+            let mut backup_lease = self.backup_lease.take();
+            let shared_terminal_retention = self.shared_terminal_retention.take();
+            let terminal_retention = shared_terminal_retention.is_none().then(|| {
+                Arc::new(std::sync::Mutex::new(backup_lease.as_mut().and_then(
+                    |lease| {
+                        claw_sqlite_file_control::SnapshotCleanupLease::take_terminal_retention(
+                            lease,
+                        )
+                    },
+                )))
+            });
+            let _ = handoff_state_payload(
+                cleanup_owner,
+                std::sync::Mutex::new(OwnedConnectionClosePayload {
                     connection: Some(connection),
-                    backup_lease: self.backup_lease.take(),
+                    backup_lease,
                     backup_output: self.backup_output.take(),
-                    shared_terminal_retention: self.shared_terminal_retention.take(),
+                    shared_terminal_retention,
+                    terminal_retention,
                     result: None,
-                },
+                }),
                 |_runtime, terminal_closes, payload| {
-                    let _ = close_owned_connection_payload(payload, terminal_closes);
-                    payload.backup_lease.take();
+                    let mut payload = payload
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = close_owned_connection_payload(&mut payload, terminal_closes);
                 },
             );
         }
@@ -6023,7 +6581,7 @@ fn initialize_or_validate_lock_contents(
         .metadata()
         .map_err(|error| file_error("inspect writer-lock contents", path, error))?
         .len();
-    if length > 4096 {
+    if length > MAX_WRITER_LOCK_CONTENT_BYTES {
         return Err(StateError::InvalidPath {
             path: path.to_owned(),
             reason: "writer-lock identity contents are too large",
@@ -6032,8 +6590,16 @@ fn initialize_or_validate_lock_contents(
     file.seek(SeekFrom::Start(0))
         .map_err(|error| file_error("seek writer-lock contents", path, error))?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    (&mut *file)
+        .take(MAX_WRITER_LOCK_CONTENT_BYTES + 1)
+        .read_to_string(&mut contents)
         .map_err(|error| file_error("read writer-lock contents", path, error))?;
+    if contents.len() as u64 > MAX_WRITER_LOCK_CONTENT_BYTES {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "writer-lock identity contents are too large",
+        });
+    }
     if contents.is_empty() && initialize_empty {
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(expected.as_bytes()))
@@ -6057,8 +6623,16 @@ fn read_lock_contents(path: &Path, file: &mut File) -> Result<String, StateError
     file.seek(SeekFrom::Start(0))
         .map_err(|error| file_error("seek writer-lock contents", path, error))?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    (&mut *file)
+        .take(MAX_WRITER_LOCK_CONTENT_BYTES + 1)
+        .read_to_string(&mut contents)
         .map_err(|error| file_error("read writer-lock contents", path, error))?;
+    if contents.len() as u64 > MAX_WRITER_LOCK_CONTENT_BYTES {
+        return Err(StateError::InvalidPath {
+            path: path.to_owned(),
+            reason: "writer-lock contents are too large",
+        });
+    }
     Ok(contents)
 }
 
@@ -6222,11 +6796,32 @@ fn acquire_store_lock(
                 reason: "stable Windows lock identity is unavailable",
             }
         })?;
+    if lock_guard
+        .metadata()
+        .map_err(|error| file_error("inspect Windows writer-lock header", &lock_path, error))?
+        .len()
+        > MAX_WRITER_LOCK_CONTENT_BYTES
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path,
+            reason: "Windows writer-lock header is too large",
+        });
+    }
     let mut contents = String::new();
     lock_guard
         .seek(SeekFrom::Start(0))
-        .and_then(|_| lock_guard.read_to_string(&mut contents))
+        .and_then(|_| {
+            (&mut lock_guard)
+                .take(MAX_WRITER_LOCK_CONTENT_BYTES + 1)
+                .read_to_string(&mut contents)
+        })
         .map_err(|error| file_error("read Windows writer-lock header", &lock_path, error))?;
+    if contents.len() as u64 > MAX_WRITER_LOCK_CONTENT_BYTES {
+        return Err(StateError::InvalidPath {
+            path: lock_path,
+            reason: "Windows writer-lock header is too large",
+        });
+    }
     let header_prefix = format!(
         "v2\n{}\n{}\n",
         hex_encode(&database_identity),
@@ -6925,10 +7520,31 @@ fn verify_windows_lock_binding(
     let mut file = lock_file
         .try_clone()
         .map_err(|error| file_error("clone Windows writer lock", lock_path, error))?;
+    if file
+        .metadata()
+        .map_err(|error| file_error("inspect Windows writer-lock header", lock_path, error))?
+        .len()
+        > MAX_WRITER_LOCK_CONTENT_BYTES
+    {
+        return Err(StateError::InvalidPath {
+            path: lock_path.to_owned(),
+            reason: "Windows writer-lock header is too large",
+        });
+    }
     let mut contents = Vec::new();
     file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.read_to_end(&mut contents))
+        .and_then(|_| {
+            (&mut file)
+                .take(MAX_WRITER_LOCK_CONTENT_BYTES + 1)
+                .read_to_end(&mut contents)
+        })
         .map_err(|error| file_error("read Windows writer-lock header", lock_path, error))?;
+    if contents.len() as u64 > MAX_WRITER_LOCK_CONTENT_BYTES {
+        return Err(StateError::InvalidPath {
+            path: lock_path.to_owned(),
+            reason: "Windows writer-lock header is too large",
+        });
+    }
     let prefix = format!(
         "v2\n{}\n{}\n",
         hex_encode(&database_identity),
@@ -7004,6 +7620,16 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
     const PREFIX: &str = "gta-claw-writer-v1\n";
     const MAX_IDENTITY_BYTES: u64 = 1_048_576;
 
+    let database_file = open_windows_file_no_follow(database, false, false)?;
+    let link_count = claw_sqlite_file_control::windows_file_link_count(&database_file)
+        .map_err(|error| file_control_database("inspect Windows database links", error))?;
+    if link_count != 1 {
+        return Err(StateError::InvalidPath {
+            path: database.to_owned(),
+            reason: "hard-linked SQLite databases are not supported",
+        });
+    }
+
     // Locking the shared identity stream makes first-name selection race-free.
     let identity_path = writer_identity_path_for(database);
     let mut identity_file = acquire_writer_lock(&identity_path)?;
@@ -7022,9 +7648,16 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
         .seek(SeekFrom::Start(0))
         .map_err(|error| file_error("seek writer lock identity", database, error))?;
     let mut bytes = Vec::with_capacity(length as usize);
-    identity_file
+    (&mut identity_file)
+        .take(MAX_IDENTITY_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| file_error("read writer lock identity", database, error))?;
+    if bytes.len() as u64 > MAX_IDENTITY_BYTES {
+        return Err(StateError::InvalidPath {
+            path: database.to_owned(),
+            reason: "writer lock identity metadata is too large",
+        });
+    }
     let expected = format!("{PREFIX}{}", database.display()).into_bytes();
     let mut update = bytes.is_empty();
     if !bytes.is_empty() {
@@ -7048,11 +7681,17 @@ fn prepare_windows_database_identity(database: &Path) -> Result<(), StateError> 
             if case_only {
                 let stored_file = open_windows_file_no_follow(&stored, false, false)?;
                 let database_file = open_windows_file_no_follow(database, false, false)?;
-                if claw_sqlite_file_control::windows_file_identity(&stored_file)
-                    .map_err(|error| file_control_database("identify stored Windows path", error))?
-                    != claw_sqlite_file_control::windows_file_identity(&database_file).map_err(
-                        |error| file_control_database("identify current Windows path", error),
+                if claw_sqlite_file_control::windows_file_final_path(&stored_file)
+                    .map_err(|error| file_control_database("resolve stored Windows path", error))?
+                    != claw_sqlite_file_control::windows_file_final_path(&database_file).map_err(
+                        |error| file_control_database("resolve current Windows path", error),
                     )?
+                    || claw_sqlite_file_control::windows_file_identity(&stored_file).map_err(
+                        |error| file_control_database("identify stored Windows path", error),
+                    )? != claw_sqlite_file_control::windows_file_identity(&database_file)
+                        .map_err(|error| {
+                            file_control_database("identify current Windows path", error)
+                        })?
                 {
                     return Err(StateError::InvalidPath {
                         path: database.to_owned(),
@@ -7150,6 +7789,20 @@ async fn inspect_database(
     require_latest: bool,
     deadline_state: Option<Arc<OpenDeadlineState>>,
 ) -> Result<InspectedDatabase, StateError> {
+    let inspection_deadline = deadline_state.as_ref().map_or_else(
+        || tokio::time::Instant::now() + MAX_CONFIGURED_TIMEOUT,
+        |state| tokio::time::Instant::from_std(state.deadline),
+    );
+    let inspection_timeout = || {
+        deadline_state.as_ref().map_or(
+            StateError::OperationTimedOut {
+                operation: "SQLite database inspection",
+                timeout_ms: u64::try_from(MAX_CONFIGURED_TIMEOUT.as_millis())
+                    .expect("timeout fits u64"),
+            },
+            |state| state.timeout_error(),
+        )
+    };
     if database_file
         .metadata()
         .map_err(|error| file_error("inspect state database", path, error))?
@@ -7158,6 +7811,14 @@ async fn inspect_database(
     {
         return Ok(InspectedDatabase::Fresh);
     }
+    ensure_state_cleanup_executor(inspection_deadline)
+        .await
+        .map_err(|error| {
+            database(
+                "prepare database inspection cleanup executor",
+                sqlx::Error::Protocol(error),
+            )
+        })?;
     verify_path_identity(path, database_file)?;
     let wal = sqlite_sidecar(path, "-wal");
     let shm = sqlite_sidecar(path, "-shm");
@@ -7169,22 +7830,28 @@ async fn inspect_database(
         });
     }
     if !has_wal {
-        let mut inspection = SqliteConnection::connect_with(
-            &SqliteConnectOptions::new()
-                .filename(path)
-                .read_only(true)
-                .create_if_missing(false)
-                .immutable(true)
-                .foreign_keys(true),
+        let mut inspection = tokio::time::timeout_at(
+            inspection_deadline,
+            SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(path)
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .immutable(true)
+                    .foreign_keys(true),
+            ),
         )
         .await
+        .map_err(|_| inspection_timeout())?
         .map_err(|error| database("open immutable database inspection", error))?;
         install_open_deadline_handler(&mut inspection, deadline_state.clone()).await?;
         let result = inspect_database_connection(&mut inspection, path, require_latest).await;
-        let close = inspection
-            .close()
+        let close = tokio::time::timeout_at(inspection_deadline, inspection.close())
             .await
-            .map_err(|error| database("close immutable database inspection", error));
+            .map_err(|_| inspection_timeout())
+            .and_then(|result| {
+                result.map_err(|error| database("close immutable database inspection", error))
+            });
         verify_path_identity(path, database_file)?;
         return match (result, close) {
             (Err(error), _) => Err(error),
@@ -7234,22 +7901,30 @@ async fn inspect_database(
     let source_cleanup_owner = cleanup_owners
         .pop()
         .expect("inspection source cleanup owner");
-    let inspection = SqliteConnection::connect_with(
-        &SqliteConnectOptions::new()
-            .in_memory(true)
-            .foreign_keys(true),
+    let inspection = tokio::time::timeout_at(
+        inspection_deadline,
+        SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        ),
     )
     .await
+    .map_err(|_| inspection_timeout())?
     .map_err(|error| database("open in-memory database inspection", error))?;
-    let mut source = SqliteConnection::connect_with(
-        &SqliteConnectOptions::new()
-            .filename(path)
-            .read_only(true)
-            .create_if_missing(false)
-            .immutable(!has_wal)
-            .busy_timeout(Duration::ZERO),
+    let mut source = tokio::time::timeout_at(
+        inspection_deadline,
+        SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .create_if_missing(false)
+                .immutable(!has_wal)
+                .busy_timeout(Duration::ZERO),
+        ),
     )
     .await
+    .map_err(|_| inspection_timeout())?
     .map_err(|error| database("open database inspection source", error))?;
     let max_pages = bounded_backup_max_pages(&mut source).await?;
     let cancelled = deadline_state.as_ref().map_or_else(
@@ -7383,7 +8058,7 @@ async fn initialize_database(
 
 async fn reject_late_open_claim(
     connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
-    mut cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
     terminal_permit: claw_sqlite_file_control::TerminalClosePermit,
     owner: &str,
     deadline_state: &OpenDeadlineState,
@@ -7391,11 +8066,7 @@ async fn reject_late_open_claim(
 ) -> StateError {
     struct LateClaimCleanupPayload {
         connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
-        close: Option<
-            claw_sqlite_file_control::RetainedTerminalClose<
-                sqlx::pool::PoolConnection<sqlx::Sqlite>,
-            >,
-        >,
+        terminal_permit: Option<claw_sqlite_file_control::TerminalClosePermit>,
         owner: String,
         deadline: std::time::Instant,
         result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
@@ -7403,16 +8074,19 @@ async fn reject_late_open_claim(
 
     let primary = deadline_state.timeout_error();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let handoff = cleanup_owner.handoff_terminal_payload(
-        terminal_permit,
-        LateClaimCleanupPayload {
+    let handoff = handoff_state_payload(
+        cleanup_owner,
+        std::sync::Mutex::new(LateClaimCleanupPayload {
             connection: Some(connection),
-            close: None,
+            terminal_permit: Some(terminal_permit),
             owner: owner.to_owned(),
             deadline: deadline_state.deadline,
             result: Some(result_tx),
-        },
-        |runtime, payload| {
+        }),
+        |runtime, _, payload| {
+            let mut payload = payload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let remaining = payload
                 .deadline
                 .saturating_duration_since(std::time::Instant::now());
@@ -7420,6 +8094,7 @@ async fn reject_late_open_claim(
                 Err("late writer-claim cleanup cutoff elapsed".to_owned())
             } else {
                 runtime.block_on(async {
+                    let owner = payload.owner.clone();
                     let connection = payload
                         .connection
                         .as_mut()
@@ -7431,7 +8106,7 @@ async fn reject_late_open_claim(
                         sqlx::query(
                             "DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?",
                         )
-                        .bind(&payload.owner)
+                        .bind(&owner)
                         .execute(&mut **connection)
                         .await
                         .map_err(|error| error.to_string())?;
@@ -7439,7 +8114,7 @@ async fn reject_late_open_claim(
                             "SELECT COUNT(*) FROM claw_writer_lock
                                  WHERE singleton = 1 AND owner = ?",
                         )
-                        .bind(&payload.owner)
+                        .bind(&owner)
                         .fetch_one(&mut **connection)
                         .await
                         .map_err(|error| error.to_string())?;
@@ -7456,28 +8131,15 @@ async fn reject_late_open_claim(
                 .connection
                 .take()
                 .expect("late-claim close is single-use");
-            payload.close = Some(claw_sqlite_file_control::RetainedTerminalClose::new(
-                connection,
-            ));
             let close = match payload
-                .close
-                .as_mut()
-                .expect("late-claim close remains owned")
-                .run(runtime)
+                .terminal_permit
+                .take()
+                .expect("late-claim terminal permit remains owned")
+                .close(connection)
             {
-                claw_sqlite_file_control::TerminalCloseOutcome::Closed => payload
-                    .close
-                    .as_mut()
-                    .expect("late-claim close remains owned")
-                    .finish_success()
-                    .then_some(())
-                    .ok_or_else(|| "terminal close future destruction panicked".to_owned()),
-                claw_sqlite_file_control::TerminalCloseOutcome::Failed(error) => {
-                    Err(format!("terminal close failed: {error}"))
-                }
+                claw_sqlite_file_control::TerminalCloseOutcome::Closed => Ok(()),
                 outcome => Err(format!("terminal close did not complete: {outcome:?}")),
             };
-            let close_succeeded = close.is_ok();
             let outcome = match (cleanup, close) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(cleanup), Ok(())) => Err(cleanup),
@@ -7486,11 +8148,6 @@ async fn reject_late_open_claim(
             };
             if let Some(result) = payload.result.take() {
                 let _ = result.send(outcome.clone());
-            }
-            if close_succeeded {
-                Ok(())
-            } else {
-                Err(outcome.expect_err("failed close reports a terminal error"))
             }
         },
     );
@@ -8488,7 +9145,7 @@ async fn materialize_authenticated_snapshot(
     let worker_owner = cleanup_owners
         .pop()
         .expect("restore materialization worker owner");
-    let mut finalization_worker_owner = cleanup_owners
+    let finalization_worker_owner = cleanup_owners
         .pop()
         .expect("restore finalization worker owner");
     let source_cleanup_owner = cleanup_owners.pop().expect("restore source cleanup owner");
@@ -8526,6 +9183,7 @@ async fn materialize_authenticated_snapshot(
         });
     }
     let output_destination = destination.to_owned();
+    let mut output_guard = Some(output_guard);
     let output = run_bounded_filesystem(
         output_creation_owner,
         tokio::time::Instant::from_std(deadline) + Duration::from_secs(1),
@@ -8534,10 +9192,27 @@ async fn materialize_authenticated_snapshot(
             .as_ref()
             .map_or(u64::MAX, |state| state.timeout_ms),
         move || {
-            let result = create_bound_snapshot_output(&output_destination, Some(&mut output_guard));
+            let result = create_bound_snapshot_output(
+                &output_destination,
+                Some(
+                    output_guard
+                        .as_mut()
+                        .expect("restore output guard remains owned"),
+                ),
+            );
             Ok(match result {
-                Ok(output) => Ok((output, output_guard)),
-                Err(error) => Err((error, output_guard)),
+                Ok(output) => Ok((
+                    output,
+                    output_guard
+                        .take()
+                        .expect("restore output guard is delivered once"),
+                )),
+                Err(error) => Err((
+                    error,
+                    output_guard
+                        .take()
+                        .expect("failed restore output guard is delivered once"),
+                )),
             })
         },
     )
@@ -8724,41 +9399,44 @@ async fn materialize_authenticated_snapshot(
         let primary = invalid_backup(source, "clear restored writer ownership", error);
         let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let close_retention = Arc::clone(&operation_reservation);
-        finalization_worker_owner
-            .handoff_payload(
-                (
-                    Some(destination_connection),
-                    Some(close_retention),
-                    Some(close_tx),
-                ),
-                |_, terminal_closes, payload| {
-                    let permit = terminal_closes
-                        .take_permit()
-                        .expect("restore destination close capacity was pre-reserved");
-                    let destination_connection = payload
-                        .0
-                        .take()
-                        .expect("restore destination connection remains owned");
-                    let close_retention = payload
-                        .1
-                        .take()
-                        .expect("restore close retention remains owned");
-                    let close_tx = payload
-                        .2
-                        .take()
-                        .expect("restore close result remains owned");
-                    let _ = close_tx.send(
-                        permit.close_with_shared_retention(destination_connection, close_retention),
-                    );
-                },
+        handoff_state_payload(
+            finalization_worker_owner,
+            std::sync::Mutex::new((
+                Some(destination_connection),
+                Some(close_retention),
+                Some(close_tx),
+            )),
+            |_, terminal_closes, payload| {
+                let mut payload = payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let permit = terminal_closes
+                    .take_permit()
+                    .expect("restore destination close capacity was pre-reserved");
+                let destination_connection = payload
+                    .0
+                    .take()
+                    .expect("restore destination connection remains owned");
+                let close_retention = payload
+                    .1
+                    .take()
+                    .expect("restore close retention remains owned");
+                let close_tx = payload
+                    .2
+                    .take()
+                    .expect("restore close result remains owned");
+                let _ = close_tx.send(
+                    permit.close_with_shared_retention(destination_connection, close_retention),
+                );
+            },
+        )
+        .map_err(|handoff| {
+            append_operation_cleanup(
+                "SQLite restore",
+                primary.clone(),
+                format!("destination terminal close handoff: {handoff}"),
             )
-            .map_err(|handoff| {
-                append_operation_cleanup(
-                    "SQLite restore",
-                    primary.clone(),
-                    format!("destination terminal close handoff: {handoff}"),
-                )
-            })?;
+        })?;
         let close = tokio::time::timeout(std::time::Duration::from_secs(1), close_rx)
             .await
             .ok()
@@ -8800,6 +9478,7 @@ async fn materialize_authenticated_snapshot(
     let inspection_destination = destination.to_owned();
     let inspection_deadline = deadline_state.clone();
     let inspection_receipt = receipt.clone();
+    let mut output_guard = Some(output_guard);
     let inspected = run_bounded_filesystem(
         output_inspection_owner,
         tokio::time::Instant::from_std(deadline),
@@ -8810,6 +9489,8 @@ async fn materialize_authenticated_snapshot(
         move || {
             let result = (|| {
                 let expected_file = output_guard
+                    .as_ref()
+                    .expect("snapshot inspection guard remains owned")
                     .expected_file
                     .as_ref()
                     .expect("restore output identity was bound before finalization");
@@ -8837,8 +9518,15 @@ async fn materialize_authenticated_snapshot(
                 secure_private_snapshot_file(&inspection_destination)
             })();
             Ok(match result {
-                Ok(()) => Ok(output_guard),
-                Err(error) => Err((error, output_guard)),
+                Ok(()) => Ok(output_guard
+                    .take()
+                    .expect("snapshot inspection guard is delivered once")),
+                Err(error) => Err((
+                    error,
+                    output_guard
+                        .take()
+                        .expect("failed snapshot inspection guard is delivered once"),
+                )),
             })
         },
     )
@@ -9710,6 +10398,7 @@ async fn backup_pool(
         .pop()
         .expect("logical backup source cleanup owner");
     let preflight_destination = destination.to_owned();
+    let mut snapshot_cleanup_owner = Some(snapshot_cleanup_owner);
     let (destination_directory, temporary, snapshot_guard) = run_bounded_filesystem(
         destination_preflight_owner,
         deadline,
@@ -9735,9 +10424,11 @@ async fn backup_pool(
             let guard = SnapshotCleanupGuard::new_pinned(
                 &preflight_destination,
                 &destination_directory,
-                snapshot_cleanup_owner,
+                snapshot_cleanup_owner
+                    .take()
+                    .expect("backup snapshot cleanup owner is consumed once"),
             )?;
-            Ok((destination_directory, preflight_destination, guard))
+            Ok((destination_directory, preflight_destination.clone(), guard))
         },
     )
     .await?;
@@ -9758,6 +10449,7 @@ async fn backup_pool(
     };
     let mut cancellation_guard = OperationCancellationGuard::new(Arc::clone(&deadline_state));
     let output_temporary = temporary.clone();
+    let mut temporary_guard = Some(temporary_guard);
     let output = run_bounded_filesystem(
         output_creation_owner,
         deadline + Duration::from_secs(1),
@@ -9766,11 +10458,26 @@ async fn backup_pool(
         move || {
             let result = create_bound_snapshot_output(
                 &output_temporary,
-                Some(&mut temporary_guard.snapshot),
+                Some(
+                    &mut temporary_guard
+                        .as_mut()
+                        .expect("backup staging guard remains owned")
+                        .snapshot,
+                ),
             );
             Ok(match result {
-                Ok(output) => Ok((output, temporary_guard)),
-                Err(error) => Err((error, temporary_guard)),
+                Ok(output) => Ok((
+                    output,
+                    temporary_guard
+                        .take()
+                        .expect("backup staging guard is delivered once"),
+                )),
+                Err(error) => Err((
+                    error,
+                    temporary_guard
+                        .take()
+                        .expect("failed backup staging guard is delivered once"),
+                )),
             })
         },
     )
@@ -9812,11 +10519,15 @@ async fn backup_pool(
     let max_pages = match bounded_backup_max_pages(&mut connection).await {
         Ok(max_pages) => max_pages,
         Err(error) => {
-            let mut owner = validation_cleanup_owner;
+            let owner = validation_cleanup_owner;
             let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-            if let Err(handoff) = owner.handoff_payload(
-                (Some(destination_connection), Some(close_tx)),
+            if let Err(handoff) = handoff_state_payload(
+                owner,
+                std::sync::Mutex::new((Some(destination_connection), Some(close_tx))),
                 |_, terminal_closes, payload| {
+                    let mut payload = payload
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let permit = terminal_closes
                         .take_permit()
                         .expect("backup destination close capacity was pre-reserved");
@@ -10002,6 +10713,7 @@ async fn backup_pool(
     let inspection_destination = destination.to_owned();
     let inspection_deadline_state = Arc::clone(&deadline_state);
     let inspection_receipt = write_receipt.clone();
+    let mut temporary_guard = Some(temporary_guard);
     let inspection = run_bounded_filesystem(
         inspection_owner,
         deadline,
@@ -10009,14 +10721,38 @@ async fn backup_pool(
         timeout_ms,
         move || {
             if let Err(error) = secure_private_snapshot_file(&inspection_temporary) {
-                return Ok(Err((error, None, temporary_guard)));
+                return Ok(Err((
+                    error,
+                    None,
+                    temporary_guard
+                        .take()
+                        .expect("failed backup inspection guard is delivered once"),
+                )));
             }
             let pinned = match PinnedSnapshot::open(&inspection_temporary) {
                 Ok(pinned) => pinned,
-                Err(error) => return Ok(Err((error, None, temporary_guard))),
+                Err(error) => {
+                    return Ok(Err((
+                        error,
+                        None,
+                        temporary_guard
+                            .take()
+                            .expect("failed backup inspection guard is delivered once"),
+                    )));
+                }
             };
-            if let Err(error) = temporary_guard.bind_file(&pinned.file) {
-                return Ok(Err((error, Some(pinned), temporary_guard)));
+            if let Err(error) = temporary_guard
+                .as_mut()
+                .expect("backup inspection guard remains owned")
+                .bind_file(&pinned.file)
+            {
+                return Ok(Err((
+                    error,
+                    Some(pinned),
+                    temporary_guard
+                        .take()
+                        .expect("failed backup inspection guard is delivered once"),
+                )));
             }
             let snapshot_length = match pinned.file.metadata() {
                 Ok(metadata) => metadata.len(),
@@ -10028,7 +10764,9 @@ async fn backup_pool(
                             error,
                         ),
                         Some(pinned),
-                        temporary_guard,
+                        temporary_guard
+                            .take()
+                            .expect("failed backup inspection guard is delivered once"),
                     )));
                 }
             };
@@ -10039,18 +10777,31 @@ async fn backup_pool(
                         && snapshot_length == inspection_receipt.byte_count
                         && digest == inspection_receipt.digest =>
                 {
-                    Ok(Ok((pinned, temporary_guard)))
+                    Ok(Ok((
+                        pinned,
+                        temporary_guard
+                            .take()
+                            .expect("backup inspection guard is delivered once"),
+                    )))
                 }
                 Ok(_) => Ok(Err((
                     StateError::InvalidBackup {
-                        path: inspection_destination,
+                        path: inspection_destination.clone(),
                         reason: "completed backup failed final held size/digest verification"
                             .to_owned(),
                     },
                     Some(pinned),
-                    temporary_guard,
+                    temporary_guard
+                        .take()
+                        .expect("failed backup inspection guard is delivered once"),
                 ))),
-                Err(error) => Ok(Err((error, Some(pinned), temporary_guard))),
+                Err(error) => Ok(Err((
+                    error,
+                    Some(pinned),
+                    temporary_guard
+                        .take()
+                        .expect("failed backup inspection guard is delivered once"),
+                ))),
             }
         },
     )
@@ -10079,6 +10830,8 @@ async fn backup_pool(
     let durability_destination = destination.to_owned();
     let durability_temporary = temporary.clone();
     let durability_deadline_state = Arc::clone(&deadline_state);
+    let mut pinned = Some(pinned);
+    let mut temporary_guard = Some(temporary_guard);
     let durability = run_bounded_filesystem(
         durability_owner,
         deadline,
@@ -10088,7 +10841,10 @@ async fn backup_pool(
             let result = (|| {
                 let mut identity_guard = initialize_restored_store_identity(
                     &durability_temporary,
-                    &pinned.file,
+                    &pinned
+                        .as_ref()
+                        .expect("backup durability snapshot remains owned")
+                        .file,
                     &durability_destination,
                 )?;
                 if tokio::time::Instant::now() >= deadline {
@@ -10097,8 +10853,12 @@ async fn backup_pool(
                         timeout_ms,
                     });
                 }
-                let mut seal =
-                    create_trusted_backup_seal(&pinned, Some(durability_deadline_state.as_ref()))?;
+                let mut seal = create_trusted_backup_seal(
+                    pinned
+                        .as_ref()
+                        .expect("backup durability snapshot remains owned"),
+                    Some(durability_deadline_state.as_ref()),
+                )?;
                 if tokio::time::Instant::now() >= deadline {
                     let error = StateError::OperationTimedOut {
                         operation: "SQLite backup",
@@ -10118,7 +10878,11 @@ async fn backup_pool(
                         error,
                     ));
                 }
-                if let Err(error) = pinned.sync() {
+                if let Err(error) = pinned
+                    .as_ref()
+                    .expect("backup durability snapshot remains owned")
+                    .sync()
+                {
                     let error = match seal.cleanup() {
                         Ok(()) => error,
                         Err(cleanup) => append_operation_cleanup(
@@ -10152,20 +10916,36 @@ async fn backup_pool(
                         error,
                     ));
                 }
-                Ok((pinned, identity_guard, seal))
+                Ok((identity_guard, seal))
             })();
             Ok(match result {
-                Ok((pinned, identity_guard, seal)) => {
-                    Ok((pinned, identity_guard, seal, temporary_guard))
-                }
-                Err(error) => Err((error, temporary_guard)),
+                Ok((identity_guard, seal)) => Ok((
+                    pinned
+                        .take()
+                        .expect("backup durability snapshot is delivered once"),
+                    identity_guard,
+                    seal,
+                    temporary_guard
+                        .take()
+                        .expect("backup durability guard is delivered once"),
+                )),
+                Err(error) => Err((
+                    error,
+                    pinned
+                        .take()
+                        .expect("failed backup durability snapshot is delivered once"),
+                    temporary_guard
+                        .take()
+                        .expect("failed backup durability guard is delivered once"),
+                )),
             })
         },
     )
     .await?;
-    let (pinned, identity_guard, seal, mut temporary_guard) = match durability {
+    let (pinned, identity_guard, seal, temporary_guard) = match durability {
         Ok(durable) => durable,
-        Err((error, mut guard)) => {
+        Err((error, pinned, mut guard)) => {
+            drop(pinned);
             return Err(cleanup_backup_staging_or_error(&mut guard, error).await);
         }
     };
@@ -10173,17 +10953,24 @@ async fn backup_pool(
     let caller_receipt = write_receipt.clone();
     let publication_receipt = write_receipt;
     let publication_deadline_state = Arc::clone(&deadline_state);
+    let mut pinned = Some(pinned);
+    let mut temporary_guard = Some(temporary_guard);
+    let mut identity_guard = Some(identity_guard);
+    let mut seal = Some(seal);
     let publication = run_bounded_filesystem(
         publication_owner,
         deadline + Duration::from_secs(1),
         "SQLite backup",
         timeout_ms,
         move || {
-            let mut identity_guard = identity_guard;
-            let mut seal = seal;
             let result = publish_bound_snapshot(
-                &pinned,
-                &mut temporary_guard.snapshot,
+                pinned
+                    .as_ref()
+                    .expect("backup publication snapshot remains owned"),
+                &mut temporary_guard
+                    .as_mut()
+                    .expect("backup publication guard remains owned")
+                    .snapshot,
                 &publication_destination,
                 "SQLite backup",
                 Some((deadline, timeout_ms)),
@@ -10194,16 +10981,26 @@ async fn backup_pool(
                     let handoff =
                         validate_published_snapshot_handoff(
                             &publication_destination,
-                            &pinned.file,
+                            &pinned
+                                .as_ref()
+                                .expect("backup publication snapshot remains owned")
+                                .file,
                         )
                         .and_then(
                             |()| {
-                                pinned.verify()?;
+                                pinned
+                                    .as_ref()
+                                    .expect("backup publication snapshot remains owned")
+                                    .verify()?;
                                 let sealed_digest = validate_trusted_backup_seal(
-                                    &pinned,
+                                    pinned
+                                        .as_ref()
+                                        .expect("backup publication snapshot remains owned"),
                                     Some(&publication_deadline_state),
                                 )?;
                                 if pinned
+                                    .as_ref()
+                                    .expect("backup publication snapshot remains owned")
                                     .file
                                     .metadata()
                                     .map_err(|error| {
@@ -10216,13 +11013,19 @@ async fn backup_pool(
                                     .len()
                                     != publication_receipt.byte_count
                                     || file_digest_with_deadline(
-                                        &pinned.file,
+                                        &pinned
+                                            .as_ref()
+                                            .expect("backup publication snapshot remains owned")
+                                            .file,
                                         Some(&publication_deadline_state),
                                     )? != publication_receipt.digest
                                     || sealed_digest.as_slice() != publication_receipt.digest
                                     || snapshot_is_staging(
                                         &publication_destination,
-                                        &pinned.file,
+                                        &pinned
+                                            .as_ref()
+                                            .expect("backup publication snapshot remains owned")
+                                            .file,
                                     )?
                                 {
                                     return Err(StateError::InvalidBackup {
@@ -10248,34 +11051,78 @@ async fn backup_pool(
                         );
                     match handoff {
                         Ok(()) => {
-                            identity_guard.mark_published();
-                            seal.disarm();
-                            Ok((pinned, temporary_guard, identity_guard))
+                            identity_guard
+                                .as_mut()
+                                .expect("backup identity guard remains owned")
+                                .mark_published();
+                            seal.as_mut()
+                                .expect("backup seal remains owned")
+                                .disarm();
+                            Ok((
+                                pinned
+                                    .take()
+                                    .expect("published backup snapshot is delivered once"),
+                                temporary_guard
+                                    .take()
+                                    .expect("published backup guard is delivered once"),
+                                identity_guard
+                                    .take()
+                                    .expect("published backup identity is delivered once"),
+                            ))
                         }
                         Err(error) => {
-                            identity_guard.mark_published();
-                            seal.disarm();
-                            temporary_guard.mark_publication_uncertain();
+                            identity_guard
+                                .as_mut()
+                                .expect("backup identity guard remains owned")
+                                .mark_published();
+                            seal.as_mut()
+                                .expect("backup seal remains owned")
+                                .disarm();
+                            temporary_guard
+                                .as_mut()
+                                .expect("backup publication guard remains owned")
+                                .mark_publication_uncertain();
                             Err((
                                 StateError::PublicationUncertain {
-                                    path: publication_destination,
+                                    path: publication_destination.clone(),
                                     reason: format!(
                                         "published backup failed final identity/deadline validation: {error}"
                                     ),
                                 },
-                                pinned,
-                                temporary_guard,
+                                pinned
+                                    .take()
+                                    .expect("uncertain backup snapshot is delivered once"),
+                                temporary_guard
+                                    .take()
+                                    .expect("uncertain backup guard is delivered once"),
                             ))
                         }
                     }
                 }
                 Err(error @ StateError::PublicationUncertain { .. }) => {
-                    identity_guard.mark_published();
-                    seal.disarm();
-                    Err((error, pinned, temporary_guard))
+                    identity_guard
+                        .as_mut()
+                        .expect("backup identity guard remains owned")
+                        .mark_published();
+                    seal.as_mut()
+                        .expect("backup seal remains owned")
+                        .disarm();
+                    Err((
+                        error,
+                        pinned
+                            .take()
+                            .expect("uncertain backup snapshot is delivered once"),
+                        temporary_guard
+                            .take()
+                            .expect("uncertain backup guard is delivered once"),
+                    ))
                 }
                 Err(error) => {
-                    let error = match seal.cleanup() {
+                    let error = match seal
+                        .as_mut()
+                        .expect("backup seal remains owned")
+                        .cleanup()
+                    {
                         Ok(()) => error,
                         Err(cleanup) => append_operation_cleanup(
                             "SQLite backup publication",
@@ -10285,10 +11132,20 @@ async fn backup_pool(
                     };
                     let error = cleanup_identity_or_error(
                         "SQLite backup publication",
-                        &mut identity_guard,
+                        identity_guard
+                            .as_mut()
+                            .expect("backup identity guard remains owned"),
                         error,
                     );
-                    Err((error, pinned, temporary_guard))
+                    Err((
+                        error,
+                        pinned
+                            .take()
+                            .expect("failed backup publication snapshot is delivered once"),
+                        temporary_guard
+                            .take()
+                            .expect("failed backup publication guard is delivered once"),
+                    ))
                 }
             })
         },
@@ -10322,50 +11179,106 @@ async fn backup_pool(
     wait_at_published_handoff_test_barrier(destination).await;
     let final_destination = destination.to_owned();
     let final_deadline_state = Arc::clone(&deadline_state);
+    let mut pinned = Some(pinned);
+    let mut temporary_guard = Some(temporary_guard);
+    let mut identity_guard = Some(identity_guard);
     let final_handoff = run_bounded_filesystem(
         final_handoff_owner,
         deadline + Duration::from_secs(1),
         "SQLite backup",
         timeout_ms,
         move || {
-            let result = validate_published_snapshot_handoff(&final_destination, &pinned.file)
-                .and_then(|()| {
-                    pinned.verify()?;
-                    let sealed_digest =
-                        validate_trusted_backup_seal(&pinned, Some(&final_deadline_state))?;
-                    if pinned
-                        .file
-                        .metadata()
-                        .map_err(|error| {
-                            file_error(
-                                "inspect caller published backup size",
-                                &final_destination,
-                                error,
-                            )
-                        })?
-                        .len()
-                        != caller_receipt.byte_count
-                        || file_digest_with_deadline(&pinned.file, Some(&final_deadline_state))?
-                            != caller_receipt.digest
-                        || sealed_digest.as_slice() != caller_receipt.digest
-                        || snapshot_is_staging(&final_destination, &pinned.file)?
-                        || tokio::time::Instant::now() >= deadline
-                    {
-                        return Err(StateError::OperationTimedOut {
-                            operation: "SQLite backup",
-                            timeout_ms,
-                        });
-                    }
-                    Ok(())
-                });
+            let result = validate_published_snapshot_handoff(
+                &final_destination,
+                &pinned
+                    .as_ref()
+                    .expect("final backup snapshot remains owned")
+                    .file,
+            )
+            .and_then(|()| {
+                pinned
+                    .as_ref()
+                    .expect("final backup snapshot remains owned")
+                    .verify()?;
+                let sealed_digest = validate_trusted_backup_seal(
+                    pinned
+                        .as_ref()
+                        .expect("final backup snapshot remains owned"),
+                    Some(&final_deadline_state),
+                )?;
+                if pinned
+                    .as_ref()
+                    .expect("final backup snapshot remains owned")
+                    .file
+                    .metadata()
+                    .map_err(|error| {
+                        file_error(
+                            "inspect caller published backup size",
+                            &final_destination,
+                            error,
+                        )
+                    })?
+                    .len()
+                    != caller_receipt.byte_count
+                    || file_digest_with_deadline(
+                        &pinned
+                            .as_ref()
+                            .expect("final backup snapshot remains owned")
+                            .file,
+                        Some(&final_deadline_state),
+                    )? != caller_receipt.digest
+                    || sealed_digest.as_slice() != caller_receipt.digest
+                    || snapshot_is_staging(
+                        &final_destination,
+                        &pinned
+                            .as_ref()
+                            .expect("final backup snapshot remains owned")
+                            .file,
+                    )?
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    return Err(StateError::OperationTimedOut {
+                        operation: "SQLite backup",
+                        timeout_ms,
+                    });
+                }
+                Ok(())
+            });
+            let result = result.and_then(|()| {
+                temporary_guard
+                    .as_mut()
+                    .expect("final backup guard remains owned")
+                    .disarm_published()
+            });
             Ok(match result {
-                Ok(()) => Ok((pinned, temporary_guard, identity_guard)),
-                Err(error) => Err((error, pinned, temporary_guard, identity_guard)),
+                Ok(()) => Ok((
+                    pinned
+                        .take()
+                        .expect("final backup snapshot is delivered once"),
+                    temporary_guard
+                        .take()
+                        .expect("final backup guard is delivered once"),
+                    identity_guard
+                        .take()
+                        .expect("final backup identity is delivered once"),
+                )),
+                Err(error) => Err((
+                    error,
+                    pinned
+                        .take()
+                        .expect("failed final backup snapshot is delivered once"),
+                    temporary_guard
+                        .take()
+                        .expect("failed final backup guard is delivered once"),
+                    identity_guard
+                        .take()
+                        .expect("failed final backup identity is delivered once"),
+                )),
             })
         },
     )
     .await;
-    let (pinned, mut temporary_guard, mut identity_guard) = match final_handoff {
+    let (pinned, _temporary_guard, mut identity_guard) = match final_handoff {
         Ok(Ok(result)) => result,
         Ok(Err((error, pinned, mut guard, identity_guard))) => {
             guard.mark_publication_uncertain();
@@ -10386,7 +11299,6 @@ async fn backup_pool(
     };
     drop(pinned);
     cancellation_guard.disarm();
-    temporary_guard.disarm_published()?;
     identity_guard.disarm();
     Ok(())
 }
@@ -10944,7 +11856,7 @@ pub(crate) mod test_support {
         guard
             .bind_file(&file)
             .expect("bind published snapshot identity");
-        guard.disarm();
+        guard.disarm().expect("disarm published snapshot guard");
         drop(guard);
     }
 

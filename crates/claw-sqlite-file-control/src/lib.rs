@@ -315,6 +315,12 @@ struct RetainedDropInner<T> {
 
 struct RetainedDrop<T>(Arc<RetainedDropInner<T>>);
 
+impl<T> Clone for RetainedDrop<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
 impl<T> RetainedDrop<T> {
     fn new(value: T) -> Self {
         Self(Arc::new(RetainedDropInner {
@@ -371,9 +377,20 @@ impl<T> RetainedDrop<T> {
     }
 }
 
+trait RetainedDestructor: Send {
+    fn destroy_once(&self) -> Result<(), ()>;
+}
+
+impl<T: Send + 'static> RetainedDestructor for RetainedDrop<T> {
+    fn destroy_once(&self) -> Result<(), ()> {
+        RetainedDrop::destroy_once(self)
+    }
+}
+
 struct CleanupEnvelope {
     job: DropSlot<BlockingCleanupJob>,
     panic_retention: Option<RetainedDrop<Box<dyn Send>>>,
+    callback_retention: Option<Box<dyn RetainedDestructor>>,
     reservation: DropSlot<CleanupReservation>,
     retirement_reservation: DropSlot<TerminalCloseReservation>,
 }
@@ -403,6 +420,7 @@ impl Drop for TerminalCloseReservation {
 struct TerminalCloseEnvelope {
     job: DropSlot<TerminalCloseJob>,
     panic_retention: Option<RetainedDrop<Box<dyn Send>>>,
+    callback_retention: Option<Box<dyn RetainedDestructor>>,
     cleanup_reservation: DropSlot<CleanupReservation>,
     reservation: DropSlot<TerminalCloseReservation>,
 }
@@ -593,6 +611,7 @@ static CLEANUP_EXECUTOR: std::sync::LazyLock<Result<CleanupExecutor, String>> =
                                         TerminalJobDisposition::Completed
                                     })),
                                     panic_retention: envelope.panic_retention.take(),
+                                    callback_retention: envelope.callback_retention.take(),
                                     cleanup_reservation: envelope.reservation.take_slot(),
                                     reservation: envelope.retirement_reservation.take_slot(),
                                 };
@@ -687,8 +706,18 @@ static TERMINAL_CLOSE_EXECUTOR: std::sync::LazyLock<Result<TerminalCloseExecutor
                                     .unwrap_or(Ok(()));
                                 if retention_destroyed.is_ok() {
                                     envelope.panic_retention.take();
-                                    envelope.cleanup_reservation.take();
-                                    envelope.reservation.take();
+                                    let callback_destroyed = envelope
+                                        .callback_retention
+                                        .as_ref()
+                                        .map(|callback| callback.destroy_once())
+                                        .unwrap_or(Ok(()));
+                                    if callback_destroyed.is_ok() {
+                                        envelope.callback_retention.take();
+                                        envelope.cleanup_reservation.take();
+                                        envelope.reservation.take();
+                                    } else {
+                                        retain_terminal_panic(envelope);
+                                    }
                                 } else {
                                     retain_terminal_panic(envelope);
                                 }
@@ -807,6 +836,7 @@ impl TerminalClosePermit {
         let envelope = TerminalCloseEnvelope {
             job: DropSlot::new(job),
             panic_retention: panic_retention.map(RetainedDrop::new),
+            callback_retention: None,
             cleanup_reservation: cleanup_reservation
                 .map(DropSlot::new)
                 .unwrap_or_else(DropSlot::empty),
@@ -966,34 +996,6 @@ impl TerminalClosePermit {
         self.submit(connection)
             .wait(std::time::Instant::now() + TERMINAL_CLOSE_TIMEOUT)
     }
-
-    /// Transfers caller-supplied retention into terminal ownership before close.
-    pub fn close_with_quarantine_retention<Connection, Retention>(
-        self,
-        connection: Connection,
-        retention: Retention,
-    ) -> TerminalCloseOutcome
-    where
-        Connection: BeginOwnedConnection,
-        Retention: FnOnce() -> Option<Box<dyn Send>>,
-    {
-        let close = RetainedTerminalClose::new(connection);
-        let retention = std::panic::catch_unwind(std::panic::AssertUnwindSafe(retention));
-        match retention {
-            Ok(retention) => {
-                let retention: Arc<dyn Send + Sync> = Arc::new(std::sync::Mutex::new(retention));
-                self.submit_retained_full(close, 0, Some(retention))
-                    .wait(std::time::Instant::now() + TERMINAL_CLOSE_TIMEOUT)
-            }
-            Err(panic) => {
-                let _ = self.submit_job(
-                    Box::new(|_| TerminalJobDisposition::Quarantined),
-                    Some(Box::new(close)),
-                );
-                std::panic::resume_unwind(panic);
-            }
-        }
-    }
 }
 
 /// Pre-acquired dedicated owner for cancellation-safe blocking cleanup.
@@ -1001,6 +1003,51 @@ pub struct BlockingCleanupOwner {
     reservation: Option<CleanupReservation>,
     terminal_closes: Option<TerminalCloseBatch>,
     retirement_reservation: Option<TerminalCloseReservation>,
+}
+
+/// Opaque pre-reserved capacity for a trusted external bounded worker.
+pub struct ExternalCleanupPermit {
+    reservation: Option<CleanupReservation>,
+    terminal_closes: Option<TerminalCloseBatch>,
+    retirement_reservation: Option<TerminalCloseReservation>,
+}
+
+impl ExternalCleanupPermit {
+    /// Borrows the pre-reserved terminal close batch.
+    pub fn terminal_closes(&mut self) -> &mut TerminalCloseBatch {
+        self.terminal_closes
+            .as_mut()
+            .expect("external cleanup terminal capacity remains owned")
+    }
+
+    /// Transfers callback capture destruction to the terminal executor.
+    pub fn retire(mut self, retention: Box<dyn Send>) -> Result<(), String> {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("external cleanup reservation remains owned");
+        let retirement_reservation = self
+            .retirement_reservation
+            .take()
+            .expect("external cleanup retirement capacity remains owned");
+        self.terminal_closes.take();
+        let envelope = TerminalCloseEnvelope {
+            job: DropSlot::new(Box::new(|_| TerminalJobDisposition::Completed)),
+            panic_retention: Some(RetainedDrop::new(retention)),
+            callback_retention: None,
+            cleanup_reservation: DropSlot::new(reservation),
+            reservation: DropSlot::new(retirement_reservation),
+        };
+        let executor = match TERMINAL_CLOSE_EXECUTOR.as_ref() {
+            Ok(executor) => executor,
+            Err(error) => {
+                mark_executor_unhealthy(&TERMINAL_CLOSE_EXECUTOR_HEALTHY);
+                retain_terminal_handoff(envelope);
+                return Err(format!("terminal executor unavailable: {error}"));
+            }
+        };
+        try_send_terminal_envelope(&executor.sender, envelope, &TERMINAL_CLOSE_EXECUTOR_HEALTHY)
+    }
 }
 
 impl std::fmt::Debug for BlockingCleanupOwner {
@@ -1053,18 +1100,34 @@ impl BlockingCleanupOwner {
         count: usize,
         deadline: Option<std::time::Instant>,
     ) -> Result<Vec<Self>, String> {
-        let _ = Self::validate_executor(thread_name)?;
-        let health_generation = EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire);
         if count == 0 || count > MAX_CLEANUP_JOBS {
             return Err("blocking cleanup owner count is out of range".to_owned());
         }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err("blocking cleanup owner admission timed out".to_owned());
+        }
+        if let Some(deadline) = deadline {
+            let thread_name = thread_name.to_owned();
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                tokio::task::spawn_blocking(move || {
+                    Self::validate_executor(&thread_name).map(|_| ())
+                }),
+            )
+            .await
+            .map_err(|_| "blocking cleanup executor readiness timed out".to_owned())?
+            .map_err(|error| format!("blocking cleanup executor readiness task: {error}"))??;
+        } else {
+            let _ = Self::validate_executor(thread_name)?;
+        }
+        let health_generation = EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire);
         loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err("blocking cleanup owner admission timed out".to_owned());
+            }
             let _ = Self::validate_executor(thread_name)?;
             if EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire) != health_generation {
                 return Err("cleanup executor health changed during admission".to_owned());
-            }
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Err("blocking cleanup owner admission timed out".to_owned());
             }
             let terminal_count = count
                 .checked_mul(TERMINAL_RESERVATIONS_PER_OWNER)
@@ -1168,16 +1231,25 @@ impl BlockingCleanupOwner {
         self.handoff_with_panic_retention(cleanup, None)
     }
 
-    /// Transfers a payload by mutable borrow so worker panic retains that exact ownership.
-    pub fn handoff_payload<Payload>(
-        &mut self,
-        payload: Payload,
-        cleanup: fn(&tokio::runtime::Runtime, &mut TerminalCloseBatch, &mut Payload),
-    ) -> Result<(), String>
-    where
-        Payload: Send + 'static,
-    {
-        self.handoff_payload_internal(payload, cleanup)
+    /// Converts this owner into opaque capacity for another bounded executor.
+    pub fn into_external_cleanup(mut self) -> Result<ExternalCleanupPermit, String> {
+        Ok(ExternalCleanupPermit {
+            reservation: Some(
+                self.reservation
+                    .take()
+                    .ok_or_else(|| "blocking cleanup owner is missing".to_owned())?,
+            ),
+            terminal_closes: Some(
+                self.terminal_closes
+                    .take()
+                    .ok_or_else(|| "terminal close owner is missing".to_owned())?,
+            ),
+            retirement_reservation: Some(
+                self.retirement_reservation
+                    .take()
+                    .ok_or_else(|| "cleanup retirement owner is missing".to_owned())?,
+            ),
+        })
     }
 
     fn handoff_payload_internal<Payload, Cleanup>(
@@ -1187,9 +1259,8 @@ impl BlockingCleanupOwner {
     ) -> Result<(), String>
     where
         Payload: Send + 'static,
-        Cleanup: FnOnce(&tokio::runtime::Runtime, &mut TerminalCloseBatch, &mut Payload)
-            + Send
-            + 'static,
+        Cleanup:
+            FnMut(&tokio::runtime::Runtime, &mut TerminalCloseBatch, &Payload) + Send + 'static,
     {
         let reservation = self
             .reservation
@@ -1207,17 +1278,22 @@ impl BlockingCleanupOwner {
         let job_payload = Arc::clone(&payload);
         let terminal_closes = Arc::new(std::sync::Mutex::new(terminal_closes));
         let job_terminal_closes = Arc::clone(&terminal_closes);
+        let cleanup = RetainedDrop::new(cleanup);
+        let job_cleanup = cleanup.clone();
         let envelope = CleanupEnvelope {
             job: DropSlot::new(Box::new(move |runtime| {
-                let mut payload = job_payload
+                let payload = job_payload
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut terminal_closes = job_terminal_closes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                cleanup(runtime, &mut terminal_closes, &mut payload);
+                job_cleanup
+                    .with_mut(|cleanup| cleanup(runtime, &mut terminal_closes, &payload))
+                    .expect("cleanup callback remains owned");
             })),
             panic_retention: Some(RetainedDrop::new(Box::new((payload, terminal_closes)))),
+            callback_retention: Some(Box::new(cleanup)),
             reservation: DropSlot::new(reservation),
             retirement_reservation: DropSlot::new(retirement_reservation),
         };
@@ -1245,44 +1321,6 @@ impl BlockingCleanupOwner {
             .take_permit()
     }
 
-    /// Transfers a payload directly to terminal capacity without occupying a normal worker.
-    pub fn handoff_terminal_payload<Payload>(
-        &mut self,
-        permit: TerminalClosePermit,
-        payload: Payload,
-        cleanup: fn(&tokio::runtime::Runtime, &mut Payload) -> Result<(), String>,
-    ) -> Result<(), String>
-    where
-        Payload: Send + 'static,
-    {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("blocking terminal payload handoff is single-use");
-        let terminal_closes = self
-            .terminal_closes
-            .take()
-            .expect("terminal payload handoff is single-use");
-        let payload = Arc::new(std::sync::Mutex::new(payload));
-        let job_payload = Arc::clone(&payload);
-        let result = permit.submit_job_with_cleanup(
-            Box::new(move |runtime| {
-                let mut payload = job_payload
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match cleanup(runtime, &mut payload) {
-                    Ok(()) => TerminalJobDisposition::Completed,
-                    Err(_) => TerminalJobDisposition::Quarantined,
-                }
-            }),
-            Some(Box::new(payload)),
-            Some(reservation),
-        );
-        drop(terminal_closes);
-        self.retirement_reservation.take();
-        result
-    }
-
     #[cfg(test)]
     fn handoff_with_panic_retention<Cleanup>(
         &mut self,
@@ -1307,6 +1345,7 @@ impl BlockingCleanupOwner {
         let envelope = CleanupEnvelope {
             job: DropSlot::new(Box::new(move |runtime| cleanup(runtime, terminal_closes))),
             panic_retention: panic_retention.map(RetainedDrop::new),
+            callback_retention: None,
             reservation: DropSlot::new(reservation),
             retirement_reservation: DropSlot::new(retirement_reservation),
         };
@@ -1704,14 +1743,17 @@ where
     let deadline = context.deadline;
     worker_owner
         .handoff_payload_internal(
-        BackupWorkerPayload {
+        std::sync::Mutex::new(BackupWorkerPayload {
             source: Some(source),
             destination: Some(destination),
             reservation: Some(reservation),
             close_retention: None,
             result: Some(result_tx),
-        },
+        }),
         move |runtime, terminal_closes, payload| {
+        let mut payload = payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut source_close_permit = Some(
             terminal_closes
                 .take_permit()
@@ -1723,14 +1765,17 @@ where
                 .expect("backup destination close capacity was pre-reserved"),
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let BackupWorkerPayload {
+                source,
+                destination,
+                ..
+            } = &mut *payload;
             runtime.block_on(backup_main_database(
-                payload
-                    .source
+                source
                     .as_mut()
                     .expect("backup source remains owned")
                     .sqlite(),
-                payload
-                    .destination
+                destination
                     .as_mut()
                     .expect("backup destination remains owned")
                     .sqlite(),
@@ -1933,7 +1978,7 @@ pub async fn finalize_owned_snapshot<Cleanup>(
     mut worker_owner: BlockingCleanupOwner,
     connection: sqlx::SqliteConnection,
     output: std::fs::File,
-    cleanup: Cleanup,
+    mut cleanup: Cleanup,
     context: SnapshotFinalizeContext,
 ) -> Result<(SnapshotWriteReceipt, Cleanup), FileControlError>
 where
@@ -1946,6 +1991,7 @@ where
         connection: Option<sqlx::SqliteConnection>,
         output: Option<std::fs::File>,
         cleanup: Option<Cleanup>,
+        close_retention: Arc<std::sync::Mutex<Option<Box<dyn Send>>>>,
         result: Option<std::sync::mpsc::SyncSender<FinalizeWorkerResult<Cleanup>>>,
     }
 
@@ -1957,15 +2003,20 @@ where
     } = context;
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
     let delivery_cancelled = Arc::clone(&cancelled);
+    let close_retention = Arc::new(std::sync::Mutex::new(cleanup.take_terminal_retention()));
     worker_owner
         .handoff_payload_internal(
-            FinalizeWorkerPayload {
+            std::sync::Mutex::new(FinalizeWorkerPayload {
                 connection: Some(connection),
                 output: Some(output),
                 cleanup: Some(cleanup),
+                close_retention,
                 result: Some(result_tx),
-            },
+            }),
             move |runtime, terminal_closes, payload| {
+                let mut payload = payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut close_permit = Some(
                     terminal_closes
                         .take_permit()
@@ -2012,12 +2063,10 @@ where
                             let close = close_permit
                                 .take()
                                 .expect("snapshot close permit remains owned")
-                                .close_with_quarantine_retention(connection, || {
-                                    payload
-                                        .cleanup
-                                        .as_mut()
-                                        .and_then(SnapshotCleanupLease::take_terminal_retention)
-                                });
+                                .close_with_shared_retention(
+                                    connection,
+                                    Arc::clone(&payload.close_retention),
+                                );
                             return Err(if close == TerminalCloseOutcome::Closed {
                                 error
                             } else {
@@ -2039,12 +2088,10 @@ where
                     match close_permit
                         .take()
                         .expect("snapshot close permit remains owned")
-                        .close_with_quarantine_retention(connection, || {
-                            payload
-                                .cleanup
-                                .as_mut()
-                                .and_then(SnapshotCleanupLease::take_terminal_retention)
-                        }) {
+                        .close_with_shared_retention(
+                            connection,
+                            Arc::clone(&payload.close_retention),
+                        ) {
                         TerminalCloseOutcome::Closed => {}
                         close => {
                             return Err(FileControlError::Handle(format!(
@@ -2139,12 +2186,10 @@ where
                     let close = close_permit
                         .take()
                         .expect("residual snapshot close permit remains owned")
-                        .close_with_quarantine_retention(connection, || {
-                            payload
-                                .cleanup
-                                .as_mut()
-                                .and_then(SnapshotCleanupLease::take_terminal_retention)
-                        });
+                        .close_with_shared_retention(
+                            connection,
+                            Arc::clone(&payload.close_retention),
+                        );
                     match (operation, close) {
                         (result, TerminalCloseOutcome::Closed) => result,
                         (Ok(_), close) => Err(FileControlError::Handle(format!(
@@ -2172,7 +2217,9 @@ where
                 };
                 if let Err(error) = delivered {
                     match error.0 {
-                        Ok((_, mut cleanup)) | Err((_, mut cleanup)) => cleanup.detach_cleanup(),
+                        Ok((_, cleanup)) | Err((_, cleanup)) => {
+                            payload.cleanup = Some(cleanup);
+                        }
                     }
                 }
             },
@@ -2476,6 +2523,10 @@ impl Drop for PreflightPragmaGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+struct StatementPreflight {
+    denied_during_parse: bool,
 }
 
 unsafe extern "C" fn drop_connection_nonce(value: *mut std::ffi::c_void) {
@@ -3465,12 +3516,15 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         cleanup_owner
             .handoff_payload_internal(
-                CommitWorkerPayload {
+                std::sync::Mutex::new(CommitWorkerPayload {
                     connection: Some(connection),
                     token: Some(token),
                     result: Some(result_tx),
-                },
+                }),
                 move |runtime, terminal_closes, payload| {
+                    let mut payload = payload
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let mut terminal_permit = Some(
                         terminal_closes
                             .take_permit()
@@ -3478,7 +3532,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     );
                     let cancellation = Arc::new(BeginCancellation {
                         local: std::sync::atomic::AtomicBool::new(false),
-                        external: Some(cancelled),
+                        external: Some(Arc::clone(&cancelled)),
                         deadline,
                         #[cfg(test)]
                         busy_entered: std::sync::Mutex::new(None),
@@ -3489,7 +3543,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                         runtime.block_on(async {
                             let CommitWorkerPayload {
                                 connection, token, ..
-                            } = payload;
+                            } = &mut *payload;
                             let connection = connection
                                 .as_mut()
                                 .expect("COMMIT worker connection remains owned");
@@ -3589,7 +3643,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                 TerminalCommittedRequest {
                                     connection,
                                     token,
-                                    owner: late_writer_owner,
+                                    owner: late_writer_owner.clone(),
                                     cleanup_deadline,
                                     result: TerminalCommittedResult::Commit(result_tx),
                                     primary: Some(FileControlError::CommitOutcomeUncertain(
@@ -3626,7 +3680,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                     TerminalCommittedRequest {
                                         connection,
                                         token,
-                                        owner: late_writer_owner,
+                                        owner: late_writer_owner.clone(),
                                         cleanup_deadline,
                                         result: TerminalCommittedResult::Commit(result_tx),
                                         primary: None,
@@ -3651,7 +3705,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                         .take()
                                         .expect("COMMIT terminal permit remains owned"),
                                     shared,
-                                    late_writer_owner,
+                                    late_writer_owner.clone(),
                                     cleanup_deadline,
                                 );
                             }
@@ -3670,7 +3724,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                     TerminalCommittedRequest {
                                         connection,
                                         token,
-                                        owner: late_writer_owner,
+                                        owner: late_writer_owner.clone(),
                                         cleanup_deadline,
                                         result: TerminalCommittedResult::Commit(result_tx),
                                         primary: Some(error),
@@ -3884,7 +3938,10 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         Ok(Arc::clone(&token.state))
     }
 
-    async fn preflight_one_statement(&mut self, sql: &str) -> Result<(), sqlx::Error> {
+    async fn preflight_one_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<StatementPreflight, sqlx::Error> {
         if sql.as_bytes().contains(&0) {
             return Err(sqlx::Error::Protocol(
                 "SQLite statement contains an embedded NUL".to_owned(),
@@ -3928,6 +3985,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         let base = sql.as_ptr();
         let mut offset = 0_usize;
         let mut statements = 0_usize;
+        let mut denied_during_parse = false;
         while offset < sql.len() {
             let mut statement = std::ptr::null_mut();
             let mut tail = std::ptr::null();
@@ -3951,6 +4009,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     }
                 }
                 if result == libsqlite3_sys::SQLITE_AUTH {
+                    denied_during_parse = true;
                     if tail.is_null() {
                         return Err(sqlx::Error::Protocol(
                             "SQLite denied statement preflight returned no tail".to_owned(),
@@ -4009,7 +4068,9 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
             offset = tail_offset;
         }
         if statements == 1 {
-            Ok(())
+            Ok(StatementPreflight {
+                denied_during_parse,
+            })
         } else {
             Err(sqlx::Error::Protocol(
                 "manual transactions accept exactly one SQLite statement".to_owned(),
@@ -4323,9 +4384,28 @@ impl<'connection, Connection: BeginOwnedConnection> sqlx::Executor<'connection>
         'connection: 'executor,
     {
         let sql_text = sql.as_str().to_owned();
+        let guard = self.begin_statement_operation();
         Box::pin(async move {
-            self.preflight_one_statement(&sql_text).await?;
-            sqlx::Executor::prepare_with(
+            let guard = guard?;
+            let preflight = match self.preflight_one_statement(&sql_text).await {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    return match self.verify_statement_operation(guard).await {
+                        Ok(()) => Err(error),
+                        Err(verification) => Err(verification),
+                    };
+                }
+            };
+            if preflight.denied_during_parse {
+                let error = sqlx::Error::Protocol(
+                    "explicit prepare rejects statements with prepare-time effects".to_owned(),
+                );
+                return match self.verify_statement_operation(guard).await {
+                    Ok(()) => Err(error),
+                    Err(verification) => Err(verification),
+                };
+            }
+            let result = sqlx::Executor::prepare_with(
                 self.connection
                     .as_mut()
                     .expect("manual transaction connection remains owned")
@@ -4334,7 +4414,13 @@ impl<'connection, Connection: BeginOwnedConnection> sqlx::Executor<'connection>
                 sql,
                 parameters,
             )
-            .await
+            .await;
+            #[cfg(test)]
+            wait_at_prepare_delivery_test_gate(guard.state.generation).await;
+            match self.verify_statement_operation(guard).await {
+                Ok(()) => result,
+                Err(error) => Err(error),
+            }
         })
     }
 }
@@ -4464,6 +4550,32 @@ static FAIL_COMMIT_GENERATIONS: std::sync::LazyLock<
 static FORCE_IMPLICIT_ROLLBACK_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+struct PrepareDeliveryTestGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static PREPARE_DELIVERY_TEST_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, PrepareDeliveryTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+async fn wait_at_prepare_delivery_test_gate(generation: u64) {
+    let gate = PREPARE_DELIVERY_TEST_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&generation)
+        .map(|gate| (Arc::clone(&gate.entered), Arc::clone(&gate.release)));
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        while !release.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
 
 #[cfg(test)]
 fn run_rollback_test_gate(token: &ManualTransactionToken, stage: RollbackTestStage) {
@@ -4609,6 +4721,57 @@ fn wait_at_begin_failure_cleanup_gate(cancellation: &BeginCancellation) {
 pub type TerminalCloseFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>;
 
+struct RetainedConsumingCloseFuture<Future> {
+    future: std::mem::ManuallyDrop<Future>,
+    completed: bool,
+}
+
+impl<Future, Error> std::future::Future for RetainedConsumingCloseFuture<Future>
+where
+    Future: std::future::Future<Output = Result<(), Error>>,
+    Error: ToString,
+{
+    type Output = Result<(), String>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: `future` is never moved after this wrapper is pinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.completed {
+            return std::task::Poll::Ready(Err(
+                "completed close future was polled again".to_owned()
+            ));
+        }
+        // SAFETY: the ManuallyDrop storage remains live until Ready or quarantine.
+        let future =
+            unsafe { std::pin::Pin::new_unchecked(&mut *(&raw mut this.future).cast::<Future>()) };
+        match future.poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(result) => {
+                this.completed = true;
+                // SAFETY: Ready transfers the result and ends the consuming future.
+                unsafe {
+                    std::mem::ManuallyDrop::drop(&mut this.future);
+                }
+                std::task::Poll::Ready(result.map_err(|error| error.to_string()))
+            }
+        }
+    }
+}
+
+fn retain_consuming_close_future<Future, Error>(future: Future) -> TerminalCloseFuture
+where
+    Future: std::future::Future<Output = Result<(), Error>> + Send + 'static,
+    Error: ToString,
+{
+    Box::pin(RetainedConsumingCloseFuture {
+        future: std::mem::ManuallyDrop::new(future),
+        completed: false,
+    })
+}
+
 #[doc(hidden)]
 pub struct CloseTransfer<Connection>(Arc<std::sync::Mutex<DropSlot<Connection>>>);
 
@@ -4629,22 +4792,20 @@ impl<Connection> CloseTransfer<Connection> {
             .map(operation)
     }
 
-    fn into_future<Factory, Future>(self, factory: Factory) -> TerminalCloseFuture
+    fn into_future<Factory, Future, Error>(self, factory: Factory) -> TerminalCloseFuture
     where
         Factory: FnOnce(std::mem::ManuallyDrop<Connection>) -> Future + Send + 'static,
-        Future: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        Future: std::future::Future<Output = Result<(), Error>> + Send + 'static,
+        Error: ToString,
         Connection: Send + 'static,
     {
-        Box::pin(async move {
-            let connection = self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0
-                .take()
-                .expect("terminal close transfer is single-use");
-            factory(connection).await
-        })
+        let connection = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("terminal close transfer is single-use");
+        retain_consuming_close_future(factory(std::mem::ManuallyDrop::new(connection)))
     }
 }
 
@@ -4670,6 +4831,7 @@ pub struct RetainedTerminalClose<Connection: BeginOwnedConnection> {
     transfer: CloseTransfer<Connection>,
     future: Option<RetainedDrop<TerminalCloseFuture>>,
     prepared: bool,
+    outcome: Option<TerminalCloseOutcome>,
 }
 
 impl<Connection: BeginOwnedConnection> RetainedTerminalClose<Connection> {
@@ -4679,22 +4841,31 @@ impl<Connection: BeginOwnedConnection> RetainedTerminalClose<Connection> {
             transfer: CloseTransfer::new(connection),
             future: None,
             prepared: false,
+            outcome: None,
         }
+    }
+
+    fn remember_outcome(&mut self, outcome: TerminalCloseOutcome) -> TerminalCloseOutcome {
+        self.outcome = Some(outcome.clone());
+        outcome
     }
 
     /// Drives preparation, conversion, and physical close without losing panic ownership.
     pub fn run(&mut self, runtime: &tokio::runtime::Runtime) -> TerminalCloseOutcome {
+        if let Some(outcome) = &self.outcome {
+            return outcome.clone();
+        }
         if !self.prepared {
             let Some(prepared) = self.transfer.with_mut(|connection| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     <Connection as private::SealedConnection>::prepare_terminal_close(connection);
                 }))
             }) else {
-                return TerminalCloseOutcome::Panicked;
+                return self.remember_outcome(TerminalCloseOutcome::Panicked);
             };
             if let Err(panic) = prepared {
                 std::mem::forget(panic);
-                return TerminalCloseOutcome::Panicked;
+                return self.remember_outcome(TerminalCloseOutcome::Panicked);
             }
             self.prepared = true;
         }
@@ -4706,7 +4877,7 @@ impl<Connection: BeginOwnedConnection> RetainedTerminalClose<Connection> {
                 if let Err(panic) = future {
                     std::mem::forget(panic);
                 }
-                return TerminalCloseOutcome::Panicked;
+                return self.remember_outcome(TerminalCloseOutcome::Panicked);
             };
             self.future = Some(RetainedDrop::new(future));
         }
@@ -4720,20 +4891,24 @@ impl<Connection: BeginOwnedConnection> RetainedTerminalClose<Connection> {
                 }))
             })
         else {
-            return TerminalCloseOutcome::Panicked;
+            return self.remember_outcome(TerminalCloseOutcome::Panicked);
         };
-        match outcome {
+        let outcome = match outcome {
             Ok(Ok(())) => TerminalCloseOutcome::Closed,
             Ok(Err(error)) => TerminalCloseOutcome::Failed(error),
             Err(panic) => {
                 std::mem::forget(panic);
                 TerminalCloseOutcome::Panicked
             }
-        }
+        };
+        self.remember_outcome(outcome)
     }
 
     /// Explicitly destroys a completed close future exactly once.
     pub fn finish_success(&mut self) -> bool {
+        if self.outcome != Some(TerminalCloseOutcome::Closed) {
+            return false;
+        }
         let destroyed = self
             .future
             .as_ref()
@@ -4761,12 +4936,10 @@ impl private::SealedConnection for sqlx::SqliteConnection {
     fn prepare_terminal_close(_connection: &mut Self) {}
 
     fn make_close_future(transfer: CloseTransfer<Self>) -> TerminalCloseFuture {
-        transfer.into_future(|mut connection| async move {
+        transfer.into_future(|mut connection| {
             // SAFETY: the installed future is the unique terminal owner.
             let connection = unsafe { std::mem::ManuallyDrop::take(&mut connection) };
             sqlx::Connection::close(connection)
-                .await
-                .map_err(|error| error.to_string())
         })
     }
 }
@@ -4787,10 +4960,10 @@ impl private::SealedConnection for sqlx::pool::PoolConnection<sqlx::Sqlite> {
     }
 
     fn make_close_future(transfer: CloseTransfer<Self>) -> TerminalCloseFuture {
-        transfer.into_future(|mut connection| async move {
+        transfer.into_future(|mut connection| {
             // SAFETY: the installed future is the unique terminal owner.
             let connection = unsafe { std::mem::ManuallyDrop::take(&mut connection) };
-            connection.close().await.map_err(|error| error.to_string())
+            connection.close()
         })
     }
 }
@@ -5470,10 +5643,13 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let (worker_result_tx, worker_result_rx) = std::sync::mpsc::sync_channel(0);
     worker_owner
         .handoff_payload_internal(
-            Some(connection),
+            std::sync::Mutex::new(Some(connection)),
             move |runtime, terminal_closes, connection| {
+                let mut connection = connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let decision = run_owned_begin_worker(
-                    connection,
+                    &mut connection,
                     &outcome_tx,
                     &command_rx,
                     &worker_database,
@@ -6742,6 +6918,82 @@ pub fn windows_file_identity(file: &std::fs::File) -> Result<[u8; 24], FileContr
     Ok(identity)
 }
 
+/// Returns the number of hard-link names for a Windows file handle.
+#[cfg(windows)]
+pub fn windows_file_link_count(file: &std::fs::File) -> Result<u32, FileControlError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = FILE_STANDARD_INFO::default();
+    // SAFETY: The live file handle and output match FileStandardInfo.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&raw mut information).cast(),
+            u32::try_from(std::mem::size_of::<FILE_STANDARD_INFO>())
+                .expect("FILE_STANDARD_INFO size fits u32"),
+        )
+    };
+    if succeeded == 0 {
+        Err(FileControlError::Handle(format!(
+            "Windows file link-count query failed: {}",
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        Ok(information.NumberOfLinks)
+    }
+}
+
+/// Returns the normalized native final path for a Windows file handle.
+#[cfg(windows)]
+pub fn windows_file_final_path(
+    file: &std::fs::File,
+) -> Result<std::path::PathBuf, FileControlError> {
+    use std::os::windows::{ffi::OsStringExt as _, io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    // SAFETY: A null output with zero length queries the required buffer size.
+    let required = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if required == 0 {
+        return Err(FileControlError::Handle(format!(
+            "Windows final-path size query failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut path = vec![0_u16; required as usize];
+    // SAFETY: `path` provides the size returned by the preceding query.
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            path.as_mut_ptr(),
+            required,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written >= required {
+        return Err(FileControlError::Handle(format!(
+            "Windows final-path query failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    path.truncate(written as usize);
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &path,
+    )))
+}
+
 /// Tries to lock a private marker byte outside ordinary file contents.
 #[cfg(windows)]
 pub fn windows_try_lock_writer_marker(file: &std::fs::File) -> std::io::Result<bool> {
@@ -7192,6 +7444,23 @@ mod deadline_tests {
         }
     }
 
+    struct OwnedPollPanickingCloseFuture {
+        connection: std::mem::ManuallyDrop<HookPanickingPoolConnection>,
+    }
+
+    impl std::future::Future for OwnedPollPanickingCloseFuture {
+        type Output = Result<(), String>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.connection.entered.fetch_add(1, Ordering::AcqRel);
+            std::hint::black_box(&self.connection.connection);
+            panic!("injected close poll panic after take");
+        }
+    }
+
     impl private::SealedConnection for HookPanickingPoolConnection {
         fn prepare_terminal_close(connection: &mut Self) {
             connection.entered.fetch_add(1, Ordering::AcqRel);
@@ -7227,11 +7496,9 @@ mod deadline_tests {
                     std::hint::black_box(&connection.connection);
                     panic!("injected close conversion panic after take");
                 }
-                CloseHookPanic::PollAfterTake => transfer.into_future(|connection| async move {
-                    connection.entered.fetch_add(1, Ordering::AcqRel);
-                    std::hint::black_box(&connection.connection);
-                    panic!("injected close poll panic after take");
-                }),
+                CloseHookPanic::PollAfterTake => {
+                    transfer.into_future(|connection| OwnedPollPanickingCloseFuture { connection })
+                }
             }
         }
     }
@@ -7297,6 +7564,9 @@ mod deadline_tests {
         if let Some(retention) = envelope.panic_retention.take() {
             let _ = retention.destroy_once();
         }
+        if let Some(callback) = envelope.callback_retention.take() {
+            let _ = callback.destroy_once();
+        }
         envelope.reservation.take();
         envelope.retirement_reservation.take();
     }
@@ -7307,6 +7577,9 @@ mod deadline_tests {
         }
         if let Some(retention) = envelope.panic_retention.take() {
             let _ = retention.destroy_once();
+        }
+        if let Some(callback) = envelope.callback_retention.take() {
+            let _ = callback.destroy_once();
         }
         envelope.cleanup_reservation.take();
         envelope.reservation.take();
@@ -9055,7 +9328,7 @@ mod deadline_tests {
             .await
             .expect("open prepare-only fixture");
         connection
-            .execute("CREATE TABLE value(id INTEGER)")
+            .execute("CREATE TABLE value(id INTEGER CHECK(id > 0))")
             .await
             .expect("create prepare-only table");
         let mut transaction =
@@ -9071,6 +9344,16 @@ mod deadline_tests {
             .await
             .expect_err("prepare rejects multiple executable statements");
         transaction
+            .prepare(sqlx::SqlStr::from_static(
+                "PRAGMA ignore_check_constraints=ON",
+            ))
+            .await
+            .expect_err("prepare rejects PRAGMA side effects");
+        transaction
+            .execute("INSERT INTO value VALUES (-1)")
+            .await
+            .expect_err("rejected PRAGMA prepare cannot mutate transaction flags");
+        transaction
             .execute("INSERT INTO value VALUES (1)")
             .await
             .expect("prepare-only transaction stays healthy");
@@ -9078,6 +9361,53 @@ mod deadline_tests {
             .commit()
             .await
             .expect("commit prepare guard transaction");
+
+        let connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open cancelled prepare fixture");
+        let mut transaction =
+            begin_manual_transaction(connection, std::time::Duration::from_secs(1), None)
+                .await
+                .expect("begin cancelled prepare transaction");
+        let generation = transaction
+            .token
+            .as_ref()
+            .expect("cancelled prepare token remains owned")
+            .generation;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(AtomicBool::new(false));
+        assert!(
+            PREPARE_DELIVERY_TEST_GATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    generation,
+                    PrepareDeliveryTestGate {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    },
+                )
+                .is_none()
+        );
+        let mut prepare = transaction.prepare(sqlx::SqlStr::from_static("SELECT 1"));
+        tokio::select! {
+            result = &mut prepare => panic!("prepare completed before cancellation gate: {result:?}"),
+            () = entered.notified() => {}
+        }
+        drop(prepare);
+        PREPARE_DELIVERY_TEST_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&generation);
+        assert!(
+            transaction
+                .execute("SELECT 2")
+                .await
+                .expect_err("cancelled dispatched prepare poisons the transaction")
+                .to_string()
+                .contains("poison")
+        );
+        drop(transaction);
     }
 
     #[test]
@@ -9098,6 +9428,7 @@ mod deadline_tests {
                 "forbidden SQLite output-path source pattern remains"
             );
         }
+
         let begin = helper
             .split("fn run_locked_begin")
             .nth(1)
@@ -9107,6 +9438,24 @@ mod deadline_tests {
             !begin.contains("c\"ROLLBACK\""),
             "provisional BEGIN cancellation must transfer directly to terminal close"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_link_count_distinguishes_single_name_and_hardlink() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().expect("Windows link-count directory");
+        let path = directory.path().join("source");
+        let alias = directory.path().join("alias");
+        let mut file = std::fs::File::create(&path).expect("create Windows link-count file");
+        file.write_all(b"x").expect("write Windows link-count file");
+        assert_eq!(
+            windows_file_link_count(&file).expect("single link count"),
+            1
+        );
+        std::fs::hard_link(&path, &alias).expect("create Windows test hardlink");
+        assert_eq!(windows_file_link_count(&file).expect("hardlink count"), 2);
     }
 
     #[tokio::test]
@@ -9429,14 +9778,30 @@ mod deadline_tests {
                 })
                 .expect("submit panicking cleanup job");
         }
+        let captured_drops = Arc::new(AtomicUsize::new(0));
+        let captured_probe = DropProbe(Arc::clone(&captured_drops));
+        let mut owner =
+            BlockingCleanupOwner::acquire_without_runtime("panicking-captured-cleanup-worker")
+                .expect("reserve captured cleanup panic");
+        owner
+            .handoff_payload_internal((), move |_, _, _| {
+                std::hint::black_box(&captured_probe);
+                panic!("injected panic with retained callback capture");
+            })
+            .expect("submit captured cleanup panic");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while CLEANUP_JOB_PANICS.load(Ordering::Acquire) < cleanup_panics + 5 {
+            while CLEANUP_JOB_PANICS.load(Ordering::Acquire) < cleanup_panics + 6 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("normal cleanup panics are caught");
         assert_eq!(cleanup_drops.load(Ordering::Acquire), 0);
+        assert_eq!(
+            captured_drops.load(Ordering::Acquire),
+            0,
+            "FnMut callback captures remain quarantined instead of unwinding"
+        );
         assert_eq!(
             LIVE_CLEANUP_WORKERS.load(Ordering::Acquire),
             CLEANUP_THREADS
@@ -9523,6 +9888,25 @@ mod deadline_tests {
         let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let cleanup_before = ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire);
         let terminal_before = ACTIVE_TERMINAL_CLOSE_JOBS.load(Ordering::Acquire);
+
+        let captured_entered = Arc::new(AtomicBool::new(false));
+        let captured_drops = Arc::new(AtomicUsize::new(0));
+        let captured_retention = RetentionDropProbe {
+            entered: Arc::clone(&captured_entered),
+            drops: Arc::clone(&captured_drops),
+            threads: Arc::clone(&threads),
+            release: None,
+            panic: false,
+        };
+        let mut owner = BlockingCleanupOwner::acquire_without_runtime("captured-retention-drop")
+            .expect("reserve captured retention job");
+        owner
+            .handoff_payload_internal((), move |_, _, _| {
+                std::hint::black_box(&captured_retention);
+            })
+            .expect("submit captured retention job");
+        wait_for_atomic(&captured_entered, "captured retention destructor").await;
+        assert_eq!(captured_drops.load(Ordering::Acquire), 1);
 
         let entered = Arc::new(AtomicBool::new(false));
         let drops = Arc::new(AtomicUsize::new(0));
@@ -9700,6 +10084,32 @@ mod deadline_tests {
         assert_eq!(ACTIVE_TERMINAL_CLOSE_JOBS.load(Ordering::Acquire), 0);
     }
 
+    #[tokio::test]
+    async fn cold_executor_readiness_obeys_admission_deadline() {
+        if run_in_isolated_child(
+            "deadline_tests::cold_executor_readiness_obeys_admission_deadline",
+            "GTA_CLAW_COLD_EXECUTOR_DEADLINE_CHILD",
+        ) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let owners = BlockingCleanupOwner::acquire_set(
+            "cold-executor-deadline",
+            1,
+            std::time::Instant::now() + std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cold executor readiness must not inherit the five-second worker timeout"
+        );
+        if let Ok(owners) = owners {
+            for owner in owners {
+                owner.shutdown().expect("release cold executor owner");
+            }
+        }
+    }
+
     #[test]
     fn full_and_disconnected_sends_retain_exact_envelopes_fail_closed() {
         if run_in_isolated_child(
@@ -9711,6 +10121,7 @@ mod deadline_tests {
         let cleanup_before = ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire);
         let terminal_before = ACTIVE_TERMINAL_CLOSE_JOBS.load(Ordering::Acquire);
         let cleanup_drops = Arc::new(AtomicUsize::new(0));
+        let callback_drops = Arc::new(AtomicUsize::new(0));
         let terminal_drops = Arc::new(AtomicUsize::new(0));
 
         for disconnected in [false, true] {
@@ -9728,6 +10139,9 @@ mod deadline_tests {
             let envelope = CleanupEnvelope {
                 job: DropSlot::new(Box::new(move |_| drop(probe))),
                 panic_retention: None,
+                callback_retention: Some(Box::new(RetainedDrop::new(DropProbe(Arc::clone(
+                    &callback_drops,
+                ))))),
                 reservation: DropSlot::new(CleanupReservation),
                 retirement_reservation: DropSlot::new(TerminalCloseReservation),
             };
@@ -9737,6 +10151,7 @@ mod deadline_tests {
             drop(receiver);
         }
         assert_eq!(cleanup_drops.load(Ordering::Acquire), 0);
+        assert_eq!(callback_drops.load(Ordering::Acquire), 0);
         {
             let mut retained = FAILED_CLEANUP_HANDOFFS
                 .lock()
@@ -9748,6 +10163,7 @@ mod deadline_tests {
             }
         }
         assert_eq!(cleanup_drops.load(Ordering::Acquire), 2);
+        assert_eq!(callback_drops.load(Ordering::Acquire), 2);
         assert_eq!(ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire), cleanup_before);
 
         for disconnected in [false, true] {
@@ -9765,6 +10181,7 @@ mod deadline_tests {
                 panic_retention: Some(RetainedDrop::new(Box::new(DropProbe(Arc::clone(
                     &terminal_drops,
                 ))))),
+                callback_retention: None,
                 cleanup_reservation: DropSlot::empty(),
                 reservation: DropSlot::new(TerminalCloseReservation),
             };
@@ -9804,6 +10221,7 @@ mod deadline_tests {
             .try_send(CleanupEnvelope {
                 job: DropSlot::new(Box::new(move |_| drop(probe))),
                 panic_retention: None,
+                callback_retention: None,
                 reservation: DropSlot::new(CleanupReservation),
                 retirement_reservation: DropSlot::new(TerminalCloseReservation),
             })
@@ -9839,6 +10257,7 @@ mod deadline_tests {
                 panic_retention: Some(RetainedDrop::new(Box::new(DropProbe(Arc::clone(
                     &queued_terminal_drops,
                 ))))),
+                callback_retention: None,
                 cleanup_reservation: DropSlot::empty(),
                 reservation: DropSlot::new(TerminalCloseReservation),
             })
@@ -10080,6 +10499,22 @@ mod deadline_tests {
         );
     }
 
+    #[test]
+    fn completed_retained_close_is_idempotent_in_release_paths() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build retained close test runtime");
+        let connection = runtime
+            .block_on(sqlx::SqliteConnection::connect("sqlite::memory:"))
+            .expect("open retained close test connection");
+        let mut close = RetainedTerminalClose::new(connection);
+        assert_eq!(close.run(&runtime), TerminalCloseOutcome::Closed);
+        assert_eq!(close.run(&runtime), TerminalCloseOutcome::Closed);
+        assert!(close.finish_success());
+        assert_eq!(close.run(&runtime), TerminalCloseOutcome::Closed);
+    }
+
     #[tokio::test]
     async fn prepare_and_conversion_panics_retain_exact_pool_lease() {
         if run_in_isolated_child(
@@ -10181,40 +10616,6 @@ mod deadline_tests {
             );
         }
 
-        let directory = tempfile::tempdir().expect("retention-provider panic directory");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(directory.path().join("retention-provider.sqlite"))
-            .create_if_missing(true);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open retention-provider panic pool");
-        let connection = pool
-            .acquire()
-            .await
-            .expect("acquire retention-provider panic lease");
-        let mut owner =
-            BlockingCleanupOwner::acquire_without_runtime("retention-provider-panic-owner")
-                .expect("reserve retention-provider panic owner");
-        let permit = owner
-            .take_terminal_permit()
-            .expect("retention-provider panic capacity was pre-reserved");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            permit.close_with_quarantine_retention(connection, || -> Option<Box<dyn Send>> {
-                panic!("injected retention-provider panic");
-            })
-        }));
-        assert!(panic.is_err(), "retention-provider panic is propagated");
-        owner
-            .shutdown()
-            .expect("release unused retention-provider capacity");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), pool.acquire())
-                .await
-                .is_err(),
-            "retention-provider panic quarantines the exact pool lease"
-        );
         assert_eq!(
             LIVE_TERMINAL_CLOSE_WORKERS.load(Ordering::Acquire),
             TERMINAL_CLOSE_THREADS
