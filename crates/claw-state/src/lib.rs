@@ -4544,54 +4544,72 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_live_wal_path_rolls_back_commit() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = database_path(&directory, "missing-live-wal.sqlite");
-        let store = std::sync::Arc::new(open(&path).await);
-        let owner = test_support::owner(&store).to_owned();
-        let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
-        let record = session("missing-wal-row", 1);
-        let record_id = record.id.clone();
-        let writer_store = std::sync::Arc::clone(&store);
-        let mut writer = tokio::spawn(async move { writer_store.sessions().create(&record).await });
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .expect("writer reaches missing-WAL commit boundary");
-        fs::remove_file(sidecar(&path, "-wal")).expect("unlink live WAL pathname");
-        release.notify_one();
-        let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
-            .await
-            .expect("missing-WAL rejection remains bounded")
-            .expect("missing-WAL writer joins")
-            .expect_err("commit hook rejects missing WAL pathname");
-        let StateError::CommitOutcomeUncertain {
-            operation,
-            code,
-            message,
-        } = &error
-        else {
-            panic!("expected typed uncertain commit outcome, received {error:?}");
-        };
-        assert_eq!(*operation, "commit session create");
-        assert_eq!(*code, 531);
-        assert!(message.contains("autocommit was restored"));
-        assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
-        assert!(
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for mutation in ["missing", "replaced"] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = database_path(&directory, &format!("{mutation}-live-wal.sqlite"));
+            let store = std::sync::Arc::new(open(&path).await);
+            let owner = test_support::owner(&store).to_owned();
+            let (entered, release) = crate::repository::test_support::set_commit_barrier(&owner);
+            let record = session(&format!("{mutation}-wal-row"), 1);
+            let record_id = record.id.clone();
+            let writer_store = std::sync::Arc::clone(&store);
+            let mut writer =
+                tokio::spawn(async move { writer_store.sessions().create(&record).await });
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("writer reaches WAL identity commit boundary");
+            let wal = sidecar(&path, "-wal");
+            let saved_wal = sidecar(&path, "-wal-saved");
+            if mutation == "missing" {
+                fs::hard_link(&wal, &saved_wal).expect("retain missing-WAL identity");
+                fs::remove_file(&wal).expect("unlink live WAL pathname");
+            } else {
+                fs::rename(&wal, &saved_wal).expect("detach live WAL pathname");
+                fs::write(&wal, b"replacement WAL").expect("create replacement WAL");
+                fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))
+                    .expect("secure replacement WAL");
+            }
+            release.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(2), &mut writer)
+                .await
+                .expect("WAL identity rejection remains bounded")
+                .expect("WAL identity writer joins")
+                .expect_err("commit hook rejects changed WAL pathname");
+            assert!(matches!(
+                &error,
+                StateError::InvalidPath {
+                    path: rejected,
+                    reason: "SQLite WAL identity changed during COMMIT",
+                } if rejected == &wal
+            ));
+            assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+            if mutation == "replaced" {
+                match fs::remove_file(&wal) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove replacement WAL: {error}"),
+                }
+            }
+            fs::rename(&saved_wal, &wal).expect("restore original WAL identity");
+            assert!(
+                store
+                    .sessions()
+                    .get(&record_id)
+                    .await
+                    .expect("read WAL identity rollback")
+                    .is_none()
+            );
             store
                 .sessions()
-                .get(&record_id)
+                .create(&session(&format!("{mutation}-wal-recovery"), 2))
                 .await
-                .expect("read missing-WAL rollback")
-                .is_none()
-        );
-        let store = std::sync::Arc::try_unwrap(store)
-            .unwrap_or_else(|_| panic!("writer retained missing-WAL store"));
-        assert!(matches!(
-            store.close().await,
-            Err(StateError::CloseDegraded {
-                os_lock_released: true,
-                ..
-            })
-        ));
+                .expect("replacement pool connection commits after WAL veto");
+            let store = std::sync::Arc::try_unwrap(store)
+                .unwrap_or_else(|_| panic!("writer retained WAL identity store"));
+            store.close().await.expect("restored WAL store closes");
+        }
     }
 
     #[tokio::test]
@@ -4614,18 +4632,23 @@ mod tests {
             .expect("invalidated-generation rejection remains bounded")
             .expect("invalidated-generation writer joins")
             .expect_err("commit hook rejects an invalidated writer generation");
-        let StateError::CommitOutcomeUncertain {
-            operation,
-            code,
-            message,
-        } = &error
-        else {
-            panic!("expected typed uncertain commit outcome, received {error:?}");
-        };
-        assert_eq!(*operation, "commit session create");
-        assert_eq!(*code, 531);
-        assert!(message.contains("autocommit was restored"));
-        assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
+        #[cfg(unix)]
+        assert!(matches!(
+            &error,
+            StateError::InvalidPath {
+                reason: "SQLite writer generation changed during COMMIT",
+                ..
+            }
+        ));
+        #[cfg(windows)]
+        assert!(matches!(
+            &error,
+            StateError::InvalidPath {
+                reason: "Windows SQLite identity binding changed during COMMIT",
+                ..
+            }
+        ));
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
@@ -6256,41 +6279,32 @@ mod tests {
             .expect("parent replacement rejection remains bounded")
             .expect("parent replacement writer joins")
             .expect_err("commit hook rejects a replaced state parent");
-        let StateError::Database(failure) = error else {
-            panic!("expected commit-hook constraint, received {error:?}");
-        };
-        assert_eq!(failure.operation(), "commit session create");
-        assert_eq!(failure.code(), Some("531"));
+        assert!(matches!(
+            &error,
+            StateError::InvalidPath {
+                path: rejected,
+                reason: "SQLite database parent identity changed during COMMIT",
+            } if rejected == &original_parent
+        ));
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+        fs::remove_dir(&original_parent).expect("remove replacement state parent");
+        fs::rename(&moved_parent, &original_parent).expect("restore pinned state parent");
+        assert!(
+            store
+                .sessions()
+                .get(&SessionId::new("parent-replacement-row").expect("valid test id"))
+                .await
+                .expect("read parent-replacement rollback")
+                .is_none()
+        );
+        store
+            .sessions()
+            .create(&session("parent-replacement-recovery", 2))
+            .await
+            .expect("replacement pool connection commits after parent restoration");
         let store = std::sync::Arc::try_unwrap(store)
             .unwrap_or_else(|_| panic!("writer retained parent-replacement store"));
-        assert!(matches!(
-            store.close().await,
-            Err(StateError::CloseDegraded {
-                os_lock_released: true,
-                ..
-            })
-        ));
-
-        let moved_database = moved_parent.join("parent-replacement.sqlite");
-        let options = SqliteConnectOptions::new()
-            .filename(&moved_database)
-            .read_only(true)
-            .create_if_missing(false);
-        let mut reader = SqliteConnection::connect_with(&options)
-            .await
-            .expect("open moved database rollback reader");
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sessions WHERE id = 'parent-replacement-row'"
-            )
-            .fetch_one(&mut reader)
-            .await
-            .expect("read parent-replacement rollback"),
-            0
-        );
-        reader.close().await.expect("close moved rollback reader");
-        fs::remove_dir(&original_parent).expect("remove replacement state parent");
-        fs::remove_dir_all(&moved_parent).expect("remove moved state parent");
+        store.close().await.expect("restored parent store closes");
     }
 
     #[cfg(unix)]
@@ -6484,9 +6498,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use xattr::FileExt as _;
 
-        for drift in ["xattr", "header"] {
+        for drift in ["database", "xattr", "header"] {
             let directory = tempfile::tempdir().expect("temporary directory");
             let path = database_path(&directory, &format!("commit-{drift}.sqlite"));
+            let detached_path = database_path(&directory, "commit-database-detached.sqlite");
             let store = std::sync::Arc::new(open(&path).await);
             let owner = test_support::owner(&store).to_owned();
             let lock_path = unix_lock_path(&path);
@@ -6510,7 +6525,9 @@ mod tests {
                 .await
                 .expect("writer reaches actual SQLite commit boundary");
 
-            if drift == "xattr" {
+            if drift == "database" {
+                fs::rename(&path, &detached_path).expect("detach database pathname before commit");
+            } else if drift == "xattr" {
                 database_file
                     .remove_xattr("user.gta-claw.writer-lock-path")
                     .expect("remove database generation before commit");
@@ -6526,13 +6543,30 @@ mod tests {
                 .expect("commit-hook rejection remains bounded")
                 .expect("writer task joins")
                 .expect_err("commit hook rejects lost binding");
-            let StateError::Database(failure) = error else {
-                panic!("expected SQLite commit-hook constraint, received {error:?}");
+            let (expected_path, expected_reason) = match drift {
+                "database" => (&path, "SQLite database path identity changed during COMMIT"),
+                "xattr" => (
+                    &path,
+                    "SQLite writer lock identity xattr is missing during COMMIT",
+                ),
+                "header" => (
+                    &lock_path,
+                    "SQLite writer lock contents changed during COMMIT",
+                ),
+                _ => unreachable!(),
             };
-            assert_eq!(failure.operation(), "commit session create");
-            assert_eq!(failure.code(), Some("531"));
+            assert!(matches!(
+                &error,
+                StateError::InvalidPath {
+                    path: rejected,
+                    reason,
+                } if rejected == expected_path && *reason == expected_reason
+            ));
+            assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
 
-            if drift == "xattr" {
+            if drift == "database" {
+                fs::rename(&detached_path, &path).expect("restore database pathname after veto");
+            } else if drift == "xattr" {
                 database_file
                     .set_xattr("user.gta-claw.writer-lock-path", &identity)
                     .expect("restore database generation");
@@ -6549,6 +6583,11 @@ mod tests {
                     .expect("read rolled-back commit-hook row")
                     .is_none()
             );
+            store
+                .sessions()
+                .create(&session(&format!("commit-{drift}-recovery"), 2))
+                .await
+                .expect("replacement pool connection commits after identity restoration");
             let store = std::sync::Arc::try_unwrap(store)
                 .unwrap_or_else(|_| panic!("writer retained commit-hook store"));
             store.close().await.expect("commit-hook store closes");

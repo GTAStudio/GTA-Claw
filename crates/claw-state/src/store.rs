@@ -577,6 +577,20 @@ fn file_control_database(
                 message,
             };
         }
+        claw_sqlite_file_control::FileControlError::IdentityCommitVetoed(veto, cleanup) => {
+            let primary = StateError::InvalidPath {
+                path: veto.path().to_owned(),
+                reason: veto.reason(),
+            };
+            return match cleanup {
+                Some(cleanup) => StateError::OperationCleanupFailed {
+                    operation,
+                    primary: Box::new(primary),
+                    cleanup,
+                },
+                None => primary,
+            };
+        }
         other => other,
     };
     error.code().map_or_else(

@@ -1492,6 +1492,20 @@ async fn commit_verified(
                     message,
                 }
             }
+            claw_sqlite_file_control::FileControlError::IdentityCommitVetoed(veto, cleanup) => {
+                let primary = StateError::InvalidPath {
+                    path: veto.path().to_owned(),
+                    reason: veto.reason(),
+                };
+                match cleanup {
+                    Some(cleanup) => StateError::OperationCleanupFailed {
+                        operation,
+                        primary: Box::new(primary),
+                        cleanup,
+                    },
+                    None => primary,
+                }
+            }
             other if other.code() == Some(9) && std::time::Instant::now() >= deadline => {
                 StateError::OperationTimedOut {
                     operation,

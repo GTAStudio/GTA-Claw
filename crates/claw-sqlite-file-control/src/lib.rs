@@ -8,6 +8,28 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+
+/// Typed reason recorded by the installed identity commit hook for one COMMIT attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityCommitVeto {
+    path: std::path::PathBuf,
+    reason: &'static str,
+}
+
+impl IdentityCommitVeto {
+    /// Returns the path whose identity check rejected the COMMIT.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Returns the stable identity-rejection reason.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
 /// Failure returned by SQLite while inspecting its open main database file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileControlError {
@@ -21,6 +43,8 @@ pub enum FileControlError {
     CommittedWithCleanupFailure(String),
     /// COMMIT returned an error after autocommit made durability uncertain.
     CommitOutcomeUncertain(i32, String),
+    /// The installed identity hook vetoed this exact COMMIT and SQLite rolled it back.
+    IdentityCommitVetoed(IdentityCommitVeto, Option<String>),
     /// SQLite ended the exact manual transaction outside its owner.
     TransactionInvalidated(String),
 }
@@ -67,6 +91,7 @@ impl FileControlError {
             Self::CommittedAfterDeadline(_) => None,
             Self::CommittedWithCleanupFailure(_) => None,
             Self::CommitOutcomeUncertain(code, _) => Some(*code),
+            Self::IdentityCommitVetoed(_, _) => None,
             Self::TransactionInvalidated(_) => None,
         }
     }
@@ -99,6 +124,18 @@ impl Display for FileControlError {
                 formatter,
                 "SQLite COMMIT returned code {code} after autocommit; outcome is uncertain: {cleanup}"
             ),
+            Self::IdentityCommitVetoed(veto, cleanup) => {
+                write!(
+                    formatter,
+                    "SQLite identity hook vetoed COMMIT for {}: {}",
+                    veto.path.display(),
+                    veto.reason
+                )?;
+                if let Some(cleanup) = cleanup {
+                    write!(formatter, "; terminal cleanup failed: {cleanup}")?;
+                }
+                Ok(())
+            }
             Self::TransactionInvalidated(message) => {
                 write!(
                     formatter,
@@ -121,6 +158,13 @@ fn append_committed_cleanup(
         }
         FileControlError::CommitOutcomeUncertain(code, cleanup) => {
             FileControlError::CommitOutcomeUncertain(code, format!("{cleanup}; {additional}"))
+        }
+        FileControlError::IdentityCommitVetoed(veto, cleanup) => {
+            let cleanup = cleanup.map_or_else(
+                || additional.to_string(),
+                |cleanup| format!("{cleanup}; {additional}"),
+            );
+            FileControlError::IdentityCommitVetoed(veto, Some(cleanup))
         }
         error => FileControlError::Handle(format!("{error}; {additional}")),
     }
@@ -2909,7 +2953,7 @@ fn terminal_close_transaction<Connection: BeginOwnedConnection>(
                             authorizer_address as *mut TransactionAuthorizerContext,
                         ));
                     }
-                } else {
+                } else if token.active {
                     unregister_manual_transaction(token);
                 }
             }
@@ -3128,6 +3172,81 @@ impl<Connection: BeginOwnedConnection> TerminalCommittedResult<Connection> {
             }
         }
     }
+}
+
+struct TerminalIdentityVetoPayload<Connection: BeginOwnedConnection> {
+    transaction: TerminalRollbackPayload<Connection>,
+    result: Option<TerminalCommittedResult<Connection>>,
+    primary: Option<FileControlError>,
+}
+
+fn run_terminal_identity_veto_close<Connection: BeginOwnedConnection>(
+    payload: &Arc<std::sync::Mutex<TerminalIdentityVetoPayload<Connection>>>,
+    runtime: &tokio::runtime::Runtime,
+) -> TerminalJobDisposition {
+    let mut payload = payload
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (close, disposition) = terminal_close_transaction(&mut payload.transaction, runtime);
+    let primary = payload
+        .primary
+        .take()
+        .expect("identity veto primary error remains owned");
+    let error = if close == TerminalCloseOutcome::Closed {
+        primary
+    } else {
+        append_committed_cleanup(primary, format!("terminal close: {close:?}"))
+    };
+    if let Some(result) = payload.result.take() {
+        result.send_error(error);
+    }
+    disposition
+}
+
+fn submit_terminal_identity_veto_close<Connection: BeginOwnedConnection>(
+    permit: TerminalClosePermit,
+    connection: TransactionConnection<Connection>,
+    token: ManualTransactionToken,
+    result: TerminalCommittedResult<Connection>,
+    primary: FileControlError,
+) -> Result<(), String> {
+    let payload = Arc::new(std::sync::Mutex::new(TerminalIdentityVetoPayload {
+        transaction: TerminalRollbackPayload {
+            connection: Some(connection),
+            close: None,
+            token: Some(token),
+            completion: Some(TerminalRollbackCompletion::Drop),
+        },
+        result: Some(result),
+        primary: Some(primary),
+    }));
+    let job_payload = Arc::clone(&payload);
+    permit.submit_job(
+        Box::new(move |runtime| run_terminal_identity_veto_close(&job_payload, runtime)),
+        Some(Box::new(payload)),
+    )
+}
+
+fn handoff_terminal_identity_veto_close<Connection: BeginOwnedConnection>(
+    owner: &mut BlockingCleanupOwner,
+    permit: TerminalClosePermit,
+    connection: TransactionConnection<Connection>,
+    token: ManualTransactionToken,
+    result: TerminalCommittedResult<Connection>,
+    primary: FileControlError,
+) -> Result<(), String> {
+    let reservation = owner
+        .reservation
+        .take()
+        .ok_or_else(|| "blocking cleanup owner is missing".to_owned())?;
+    let terminal_closes = owner
+        .terminal_closes
+        .take()
+        .ok_or_else(|| "terminal close owner is missing".to_owned())?;
+    let result = submit_terminal_identity_veto_close(permit, connection, token, result, primary);
+    drop(terminal_closes);
+    drop(reservation);
+    result
 }
 
 struct TerminalCommittedPayload<Connection: BeginOwnedConnection> {
@@ -3509,6 +3628,8 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     .inner)
             }
             Err(commit_error) => {
+                let identity_veto =
+                    matches!(commit_error, FileControlError::IdentityCommitVetoed(_, _));
                 let committed = matches!(
                     commit_error,
                     FileControlError::CommittedWithCleanupFailure(_)
@@ -3534,7 +3655,16 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     .expect("failed commit cleanup owner remains owned");
                 let fallback = commit_error.clone();
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-                let handoff = if committed {
+                let handoff = if identity_veto {
+                    handoff_terminal_identity_veto_close(
+                        &mut owner,
+                        permit,
+                        connection,
+                        token,
+                        TerminalCommittedResult::Plain(result_tx),
+                        commit_error,
+                    )
+                } else if committed {
                     handoff_terminal_committed_cleanup(
                         &mut owner,
                         permit,
@@ -3556,7 +3686,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     )
                 };
                 if let Err(error) = handoff {
-                    return Err(if committed {
+                    return Err(if identity_veto || committed {
                         append_committed_cleanup(
                             fallback,
                             format!("terminal cleanup handoff: {error}"),
@@ -3573,7 +3703,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     Ok(Err(_)) => Err(FileControlError::Handle(format!(
                         "COMMIT failed: {fallback}; terminal cleanup owner stopped without result"
                     ))),
-                    Err(_) if committed => Err(append_committed_cleanup(
+                    Err(_) if identity_veto || committed => Err(append_committed_cleanup(
                         fallback,
                         "terminal cleanup exceeded its fixed cutoff".to_owned(),
                     )),
@@ -3652,6 +3782,8 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
             >,
         }
         let delivery_cancelled = Arc::clone(&cancelled);
+        let identity_veto_fallback = Arc::new(std::sync::Mutex::new(None));
+        let worker_identity_veto_fallback = Arc::clone(&identity_veto_fallback);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         cleanup_owner
             .handoff_payload_internal(
@@ -3759,6 +3891,13 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                     code,
                                     format!("{commit}; restore busy handler: {error}"),
                                 )),
+                                (
+                                    Err(FileControlError::IdentityCommitVetoed(veto, cleanup)),
+                                    Err(error),
+                                ) => Err(append_committed_cleanup(
+                                    FileControlError::IdentityCommitVetoed(veto, cleanup),
+                                    format!("restore busy handler: {error}"),
+                                )),
                                 (Err(error), Ok(())) => Err(error),
                                 (Err(error), Err(restore)) => Err(FileControlError::Handle(
                                     format!("{error}; restore busy handler failed: {restore}"),
@@ -3856,12 +3995,28 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                             }
                         }
                         Err(error) => {
+                            let identity_veto =
+                                matches!(error, FileControlError::IdentityCommitVetoed(_, _));
                             let committed = matches!(
                                 error,
                                 FileControlError::CommittedWithCleanupFailure(_)
                                     | FileControlError::CommitOutcomeUncertain(_, _)
                             );
-                            if committed {
+                            if identity_veto {
+                                *worker_identity_veto_fallback
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(error.clone());
+                                let _ = submit_terminal_identity_veto_close(
+                                    terminal_permit
+                                        .take()
+                                        .expect("COMMIT terminal permit remains owned"),
+                                    connection,
+                                    token,
+                                    TerminalCommittedResult::Commit(result_tx),
+                                    error,
+                                );
+                            } else if committed {
                                 let _ = submit_terminal_committed_cleanup(
                                     terminal_permit
                                         .take()
@@ -3930,6 +4085,16 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                 Ok(Err(error)) => return Err(error),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= cleanup_deadline {
+                        if let Some(veto) = identity_veto_fallback
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        {
+                            return Err(append_committed_cleanup(
+                                veto,
+                                "terminal close exceeded the bounded COMMIT cleanup cutoff",
+                            ));
+                        }
                         return Err(FileControlError::CommitOutcomeUncertain(
                             libsqlite3_sys::SQLITE_INTERRUPT,
                             "bounded COMMIT exceeded its cleanup cutoff".to_owned(),
@@ -3938,6 +4103,16 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     tokio::task::yield_now().await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(veto) = identity_veto_fallback
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        return Err(append_committed_cleanup(
+                            veto,
+                            "terminal close owner stopped without a result",
+                        ));
+                    }
                     return Err(FileControlError::CommitOutcomeUncertain(
                         libsqlite3_sys::SQLITE_ABORT,
                         "bounded COMMIT cleanup owner stopped without a result".to_owned(),
@@ -4693,6 +4868,10 @@ static ROLLBACK_TEST_GATES: std::sync::LazyLock<
 static FAIL_COMMIT_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static ROLLBACK_SYNCHRONOUS_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static FORCE_IMPLICIT_ROLLBACK_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
@@ -6142,6 +6321,10 @@ async fn commit_synchronously(
     }
     let internal_permit = InternalTransactionPermit::activate(token)?;
     let mut message = std::ptr::null_mut();
+    let identity_attempt = arm_identity_commit_attempt(
+        NonNull::new(database.as_raw_handle().as_ptr())
+            .expect("SQLx locked handle exposes a non-null SQLite connection"),
+    );
     // SAFETY: The SQL string is static and NUL-terminated. SQLx's locked handle
     // prevents concurrent worker access for the duration of sqlite3_exec.
     let result = unsafe {
@@ -6153,6 +6336,11 @@ async fn commit_synchronously(
             &raw mut message,
         )
     };
+    let identity_veto = finish_identity_commit_attempt(
+        NonNull::new(database.as_raw_handle().as_ptr())
+            .expect("SQLx locked handle exposes a non-null SQLite connection"),
+        identity_attempt,
+    );
     drop(internal_permit);
     // A failed COMMIT can leave the transaction active (notably SQLITE_BUSY).
     // Invalidate the linear token only once SQLite confirms autocommit.
@@ -6180,6 +6368,11 @@ async fn commit_synchronously(
         return Err(if result == libsqlite3_sys::SQLITE_OK || autocommit {
             if result == libsqlite3_sys::SQLITE_OK {
                 FileControlError::CommittedWithCleanupFailure(error.to_string())
+            } else if let Some(veto) = identity_veto {
+                FileControlError::IdentityCommitVetoed(
+                    veto,
+                    Some(format!("transaction authorizer cleanup: {error}")),
+                )
             } else {
                 FileControlError::CommitOutcomeUncertain(result, error.to_string())
             }
@@ -6192,9 +6385,14 @@ async fn commit_synchronously(
     if result == libsqlite3_sys::SQLITE_OK {
         Ok(())
     } else if autocommit {
-        Err(FileControlError::CommitOutcomeUncertain(
-            result,
-            "autocommit was restored before the error was reported".to_owned(),
+        Err(identity_veto.map_or_else(
+            || {
+                FileControlError::CommitOutcomeUncertain(
+                    result,
+                    "autocommit was restored before the error was reported".to_owned(),
+                )
+            },
+            |veto| FileControlError::IdentityCommitVetoed(veto, None),
         ))
     } else {
         Err(FileControlError::SQLite(result))
@@ -6207,6 +6405,13 @@ async fn rollback_synchronously(
     connection: &mut sqlx::SqliteConnection,
     token: &mut ManualTransactionToken,
 ) -> Result<(), FileControlError> {
+    #[cfg(test)]
+    {
+        let mut calls = ROLLBACK_SYNCHRONOUS_CALLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *calls.entry(token.generation).or_default() += 1;
+    }
     #[cfg(test)]
     run_rollback_test_gate(token, RollbackTestStage::BeforeLockHandle);
     let mut database = connection
@@ -6388,6 +6593,7 @@ pub async fn install_identity_commit_guard(
         sidecars,
         writer_generation,
         expected_writer_generation,
+        commit_attempt: std::sync::Mutex::new(IdentityCommitAttemptState::default()),
     });
     let context = Box::into_raw(context);
     // SAFETY: SQLite assumes ownership of the boxed context and invokes the
@@ -6430,6 +6636,146 @@ struct IdentityCommitContext {
     sidecars: Vec<PinnedSidecar>,
     writer_generation: Arc<AtomicU64>,
     expected_writer_generation: u64,
+    commit_attempt: std::sync::Mutex<IdentityCommitAttemptState>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Default)]
+struct IdentityCommitAttemptState {
+    next_id: u64,
+    active: Option<IdentityCommitAttempt>,
+}
+
+#[cfg(any(unix, windows))]
+struct IdentityCommitAttempt {
+    id: u64,
+    veto: Option<IdentityCommitVeto>,
+}
+
+#[cfg(any(unix, windows))]
+fn arm_commit_attempt(state: &std::sync::Mutex<IdentityCommitAttemptState>) -> u64 {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.next_id = state.next_id.wrapping_add(1);
+    let id = state.next_id;
+    state.active = Some(IdentityCommitAttempt { id, veto: None });
+    id
+}
+
+#[cfg(any(unix, windows))]
+fn record_commit_veto(
+    state: &std::sync::Mutex<IdentityCommitAttemptState>,
+    veto: IdentityCommitVeto,
+) {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(attempt) = state.active.as_mut()
+        && attempt.veto.is_none()
+    {
+        attempt.veto = Some(veto);
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn finish_commit_attempt(
+    state: &std::sync::Mutex<IdentityCommitAttemptState>,
+    id: u64,
+) -> Option<IdentityCommitVeto> {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state
+        .active
+        .as_ref()
+        .is_some_and(|attempt| attempt.id == id)
+    {
+        state.active.take().and_then(|attempt| attempt.veto)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn arm_identity_commit_attempt(database: NonNull<libsqlite3_sys::sqlite3>) -> Option<u64> {
+    // SAFETY: the locked connection owns any named client-data context.
+    let context = unsafe {
+        libsqlite3_sys::sqlite3_get_clientdata(
+            database.as_ptr(),
+            c"gta-claw-commit-identity".as_ptr(),
+        )
+    };
+    let context = NonNull::new(context.cast::<IdentityCommitContext>())?;
+    // SAFETY: client data remains live for the locked connection.
+    Some(arm_commit_attempt(
+        &unsafe { context.as_ref() }.commit_attempt,
+    ))
+}
+
+#[cfg(unix)]
+fn finish_identity_commit_attempt(
+    database: NonNull<libsqlite3_sys::sqlite3>,
+    id: Option<u64>,
+) -> Option<IdentityCommitVeto> {
+    let id = id?;
+    // SAFETY: the locked connection owns any named client-data context.
+    let context = unsafe {
+        libsqlite3_sys::sqlite3_get_clientdata(
+            database.as_ptr(),
+            c"gta-claw-commit-identity".as_ptr(),
+        )
+    };
+    let context = NonNull::new(context.cast::<IdentityCommitContext>())?;
+    // SAFETY: client data remains live for the locked connection.
+    finish_commit_attempt(&unsafe { context.as_ref() }.commit_attempt, id)
+}
+
+#[cfg(windows)]
+fn arm_identity_commit_attempt(database: NonNull<libsqlite3_sys::sqlite3>) -> Option<u64> {
+    // SAFETY: the locked connection owns any named client-data context.
+    let context = unsafe {
+        libsqlite3_sys::sqlite3_get_clientdata(
+            database.as_ptr(),
+            c"gta-claw-windows-commit-identity".as_ptr(),
+        )
+    };
+    let context = NonNull::new(context.cast::<WindowsIdentityCommitContext>())?;
+    // SAFETY: client data remains live for the locked connection.
+    Some(arm_commit_attempt(
+        &unsafe { context.as_ref() }.commit_attempt,
+    ))
+}
+
+#[cfg(windows)]
+fn finish_identity_commit_attempt(
+    database: NonNull<libsqlite3_sys::sqlite3>,
+    id: Option<u64>,
+) -> Option<IdentityCommitVeto> {
+    let id = id?;
+    // SAFETY: the locked connection owns any named client-data context.
+    let context = unsafe {
+        libsqlite3_sys::sqlite3_get_clientdata(
+            database.as_ptr(),
+            c"gta-claw-windows-commit-identity".as_ptr(),
+        )
+    };
+    let context = NonNull::new(context.cast::<WindowsIdentityCommitContext>())?;
+    // SAFETY: client data remains live for the locked connection.
+    finish_commit_attempt(&unsafe { context.as_ref() }.commit_attempt, id)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn arm_identity_commit_attempt(_database: NonNull<libsqlite3_sys::sqlite3>) -> Option<u64> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn finish_identity_commit_attempt(
+    _database: NonNull<libsqlite3_sys::sqlite3>,
+    _id: Option<u64>,
+) -> Option<IdentityCommitVeto> {
+    None
 }
 
 #[cfg(any(unix, windows))]
@@ -6455,47 +6801,85 @@ unsafe extern "C" fn reject_moved_or_unbound_commit(context: *mut std::ffi::c_vo
     // SAFETY: SQLite invokes the hook only while its client-data context and
     // connection are live.
     let context = unsafe { context.as_ref() };
-    let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        !database_has_moved(context.database) && unix_identity_matches(context)
+    let veto = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unix_identity_rejection(context).or_else(|| {
+            database_has_moved(context.database).then(|| IdentityCommitVeto {
+                path: context.database_path.clone(),
+                reason: "SQLite main database identity changed during COMMIT",
+            })
+        })
     }))
-    .unwrap_or(false);
-    i32::from(!valid)
+    .unwrap_or_else(|_| {
+        Some(IdentityCommitVeto {
+            path: context.database_path.clone(),
+            reason: "SQLite identity commit hook panicked",
+        })
+    });
+    if let Some(veto) = veto {
+        record_commit_veto(&context.commit_attempt, veto);
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(unix)]
-fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
+fn unix_identity_rejection(context: &IdentityCommitContext) -> Option<IdentityCommitVeto> {
     use std::os::unix::fs::FileExt as _;
     use xattr::FileExt as _;
 
-    if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation
-        || !unix_path_matches_private_directory(
-            &context.database_parent_path,
-            &context.database_parent,
-            context.expected_uid,
-        )
-        || !unix_path_matches_private_file(
-            &context.database_path,
-            &context.database_file,
-            0o600,
-            context.expected_uid,
-        )
-        || !unix_path_matches_private_file(
-            &context.lock_path,
-            &context.lock_file,
-            0o600,
-            context.expected_uid,
-        )
-    {
-        return false;
+    if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation {
+        return Some(IdentityCommitVeto {
+            path: context.lock_path.clone(),
+            reason: "SQLite writer generation changed during COMMIT",
+        });
+    }
+    if !unix_path_matches_private_directory(
+        &context.database_parent_path,
+        &context.database_parent,
+        context.expected_uid,
+    ) {
+        return Some(IdentityCommitVeto {
+            path: context.database_parent_path.clone(),
+            reason: "SQLite database parent identity changed during COMMIT",
+        });
+    }
+    if !unix_path_matches_private_file(
+        &context.database_path,
+        &context.database_file,
+        0o600,
+        context.expected_uid,
+    ) {
+        return Some(IdentityCommitVeto {
+            path: context.database_path.clone(),
+            reason: "SQLite database path identity changed during COMMIT",
+        });
+    }
+    if !unix_path_matches_private_file(
+        &context.lock_path,
+        &context.lock_file,
+        0o600,
+        context.expected_uid,
+    ) {
+        return Some(IdentityCommitVeto {
+            path: context.lock_path.clone(),
+            reason: "SQLite writer lock identity changed during COMMIT",
+        });
     }
     let Ok(Some(identity)) = context
         .database_file
         .get_xattr("user.gta-claw.writer-lock-path")
     else {
-        return false;
+        return Some(IdentityCommitVeto {
+            path: context.database_path.clone(),
+            reason: "SQLite writer lock identity xattr is missing during COMMIT",
+        });
     };
     if identity != context.expected_identity {
-        return false;
+        return Some(IdentityCommitVeto {
+            path: context.database_path.clone(),
+            reason: "SQLite writer lock identity xattr changed during COMMIT",
+        });
     }
     for sidecar in &context.sidecars {
         let expected_generation = unix_sidecar_generation_record(
@@ -6514,7 +6898,20 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
                 .get_xattr("user.gta-claw.sidecar-generation"),
             Ok(Some(generation)) if generation == expected_generation
         ) {
-            return false;
+            let reason = if sidecar
+                .path
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b"-wal")
+            {
+                "SQLite WAL identity changed during COMMIT"
+            } else {
+                "SQLite shared-memory identity changed during COMMIT"
+            };
+            return Some(IdentityCommitVeto {
+                path: sidecar.path.clone(),
+                reason,
+            });
         }
     }
     let mut journal = context.database_path.as_os_str().to_owned();
@@ -6526,13 +6923,22 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
         &context.expected_identity,
         false,
     ) {
-        return false;
+        return Some(IdentityCommitVeto {
+            path: std::path::PathBuf::from(journal),
+            reason: "SQLite rollback journal identity changed during COMMIT",
+        });
     }
     let Ok(metadata) = context.lock_file.metadata() else {
-        return false;
+        return Some(IdentityCommitVeto {
+            path: context.lock_path.clone(),
+            reason: "SQLite writer lock metadata became unavailable during COMMIT",
+        });
     };
     if usize::try_from(metadata.len()).ok() != Some(context.expected_identity.len()) {
-        return false;
+        return Some(IdentityCommitVeto {
+            path: context.lock_path.clone(),
+            reason: "SQLite writer lock contents changed during COMMIT",
+        });
     }
 
     #[cfg(unix)]
@@ -6604,8 +7010,11 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
     }
     let mut contents = vec![0_u8; context.expected_identity.len()];
     match context.lock_file.read_at(&mut contents, 0) {
-        Ok(read) => read == contents.len() && contents == context.expected_identity,
-        Err(_) => false,
+        Ok(read) if read == contents.len() && contents == context.expected_identity => None,
+        Ok(_) | Err(_) => Some(IdentityCommitVeto {
+            path: context.lock_path.clone(),
+            reason: "SQLite writer lock contents changed during COMMIT",
+        }),
     }
 }
 
@@ -6722,6 +7131,7 @@ pub async fn install_windows_identity_commit_guard(
         sidecars,
         writer_generation,
         expected_writer_generation,
+        commit_attempt: std::sync::Mutex::new(IdentityCommitAttemptState::default()),
     });
     let context = Box::into_raw(context);
     // SAFETY: SQLite owns the context and invokes its destructor exactly once.
@@ -6759,6 +7169,7 @@ struct WindowsIdentityCommitContext {
     sidecars: Vec<PinnedSidecar>,
     writer_generation: Arc<AtomicU64>,
     expected_writer_generation: u64,
+    commit_attempt: std::sync::Mutex<IdentityCommitAttemptState>,
 }
 
 #[cfg(windows)]
@@ -6780,7 +7191,18 @@ unsafe extern "C" fn reject_unbound_windows_commit(context: *mut std::ffi::c_voi
         windows_identity_matches(context)
     }))
     .unwrap_or(false);
-    i32::from(!valid)
+    if valid {
+        0
+    } else {
+        record_commit_veto(
+            &context.commit_attempt,
+            IdentityCommitVeto {
+                path: context.database_path.clone(),
+                reason: "Windows SQLite identity binding changed during COMMIT",
+            },
+        );
+        1
+    }
 }
 
 #[cfg(windows)]
@@ -8586,6 +9008,309 @@ mod deadline_tests {
             .execute(&pool)
             .await
             .expect("expired deadline returns the unmodified pool lease");
+        pool.close().await;
+    }
+
+    unsafe extern "C" fn reject_hookless_commit(_context: *mut std::ffi::c_void) -> i32 {
+        1
+    }
+
+    #[tokio::test]
+    async fn hookless_commit_veto_remains_uncertain() {
+        let directory = tempfile::tempdir().expect("hookless veto directory");
+        let path = directory.path().join("hookless-veto.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open hookless veto pool");
+        sqlx::query("CREATE TABLE value(id INTEGER)")
+            .execute(&pool)
+            .await
+            .expect("create hookless veto fixture");
+        let connection = pool.acquire().await.expect("acquire hookless veto owner");
+        let mut transaction =
+            begin_manual_pool_transaction(connection, std::time::Duration::from_millis(500))
+                .await
+                .expect("begin hookless veto transaction");
+        sqlx::query("INSERT INTO value VALUES (1)")
+            .execute(&mut transaction)
+            .await
+            .expect("stage hookless veto row");
+        {
+            let mut handle = transaction
+                .connection
+                .as_mut()
+                .expect("hookless veto connection remains owned")
+                .inner
+                .sqlite()
+                .lock_handle()
+                .await
+                .expect("lock hookless veto handle");
+            // SAFETY: the locked live handle retains this no-context callback until close.
+            unsafe {
+                libsqlite3_sys::sqlite3_commit_hook(
+                    handle.as_raw_handle().as_ptr(),
+                    Some(reject_hookless_commit),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        let error = transaction
+            .commit()
+            .await
+            .expect_err("hookless veto cannot be proven safe");
+        assert!(matches!(
+            error,
+            FileControlError::CommitOutcomeUncertain(531, _)
+        ));
+        let replacement = pool
+            .acquire()
+            .await
+            .expect("hookless veto terminal close restores pool capacity");
+        drop(replacement);
+        pool.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proven_identity_commit_veto_closes_without_second_rollback() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use xattr::FileExt as _;
+
+        let directory = tempfile::tempdir().expect("identity veto directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure identity veto directory");
+        let path = directory.path().join("identity-veto.sqlite");
+        let lock_path = directory.path().join("identity-veto.lock");
+        let identity = b"identity-veto-generation";
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open identity veto pool");
+        sqlx::query("CREATE TABLE value(id INTEGER)")
+            .execute(&pool)
+            .await
+            .expect("create identity veto fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure identity veto database");
+        let database_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open identity veto database");
+        database_file
+            .set_xattr("user.gta-claw.writer-lock-path", identity)
+            .expect("bind identity veto database");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("create identity veto lock");
+        lock_file
+            .write_all(identity)
+            .and_then(|()| lock_file.sync_all())
+            .expect("persist identity veto lock");
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure identity veto lock");
+        let parent_file = std::fs::File::open(directory.path()).expect("open identity veto parent");
+
+        let connection = pool.acquire().await.expect("acquire identity veto owner");
+        let mut transaction =
+            begin_manual_pool_transaction(connection, std::time::Duration::from_millis(500))
+                .await
+                .expect("begin identity veto transaction");
+        sqlx::query("INSERT INTO value VALUES (1)")
+            .execute(&mut transaction)
+            .await
+            .expect("stage identity veto row");
+        sqlx::query("CREATE TABLE veto_schema(value TEXT)")
+            .execute(&mut transaction)
+            .await
+            .expect("stage identity veto schema mutation");
+        let writer_generation = Arc::new(AtomicU64::new(7));
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let mut handle = transaction
+                .connection
+                .as_mut()
+                .expect("identity veto connection remains owned")
+                .inner
+                .sqlite()
+                .lock_handle()
+                .await
+                .expect("lock identity veto handle");
+            let database = handle.as_raw_handle();
+            let context = Box::new(IdentityCommitContext {
+                database,
+                database_parent_path: directory.path().to_owned(),
+                database_parent: parent_file.try_clone().expect("clone identity veto parent"),
+                database_path: path.clone(),
+                database_file: database_file
+                    .try_clone()
+                    .expect("clone identity veto database"),
+                lock_path: lock_path.clone(),
+                lock_file: lock_file.try_clone().expect("clone identity veto lock"),
+                expected_identity: identity.to_vec(),
+                expected_uid: database_file
+                    .metadata()
+                    .expect("inspect identity veto database")
+                    .uid(),
+                sidecars: Vec::new(),
+                writer_generation,
+                expected_writer_generation: 7,
+                commit_attempt: std::sync::Mutex::new(IdentityCommitAttemptState::default()),
+            });
+            let context = Box::into_raw(context);
+            // SAFETY: SQLite owns this exact boxed context until connection close.
+            let registered = unsafe {
+                libsqlite3_sys::sqlite3_set_clientdata(
+                    database.as_ptr(),
+                    c"gta-claw-commit-identity".as_ptr(),
+                    context.cast(),
+                    Some(drop_identity_commit_context),
+                )
+            };
+            assert_eq!(registered, libsqlite3_sys::SQLITE_OK);
+            // SAFETY: the client-data context is live and bound to this hook.
+            unsafe {
+                libsqlite3_sys::sqlite3_commit_hook(
+                    database.as_ptr(),
+                    Some(reject_moved_or_unbound_commit),
+                    context.cast(),
+                );
+            }
+        }
+        database_file
+            .remove_xattr("user.gta-claw.writer-lock-path")
+            .expect("remove identity binding before COMMIT");
+        let generation = transaction
+            .token
+            .as_ref()
+            .expect("identity veto token remains owned")
+            .generation;
+        let transaction_key = transaction
+            .token
+            .as_ref()
+            .expect("identity veto token remains owned")
+            .state
+            .key;
+        let rollback_before = ROLLBACK_SYNCHRONOUS_CALLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&generation)
+            .copied()
+            .unwrap_or_default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = transaction
+            .commit_with_deadline(
+                deadline,
+                deadline + std::time::Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_millis(500),
+                None,
+            )
+            .await
+            .expect_err("identity hook vetoes exact COMMIT");
+        let FileControlError::IdentityCommitVetoed(veto, cleanup) = error else {
+            panic!("expected proven identity veto");
+        };
+        assert_eq!(veto.path(), path);
+        assert_eq!(
+            veto.reason(),
+            "SQLite writer lock identity xattr is missing during COMMIT"
+        );
+        assert!(cleanup.is_none());
+        assert!(
+            !ACTIVE_MANUAL_TRANSACTIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&transaction_key),
+            "proven veto unregisters its exact transaction generation"
+        );
+        assert_eq!(
+            ROLLBACK_SYNCHRONOUS_CALLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&generation)
+                .unwrap_or_default(),
+            rollback_before,
+            "proven hook rollback cannot dispatch a second SQL ROLLBACK"
+        );
+        database_file
+            .set_xattr("user.gta-claw.writer-lock-path", identity)
+            .expect("restore identity binding");
+        let mut replacement = pool
+            .acquire()
+            .await
+            .expect("terminally closed veto connection is replaced");
+        {
+            let mut handle = replacement
+                .lock_handle()
+                .await
+                .expect("lock replacement connection");
+            // SAFETY: the replacement handle is locked and live.
+            let stale_context = unsafe {
+                libsqlite3_sys::sqlite3_get_clientdata(
+                    handle.as_raw_handle().as_ptr(),
+                    c"gta-claw-commit-identity".as_ptr(),
+                )
+            };
+            assert!(
+                stale_context.is_null(),
+                "the identity-compromised connection cannot return to the pool"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM value")
+                .fetch_one(&mut *replacement)
+                .await
+                .expect("read replacement connection"),
+            0
+        );
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'veto_schema'
+                 )",
+            )
+            .fetch_one(&mut *replacement)
+            .await
+            .expect("inspect vetoed schema mutation")
+        );
+        sqlx::query("INSERT INTO value VALUES (2)")
+            .execute(&mut *replacement)
+            .await
+            .expect("replacement connection remains usable");
+        drop(replacement);
+
+        let attempts = std::sync::Mutex::new(IdentityCommitAttemptState::default());
+        let first = arm_commit_attempt(&attempts);
+        record_commit_veto(
+            &attempts,
+            IdentityCommitVeto {
+                path: path.clone(),
+                reason: "first attempt rejection",
+            },
+        );
+        assert!(finish_commit_attempt(&attempts, first).is_some());
+        let second = arm_commit_attempt(&attempts);
+        assert!(
+            finish_commit_attempt(&attempts, second).is_none(),
+            "stale veto provenance cannot affect a later COMMIT attempt"
+        );
         pool.close().await;
     }
 
@@ -11475,6 +12200,7 @@ mod windows_tests {
             sidecars,
             writer_generation: std::sync::Arc::new(AtomicU64::new(1)),
             expected_writer_generation: 1,
+            commit_attempt: std::sync::Mutex::new(IdentityCommitAttemptState::default()),
         };
         assert!(windows_identity_matches(&context));
 
