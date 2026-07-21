@@ -7,9 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-test-hooks = []
-
 [dependencies]
 futures-core = "=0.3.32"
 libsqlite3-sys = "0.37.0"

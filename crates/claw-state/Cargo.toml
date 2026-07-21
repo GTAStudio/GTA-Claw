@@ -25,7 +25,6 @@ same-file.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
-claw-sqlite-file-control = { workspace = true, features = ["test-hooks"] }
 tempfile = "3.27.0"
 
 [lints]

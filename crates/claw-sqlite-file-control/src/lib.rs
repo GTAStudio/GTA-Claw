@@ -1533,37 +1533,6 @@ async fn wait_for_cleanup_owner_retirement(
     Ok(())
 }
 
-/// Installs the single BEGIN-worker retirement gate used by dependent crate tests.
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub fn set_begin_worker_retirement_test_gate() -> (Arc<tokio::sync::Notify>, Arc<AtomicBool>) {
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(AtomicBool::new(false));
-    let mut gate = BEGIN_WORKER_RETIRE_TEST_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(gate.is_none(), "BEGIN worker retirement gate is unique");
-    *gate = Some((Arc::clone(&entered), Arc::clone(&release)));
-    (entered, release)
-}
-
-/// Clears the dependent-crate BEGIN-worker retirement gate.
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub fn clear_begin_worker_retirement_test_gate() {
-    BEGIN_WORKER_RETIRE_TEST_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-}
-
-/// Returns the exact number of globally charged cleanup owners for quota tests.
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub fn active_cleanup_owner_count_for_test() -> usize {
-    ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire)
-}
-
 /// Returns whether a Unix file has the expected owner/mode and no effective
 /// platform ACL beyond those mode bits.
 #[cfg(unix)]
@@ -5892,13 +5861,13 @@ static FAIL_AUTHORIZER_DETACH_GENERATIONS: std::sync::LazyLock<
 static FAIL_BEGIN_BUSY_RESTORE_NONCES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 type ApplicationIdPostExecGate = (Arc<tokio::sync::Notify>, Arc<AtomicBool>);
 #[cfg(test)]
 static APPLICATION_ID_POST_EXEC_TEST_GATE: std::sync::LazyLock<
     std::sync::Mutex<Option<ApplicationIdPostExecGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 static BEGIN_WORKER_RETIRE_TEST_GATE: std::sync::LazyLock<
     std::sync::Mutex<Option<ApplicationIdPostExecGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
@@ -6634,7 +6603,7 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
                         BeginWorkerOutput::Terminal(_, _) => {}
                     }
                 }
-                #[cfg(any(test, feature = "test-hooks"))]
+                #[cfg(test)]
                 if let Some((entered, release)) = BEGIN_WORKER_RETIRE_TEST_GATE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -9298,6 +9267,21 @@ mod deadline_tests {
         .unwrap_or_else(|_| panic!("{operation} did not reach its test gate"));
     }
 
+    async fn wait_for_cleanup_owner_count(expected: usize, operation: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{operation}: expected {expected} owners, observed {}",
+                ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire)
+            )
+        });
+    }
+
     fn run_in_isolated_child(test_name: &str, marker: &str) -> bool {
         if std::env::var_os(marker).is_some() {
             return false;
@@ -10194,6 +10178,11 @@ mod deadline_tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
             .await
             .expect("BEGIN worker publishes result before retirement");
+        assert_eq!(
+            ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire),
+            3,
+            "gated BEGIN owns exactly its worker and two delivered owners"
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
                 .await
@@ -10201,12 +10190,20 @@ mod deadline_tests {
             "BEGIN cannot return while its worker owner remains charged"
         );
         release.store(true, Ordering::Release);
-        task.await
+        let transaction = task
+            .await
             .expect("BEGIN retirement task joins")
-            .expect("BEGIN returns after worker retirement")
+            .expect("BEGIN returns after worker retirement");
+        assert_eq!(
+            ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire),
+            2,
+            "successful BEGIN returns only its transaction and post-COMMIT owners"
+        );
+        transaction
             .rollback()
             .await
             .expect("BEGIN retirement transaction rolls back");
+        wait_for_cleanup_owner_count(0, "successful BEGIN terminal retirement").await;
         pool.close().await;
     }
 
@@ -10265,6 +10262,11 @@ mod deadline_tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
                 .await
                 .expect("failed BEGIN publishes its terminal result before retirement");
+            assert_eq!(
+                ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire),
+                2,
+                "failed BEGIN retains its worker and post-COMMIT owner until retirement"
+            );
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
                     .await
@@ -10275,6 +10277,7 @@ mod deadline_tests {
             task.await
                 .expect("failed BEGIN retirement task joins")
                 .expect_err("contended BEGIN remains an error");
+            wait_for_cleanup_owner_count(0, "failed BEGIN terminal retirement").await;
             drop(guard);
             sqlx::query("ROLLBACK")
                 .execute(&mut *blocker)
@@ -10320,6 +10323,11 @@ mod deadline_tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
                 .await
                 .expect("cancelled BEGIN publishes its terminal result before retirement");
+            assert_eq!(
+                ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire),
+                2,
+                "cancelled BEGIN retains its worker and post-COMMIT owner until retirement"
+            );
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
                     .await
@@ -10332,6 +10340,7 @@ mod deadline_tests {
                 .expect("cancelled BEGIN retirement task joins")
                 .expect_err("cancelled BEGIN remains an error");
             assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_INTERRUPT));
+            wait_for_cleanup_owner_count(0, "cancelled BEGIN terminal retirement").await;
             pool.close().await;
         }
     }
