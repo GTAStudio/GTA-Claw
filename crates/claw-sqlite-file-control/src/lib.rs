@@ -5679,6 +5679,12 @@ static FAIL_BEGIN_BUSY_RESTORE_NONCES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
+type ApplicationIdPostExecGate = (Arc<tokio::sync::Notify>, Arc<AtomicBool>);
+#[cfg(test)]
+static APPLICATION_ID_POST_EXEC_TEST_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<ApplicationIdPostExecGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
 static DROPPED_AUTHORIZER_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -7012,6 +7018,21 @@ pub async fn read_application_id_with_deadline(
     };
     if result != libsqlite3_sys::SQLITE_OK {
         return Err(FileControlError::SQLite(result));
+    }
+    #[cfg(test)]
+    if let Some((entered, release)) = APPLICATION_ID_POST_EXEC_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|(entered, release)| (Arc::clone(entered), Arc::clone(release)))
+    {
+        entered.notify_one();
+        while !release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+    if context.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= context.deadline {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
     }
     context.value.ok_or_else(|| {
         FileControlError::Handle("PRAGMA application_id returned no value".to_owned())
@@ -9749,6 +9770,64 @@ mod deadline_tests {
             .expect("pre-dispatch rejection releases pool capacity")
             .expect("equal-deadline lease remains reusable");
         drop(replacement);
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_id_success_after_cutoff_is_not_delivered() {
+        struct GateGuard {
+            release: Arc<AtomicBool>,
+        }
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.release.store(true, Ordering::Release);
+                APPLICATION_ID_POST_EXEC_TEST_GATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open application-id post-exec pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire application-id post-exec connection");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(AtomicBool::new(false));
+        *APPLICATION_ID_POST_EXEC_TEST_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        let _guard = GateGuard {
+            release: Arc::clone(&release),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let task = tokio::spawn(async move {
+            let mut connection = connection;
+            let result = read_application_id_with_deadline(
+                &mut connection,
+                deadline,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            (connection, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("application-id raw execution reaches post-success gate");
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        release.store(true, Ordering::Release);
+        let (connection, result) = task.await.expect("application-id post-exec task joins");
+        assert_eq!(
+            result.expect_err("post-cutoff application id is never delivered"),
+            FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)
+        );
+        drop(connection);
         pool.close().await;
     }
 

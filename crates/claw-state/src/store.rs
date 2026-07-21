@@ -421,26 +421,32 @@ static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, 
         })
     });
 
+fn run_open_lifecycle_runtime(
+    ready: std::sync::mpsc::SyncSender<Result<tokio::runtime::Handle, String>>,
+) {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(STATE_OPEN_ADMISSION_LIMIT)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(error.to_string()));
+            return;
+        }
+    };
+    if ready.send(Ok(runtime.handle().clone())).is_err() {
+        return;
+    }
+    runtime.block_on(std::future::pending::<()>());
+}
+
 static OPEN_LIFECYCLE_RUNTIME: std::sync::LazyLock<Result<tokio::runtime::Handle, String>> =
     std::sync::LazyLock::new(|| {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("claw-state-open-lifecycle".to_owned())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(STATE_OPEN_ADMISSION_LIMIT)
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                let _ = ready_tx.send(Ok(runtime.handle().clone()));
-                runtime.block_on(std::future::pending::<()>());
-            })
+            .spawn(move || run_open_lifecycle_runtime(ready_tx))
             .map_err(|error| error.to_string())?;
         ready_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -854,6 +860,10 @@ static OPEN_POSTCOMMIT_TEST_BARRIER: std::sync::LazyLock<
 static OPEN_POSTCOMMIT_HOLD_AFTER_CANCEL: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static OPEN_AFTER_ACK_TEST_BARRIER: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static OPEN_CLEANUP_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
@@ -1773,7 +1783,7 @@ async fn close_undelivered_writer_claim(
 }
 
 async fn open_timeout_error(
-    mut terminal: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    mut terminal: tokio::sync::oneshot::Receiver<Result<OpenLifecycleTerminal, String>>,
     deadline: tokio::time::Instant,
     deadline_state: &OpenDeadlineState,
     timeout_ms: u64,
@@ -1800,7 +1810,11 @@ async fn open_timeout_error(
         }
     };
     match terminal_result {
-        Ok(Ok(())) => primary,
+        Ok(Ok(OpenLifecycleTerminal::Delivery(delivery))) => {
+            drop(delivery);
+            primary
+        }
+        Ok(Ok(OpenLifecycleTerminal::Cleaned)) => primary,
         Ok(Err(cleanup)) => StateError::OperationCleanupFailed {
             operation: "state store open",
             primary: Box::new(primary),
@@ -1844,10 +1858,51 @@ struct OpenLifecycleActorInput {
     deadline_state: Arc<OpenDeadlineState>,
     ready: tokio::sync::oneshot::Sender<Result<(), StateError>>,
     delivery_ack: tokio::sync::oneshot::Receiver<()>,
-    delivered_store: Arc<std::sync::Mutex<Option<StateStore>>>,
 }
 
-async fn run_open_lifecycle_actor(input: OpenLifecycleActorInput) -> Result<(), StateError> {
+struct OpenStoreDelivery {
+    store: Option<StateStore>,
+    cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    open_admission: Option<tokio::sync::SemaphorePermit<'static>>,
+    deadline: tokio::time::Instant,
+    deadline_state: Arc<OpenDeadlineState>,
+}
+
+enum OpenLifecycleTerminal {
+    Delivery(Box<OpenStoreDelivery>),
+    Cleaned,
+}
+
+impl OpenStoreDelivery {
+    fn accept(mut self) -> StateStore {
+        self.cleanup_owner.take();
+        self.open_admission.take();
+        self.store.take().expect("delivered store remains owned")
+    }
+}
+
+impl Drop for OpenStoreDelivery {
+    fn drop(&mut self) {
+        let (Some(owner), Some(store), Some(open_admission)) = (
+            self.cleanup_owner.take(),
+            self.store.take(),
+            self.open_admission.take(),
+        ) else {
+            return;
+        };
+        let _ = handoff_undelivered_store(
+            owner,
+            store,
+            open_admission,
+            self.deadline,
+            Arc::clone(&self.deadline_state),
+        );
+    }
+}
+
+async fn run_open_lifecycle_actor(
+    input: OpenLifecycleActorInput,
+) -> Result<OpenLifecycleTerminal, StateError> {
     let OpenLifecycleActorInput {
         config,
         close_retention,
@@ -1856,12 +1911,11 @@ async fn run_open_lifecycle_actor(input: OpenLifecycleActorInput) -> Result<(), 
         deadline_state,
         ready,
         delivery_ack,
-        delivered_store,
     } = input;
     match StateStore::open_inner(config, Arc::clone(&deadline_state), close_retention).await {
         Err(error) => {
             let _ = ready.send(Err(error));
-            Ok(())
+            Ok(OpenLifecycleTerminal::Cleaned)
         }
         Ok(mut store) => {
             let undelivered_cleanup_owner = store
@@ -1871,46 +1925,37 @@ async fn run_open_lifecycle_actor(input: OpenLifecycleActorInput) -> Result<(), 
             let _ = deadline_state.retain_open_cleanup();
             #[cfg(test)]
             wait_at_open_postcommit_test_barrier(store.path(), &deadline_state).await;
-            *delivered_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
             if ready.send(Ok(())).is_err() {
-                let store = delivered_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                if let Some(store) = store {
-                    return handoff_undelivered_store(
-                        undelivered_cleanup_owner,
-                        store,
-                        open_admission,
-                        deadline,
-                        deadline_state,
-                    );
-                }
-                return Ok(());
+                handoff_undelivered_store(
+                    undelivered_cleanup_owner,
+                    store,
+                    open_admission,
+                    deadline,
+                    deadline_state,
+                )?;
+                return Ok(OpenLifecycleTerminal::Cleaned);
             }
             if delivery_ack.await.is_err() {
-                let store = delivered_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                if let Some(store) = store {
-                    return handoff_undelivered_store(
-                        undelivered_cleanup_owner,
-                        store,
-                        open_admission,
-                        deadline,
-                        deadline_state,
-                    );
-                }
+                handoff_undelivered_store(
+                    undelivered_cleanup_owner,
+                    store,
+                    open_admission,
+                    deadline,
+                    deadline_state,
+                )?;
+                return Ok(OpenLifecycleTerminal::Cleaned);
             }
-            undelivered_cleanup_owner.shutdown().map_err(|error| {
-                database(
-                    "release undelivered state-store cleanup owner",
-                    sqlx::Error::Protocol(error),
-                )
-            })
+            #[cfg(test)]
+            wait_at_open_after_ack_test_barrier(store.path()).await;
+            Ok(OpenLifecycleTerminal::Delivery(Box::new(
+                OpenStoreDelivery {
+                    store: Some(store),
+                    cleanup_owner: Some(undelivered_cleanup_owner),
+                    open_admission: Some(open_admission),
+                    deadline,
+                    deadline_state,
+                },
+            )))
         }
     }
 }
@@ -1981,7 +2026,6 @@ impl StateStore {
         let (delivery_ack_tx, delivery_ack_rx) = tokio::sync::oneshot::channel();
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let mut delivery_ack_tx = Some(delivery_ack_tx);
-        let delivered_store = Arc::new(std::sync::Mutex::new(None));
         let actor_runtime = OPEN_LIFECYCLE_RUNTIME.as_ref().map_err(|error| {
             database(
                 "start state open lifecycle actor",
@@ -1989,7 +2033,6 @@ impl StateStore {
             )
         })?;
         let actor_deadline_state = Arc::clone(&deadline_state);
-        let actor_delivered_store = Arc::clone(&delivered_store);
         actor_runtime.spawn(async move {
             let result = run_open_lifecycle_actor(OpenLifecycleActorInput {
                 config,
@@ -1999,7 +2042,6 @@ impl StateStore {
                 deadline_state: actor_deadline_state,
                 ready: ready_tx,
                 delivery_ack: delivery_ack_rx,
-                delivered_store: actor_delivered_store,
             })
             .await;
             let _ = terminal_tx.send(result.map_err(|error| error.to_string()));
@@ -2022,18 +2064,6 @@ impl StateStore {
                             cancellation_guard.disarm();
                             return Err(error);
                         }
-                        let store = delivered_store
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                            .ok_or_else(|| {
-                                database(
-                                    "deliver opened state store",
-                                    sqlx::Error::Protocol(
-                                        "open lifecycle did not retain the delivered store".to_owned(),
-                                    ),
-                                )
-                            })?;
                         delivery_ack_tx
                             .take()
                             .ok_or_else(|| {
@@ -2053,7 +2083,7 @@ impl StateStore {
                                     ),
                                 )
                             })?;
-                        terminal_rx
+                        let delivery = terminal_rx
                             .await
                             .map_err(|_| {
                                 database(
@@ -2069,6 +2099,17 @@ impl StateStore {
                                     sqlx::Error::Protocol(cleanup),
                                 )
                             })?;
+                        let store = match delivery {
+                            OpenLifecycleTerminal::Delivery(delivery) => delivery.accept(),
+                            OpenLifecycleTerminal::Cleaned => {
+                                return Err(database(
+                                    "deliver opened state store",
+                                    sqlx::Error::Protocol(
+                                        "open actor cleaned the store before delivery".to_owned(),
+                                    ),
+                                ));
+                            }
+                        };
                         deadline_state
                             .finished
                             .store(true, std::sync::atomic::Ordering::Release);
@@ -6263,6 +6304,18 @@ fn reserve_snapshot_quarantine(
 #[cfg(test)]
 mod open_deadline_tests {
     use super::*;
+
+    #[test]
+    fn dropped_open_runtime_readiness_receiver_stops_all_workers() {
+        let (ready, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        std::thread::Builder::new()
+            .name("open-runtime-readiness-test".to_owned())
+            .spawn(move || run_open_lifecycle_runtime(ready))
+            .expect("spawn isolated open runtime readiness thread")
+            .join()
+            .expect("dropped readiness receiver stops the open runtime");
+    }
 
     #[tokio::test]
     async fn bootstrap_pool_acquire_uses_the_immutable_work_cutoff() {
@@ -11239,6 +11292,23 @@ async fn wait_at_open_postcommit_test_barrier(path: &Path, deadline_state: &Open
 }
 
 #[cfg(test)]
+async fn wait_at_open_after_ack_test_barrier(path: &Path) {
+    let barrier = OPEN_AFTER_ACK_TEST_BARRIER
+        .lock()
+        .expect("open after-ack barrier lock poisoned")
+        .get(path)
+        .map(|barrier| (Arc::clone(&barrier.entered), Arc::clone(&barrier.release)));
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        OPEN_AFTER_ACK_TEST_BARRIER
+            .lock()
+            .expect("open after-ack barrier lock poisoned")
+            .remove(path);
+    }
+}
+
+#[cfg(test)]
 async fn wait_at_open_cleanup_test_barrier(path: &Path) {
     let barrier = OPEN_CLEANUP_TEST_BARRIER
         .lock()
@@ -14578,6 +14648,32 @@ pub(crate) mod test_support {
             "held postcommit barrier is configured once"
         );
         barrier
+    }
+
+    pub(crate) fn set_open_after_ack_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let path = super::resolve_database_path(path).expect("resolve after-ack barrier path");
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        assert!(
+            super::OPEN_AFTER_ACK_TEST_BARRIER
+                .lock()
+                .expect("open after-ack barrier lock poisoned")
+                .insert(
+                    path,
+                    super::MigrationTestBarrier {
+                        entered: std::sync::Arc::clone(&entered),
+                        release: std::sync::Arc::clone(&release),
+                    },
+                )
+                .is_none(),
+            "open after-ack barrier is configured once"
+        );
+        (entered, release)
     }
 
     pub(crate) fn set_open_cleanup_barrier(

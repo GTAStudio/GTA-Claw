@@ -1371,6 +1371,58 @@ mod tests {
             .expect("actor releases ownership after gate release");
             reopened.close().await.expect("actor cleanup reopen closes");
         }
+        let path = database_path(&directory, "actor-after-ack.sqlite");
+        let (entered, release) = test_support::set_open_after_ack_barrier(&path);
+        let drop_runtime = std::sync::Arc::new(tokio::sync::Notify::new());
+        let thread_drop = std::sync::Arc::clone(&drop_runtime);
+        let open_path = path.clone();
+        let caller = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build after-ack caller runtime");
+            runtime.block_on(async move {
+                let _opening = tokio::spawn(async move {
+                    StateStore::open(
+                        StoreConfig::new(open_path).with_open_timeout(Duration::from_secs(2)),
+                    )
+                    .await
+                });
+                thread_drop.notified().await;
+            });
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("actor reaches after-ack final delivery gate");
+        drop_runtime.notify_one();
+        tokio::task::spawn_blocking(move || caller.join())
+            .await
+            .expect("after-ack caller thread joins")
+            .expect("after-ack caller runtime exits cleanly");
+        assert!(
+            StateStore::open(StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)),)
+                .await
+                .is_err(),
+            "actor retains the store while final delivery receiver is closed"
+        );
+        release.notify_one();
+        let reopened = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("after-ack actor cleanup reopen failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("failed final delivery triggers actor-owned cleanup");
+        reopened
+            .close()
+            .await
+            .expect("after-ack actor cleanup reopen closes");
         assert_eq!(
             test_support::available_close_retention_slots(),
             close_capacity
