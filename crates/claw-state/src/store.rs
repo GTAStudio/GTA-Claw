@@ -13350,6 +13350,15 @@ pub(crate) mod test_support {
             .count()
     }
 
+    pub(crate) fn retained_state_cleanup_jobs() -> usize {
+        super::STATE_CLEANUP_QUARANTINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
+    }
+
     pub(crate) fn set_open_admission_barrier() -> (
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,

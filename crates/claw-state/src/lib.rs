@@ -1642,12 +1642,13 @@ mod tests {
         let owner = test_support::owner(&store).to_owned();
 
         for mode in 1..=3 {
-            crate::repository::test_support::disrupt_next_rollback_cleanup(&owner, mode);
+            let rollback_cleanup =
+                crate::repository::test_support::disrupt_next_rollback_cleanup(&owner, mode);
             assert!(matches!(
                 store.sessions().create(&duplicate).await,
                 Err(StateError::AlreadyExists { .. })
             ));
-            crate::repository::test_support::assert_rollback_cleanup_disruption_consumed(&owner);
+            rollback_cleanup.assert_claimed();
             store
                 .sessions()
                 .create(&session(&format!("rollback-recovery-{mode}"), mode.into()))
@@ -1714,6 +1715,193 @@ mod tests {
         ));
         first.close().await.expect("first keyed store closes");
         second.close().await.expect("second keyed store closes");
+    }
+
+    #[tokio::test]
+    #[ignore = "run explicitly by the P03b repository rollback ownership gate"]
+    async fn repository_errors_await_rollback_but_cancelled_futures_retain_ownership() {
+        const CHILD_ENV: &str = "GTA_CLAW_REPOSITORY_ROLLBACK_OWNERSHIP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let status = Command::new(
+                std::env::current_exe().expect("current state test executable"),
+            )
+            .arg("--exact")
+            .arg("tests::repository_errors_await_rollback_but_cancelled_futures_retain_ownership")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("run isolated repository rollback ownership test");
+            assert!(
+                status.success(),
+                "isolated repository rollback ownership test failed"
+            );
+            return;
+        }
+
+        let close_capacity = test_support::close_retention_capacity();
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            close_capacity
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        assert_eq!(
+            crate::repository::test_support::pending_rollback_cleanup_tests(),
+            0
+        );
+
+        let directory = tempfile::tempdir().expect("repository rollback ownership directory");
+        let path = database_path(&directory, "repository-rollback-ownership.sqlite");
+        let store = std::sync::Arc::new(
+            StateStore::open(StoreConfig::new(&path).with_max_connections(1))
+                .await
+                .expect("repository rollback ownership store opens"),
+        );
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            close_capacity - 1
+        );
+        let duplicate = session("repository-rollback-duplicate", 1);
+        store
+            .sessions()
+            .create(&duplicate)
+            .await
+            .expect("seed repository rollback duplicate");
+        let owner = test_support::owner(&store).to_owned();
+
+        let unconsumed = crate::repository::test_support::hold_next_detached_rollback(&owner)
+            .expect("register unconsumed rollback hold");
+        drop(unconsumed);
+        assert_eq!(
+            crate::repository::test_support::pending_rollback_cleanup_tests(),
+            0,
+            "dropping an unconsumed registration removes its queued state"
+        );
+
+        let primary_registration =
+            crate::repository::test_support::hold_next_detached_rollback(&owner)
+                .expect("register primary-error rollback hold");
+        assert!(
+            crate::repository::test_support::hold_next_detached_rollback(&owner).is_err(),
+            "duplicate setup cannot replace the queued one-shot state"
+        );
+        let primary_store = std::sync::Arc::clone(&store);
+        let primary_duplicate = duplicate.clone();
+        let primary =
+            tokio::spawn(async move { primary_store.sessions().create(&primary_duplicate).await });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            primary_registration.wait_until_claimed(),
+        )
+        .await
+        .expect("primary-error transaction claims rollback state");
+        primary_registration.allow_operation();
+        let error = primary
+            .await
+            .expect("primary-error task joins")
+            .expect_err("duplicate session remains a primary error");
+        assert!(matches!(error, StateError::AlreadyExists { .. }));
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+        primary_registration.assert_claimed();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                primary_registration.wait_until_detached(),
+            )
+            .await
+            .is_err(),
+            "normal primary errors must await explicit rollback instead of detaching"
+        );
+        drop(primary_registration);
+        store
+            .sessions()
+            .create(&session("repository-rollback-after-primary", 2))
+            .await
+            .expect("writer is reusable after explicit primary-error rollback");
+
+        let cancellation_registration =
+            crate::repository::test_support::hold_next_detached_rollback(&owner)
+                .expect("register cancelled-future rollback hold");
+        let cancelled_store = std::sync::Arc::clone(&store);
+        let cancelled = tokio::spawn(async move {
+            cancelled_store
+                .sessions()
+                .create(&session("repository-rollback-cancelled", 3))
+                .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cancellation_registration.wait_until_claimed(),
+        )
+        .await
+        .expect("cancelled transaction claims rollback state");
+        cancelled.abort();
+        assert!(
+            cancelled
+                .await
+                .expect_err("cancelled repository task reports cancellation")
+                .is_cancelled()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cancellation_registration.wait_until_detached(),
+        )
+        .await
+        .expect("cancelled repository future retains detached rollback ownership");
+        cancellation_registration.assert_claimed();
+        assert_eq!(test_support::pool(&store).size(), 1);
+        assert_eq!(test_support::pool(&store).num_idle(), 0);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                store
+                    .sessions()
+                    .create(&session("blocked-before-release", 4)),
+            )
+            .await
+            .is_err(),
+            "writer ownership cannot be reused before rollback confirmation"
+        );
+        drop(cancellation_registration);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store
+                .sessions()
+                .create(&session("repository-rollback-after-cancel", 5)),
+        )
+        .await
+        .expect("released detached rollback restores writer progress")
+        .expect("writer recovers after detached rollback confirmation");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while test_support::pool(&store).num_idle() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("confirmed writer completion returns the sole pool connection");
+        assert_eq!(test_support::pool(&store).size(), 1);
+        assert_eq!(test_support::pool(&store).num_idle(), 1);
+        assert_eq!(
+            crate::repository::test_support::pending_rollback_cleanup_tests(),
+            0
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+
+        let store = std::sync::Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("repository rollback test retained the store"));
+        store
+            .close()
+            .await
+            .expect("repository rollback store closes");
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            close_capacity
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
     }
 
     #[tokio::test]

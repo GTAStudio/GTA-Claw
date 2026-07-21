@@ -109,9 +109,20 @@ struct VerifiedWriteTransaction {
     restore_busy_timeout: std::time::Duration,
     timeout_ms: u64,
     #[cfg(test)]
-    rollback_cleanup_test_mode: Option<u8>,
+    rollback_cleanup_test: Option<Arc<RollbackCleanupTestState>>,
     #[cfg(all(test, unix))]
     test_owner: String,
+}
+
+macro_rules! rollback_on_error {
+    ($transaction:ident, $operation:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err($transaction.rollback_after_error($operation, error).await);
+            }
+        }
+    };
 }
 
 #[derive(Clone)]
@@ -215,6 +226,50 @@ impl VerifiedWriteTransaction {
             .map_err(claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure)?;
         Ok(connection)
     }
+
+    async fn rollback_after_error(
+        mut self,
+        operation: &'static str,
+        primary: StateError,
+    ) -> StateError {
+        #[cfg(test)]
+        if self
+            .rollback_cleanup_test
+            .as_ref()
+            .is_some_and(|state| (1..=3).contains(&state.mode))
+        {
+            return primary;
+        }
+        #[cfg(test)]
+        self.rollback_cleanup_test.take();
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let transaction = self
+            .transaction
+            .take()
+            .expect("failed verified write transaction remains owned");
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.cleanup_deadline),
+            transaction.rollback(),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => {
+                drop(connection);
+                primary
+            }
+            Ok(Err(error)) => StateError::OperationCleanupFailed {
+                operation,
+                primary: Box::new(primary),
+                cleanup: format!("repository rollback failed: {error}"),
+            },
+            Err(_) => StateError::OperationCleanupFailed {
+                operation,
+                primary: Box::new(primary),
+                cleanup: "repository rollback exceeded its cleanup deadline".to_owned(),
+            },
+        }
+    }
 }
 
 impl Drop for VerifiedWriteTransaction {
@@ -222,10 +277,10 @@ impl Drop for VerifiedWriteTransaction {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
         #[cfg(test)]
-        if let Some(mode) = self.rollback_cleanup_test_mode.take()
+        if let Some(state) = self.rollback_cleanup_test.take()
             && let Some(transaction) = self.transaction.take()
         {
-            match mode {
+            match state.mode {
                 1 => drop(transaction),
                 2 => {
                     std::thread::spawn(move || drop(transaction))
@@ -234,6 +289,16 @@ impl Drop for VerifiedWriteTransaction {
                 }
                 3 => {
                     std::thread::spawn(move || drop(transaction));
+                }
+                4 => {
+                    std::thread::spawn(move || {
+                        state
+                            .detached_started
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        state.detached_entered.notify_one();
+                        state.wait_for_detached_release();
+                        drop(transaction);
+                    });
                 }
                 _ => unreachable!("validated rollback cleanup test mode"),
             }
@@ -258,12 +323,94 @@ static IDENTITY_INVALIDATION_TEST_BARRIERS: LazyLock<
     Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
-static ROLLBACK_CLEANUP_TEST_MODES: LazyLock<Mutex<std::collections::HashMap<String, u8>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static ROLLBACK_CLEANUP_TEST_STATES: LazyLock<
+    Mutex<std::collections::HashMap<String, Arc<RollbackCleanupTestState>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 struct WriteTestBarrier {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+struct RollbackCleanupTestState {
+    mode: u8,
+    claimed: std::sync::atomic::AtomicBool,
+    claim_entered: tokio::sync::Notify,
+    begin_released: std::sync::atomic::AtomicBool,
+    begin_release: tokio::sync::Notify,
+    detached_started: std::sync::atomic::AtomicBool,
+    detached_entered: tokio::sync::Notify,
+    detached_released: std::sync::atomic::AtomicBool,
+    detached_release: std::sync::Condvar,
+    detached_release_lock: std::sync::Mutex<()>,
+}
+
+#[cfg(test)]
+impl RollbackCleanupTestState {
+    fn release(&self) {
+        if !self
+            .begin_released
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.begin_release.notify_waiters();
+        }
+        if !self
+            .detached_released
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.detached_release.notify_all();
+        }
+    }
+
+    async fn wait_after_claim(&self) {
+        if self.mode != 4 {
+            return;
+        }
+        self.claim_entered.notify_one();
+        while !self
+            .begin_released
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let released = self.begin_release.notified();
+            tokio::pin!(released);
+            if self
+                .begin_released
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            released.await;
+        }
+    }
+
+    fn wait_for_detached_release(&self) {
+        let mut locked = self
+            .detached_release_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self
+            .detached_released
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            locked = self
+                .detached_release
+                .wait(locked)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(test)]
+fn claim_rollback_cleanup_test(owner: &str) -> Option<Arc<RollbackCleanupTestState>> {
+    let state = ROLLBACK_CLEANUP_TEST_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(owner)?;
+    state
+        .claimed
+        .store(true, std::sync::atomic::Ordering::Release);
+    Some(state)
 }
 
 /// Transactional access to durable sessions.
@@ -293,22 +440,26 @@ impl<'store> SessionRepository<'store> {
             begin_verified_write(self.pool, self.owner, self.identity, "begin session create")
                 .await?;
         let deadline = transaction.operation_deadline();
-        deadline
-            .run(
-                "insert session",
-                sqlx::query(
-                    "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
+        rollback_on_error!(
+            transaction,
+            "session create",
+            deadline
+                .run(
+                    "insert session",
+                    sqlx::query(
+                        "INSERT INTO sessions(id, status, created_at_ms, updated_at_ms, version)
                      VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(record.id.as_str())
+                    .bind(record.status.as_db())
+                    .bind(record.created_at.get())
+                    .bind(record.updated_at.get())
+                    .bind(record.version)
+                    .execute(transaction.executor()),
+                    |error| create_error(error, "session", record.id.as_str(), None),
                 )
-                .bind(record.id.as_str())
-                .bind(record.status.as_db())
-                .bind(record.created_at.get())
-                .bind(record.updated_at.get())
-                .bind(record.version)
-                .execute(transaction.executor()),
-                |error| create_error(error, "session", record.id.as_str(), None),
-            )
-            .await?;
+                .await
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -405,27 +556,34 @@ impl<'store> SessionRepository<'store> {
         )
         .await?;
         let deadline = transaction.operation_deadline();
-        let row = deadline
-            .run(
-                "update session",
-                sqlx::query(
-                    "UPDATE sessions
+        let row = rollback_on_error!(
+            transaction,
+            "session update",
+            deadline
+                .run(
+                    "update session",
+                    sqlx::query(
+                        "UPDATE sessions
                      SET status = ?, updated_at_ms = ?, version = version + 1
                      WHERE id = ? AND version = ?
                      RETURNING id, status, created_at_ms, updated_at_ms, version",
+                    )
+                    .bind(status.as_db())
+                    .bind(updated_at.get())
+                    .bind(id.as_str())
+                    .bind(expected_version)
+                    .fetch_optional(transaction.executor()),
+                    |error| database("update session", error),
                 )
-                .bind(status.as_db())
-                .bind(updated_at.get())
-                .bind(id.as_str())
-                .bind(expected_version)
-                .fetch_optional(transaction.executor()),
-                |error| database("update session", error),
-            )
-            .await?;
-        let record = row
-            .map(session_from_row)
-            .transpose()?
-            .ok_or_else(|| conflict("session", id.as_str(), expected_version))?;
+                .await
+        );
+        let record = rollback_on_error!(
+            transaction,
+            "session update",
+            row.map(session_from_row).transpose().and_then(|record| {
+                record.ok_or_else(|| conflict("session", id.as_str(), expected_version))
+            })
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -463,7 +621,11 @@ impl<'store> DeviceRepository<'store> {
         let mut transaction =
             begin_verified_write(self.pool, self.owner, self.identity, "begin device create")
                 .await?;
-        insert_device(&mut transaction, record).await?;
+        rollback_on_error!(
+            transaction,
+            "device create",
+            insert_device(&mut transaction, record).await
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -495,8 +657,16 @@ impl<'store> DeviceRepository<'store> {
             "begin device and authentication create",
         )
         .await?;
-        insert_device(&mut transaction, device).await?;
-        insert_authentication(&mut transaction, authentication).await?;
+        rollback_on_error!(
+            transaction,
+            "device and authentication create",
+            insert_device(&mut transaction, device).await
+        );
+        rollback_on_error!(
+            transaction,
+            "device and authentication create",
+            insert_authentication(&mut transaction, authentication).await
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -580,27 +750,34 @@ impl<'store> DeviceRepository<'store> {
         )
         .await?;
         let deadline = transaction.operation_deadline();
-        let row = deadline
-            .run(
-                "rename device",
-                sqlx::query(
-                    "UPDATE devices
+        let row = rollback_on_error!(
+            transaction,
+            "device rename",
+            deadline
+                .run(
+                    "rename device",
+                    sqlx::query(
+                        "UPDATE devices
                      SET display_name = ?, updated_at_ms = ?, version = version + 1
                      WHERE id = ? AND version = ?
                      RETURNING id, display_name, created_at_ms, updated_at_ms, version",
+                    )
+                    .bind(display_name)
+                    .bind(updated_at.get())
+                    .bind(id.as_str())
+                    .bind(expected_version)
+                    .fetch_optional(transaction.executor()),
+                    |error| database("rename device", error),
                 )
-                .bind(display_name)
-                .bind(updated_at.get())
-                .bind(id.as_str())
-                .bind(expected_version)
-                .fetch_optional(transaction.executor()),
-                |error| database("rename device", error),
-            )
-            .await?;
-        let record = row
-            .map(device_from_row)
-            .transpose()?
-            .ok_or_else(|| conflict("device", id.as_str(), expected_version))?;
+                .await
+        );
+        let record = rollback_on_error!(
+            transaction,
+            "device rename",
+            row.map(device_from_row).transpose().and_then(|record| {
+                record.ok_or_else(|| conflict("device", id.as_str(), expected_version))
+            })
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -642,7 +819,11 @@ impl<'store> AuthenticationRepository<'store> {
             "begin authentication create",
         )
         .await?;
-        insert_authentication(&mut transaction, record).await?;
+        rollback_on_error!(
+            transaction,
+            "authentication create",
+            insert_authentication(&mut transaction, record).await
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -754,29 +935,38 @@ impl<'store> AuthenticationRepository<'store> {
         )
         .await?;
         let deadline = transaction.operation_deadline();
-        let row = deadline
-            .run(
-                "update authentication",
-                sqlx::query(
-                    "UPDATE authentication_records
+        let row = rollback_on_error!(
+            transaction,
+            "authentication update",
+            deadline
+                .run(
+                    "update authentication",
+                    sqlx::query(
+                        "UPDATE authentication_records
                      SET status = ?, subject = ?, updated_at_ms = ?, version = version + 1
                      WHERE id = ? AND version = ?
                      RETURNING id, device_id, provider, subject, status,
                                created_at_ms, updated_at_ms, version",
+                    )
+                    .bind(status.as_db())
+                    .bind(subject)
+                    .bind(updated_at.get())
+                    .bind(id.as_str())
+                    .bind(expected_version)
+                    .fetch_optional(transaction.executor()),
+                    |error| database("update authentication", error),
                 )
-                .bind(status.as_db())
-                .bind(subject)
-                .bind(updated_at.get())
-                .bind(id.as_str())
-                .bind(expected_version)
-                .fetch_optional(transaction.executor()),
-                |error| database("update authentication", error),
-            )
-            .await?;
-        let record = row
-            .map(authentication_from_row)
-            .transpose()?
-            .ok_or_else(|| conflict("authentication", id.as_str(), expected_version))?;
+                .await
+        );
+        let record = rollback_on_error!(
+            transaction,
+            "authentication update",
+            row.map(authentication_from_row)
+                .transpose()
+                .and_then(|record| {
+                    record.ok_or_else(|| conflict("authentication", id.as_str(), expected_version))
+                })
+        );
         commit_verified(
             transaction,
             self.owner,
@@ -813,7 +1003,11 @@ impl<'store> TaskRepository<'store> {
         validate_new_task(record)?;
         let mut transaction =
             begin_verified_write(self.pool, self.owner, self.identity, "begin task create").await?;
-        insert_task(&mut transaction, record).await?;
+        rollback_on_error!(
+            transaction,
+            "task create",
+            insert_task(&mut transaction, record).await
+        );
         commit_verified(transaction, self.owner, self.identity, "commit task create").await
     }
 
@@ -910,28 +1104,35 @@ impl<'store> TaskRepository<'store> {
         )
         .await?;
         let deadline = transaction.operation_deadline();
-        let row = deadline
-            .run(
-                "update task",
-                sqlx::query(
-                    "UPDATE tasks
+        let row = rollback_on_error!(
+            transaction,
+            "task update",
+            deadline
+                .run(
+                    "update task",
+                    sqlx::query(
+                        "UPDATE tasks
                      SET status = ?, updated_at_ms = ?, version = version + 1
                      WHERE id = ? AND version = ?
                      RETURNING id, session_id, kind, payload, status,
                                created_at_ms, updated_at_ms, version",
+                    )
+                    .bind(status.as_db())
+                    .bind(updated_at.get())
+                    .bind(id.as_str())
+                    .bind(expected_version)
+                    .fetch_optional(transaction.executor()),
+                    |error| database("update task", error),
                 )
-                .bind(status.as_db())
-                .bind(updated_at.get())
-                .bind(id.as_str())
-                .bind(expected_version)
-                .fetch_optional(transaction.executor()),
-                |error| database("update task", error),
-            )
-            .await?;
-        let record = row
-            .map(task_from_row)
-            .transpose()?
-            .ok_or_else(|| conflict("task", id.as_str(), expected_version))?;
+                .await
+        );
+        let record = rollback_on_error!(
+            transaction,
+            "task update",
+            row.map(task_from_row).transpose().and_then(|record| {
+                record.ok_or_else(|| conflict("task", id.as_str(), expected_version))
+            })
+        );
         commit_verified(transaction, self.owner, self.identity, "commit task update").await?;
         Ok(record)
     }
@@ -1003,56 +1204,76 @@ async fn begin_verified_write_with_deadline(
         restore_busy_timeout: identity.busy_timeout,
         timeout_ms,
         #[cfg(test)]
-        rollback_cleanup_test_mode: ROLLBACK_CLEANUP_TEST_MODES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(owner),
+        rollback_cleanup_test: claim_rollback_cleanup_test(owner),
         #[cfg(all(test, unix))]
         test_owner: owner.to_owned(),
     };
+    #[cfg(test)]
+    if let Some(state) = transaction.rollback_cleanup_test.as_ref() {
+        state.wait_after_claim().await;
+    }
     let deadline = transaction.operation_deadline();
-    let ownership = deadline
-        .run(
-            "lock and verify application writer",
-            sqlx::query(
-                "UPDATE claw_writer_lock
+    let ownership = rollback_on_error!(
+        transaction,
+        operation,
+        deadline
+            .run(
+                "lock and verify application writer",
+                sqlx::query(
+                    "UPDATE claw_writer_lock
                  SET owner = owner
                  WHERE singleton = 1 AND owner = ?",
+                )
+                .bind(owner)
+                .execute(transaction.executor()),
+                |error| database("lock and verify application writer", error),
             )
-            .bind(owner)
-            .execute(transaction.executor()),
-            |error| database("lock and verify application writer", error),
-        )
-        .await?;
+            .await
+    );
     if ownership.rows_affected() != 1 {
-        return Err(StateError::InvalidMigrationHistory {
+        let error = StateError::InvalidMigrationHistory {
             reason: "application writer ownership changed before repository write".to_owned(),
-        });
+        };
+        return Err(transaction.rollback_after_error(operation, error).await);
     }
     let deadline = transaction.operation_deadline();
-    let application_id = deadline
-        .run(
-            "verify repository application id",
-            sqlx::query_scalar::<_, i64>("PRAGMA application_id").fetch_one(transaction.executor()),
-            |error| database("verify repository application id", error),
-        )
-        .await?;
+    let application_id = rollback_on_error!(
+        transaction,
+        operation,
+        deadline
+            .run(
+                "verify repository application id",
+                sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                    .fetch_one(transaction.executor()),
+                |error| database("verify repository application id", error),
+            )
+            .await
+    );
     if application_id != APPLICATION_ID {
-        return Err(StateError::InvalidValue {
+        let error = StateError::InvalidValue {
             field: "SQLite application id",
             reason: "database ownership changed before repository write",
-        });
+        };
+        return Err(transaction.rollback_after_error(operation, error).await);
     }
     let deadline = transaction.operation_deadline();
-    deadline
-        .run(
-            "validate repository schema",
-            validate_operational_schema(transaction.executor()),
-            std::convert::identity,
-        )
-        .await?;
-    identity.verify()?;
-    transaction.ensure_within_deadline(operation)?;
+    rollback_on_error!(
+        transaction,
+        operation,
+        deadline
+            .run(
+                "validate repository schema",
+                validate_operational_schema(transaction.executor()),
+                std::convert::identity,
+            )
+            .await
+    );
+    rollback_on_error!(transaction, operation, identity.verify());
+    rollback_on_error!(
+        transaction,
+        operation,
+        transaction.ensure_within_deadline(operation)
+    );
     #[cfg(test)]
     wait_at_write_test_barrier(owner).await;
     Ok(transaction)
@@ -1152,69 +1373,105 @@ async fn commit_verified(
     identity: OperationalIdentity<'_>,
     operation: &'static str,
 ) -> Result<(), StateError> {
-    transaction.ensure_within_deadline(operation)?;
+    rollback_on_error!(
+        transaction,
+        operation,
+        transaction.ensure_within_deadline(operation)
+    );
     #[cfg(test)]
-    apply_commit_test_tamper(&mut transaction, owner).await?;
+    rollback_on_error!(
+        transaction,
+        operation,
+        apply_commit_test_tamper(&mut transaction, owner).await
+    );
     let deadline_guard = transaction.operation_deadline();
-    let persisted_owner = deadline_guard
-        .run(
-            "reverify repository writer owner",
-            sqlx::query_scalar::<_, String>(
-                "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
+    let persisted_owner = rollback_on_error!(
+        transaction,
+        operation,
+        deadline_guard
+            .run(
+                "reverify repository writer owner",
+                sqlx::query_scalar::<_, String>(
+                    "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
+                )
+                .fetch_optional(transaction.executor()),
+                |error| database("reverify repository writer owner", error),
             )
-            .fetch_optional(transaction.executor()),
-            |error| database("reverify repository writer owner", error),
-        )
-        .await?;
+            .await
+    );
     if persisted_owner.as_deref() != Some(owner) {
-        return Err(StateError::InvalidMigrationHistory {
+        let error = StateError::InvalidMigrationHistory {
             reason: "application writer ownership changed before repository commit".to_owned(),
-        });
+        };
+        return Err(transaction.rollback_after_error(operation, error).await);
     }
     let deadline_guard = transaction.operation_deadline();
-    let application_id = deadline_guard
-        .run(
-            "reverify repository application id",
-            sqlx::query_scalar::<_, i64>("PRAGMA application_id").fetch_one(transaction.executor()),
-            |error| database("reverify repository application id", error),
-        )
-        .await?;
+    let application_id = rollback_on_error!(
+        transaction,
+        operation,
+        deadline_guard
+            .run(
+                "reverify repository application id",
+                sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+                    .fetch_one(transaction.executor()),
+                |error| database("reverify repository application id", error),
+            )
+            .await
+    );
     if application_id != APPLICATION_ID {
-        return Err(StateError::InvalidValue {
+        let error = StateError::InvalidValue {
             field: "SQLite application id",
             reason: "database ownership changed before repository commit",
-        });
+        };
+        return Err(transaction.rollback_after_error(operation, error).await);
     }
     let deadline_guard = transaction.operation_deadline();
-    deadline_guard
-        .run(
-            "revalidate repository schema",
-            validate_operational_schema(transaction.executor()),
-            std::convert::identity,
-        )
-        .await?;
-    identity.verify()?;
+    rollback_on_error!(
+        transaction,
+        operation,
+        deadline_guard
+            .run(
+                "revalidate repository schema",
+                validate_operational_schema(transaction.executor()),
+                std::convert::identity,
+            )
+            .await
+    );
+    rollback_on_error!(transaction, operation, identity.verify());
     #[cfg(unix)]
     {
         let deadline_guard = transaction.operation_deadline();
-        let moved = deadline_guard
-            .run(operation, transaction.main_database_has_moved(), |error| {
-                database(operation, sqlx::Error::Protocol(error.to_string()))
-            })
-            .await?;
+        let moved = rollback_on_error!(
+            transaction,
+            operation,
+            deadline_guard
+                .run(operation, transaction.main_database_has_moved(), |error| {
+                    database(operation, sqlx::Error::Protocol(error.to_string()))
+                })
+                .await
+        );
         if moved {
-            return Err(database(
+            let error = database(
                 operation,
                 sqlx::Error::Protocol(
                     "SQLite main database identity changed before commit".to_owned(),
                 ),
-            ));
+            );
+            return Err(transaction.rollback_after_error(operation, error).await);
         }
     }
-    transaction.ensure_within_deadline(operation)?;
+    rollback_on_error!(
+        transaction,
+        operation,
+        transaction.ensure_within_deadline(operation)
+    );
     #[cfg(test)]
     wait_at_commit_test_barrier(owner).await;
-    transaction.ensure_within_deadline(operation)?;
+    rollback_on_error!(
+        transaction,
+        operation,
+        transaction.ensure_within_deadline(operation)
+    );
     let deadline = transaction.deadline;
     let timeout_ms = transaction.timeout_ms;
     transaction
@@ -1761,11 +2018,121 @@ mod deadline_tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{
-        Arc, COMMIT_TEST_BARRIERS, READ_TEST_BARRIERS, ROLLBACK_CLEANUP_TEST_MODES,
-        WRITE_TEST_BARRIERS, WriteTestBarrier,
+        Arc, COMMIT_TEST_BARRIERS, READ_TEST_BARRIERS, ROLLBACK_CLEANUP_TEST_STATES,
+        RollbackCleanupTestState, WRITE_TEST_BARRIERS, WriteTestBarrier,
     };
     #[cfg(unix)]
     use super::{COMMIT_TEST_TAMPERS, IDENTITY_INVALIDATION_TEST_BARRIERS};
+
+    pub(crate) struct RollbackCleanupTestRegistration {
+        owner: String,
+        state: Arc<RollbackCleanupTestState>,
+    }
+
+    impl RollbackCleanupTestRegistration {
+        pub(crate) fn assert_claimed(&self) {
+            assert!(
+                self.state
+                    .claimed
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "rollback cleanup disruption was not consumed"
+            );
+        }
+
+        pub(crate) async fn wait_until_claimed(&self) {
+            while !self
+                .state
+                .claimed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let claimed = self.state.claim_entered.notified();
+                tokio::pin!(claimed);
+                if self
+                    .state
+                    .claimed
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
+                claimed.await;
+            }
+        }
+
+        pub(crate) fn allow_operation(&self) {
+            if !self
+                .state
+                .begin_released
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.state.begin_release.notify_waiters();
+            }
+        }
+
+        pub(crate) async fn wait_until_detached(&self) {
+            while !self
+                .state
+                .detached_started
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let detached = self.state.detached_entered.notified();
+                tokio::pin!(detached);
+                if self
+                    .state
+                    .detached_started
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
+                detached.await;
+            }
+        }
+    }
+
+    impl Drop for RollbackCleanupTestRegistration {
+        fn drop(&mut self) {
+            let mut states = ROLLBACK_CLEANUP_TEST_STATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if states
+                .get(&self.owner)
+                .is_some_and(|queued| Arc::ptr_eq(queued, &self.state))
+            {
+                states.remove(&self.owner);
+            }
+            drop(states);
+            self.state.release();
+        }
+    }
+
+    fn register_rollback_cleanup_test(
+        owner: &str,
+        mode: u8,
+    ) -> Result<RollbackCleanupTestRegistration, &'static str> {
+        assert!((1..=4).contains(&mode));
+        let mut states = ROLLBACK_CLEANUP_TEST_STATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if states.contains_key(owner) {
+            return Err("rollback cleanup disruption is already queued");
+        }
+        let state = Arc::new(RollbackCleanupTestState {
+            mode,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            claim_entered: tokio::sync::Notify::new(),
+            begin_released: std::sync::atomic::AtomicBool::new(mode != 4),
+            begin_release: tokio::sync::Notify::new(),
+            detached_started: std::sync::atomic::AtomicBool::new(false),
+            detached_entered: tokio::sync::Notify::new(),
+            detached_released: std::sync::atomic::AtomicBool::new(false),
+            detached_release: std::sync::Condvar::new(),
+            detached_release_lock: std::sync::Mutex::new(()),
+        });
+        states.insert(owner.to_owned(), Arc::clone(&state));
+        Ok(RollbackCleanupTestRegistration {
+            owner: owner.to_owned(),
+            state,
+        })
+    }
 
     pub(crate) fn set_write_barrier(
         owner: &str,
@@ -1848,26 +2215,25 @@ pub(crate) mod test_support {
         (entered, release)
     }
 
-    pub(crate) fn disrupt_next_rollback_cleanup(owner: &str, mode: u8) {
-        assert!((1..=3).contains(&mode));
-        assert!(
-            ROLLBACK_CLEANUP_TEST_MODES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(owner.to_owned(), mode)
-                .is_none(),
-            "rollback cleanup disruption must be consumed before replacement"
-        );
+    pub(crate) fn disrupt_next_rollback_cleanup(
+        owner: &str,
+        mode: u8,
+    ) -> RollbackCleanupTestRegistration {
+        register_rollback_cleanup_test(owner, mode)
+            .expect("rollback cleanup disruption must be unique")
     }
 
-    pub(crate) fn assert_rollback_cleanup_disruption_consumed(owner: &str) {
-        assert!(
-            !ROLLBACK_CLEANUP_TEST_MODES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(owner),
-            "rollback cleanup disruption was not consumed"
-        );
+    pub(crate) fn hold_next_detached_rollback(
+        owner: &str,
+    ) -> Result<RollbackCleanupTestRegistration, &'static str> {
+        register_rollback_cleanup_test(owner, 4)
+    }
+
+    pub(crate) fn pending_rollback_cleanup_tests() -> usize {
+        ROLLBACK_CLEANUP_TEST_STATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     pub(crate) async fn drop_transaction_without_runtime(pool: &sqlx::SqlitePool) {
