@@ -970,29 +970,31 @@ async fn begin_verified_write_with_deadline(
     let begin_timeout = identity
         .busy_timeout
         .min(deadline.saturating_duration_since(std::time::Instant::now()));
-    let active = match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore(
-        connection,
-        begin_timeout,
-        identity.busy_timeout,
-        Some(Arc::clone(&cancelled)),
-    )
-    .await
-    {
-        Ok(active) => active,
-        Err(error) => {
-            let begin_operation = "lock and verify application writer";
-            if std::time::Instant::now() >= deadline || error.code() == Some(9) {
-                return Err(StateError::OperationTimedOut {
-                    operation,
-                    timeout_ms,
-                });
+    let active =
+        match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadline(
+            connection,
+            deadline,
+            begin_timeout,
+            identity.busy_timeout,
+            Some(Arc::clone(&cancelled)),
+        )
+        .await
+        {
+            Ok(active) => active,
+            Err(error) => {
+                let begin_operation = "lock and verify application writer";
+                if std::time::Instant::now() >= deadline || error.code() == Some(9) {
+                    return Err(StateError::OperationTimedOut {
+                        operation,
+                        timeout_ms,
+                    });
+                }
+                return Err(error.code().map_or_else(
+                    || database(begin_operation, sqlx::Error::Protocol(error.to_string())),
+                    |code| database_code(begin_operation, code, error.to_string()),
+                ));
             }
-            return Err(error.code().map_or_else(
-                || database(begin_operation, sqlx::Error::Protocol(error.to_string())),
-                |code| database_code(begin_operation, code, error.to_string()),
-            ));
-        }
-    };
+        };
     let mut transaction = VerifiedWriteTransaction {
         transaction: Some(active),
         deadline,

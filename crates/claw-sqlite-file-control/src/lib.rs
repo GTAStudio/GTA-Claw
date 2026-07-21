@@ -277,6 +277,7 @@ const TERMINAL_CLOSE_THREADS: usize = 4;
 const TERMINAL_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
 static ACTIVE_CLEANUP_JOBS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_TERMINAL_CLOSE_JOBS: AtomicUsize = AtomicUsize::new(0);
+static CLEANUP_ADMISSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static LIVE_CLEANUP_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_TERMINAL_CLOSE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static CLEANUP_EXECUTOR_HEALTHY: AtomicBool = AtomicBool::new(true);
@@ -1140,13 +1141,11 @@ impl BlockingCleanupOwner {
             let _ = Self::validate_executor(thread_name)?;
         }
         let health_generation = EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire);
-        let mut first_attempt = true;
         loop {
             let expired = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
-            if expired && !(first_attempt && allow_expired_first_attempt) {
+            if expired && !allow_expired_first_attempt {
                 return Err("blocking cleanup owner admission timed out".to_owned());
             }
-            first_attempt = false;
             let _ = Self::validate_executor(thread_name)?;
             if EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire) != health_generation {
                 return Err("cleanup executor health changed during admission".to_owned());
@@ -1154,61 +1153,56 @@ impl BlockingCleanupOwner {
             let terminal_count = count
                 .checked_mul(TERMINAL_RESERVATIONS_PER_OWNER)
                 .ok_or_else(|| "terminal close owner count overflowed".to_owned())?;
+            let admission = CLEANUP_ADMISSION_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let active = ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire);
             let active_terminal = ACTIVE_TERMINAL_CLOSE_JOBS.load(Ordering::Acquire);
-            if active <= MAX_CLEANUP_JOBS - count
-                && active_terminal <= MAX_TERMINAL_CLOSE_JOBS - terminal_count
-                && ACTIVE_CLEANUP_JOBS
-                    .compare_exchange(active, active + count, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+            if active > MAX_CLEANUP_JOBS - count
+                || active_terminal > MAX_TERMINAL_CLOSE_JOBS - terminal_count
             {
-                if ACTIVE_TERMINAL_CLOSE_JOBS
-                    .compare_exchange(
-                        active_terminal,
-                        active_terminal + terminal_count,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
-                    tokio::task::yield_now().await;
-                    continue;
+                drop(admission);
+                if allow_expired_first_attempt {
+                    return Err("blocking cleanup owner capacity is exhausted".to_owned());
                 }
-                if EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire) != health_generation
-                    || Self::validate_executor(thread_name).is_err()
-                {
-                    ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
-                    ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
-                    return Err("cleanup executor became unhealthy during admission".to_owned());
-                }
-                if !allow_expired_first_attempt
-                    && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                {
-                    ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
-                    ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
-                    return Err("blocking cleanup owner admission timed out".to_owned());
-                }
-                let mut owners = Vec::new();
-                if let Err(error) = owners.try_reserve_exact(count) {
-                    ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
-                    ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
-                    return Err(format!("reserve cleanup owner set: {error}"));
-                }
-                for _ in 0..count {
-                    owners.push(Self {
-                        reservation: Some(CleanupReservation),
-                        terminal_closes: Some(TerminalCloseBatch {
-                            reservations: (0..TERMINAL_CLOSE_SLOTS_PER_OWNER)
-                                .map(|_| TerminalCloseReservation)
-                                .collect(),
-                        }),
-                        retirement_reservation: Some(TerminalCloseReservation),
-                    });
-                }
-                return Ok(owners);
+                tokio::task::yield_now().await;
+                continue;
             }
-            tokio::task::yield_now().await;
+            ACTIVE_CLEANUP_JOBS.fetch_add(count, Ordering::AcqRel);
+            ACTIVE_TERMINAL_CLOSE_JOBS.fetch_add(terminal_count, Ordering::AcqRel);
+            drop(admission);
+            if EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire) != health_generation
+                || Self::validate_executor(thread_name).is_err()
+            {
+                ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
+                ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
+                return Err("cleanup executor became unhealthy during admission".to_owned());
+            }
+            if !allow_expired_first_attempt
+                && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
+                ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
+                return Err("blocking cleanup owner admission timed out".to_owned());
+            }
+            let mut owners = Vec::new();
+            if let Err(error) = owners.try_reserve_exact(count) {
+                ACTIVE_CLEANUP_JOBS.fetch_sub(count, Ordering::AcqRel);
+                ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(terminal_count, Ordering::AcqRel);
+                return Err(format!("reserve cleanup owner set: {error}"));
+            }
+            for _ in 0..count {
+                owners.push(Self {
+                    reservation: Some(CleanupReservation),
+                    terminal_closes: Some(TerminalCloseBatch {
+                        reservations: (0..TERMINAL_CLOSE_SLOTS_PER_OWNER)
+                            .map(|_| TerminalCloseReservation)
+                            .collect(),
+                    }),
+                    retirement_reservation: Some(TerminalCloseReservation),
+                });
+            }
+            return Ok(owners);
         }
     }
 
@@ -1216,18 +1210,20 @@ impl BlockingCleanupOwner {
     fn acquire_without_runtime(thread_name: &str) -> Result<Self, String> {
         let _ = Self::validate_executor(thread_name)?;
         let health_generation = EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire);
-        let active = ACTIVE_CLEANUP_JOBS.fetch_add(1, Ordering::AcqRel);
+        let admission = CLEANUP_ADMISSION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire);
         if active >= MAX_CLEANUP_JOBS {
-            ACTIVE_CLEANUP_JOBS.fetch_sub(1, Ordering::AcqRel);
             return Err("blocking cleanup owner capacity is exhausted".to_owned());
         }
-        let terminal_active =
-            ACTIVE_TERMINAL_CLOSE_JOBS.fetch_add(TERMINAL_RESERVATIONS_PER_OWNER, Ordering::AcqRel);
+        let terminal_active = ACTIVE_TERMINAL_CLOSE_JOBS.load(Ordering::Acquire);
         if terminal_active > MAX_TERMINAL_CLOSE_JOBS - TERMINAL_RESERVATIONS_PER_OWNER {
-            ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(TERMINAL_RESERVATIONS_PER_OWNER, Ordering::AcqRel);
-            ACTIVE_CLEANUP_JOBS.fetch_sub(1, Ordering::AcqRel);
             return Err("terminal close owner capacity is exhausted".to_owned());
         }
+        ACTIVE_CLEANUP_JOBS.fetch_add(1, Ordering::AcqRel);
+        ACTIVE_TERMINAL_CLOSE_JOBS.fetch_add(TERMINAL_RESERVATIONS_PER_OWNER, Ordering::AcqRel);
+        drop(admission);
         if EXECUTOR_HEALTH_GENERATION.load(Ordering::Acquire) != health_generation
             || Self::validate_executor(thread_name).is_err()
         {
@@ -3677,6 +3673,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                         local: std::sync::atomic::AtomicBool::new(false),
                         external: Some(Arc::clone(&cancelled)),
                         deadline: Some(deadline),
+                        busy_deadline: Some(deadline),
                         cleanup_cutoff: deadline
                             .checked_add(std::time::Duration::from_secs(1))
                             .unwrap_or(deadline),
@@ -5135,6 +5132,7 @@ struct BeginCancellation {
     local: std::sync::atomic::AtomicBool,
     external: Option<Arc<std::sync::atomic::AtomicBool>>,
     deadline: Option<std::time::Instant>,
+    busy_deadline: Option<std::time::Instant>,
     cleanup_cutoff: std::time::Instant,
     #[cfg(test)]
     busy_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -5195,9 +5193,9 @@ unsafe extern "C" fn begin_busy_handler(
         entered.notify_one();
     }
     if cancellation.is_cancelled()
-        || cancellation.deadline.is_none()
+        || cancellation.busy_deadline.is_none()
         || cancellation
-            .deadline
+            .busy_deadline
             .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     {
         0
@@ -5769,18 +5767,24 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
 async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     connection: Connection,
     busy_timeout: std::time::Duration,
+    operation_deadline: Option<std::time::Instant>,
+    allow_expired_first_attempt: bool,
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<Connection>, FileControlError> {
-    let operation_deadline = std::time::Instant::now()
-        .checked_add(busy_timeout)
-        .unwrap_or(std::time::Instant::now());
-    let zero_busy_timeout = busy_timeout.is_zero();
+    let now = std::time::Instant::now();
+    let busy_deadline = if busy_timeout.is_zero() {
+        None
+    } else {
+        let relative = now.checked_add(busy_timeout).unwrap_or(now);
+        Some(operation_deadline.map_or(relative, |deadline| deadline.min(relative)))
+    };
+    let admission_deadline = operation_deadline.unwrap_or_else(std::time::Instant::now);
     let mut owners = BlockingCleanupOwner::acquire_many_until(
         "claw-sqlite-begin-owner",
         3,
-        Some(operation_deadline),
-        zero_busy_timeout,
+        Some(admission_deadline),
+        allow_expired_first_attempt,
     )
     .await
     .map_err(|error| {
@@ -5794,10 +5798,11 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let cancellation = Arc::new(BeginCancellation {
         local: std::sync::atomic::AtomicBool::new(false),
         external: external_cancellation,
-        deadline: (!zero_busy_timeout).then_some(operation_deadline),
-        cleanup_cutoff: operation_deadline
+        deadline: operation_deadline,
+        busy_deadline,
+        cleanup_cutoff: admission_deadline
             .checked_add(std::time::Duration::from_secs(1))
-            .unwrap_or(operation_deadline),
+            .unwrap_or(admission_deadline),
         #[cfg(test)]
         busy_entered: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -5936,15 +5941,29 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     Ok(transaction)
 }
 
+fn relative_begin_deadline(
+    busy_timeout: std::time::Duration,
+) -> (Option<std::time::Instant>, bool) {
+    if busy_timeout.is_zero() {
+        (None, true)
+    } else {
+        let now = std::time::Instant::now();
+        (Some(now.checked_add(busy_timeout).unwrap_or(now)), false)
+    }
+}
+
 /// Starts a manual immediate transaction on an owned, non-pool-returnable connection.
 pub async fn begin_manual_transaction(
     connection: sqlx::SqliteConnection,
     busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<sqlx::SqliteConnection>, FileControlError> {
+    let (deadline, allow_expired_first_attempt) = relative_begin_deadline(busy_timeout);
     begin_manual_transaction_inner(
         connection,
         busy_timeout,
+        deadline,
+        allow_expired_first_attempt,
         busy_timeout,
         external_cancellation,
     )
@@ -5956,7 +5975,16 @@ pub async fn begin_manual_pool_transaction(
     connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
     busy_timeout: std::time::Duration,
 ) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
-    begin_manual_transaction_inner(connection, busy_timeout, busy_timeout, None).await
+    let (deadline, allow_expired_first_attempt) = relative_begin_deadline(busy_timeout);
+    begin_manual_transaction_inner(
+        connection,
+        busy_timeout,
+        deadline,
+        allow_expired_first_attempt,
+        busy_timeout,
+        None,
+    )
+    .await
 }
 
 /// Starts a pool transaction with a temporary BEGIN busy bound and restores the configured bound.
@@ -5966,9 +5994,31 @@ pub async fn begin_manual_pool_transaction_with_restore(
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
+    let (deadline, allow_expired_first_attempt) = relative_begin_deadline(begin_busy_timeout);
     begin_manual_transaction_inner(
         connection,
         begin_busy_timeout,
+        deadline,
+        allow_expired_first_attempt,
+        restore_busy_timeout,
+        external_cancellation,
+    )
+    .await
+}
+
+/// Starts a pool transaction bounded by an existing absolute operation deadline.
+pub async fn begin_manual_pool_transaction_with_restore_deadline(
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    operation_deadline: std::time::Instant,
+    begin_busy_timeout: std::time::Duration,
+    restore_busy_timeout: std::time::Duration,
+    external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
+    begin_manual_transaction_inner(
+        connection,
+        begin_busy_timeout,
+        Some(operation_deadline),
+        false,
         restore_busy_timeout,
         external_cancellation,
     )
@@ -8436,6 +8486,52 @@ mod deadline_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_absolute_deadline_is_not_rebased_as_zero_busy_timeout() {
+        if run_in_isolated_child(
+            "deadline_tests::expired_absolute_deadline_is_not_rebased_as_zero_busy_timeout",
+            "GTA_CLAW_EXPIRED_ABSOLUTE_BEGIN_CHILD",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("expired-absolute-begin.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open expired absolute deadline pool");
+        sqlx::query("CREATE TABLE value(id INTEGER)")
+            .execute(&pool)
+            .await
+            .expect("create expired deadline fixture");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire expired deadline lease");
+        let error = begin_manual_pool_transaction_with_restore_deadline(
+            connection,
+            std::time::Instant::now(),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(500),
+            None,
+        )
+        .await
+        .expect_err("expired absolute deadline rejects before BEGIN");
+        assert!(
+            error.to_string().contains("admission timed out"),
+            "absolute expiry remains a timeout instead of zero-timeout permission: {error}"
+        );
+        sqlx::query("INSERT INTO value VALUES (1)")
+            .execute(&pool)
+            .await
+            .expect("expired deadline returns the unmodified pool lease");
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_contended_manual_begin_interrupts_and_joins_worker() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("cancelled-begin.sqlite");
@@ -8781,6 +8877,8 @@ mod deadline_tests {
         let transaction = begin_manual_transaction_inner(
             connection,
             std::time::Duration::from_millis(500),
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(500)),
+            false,
             std::time::Duration::from_millis(500),
             None,
         )
@@ -8883,6 +8981,7 @@ mod deadline_tests {
             local: AtomicBool::new(true),
             external: None,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            busy_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             cleanup_cutoff: std::time::Instant::now() + std::time::Duration::from_secs(2),
             busy_entered: std::sync::Mutex::new(None),
             test_key: std::sync::Mutex::new(None),
@@ -10674,6 +10773,8 @@ mod deadline_tests {
                 dropped: Arc::clone(&dropped),
             },
             std::time::Duration::from_secs(1),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            false,
             std::time::Duration::from_secs(1),
             None,
         )
@@ -10782,6 +10883,8 @@ mod deadline_tests {
                     dropped: Arc::clone(&dropped),
                 },
                 std::time::Duration::from_secs(1),
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+                false,
                 std::time::Duration::from_secs(1),
                 None,
             )

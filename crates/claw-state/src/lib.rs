@@ -2548,6 +2548,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_open_admission_preserves_cleanup_headroom() {
+        const CHILD_ENV: &str = "GTA_CLAW_OPEN_HEADROOM_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let executable = std::env::current_exe().expect("current state test executable");
+            let status = Command::new(executable)
+                .arg("--exact")
+                .arg("tests::production_open_admission_preserves_cleanup_headroom")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated open headroom test");
+            assert!(status.success(), "isolated open headroom test failed");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("open headroom directory");
+        let (entered, release) = test_support::set_open_admission_barrier();
+        let mut opens = tokio::task::JoinSet::new();
+        for index in 0..40 {
+            let path = database_path(&directory, &format!("open-headroom-{index:02}.sqlite"));
+            opens.spawn(async move { StateStore::open(StoreConfig::new(path)).await });
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entered.load(std::sync::atomic::Ordering::Acquire) < 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("thirty-two production opens reach the cleanup-owner barrier");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::Acquire),
+            32,
+            "production admission retains cleanup-owner headroom"
+        );
+        release.store(true, std::sync::atomic::Ordering::Release);
+
+        let mut stores = Vec::with_capacity(40);
+        while let Some(joined) = opens.join_next().await {
+            stores.push(
+                joined
+                    .expect("open headroom task joins")
+                    .expect("admitted open completes"),
+            );
+        }
+        test_support::clear_open_admission_barrier();
+        assert_eq!(stores.len(), 40);
+        for store in stores {
+            store.close().await.expect("headroom store closes");
+        }
+    }
+
+    #[tokio::test]
     async fn migration_checksum_drift_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "checksum.sqlite");

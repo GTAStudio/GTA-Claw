@@ -42,6 +42,7 @@ const SNAPSHOT_OPERATION_PEAK_UNITS: u32 =
 const PROCESS_SNAPSHOT_PEAK_UNITS: usize = SNAPSHOT_OPERATION_PEAK_UNITS as usize * 2;
 static BACKUP_CLEANUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 static RESTORE_CLEANUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+static STATE_OPEN_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 static SNAPSHOT_MEMORY_ADMISSION: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(PROCESS_SNAPSHOT_PEAK_UNITS);
 #[cfg(test)]
@@ -669,6 +670,9 @@ static FINAL_CONNECTION_CLOSE_FAILURES: std::sync::LazyLock<
 static PANIC_CLOSE_AFTER_OWNERSHIP_GUARD: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static OPEN_ADMISSION_TEST_BARRIER: std::sync::LazyLock<Mutex<Option<OpenAdmissionTestBarrier>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
 struct MigrationTestBarrier {
@@ -688,6 +692,35 @@ struct BackupCaptureTestBarrier {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<std::sync::atomic::AtomicBool>,
     observed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+struct OpenAdmissionTestBarrier {
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+fn open_admission_test_barrier_is_active() -> bool {
+    OPEN_ADMISSION_TEST_BARRIER
+        .lock()
+        .expect("open admission test barrier lock poisoned")
+        .is_some()
+}
+
+#[cfg(test)]
+async fn wait_at_open_admission_test_barrier() {
+    let barrier = OPEN_ADMISSION_TEST_BARRIER
+        .lock()
+        .expect("open admission test barrier lock poisoned")
+        .as_ref()
+        .map(|barrier| (Arc::clone(&barrier.entered), Arc::clone(&barrier.release)));
+    if let Some((entered, release)) = barrier {
+        entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        while !release.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1253,6 +1286,7 @@ impl Drop for ProcessIdentityGuard {
 
 struct UndeliveredStoreCleanup {
     store: Option<StateStore>,
+    open_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 }
@@ -1260,6 +1294,7 @@ struct UndeliveredStoreCleanup {
 fn handoff_undelivered_store(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     store: StateStore,
+    open_admission: tokio::sync::SemaphorePermit<'static>,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 ) -> Result<(), StateError> {
@@ -1267,6 +1302,7 @@ fn handoff_undelivered_store(
         owner,
         std::sync::Mutex::new(UndeliveredStoreCleanup {
             store: Some(store),
+            open_admission: Some(open_admission),
             deadline,
             deadline_state,
         }),
@@ -1294,7 +1330,12 @@ fn handoff_undelivered_store(
                     .take()
                     .expect("undelivered store is consumed once");
                 let deadline_state = Arc::clone(&payload.deadline_state);
+                let open_admission = payload
+                    .open_admission
+                    .take()
+                    .expect("undelivered open admission remains owned");
                 drop(payload);
+                let _open_admission = open_admission;
                 let _ = runtime.block_on(store.close_inner(true));
                 deadline_state
                     .finished
@@ -1467,10 +1508,16 @@ impl StateStore {
     /// Opens an explicit on-disk database, acquires its writer lock, and migrates forward.
     pub async fn open(config: StoreConfig) -> Result<Self, StateError> {
         #[cfg(test)]
-        let _test_open_permit = TEST_OPEN_CONCURRENCY
-            .acquire()
-            .await
-            .expect("test open concurrency semaphore remains live");
+        let _test_open_permit = if open_admission_test_barrier_is_active() {
+            None
+        } else {
+            Some(
+                TEST_OPEN_CONCURRENCY
+                    .acquire()
+                    .await
+                    .expect("test open concurrency semaphore remains live"),
+            )
+        };
         validate_config(&config)?;
         let close_retention = reserve_state_close_retention()?;
         let timeout_ms = u64::try_from(config.open_timeout.as_millis()).map_err(|_| {
@@ -1505,6 +1552,18 @@ impl StateStore {
             final_commit_state: std::sync::atomic::AtomicU8::new(0),
             open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
         });
+        let open_admission = tokio::time::timeout_at(cancel_at, STATE_OPEN_ADMISSION.acquire())
+            .await
+            .map_err(|_| StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms,
+            })?
+            .map_err(|_| {
+                database(
+                    "acquire state open admission",
+                    sqlx::Error::Protocol("state open admission is closed".to_owned()),
+                )
+            })?;
         let mut undelivered_cleanup_owners =
             claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
                 "state-open-undelivered-cleanup",
@@ -1528,6 +1587,8 @@ impl StateStore {
         let undelivered_cleanup_owner = undelivered_cleanup_owners
             .pop()
             .expect("one undelivered cleanup owner was reserved");
+        #[cfg(test)]
+        wait_at_open_admission_test_barrier().await;
         let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
         let (delivery_ack_tx, delivery_ack_rx) = tokio::sync::oneshot::channel();
         let mut delivery_ack_tx = Some(delivery_ack_tx);
@@ -1535,6 +1596,7 @@ impl StateStore {
         let task_delivered_store = Arc::clone(&delivered_store);
         let task_deadline_state = Arc::clone(&deadline_state);
         let lifecycle = tokio::spawn(async move {
+            let mut open_admission = Some(open_admission);
             let mut undelivered_cleanup_owner = Some(undelivered_cleanup_owner);
             match Self::open_inner(config, Arc::clone(&task_deadline_state), close_retention).await
             {
@@ -1574,6 +1636,9 @@ impl StateStore {
                                     .take()
                                     .expect("undelivered cleanup owner remains reserved"),
                                 store,
+                                open_admission
+                                    .take()
+                                    .expect("open admission remains owned for cleanup"),
                                 deadline,
                                 Arc::clone(&task_deadline_state),
                             );
@@ -1593,6 +1658,9 @@ impl StateStore {
                                     .take()
                                     .expect("undelivered cleanup owner remains reserved"),
                                 store,
+                                open_admission
+                                    .take()
+                                    .expect("open admission remains owned for cleanup"),
                                 deadline,
                                 Arc::clone(&task_deadline_state),
                             );
@@ -12744,6 +12812,30 @@ pub(crate) mod test_support {
             .iter()
             .filter(|slot| !slot.reserved)
             .count()
+    }
+
+    pub(crate) fn set_open_admission_barrier() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut barrier = super::OPEN_ADMISSION_TEST_BARRIER
+            .lock()
+            .expect("open admission test barrier lock poisoned");
+        assert!(barrier.is_none(), "open admission test barrier is unique");
+        *barrier = Some(super::OpenAdmissionTestBarrier {
+            entered: std::sync::Arc::clone(&entered),
+            release: std::sync::Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    pub(crate) fn clear_open_admission_barrier() {
+        super::OPEN_ADMISSION_TEST_BARRIER
+            .lock()
+            .expect("open admission test barrier lock poisoned")
+            .take();
     }
 
     pub(crate) fn reseal_backup_fixture(path: &Path) {
