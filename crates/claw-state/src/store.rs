@@ -82,6 +82,16 @@ struct StateCleanupEnvelope {
     permit: Option<claw_sqlite_file_control::ExternalCleanupPermit>,
 }
 
+struct RetainedStateCleanup {
+    envelope: StateCleanupEnvelope,
+    retry_at: std::time::Instant,
+}
+
+struct StateCleanupQuarantine {
+    slots: [Option<RetainedStateCleanup>; MAX_STATE_CLEANUP_JOBS],
+    next_retry_slot: usize,
+}
+
 struct StateCleanupExecutor {
     sender: std::sync::mpsc::SyncSender<StateCleanupEnvelope>,
     _receiver: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<StateCleanupEnvelope>>>,
@@ -94,9 +104,14 @@ const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
 const SNAPSHOT_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SNAPSHOT_CLEANUP_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 const SNAPSHOT_CLEANUP_MAX_ATTEMPTS: usize = 8;
-static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<
-    std::sync::Mutex<[Option<StateCleanupEnvelope>; MAX_STATE_CLEANUP_JOBS]>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
+const RETAINED_STATE_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<std::sync::Mutex<StateCleanupQuarantine>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(StateCleanupQuarantine {
+            slots: std::array::from_fn(|_| None),
+            next_retry_slot: 0,
+        })
+    });
 
 struct StateCloseRetention {
     _pool: SqlitePool,
@@ -192,19 +207,33 @@ fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
     let mut quarantine = STATE_CLEANUP_QUARANTINE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(slot) = quarantine.iter_mut().find(|slot| slot.is_none()) {
-        *slot = Some(envelope);
+    if let Some(slot) = quarantine.slots.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(RetainedStateCleanup {
+            envelope,
+            retry_at: std::time::Instant::now() + RETAINED_STATE_CLEANUP_RETRY_INTERVAL,
+        });
     } else {
         std::mem::forget(envelope);
     }
 }
 
-fn take_retained_state_cleanup() -> Option<StateCleanupEnvelope> {
-    STATE_CLEANUP_QUARANTINE
+fn take_due_retained_state_cleanup(now: std::time::Instant) -> Option<StateCleanupEnvelope> {
+    let mut quarantine = STATE_CLEANUP_QUARANTINE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter_mut()
-        .find_map(Option::take)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for offset in 0..MAX_STATE_CLEANUP_JOBS {
+        let index = (quarantine.next_retry_slot + offset) % MAX_STATE_CLEANUP_JOBS;
+        if quarantine.slots[index]
+            .as_ref()
+            .is_some_and(|retained| retained.retry_at <= now)
+        {
+            quarantine.next_retry_slot = (index + 1) % MAX_STATE_CLEANUP_JOBS;
+            return quarantine.slots[index]
+                .take()
+                .map(|retained| retained.envelope);
+        }
+    }
+    None
 }
 
 fn run_state_cleanup_envelope(
@@ -265,17 +294,32 @@ static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, 
                         }
                     };
                     let _ = ready_tx.send(Ok(()));
+                    let mut retained_turn = false;
                     loop {
+                        if retained_turn
+                            && let Some(envelope) =
+                                take_due_retained_state_cleanup(std::time::Instant::now())
+                        {
+                            retained_turn = false;
+                            run_state_cleanup_envelope(&runtime, envelope);
+                            continue;
+                        }
                         let received = receiver
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .recv_timeout(Duration::from_millis(50));
+                            .recv_timeout(RETAINED_STATE_CLEANUP_RETRY_INTERVAL);
                         let envelope = match received {
-                            Ok(envelope) => envelope,
+                            Ok(envelope) => {
+                                retained_turn = true;
+                                envelope
+                            }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                let Some(envelope) = take_retained_state_cleanup() else {
+                                let Some(envelope) =
+                                    take_due_retained_state_cleanup(std::time::Instant::now())
+                                else {
                                     continue;
                                 };
+                                retained_turn = false;
                                 envelope
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -6087,6 +6131,7 @@ mod snapshot_quarantine_tests {
         STATE_CLEANUP_QUARANTINE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots
             .iter()
             .filter(|entry| entry.is_some())
             .count()
@@ -13516,6 +13561,7 @@ pub(crate) mod test_support {
         super::STATE_CLEANUP_QUARANTINE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots
             .iter()
             .filter(|entry| entry.is_some())
             .count()
@@ -13837,6 +13883,7 @@ pub(crate) mod test_support {
         alternate: &Path,
         victim: &Path,
         block_first_delete: bool,
+        normal_queue_pressure: bool,
     ) {
         use std::io::Write as _;
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -13888,6 +13935,7 @@ pub(crate) mod test_support {
                 while super::STATE_CLEANUP_QUARANTINE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .slots
                     .iter()
                     .all(Option::is_none)
                 {
@@ -13903,12 +13951,45 @@ pub(crate) mod test_support {
                 0,
                 "bound staging contents are scrubbed before deletion can be blocked"
             );
+            let pressure = if normal_queue_pressure {
+                let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let producer_submitted = std::sync::Arc::clone(&submitted);
+                let producer_completed = std::sync::Arc::clone(&completed);
+                let producer = tokio::spawn(async move {
+                    for _ in 0..256 {
+                        let owner = claw_sqlite_file_control::BlockingCleanupOwner::acquire(
+                            "windows-retained-fairness-test",
+                        )
+                        .await
+                        .expect("reserve normal cleanup pressure owner");
+                        let completed = std::sync::Arc::clone(&producer_completed);
+                        super::handoff_state_payload(owner, completed, |_, _, completed| {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            completed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        })
+                        .expect("submit normal cleanup pressure job");
+                        producer_submitted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while submitted.load(std::sync::atomic::Ordering::Acquire) < 64 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("normal cleanup pressure fills executor capacity");
+                Some((producer, completed))
+            } else {
+                None
+            };
             drop(blocker);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 while alternate.exists()
                     || super::STATE_CLEANUP_QUARANTINE
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .slots
                         .iter()
                         .any(Option::is_some)
                 {
@@ -13917,6 +13998,23 @@ pub(crate) mod test_support {
             })
             .await
             .expect("retained Windows cleanup retries after delete access is restored");
+            if let Some((producer, completed)) = pressure {
+                assert!(
+                    completed.load(std::sync::atomic::Ordering::Acquire) < 256,
+                    "retained cleanup completes before the normal producer drains"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(5), producer)
+                    .await
+                    .expect("normal cleanup pressure producer remains bounded")
+                    .expect("normal cleanup pressure producer joins");
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while completed.load(std::sync::atomic::Ordering::Acquire) < 256 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("normal cleanup pressure jobs all complete");
+            }
         } else {
             result.expect("cleanup exact renamed Windows staging");
         }

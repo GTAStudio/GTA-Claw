@@ -3992,7 +3992,8 @@ mod tests {
             .len();
 
         assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
-        test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, false).await;
+        test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, false, false)
+            .await;
 
         assert!(
             !alternate.exists(),
@@ -4041,8 +4042,10 @@ mod tests {
             test_support::secure_windows_file_fixture(&victim);
 
             assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
-            test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, true)
-                .await;
+            test_support::cleanup_renamed_windows_snapshot(
+                &staging, &alternate, &victim, true, false,
+            )
+            .await;
             assert!(!alternate.exists());
             assert_eq!(
                 fs::read(&staging).expect("read retained cleanup victim alias"),
@@ -4051,6 +4054,28 @@ mod tests {
             assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
             fs::remove_file(&staging).expect("remove retained cleanup victim alias");
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_snapshot_cleanup_progresses_under_normal_queue_pressure() {
+        let directory = tempfile::tempdir().expect("Windows retained fairness directory");
+        let staging = database_path(&directory, "retained-fairness-staging.sqlite");
+        let alternate = database_path(&directory, "retained-fairness-alternate.sqlite");
+        let victim = database_path(&directory, "retained-fairness-victim.sqlite");
+        fs::write(&victim, b"retained fairness victim").expect("write retained fairness victim");
+        test_support::secure_windows_file_fixture(&victim);
+
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, true, true)
+            .await;
+        assert!(!alternate.exists());
+        assert_eq!(
+            fs::read(&staging).expect("read retained fairness victim alias"),
+            b"retained fairness victim"
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        fs::remove_file(&staging).expect("remove retained fairness victim alias");
     }
 
     #[tokio::test]
