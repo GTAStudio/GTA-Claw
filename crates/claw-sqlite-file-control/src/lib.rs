@@ -1776,8 +1776,6 @@ pub async fn deserialize_readonly(
 pub struct BackupExecutionContext {
     /// Absolute operation deadline.
     pub deadline: std::time::Instant,
-    /// Absolute deadline for terminal worker retirement.
-    pub cleanup_deadline: std::time::Instant,
     /// Shared operation cancellation state.
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Maximum permitted SQLite page count.
@@ -1919,11 +1917,40 @@ async fn backup_main_database(
 /// Runs a logical SQLite backup on the bounded native executor while retaining
 /// exclusive ownership of both connections through terminal result delivery.
 pub async fn backup_owned_main_database<Source, Destination, Reservation>(
+    worker_owner: BlockingCleanupOwner,
+    source: Source,
+    destination: Destination,
+    reservation: Reservation,
+    context: BackupExecutionContext,
+) -> Result<(Source, Destination, Reservation), FileControlError>
+where
+    Source: BeginOwnedConnection,
+    Destination: BeginOwnedConnection,
+    Reservation: Send + 'static,
+{
+    let cleanup_deadline = context
+        .deadline
+        .checked_add(std::time::Duration::from_secs(5))
+        .unwrap_or(context.deadline);
+    backup_owned_main_database_with_cleanup_deadline(
+        worker_owner,
+        source,
+        destination,
+        reservation,
+        context,
+        cleanup_deadline,
+    )
+    .await
+}
+
+/// Runs a logical backup with a caller-supplied immutable terminal cleanup deadline.
+pub async fn backup_owned_main_database_with_cleanup_deadline<Source, Destination, Reservation>(
     mut worker_owner: BlockingCleanupOwner,
     source: Source,
     destination: Destination,
     reservation: Reservation,
     context: BackupExecutionContext,
+    cleanup_deadline: std::time::Instant,
 ) -> Result<(Source, Destination, Reservation), FileControlError>
 where
     Source: BeginOwnedConnection,
@@ -2009,7 +2036,6 @@ where
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
     let deadline = context.deadline;
-    let cleanup_deadline = context.cleanup_deadline;
     let delivery_cancelled = Arc::clone(&context.cancelled);
     let worker_owner_retired = Arc::new(AtomicU8::new(0));
     worker_owner
@@ -12103,7 +12129,6 @@ mod deadline_tests {
             &mut baseline_destination,
             &BackupExecutionContext {
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
-                cleanup_deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 max_pages: 10_000,
                 source_busy_timeout: std::time::Duration::ZERO,
@@ -12130,8 +12155,6 @@ mod deadline_tests {
                     &mut destination,
                     &BackupExecutionContext {
                         deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
-                        cleanup_deadline: std::time::Instant::now()
-                            + std::time::Duration::from_secs(2),
                         cancelled: Arc::new(AtomicBool::new(false)),
                         max_pages: 10_000,
                         source_busy_timeout: std::time::Duration::ZERO,
@@ -12210,7 +12233,6 @@ mod deadline_tests {
                 &mut destination,
                 &BackupExecutionContext {
                     deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-                    cleanup_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     max_pages: 1,
                     source_busy_timeout: std::time::Duration::ZERO,

@@ -1040,6 +1040,19 @@ static EARLY_VERIFIER_RETIRE_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, OpenAdmissionTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
+#[derive(Clone)]
+struct OwnedCloseCutoffTestControl {
+    fallback_timeout: Duration,
+    result_entered: Arc<tokio::sync::Notify>,
+    result_release: Arc<std::sync::atomic::AtomicBool>,
+    retirement_entered: Arc<tokio::sync::Notify>,
+    retirement_release: Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(test)]
+static OWNED_CLOSE_CUTOFF_TEST_CONTROL: std::sync::LazyLock<
+    Mutex<Option<OwnedCloseCutoffTestControl>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
 static EXPIRED_UNDELIVERED_BEGIN_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
@@ -6602,6 +6615,23 @@ fn reserve_snapshot_quarantine(
 mod open_deadline_tests {
     use super::*;
 
+    fn run_in_isolated_child(test_name: &str, marker: &str) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return false;
+        }
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("resolve state test binary"))
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(marker, "1")
+                .status()
+                .expect("run isolated state test");
+        assert!(status.success(), "isolated state test failed: {test_name}");
+        true
+    }
+
     #[test]
     fn dropped_open_runtime_readiness_receiver_stops_all_workers() {
         let (ready, receiver) = std::sync::mpsc::sync_channel(1);
@@ -6779,6 +6809,102 @@ mod open_deadline_tests {
             0
         );
         pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_connection_close_uses_one_immutable_fallback_cutoff() {
+        if run_in_isolated_child(
+            "store::open_deadline_tests::owned_connection_close_uses_one_immutable_fallback_cutoff",
+            "GTA_CLAW_OWNED_CLOSE_CUTOFF_CHILD",
+        ) {
+            return;
+        }
+
+        struct GateGuard {
+            result_release: Arc<std::sync::atomic::AtomicBool>,
+            retirement_release: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.result_release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.retirement_release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                OWNED_CLOSE_CUTOFF_TEST_CONTROL
+                    .lock()
+                    .expect("owned close cutoff control lock poisoned")
+                    .take();
+            }
+        }
+
+        let result_entered = Arc::new(tokio::sync::Notify::new());
+        let result_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retirement_entered = Arc::new(tokio::sync::Notify::new());
+        let retirement_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *OWNED_CLOSE_CUTOFF_TEST_CONTROL
+            .lock()
+            .expect("owned close cutoff control lock poisoned") =
+            Some(OwnedCloseCutoffTestControl {
+                fallback_timeout: Duration::from_millis(500),
+                result_entered: Arc::clone(&result_entered),
+                result_release: Arc::clone(&result_release),
+                retirement_entered: Arc::clone(&retirement_entered),
+                retirement_release: Arc::clone(&retirement_release),
+            });
+        let _guard = GateGuard {
+            result_release: Arc::clone(&result_release),
+            retirement_release: Arc::clone(&retirement_release),
+        };
+
+        let connection = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open owned close cutoff connection");
+        let cleanup_owner =
+            claw_sqlite_file_control::BlockingCleanupOwner::acquire("owned-close-cutoff-test")
+                .await
+                .expect("reserve owned close cutoff owner");
+        let connection =
+            OwnedSqliteConnectionGuard::new_cancellable_with_owner(connection, None, cleanup_owner);
+        let started = std::time::Instant::now();
+        let close = tokio::spawn(connection.close());
+        tokio::time::timeout(Duration::from_secs(1), result_entered.notified())
+            .await
+            .expect("owned close reaches delayed result gate");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        result_release.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), retirement_entered.notified())
+            .await
+            .expect("owned close reaches retirement gate after result delivery");
+        let error = tokio::time::timeout(Duration::from_millis(300), close)
+            .await
+            .expect("retirement wait reuses the original fallback cutoff")
+            .expect("owned close cutoff task joins")
+            .expect_err("stalled retirement exceeds the immutable cutoff");
+        assert!(
+            error
+                .to_string()
+                .contains("owner terminal retirement exceeded its cleanup deadline"),
+            "delivered close result preserves retirement error precedence: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(650),
+            "result and retirement waits share one absolute fallback cutoff"
+        );
+
+        retirement_release.store(true, std::sync::atomic::Ordering::Release);
+        let all = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "owned-close-cutoff-capacity-proof",
+            64,
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("stalled owned close terminalizes after release");
+        for owner in all {
+            owner
+                .shutdown()
+                .expect("release owned close cutoff capacity proof");
+        }
     }
 }
 
@@ -7758,6 +7884,55 @@ fn close_owned_connection_payload(
     result
 }
 
+#[cfg(test)]
+fn owned_close_fallback_timeout() -> Duration {
+    OWNED_CLOSE_CUTOFF_TEST_CONTROL
+        .lock()
+        .expect("owned close cutoff control lock poisoned")
+        .as_ref()
+        .map_or(Duration::from_secs(1), |control| control.fallback_timeout)
+}
+
+#[cfg(test)]
+fn wait_at_owned_close_result_test_gate() {
+    let gate = OWNED_CLOSE_CUTOFF_TEST_CONTROL
+        .lock()
+        .expect("owned close cutoff control lock poisoned")
+        .as_ref()
+        .map(|control| {
+            (
+                Arc::clone(&control.result_entered),
+                Arc::clone(&control.result_release),
+            )
+        });
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        while !release.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(test)]
+fn wait_at_owned_close_retirement_test_gate() {
+    let gate = OWNED_CLOSE_CUTOFF_TEST_CONTROL
+        .lock()
+        .expect("owned close cutoff control lock poisoned")
+        .as_ref()
+        .map(|control| {
+            (
+                Arc::clone(&control.retirement_entered),
+                Arc::clone(&control.retirement_release),
+            )
+        });
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        while !release.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+}
+
 impl OwnedSqliteConnectionGuard {
     fn new_cancellable_with_owner(
         connection: SqliteConnection,
@@ -7847,7 +8022,15 @@ impl OwnedSqliteConnectionGuard {
                 },
             )))
         });
-        let retirement_deadline = self.cancellation.as_ref().map(|state| state.deadline);
+        #[cfg(test)]
+        let fallback_timeout = owned_close_fallback_timeout();
+        #[cfg(not(test))]
+        let fallback_timeout = std::time::Duration::from_secs(1);
+        let result_cutoff = std::time::Instant::now() + fallback_timeout;
+        let retirement_deadline = self
+            .cancellation
+            .as_ref()
+            .map_or(result_cutoff, |state| state.deadline);
         let retirement = StateOwnerRetirementReceipt::new();
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
         handoff_state_payload_with_completion(
@@ -7866,6 +8049,8 @@ impl OwnedSqliteConnectionGuard {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let result = close_owned_connection_payload(&mut payload, terminal_closes);
+                #[cfg(test)]
+                wait_at_owned_close_result_test_gate();
                 let done_tx = payload
                     .result
                     .take()
@@ -7877,15 +8062,18 @@ impl OwnedSqliteConnectionGuard {
                     }
                     payload.backup_lease = backup_lease;
                 }
+                #[cfg(test)]
+                wait_at_owned_close_retirement_test_gate();
             },
         )
         .map_err(sqlx::Error::Protocol)?;
         self.cancellation = None;
-        let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let (close, mut backup_lease) = loop {
             match done_rx.try_recv() {
                 Ok(result) => break result,
-                Err(std::sync::mpsc::TryRecvError::Empty) if std::time::Instant::now() < cutoff => {
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if std::time::Instant::now() < result_cutoff =>
+                {
                     tokio::task::yield_now().await;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -7900,8 +8088,6 @@ impl OwnedSqliteConnectionGuard {
                 }
             }
         };
-        let retirement_deadline = retirement_deadline
-            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(1));
         retirement
             .wait(retirement_deadline, "owned SQLite connection cleanup")
             .await
@@ -10332,19 +10518,19 @@ async fn inspect_database(
         |state| Arc::clone(&state.cancelled),
     );
     let (source, inspection, _snapshot_memory) =
-        claw_sqlite_file_control::backup_owned_main_database(
+        claw_sqlite_file_control::backup_owned_main_database_with_cleanup_deadline(
             worker_owner,
             source,
             inspection,
             snapshot_memory,
             claw_sqlite_file_control::BackupExecutionContext {
                 deadline,
-                cleanup_deadline: inspection_deadline.into_std(),
                 cancelled,
                 max_pages,
                 source_busy_timeout: Duration::ZERO,
                 destination_busy_timeout: Duration::ZERO,
             },
+            inspection_deadline.into_std(),
         )
         .await
         .map_err(|error| file_control_database("copy database for inspection", error))?;
@@ -12148,21 +12334,21 @@ async fn materialize_authenticated_snapshot(
         |state| Arc::clone(&state.cancelled),
     );
     let (source_connection, source_cleanup_owner) = source_connection.release_connection();
-    let copied = claw_sqlite_file_control::backup_owned_main_database(
+    let copied = claw_sqlite_file_control::backup_owned_main_database_with_cleanup_deadline(
         worker_owner,
         source_connection,
         destination_connection,
         Arc::clone(&operation_reservation),
         claw_sqlite_file_control::BackupExecutionContext {
             deadline,
-            cleanup_deadline: deadline_state
-                .as_ref()
-                .map_or(deadline, |state| state.deadline),
             cancelled: Arc::clone(&cancelled),
             max_pages,
             source_busy_timeout: Duration::ZERO,
             destination_busy_timeout: Duration::ZERO,
         },
+        deadline_state
+            .as_ref()
+            .map_or(deadline, |state| state.deadline),
     )
     .await;
     let (source_connection, destination_connection, operation_reservation) = match copied {
@@ -13425,33 +13611,34 @@ async fn backup_pool(
             .take()
             .expect("backup admission permit remains reserved"),
     );
-    let backup_connections = claw_sqlite_file_control::backup_owned_main_database(
-        backup_worker_owner,
-        connection,
-        destination_connection,
-        operation_reservation,
-        claw_sqlite_file_control::BackupExecutionContext {
-            deadline: deadline.into_std(),
-            cleanup_deadline: deadline_state.deadline,
-            cancelled: Arc::clone(&deadline_state.cancelled),
-            max_pages,
-            source_busy_timeout,
-            destination_busy_timeout: Duration::ZERO,
-        },
-    )
-    .await
-    .map_err(|error| {
-        if error.code() == Some(9)
-            && (tokio::time::Instant::now() >= deadline
-                || deadline_state
-                    .cancelled
-                    .load(std::sync::atomic::Ordering::Acquire))
-        {
-            timed_out()
-        } else {
-            file_control_database("create consistent SQLite backup", error)
-        }
-    });
+    let backup_connections =
+        claw_sqlite_file_control::backup_owned_main_database_with_cleanup_deadline(
+            backup_worker_owner,
+            connection,
+            destination_connection,
+            operation_reservation,
+            claw_sqlite_file_control::BackupExecutionContext {
+                deadline: deadline.into_std(),
+                cancelled: Arc::clone(&deadline_state.cancelled),
+                max_pages,
+                source_busy_timeout,
+                destination_busy_timeout: Duration::ZERO,
+            },
+            deadline_state.deadline,
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == Some(9)
+                && (tokio::time::Instant::now() >= deadline
+                    || deadline_state
+                        .cancelled
+                        .load(std::sync::atomic::Ordering::Acquire))
+            {
+                timed_out()
+            } else {
+                file_control_database("create consistent SQLite backup", error)
+            }
+        });
     let (connection, destination_connection, operation_reservation) = match backup_connections {
         Ok(connections) => connections,
         Err(primary) => {
