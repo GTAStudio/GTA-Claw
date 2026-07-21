@@ -3973,6 +3973,74 @@ mod tests {
         source.close().await.expect("backup timeout source closes");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bound_snapshot_cleanup_deletes_renamed_staging_not_substituted_victim() {
+        let directory = tempfile::tempdir().expect("Windows bound cleanup directory");
+        let staging = database_path(&directory, "bound-cleanup-staging.sqlite");
+        let alternate = database_path(&directory, "attacker-renamed-staging.sqlite");
+        let victim = database_path(&directory, "bound-cleanup-victim.sqlite");
+        let victim_bytes = b"attacker victim must remain unchanged";
+        fs::write(&victim, victim_bytes).expect("write Windows cleanup victim");
+        test_support::secure_windows_file_fixture(&victim);
+        let victim_file = fs::File::open(&victim).expect("open Windows cleanup victim");
+        let victim_identity = claw_sqlite_file_control::windows_file_identity(&victim_file)
+            .expect("identify Windows cleanup victim");
+        let victim_size = victim_file
+            .metadata()
+            .expect("stat Windows cleanup victim")
+            .len();
+
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, false).await;
+
+        assert!(
+            !alternate.exists(),
+            "handle-bound cleanup removes sensitive bytes at the renamed path"
+        );
+        let substituted = fs::File::open(&staging).expect("open substituted Windows victim alias");
+        assert_eq!(
+            claw_sqlite_file_control::windows_file_identity(&substituted)
+                .expect("identify substituted Windows victim alias"),
+            victim_identity
+        );
+        assert_eq!(
+            fs::read(&staging).expect("read substituted victim"),
+            victim_bytes
+        );
+        assert_eq!(
+            fs::metadata(&staging)
+                .expect("stat substituted Windows victim")
+                .len(),
+            victim_size
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        drop(substituted);
+        drop(victim_file);
+        fs::remove_file(&staging).expect("remove test-created victim alias");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bound_snapshot_delete_error_retains_cleanup_for_retry() {
+        let directory = tempfile::tempdir().expect("Windows retained cleanup directory");
+        let staging = database_path(&directory, "retained-cleanup-staging.sqlite");
+        let alternate = database_path(&directory, "retained-cleanup-alternate.sqlite");
+        let victim = database_path(&directory, "retained-cleanup-victim.sqlite");
+        fs::write(&victim, b"retained cleanup victim").expect("write retained cleanup victim");
+        test_support::secure_windows_file_fixture(&victim);
+
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, true).await;
+        assert!(!alternate.exists());
+        assert_eq!(
+            fs::read(&staging).expect("read retained cleanup victim alias"),
+            b"retained cleanup victim"
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        fs::remove_file(&staging).expect("remove retained cleanup victim alias");
+    }
+
     #[tokio::test]
     async fn snapshot_output_creation_is_fenced_before_filesystem_mutation() {
         let directory = tempfile::tempdir().expect("output creation fence directory");

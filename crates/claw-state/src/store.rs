@@ -5453,13 +5453,15 @@ impl SnapshotCleanupGuard {
         {
             verify_child_identity_at(parent, &self.path, expected_file)?;
         }
-        #[cfg(not(unix))]
+        #[cfg(all(not(unix), not(windows)))]
         if let Some(expected_file) = &self.expected_file {
             verify_path_identity(&self.path, expected_file)?;
         }
-        #[cfg(not(unix))]
+        #[cfg(all(not(unix), not(windows)))]
         let _pinned_parent_lifetime = self.pinned_parent.as_ref();
+        #[cfg(not(windows))]
         let artifacts = database_artifacts(&self.path);
+        #[cfg(not(windows))]
         for sidecar in artifacts.iter().skip(1) {
             if path_entry_exists(sidecar)? {
                 return Err(StateError::InvalidPath {
@@ -13799,6 +13801,76 @@ pub(crate) mod test_support {
             .expect("protect Windows fixture security descriptor");
         super::validate_private_database_file(path, &file)
             .expect("validate protected Windows fixture");
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn cleanup_renamed_windows_snapshot(
+        staging: &Path,
+        alternate: &Path,
+        victim: &Path,
+        block_first_delete: bool,
+    ) {
+        use std::io::Write as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let staging =
+            super::resolve_database_path(staging).expect("resolve Windows staging fixture");
+        let alternate =
+            super::resolve_database_path(alternate).expect("resolve Windows alternate fixture");
+        let victim = super::resolve_database_path(victim).expect("resolve Windows victim fixture");
+        let parent =
+            super::pin_private_directory(&staging).expect("pin Windows staging fixture parent");
+        let cleanup_owner =
+            claw_sqlite_file_control::BlockingCleanupOwner::acquire("windows-bound-delete-test")
+                .await
+                .expect("reserve Windows bound deletion cleanup owner");
+        let mut guard =
+            super::SnapshotCleanupGuard::new_pinned(&staging, &parent, cleanup_owner, None)
+                .expect("create Windows bound deletion guard");
+        let mut file = super::create_bound_snapshot_output(
+            &staging,
+            Some(&mut guard),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            None,
+            "Windows bound deletion test",
+            1_000,
+        )
+        .expect("create Windows bound deletion staging");
+        file.write_all(b"sensitive staging bytes")
+            .and_then(|()| file.sync_all())
+            .expect("persist Windows bound deletion staging");
+        drop(file);
+        std::fs::rename(&staging, &alternate).expect("rename bound Windows staging");
+        std::fs::hard_link(&victim, &staging).expect("substitute Windows victim");
+        let blocker = block_first_delete.then(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&alternate)
+                .expect("block the first Windows bound deletion")
+        });
+        let result = guard.cleanup().await;
+        if let Some(blocker) = blocker {
+            assert!(
+                result.is_err(),
+                "a failed handle deletion must not report successful cleanup"
+            );
+            assert!(
+                alternate.exists(),
+                "failed handle deletion retains the bound staging object"
+            );
+            drop(blocker);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while alternate.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("retained Windows cleanup retries after delete access is restored");
+        } else {
+            result.expect("cleanup exact renamed Windows staging");
+        }
     }
 
     #[cfg(unix)]
