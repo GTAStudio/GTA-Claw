@@ -91,6 +91,9 @@ const STATE_CLEANUP_THREADS: usize = 16;
 const MAX_STATE_CLEANUP_JOBS: usize = 64;
 const MAX_STATE_CLOSE_RETENTIONS: usize = 64;
 const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
+const SNAPSHOT_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const SNAPSHOT_CLEANUP_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
+const SNAPSHOT_CLEANUP_MAX_ATTEMPTS: usize = 8;
 static STATE_CLEANUP_QUARANTINE: std::sync::LazyLock<
     std::sync::Mutex<[Option<StateCleanupEnvelope>; MAX_STATE_CLEANUP_JOBS]>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::array::from_fn(|_| None)));
@@ -670,9 +673,46 @@ static FINAL_CONNECTION_CLOSE_FAILURES: std::sync::LazyLock<
 static PANIC_CLOSE_AFTER_OWNERSHIP_GUARD: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(all(test, unix))]
+static FAIL_SNAPSHOT_CLEANUP_AFTER_RENAME: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, CountedFailure>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, unix))]
+static FAIL_TRUSTED_SEAL_AFTER_UNLINK: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, CountedFailure>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static OPEN_ADMISSION_TEST_BARRIER: std::sync::LazyLock<Mutex<Option<OpenAdmissionTestBarrier>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+
+#[cfg(all(test, unix))]
+struct CountedFailure {
+    remaining: usize,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(all(test, unix))]
+fn take_counted_failure(
+    failures: &Mutex<std::collections::HashMap<PathBuf, CountedFailure>>,
+    path: &Path,
+) -> bool {
+    let mut failures = failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(failure) = failures.get_mut(path) else {
+        return false;
+    };
+    if failure.remaining == 0 {
+        return false;
+    }
+    failure
+        .attempts
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if failure.remaining != usize::MAX {
+        failure.remaining -= 1;
+    }
+    true
+}
 
 #[cfg(test)]
 struct MigrationTestBarrier {
@@ -4889,6 +4929,40 @@ enum SnapshotPublicationState {
     Reclaimed,
 }
 
+struct SnapshotCleanupRetryBudget {
+    deadline: std::time::Instant,
+    attempts_remaining: usize,
+}
+
+impl SnapshotCleanupRetryBudget {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            deadline: now
+                .checked_add(SNAPSHOT_CLEANUP_RETRY_TIMEOUT)
+                .unwrap_or(now),
+            attempts_remaining: SNAPSHOT_CLEANUP_MAX_ATTEMPTS,
+        }
+    }
+
+    fn wait_for_retry(&mut self) -> bool {
+        self.attempts_remaining = self.attempts_remaining.saturating_sub(1);
+        if self.attempts_remaining == 0 {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= self.deadline {
+            return false;
+        }
+        std::thread::sleep(
+            self.deadline
+                .saturating_duration_since(now)
+                .min(SNAPSHOT_CLEANUP_RETRY_INTERVAL),
+        );
+        std::time::Instant::now() < self.deadline
+    }
+}
+
 struct SnapshotCleanupGuard {
     path: PathBuf,
     pinned_parent: Option<File>,
@@ -4902,6 +4976,10 @@ struct SnapshotCleanupGuard {
     quarantine_name: Option<String>,
     #[cfg(unix)]
     quarantine_reservation: Option<File>,
+    #[cfg(unix)]
+    quarantine_active: bool,
+    #[cfg(unix)]
+    quarantined_file: Option<File>,
 }
 
 struct SnapshotCleanupPayload {
@@ -4916,6 +4994,10 @@ struct SnapshotCleanupPayload {
     quarantine_name: Option<String>,
     #[cfg(unix)]
     quarantine_reservation: Option<File>,
+    #[cfg(unix)]
+    quarantine_active: bool,
+    #[cfg(unix)]
+    quarantined_file: Option<File>,
 }
 
 impl SnapshotCleanupPayload {
@@ -4933,6 +5015,10 @@ impl SnapshotCleanupPayload {
             quarantine_name: self.quarantine_name,
             #[cfg(unix)]
             quarantine_reservation: self.quarantine_reservation,
+            #[cfg(unix)]
+            quarantine_active: self.quarantine_active,
+            #[cfg(unix)]
+            quarantined_file: self.quarantined_file,
         }
     }
 }
@@ -5044,6 +5130,10 @@ impl SnapshotCleanupGuard {
             quarantine_name: Some(quarantine_name),
             #[cfg(unix)]
             quarantine_reservation: Some(quarantine_reservation),
+            #[cfg(unix)]
+            quarantine_active: false,
+            #[cfg(unix)]
+            quarantined_file: None,
         })
     }
 
@@ -5183,6 +5273,10 @@ impl SnapshotCleanupGuard {
             quarantine_name: self.quarantine_name.take(),
             #[cfg(unix)]
             quarantine_reservation: self.quarantine_reservation.take(),
+            #[cfg(unix)]
+            quarantine_active: self.quarantine_active,
+            #[cfg(unix)]
+            quarantined_file: self.quarantined_file.take(),
         })
     }
 
@@ -5192,11 +5286,11 @@ impl SnapshotCleanupGuard {
             return;
         };
         let guard = payload.into_guard();
-        let _ = handoff_state_payload(owner, std::sync::Mutex::new(guard), |_, _, guard| {
-            let _ = guard
+        let _ = handoff_state_payload_decide(owner, std::sync::Mutex::new(guard), |_, _, guard| {
+            let mut guard = guard
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .cleanup_now();
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cleanup_snapshot_with_bounded_retries(&mut guard, |_| {})
         });
     }
 
@@ -5211,7 +5305,7 @@ impl SnapshotCleanupGuard {
             undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
         }
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
-        handoff_state_payload(
+        handoff_state_payload_decide(
             owner,
             SnapshotCleanupWorker {
                 guard: std::sync::Mutex::new(payload.into_guard()),
@@ -5219,17 +5313,18 @@ impl SnapshotCleanupGuard {
                 undelivered: std::sync::Mutex::new(None),
             },
             |_, _, payload| {
-                let result = payload
+                let mut guard = payload
                     .guard
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .cleanup_now();
-                if let Err(result) = payload.result.send(result) {
-                    *payload
-                        .undelivered
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.0);
-                }
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cleanup_snapshot_with_bounded_retries(&mut guard, |result| {
+                    if let Err(result) = payload.result.send(result) {
+                        *payload
+                            .undelivered
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.0);
+                    }
+                })
             },
         )
         .map_err(|error| {
@@ -5283,8 +5378,9 @@ impl SnapshotCleanupGuard {
             });
         }
         #[cfg(unix)]
-        if let (Some(parent), Some(expected_file)) =
-            (self.pinned_parent.as_ref(), self.expected_file.as_ref())
+        if !self.quarantine_active
+            && let (Some(parent), Some(expected_file)) =
+                (self.pinned_parent.as_ref(), self.expected_file.as_ref())
         {
             verify_child_identity_at(parent, &self.path, expected_file)?;
         }
@@ -5328,71 +5424,83 @@ impl SnapshotCleanupGuard {
                     reason: "snapshot quarantine capacity was not pre-reserved",
                 })?
                 .clone();
-            expected
-                .set_len(1)
-                .and_then(|()| expected.sync_all())
-                .map_err(|error| {
-                    file_error("mark active snapshot quarantine", &self.path, error)
-                })?;
-            rustix::fs::renameat(parent, name, parent, quarantine.as_str()).map_err(|error| {
-                file_error(
-                    "quarantine pinned snapshot through held parent",
-                    &self.path,
-                    error.into(),
-                )
-            })?;
-            let quarantined = rustix::fs::openat(
-                parent,
-                quarantine.as_str(),
-                rustix::fs::OFlags::RDWR
-                    | rustix::fs::OFlags::CLOEXEC
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::NONBLOCK,
-                rustix::fs::Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(|error| {
-                file_error(
-                    "open quarantined snapshot identity",
-                    &self.path,
-                    error.into(),
-                )
-            })?;
-            quarantined.try_lock().map_err(|error| match error {
-                std::fs::TryLockError::WouldBlock => StateError::InvalidPath {
-                    path: self.path.clone(),
-                    reason: "quarantined snapshot identity is already locked",
-                },
-                std::fs::TryLockError::Error(error) => {
-                    file_error("lock quarantined snapshot identity", &self.path, error)
-                }
-            })?;
-            if !files_share_identity_from_handles_portable(expected, &quarantined)? {
-                return Err(StateError::InvalidPath {
-                    path: self.path.clone(),
-                    reason: "quarantined snapshot did not match the bound identity",
-                });
+            if !self.quarantine_active {
+                expected
+                    .set_len(1)
+                    .and_then(|()| expected.sync_all())
+                    .map_err(|error| {
+                        file_error("mark active snapshot quarantine", &self.path, error)
+                    })?;
+                rustix::fs::renameat(parent, name, parent, quarantine.as_str()).map_err(
+                    |error| {
+                        file_error(
+                            "quarantine pinned snapshot through held parent",
+                            &self.path,
+                            error.into(),
+                        )
+                    },
+                )?;
+                self.quarantine_active = true;
             }
+            if self.quarantined_file.is_none() {
+                let quarantined = rustix::fs::openat(
+                    parent,
+                    quarantine.as_str(),
+                    rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(|error| {
+                    file_error(
+                        "open quarantined snapshot identity",
+                        &self.path,
+                        error.into(),
+                    )
+                })?;
+                quarantined.try_lock().map_err(|error| match error {
+                    std::fs::TryLockError::WouldBlock => StateError::InvalidPath {
+                        path: self.path.clone(),
+                        reason: "quarantined snapshot identity is already locked",
+                    },
+                    std::fs::TryLockError::Error(error) => {
+                        file_error("lock quarantined snapshot identity", &self.path, error)
+                    }
+                })?;
+                if !files_share_identity_from_handles_portable(expected, &quarantined)? {
+                    return Err(StateError::InvalidPath {
+                        path: self.path.clone(),
+                        reason: "quarantined snapshot did not match the bound identity",
+                    });
+                }
+                self.quarantined_file = Some(quarantined);
+            }
+            let quarantined = self
+                .quarantined_file
+                .as_ref()
+                .expect("active quarantine identity remains retained");
             let reservation =
                 self.quarantine_reservation
-                    .take()
+                    .as_ref()
                     .ok_or_else(|| StateError::InvalidPath {
                         path: self.path.clone(),
                         reason: "snapshot quarantine reservation handle is missing",
                     })?;
-            File::unlock(&reservation).map_err(|error| {
-                file_error(
-                    "unlock replaced snapshot quarantine reservation",
-                    &self.path,
-                    error,
-                )
-            })?;
             expected
                 .set_len(0)
                 .and_then(|()| expected.sync_all())
                 .map_err(|error| {
                     file_error("reclaim quarantined snapshot blocks", &self.path, error)
                 })?;
+            #[cfg(test)]
+            if take_counted_failure(&FAIL_SNAPSHOT_CLEANUP_AFTER_RENAME, &self.path) {
+                return Err(StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "injected failure after snapshot quarantine rename",
+                });
+            }
             parent.sync_all().map_err(|error| {
                 file_error(
                     "sync durable snapshot quarantine directory",
@@ -5400,12 +5508,22 @@ impl SnapshotCleanupGuard {
                     error,
                 )
             })?;
-            File::unlock(&quarantined).map_err(|error| {
+            File::unlock(reservation).map_err(|error| {
+                file_error(
+                    "unlock replaced snapshot quarantine reservation",
+                    &self.path,
+                    error,
+                )
+            })?;
+            File::unlock(quarantined).map_err(|error| {
                 file_error("unlock reclaimed snapshot quarantine", &self.path, error)
             })?;
+            self.quarantined_file.take();
+            self.quarantine_reservation.take();
             self.quarantine_name.take();
+            self.quarantine_active = false;
             self.state = SnapshotPublicationState::Reclaimed;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -5437,6 +5555,23 @@ impl SnapshotCleanupGuard {
             Ok(())
         }
     }
+}
+
+fn cleanup_snapshot_with_bounded_retries(
+    guard: &mut SnapshotCleanupGuard,
+    report_first: impl FnOnce(Result<(), StateError>),
+) -> bool {
+    let mut budget = SnapshotCleanupRetryBudget::new();
+    let first = guard.cleanup_now();
+    let mut failed = first.is_err();
+    report_first(first);
+    while failed {
+        if !budget.wait_for_retry() {
+            return false;
+        }
+        failed = guard.cleanup_now().is_err();
+    }
+    true
 }
 
 #[cfg(unix)]
@@ -5737,9 +5872,104 @@ fn reserve_snapshot_quarantine(
 mod snapshot_quarantine_tests {
     use super::*;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("create private test directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure private test directory");
+        directory
+    }
+
+    fn run_ignored_in_isolated_child(test_name: &str, marker: &str) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return false;
+        }
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("resolve state test binary"))
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--ignored")
+                .arg("--test-threads=1")
+                .env(marker, "1")
+                .status()
+                .expect("run isolated snapshot cleanup test");
+        assert!(
+            status.success(),
+            "isolated snapshot cleanup test failed: {test_name}"
+        );
+        true
+    }
+
+    async fn staging_cleanup_guard(path: &Path) -> SnapshotCleanupGuard {
+        let parent = pin_private_directory(path).expect("pin snapshot cleanup directory");
+        let cleanup_owner =
+            claw_sqlite_file_control::BlockingCleanupOwner::acquire("snapshot-retry-test")
+                .await
+                .expect("reserve snapshot retry cleanup owner");
+        let mut guard = SnapshotCleanupGuard::new_pinned(path, &parent, cleanup_owner, None)
+            .expect("create snapshot retry guard");
+        let file = create_bound_snapshot_output(
+            path,
+            Some(&mut guard),
+            std::time::Instant::now() + Duration::from_secs(1),
+            None,
+            "snapshot cleanup retry test",
+            1_000,
+        )
+        .expect("create bound snapshot retry fixture");
+        file.set_len(4096)
+            .and_then(|()| file.sync_all())
+            .expect("persist snapshot retry fixture");
+        guard
+    }
+
+    fn fail_snapshot_cleanup_after_rename(
+        path: &Path,
+        remaining: usize,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let previous = FAIL_SNAPSHOT_CLEANUP_AFTER_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                path.to_owned(),
+                CountedFailure {
+                    remaining,
+                    attempts: Arc::clone(&attempts),
+                },
+            );
+        assert!(previous.is_none(), "snapshot cleanup failpoint is unique");
+        attempts
+    }
+
+    async fn wait_for_quarantine_usage(parent: &Path, expected: (usize, u64)) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if snapshot_quarantine_usage(parent).expect("inspect snapshot quarantine")
+                    == expected
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("snapshot quarantine reaches expected usage");
+    }
+
+    fn retained_state_cleanup_count() -> usize {
+        STATE_CLEANUP_QUARANTINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
+    }
+
     #[test]
     fn concurrent_reservations_cannot_exceed_residual_quota() {
-        let directory = tempfile::tempdir().expect("quarantine quota directory");
+        let directory = private_tempdir();
         let database = directory.path().join("state.sqlite");
         let parent = pin_private_directory(&database).expect("pin quarantine quota directory");
         for index in 0..63 {
@@ -5772,6 +6002,299 @@ mod snapshot_quarantine_tests {
             1,
             "only one reservation may consume the final quarantine slot"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "run explicitly by the P03b transient cleanup-capacity gate"]
+    async fn transient_post_rename_cleanup_releases_all_capacity() {
+        const CHILD_ENV: &str = "GTA_CLAW_TRANSIENT_SNAPSHOT_CLEANUP_CHILD";
+        if run_ignored_in_isolated_child(
+            "store::snapshot_quarantine_tests::transient_post_rename_cleanup_releases_all_capacity",
+            CHILD_ENV,
+        ) {
+            return;
+        }
+
+        let directory = private_tempdir();
+        let mut cleanups = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let path = directory
+                .path()
+                .join(format!("transient-cleanup-{index:02}.sqlite"));
+            let mut guard = staging_cleanup_guard(&path).await;
+            let attempts = fail_snapshot_cleanup_after_rename(&path, 1);
+            cleanups.spawn(async move {
+                let result = guard.cleanup().await;
+                (path, attempts, result)
+            });
+        }
+
+        let mut paths = Vec::new();
+        while let Some(joined) = cleanups.join_next().await {
+            let (path, attempts, result) = joined.expect("transient cleanup task joins");
+            assert!(matches!(
+                result,
+                Err(StateError::InvalidPath {
+                    reason: "injected failure after snapshot quarantine rename",
+                    ..
+                })
+            ));
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "each transient failure is injected exactly once"
+            );
+            paths.push(path);
+        }
+        wait_for_quarantine_usage(directory.path(), (0, 0)).await;
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "every renamed staging path remains absent"
+        );
+        assert_eq!(
+            retained_state_cleanup_count(),
+            0,
+            "successful retries cannot enter fail-closed retention"
+        );
+
+        let owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "snapshot-retry-capacity-proof",
+            MAX_STATE_CLEANUP_JOBS,
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("transient retries release complete cleanup capacity");
+        for owner in owners {
+            owner
+                .shutdown()
+                .expect("release transient capacity proof owner");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "run explicitly by the P03b persistent cleanup-retention gate"]
+    async fn persistent_post_rename_cleanup_is_bounded_and_retains_capacity() {
+        const CHILD_ENV: &str = "GTA_CLAW_PERSISTENT_SNAPSHOT_CLEANUP_CHILD";
+        if run_ignored_in_isolated_child(
+            "store::snapshot_quarantine_tests::persistent_post_rename_cleanup_is_bounded_and_retains_capacity",
+            CHILD_ENV,
+        ) {
+            return;
+        }
+
+        let directory = private_tempdir();
+        let path = directory.path().join("persistent-cleanup.sqlite");
+        let mut guard = staging_cleanup_guard(&path).await;
+        let attempts = fail_snapshot_cleanup_after_rename(&path, usize::MAX);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            guard.cleanup().await,
+            Err(StateError::InvalidPath {
+                reason: "injected failure after snapshot quarantine rename",
+                ..
+            })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the first persistent cleanup failure is surfaced promptly"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(std::sync::atomic::Ordering::Acquire)
+                < SNAPSHOT_CLEANUP_MAX_ATTEMPTS
+                || retained_state_cleanup_count() != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("persistent cleanup exhausts into fail-closed retention");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Acquire),
+            SNAPSHOT_CLEANUP_MAX_ATTEMPTS,
+            "persistent cleanup stops at its explicit attempt bound"
+        );
+        assert!(
+            started.elapsed() < SNAPSHOT_CLEANUP_RETRY_TIMEOUT + Duration::from_secs(1),
+            "persistent cleanup cannot occupy a worker indefinitely"
+        );
+        assert!(
+            !path.exists(),
+            "the original staging name remains quarantined"
+        );
+        assert_eq!(
+            snapshot_quarantine_usage(directory.path()).expect("inspect retained quarantine"),
+            (0, 0),
+            "retry exhaustion cannot leave residual snapshot bytes"
+        );
+        let quarantine_name = std::fs::read_dir(directory.path())
+            .expect("read retained quarantine directory")
+            .map(|entry| entry.expect("read retained quarantine entry"))
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gta-claw-quarantine-slot-")
+            })
+            .expect("retained quarantine slot exists")
+            .file_name();
+        let parent =
+            pin_private_directory(&path).expect("pin retained snapshot quarantine directory");
+        assert!(
+            claim_reusable_snapshot_quarantine_slot(
+                &parent,
+                quarantine_name
+                    .to_str()
+                    .expect("quarantine slot name is UTF-8"),
+                None,
+            )
+            .expect("probe retained quarantine slot")
+            .is_none(),
+            "retry exhaustion retains the quarantined identity lock"
+        );
+
+        let owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "snapshot-retained-capacity-proof",
+            MAX_STATE_CLEANUP_JOBS - 1,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("exactly one cleanup owner remains retained");
+        for owner in owners {
+            owner
+                .shutdown()
+                .expect("release persistent capacity proof owner");
+        }
+        assert!(
+            claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+                "snapshot-retained-full-capacity-rejection",
+                MAX_STATE_CLEANUP_JOBS,
+                std::time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .is_err(),
+            "retained cleanup ownership prevents unsafe full-capacity admission"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod trusted_backup_seal_cleanup_tests {
+    use super::*;
+
+    fn trusted_seal_fixture(
+        path: &Path,
+        remaining_failures: usize,
+    ) -> (TrustedBackupSeal, Arc<std::sync::atomic::AtomicUsize>) {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("create trusted seal cleanup fixture");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let previous = FAIL_TRUSTED_SEAL_AFTER_UNLINK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                path.to_owned(),
+                CountedFailure {
+                    remaining: remaining_failures,
+                    attempts: Arc::clone(&attempts),
+                },
+            );
+        assert!(previous.is_none(), "trusted seal failpoint is unique");
+        (
+            TrustedBackupSeal {
+                path: path.to_owned(),
+                file: Some(file),
+                deleted: false,
+                armed: true,
+            },
+            attempts,
+        )
+    }
+
+    #[test]
+    fn transient_post_unlink_failure_resumes_at_parent_sync() {
+        let directory = tempfile::tempdir().expect("transient seal cleanup directory");
+        let path = directory.path().join("transient-seal.record");
+        let (mut seal, attempts) = trusted_seal_fixture(&path, 1);
+
+        assert!(matches!(
+            seal.cleanup(),
+            Err(StateError::InvalidPath {
+                reason: "injected failure after trusted backup seal unlink",
+                ..
+            })
+        ));
+        assert!(!path.exists(), "trusted seal was unlinked before failure");
+        assert!(seal.deleted, "successful unlink is recorded");
+        assert!(
+            seal.file.is_some(),
+            "identity retention survives failed sync"
+        );
+        assert!(seal.armed, "failed cleanup remains armed");
+        seal.cleanup()
+            .expect("transient seal cleanup resumes with parent sync");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "resumed cleanup cannot repeat the unlink"
+        );
+        assert!(
+            seal.file.is_none(),
+            "completed cleanup releases identity retention"
+        );
+        assert!(!seal.armed, "completed cleanup disarms the seal");
+    }
+
+    #[test]
+    fn persistent_post_unlink_failure_returns_without_reunlinking() {
+        let directory = tempfile::tempdir().expect("persistent seal cleanup directory");
+        let path = directory.path().join("persistent-seal.record");
+        let (mut seal, attempts) = trusted_seal_fixture(&path, usize::MAX);
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            seal.cleanup(),
+            Err(StateError::InvalidPath {
+                reason: "injected failure after trusted backup seal unlink",
+                ..
+            })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "persistent seal cleanup returns without an internal retry loop"
+        );
+        assert!(
+            !path.exists(),
+            "persistent failure cannot restore the seal path"
+        );
+        assert!(seal.deleted, "persistent cleanup retains the unlink state");
+        assert!(
+            seal.file.is_some(),
+            "persistent cleanup retains the identity handle"
+        );
+        assert!(
+            seal.armed,
+            "persistent cleanup remains armed for a later attempt"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "one cleanup call performs one bounded parent-sync attempt"
+        );
+
+        FAIL_TRUSTED_SEAL_AFTER_UNLINK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&path)
+            .expect("persistent seal failpoint remains registered")
+            .remaining = 0;
+        seal.cleanup()
+            .expect("persistent seal cleanup resumes once sync can proceed");
+        assert!(seal.file.is_none());
+        assert!(!seal.armed);
     }
 }
 
@@ -10968,6 +11491,8 @@ struct TrustedBackupSeal {
     path: PathBuf,
     #[cfg(unix)]
     file: Option<File>,
+    #[cfg(unix)]
+    deleted: bool,
     armed: bool,
 }
 
@@ -11027,16 +11552,26 @@ impl TrustedBackupSeal {
     fn cleanup(&mut self) -> Result<(), StateError> {
         #[cfg(unix)]
         {
-            let Some(file) = self.file.take() else {
+            let Some(file) = self.file.as_ref() else {
                 self.armed = false;
                 return Ok(());
             };
-            verify_path_identity(&self.path, &file)?;
-            drop(file);
-            std::fs::remove_file(&self.path).map_err(|error| {
-                file_error("remove unused trusted backup seal", &self.path, error)
-            })?;
+            if !self.deleted {
+                verify_path_identity(&self.path, file)?;
+                std::fs::remove_file(&self.path).map_err(|error| {
+                    file_error("remove unused trusted backup seal", &self.path, error)
+                })?;
+                self.deleted = true;
+            }
+            #[cfg(test)]
+            if take_counted_failure(&FAIL_TRUSTED_SEAL_AFTER_UNLINK, &self.path) {
+                return Err(StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "injected failure after trusted backup seal unlink",
+                });
+            }
             sync_parent_directory(&self.path)?;
+            self.file.take();
         }
         #[cfg(windows)]
         match std::fs::remove_file(&self.path) {
@@ -11135,6 +11670,7 @@ fn create_trusted_backup_seal(
     Ok(TrustedBackupSeal {
         path: seal_path,
         file: Some(record),
+        deleted: false,
         armed: true,
     })
 }

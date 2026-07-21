@@ -3680,6 +3680,8 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                         #[cfg(test)]
                         busy_entered: std::sync::Mutex::new(None),
                         #[cfg(test)]
+                        busy_sleep_gate: std::sync::Mutex::new(None),
+                        #[cfg(test)]
                         test_key: std::sync::Mutex::new(None),
                     });
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5137,7 +5139,15 @@ struct BeginCancellation {
     #[cfg(test)]
     busy_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
+    busy_sleep_gate: std::sync::Mutex<Option<BeginBusySleepTestGate>>,
+    #[cfg(test)]
     test_key: std::sync::Mutex<Option<BeginTestKey>>,
+}
+
+#[cfg(test)]
+struct BeginBusySleepTestGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct BusyHandlerRestore {
@@ -5192,16 +5202,31 @@ unsafe extern "C" fn begin_busy_handler(
     {
         entered.notify_one();
     }
-    if cancellation.is_cancelled()
-        || cancellation.busy_deadline.is_none()
-        || cancellation
-            .busy_deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-    {
+    let permits_retry = || {
+        !cancellation.is_cancelled()
+            && cancellation.busy_deadline.is_some()
+            && cancellation
+                .busy_deadline
+                .is_none_or(|deadline| std::time::Instant::now() < deadline)
+    };
+    if !permits_retry() {
         0
     } else {
         std::thread::sleep(std::time::Duration::from_millis(1));
-        1
+        #[cfg(test)]
+        if let Some((entered, release)) = cancellation
+            .busy_sleep_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|gate| (Arc::clone(&gate.entered), Arc::clone(&gate.release)))
+        {
+            entered.notify_one();
+            while !release.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+        i32::from(permits_retry())
     }
 }
 
@@ -5805,6 +5830,8 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
             .unwrap_or(admission_deadline),
         #[cfg(test)]
         busy_entered: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        busy_sleep_gate: std::sync::Mutex::new(None),
         #[cfg(test)]
         test_key: std::sync::Mutex::new(None),
     });
@@ -8137,6 +8164,37 @@ mod deadline_tests {
         (registration, entered)
     }
 
+    fn cancellation_with_busy_sleep_gate(
+        external: Option<Arc<AtomicBool>>,
+        busy_deadline: std::time::Instant,
+    ) -> (
+        Arc<BeginCancellation>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicBool>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(AtomicBool::new(false));
+        (
+            Arc::new(BeginCancellation {
+                local: AtomicBool::new(false),
+                external,
+                deadline: Some(busy_deadline),
+                busy_deadline: Some(busy_deadline),
+                cleanup_cutoff: busy_deadline
+                    .checked_add(std::time::Duration::from_secs(1))
+                    .unwrap_or(busy_deadline),
+                busy_entered: std::sync::Mutex::new(None),
+                busy_sleep_gate: std::sync::Mutex::new(Some(BeginBusySleepTestGate {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                })),
+                test_key: std::sync::Mutex::new(None),
+            }),
+            entered,
+            release,
+        )
+    }
+
     struct BackupTestRegistration {
         database_address: usize,
     }
@@ -8529,6 +8587,49 @@ mod deadline_tests {
             .await
             .expect("expired deadline returns the unmodified pool lease");
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_busy_sleep_stops_the_pending_retry() {
+        let external = Arc::new(AtomicBool::new(false));
+        let (cancellation, entered, release) = cancellation_with_busy_sleep_gate(
+            Some(Arc::clone(&external)),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker = std::thread::spawn(move || {
+            // SAFETY: the worker retains the Arc for the complete callback.
+            unsafe { begin_busy_handler(Arc::as_ptr(&worker_cancellation).cast_mut().cast(), 0) }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("busy handler completes its retry sleep");
+        external.store(true, Ordering::Release);
+        release.store(true, Ordering::Release);
+        assert_eq!(
+            worker.join().expect("busy handler worker joins"),
+            0,
+            "cancellation after sleep must prevent SQLite from retrying BEGIN"
+        );
+    }
+
+    #[test]
+    fn deadline_after_busy_sleep_stops_the_pending_retry() {
+        let busy_deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let (cancellation, _entered, release) =
+            cancellation_with_busy_sleep_gate(None, busy_deadline);
+        let release_after_expiry = Arc::clone(&release);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(busy_deadline.saturating_duration_since(std::time::Instant::now()));
+            release_after_expiry.store(true, Ordering::Release);
+        });
+        // SAFETY: `cancellation` remains alive for the complete callback.
+        let retry = unsafe { begin_busy_handler(Arc::as_ptr(&cancellation).cast_mut().cast(), 0) };
+        releaser.join().expect("busy deadline releaser joins");
+        assert_eq!(
+            retry, 0,
+            "deadline expiry after sleep must prevent an extra SQLite busy retry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8984,6 +9085,7 @@ mod deadline_tests {
             busy_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             cleanup_cutoff: std::time::Instant::now() + std::time::Duration::from_secs(2),
             busy_entered: std::sync::Mutex::new(None),
+            busy_sleep_gate: std::sync::Mutex::new(None),
             test_key: std::sync::Mutex::new(None),
         };
 
