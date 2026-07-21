@@ -1168,14 +1168,12 @@ async fn begin_verified_write_with_deadline(
         cancelled,
         timeout_ms,
     } = timing;
-    let begin_timeout = identity
-        .busy_timeout
-        .min(deadline.saturating_duration_since(std::time::Instant::now()));
     let active =
-        match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadline(
+        match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
             connection,
             deadline,
-            begin_timeout,
+            cleanup_deadline,
+            identity.busy_timeout,
             identity.busy_timeout,
             Some(Arc::clone(&cancelled)),
         )

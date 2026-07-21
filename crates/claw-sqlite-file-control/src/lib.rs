@@ -3837,11 +3837,12 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     let cancellation = Arc::new(BeginCancellation {
                         local: std::sync::atomic::AtomicBool::new(false),
                         external: Some(Arc::clone(&cancelled)),
-                        deadline: Some(deadline),
+                        work_deadline: Some(deadline),
                         busy_deadline: Some(deadline),
-                        cleanup_cutoff: deadline
+                        cleanup_deadline: deadline
                             .checked_add(std::time::Duration::from_secs(1))
                             .unwrap_or(deadline),
+                        stop_cause: AtomicU8::new(BEGIN_STOP_NONE),
                         #[cfg(test)]
                         busy_entered: std::sync::Mutex::new(None),
                         #[cfg(test)]
@@ -5378,15 +5379,16 @@ impl BeginOwnedConnection for sqlx::pool::PoolConnection<sqlx::Sqlite> {
 
 enum BeginWorkerOutput<Connection> {
     Accepted(Connection, ManualTransactionIdentity, usize),
-    Terminal(TerminalCloseOutcome),
+    Terminal(TerminalCloseOutcome, Option<FileControlError>),
 }
 
 struct BeginCancellation {
     local: std::sync::atomic::AtomicBool,
     external: Option<Arc<std::sync::atomic::AtomicBool>>,
-    deadline: Option<std::time::Instant>,
+    work_deadline: Option<std::time::Instant>,
     busy_deadline: Option<std::time::Instant>,
-    cleanup_cutoff: std::time::Instant,
+    cleanup_deadline: std::time::Instant,
+    stop_cause: AtomicU8,
     #[cfg(test)]
     busy_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
@@ -5401,20 +5403,48 @@ struct BeginBusySleepTestGate {
     release: Arc<std::sync::atomic::AtomicBool>,
 }
 
-struct BusyHandlerRestore {
+struct BeginBusyRegistration {
     database: LiveInterruptPointer,
-    timeout_ms: i32,
+    active: bool,
 }
 
-impl Drop for BusyHandlerRestore {
-    fn drop(&mut self) {
-        // SAFETY: the worker still owns SQLx's locked live handle while this
-        // generation-bound restore guard is in scope.
-        unsafe {
-            libsqlite3_sys::sqlite3_busy_timeout(self.database.as_ptr(), self.timeout_ms);
+impl BeginBusyRegistration {
+    fn clear(&mut self) -> Result<(), FileControlError> {
+        if !self.active {
+            return Ok(());
+        }
+        // SAFETY: the worker exclusively owns SQLx's locked live handle.
+        let result = unsafe {
+            libsqlite3_sys::sqlite3_busy_handler(self.database.as_ptr(), None, std::ptr::null_mut())
+        };
+        if result == libsqlite3_sys::SQLITE_OK {
+            self.active = false;
+            Ok(())
+        } else {
+            Err(FileControlError::SQLite(result))
         }
     }
 }
+
+impl Drop for BeginBusyRegistration {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: the registration guard cannot outlive the locked live handle.
+            unsafe {
+                libsqlite3_sys::sqlite3_busy_handler(
+                    self.database.as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+}
+
+const BEGIN_STOP_NONE: u8 = 0;
+const BEGIN_STOP_CANCELLED: u8 = 1;
+const BEGIN_STOP_WORK_DEADLINE: u8 = 2;
+const BEGIN_STOP_BUSY_DEADLINE: u8 = 3;
 
 impl BeginCancellation {
     fn is_cancelled(&self) -> bool {
@@ -5428,12 +5458,42 @@ impl BeginCancellation {
     fn is_expired(&self) -> bool {
         self.is_cancelled()
             || self
-                .deadline
+                .work_deadline
                 .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
-    fn cleanup_cutoff(&self) -> std::time::Instant {
-        self.cleanup_cutoff
+    fn cleanup_deadline(&self) -> std::time::Instant {
+        self.cleanup_deadline
+    }
+
+    fn latch_stop_cause(&self, now: std::time::Instant) -> u8 {
+        let observed = if self.is_cancelled() {
+            BEGIN_STOP_CANCELLED
+        } else if self.work_deadline.is_some_and(|deadline| now >= deadline) {
+            BEGIN_STOP_WORK_DEADLINE
+        // No configured busy deadline is the zero-timeout mode: SQLite gets
+        // exactly one non-waiting attempt and the callback always denies retry.
+        } else if self.busy_deadline.is_none_or(|deadline| now >= deadline) {
+            BEGIN_STOP_BUSY_DEADLINE
+        } else {
+            BEGIN_STOP_NONE
+        };
+        if observed != BEGIN_STOP_NONE {
+            let _ = self.stop_cause.compare_exchange(
+                BEGIN_STOP_NONE,
+                observed,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+        self.stop_cause.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn stopped_by_work_or_cancellation(&self) -> bool {
+        matches!(
+            self.latch_stop_cause(std::time::Instant::now()),
+            BEGIN_STOP_CANCELLED | BEGIN_STOP_WORK_DEADLINE
+        )
     }
 }
 
@@ -5453,13 +5513,8 @@ unsafe extern "C" fn begin_busy_handler(
     {
         entered.notify_one();
     }
-    let permits_retry = || {
-        !cancellation.is_cancelled()
-            && cancellation.busy_deadline.is_some()
-            && cancellation
-                .busy_deadline
-                .is_none_or(|deadline| std::time::Instant::now() < deadline)
-    };
+    let permits_retry =
+        || cancellation.latch_stop_cause(std::time::Instant::now()) == BEGIN_STOP_NONE;
     if !permits_retry() {
         0
     } else {
@@ -5537,6 +5592,10 @@ struct TransactionAuthorizerContext {
 
 #[cfg(test)]
 static FAIL_AUTHORIZER_DETACH_GENERATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static FAIL_BEGIN_BUSY_RESTORE_NONCES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
@@ -5701,7 +5760,7 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
     async fn receive_worker_result(
         &mut self,
     ) -> Result<BeginWorkerOutput<Connection>, FileControlError> {
-        let cutoff = self.cancellation.cleanup_cutoff();
+        let cutoff = self.cancellation.cleanup_deadline();
         loop {
             let received = self
                 .worker_result
@@ -5756,10 +5815,12 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
             BeginWorkerOutput::Accepted(connection, identity, authorizer_address) => {
                 (connection, identity, authorizer_address)
             }
-            BeginWorkerOutput::Terminal(close) => {
-                return Err(FileControlError::Handle(format!(
-                    "BEGIN worker discarded the connection; terminal close: {close:?}"
-                )));
+            BeginWorkerOutput::Terminal(close, primary) => {
+                return Err(primary.unwrap_or_else(|| {
+                    FileControlError::Handle(format!(
+                        "BEGIN worker discarded the connection; terminal close: {close:?}"
+                    ))
+                }));
             }
         };
         let cleanup_owner = self
@@ -5772,11 +5833,12 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
 
     async fn join_failure(mut self) -> Result<(), FileControlError> {
         self.command.take();
-        if let BeginWorkerOutput::Terminal(close) = self.receive_worker_result().await?
+        if let BeginWorkerOutput::Terminal(close, primary) = self.receive_worker_result().await?
             && close != TerminalCloseOutcome::Closed
         {
-            return Err(FileControlError::Handle(format!(
-                "BEGIN terminal cleanup degraded: {close:?}"
+            return Err(FileControlError::Handle(primary.map_or_else(
+                || format!("BEGIN terminal cleanup degraded: {close:?}"),
+                |primary| format!("{primary}; terminal cleanup degraded: {close:?}"),
             )));
         }
         self.shutdown_cleanup_owner()?;
@@ -5812,6 +5874,22 @@ enum LockedBeginOutcome {
     Accepted(ManualTransactionIdentity, usize),
     Failed(FileControlError),
     Cancelled,
+}
+
+fn begin_result_error(result: i32, cancellation: &BeginCancellation) -> FileControlError {
+    let primary = result & 0xff;
+    if matches!(
+        primary,
+        libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT
+    ) {
+        if cancellation.stopped_by_work_or_cancellation() {
+            FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)
+        } else {
+            FileControlError::SQLite(primary)
+        }
+    } else {
+        FileControlError::SQLite(result)
+    }
 }
 
 fn run_locked_begin<Connection: BeginOwnedConnection>(
@@ -5869,9 +5947,9 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
     if busy_result != libsqlite3_sys::SQLITE_OK {
         return LockedBeginOutcome::Failed(FileControlError::SQLite(busy_result));
     }
-    let _busy_restore = BusyHandlerRestore {
+    let mut busy_registration = BeginBusyRegistration {
         database: pointer,
-        timeout_ms: restore_busy_timeout_ms,
+        active: true,
     };
     let _interrupt_registration =
         LiveInterruptRegistration::publish(Arc::clone(database_slot), pointer);
@@ -5913,8 +5991,11 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
             libsqlite3_sys::sqlite3_free(message.cast());
         }
     }
+    if let Err(error) = busy_registration.clear() {
+        return LockedBeginOutcome::Failed(error);
+    }
     if result != libsqlite3_sys::SQLITE_OK {
-        return LockedBeginOutcome::Failed(FileControlError::SQLite(result));
+        return LockedBeginOutcome::Failed(begin_result_error(result, cancellation));
     }
     #[cfg(test)]
     if !wait_at_begin_test_gate(BeginTestStage::AfterBegin, cancellation, command) {
@@ -5941,6 +6022,28 @@ fn run_locked_begin<Connection: BeginOwnedConnection>(
         && accept_gate_open
         && !cancellation.is_expired()
     {
+        // SAFETY: the callback was cleared above and the worker still exclusively
+        // owns the locked live handle. Only a reusable accepted connection is restored.
+        #[cfg(test)]
+        let restore = if FAIL_BEGIN_BUSY_RESTORE_NONCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&connection_nonce)
+        {
+            libsqlite3_sys::SQLITE_ERROR
+        } else {
+            // SAFETY: the callback is cleared and the locked live handle remains owned.
+            unsafe {
+                libsqlite3_sys::sqlite3_busy_timeout(pointer.as_ptr(), restore_busy_timeout_ms)
+            }
+        };
+        #[cfg(not(test))]
+        let restore = unsafe {
+            libsqlite3_sys::sqlite3_busy_timeout(pointer.as_ptr(), restore_busy_timeout_ms)
+        };
+        if restore != libsqlite3_sys::SQLITE_OK {
+            return LockedBeginOutcome::Failed(FileControlError::SQLite(restore));
+        }
         return match install_transaction_authorizer(pointer, identity, state) {
             Ok(authorizer_address) => LockedBeginOutcome::Accepted(identity, authorizer_address),
             Err(error) => LockedBeginOutcome::Failed(error),
@@ -5957,7 +6060,7 @@ struct BeginWorkerExecutors<'worker> {
 
 enum BeginWorkerDecision {
     Accepted(ManualTransactionIdentity, usize),
-    Terminal(TerminalCloseOutcome),
+    Terminal(TerminalCloseOutcome, Option<FileControlError>),
 }
 
 fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
@@ -5998,7 +6101,12 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
                     .take()
                     .expect("panicked BEGIN retains its connection"),
             );
-            return BeginWorkerDecision::Terminal(close);
+            return BeginWorkerDecision::Terminal(
+                close,
+                Some(FileControlError::Handle(
+                    "BEGIN worker panicked after taking connection ownership".to_owned(),
+                )),
+            );
         }
     };
     match begin {
@@ -6006,7 +6114,7 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
             BeginWorkerDecision::Accepted(identity, authorizer_address)
         }
         LockedBeginOutcome::Failed(error) => {
-            let _ = outcome.try_send(Err(error));
+            let _ = outcome.try_send(Err(error.clone()));
             #[cfg(test)]
             wait_at_begin_failure_cleanup_gate(cancellation);
             let permit = executors
@@ -6019,7 +6127,7 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
                     .take()
                     .expect("failed BEGIN retains its connection"),
             );
-            BeginWorkerDecision::Terminal(close)
+            BeginWorkerDecision::Terminal(close, Some(error))
         }
         LockedBeginOutcome::Cancelled => {
             let _ = outcome.try_send(Err(FileControlError::SQLite(
@@ -6035,7 +6143,10 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
                     .take()
                     .expect("cancelled BEGIN retains its connection"),
             );
-            BeginWorkerDecision::Terminal(close)
+            BeginWorkerDecision::Terminal(
+                close,
+                Some(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)),
+            )
         }
     }
 }
@@ -6043,19 +6154,25 @@ fn run_owned_begin_worker<Connection: BeginOwnedConnection>(
 async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     connection: Connection,
     busy_timeout: std::time::Duration,
-    operation_deadline: Option<std::time::Instant>,
+    work_deadline: Option<std::time::Instant>,
+    cleanup_deadline: std::time::Instant,
     allow_expired_first_attempt: bool,
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<Connection>, FileControlError> {
     let now = std::time::Instant::now();
+    if work_deadline.is_some_and(|deadline| cleanup_deadline <= deadline) {
+        return Err(FileControlError::Handle(
+            "BEGIN cleanup deadline must be later than its work deadline".to_owned(),
+        ));
+    }
     let busy_deadline = if busy_timeout.is_zero() {
         None
     } else {
         let relative = now.checked_add(busy_timeout).unwrap_or(now);
-        Some(operation_deadline.map_or(relative, |deadline| deadline.min(relative)))
+        Some(work_deadline.map_or(relative, |deadline| deadline.min(relative)))
     };
-    let admission_deadline = operation_deadline.unwrap_or_else(std::time::Instant::now);
+    let admission_deadline = work_deadline.unwrap_or(now);
     let mut owners = BlockingCleanupOwner::acquire_many_until(
         "claw-sqlite-begin-owner",
         3,
@@ -6074,11 +6191,10 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let cancellation = Arc::new(BeginCancellation {
         local: std::sync::atomic::AtomicBool::new(false),
         external: external_cancellation,
-        deadline: operation_deadline,
+        work_deadline,
         busy_deadline,
-        cleanup_cutoff: admission_deadline
-            .checked_add(std::time::Duration::from_secs(1))
-            .unwrap_or(admission_deadline),
+        cleanup_deadline,
+        stop_cause: AtomicU8::new(BEGIN_STOP_NONE),
         #[cfg(test)]
         busy_entered: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -6119,15 +6235,19 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
                             authorizer_address,
                         )
                     }
-                    BeginWorkerDecision::Terminal(close) => BeginWorkerOutput::Terminal(close),
+                    BeginWorkerDecision::Terminal(close, primary) => {
+                        BeginWorkerOutput::Terminal(close, primary)
+                    }
                 };
                 if let Err(error) = worker_result_tx.send(result) {
                     let permit = terminal_closes
                         .take_permit()
                         .expect("rejected BEGIN delivery close capacity was pre-reserved");
-                    if let BeginWorkerOutput::Accepted(connection, _, authorizer_address) = error.0
-                    {
-                        let _ = permit.submit_with_authorizer(connection, authorizer_address);
+                    match error.0 {
+                        BeginWorkerOutput::Accepted(connection, _, authorizer_address) => {
+                            let _ = permit.submit_with_authorizer(connection, authorizer_address);
+                        }
+                        BeginWorkerOutput::Terminal(_, _) => {}
                     }
                 }
             },
@@ -6145,8 +6265,8 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         match outcome_rx.try_recv() {
             Ok(outcome) => break outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if cancellation.is_cancelled()
-                    || std::time::Instant::now() >= cancellation.cleanup_cutoff()
+                if cancellation.is_expired()
+                    || std::time::Instant::now() >= cancellation.cleanup_deadline()
                 {
                     guard.request_cancellation();
                     if let Err(cleanup) = guard.join_failure().await {
@@ -6173,17 +6293,35 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
                 drop(guard);
                 return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
             }
+            let primary = if cancellation.stopped_by_work_or_cancellation()
+                && matches!(
+                    error.code().map(|code| code & 0xff),
+                    Some(libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT)
+                ) {
+                FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)
+            } else {
+                error
+            };
             if let Err(cleanup) = guard.join_failure().await {
                 return Err(FileControlError::Handle(format!(
-                    "{error}; terminal cleanup failed: {cleanup}"
+                    "{primary}; terminal cleanup failed: {cleanup}"
                 )));
             }
-            return Err(error);
+            return Err(primary);
         }
     };
     if cancellation.is_expired() {
-        drop(guard);
-        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+        let primary = FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT);
+        if cancellation.is_cancelled() {
+            drop(guard);
+            return Err(primary);
+        }
+        if let Err(cleanup) = guard.join_failure().await {
+            return Err(FileControlError::Handle(format!(
+                "{primary}; terminal cleanup failed: {cleanup}"
+            )));
+        }
+        return Err(primary);
     }
     let generation = take_nonzero_generation(
         &NEXT_MANUAL_TRANSACTION_GENERATION,
@@ -6203,7 +6341,7 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         post_commit_owner: Some(post_commit_owner),
     };
     if cancellation.is_expired() {
-        let cleanup_cutoff = tokio::time::Instant::from_std(cancellation.cleanup_cutoff());
+        let cleanup_cutoff = tokio::time::Instant::from_std(cancellation.cleanup_deadline());
         let rollback = tokio::time::timeout_at(cleanup_cutoff, transaction.rollback()).await;
         return Err(match rollback {
             Ok(Ok(_)) => FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT),
@@ -6221,12 +6359,24 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
 
 fn relative_begin_deadline(
     busy_timeout: std::time::Duration,
-) -> (Option<std::time::Instant>, bool) {
+) -> (Option<std::time::Instant>, std::time::Instant, bool) {
+    let now = std::time::Instant::now();
     if busy_timeout.is_zero() {
-        (None, true)
+        (
+            None,
+            now.checked_add(std::time::Duration::from_secs(1))
+                .unwrap_or(now),
+            true,
+        )
     } else {
-        let now = std::time::Instant::now();
-        (Some(now.checked_add(busy_timeout).unwrap_or(now)), false)
+        let work_deadline = now.checked_add(busy_timeout).unwrap_or(now);
+        (
+            Some(work_deadline),
+            work_deadline
+                .checked_add(std::time::Duration::from_secs(1))
+                .unwrap_or(work_deadline),
+            false,
+        )
     }
 }
 
@@ -6236,11 +6386,13 @@ pub async fn begin_manual_transaction(
     busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<sqlx::SqliteConnection>, FileControlError> {
-    let (deadline, allow_expired_first_attempt) = relative_begin_deadline(busy_timeout);
+    let (deadline, cleanup_deadline, allow_expired_first_attempt) =
+        relative_begin_deadline(busy_timeout);
     begin_manual_transaction_inner(
         connection,
         busy_timeout,
         deadline,
+        cleanup_deadline,
         allow_expired_first_attempt,
         busy_timeout,
         external_cancellation,
@@ -6253,11 +6405,13 @@ pub async fn begin_manual_pool_transaction(
     connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
     busy_timeout: std::time::Duration,
 ) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
-    let (deadline, allow_expired_first_attempt) = relative_begin_deadline(busy_timeout);
+    let (deadline, cleanup_deadline, allow_expired_first_attempt) =
+        relative_begin_deadline(busy_timeout);
     begin_manual_transaction_inner(
         connection,
         busy_timeout,
         deadline,
+        cleanup_deadline,
         allow_expired_first_attempt,
         busy_timeout,
         None,
@@ -6272,11 +6426,13 @@ pub async fn begin_manual_pool_transaction_with_restore(
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
-    let (deadline, allow_expired_first_attempt) = relative_begin_deadline(begin_busy_timeout);
+    let (deadline, cleanup_deadline, allow_expired_first_attempt) =
+        relative_begin_deadline(begin_busy_timeout);
     begin_manual_transaction_inner(
         connection,
         begin_busy_timeout,
         deadline,
+        cleanup_deadline,
         allow_expired_first_attempt,
         restore_busy_timeout,
         external_cancellation,
@@ -6292,10 +6448,34 @@ pub async fn begin_manual_pool_transaction_with_restore_deadline(
     restore_busy_timeout: std::time::Duration,
     external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
+    let cleanup_deadline = operation_deadline
+        .checked_add(std::time::Duration::from_secs(1))
+        .unwrap_or(operation_deadline);
+    begin_manual_pool_transaction_with_restore_deadlines(
+        connection,
+        operation_deadline,
+        cleanup_deadline,
+        begin_busy_timeout,
+        restore_busy_timeout,
+        external_cancellation,
+    )
+    .await
+}
+
+/// Starts a pool transaction with immutable absolute work and cleanup deadlines.
+pub async fn begin_manual_pool_transaction_with_restore_deadlines(
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    work_deadline: std::time::Instant,
+    cleanup_deadline: std::time::Instant,
+    begin_busy_timeout: std::time::Duration,
+    restore_busy_timeout: std::time::Duration,
+    external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
     begin_manual_transaction_inner(
         connection,
         begin_busy_timeout,
-        Some(operation_deadline),
+        Some(work_deadline),
+        cleanup_deadline,
         false,
         restore_busy_timeout,
         external_cancellation,
@@ -8786,11 +8966,12 @@ mod deadline_tests {
             Arc::new(BeginCancellation {
                 local: AtomicBool::new(false),
                 external,
-                deadline: Some(busy_deadline),
+                work_deadline: Some(busy_deadline),
                 busy_deadline: Some(busy_deadline),
-                cleanup_cutoff: busy_deadline
+                cleanup_deadline: busy_deadline
                     .checked_add(std::time::Duration::from_secs(1))
                     .unwrap_or(busy_deadline),
+                stop_cause: AtomicU8::new(BEGIN_STOP_NONE),
                 busy_entered: std::sync::Mutex::new(None),
                 busy_sleep_gate: std::sync::Mutex::new(Some(BeginBusySleepTestGate {
                     entered: Arc::clone(&entered),
@@ -9194,6 +9375,136 @@ mod deadline_tests {
             .execute(&pool)
             .await
             .expect("expired deadline returns the unmodified pool lease");
+        pool.close().await;
+    }
+
+    #[test]
+    fn begin_stop_cause_precedence_and_primary_code_mapping_are_deterministic() {
+        fn cancellation(
+            work_deadline: std::time::Instant,
+            busy_deadline: std::time::Instant,
+            external: Option<Arc<AtomicBool>>,
+        ) -> BeginCancellation {
+            BeginCancellation {
+                local: AtomicBool::new(false),
+                external,
+                work_deadline: Some(work_deadline),
+                busy_deadline: Some(busy_deadline),
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                stop_cause: AtomicU8::new(BEGIN_STOP_NONE),
+                busy_entered: std::sync::Mutex::new(None),
+                busy_sleep_gate: std::sync::Mutex::new(None),
+                test_key: std::sync::Mutex::new(None),
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let equal = cancellation(now, now, None);
+        assert_eq!(equal.latch_stop_cause(now), BEGIN_STOP_WORK_DEADLINE);
+        assert_eq!(
+            begin_result_error(libsqlite3_sys::SQLITE_BUSY | (2 << 8), &equal),
+            FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT)
+        );
+
+        let configured_first = cancellation(now + std::time::Duration::from_secs(1), now, None);
+        assert_eq!(
+            configured_first.latch_stop_cause(now),
+            BEGIN_STOP_BUSY_DEADLINE
+        );
+        assert_eq!(
+            begin_result_error(libsqlite3_sys::SQLITE_BUSY | (3 << 8), &configured_first,),
+            FileControlError::SQLite(libsqlite3_sys::SQLITE_BUSY)
+        );
+
+        let external = Arc::new(AtomicBool::new(true));
+        let cancelled = cancellation(
+            now + std::time::Duration::from_secs(1),
+            now + std::time::Duration::from_secs(1),
+            Some(external),
+        );
+        assert_eq!(cancelled.latch_stop_cause(now), BEGIN_STOP_CANCELLED);
+        assert_eq!(
+            begin_result_error(libsqlite3_sys::SQLITE_IOERR | (7 << 8), &cancelled),
+            FileControlError::SQLite(libsqlite3_sys::SQLITE_IOERR | (7 << 8))
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_busy_restore_failure_discards_the_connection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open restore-failure pool");
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("acquire restore-failure connection");
+        let nonce = {
+            let mut handle = connection
+                .lock_handle()
+                .await
+                .expect("lock restore-failure handle");
+            connection_lifetime_nonce(LiveInterruptPointer(handle.as_raw_handle()))
+                .expect("read restore-failure nonce")
+        };
+        assert!(
+            FAIL_BEGIN_BUSY_RESTORE_NONCES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(nonce)
+        );
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = begin_manual_pool_transaction_with_restore_deadlines(
+            connection,
+            work_deadline,
+            work_deadline + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(500),
+            None,
+        )
+        .await
+        .expect_err("restore failure discards an otherwise successful BEGIN");
+        assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_ERROR));
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("discarded restore-failure connection releases pool capacity")
+            .expect("replacement restore-failure connection opens");
+        drop(replacement);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn equal_absolute_begin_deadlines_are_rejected_before_dispatch() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open equal-deadline pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire equal-deadline connection");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = begin_manual_pool_transaction_with_restore_deadlines(
+            connection,
+            deadline,
+            deadline,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(500),
+            None,
+        )
+        .await
+        .expect_err("equal work and cleanup deadlines are ambiguous");
+        assert!(
+            error.to_string().contains("cleanup deadline must be later"),
+            "deadline ordering error is explicit: {error}"
+        );
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("pre-dispatch rejection releases pool capacity")
+            .expect("equal-deadline lease remains reusable");
+        drop(replacement);
         pool.close().await;
     }
 
@@ -9937,6 +10248,7 @@ mod deadline_tests {
             connection,
             std::time::Duration::from_millis(500),
             Some(std::time::Instant::now() + std::time::Duration::from_millis(500)),
+            std::time::Instant::now() + std::time::Duration::from_millis(1_500),
             false,
             std::time::Duration::from_millis(500),
             None,
@@ -10039,9 +10351,10 @@ mod deadline_tests {
         let cancellation = BeginCancellation {
             local: AtomicBool::new(true),
             external: None,
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            work_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             busy_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
-            cleanup_cutoff: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            cleanup_deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            stop_cause: AtomicU8::new(BEGIN_STOP_NONE),
             busy_entered: std::sync::Mutex::new(None),
             busy_sleep_gate: std::sync::Mutex::new(None),
             test_key: std::sync::Mutex::new(None),
@@ -11834,6 +12147,7 @@ mod deadline_tests {
             },
             std::time::Duration::from_secs(1),
             Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
             false,
             std::time::Duration::from_secs(1),
             None,
@@ -11944,6 +12258,7 @@ mod deadline_tests {
                 },
                 std::time::Duration::from_secs(1),
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
                 false,
                 std::time::Duration::from_secs(1),
                 None,

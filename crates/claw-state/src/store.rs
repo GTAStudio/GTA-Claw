@@ -1499,20 +1499,14 @@ fn handoff_undelivered_store(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let deadline = payload.deadline;
-            let cleanup = runtime.block_on(async {
-                tokio::time::timeout_at(
-                    deadline,
-                    close_undelivered_writer_claim(
-                        payload
-                            .store
-                            .as_mut()
-                            .expect("undelivered store remains owned"),
-                        deadline,
-                    ),
-                )
-                .await
-            });
-            if matches!(cleanup, Ok(Ok(()))) {
+            let cleanup = runtime.block_on(close_undelivered_writer_claim(
+                payload
+                    .store
+                    .as_mut()
+                    .expect("undelivered store remains owned"),
+                deadline,
+            ));
+            if cleanup.is_ok() {
                 let store = payload
                     .store
                     .take()
@@ -1548,15 +1542,22 @@ async fn close_undelivered_writer_claim(
 ) -> Result<(), StateError> {
     #[cfg(test)]
     wait_at_open_cleanup_test_barrier(store.path()).await;
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let cleanup_deadline = deadline.into_std();
+    let work_deadline = cleanup_deadline
+        .checked_sub(Duration::from_millis(10))
+        .unwrap_or(cleanup_deadline);
+    let remaining = work_deadline.saturating_duration_since(std::time::Instant::now());
     let timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-    let connection = tokio::time::timeout_at(deadline, store.pool().acquire())
-        .await
-        .map_err(|_| StateError::OperationTimedOut {
-            operation: "acquire undelivered claim cleanup connection",
-            timeout_ms,
-        })?
-        .map_err(|error| database("acquire undelivered claim cleanup connection", error))?;
+    let connection = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(work_deadline),
+        store.pool().acquire(),
+    )
+    .await
+    .map_err(|_| StateError::OperationTimedOut {
+        operation: "acquire undelivered claim cleanup connection",
+        timeout_ms,
+    })?
+    .map_err(|error| database("acquire undelivered claim cleanup connection", error))?;
     let mut connection = connection;
     {
         let mut handle = connection
@@ -1565,15 +1566,18 @@ async fn close_undelivered_writer_claim(
             .map_err(|error| database("clear undelivered cleanup progress handler", error))?;
         handle.set_progress_handler(0, || true);
     }
-    claw_sqlite_file_control::set_busy_timeout(&mut connection, remaining)
-        .await
-        .map_err(|error| {
-            file_control_database("bound undelivered claim cleanup busy timeout", error)
-        })?;
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut transaction =
-        claw_sqlite_file_control::begin_manual_pool_transaction(connection, remaining)
-            .await
-            .map_err(|error| file_control_database("begin undelivered claim cleanup", error))?;
+        claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
+            connection,
+            work_deadline,
+            cleanup_deadline,
+            store.busy_timeout,
+            store.busy_timeout,
+            Some(Arc::clone(&cancelled)),
+        )
+        .await
+        .map_err(|error| file_control_database("begin undelivered claim cleanup", error))?;
     let released = sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
         .bind(&store.owner)
         .execute(&mut transaction)
@@ -1605,8 +1609,14 @@ async fn close_undelivered_writer_claim(
             }),
         };
     }
-    let mut connection = transaction
-        .commit()
+    let (mut connection, post_commit_owner) = transaction
+        .commit_with_deadline(
+            work_deadline,
+            cleanup_deadline,
+            cancelled,
+            store.busy_timeout,
+            None,
+        )
         .await
         .map_err(|error| file_control_database("commit undelivered claim cleanup", error))?;
     let remaining_claims = sqlx::query_scalar::<_, i64>(
@@ -1625,6 +1635,12 @@ async fn close_undelivered_writer_claim(
         .close()
         .await
         .map_err(|error| database("close undelivered claim cleanup connection", error))?;
+    post_commit_owner.shutdown().map_err(|error| {
+        database(
+            "release undelivered claim post-COMMIT owner",
+            sqlx::Error::Protocol(error),
+        )
+    })?;
     Ok(())
 }
 
@@ -2337,7 +2353,7 @@ impl StateStore {
         }
 
         let initial = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline_state.deadline),
+            tokio::time::Instant::from_std(deadline_state.work_cutoff),
             pool.acquire(),
         )
         .await
@@ -2352,16 +2368,14 @@ impl StateStore {
                 return Err(close_pool_after_open_failure(&pool, &deadline_state, primary).await);
             }
         };
-        let initial_busy_timeout = configured_busy_timeout.min(
-            deadline_state
-                .deadline
-                .saturating_duration_since(std::time::Instant::now()),
-        );
+        let initial_busy_timeout = configured_busy_timeout;
         let mut initial =
-            match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore(
+            match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
                 initial,
+                deadline_state.work_cutoff,
+                deadline_state.deadline,
                 initial_busy_timeout,
-                initial_busy_timeout,
+                configured_busy_timeout,
                 Some(Arc::clone(&deadline_state.cancelled)),
             )
             .await
@@ -2429,7 +2443,7 @@ impl StateStore {
 
         let configured = async {
             let mut configured_connection = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline_state.deadline),
+                tokio::time::Instant::from_std(deadline_state.work_cutoff),
                 pool.acquire(),
             )
             .await
@@ -6106,6 +6120,53 @@ fn reserve_snapshot_quarantine(
     })
 }
 
+#[cfg(test)]
+mod open_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bootstrap_pool_acquire_uses_the_immutable_work_cutoff() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open bootstrap acquire pool");
+        let held = pool.acquire().await.expect("hold bootstrap pool capacity");
+        let work_cutoff = std::time::Instant::now() + Duration::from_millis(50);
+        let deadline_state = Arc::new(OpenDeadlineState {
+            work_cutoff,
+            deadline: work_cutoff + Duration::from_millis(500),
+            timeout_ms: 50,
+            operation: "state store open",
+            busy_timeout: Duration::from_secs(1),
+            expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            final_commit_state: std::sync::atomic::AtomicU8::new(0),
+            open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
+        });
+        let started = std::time::Instant::now();
+        let error = initialize_fresh_database(
+            &pool,
+            Path::new("bootstrap-acquire.sqlite"),
+            "bootstrap-acquire-owner",
+            deadline_state,
+        )
+        .await
+        .expect_err("held pool capacity consumes the bootstrap work cutoff");
+        assert!(matches!(
+            error,
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 50,
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(held);
+        pool.close().await;
+    }
+}
+
 #[cfg(all(test, unix))]
 mod snapshot_quarantine_tests {
     use super::*;
@@ -9770,6 +9831,7 @@ async fn reject_late_open_claim(
         terminal_permit: Option<claw_sqlite_file_control::TerminalClosePermit>,
         owner: String,
         deadline: std::time::Instant,
+        busy_timeout: Duration,
         result: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     }
 
@@ -9783,6 +9845,7 @@ async fn reject_late_open_claim(
             terminal_permit: Some(terminal_permit),
             owner: owner.to_owned(),
             deadline: deadline_state.deadline,
+            busy_timeout: deadline_state.busy_timeout,
             result: Some(result_tx),
         }),
         |runtime, _, payload| {
@@ -9790,82 +9853,141 @@ async fn reject_late_open_claim(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let cleanup_deadline = payload.deadline;
-            let deadline = tokio::time::Instant::from_std(cleanup_deadline);
-            let cleanup = runtime.block_on(async {
-                tokio::time::timeout_at(deadline, async {
-                    let owner = payload.owner.clone();
-                    let connection = payload
-                        .connection
-                        .as_mut()
-                        .expect("late-claim connection remains owned");
-                    {
-                        let mut handle = connection
-                            .lock_handle()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        handle.set_progress_handler(0, || true);
-                    }
-                    let remaining =
-                        cleanup_deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err("late writer-claim cleanup cutoff elapsed".to_owned());
-                    }
-                    claw_sqlite_file_control::set_busy_timeout(connection, remaining)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    if std::time::Instant::now() >= cleanup_deadline {
-                        return Err(
-                            "late writer-claim cutoff elapsed after busy-timeout setup".to_owned()
-                        );
-                    }
-                    sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
-                        .bind(&owner)
-                        .execute(&mut **connection)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let claims = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM claw_writer_lock
-                     WHERE singleton = 1 AND owner = ?",
-                    )
-                    .bind(&owner)
-                    .fetch_one(&mut **connection)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    if claims != 0 {
-                        return Err("late writer claim cleanup was not verified".to_owned());
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(|_| "late writer-claim cleanup timed out".to_owned())?
-            });
+            let work_deadline = cleanup_deadline
+                .checked_sub(Duration::from_millis(10))
+                .unwrap_or(cleanup_deadline);
+            let owner = payload.owner.clone();
+            let busy_timeout = payload.busy_timeout;
             let connection = payload
                 .connection
                 .take()
-                .expect("late-claim close is single-use");
-            let close = match payload
-                .terminal_permit
-                .take()
-                .expect("late-claim terminal permit remains owned")
-                .close(connection)
-            {
-                claw_sqlite_file_control::TerminalCloseOutcome::Closed => Ok(()),
-                outcome => Err(format!("terminal close did not complete: {outcome:?}")),
-            };
-            let outcome = match (cleanup, close) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(cleanup), Ok(())) => Err(cleanup),
-                (Ok(()), Err(close)) => Err(close),
-                (Err(cleanup), Err(close)) => Err(format!("{cleanup}; {close}")),
-            };
-            if outcome.is_ok() {
-                if let Some(result) = payload.result.take() {
-                    let _ = result.send(Ok(()));
+                .expect("late-claim connection remains owned");
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (connection, post_commit_owner, cleanup) = runtime.block_on(async {
+                let mut transaction =
+                    match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
+                        connection,
+                        work_deadline,
+                        cleanup_deadline,
+                        busy_timeout,
+                        busy_timeout,
+                        Some(Arc::clone(&cancelled)),
+                    )
+                    .await
+                    {
+                        Ok(transaction) => transaction,
+                        Err(error) => return (None, None, Err(error.to_string())),
+                    };
+                let deletion =
+                    sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
+                        .bind(&owner)
+                        .execute(&mut transaction)
+                        .await;
+                let deletion = match deletion {
+                    Ok(deletion) if deletion.rows_affected() == 1 => deletion,
+                    Ok(_) => {
+                        let error =
+                            "late writer claim cleanup did not own the committed row".to_owned();
+                        return match transaction.rollback().await {
+                            Ok(connection) => (Some(connection), None, Err(error)),
+                            Err(cleanup) => (
+                                None,
+                                None,
+                                Err(format!("{error}; rollback failed: {cleanup}")),
+                            ),
+                        };
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        return match transaction.rollback().await {
+                            Ok(connection) => (Some(connection), None, Err(error)),
+                            Err(cleanup) => (
+                                None,
+                                None,
+                                Err(format!("{error}; rollback failed: {cleanup}")),
+                            ),
+                        };
+                    }
+                };
+                let _ = deletion;
+                let claims = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM claw_writer_lock WHERE singleton = 1 AND owner = ?",
+                )
+                .bind(&owner)
+                .fetch_one(&mut transaction)
+                .await;
+                match claims {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        let error = "late writer claim cleanup was not verified".to_owned();
+                        return match transaction.rollback().await {
+                            Ok(connection) => (Some(connection), None, Err(error)),
+                            Err(cleanup) => (
+                                None,
+                                None,
+                                Err(format!("{error}; rollback failed: {cleanup}")),
+                            ),
+                        };
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        return match transaction.rollback().await {
+                            Ok(connection) => (Some(connection), None, Err(error)),
+                            Err(cleanup) => (
+                                None,
+                                None,
+                                Err(format!("{error}; rollback failed: {cleanup}")),
+                            ),
+                        };
+                    }
                 }
-                true
+                match transaction
+                    .commit_with_deadline(
+                        work_deadline,
+                        cleanup_deadline,
+                        cancelled,
+                        busy_timeout,
+                        None,
+                    )
+                    .await
+                {
+                    Ok((connection, post_commit_owner)) => {
+                        (Some(connection), Some(post_commit_owner), Ok(()))
+                    }
+                    Err(error) => (None, None, Err(error.to_string())),
+                }
+            });
+            let close = if let Some(connection) = connection {
+                match payload
+                    .terminal_permit
+                    .take()
+                    .expect("late-claim terminal permit remains owned")
+                    .close(connection)
+                {
+                    claw_sqlite_file_control::TerminalCloseOutcome::Closed => Ok(()),
+                    outcome => Err(format!("terminal close did not complete: {outcome:?}")),
+                }
             } else {
-                false
+                payload.terminal_permit.take();
+                Ok(())
+            };
+            let owner_shutdown = post_commit_owner.map_or(Ok(()), |owner| owner.shutdown());
+            let outcome = match (cleanup, close, owner_shutdown) {
+                (Ok(()), Ok(()), Ok(())) => Ok(()),
+                (Err(cleanup), Ok(()), Ok(())) => Err(cleanup),
+                (Ok(()), Err(close), Ok(())) => Err(close),
+                (Ok(()), Ok(()), Err(owner)) => Err(owner),
+                (Err(cleanup), Err(close), Ok(())) => Err(format!("{cleanup}; {close}")),
+                (Err(cleanup), Ok(()), Err(owner)) => Err(format!("{cleanup}; {owner}")),
+                (Ok(()), Err(close), Err(owner)) => Err(format!("{close}; {owner}")),
+                (Err(cleanup), Err(close), Err(owner)) => {
+                    Err(format!("{cleanup}; {close}; {owner}"))
+                }
+            };
+            if let Some(result) = payload.result.take() {
+                let _ = result.send(outcome.clone());
             }
+            true
         },
     );
     if let Err(error) = handoff {
@@ -9896,30 +10018,30 @@ async fn initialize_fresh_database(
 ) -> Result<Option<RecoveredWriterLock>, StateError> {
     #[cfg(not(test))]
     let _ = path;
-    let pooled = pool
-        .acquire()
-        .await
-        .map_err(|error| database("acquire state database bootstrap connection", error))?;
-    let begin_busy_timeout = deadline_state.busy_timeout.min(
-        deadline_state
-            .deadline
-            .saturating_duration_since(std::time::Instant::now()),
-    );
-    let begin_is_deadline_limited = begin_busy_timeout < deadline_state.busy_timeout;
-    let mut connection = claw_sqlite_file_control::begin_manual_pool_transaction_with_restore(
-        pooled,
-        begin_busy_timeout,
-        deadline_state.busy_timeout,
-        Some(Arc::clone(&deadline_state.cancelled)),
+    let pooled = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline_state.work_cutoff),
+        pool.acquire(),
     )
     .await
-    .map_err(|error| {
-        if begin_is_deadline_limited && error.code() == Some(5) {
-            deadline_state.timeout_error()
-        } else {
-            file_control_database("begin state database bootstrap", error)
-        }
-    })?;
+    .map_err(|_| deadline_state.timeout_error())?
+    .map_err(|error| database("acquire state database bootstrap connection", error))?;
+    let mut connection =
+        claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
+            pooled,
+            deadline_state.work_cutoff,
+            deadline_state.deadline,
+            deadline_state.busy_timeout,
+            deadline_state.busy_timeout,
+            Some(Arc::clone(&deadline_state.cancelled)),
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == Some(9) || std::time::Instant::now() >= deadline_state.work_cutoff {
+                deadline_state.timeout_error()
+            } else {
+                file_control_database("begin state database bootstrap", error)
+            }
+        })?;
     #[cfg(test)]
     wait_at_migration_test_barrier(path, &deadline_state).await;
     let application_id = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
@@ -10419,10 +10541,13 @@ async fn apply_migrations(
     owner: &str,
     deadline_state: Arc<OpenDeadlineState>,
 ) -> Result<Option<RecoveredWriterLock>, StateError> {
-    let mut preliminary = pool
-        .acquire()
-        .await
-        .map_err(|error| database("acquire migration inspection connection", error))?;
+    let mut preliminary = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline_state.work_cutoff),
+        pool.acquire(),
+    )
+    .await
+    .map_err(|_| deadline_state.timeout_error())?
+    .map_err(|error| database("acquire migration inspection connection", error))?;
     let preliminary_version =
         validate_migration_history_connection(&mut *preliminary, false).await?;
     drop(preliminary);
@@ -10433,30 +10558,30 @@ async fn apply_migrations(
         }
     }
 
-    let pooled = pool
-        .acquire()
-        .await
-        .map_err(|error| database("acquire transactional migration connection", error))?;
-    let begin_busy_timeout = deadline_state.busy_timeout.min(
-        deadline_state
-            .deadline
-            .saturating_duration_since(std::time::Instant::now()),
-    );
-    let begin_is_deadline_limited = begin_busy_timeout < deadline_state.busy_timeout;
-    let mut connection = claw_sqlite_file_control::begin_manual_pool_transaction_with_restore(
-        pooled,
-        begin_busy_timeout,
-        deadline_state.busy_timeout,
-        Some(Arc::clone(&deadline_state.cancelled)),
+    let pooled = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline_state.work_cutoff),
+        pool.acquire(),
     )
     .await
-    .map_err(|error| {
-        if begin_is_deadline_limited && error.code() == Some(5) {
-            deadline_state.timeout_error()
-        } else {
-            file_control_database("begin immediate schema migration", error)
-        }
-    })?;
+    .map_err(|_| deadline_state.timeout_error())?
+    .map_err(|error| database("acquire transactional migration connection", error))?;
+    let mut connection =
+        claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
+            pooled,
+            deadline_state.work_cutoff,
+            deadline_state.deadline,
+            deadline_state.busy_timeout,
+            deadline_state.busy_timeout,
+            Some(Arc::clone(&deadline_state.cancelled)),
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == Some(9) || std::time::Instant::now() >= deadline_state.work_cutoff {
+                deadline_state.timeout_error()
+            } else {
+                file_control_database("begin immediate schema migration", error)
+            }
+        })?;
     #[cfg(test)]
     wait_at_migration_test_barrier(path, &deadline_state).await;
     let migration_result = async {
