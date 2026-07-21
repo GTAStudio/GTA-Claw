@@ -3991,7 +3991,6 @@ mod tests {
             .expect("stat Windows cleanup victim")
             .len();
 
-        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
         test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, false, false)
             .await;
 
@@ -4015,7 +4014,6 @@ mod tests {
                 .len(),
             victim_size
         );
-        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
         drop(substituted);
         drop(victim_file);
         fs::remove_file(&staging).expect("remove test-created victim alias");
@@ -4041,7 +4039,6 @@ mod tests {
             fs::write(&victim, b"retained cleanup victim").expect("write retained cleanup victim");
             test_support::secure_windows_file_fixture(&victim);
 
-            assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
             test_support::cleanup_renamed_windows_snapshot(
                 &staging, &alternate, &victim, true, false,
             )
@@ -4051,7 +4048,6 @@ mod tests {
                 fs::read(&staging).expect("read retained cleanup victim alias"),
                 b"retained cleanup victim"
             );
-            assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
             fs::remove_file(&staging).expect("remove retained cleanup victim alias");
         }
     }
@@ -4066,7 +4062,6 @@ mod tests {
         fs::write(&victim, b"retained fairness victim").expect("write retained fairness victim");
         test_support::secure_windows_file_fixture(&victim);
 
-        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
         test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, true, true)
             .await;
         assert!(!alternate.exists());
@@ -4074,7 +4069,6 @@ mod tests {
             fs::read(&staging).expect("read retained fairness victim alias"),
             b"retained fairness victim"
         );
-        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
         fs::remove_file(&staging).expect("remove retained fairness victim alias");
     }
 

@@ -6,7 +6,7 @@ use std::fmt::{self, Display, Formatter};
 use std::ptr::NonNull;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// Typed reason recorded by the installed identity commit hook for one COMMIT attempt.
@@ -459,11 +459,24 @@ enum TerminalJobDisposition {
 type TerminalCloseJob =
     Box<dyn FnOnce(&tokio::runtime::Runtime) -> TerminalJobDisposition + Send + 'static>;
 
-struct TerminalCloseReservation;
+struct TerminalCloseReservation {
+    completion_signal: Option<(Arc<AtomicU8>, u8)>,
+}
+
+impl TerminalCloseReservation {
+    fn new() -> Self {
+        Self {
+            completion_signal: None,
+        }
+    }
+}
 
 impl Drop for TerminalCloseReservation {
     fn drop(&mut self) {
         ACTIVE_TERMINAL_CLOSE_JOBS.fetch_sub(1, Ordering::AcqRel);
+        if let Some((signal, completed_state)) = self.completion_signal.take() {
+            signal.store(completed_state, Ordering::Release);
+        }
     }
 }
 
@@ -1078,15 +1091,35 @@ impl ExternalCleanupPermit {
     }
 
     /// Transfers callback capture destruction to the terminal executor.
-    pub fn retire(mut self, retention: Box<dyn Send>) -> Result<(), String> {
+    pub fn retire(self, retention: Box<dyn Send>) -> Result<(), String> {
+        self.retire_inner(retention, None)
+    }
+
+    /// Transfers capture destruction and signals after all reserved cleanup capacity is released.
+    #[doc(hidden)]
+    pub fn retire_with_completion_signal(
+        self,
+        retention: Box<dyn Send>,
+        signal: Arc<AtomicU8>,
+        completed_state: u8,
+    ) -> Result<(), String> {
+        self.retire_inner(retention, Some((signal, completed_state)))
+    }
+
+    fn retire_inner(
+        mut self,
+        retention: Box<dyn Send>,
+        completion_signal: Option<(Arc<AtomicU8>, u8)>,
+    ) -> Result<(), String> {
         let reservation = self
             .reservation
             .take()
             .expect("external cleanup reservation remains owned");
-        let retirement_reservation = self
+        let mut retirement_reservation = self
             .retirement_reservation
             .take()
             .expect("external cleanup retirement capacity remains owned");
+        retirement_reservation.completion_signal = completion_signal;
         self.terminal_closes.take();
         let envelope = TerminalCloseEnvelope {
             job: DropSlot::new(Box::new(|_| TerminalJobDisposition::Completed)),
@@ -1240,10 +1273,10 @@ impl BlockingCleanupOwner {
                     reservation: Some(CleanupReservation),
                     terminal_closes: Some(TerminalCloseBatch {
                         reservations: (0..TERMINAL_CLOSE_SLOTS_PER_OWNER)
-                            .map(|_| TerminalCloseReservation)
+                            .map(|_| TerminalCloseReservation::new())
                             .collect(),
                     }),
-                    retirement_reservation: Some(TerminalCloseReservation),
+                    retirement_reservation: Some(TerminalCloseReservation::new()),
                 });
             }
             return Ok(owners);
@@ -1279,10 +1312,10 @@ impl BlockingCleanupOwner {
             reservation: Some(CleanupReservation),
             terminal_closes: Some(TerminalCloseBatch {
                 reservations: (0..TERMINAL_CLOSE_SLOTS_PER_OWNER)
-                    .map(|_| TerminalCloseReservation)
+                    .map(|_| TerminalCloseReservation::new())
                     .collect(),
             }),
-            retirement_reservation: Some(TerminalCloseReservation),
+            retirement_reservation: Some(TerminalCloseReservation::new()),
         })
     }
 
@@ -11500,7 +11533,7 @@ mod deadline_tests {
                     &callback_drops,
                 ))))),
                 reservation: DropSlot::new(CleanupReservation),
-                retirement_reservation: DropSlot::new(TerminalCloseReservation),
+                retirement_reservation: DropSlot::new(TerminalCloseReservation::new()),
             };
             assert!(try_send_cleanup_envelope(&sender, envelope, &healthy).is_err());
             assert!(!healthy.load(Ordering::Acquire));
@@ -11540,7 +11573,7 @@ mod deadline_tests {
                 ))))),
                 callback_retention: None,
                 cleanup_reservation: DropSlot::empty(),
-                reservation: DropSlot::new(TerminalCloseReservation),
+                reservation: DropSlot::new(TerminalCloseReservation::new()),
             };
             assert!(try_send_terminal_envelope(&sender, envelope, &healthy).is_err());
             assert!(!healthy.load(Ordering::Acquire));
@@ -11580,7 +11613,7 @@ mod deadline_tests {
                 panic_retention: None,
                 callback_retention: None,
                 reservation: DropSlot::new(CleanupReservation),
-                retirement_reservation: DropSlot::new(TerminalCloseReservation),
+                retirement_reservation: DropSlot::new(TerminalCloseReservation::new()),
             })
             .expect("queue ownership test accepts one job");
         drop(receiver);
@@ -11616,7 +11649,7 @@ mod deadline_tests {
                 ))))),
                 callback_retention: None,
                 cleanup_reservation: DropSlot::empty(),
-                reservation: DropSlot::new(TerminalCloseReservation),
+                reservation: DropSlot::new(TerminalCloseReservation::new()),
             })
             .expect("terminal queue ownership test accepts one job");
         drop(receiver);

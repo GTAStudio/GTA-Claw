@@ -78,7 +78,7 @@ type StateCleanupJob = Box<
 >;
 
 #[cfg(test)]
-type StateCleanupRetentionSignal = Option<Arc<std::sync::atomic::AtomicBool>>;
+type StateCleanupRetentionSignal = Option<Arc<std::sync::atomic::AtomicU8>>;
 #[cfg(not(test))]
 type StateCleanupRetentionSignal = ();
 
@@ -223,7 +223,7 @@ fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
         });
         #[cfg(test)]
         if let Some(signal) = retained_signal {
-            signal.store(true, std::sync::atomic::Ordering::Release);
+            signal.store(1, std::sync::atomic::Ordering::Release);
         }
     } else {
         std::mem::forget(envelope);
@@ -266,6 +266,8 @@ fn run_state_cleanup_envelope(
     }));
     match result {
         Ok(true) => {
+            #[cfg(test)]
+            let completion_signal = envelope.retained_signal.clone();
             let job = envelope
                 .job
                 .take()
@@ -274,6 +276,13 @@ fn run_state_cleanup_envelope(
                 .permit
                 .take()
                 .expect("completed state cleanup permit remains owned");
+            #[cfg(test)]
+            let _ = if let Some(signal) = completion_signal {
+                permit.retire_with_completion_signal(Box::new(job), signal, 2)
+            } else {
+                permit.retire(Box::new(job))
+            };
+            #[cfg(not(test))]
             let _ = permit.retire(Box::new(job));
         }
         Ok(false) => retain_state_cleanup(envelope),
@@ -5171,7 +5180,7 @@ struct SnapshotCleanupGuard {
     shared_retention: Option<SharedSnapshotRetention>,
     cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
     #[cfg(test)]
-    retained_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    retained_signal: Option<Arc<std::sync::atomic::AtomicU8>>,
     #[cfg(unix)]
     quarantine_name: Option<String>,
     #[cfg(unix)]
@@ -5191,7 +5200,7 @@ struct SnapshotCleanupPayload {
     operation_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     shared_retention: Option<SharedSnapshotRetention>,
     #[cfg(test)]
-    retained_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
+    retained_signal: Option<Arc<std::sync::atomic::AtomicU8>>,
     #[cfg(unix)]
     quarantine_name: Option<String>,
     #[cfg(unix)]
@@ -13954,7 +13963,7 @@ pub(crate) mod test_support {
         let alternate =
             super::resolve_database_path(alternate).expect("resolve Windows alternate fixture");
         let victim = super::resolve_database_path(victim).expect("resolve Windows victim fixture");
-        let retained_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained_signal = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
         let parent =
             super::pin_private_directory(&staging).expect("pin Windows staging fixture parent");
         let cleanup_owner =
@@ -13994,7 +14003,7 @@ pub(crate) mod test_support {
                 "a failed handle deletion must not report successful cleanup"
             );
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !retained_signal.load(std::sync::atomic::Ordering::Acquire) {
+                while retained_signal.load(std::sync::atomic::Ordering::Acquire) < 1 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -14008,6 +14017,28 @@ pub(crate) mod test_support {
                 "bound staging contents are scrubbed before deletion can be blocked"
             );
             let pressure = if normal_queue_pressure {
+                let unrelated_release =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let unrelated_signal = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+                let unrelated_owner = claw_sqlite_file_control::BlockingCleanupOwner::acquire(
+                    "windows-unrelated-retained-test",
+                )
+                .await
+                .expect("reserve unrelated retained cleanup owner");
+                super::handoff_state_payload_decide_with_signal(
+                    unrelated_owner,
+                    std::sync::Arc::clone(&unrelated_release),
+                    Some(std::sync::Arc::clone(&unrelated_signal)),
+                    |_, _, release| release.load(std::sync::atomic::Ordering::Acquire),
+                )
+                .expect("submit unrelated retained cleanup");
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while unrelated_signal.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("unrelated cleanup reaches its exact retained slot");
                 let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -14037,29 +14068,46 @@ pub(crate) mod test_support {
                 })
                 .await
                 .expect("normal cleanup pressure fills executor capacity");
-                Some((producer, stop, accepted, completed))
+                Some((
+                    producer,
+                    stop,
+                    accepted,
+                    completed,
+                    unrelated_release,
+                    unrelated_signal,
+                ))
             } else {
                 None
             };
             drop(blocker);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while alternate.exists()
-                    || super::STATE_CLEANUP_QUARANTINE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .slots
-                        .iter()
-                        .any(Option::is_some)
-                {
+                while retained_signal.load(std::sync::atomic::Ordering::Acquire) != 2 {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("retained Windows cleanup retries after delete access is restored");
-            if let Some((producer, stop, accepted, completed)) = pressure {
+            .expect("exact retained Windows cleanup releases its slot and capacity");
+            assert!(
+                !alternate.exists(),
+                "exact retained Windows staging is deleted before completion"
+            );
+            if let Some((
+                producer,
+                stop,
+                accepted,
+                completed,
+                unrelated_release,
+                unrelated_signal,
+            )) = pressure
+            {
                 assert!(
                     !producer.is_finished(),
                     "normal cleanup producer remains actively submitting at retained completion"
+                );
+                assert_eq!(
+                    unrelated_signal.load(std::sync::atomic::Ordering::Acquire),
+                    1,
+                    "unrelated cleanup remains retained through exact target completion"
                 );
                 stop.store(true, std::sync::atomic::Ordering::Release);
                 tokio::time::timeout(std::time::Duration::from_secs(5), producer)
@@ -14078,6 +14126,14 @@ pub(crate) mod test_support {
                     completed.load(std::sync::atomic::Ordering::Acquire),
                     accepted
                 );
+                unrelated_release.store(true, std::sync::atomic::Ordering::Release);
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while unrelated_signal.load(std::sync::atomic::Ordering::Acquire) != 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("unrelated retained cleanup releases its slot and capacity");
             }
         } else {
             result.expect("cleanup exact renamed Windows staging");
