@@ -4892,6 +4892,27 @@ mod tests {
 
     #[tokio::test]
     async fn health_progress_timeout_keeps_the_runtime_responsive() {
+        const CHILD_ENV: &str = "GTA_CLAW_HEALTH_PROGRESS_TIMEOUT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let status =
+                Command::new(std::env::current_exe().expect("current state test executable"))
+                    .arg("--exact")
+                    .arg("tests::health_progress_timeout_keeps_the_runtime_responsive")
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(CHILD_ENV, "1")
+                    .status()
+                    .expect("run isolated health progress timeout test");
+            assert!(
+                status.success(),
+                "isolated health progress timeout test failed"
+            );
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "health-progress-deadline.sqlite");
         let store = StateStore::open(
