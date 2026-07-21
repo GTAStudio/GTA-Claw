@@ -77,9 +77,16 @@ type StateCleanupJob = Box<
         + 'static,
 >;
 
+#[cfg(test)]
+type StateCleanupRetentionSignal = Option<Arc<std::sync::atomic::AtomicBool>>;
+#[cfg(not(test))]
+type StateCleanupRetentionSignal = ();
+
 struct StateCleanupEnvelope {
     job: Option<StateCleanupJob>,
     permit: Option<claw_sqlite_file_control::ExternalCleanupPermit>,
+    #[cfg(test)]
+    retained_signal: StateCleanupRetentionSignal,
 }
 
 struct RetainedStateCleanup {
@@ -204,6 +211,8 @@ fn reserve_state_close_retention() -> Result<StateCloseRetentionReservation, Sta
 }
 
 fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
+    #[cfg(test)]
+    let retained_signal = envelope.retained_signal.clone();
     let mut quarantine = STATE_CLEANUP_QUARANTINE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -212,6 +221,10 @@ fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
             envelope,
             retry_at: std::time::Instant::now() + RETAINED_STATE_CLEANUP_RETRY_INTERVAL,
         });
+        #[cfg(test)]
+        if let Some(signal) = retained_signal {
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        }
     } else {
         std::mem::forget(envelope);
     }
@@ -399,6 +412,25 @@ where
 fn handoff_state_payload_decide<Payload, Cleanup>(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     payload: Payload,
+    cleanup: Cleanup,
+) -> Result<(), String>
+where
+    Payload: Send + 'static,
+    Cleanup: FnMut(
+            &tokio::runtime::Runtime,
+            &mut claw_sqlite_file_control::TerminalCloseBatch,
+            &Payload,
+        ) -> bool
+        + Send
+        + 'static,
+{
+    handoff_state_payload_decide_with_signal(owner, payload, Default::default(), cleanup)
+}
+
+fn handoff_state_payload_decide_with_signal<Payload, Cleanup>(
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    payload: Payload,
+    retained_signal: StateCleanupRetentionSignal,
     mut cleanup: Cleanup,
 ) -> Result<(), String>
 where
@@ -411,12 +443,16 @@ where
         + Send
         + 'static,
 {
+    #[cfg(not(test))]
+    let _ = retained_signal;
     let permit = owner.into_external_cleanup()?;
     let envelope = StateCleanupEnvelope {
         job: Some(Box::new(move |runtime, permit| {
             cleanup(runtime, permit.terminal_closes(), &payload)
         })),
         permit: Some(permit),
+        #[cfg(test)]
+        retained_signal,
     };
     let executor = match STATE_CLEANUP_EXECUTOR.as_ref() {
         Ok(executor) => executor,
@@ -5134,6 +5170,8 @@ struct SnapshotCleanupGuard {
     operation_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     shared_retention: Option<SharedSnapshotRetention>,
     cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    #[cfg(test)]
+    retained_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(unix)]
     quarantine_name: Option<String>,
     #[cfg(unix)]
@@ -5152,6 +5190,8 @@ struct SnapshotCleanupPayload {
     memory_reservation: Option<SnapshotMemoryReservation>,
     operation_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     shared_retention: Option<SharedSnapshotRetention>,
+    #[cfg(test)]
+    retained_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(unix)]
     quarantine_name: Option<String>,
     #[cfg(unix)]
@@ -5173,6 +5213,8 @@ impl SnapshotCleanupPayload {
             operation_admission: self.operation_admission,
             shared_retention: self.shared_retention,
             cleanup_owner: None,
+            #[cfg(test)]
+            retained_signal: self.retained_signal,
             #[cfg(unix)]
             quarantine_name: self.quarantine_name,
             #[cfg(unix)]
@@ -5288,6 +5330,8 @@ impl SnapshotCleanupGuard {
             operation_admission: None,
             shared_retention: None,
             cleanup_owner: Some(cleanup_owner),
+            #[cfg(test)]
+            retained_signal: None,
             #[cfg(unix)]
             quarantine_name: Some(quarantine_name),
             #[cfg(unix)]
@@ -5404,6 +5448,8 @@ impl SnapshotCleanupGuard {
             memory_reservation: self.memory_reservation.take(),
             operation_admission: self.operation_admission.take(),
             shared_retention: self.shared_retention.take(),
+            #[cfg(test)]
+            retained_signal: self.retained_signal.take(),
             #[cfg(unix)]
             quarantine_name: self.quarantine_name.take(),
             #[cfg(unix)]
@@ -5420,13 +5466,22 @@ impl SnapshotCleanupGuard {
         else {
             return;
         };
+        #[cfg(test)]
+        let retained_signal = payload.retained_signal.clone();
+        #[cfg(not(test))]
+        let retained_signal = ();
         let guard = payload.into_guard();
-        let _ = handoff_state_payload_decide(owner, std::sync::Mutex::new(guard), |_, _, guard| {
-            let mut guard = guard
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cleanup_snapshot_with_bounded_retries(&mut guard, |_| {})
-        });
+        let _ = handoff_state_payload_decide_with_signal(
+            owner,
+            std::sync::Mutex::new(guard),
+            retained_signal,
+            |_, _, guard| {
+                let mut guard = guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cleanup_snapshot_with_bounded_retries(&mut guard, |_| {})
+            },
+        );
     }
 
     async fn cleanup(&mut self) -> Result<(), StateError> {
@@ -5440,13 +5495,18 @@ impl SnapshotCleanupGuard {
             undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
         }
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
-        handoff_state_payload_decide(
+        #[cfg(test)]
+        let retained_signal = payload.retained_signal.clone();
+        #[cfg(not(test))]
+        let retained_signal = ();
+        handoff_state_payload_decide_with_signal(
             owner,
             SnapshotCleanupWorker {
                 guard: std::sync::Mutex::new(payload.into_guard()),
                 result: result_tx,
                 undelivered: std::sync::Mutex::new(None),
             },
+            retained_signal,
             |_, _, payload| {
                 let mut guard = payload
                     .guard
@@ -13894,6 +13954,7 @@ pub(crate) mod test_support {
         let alternate =
             super::resolve_database_path(alternate).expect("resolve Windows alternate fixture");
         let victim = super::resolve_database_path(victim).expect("resolve Windows victim fixture");
+        let retained_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let parent =
             super::pin_private_directory(&staging).expect("pin Windows staging fixture parent");
         let cleanup_owner =
@@ -13903,6 +13964,7 @@ pub(crate) mod test_support {
         let mut guard =
             super::SnapshotCleanupGuard::new_pinned(&staging, &parent, cleanup_owner, None)
                 .expect("create Windows bound deletion guard");
+        guard.retained_signal = Some(std::sync::Arc::clone(&retained_signal));
         let mut file = super::create_bound_snapshot_output(
             &staging,
             Some(&mut guard),
@@ -13932,18 +13994,12 @@ pub(crate) mod test_support {
                 "a failed handle deletion must not report successful cleanup"
             );
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while super::STATE_CLEANUP_QUARANTINE
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .slots
-                    .iter()
-                    .all(Option::is_none)
-                {
+                while !retained_signal.load(std::sync::atomic::Ordering::Acquire) {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("blocked Windows cleanup exhausts into retained retry");
+            .expect("this exact blocked Windows cleanup exhausts into retained retry");
             assert_eq!(
                 std::fs::metadata(&alternate)
                     .expect("stat scrubbed retained Windows staging")
@@ -13952,12 +14008,14 @@ pub(crate) mod test_support {
                 "bound staging contents are scrubbed before deletion can be blocked"
             );
             let pressure = if normal_queue_pressure {
-                let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let producer_submitted = std::sync::Arc::clone(&submitted);
+                let producer_stop = std::sync::Arc::clone(&stop);
+                let producer_accepted = std::sync::Arc::clone(&accepted);
                 let producer_completed = std::sync::Arc::clone(&completed);
                 let producer = tokio::spawn(async move {
-                    for _ in 0..256 {
+                    while !producer_stop.load(std::sync::atomic::Ordering::Acquire) {
                         let owner = claw_sqlite_file_control::BlockingCleanupOwner::acquire(
                             "windows-retained-fairness-test",
                         )
@@ -13969,17 +14027,17 @@ pub(crate) mod test_support {
                             completed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         })
                         .expect("submit normal cleanup pressure job");
-                        producer_submitted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        producer_accepted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     }
                 });
                 tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                    while submitted.load(std::sync::atomic::Ordering::Acquire) < 64 {
+                    while accepted.load(std::sync::atomic::Ordering::Acquire) < 64 {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
                 .expect("normal cleanup pressure fills executor capacity");
-                Some((producer, completed))
+                Some((producer, stop, accepted, completed))
             } else {
                 None
             };
@@ -13998,22 +14056,28 @@ pub(crate) mod test_support {
             })
             .await
             .expect("retained Windows cleanup retries after delete access is restored");
-            if let Some((producer, completed)) = pressure {
+            if let Some((producer, stop, accepted, completed)) = pressure {
                 assert!(
-                    completed.load(std::sync::atomic::Ordering::Acquire) < 256,
-                    "retained cleanup completes before the normal producer drains"
+                    !producer.is_finished(),
+                    "normal cleanup producer remains actively submitting at retained completion"
                 );
+                stop.store(true, std::sync::atomic::Ordering::Release);
                 tokio::time::timeout(std::time::Duration::from_secs(5), producer)
                     .await
                     .expect("normal cleanup pressure producer remains bounded")
                     .expect("normal cleanup pressure producer joins");
+                let accepted = accepted.load(std::sync::atomic::Ordering::Acquire);
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while completed.load(std::sync::atomic::Ordering::Acquire) < 256 {
+                    while completed.load(std::sync::atomic::Ordering::Acquire) < accepted {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
-                .expect("normal cleanup pressure jobs all complete");
+                .expect("every accepted normal cleanup pressure job completes");
+                assert_eq!(
+                    completed.load(std::sync::atomic::Ordering::Acquire),
+                    accepted
+                );
             }
         } else {
             result.expect("cleanup exact renamed Windows staging");
