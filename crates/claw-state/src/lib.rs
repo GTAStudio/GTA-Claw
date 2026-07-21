@@ -1310,74 +1310,59 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("open transaction quota directory");
         let (admitted, admission_release) = test_support::set_open_admission_barrier();
+        let (peak_entered, peak_release) = test_support::set_before_acquire_owner_barrier();
         let mut opens = tokio::task::JoinSet::new();
-        let mut entered_gates = Vec::new();
-        let mut releases = Vec::new();
-        for index in 0..8 {
+        for index in 0..7 {
             let path = database_path(&directory, &format!("quota-open-{index}.sqlite"));
-            let (entered, release) = test_support::set_open_precommit_barrier(&path);
-            let open_path = path.clone();
-            opens.spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
-            entered_gates.push((index, entered));
-            releases.push(release);
+            opens.spawn(async move { StateStore::open(StoreConfig::new(path)).await });
         }
         tokio::time::timeout(Duration::from_secs(2), async {
-            while admitted.load(std::sync::atomic::Ordering::Acquire) < 8 {
+            while admitted.load(std::sync::atomic::Ordering::Acquire) < 7 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("eight opens bypass test-only concurrency throttle");
+        .expect("seven opens bypass test-only concurrency throttle");
         admission_release.store(true, std::sync::atomic::Ordering::Release);
-        for (index, entered) in entered_gates {
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("reservation-bearing open {index} reaches precommit gate")
-                });
-        }
-        let mut queued = Vec::new();
-        for index in 8..32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while peak_entered.load(std::sync::atomic::Ordering::Acquire) < 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seven opens reach the true eight-owner peak");
+        for index in 7..32 {
             let path = database_path(&directory, &format!("quota-open-{index}.sqlite"));
-            let (entered, release) = test_support::set_open_precommit_barrier(&path);
             opens.spawn(async move { StateStore::open(StoreConfig::new(path)).await });
-            queued.push((entered, release));
         }
         tokio::time::timeout(Duration::from_secs(2), async {
-            while test_support::open_transaction_waiters() < 24 {
+            while test_support::open_transaction_waiters() < 25 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("remaining admitted opens queue before global owner acquisition");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), queued[0].0.notified())
-                .await
-                .is_err(),
-            "queued opens do not reach the post-reservation gate"
-        );
         let unrelated = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "open-quota-unrelated-cleanup",
             7,
             std::time::Instant::now() + Duration::from_secs(1),
         )
         .await
-        .expect("eight opens preserve seven unrelated cleanup slots");
+        .expect("seven peak opens preserve seven unrelated cleanup slots");
         for owner in unrelated {
             owner
                 .shutdown()
                 .expect("complete unrelated cleanup reservation");
         }
-        releases.remove(0).notify_one();
-        tokio::time::timeout(Duration::from_secs(2), queued[0].0.notified())
-            .await
-            .expect("ninth open progresses after one quota permit is released");
-        for release in releases {
-            release.notify_one();
-        }
-        for (_, release) in queued {
-            release.notify_one();
-        }
+        peak_release.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while test_support::open_transaction_waiters() == 25 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one released quota holder gives one queued open progress");
+        peak_release.fetch_add(6, std::sync::atomic::Ordering::AcqRel);
 
         let mut stores = Vec::new();
         while let Some(opened) = opens.join_next().await {
@@ -1401,6 +1386,7 @@ mod tests {
         for owner in all {
             owner.shutdown().expect("release quota capacity proof");
         }
+        test_support::clear_before_acquire_owner_barrier();
         test_support::clear_open_admission_barrier();
     }
 

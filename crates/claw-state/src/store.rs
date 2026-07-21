@@ -109,9 +109,10 @@ struct StateCleanupExecutor {
 
 const STATE_CLEANUP_THREADS: usize = 16;
 const STATE_OPEN_ADMISSION_LIMIT: usize = 32;
-// Eight seven-owner open transactions consume at most 56 of 64 global cleanup
-// slots, preserving eight slots for unrelated atomic cleanup reservations.
-const OPEN_TRANSACTION_ADMISSION_LIMIT: usize = 8;
+// Each open can transiently hold its seven-owner reservation plus one
+// before-acquire verifier owner. Seven opens consume at most 56 of 64 global
+// cleanup slots, preserving eight for unrelated atomic cleanup reservations.
+const OPEN_TRANSACTION_ADMISSION_LIMIT: usize = 7;
 const MAX_STATE_CLEANUP_JOBS: usize = 64;
 const MAX_STATE_CLOSE_RETENTIONS: usize = 64;
 const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
@@ -946,6 +947,21 @@ static FAIL_TRUSTED_SEAL_AFTER_UNLINK: std::sync::LazyLock<
 #[cfg(test)]
 static OPEN_ADMISSION_TEST_BARRIER: std::sync::LazyLock<Mutex<Option<OpenAdmissionTestBarrier>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static OPEN_RESERVED_OWNER_PATHS: std::sync::LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static OPEN_RESERVED_OWNER_GATE_REMAINING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+struct BeforeAcquireOwnerTestBarrier {
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    releases: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[cfg(test)]
+static BEFORE_ACQUIRE_OWNER_TEST_BARRIER: std::sync::LazyLock<
+    Mutex<Option<BeforeAcquireOwnerTestBarrier>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
 #[cfg(test)]
 static EXPIRED_UNDELIVERED_BEGIN_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -2513,6 +2529,40 @@ impl StateStore {
                         let owner = owners
                             .pop()
                             .expect("one before-acquire cleanup owner was reserved");
+                        #[cfg(test)]
+                        if OPEN_RESERVED_OWNER_PATHS
+                            .lock()
+                            .expect("reserved owner path set lock poisoned")
+                            .remove(&path)
+                        {
+                            let barrier = BEFORE_ACQUIRE_OWNER_TEST_BARRIER
+                                .lock()
+                                .expect("before-acquire owner barrier lock poisoned")
+                                .as_ref()
+                                .map(|barrier| {
+                                    (Arc::clone(&barrier.entered), Arc::clone(&barrier.releases))
+                                });
+                            if let Some((entered, releases)) = barrier {
+                                entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                loop {
+                                    let available =
+                                        releases.load(std::sync::atomic::Ordering::Acquire);
+                                    if available > 0
+                                        && releases
+                                            .compare_exchange(
+                                                available,
+                                                available - 1,
+                                                std::sync::atomic::Ordering::AcqRel,
+                                                std::sync::atomic::Ordering::Acquire,
+                                            )
+                                            .is_ok()
+                                    {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
                         let (verified_tx, verified_rx) = std::sync::mpsc::sync_channel(0);
                         struct IdentityVerificationPayload {
                             parent_path: PathBuf,
@@ -10357,6 +10407,23 @@ struct OpenTransactionOwners {
     undelivered: claw_sqlite_file_control::BlockingCleanupOwner,
 }
 
+#[cfg(test)]
+fn mark_reserved_owner_path_for_test(path: &Path) {
+    if OPEN_RESERVED_OWNER_GATE_REMAINING
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+    {
+        OPEN_RESERVED_OWNER_PATHS
+            .lock()
+            .expect("reserved owner path set lock poisoned")
+            .insert(path.to_owned());
+    }
+}
+
 async fn reserve_open_transaction_owners(
     deadline_state: &OpenDeadlineState,
     admission: tokio::sync::SemaphorePermit<'static>,
@@ -10597,6 +10664,8 @@ async fn initialize_fresh_database(
         late_begin: late_begin_owners,
         undelivered: undelivered_cleanup_owner,
     } = reserve_open_transaction_owners(&deadline_state, transaction_admission).await?;
+    #[cfg(test)]
+    mark_reserved_owner_path_for_test(path);
     let pooled = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.work_cutoff),
         pool.acquire(),
@@ -11182,6 +11251,8 @@ async fn apply_migrations(
         late_begin: late_begin_owners,
         undelivered: undelivered_cleanup_owner,
     } = reserve_open_transaction_owners(&deadline_state, transaction_admission).await?;
+    #[cfg(test)]
+    mark_reserved_owner_path_for_test(path);
     let pooled = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.work_cutoff),
         pool.acquire(),
@@ -14609,6 +14680,39 @@ pub(crate) mod test_support {
             .lock()
             .expect("open admission test barrier lock poisoned")
             .take();
+    }
+
+    pub(crate) fn set_before_acquire_owner_barrier() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let releases = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        super::OPEN_RESERVED_OWNER_GATE_REMAINING.store(
+            super::OPEN_TRANSACTION_ADMISSION_LIMIT,
+            std::sync::atomic::Ordering::Release,
+        );
+        let mut barrier = super::BEFORE_ACQUIRE_OWNER_TEST_BARRIER
+            .lock()
+            .expect("before-acquire owner barrier lock poisoned");
+        assert!(barrier.is_none(), "before-acquire owner barrier is unique");
+        *barrier = Some(super::BeforeAcquireOwnerTestBarrier {
+            entered: std::sync::Arc::clone(&entered),
+            releases: std::sync::Arc::clone(&releases),
+        });
+        (entered, releases)
+    }
+
+    pub(crate) fn clear_before_acquire_owner_barrier() {
+        super::OPEN_RESERVED_OWNER_GATE_REMAINING.store(0, std::sync::atomic::Ordering::Release);
+        super::BEFORE_ACQUIRE_OWNER_TEST_BARRIER
+            .lock()
+            .expect("before-acquire owner barrier lock poisoned")
+            .take();
+        super::OPEN_RESERVED_OWNER_PATHS
+            .lock()
+            .expect("reserved owner path set lock poisoned")
+            .clear();
     }
 
     pub(crate) fn reseal_backup_fixture(path: &Path) {
