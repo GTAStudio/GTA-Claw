@@ -1336,6 +1336,26 @@ mod tests {
                     panic!("reservation-bearing open {index} reaches precommit gate")
                 });
         }
+        let mut queued = Vec::new();
+        for index in 8..32 {
+            let path = database_path(&directory, &format!("quota-open-{index}.sqlite"));
+            let (entered, release) = test_support::set_open_precommit_barrier(&path);
+            opens.spawn(async move { StateStore::open(StoreConfig::new(path)).await });
+            queued.push((entered, release));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while test_support::open_transaction_waiters() < 24 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remaining admitted opens queue before global owner acquisition");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), queued[0].0.notified())
+                .await
+                .is_err(),
+            "queued opens do not reach the post-reservation gate"
+        );
         let unrelated = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "open-quota-unrelated-cleanup",
             7,
@@ -1343,29 +1363,21 @@ mod tests {
         )
         .await
         .expect("eight opens preserve seven unrelated cleanup slots");
-
-        let ninth_path = database_path(&directory, "quota-open-ninth.sqlite");
-        let (ninth_entered, ninth_release) = test_support::set_open_precommit_barrier(&ninth_path);
-        opens.spawn(async move { StateStore::open(StoreConfig::new(ninth_path)).await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), ninth_entered.notified())
-                .await
-                .is_err(),
-            "ninth open waits fairly before owning global cleanup slots"
-        );
         for owner in unrelated {
             owner
                 .shutdown()
                 .expect("complete unrelated cleanup reservation");
         }
         releases.remove(0).notify_one();
-        tokio::time::timeout(Duration::from_secs(2), ninth_entered.notified())
+        tokio::time::timeout(Duration::from_secs(2), queued[0].0.notified())
             .await
             .expect("ninth open progresses after one quota permit is released");
         for release in releases {
             release.notify_one();
         }
-        ninth_release.notify_one();
+        for (_, release) in queued {
+            release.notify_one();
+        }
 
         let mut stores = Vec::new();
         while let Some(opened) = opens.join_next().await {
@@ -1375,7 +1387,7 @@ mod tests {
                     .expect("quota-bound open succeeds"),
             );
         }
-        assert_eq!(stores.len(), 9);
+        assert_eq!(stores.len(), 32);
         for store in stores {
             store.close().await.expect("quota-bound store closes");
         }
@@ -1539,19 +1551,18 @@ mod tests {
     #[tokio::test]
     async fn final_store_delivery_obeys_deadline_tie_and_cancellation() {
         let directory = tempfile::tempdir().expect("final delivery deadline directory");
-        for mode in ["deadline", "tie", "cancel"] {
+        for mode in ["tail", "deadline", "tie", "cancel"] {
             let path = database_path(&directory, &format!("final-delivery-{mode}.sqlite"));
+            test_support::set_open_cleanup_budget(&path, Duration::from_secs(1));
+            let deadlines = test_support::observe_open_deadlines(&path);
             let (entered, release) = if mode == "cancel" {
                 test_support::set_open_after_ack_cancel_barrier(&path)
+            } else if mode == "tie" {
+                test_support::set_open_after_ack_expire_barrier(&path)
             } else {
                 test_support::set_open_after_ack_barrier(&path)
             };
-            let timeout = if mode == "cancel" {
-                Duration::from_secs(2)
-            } else {
-                Duration::from_millis(300)
-            };
-            let started = tokio::time::Instant::now();
+            let timeout = Duration::from_secs(2);
             let open_path = path.clone();
             let opening = tokio::spawn(async move {
                 StateStore::open(StoreConfig::new(open_path).with_open_timeout(timeout)).await
@@ -1559,6 +1570,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), entered.notified())
                 .await
                 .expect("open reaches after-ack delivery gate");
+            let (cancel_at, hard_deadline) =
+                test_support::wait_for_open_deadlines(&deadlines).await;
             assert!(
                 StateStore::open(
                     StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)),
@@ -1568,21 +1581,40 @@ mod tests {
                 "actor retains ownership before final delivery"
             );
             match mode {
-                "deadline" => tokio::time::sleep(Duration::from_millis(350)).await,
-                "tie" => {
-                    let cancel_at = started + Duration::from_millis(240);
-                    tokio::time::sleep_until(cancel_at).await;
+                "tail" => {
+                    let middle = cancel_at + hard_deadline.saturating_duration_since(cancel_at) / 2;
+                    tokio::time::sleep_until(middle).await;
                 }
+                "deadline" => {
+                    tokio::time::sleep_until(hard_deadline + Duration::from_millis(200)).await;
+                }
+                "tie" => {}
                 "cancel" => {}
                 _ => unreachable!(),
             }
             release.notify_one();
-            assert_eq!(
+            if mode == "tail" {
                 opening
                     .await
-                    .expect("deadline-bound final delivery task joins")
-                    .err()
-                    .expect("late or cancelled final delivery returns timeout"),
+                    .expect("delivery-tail open task joins")
+                    .expect("store delivery may use the cleanup tail")
+                    .close()
+                    .await
+                    .expect("delivery-tail store closes");
+                continue;
+            }
+            let error = match opening
+                .await
+                .expect("deadline-bound final delivery task joins")
+            {
+                Err(error) => error,
+                Ok(store) => {
+                    let close = store.close().await;
+                    panic!("final delivery mode {mode} returned a store; close: {close:?}");
+                }
+            };
+            assert_eq!(
+                error,
                 StateError::OperationTimedOut {
                     operation: "state store open",
                     timeout_ms: u64::try_from(timeout.as_millis()).expect("timeout fits u64"),
@@ -1592,7 +1624,11 @@ mod tests {
                 loop {
                     match StateStore::open(StoreConfig::new(&path)).await {
                         Ok(store) => break store,
-                        Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        Err(
+                            StateError::StoreLocked { .. }
+                            | StateError::FileSystem { .. }
+                            | StateError::InvalidPath { .. },
+                        ) => {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(error) => panic!("final delivery cleanup reopen failed: {error}"),

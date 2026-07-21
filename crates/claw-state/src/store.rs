@@ -874,6 +874,20 @@ static OPEN_AFTER_ACK_CANCEL_ON_RELEASE: std::sync::LazyLock<
     Mutex<std::collections::HashSet<PathBuf>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
+static OPEN_AFTER_ACK_EXPIRE_ON_RELEASE: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static OPEN_TEST_CLEANUP_BUDGET: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, Duration>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+type OpenTestDeadlineObserver = Arc<Mutex<Option<(tokio::time::Instant, tokio::time::Instant)>>>;
+#[cfg(test)]
+static OPEN_TEST_DEADLINE_OBSERVERS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, OpenTestDeadlineObserver>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
 static OPEN_CLEANUP_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -935,6 +949,26 @@ static OPEN_ADMISSION_TEST_BARRIER: std::sync::LazyLock<Mutex<Option<OpenAdmissi
 #[cfg(test)]
 static EXPIRED_UNDELIVERED_BEGIN_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static OPEN_TRANSACTION_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+struct OpenTransactionWaiter;
+
+#[cfg(test)]
+impl OpenTransactionWaiter {
+    fn new() -> Self {
+        OPEN_TRANSACTION_WAITERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenTransactionWaiter {
+    fn drop(&mut self) {
+        OPEN_TRANSACTION_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 #[cfg(all(test, unix))]
 struct CountedFailure {
@@ -1865,6 +1899,7 @@ struct OpenLifecycleActorInput {
     config: StoreConfig,
     close_retention: StateCloseRetentionReservation,
     open_admission: tokio::sync::SemaphorePermit<'static>,
+    transaction_admission: tokio::sync::SemaphorePermit<'static>,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
     ready: tokio::sync::oneshot::Sender<Result<(), StateError>>,
@@ -1922,12 +1957,20 @@ async fn run_open_lifecycle_actor(
         config,
         close_retention,
         open_admission,
+        transaction_admission,
         deadline,
         deadline_state,
         ready,
         delivery_ack,
     } = input;
-    match StateStore::open_inner(config, Arc::clone(&deadline_state), close_retention).await {
+    match StateStore::open_inner(
+        config,
+        Arc::clone(&deadline_state),
+        close_retention,
+        transaction_admission,
+    )
+    .await
+    {
         Err(error) => {
             let _ = ready.send(Err(error));
             Ok(OpenLifecycleTerminal::Cleaned)
@@ -2008,14 +2051,35 @@ impl StateStore {
                 field: "open timeout",
                 reason: "is too large for the monotonic clock",
             })?;
-        let cleanup_budget = config
+        let mut cleanup_budget = config
             .open_timeout
             .checked_div(5)
             .unwrap_or(Duration::ZERO)
             .min(Duration::from_millis(100));
+        #[cfg(test)]
+        if let Ok(path) = resolve_database_path(&config.path)
+            && let Some(configured) = OPEN_TEST_CLEANUP_BUDGET
+                .lock()
+                .expect("open test cleanup budget lock poisoned")
+                .remove(&path)
+        {
+            cleanup_budget = configured.min(config.open_timeout);
+        }
         let cancel_at = deadline
             .checked_sub(cleanup_budget)
             .unwrap_or(tokio::time::Instant::now());
+        #[cfg(test)]
+        if let Ok(path) = resolve_database_path(&config.path)
+            && let Some(observer) = OPEN_TEST_DEADLINE_OBSERVERS
+                .lock()
+                .expect("open test deadline observer lock poisoned")
+                .remove(&path)
+        {
+            *observer
+                .lock()
+                .expect("open test deadline observation lock poisoned") =
+                Some((cancel_at, deadline));
+        }
         let deadline_state = Arc::new(OpenDeadlineState {
             work_cutoff: cancel_at.into_std(),
             deadline: deadline.into_std(),
@@ -2042,6 +2106,23 @@ impl StateStore {
             })?;
         #[cfg(test)]
         wait_at_open_admission_test_barrier().await;
+        #[cfg(test)]
+        let transaction_waiter = OpenTransactionWaiter::new();
+        let transaction_admission =
+            tokio::time::timeout_at(cancel_at, OPEN_TRANSACTION_ADMISSION.acquire())
+                .await
+                .map_err(|_| StateError::OperationTimedOut {
+                    operation: "state store open",
+                    timeout_ms,
+                })?
+                .map_err(|_| {
+                    database(
+                        "acquire open transaction admission",
+                        sqlx::Error::Protocol("open transaction admission is closed".to_owned()),
+                    )
+                })?;
+        #[cfg(test)]
+        drop(transaction_waiter);
         let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
         let (delivery_ack_tx, delivery_ack_rx) = tokio::sync::oneshot::channel();
         let (terminal_tx, mut terminal_rx) = tokio::sync::oneshot::channel();
@@ -2058,6 +2139,7 @@ impl StateStore {
                 config,
                 close_retention,
                 open_admission,
+                transaction_admission,
                 deadline,
                 deadline_state: actor_deadline_state,
                 ready: ready_tx,
@@ -2072,7 +2154,14 @@ impl StateStore {
                 match ready {
                     Ok(Err(error)) => Err(error),
                     Ok(Ok(())) => {
-                        if tokio::time::Instant::now() >= cancel_at {
+                        if deadline_state
+                            .cancelled
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            || deadline_state
+                                .expired
+                                .load(std::sync::atomic::Ordering::Acquire)
+                            || tokio::time::Instant::now() >= deadline
+                        {
                             deadline_state
                                 .expired
                                 .store(true, std::sync::atomic::Ordering::Release);
@@ -2105,7 +2194,7 @@ impl StateStore {
                             })?;
                         let delivery = tokio::select! {
                             biased;
-                            () = tokio::time::sleep_until(cancel_at) => {
+                            () = tokio::time::sleep_until(deadline) => {
                                 deadline_state
                                     .expired
                                     .store(true, std::sync::atomic::Ordering::Release);
@@ -2142,7 +2231,10 @@ impl StateStore {
                         if deadline_state
                             .cancelled
                             .load(std::sync::atomic::Ordering::Acquire)
-                            || tokio::time::Instant::now() >= cancel_at
+                            || deadline_state
+                                .expired
+                                .load(std::sync::atomic::Ordering::Acquire)
+                            || tokio::time::Instant::now() >= deadline
                         {
                             drop(delivery);
                             deadline_state
@@ -2193,6 +2285,7 @@ impl StateStore {
         config: StoreConfig,
         deadline_state: Arc<OpenDeadlineState>,
         close_retention: StateCloseRetentionReservation,
+        transaction_admission: tokio::sync::SemaphorePermit<'static>,
     ) -> Result<Self, StateError> {
         let path = resolve_database_path(&config.path)?;
         let database_parent = pin_private_directory(&path)?;
@@ -2715,6 +2808,7 @@ impl StateStore {
             locked_state,
             &owner,
             Arc::clone(&deadline_state),
+            transaction_admission,
         )
         .await
         {
@@ -6398,6 +6492,10 @@ mod open_deadline_tests {
             Path::new("bootstrap-acquire.sqlite"),
             "bootstrap-acquire-owner",
             deadline_state,
+            OPEN_TRANSACTION_ADMISSION
+                .acquire()
+                .await
+                .expect("reserve bootstrap test transaction admission"),
         )
         .await
         .expect_err("held pool capacity consumes the bootstrap work cutoff");
@@ -6444,6 +6542,10 @@ mod open_deadline_tests {
             InspectedDatabase::Existing { schema_version: 0 },
             "migration-acquire-owner",
             deadline_state,
+            OPEN_TRANSACTION_ADMISSION
+                .acquire()
+                .await
+                .expect("reserve migration test transaction admission"),
         )
         .await
         .expect_err("held pool capacity consumes the migration work cutoff");
@@ -6501,6 +6603,10 @@ mod open_deadline_tests {
             InspectedDatabase::Existing { schema_version: 0 },
             "gated-application-id-owner",
             deadline_state,
+            OPEN_TRANSACTION_ADMISSION
+                .acquire()
+                .await
+                .expect("reserve application-id test transaction admission"),
         )
         .await
         .expect_err("application-id dispatch is rejected after its work cutoff");
@@ -10201,9 +10307,11 @@ async fn initialize_database(
     inspected: InspectedDatabase,
     owner: &str,
     deadline_state: Arc<OpenDeadlineState>,
+    transaction_admission: tokio::sync::SemaphorePermit<'static>,
 ) -> Result<InitializedDatabase, StateError> {
     if inspected == InspectedDatabase::Fresh {
-        return initialize_fresh_database(pool, path, owner, deadline_state).await;
+        return initialize_fresh_database(pool, path, owner, deadline_state, transaction_admission)
+            .await;
     }
     let mut application_connection = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.work_cutoff),
@@ -10239,7 +10347,7 @@ async fn initialize_database(
             reason: "database belongs to another application",
         });
     }
-    apply_migrations(pool, path, owner, deadline_state).await
+    apply_migrations(pool, path, owner, deadline_state, transaction_admission).await
 }
 
 struct OpenTransactionOwners {
@@ -10251,19 +10359,8 @@ struct OpenTransactionOwners {
 
 async fn reserve_open_transaction_owners(
     deadline_state: &OpenDeadlineState,
+    admission: tokio::sync::SemaphorePermit<'static>,
 ) -> Result<OpenTransactionOwners, StateError> {
-    let admission = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline_state.work_cutoff),
-        OPEN_TRANSACTION_ADMISSION.acquire(),
-    )
-    .await
-    .map_err(|_| deadline_state.timeout_error())?
-    .map_err(|_| {
-        database(
-            "acquire open transaction admission",
-            sqlx::Error::Protocol("open transaction admission is closed".to_owned()),
-        )
-    })?;
     let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
         "state-open-transaction",
         7,
@@ -10490,6 +10587,7 @@ async fn initialize_fresh_database(
     path: &Path,
     owner: &str,
     deadline_state: Arc<OpenDeadlineState>,
+    transaction_admission: tokio::sync::SemaphorePermit<'static>,
 ) -> Result<InitializedDatabase, StateError> {
     #[cfg(not(test))]
     let _ = path;
@@ -10498,7 +10596,7 @@ async fn initialize_fresh_database(
         primary_begin,
         late_begin: late_begin_owners,
         undelivered: undelivered_cleanup_owner,
-    } = reserve_open_transaction_owners(&deadline_state).await?;
+    } = reserve_open_transaction_owners(&deadline_state, transaction_admission).await?;
     let pooled = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.work_cutoff),
         pool.acquire(),
@@ -11059,6 +11157,7 @@ async fn apply_migrations(
     path: &Path,
     owner: &str,
     deadline_state: Arc<OpenDeadlineState>,
+    transaction_admission: tokio::sync::SemaphorePermit<'static>,
 ) -> Result<InitializedDatabase, StateError> {
     let mut preliminary = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.work_cutoff),
@@ -11082,7 +11181,7 @@ async fn apply_migrations(
         primary_begin,
         late_begin: late_begin_owners,
         undelivered: undelivered_cleanup_owner,
-    } = reserve_open_transaction_owners(&deadline_state).await?;
+    } = reserve_open_transaction_owners(&deadline_state, transaction_admission).await?;
     let pooled = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline_state.work_cutoff),
         pool.acquire(),
@@ -11384,6 +11483,15 @@ async fn wait_at_open_after_ack_test_barrier(path: &Path, deadline_state: &OpenD
             .remove(path)
         {
             deadline_state.cancel();
+        }
+        if OPEN_AFTER_ACK_EXPIRE_ON_RELEASE
+            .lock()
+            .expect("open after-ack expire set lock poisoned")
+            .remove(path)
+        {
+            deadline_state
+                .expired
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -14357,6 +14465,10 @@ pub(crate) mod test_support {
             .count()
     }
 
+    pub(crate) fn open_transaction_waiters() -> usize {
+        super::OPEN_TRANSACTION_WAITERS.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) async fn handoff_expired_undelivered_store(store: super::StateStore) -> usize {
         super::EXPIRED_UNDELIVERED_BEGIN_DISPATCHES.store(0, std::sync::atomic::Ordering::Release);
         let owner =
@@ -14773,6 +14885,72 @@ pub(crate) mod test_support {
             "open after-ack cancellation is configured once"
         );
         barrier
+    }
+
+    pub(crate) fn set_open_after_ack_expire_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let barrier = set_open_after_ack_barrier(path);
+        let path =
+            super::resolve_database_path(path).expect("resolve after-ack expire barrier path");
+        assert!(
+            super::OPEN_AFTER_ACK_EXPIRE_ON_RELEASE
+                .lock()
+                .expect("open after-ack expire set lock poisoned")
+                .insert(path),
+            "open after-ack expiry is configured once"
+        );
+        barrier
+    }
+
+    pub(crate) fn set_open_cleanup_budget(path: &Path, budget: std::time::Duration) {
+        let path = super::resolve_database_path(path).expect("resolve open cleanup budget path");
+        assert!(
+            super::OPEN_TEST_CLEANUP_BUDGET
+                .lock()
+                .expect("open test cleanup budget lock poisoned")
+                .insert(path, budget)
+                .is_none(),
+            "open cleanup budget is configured once"
+        );
+    }
+
+    pub(crate) struct OpenDeadlineObservation(super::OpenTestDeadlineObserver);
+
+    pub(crate) fn observe_open_deadlines(path: &Path) -> OpenDeadlineObservation {
+        let path = super::resolve_database_path(path).expect("resolve open deadline observer path");
+        let observer = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert!(
+            super::OPEN_TEST_DEADLINE_OBSERVERS
+                .lock()
+                .expect("open deadline observer map lock poisoned")
+                .insert(path, std::sync::Arc::clone(&observer))
+                .is_none(),
+            "open deadline observer is configured once"
+        );
+        OpenDeadlineObservation(observer)
+    }
+
+    pub(crate) async fn wait_for_open_deadlines(
+        observer: &OpenDeadlineObservation,
+    ) -> (tokio::time::Instant, tokio::time::Instant) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(deadlines) = *observer
+                    .0
+                    .lock()
+                    .expect("open deadline observation lock poisoned")
+                {
+                    break deadlines;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("open publishes its exact deadlines")
     }
 
     pub(crate) fn set_open_cleanup_barrier(
