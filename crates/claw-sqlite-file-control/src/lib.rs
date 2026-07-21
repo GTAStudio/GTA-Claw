@@ -6158,8 +6158,12 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     cleanup_deadline: std::time::Instant,
     allow_expired_first_attempt: bool,
     restore_busy_timeout: std::time::Duration,
-    external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ownership: (
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+        Option<Vec<BlockingCleanupOwner>>,
+    ),
 ) -> Result<ManualTransaction<Connection>, FileControlError> {
+    let (external_cancellation, reserved_owners) = ownership;
     let now = std::time::Instant::now();
     if work_deadline.is_some_and(|deadline| cleanup_deadline <= deadline) {
         return Err(FileControlError::Handle(
@@ -6173,16 +6177,25 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         Some(work_deadline.map_or(relative, |deadline| deadline.min(relative)))
     };
     let admission_deadline = work_deadline.unwrap_or(now);
-    let mut owners = BlockingCleanupOwner::acquire_many_until(
-        "claw-sqlite-begin-owner",
-        3,
-        Some(admission_deadline),
-        allow_expired_first_attempt,
-    )
-    .await
-    .map_err(|error| {
-        FileControlError::Handle(format!("acquire BEGIN worker and cleanup owners: {error}"))
-    })?;
+    let mut owners = if let Some(owners) = reserved_owners {
+        if owners.len() != 3 {
+            return Err(FileControlError::Handle(
+                "BEGIN requires exactly three transferred cleanup owners".to_owned(),
+            ));
+        }
+        owners
+    } else {
+        BlockingCleanupOwner::acquire_many_until(
+            "claw-sqlite-begin-owner",
+            3,
+            Some(admission_deadline),
+            allow_expired_first_attempt,
+        )
+        .await
+        .map_err(|error| {
+            FileControlError::Handle(format!("acquire BEGIN worker and cleanup owners: {error}"))
+        })?
+    };
     let post_commit_owner = owners.pop().expect("post-COMMIT cleanup owner");
     let cleanup_owner = owners.pop().expect("terminal BEGIN cleanup owner");
     let mut worker_owner = owners.pop().expect("BEGIN worker owner");
@@ -6395,7 +6408,7 @@ pub async fn begin_manual_transaction(
         cleanup_deadline,
         allow_expired_first_attempt,
         busy_timeout,
-        external_cancellation,
+        (external_cancellation, None),
     )
     .await
 }
@@ -6414,7 +6427,7 @@ pub async fn begin_manual_pool_transaction(
         cleanup_deadline,
         allow_expired_first_attempt,
         busy_timeout,
-        None,
+        (None, None),
     )
     .await
 }
@@ -6435,7 +6448,7 @@ pub async fn begin_manual_pool_transaction_with_restore(
         cleanup_deadline,
         allow_expired_first_attempt,
         restore_busy_timeout,
-        external_cancellation,
+        (external_cancellation, None),
     )
     .await
 }
@@ -6478,7 +6491,29 @@ pub async fn begin_manual_pool_transaction_with_restore_deadlines(
         cleanup_deadline,
         false,
         restore_busy_timeout,
-        external_cancellation,
+        (external_cancellation, None),
+    )
+    .await
+}
+
+/// Starts an absolute-deadline pool transaction using three transferred cleanup owners.
+pub async fn begin_manual_pool_transaction_with_restore_deadlines_and_owners(
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    work_deadline: std::time::Instant,
+    cleanup_deadline: std::time::Instant,
+    begin_busy_timeout: std::time::Duration,
+    restore_busy_timeout: std::time::Duration,
+    external_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    owners: Vec<BlockingCleanupOwner>,
+) -> Result<ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError> {
+    begin_manual_transaction_inner(
+        connection,
+        begin_busy_timeout,
+        Some(work_deadline),
+        cleanup_deadline,
+        false,
+        restore_busy_timeout,
+        (external_cancellation, Some(owners)),
     )
     .await
 }
@@ -10251,7 +10286,7 @@ mod deadline_tests {
             std::time::Instant::now() + std::time::Duration::from_millis(1_500),
             false,
             std::time::Duration::from_millis(500),
-            None,
+            (None, None),
         )
         .await
         .expect("begin authorizer quarantine transaction");
@@ -10532,6 +10567,79 @@ mod deadline_tests {
             .await
             .expect("pool permit returns after transaction terminal state")
             .expect("replacement pool acquisition succeeds");
+    }
+
+    #[tokio::test]
+    async fn transferred_begin_owners_release_after_success_and_rejection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open transferred-owner pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire transferred-owner connection");
+        let owners = BlockingCleanupOwner::acquire_set(
+            "transferred-begin-success",
+            3,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("reserve complete transferred BEGIN capacity");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let connection = begin_manual_pool_transaction_with_restore_deadlines_and_owners(
+            connection,
+            work_deadline,
+            work_deadline + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+            None,
+            owners,
+        )
+        .await
+        .expect("transferred-owner BEGIN succeeds")
+        .rollback()
+        .await
+        .expect("transferred-owner transaction rolls back");
+        drop(connection);
+
+        let rejected_connection = pool
+            .acquire()
+            .await
+            .expect("acquire rejected-transfer connection");
+        let rejected_owners = BlockingCleanupOwner::acquire_set(
+            "transferred-begin-rejected",
+            2,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("reserve incomplete transferred BEGIN capacity");
+        begin_manual_pool_transaction_with_restore_deadlines_and_owners(
+            rejected_connection,
+            work_deadline,
+            work_deadline + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+            None,
+            rejected_owners,
+        )
+        .await
+        .expect_err("incomplete transferred owner set is rejected");
+
+        let all = BlockingCleanupOwner::acquire_set(
+            "transferred-begin-capacity-proof",
+            MAX_CLEANUP_JOBS,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("success and rejection release every transferred owner slot");
+        for owner in all {
+            owner
+                .shutdown()
+                .expect("release transferred-owner capacity proof");
+        }
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -12150,7 +12258,7 @@ mod deadline_tests {
             std::time::Instant::now() + std::time::Duration::from_secs(2),
             false,
             std::time::Duration::from_secs(1),
-            None,
+            (None, None),
         )
         .await
         .expect("begin panicking-close transaction");
@@ -12261,7 +12369,7 @@ mod deadline_tests {
                 std::time::Instant::now() + std::time::Duration::from_secs(2),
                 false,
                 std::time::Duration::from_secs(1),
-                None,
+                (None, None),
             )
             .await
             .expect("begin close-hook panic transaction");

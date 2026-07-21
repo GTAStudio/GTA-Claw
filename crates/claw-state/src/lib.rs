@@ -479,7 +479,19 @@ mod tests {
             .close()
             .await
             .expect("long-name store closes");
-        let reopened = open(&path).await;
+        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("post-migration-timeout reopen failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("migration timeout releases writer ownership");
         assert!(
             reopened
                 .health()
@@ -886,7 +898,19 @@ mod tests {
             .close()
             .await
             .expect("close cancellation inspection");
-        let reopened = open(&path).await;
+        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("post-migration-timeout reopen failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("migration timeout releases writer ownership");
         assert_eq!(
             reopened.recovered_writer(),
             Some(&RecoveredWriterLock {
@@ -1191,6 +1215,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_claim_capacity_is_reserved_before_writer_claim_commit() {
+        const CHILD_ENV: &str = "GTA_CLAW_LATE_CLAIM_CAPACITY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::late_claim_capacity_is_reserved_before_writer_claim_commit")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated late-claim capacity test");
+            assert!(status.success(), "isolated late-claim capacity test failed");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("late-claim capacity directory");
+        let path = database_path(&directory, "late-claim-capacity.sqlite");
+        let (entered, _release) = test_support::set_open_precommit_barrier(&path);
+        let open_path = path.clone();
+        let opening = tokio::spawn(async move {
+            StateStore::open(
+                StoreConfig::new(open_path).with_open_timeout(Duration::from_millis(500)),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("open reaches precommit capacity fence");
+        let blockers = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "late-claim-capacity-blocker",
+            60,
+            std::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        .expect("saturate late-claim cleanup capacity");
+        let error = match opening.await.expect("capacity-bound open task joins") {
+            Err(error) => error,
+            Ok(store) => {
+                let close = store.close().await;
+                panic!("capacity reservation unexpectedly committed claim; close: {close:?}");
+            }
+        };
+        assert_eq!(
+            error,
+            StateError::OperationTimedOut {
+                operation: "state store open",
+                timeout_ms: 500,
+            }
+        );
+        for blocker in blockers {
+            blocker
+                .shutdown()
+                .expect("release late-claim capacity blocker");
+        }
+        let reopened = StateStore::open(StoreConfig::new(&path))
+            .await
+            .expect("capacity-rejected store reopens");
+        assert!(
+            reopened.recovered_writer().is_none(),
+            "writer claim is never committed without cleanup capacity"
+        );
+        reopened
+            .close()
+            .await
+            .expect("capacity-rejected store closes");
+    }
+
+    #[tokio::test]
     async fn cancelling_open_after_commit_closes_committed_owner_before_reopen() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = database_path(&directory, "cancelled-open-postcommit.sqlite");
@@ -1339,6 +1434,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_undelivered_cleanup_releases_ownership_without_retrying_begin() {
+        let directory = tempfile::tempdir().expect("expired undelivered directory");
+        let path = database_path(&directory, "expired-undelivered.sqlite");
+        let store = open(&path).await;
+        assert_eq!(
+            test_support::handoff_expired_undelivered_store(store).await,
+            0,
+            "an already-expired cleanup never dispatches BEGIN"
+        );
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(2),
+            StateStore::open(StoreConfig::new(&path)),
+        )
+        .await
+        .expect("expired cleanup releases local pool and OS ownership")
+        .expect("next open recovers the durable stale writer claim");
+        assert!(
+            reopened.recovered_writer().is_some(),
+            "terminal release intentionally leaves a recoverable durable claim"
+        );
+        reopened
+            .close()
+            .await
+            .expect("recovered expired-undelivered store closes");
+    }
+
+    #[tokio::test]
     async fn stalled_postcommit_cleanup_cannot_extend_the_open_deadline() {
         const CHILD_ENV: &str = "GTA_CLAW_STALLED_POSTCOMMIT_CLEANUP_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -1429,14 +1551,14 @@ mod tests {
         let (entered, release) = test_support::set_migration_barrier(&path);
         assert_eq!(
                 StateStore::open(
-                    StoreConfig::new(&path).with_open_timeout(Duration::from_millis(100)),
+                    StoreConfig::new(&path).with_open_timeout(Duration::from_millis(500)),
                 )
                 .await
                 .err()
                 .expect("gated migration reaches one overall timeout"),
                 StateError::OperationTimedOut {
                     operation: "state store open",
-                    timeout_ms: 100,
+                    timeout_ms: 500,
                 }
             );
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
@@ -1444,8 +1566,48 @@ mod tests {
             .expect("migration entered the deterministic gate");
         release.notify_one();
         test_support::clear_migration_barrier(&path);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let stable = database_artifact_bytes(&path);
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .busy_timeout(Duration::from_millis(50));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(mut connection) = SqliteConnection::connect_with(&options).await {
+                    if sqlx::query("BEGIN IMMEDIATE")
+                        .execute(&mut connection)
+                        .await
+                        .is_ok()
+                    {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut connection)
+                            .await
+                            .expect("release migration cleanup probe");
+                        connection
+                            .close()
+                            .await
+                            .expect("close migration cleanup probe");
+                        break;
+                    }
+                    let _ = connection.close().await;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("migration timeout reaches terminal rollback");
+        let stable = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut previous = database_artifact_bytes(&path);
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let current = database_artifact_bytes(&path);
+                if current == previous {
+                    break current;
+                }
+                previous = current;
+            }
+        })
+        .await
+        .expect("migration artifacts reach a quiescent baseline");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&path));
         let reopened = open(&path).await;
@@ -1462,14 +1624,14 @@ mod tests {
         let (entered, release) = test_support::set_migration_barrier(&fresh_path);
         assert_eq!(
             StateStore::open(
-                StoreConfig::new(&fresh_path).with_open_timeout(Duration::from_millis(100)),
+                StoreConfig::new(&fresh_path).with_open_timeout(Duration::from_millis(500)),
             )
             .await
             .err()
             .expect("fresh gated migration reaches one overall timeout"),
             StateError::OperationTimedOut {
                 operation: "state store open",
-                timeout_ms: 100,
+                timeout_ms: 500,
             }
         );
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
@@ -1477,10 +1639,63 @@ mod tests {
             .expect("fresh migration entered deterministic gate");
         release.notify_one();
         test_support::clear_migration_barrier(&fresh_path);
-        let stable = database_artifact_bytes(&fresh_path);
+        let options = SqliteConnectOptions::new()
+            .filename(&fresh_path)
+            .create_if_missing(false)
+            .busy_timeout(Duration::from_millis(50));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(mut connection) = SqliteConnection::connect_with(&options).await {
+                    if sqlx::query("BEGIN IMMEDIATE")
+                        .execute(&mut connection)
+                        .await
+                        .is_ok()
+                    {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut connection)
+                            .await
+                            .expect("release fresh migration cleanup probe");
+                        connection
+                            .close()
+                            .await
+                            .expect("close fresh migration cleanup probe");
+                        break;
+                    }
+                    let _ = connection.close().await;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh migration timeout reaches terminal rollback");
+        let stable = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut previous = database_artifact_bytes(&fresh_path);
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let current = database_artifact_bytes(&fresh_path);
+                if current == previous {
+                    break current;
+                }
+                previous = current;
+            }
+        })
+        .await
+        .expect("fresh migration artifacts reach a quiescent baseline");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_database_artifacts_unchanged(&stable, &database_artifact_bytes(&fresh_path));
-        let reopened = open(&fresh_path).await;
+        let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&fresh_path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("fresh post-migration-timeout reopen failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("fresh migration timeout releases writer ownership");
         assert!(
             reopened
                 .health()
