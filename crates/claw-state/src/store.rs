@@ -199,6 +199,49 @@ fn retain_state_cleanup(envelope: StateCleanupEnvelope) {
     }
 }
 
+fn take_retained_state_cleanup() -> Option<StateCleanupEnvelope> {
+    STATE_CLEANUP_QUARANTINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter_mut()
+        .find_map(Option::take)
+}
+
+fn run_state_cleanup_envelope(
+    runtime: &tokio::runtime::Runtime,
+    mut envelope: StateCleanupEnvelope,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let job = envelope
+            .job
+            .as_mut()
+            .expect("state cleanup job remains owned");
+        let permit = envelope
+            .permit
+            .as_mut()
+            .expect("state cleanup permit remains owned");
+        job(runtime, permit)
+    }));
+    match result {
+        Ok(true) => {
+            let job = envelope
+                .job
+                .take()
+                .expect("completed state cleanup job remains owned");
+            let permit = envelope
+                .permit
+                .take()
+                .expect("completed state cleanup permit remains owned");
+            let _ = permit.retire(Box::new(job));
+        }
+        Ok(false) => retain_state_cleanup(envelope),
+        Err(panic) => {
+            std::mem::forget(panic);
+            retain_state_cleanup(envelope);
+        }
+    }
+}
+
 static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, String>> =
     std::sync::LazyLock::new(|| {
         let (sender, receiver) =
@@ -223,42 +266,21 @@ static STATE_CLEANUP_EXECUTOR: std::sync::LazyLock<Result<StateCleanupExecutor, 
                     };
                     let _ = ready_tx.send(Ok(()));
                     loop {
-                        let envelope = receiver
+                        let received = receiver
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .recv();
-                        let Ok(mut envelope) = envelope else {
-                            return;
+                            .recv_timeout(Duration::from_millis(50));
+                        let envelope = match received {
+                            Ok(envelope) => envelope,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let Some(envelope) = take_retained_state_cleanup() else {
+                                    continue;
+                                };
+                                envelope
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                         };
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let job = envelope
-                                .job
-                                .as_mut()
-                                .expect("state cleanup job remains owned");
-                            let permit = envelope
-                                .permit
-                                .as_mut()
-                                .expect("state cleanup permit remains owned");
-                            job(&runtime, permit)
-                        }));
-                        match result {
-                            Ok(true) => {
-                                let job = envelope
-                                    .job
-                                    .take()
-                                    .expect("completed state cleanup job remains owned");
-                                let permit = envelope
-                                    .permit
-                                    .take()
-                                    .expect("completed state cleanup permit remains owned");
-                                let _ = permit.retire(Box::new(job));
-                            }
-                            Ok(false) => retain_state_cleanup(envelope),
-                            Err(panic) => {
-                                std::mem::forget(panic);
-                                retain_state_cleanup(envelope);
-                            }
-                        }
+                        run_state_cleanup_envelope(&runtime, envelope);
                     }
                 })
                 .map_err(|error| error.to_string())?;
@@ -5602,6 +5624,12 @@ impl SnapshotCleanupGuard {
                 .expected_file
                 .as_ref()
                 .expect("snapshot cleanup identity remains owned");
+            expected
+                .set_len(0)
+                .and_then(|()| expected.sync_all())
+                .map_err(|error| {
+                    file_error("scrub held snapshot cleanup artifact", &self.path, error)
+                })?;
             let deletion =
                 claw_sqlite_file_control::reopen_file_for_deletion(expected).map_err(|error| {
                     file_error(
@@ -13856,13 +13884,34 @@ pub(crate) mod test_support {
                 result.is_err(),
                 "a failed handle deletion must not report successful cleanup"
             );
-            assert!(
-                alternate.exists(),
-                "failed handle deletion retains the bound staging object"
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while super::STATE_CLEANUP_QUARANTINE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .all(Option::is_none)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("blocked Windows cleanup exhausts into retained retry");
+            assert_eq!(
+                std::fs::metadata(&alternate)
+                    .expect("stat scrubbed retained Windows staging")
+                    .len(),
+                0,
+                "bound staging contents are scrubbed before deletion can be blocked"
             );
             drop(blocker);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while alternate.exists() {
+                while alternate.exists()
+                    || super::STATE_CLEANUP_QUARANTINE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .any(Option::is_some)
+                {
                     tokio::task::yield_now().await;
                 }
             })

@@ -4024,21 +4024,33 @@ mod tests {
     #[tokio::test]
     async fn bound_snapshot_delete_error_retains_cleanup_for_retry() {
         let directory = tempfile::tempdir().expect("Windows retained cleanup directory");
-        let staging = database_path(&directory, "retained-cleanup-staging.sqlite");
-        let alternate = database_path(&directory, "retained-cleanup-alternate.sqlite");
-        let victim = database_path(&directory, "retained-cleanup-victim.sqlite");
-        fs::write(&victim, b"retained cleanup victim").expect("write retained cleanup victim");
-        test_support::secure_windows_file_fixture(&victim);
+        for index in 0..8 {
+            let staging = database_path(
+                &directory,
+                &format!("retained-cleanup-staging-{index}.sqlite"),
+            );
+            let alternate = database_path(
+                &directory,
+                &format!("retained-cleanup-alternate-{index}.sqlite"),
+            );
+            let victim = database_path(
+                &directory,
+                &format!("retained-cleanup-victim-{index}.sqlite"),
+            );
+            fs::write(&victim, b"retained cleanup victim").expect("write retained cleanup victim");
+            test_support::secure_windows_file_fixture(&victim);
 
-        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
-        test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, true).await;
-        assert!(!alternate.exists());
-        assert_eq!(
-            fs::read(&staging).expect("read retained cleanup victim alias"),
-            b"retained cleanup victim"
-        );
-        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
-        fs::remove_file(&staging).expect("remove retained cleanup victim alias");
+            assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+            test_support::cleanup_renamed_windows_snapshot(&staging, &alternate, &victim, true)
+                .await;
+            assert!(!alternate.exists());
+            assert_eq!(
+                fs::read(&staging).expect("read retained cleanup victim alias"),
+                b"retained cleanup victim"
+            );
+            assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+            fs::remove_file(&staging).expect("remove retained cleanup victim alias");
+        }
     }
 
     #[tokio::test]
