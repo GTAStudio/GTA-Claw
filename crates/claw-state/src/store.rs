@@ -667,6 +667,10 @@ static CHECKPOINT_TEST_BARRIER: std::sync::LazyLock<
 static SNAPSHOT_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, SnapshotTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, unix))]
+static SNAPSHOT_HARDENING_TEST_BARRIER: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, Arc<SnapshotHardeningTestBarrier>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static RESTORE_READ_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
@@ -739,6 +743,25 @@ struct SnapshotTestBarrier {
     temporary: Arc<Mutex<Option<PathBuf>>>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(test, unix))]
+struct SnapshotHardeningTestBarrier {
+    temporary: Arc<Mutex<Option<PathBuf>>>,
+    entered: Arc<tokio::sync::Notify>,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(all(test, unix))]
+impl SnapshotHardeningTestBarrier {
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -2735,7 +2758,7 @@ impl StateStore {
             },
         )
         .await?;
-        let pinned = match PinnedSnapshot::open(&temporary) {
+        let pinned = match PinnedSnapshot::open_cleanup(&temporary) {
             Ok(pinned) => pinned,
             Err(error) => {
                 return Err(cleanup_snapshot_guard_or_error(&mut temporary_guard, error).await);
@@ -4155,25 +4178,27 @@ fn validate_private_database_file(path: &Path, _file: &File) -> Result<(), State
 }
 
 #[cfg(unix)]
-fn secure_private_snapshot_file(path: &Path) -> Result<(), StateError> {
+fn secure_private_snapshot_file(path: &Path, file: &File) -> Result<(), StateError> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let file = open_existing_file_no_follow_writable(path)?;
+    verify_path_identity(path, file)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|error| file_error("secure private SQLite artifact", path, error))?;
-    validate_private_database_file(path, &file)
+    verify_path_identity(path, file)?;
+    validate_private_database_file(path, file)
 }
 
 #[cfg(windows)]
-fn secure_private_snapshot_file(path: &Path) -> Result<(), StateError> {
-    let file = open_windows_security_file(path)?;
-    claw_sqlite_file_control::secure_new_windows_file(&file).map_err(|_| {
+fn secure_private_snapshot_file(path: &Path, file: &File) -> Result<(), StateError> {
+    verify_path_identity(path, file)?;
+    claw_sqlite_file_control::secure_new_windows_file(file).map_err(|_| {
         StateError::InvalidPath {
             path: path.to_owned(),
             reason: "private SQLite artifact security descriptor could not be applied",
         }
     })?;
-    validate_private_database_file(path, &file)
+    verify_path_identity(path, file)?;
+    validate_private_database_file(path, file)
 }
 
 #[cfg(windows)]
@@ -4202,11 +4227,41 @@ fn open_windows_security_file(path: &Path) -> Result<File, StateError> {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn secure_private_snapshot_file(path: &Path) -> Result<(), StateError> {
+fn secure_private_snapshot_file(path: &Path, _file: &File) -> Result<(), StateError> {
     Err(StateError::InvalidPath {
         path: path.to_owned(),
         reason: "private SQLite artifacts are unsupported on this platform",
     })
+}
+
+#[cfg(not(windows))]
+fn create_private_snapshot_file(path: &Path) -> Result<File, StateError> {
+    OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| file_error("create bound snapshot output", path, error))
+}
+
+#[cfg(windows)]
+fn create_private_snapshot_file(path: &Path) -> Result<File, StateError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        WRITE_DAC, WRITE_OWNER,
+    };
+
+    OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| file_error("create bound snapshot output", path, error))
 }
 
 #[cfg(unix)]
@@ -4467,6 +4522,33 @@ fn open_existing_file_no_follow(path: &Path) -> Result<File, StateError> {
         &file
             .metadata()
             .map_err(|error| file_error("inspect Windows file handle", path, error))?,
+    )?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_cleanup_snapshot_file_no_follow(path: &Path) -> Result<File, StateError> {
+    open_existing_file_no_follow(path)
+}
+
+#[cfg(windows)]
+fn open_cleanup_snapshot_file_no_follow(path: &Path) -> Result<File, StateError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| file_error("open cleanup snapshot handle", path, error))?;
+    reject_windows_reparse(
+        path,
+        &file
+            .metadata()
+            .map_err(|error| file_error("inspect cleanup snapshot handle", path, error))?,
     )?;
     Ok(file)
 }
@@ -5161,44 +5243,17 @@ impl SnapshotCleanupGuard {
             }
             return Ok(());
         }
-        #[cfg(unix)]
-        {
-            let expected = open_existing_file_no_follow_writable(&self.path)?;
-            if !files_share_identity_from_handles_portable(file, &expected)? {
-                return Err(StateError::InvalidPath {
-                    path: self.path.clone(),
-                    reason: "cleanup writable handle does not match staging file",
-                });
-            }
-            self.expected_file = Some(expected);
-        }
+        let expected = file
+            .try_clone()
+            .map_err(|error| file_error("clone cleanup identity handle", &self.path, error))?;
         #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            };
-
-            let expected = OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&self.path)
-                .map_err(|error| file_error("open cleanup identity handle", &self.path, error))?;
-            reject_windows_reparse(
-                &self.path,
-                &expected.metadata().map_err(|error| {
-                    file_error("inspect cleanup identity handle", &self.path, error)
-                })?,
-            )?;
-            if !files_share_identity_from_handles_portable(file, &expected)? {
-                return Err(StateError::InvalidPath {
-                    path: self.path.clone(),
-                    reason: "cleanup identity handle does not match staging file",
-                });
-            }
-            self.expected_file = Some(expected);
-        }
+        reject_windows_reparse(
+            &self.path,
+            &expected.metadata().map_err(|error| {
+                file_error("inspect cleanup identity handle", &self.path, error)
+            })?,
+        )?;
+        self.expected_file = Some(expected);
         Ok(())
     }
 
@@ -5539,7 +5594,33 @@ impl SnapshotCleanupGuard {
             self.state = SnapshotPublicationState::Reclaimed;
             Ok(())
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let expected = self
+                .expected_file
+                .as_ref()
+                .expect("snapshot cleanup identity remains owned");
+            let deletion =
+                claw_sqlite_file_control::reopen_file_for_deletion(expected).map_err(|error| {
+                    file_error(
+                        "derive held snapshot cleanup deletion handle",
+                        &self.path,
+                        std::io::Error::other(error.to_string()),
+                    )
+                })?;
+            claw_sqlite_file_control::delete_file_by_handle(&deletion).map_err(|error| {
+                file_error(
+                    "mark held snapshot cleanup artifact for deletion",
+                    &self.path,
+                    std::io::Error::other(error.to_string()),
+                )
+            })?;
+            self.expected_file.take();
+            drop(deletion);
+            self.state = SnapshotPublicationState::Reclaimed;
+            Ok(())
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             for artifact in artifacts.into_iter().take(1) {
@@ -7110,6 +7191,13 @@ async fn discard_backup_connections_or_error(
 impl PinnedSnapshot {
     fn open(path: &Path) -> Result<Self, StateError> {
         let file = open_existing_file_no_follow(path)?;
+        verify_path_identity(path, &file)?;
+        reject_hard_link(path, &file)?;
+        Self::from_file(path, file)
+    }
+
+    fn open_cleanup(path: &Path) -> Result<Self, StateError> {
+        let file = open_cleanup_snapshot_file_no_follow(path)?;
         verify_path_identity(path, &file)?;
         reject_hard_link(path, &file)?;
         Self::from_file(path, file)
@@ -10479,6 +10567,32 @@ async fn wait_at_checkpoint_test_barrier(path: &Path) {
     }
 }
 
+#[cfg(all(test, unix))]
+fn wait_at_snapshot_hardening_test_barrier(destination: &Path, temporary: &Path) {
+    let barrier = SNAPSHOT_HARDENING_TEST_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(destination)
+        .cloned();
+    if let Some(barrier) = barrier {
+        *barrier
+            .temporary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(temporary.to_owned());
+        barrier.entered.notify_one();
+        let mut released = barrier
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = barrier
+                .changed
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
 #[cfg(test)]
 async fn wait_at_restore_read_test_barrier(destination: &Path) {
     let barrier = RESTORE_READ_TEST_BARRIER
@@ -11049,7 +11163,7 @@ async fn materialize_authenticated_snapshot(
                             .to_owned(),
                     });
                 }
-                secure_private_snapshot_file(&inspection_destination)
+                secure_private_snapshot_file(&inspection_destination, expected_file)
             })();
             Ok(match result {
                 Ok(()) => Ok(output_guard
@@ -11275,17 +11389,12 @@ fn create_bound_snapshot_output(
     ensure_creation_allowed()?;
     let creation_lock = acquire_creation_lock(destination)?;
     ensure_creation_allowed()?;
-    let file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(destination)
-        .map_err(|error| file_error("create bound snapshot output", destination, error))?;
+    let file = create_private_snapshot_file(destination)?;
     if let Some(guard) = output_guard {
         guard.bind_file(&file)?;
     }
     ensure_creation_allowed()?;
-    secure_private_snapshot_file(destination)?;
+    secure_private_snapshot_file(destination, &file)?;
     ensure_creation_allowed()?;
     mark_snapshot_staging(destination, &file)?;
     ensure_creation_allowed()?;
@@ -12309,7 +12418,16 @@ async fn backup_pool(
         "SQLite backup",
         timeout_ms,
         move || {
-            if let Err(error) = secure_private_snapshot_file(&inspection_temporary) {
+            let expected_file = temporary_guard
+                .as_ref()
+                .expect("backup inspection guard remains owned")
+                .snapshot
+                .expected_file
+                .as_ref()
+                .expect("backup output identity was bound before inspection");
+            #[cfg(all(test, unix))]
+            wait_at_snapshot_hardening_test_barrier(&inspection_destination, &inspection_temporary);
+            if let Err(error) = secure_private_snapshot_file(&inspection_temporary, expected_file) {
                 return Ok(Err((
                     error,
                     None,
@@ -12318,7 +12436,7 @@ async fn backup_pool(
                         .expect("failed backup inspection guard is delivered once"),
                 )));
             }
-            let pinned = match PinnedSnapshot::open(&inspection_temporary) {
+            let pinned = match PinnedSnapshot::open_cleanup(&inspection_temporary) {
                 Ok(pinned) => pinned,
                 Err(error) => {
                     return Ok(Err((
@@ -13716,6 +13834,61 @@ pub(crate) mod test_support {
                 },
             );
         (temporary, entered, release)
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct SnapshotHardeningBarrier {
+        destination: std::path::PathBuf,
+        state: std::sync::Arc<super::SnapshotHardeningTestBarrier>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for SnapshotHardeningBarrier {
+        fn drop(&mut self) {
+            self.state.release();
+            let mut barriers = super::SNAPSHOT_HARDENING_TEST_BARRIER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if barriers
+                .get(&self.destination)
+                .is_some_and(|barrier| std::sync::Arc::ptr_eq(barrier, &self.state))
+            {
+                barriers.remove(&self.destination);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_snapshot_hardening_barrier(
+        destination: &Path,
+    ) -> (
+        SnapshotHardeningBarrier,
+        std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let destination = super::resolve_database_path(destination)
+            .expect("resolve snapshot hardening barrier path");
+        let temporary = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state = std::sync::Arc::new(super::SnapshotHardeningTestBarrier {
+            temporary: std::sync::Arc::clone(&temporary),
+            entered: std::sync::Arc::clone(&entered),
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        });
+        let previous = super::SNAPSHOT_HARDENING_TEST_BARRIER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination.clone(), std::sync::Arc::clone(&state));
+        assert!(
+            previous.is_none(),
+            "snapshot hardening barrier must be unique"
+        );
+        (
+            SnapshotHardeningBarrier { destination, state },
+            temporary,
+            entered,
+        )
     }
 
     pub(crate) fn set_restore_read_barrier(

@@ -3296,10 +3296,35 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn substituted_backup_temporary_never_mutates_victim() {
+        use std::os::unix::fs::MetadataExt as _;
+        use xattr::FileExt as _;
+
+        const CHILD_ENV: &str = "GTA_CLAW_SNAPSHOT_HARDENING_SUBSTITUTION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let status =
+                Command::new(std::env::current_exe().expect("current state test executable"))
+                    .arg("--exact")
+                    .arg("tests::substituted_backup_temporary_never_mutates_victim")
+                    .arg("--nocapture")
+                    .arg("--test-threads=1")
+                    .env(CHILD_ENV, "1")
+                    .status()
+                    .expect("run isolated snapshot hardening substitution test");
+            assert!(
+                status.success(),
+                "isolated snapshot hardening substitution test failed"
+            );
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("temporary directory");
         let source_path = database_path(&directory, "substitution-source.sqlite");
         let victim_path = database_path(&directory, "substitution-victim.sqlite");
         let destination = database_path(&directory, "substitution-destination.sqlite");
+        let restore_destination = database_path(&directory, "substitution-restore.sqlite");
         let source = std::sync::Arc::new(open(&source_path).await);
         let victim = open(&victim_path).await;
         let victim_record = session("victim-session", 1);
@@ -3314,8 +3339,46 @@ mod tests {
         .fetch_one(test_support::pool(&victim))
         .await
         .expect("read victim owner");
+        let victim_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&victim_path)
+            .expect("open victim identity");
+        let victim_bytes_before = fs::read(&victim_path).expect("read victim bytes");
+        let victim_metadata_before = victim_file.metadata().expect("inspect victim metadata");
+        let victim_xattrs_before = victim_file
+            .list_xattr()
+            .expect("list victim xattrs")
+            .map(|name| {
+                let value = victim_file
+                    .get_xattr(&name)
+                    .expect("read victim xattr value");
+                (name, value)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(
+            claw_sqlite_file_control::unix_file_is_service_private(
+                &victim_file,
+                victim_metadata_before.uid(),
+                0o600,
+            )
+            .expect("validate victim ACL")
+        );
+        assert!(
+            victim_file
+                .get_xattr("user.gta-claw.backup-seal-id")
+                .expect("inspect victim backup seal")
+                .is_none()
+        );
+        assert!(
+            victim_file
+                .get_xattr("user.gta-claw.snapshot-staging")
+                .expect("inspect victim staging marker")
+                .is_none()
+        );
 
-        let (temporary, entered, release) = test_support::set_snapshot_barrier(&destination);
+        let (hardening_barrier, temporary, entered) =
+            test_support::set_snapshot_hardening_barrier(&destination);
         let backup_source = std::sync::Arc::clone(&source);
         let backup_destination = destination.clone();
         let mut backup =
@@ -3328,9 +3391,13 @@ mod tests {
             .expect("snapshot temporary path lock poisoned")
             .clone()
             .expect("snapshot temporary path published");
+        assert_eq!(
+            temporary, destination,
+            "backup hardens its staging-bound destination directly"
+        );
         fs::remove_file(&temporary).expect("unlink pinned backup temporary");
         fs::hard_link(&victim_path, &temporary).expect("substitute victim hard link");
-        release.notify_one();
+        drop(hardening_barrier);
 
         let backup_result = match tokio::time::timeout(Duration::from_secs(2), &mut backup).await {
             Ok(join) => join.expect("backup substitution task joins"),
@@ -3345,7 +3412,45 @@ mod tests {
             temporary.exists(),
             "identity-bound cleanup must not delete the substituted victim link"
         );
-        assert!(!destination.exists());
+        let destination_metadata =
+            fs::metadata(&destination).expect("inspect substituted destination");
+        assert_eq!(destination_metadata.dev(), victim_metadata_before.dev());
+        assert_eq!(destination_metadata.ino(), victim_metadata_before.ino());
+        assert_eq!(
+            fs::read(&victim_path).expect("reread victim bytes"),
+            victim_bytes_before
+        );
+        let victim_metadata_after = victim_file.metadata().expect("reinspect victim metadata");
+        assert_eq!(victim_metadata_after.len(), victim_metadata_before.len());
+        assert_eq!(victim_metadata_after.uid(), victim_metadata_before.uid());
+        assert_eq!(
+            victim_metadata_after.mode() & 0o7777,
+            victim_metadata_before.mode() & 0o7777
+        );
+        assert_eq!(
+            victim_metadata_after.nlink(),
+            victim_metadata_before.nlink() + 1,
+            "only the attacker-created alias changes victim link count"
+        );
+        let victim_xattrs_after = victim_file
+            .list_xattr()
+            .expect("relist victim xattrs")
+            .map(|name| {
+                let value = victim_file
+                    .get_xattr(&name)
+                    .expect("reread victim xattr value");
+                (name, value)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(victim_xattrs_after, victim_xattrs_before);
+        assert!(
+            claw_sqlite_file_control::unix_file_is_service_private(
+                &victim_file,
+                victim_metadata_before.uid(),
+                0o600,
+            )
+            .expect("revalidate victim ACL")
+        );
         let owner_after = sqlx::query_scalar::<_, String>(
             "SELECT owner FROM claw_writer_lock WHERE singleton = 1",
         )
@@ -3360,6 +3465,30 @@ mod tests {
                 .await
                 .expect("read untouched victim data"),
             Some(victim_record)
+        );
+        StateStore::restore_backup(&destination, &restore_destination)
+            .await
+            .expect_err("attacker alias has no trusted backup provenance");
+        assert!(!restore_destination.exists());
+        assert!(
+            victim_file
+                .get_xattr("user.gta-claw.backup-seal-id")
+                .expect("reinspect victim backup seal")
+                .is_none()
+        );
+        assert!(
+            victim_file
+                .get_xattr("user.gta-claw.snapshot-staging")
+                .expect("reinspect victim staging marker")
+                .is_none()
+        );
+        fs::remove_file(&destination).expect("remove attacker-created alias after proof");
+        assert_eq!(
+            victim_file
+                .metadata()
+                .expect("inspect victim after alias removal")
+                .nlink(),
+            victim_metadata_before.nlink()
         );
         victim.close().await.expect("victim closes");
         let source = std::sync::Arc::try_unwrap(source)

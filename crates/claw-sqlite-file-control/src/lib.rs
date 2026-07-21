@@ -8020,6 +8020,68 @@ pub fn secure_new_windows_file(file: &std::fs::File) -> Result<(), FileControlEr
     result
 }
 
+/// Marks the exact held Windows file object for deletion when its final handle closes.
+#[cfg(windows)]
+pub fn delete_file_by_handle(file: &std::fs::File) -> Result<(), FileControlError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the caller supplies a live file handle opened with DELETE access;
+    // SetFileInformationByHandle borrows the fixed-size disposition structure.
+    let result = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                .expect("file disposition structure size fits u32"),
+        )
+    };
+    if result == 0 {
+        Err(FileControlError::Handle(format!(
+            "mark held Windows file for deletion: {}",
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Derives a DELETE-capable handle for the exact held Windows file object.
+#[cfg(windows)]
+pub fn reopen_file_for_deletion(file: &std::fs::File) -> Result<std::fs::File, FileControlError> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        ReOpenFile,
+    };
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+
+    // SAFETY: ReOpenFile derives a new handle for the exact live file object and
+    // does not resolve a pathname.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            DELETE_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(FileControlError::Handle(format!(
+            "derive held Windows deletion handle: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: ReOpenFile returned a fresh uniquely owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    Ok(std::fs::File::from(handle))
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
@@ -12403,5 +12465,57 @@ mod windows_tests {
         let rejected =
             unsafe { reject_unbound_windows_commit((&raw mut context).cast::<std::ffi::c_void>()) };
         assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn held_handle_deletion_never_deletes_substituted_path() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let directory = tempfile::tempdir().expect("held deletion directory");
+        let original = directory.path().join("original.tmp");
+        let detached = directory.path().join("detached.tmp");
+        let victim = directory.path().join("victim.txt");
+        let mut held = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&original)
+            .expect("create held deletion fixture");
+        held.write_all(b"original")
+            .and_then(|()| held.sync_all())
+            .expect("persist held deletion fixture");
+        let first_clone = held.try_clone().expect("clone held deletion fixture");
+        let second_clone = held.try_clone().expect("clone held deletion fixture again");
+        std::fs::write(&victim, b"victim").expect("create held deletion victim");
+        std::fs::rename(&original, &detached).expect("detach held original path");
+        std::fs::hard_link(&victim, &original).expect("substitute victim at original path");
+
+        let deletion = reopen_file_for_deletion(&held).expect("derive exact held deletion handle");
+        delete_file_by_handle(&deletion).expect("mark exact held original for deletion");
+        assert_eq!(
+            std::fs::read(&original).expect("read substituted victim"),
+            b"victim"
+        );
+        drop(first_clone);
+        drop(second_clone);
+        drop(held);
+        drop(deletion);
+        assert!(!detached.exists(), "final close deletes only held original");
+        assert_eq!(
+            std::fs::read(&original).expect("reread substituted victim"),
+            b"victim"
+        );
+
+        let read_only = std::fs::File::open(&victim).expect("open victim without DELETE access");
+        assert!(matches!(
+            delete_file_by_handle(&read_only),
+            Err(FileControlError::Handle(_))
+        ));
+        std::fs::remove_file(&original).expect("remove attacker alias");
     }
 }
