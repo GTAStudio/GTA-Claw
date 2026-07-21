@@ -3635,6 +3635,86 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         )
     }
 
+    /// Deletes one exact writer claim under an absolute progress deadline.
+    pub async fn delete_writer_claim_with_deadline(
+        &mut self,
+        owner: &str,
+        deadline: std::time::Instant,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<u64, FileControlError> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            FileControlError::Handle("transaction connection is missing".to_owned())
+        })?;
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| FileControlError::Handle("transaction token is missing".to_owned()))?;
+        validate_terminal_transaction_state(token)?;
+        let mut database = connection
+            .inner
+            .sqlite()
+            .lock_handle()
+            .await
+            .map_err(|error| FileControlError::Handle(error.to_string()))?;
+        if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+        }
+        let database = LiveInterruptPointer(database.as_raw_handle());
+        let mut progress = RawDeadlineContext {
+            deadline,
+            cancelled,
+        };
+        // SAFETY: the locked handle and stack context remain live through statement finalization.
+        unsafe {
+            libsqlite3_sys::sqlite3_progress_handler(
+                database.as_ptr(),
+                1,
+                Some(raw_deadline_progress),
+                (&raw mut progress).cast(),
+            );
+        }
+        let _progress = RawProgressRegistration(database);
+        let mut statement = std::ptr::null_mut();
+        // SAFETY: no await occurs between the cutoff check and statement dispatch.
+        let prepared = unsafe {
+            libsqlite3_sys::sqlite3_prepare_v2(
+                database.as_ptr(),
+                c"DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?".as_ptr(),
+                -1,
+                &raw mut statement,
+                std::ptr::null_mut(),
+            )
+        };
+        if prepared != libsqlite3_sys::SQLITE_OK {
+            return Err(FileControlError::SQLite(prepared));
+        }
+        let statement = RawStatement(statement);
+        let owner = std::ffi::CString::new(owner)
+            .map_err(|_| FileControlError::Handle("writer owner contains NUL".to_owned()))?;
+        // SAFETY: SQLITE_TRANSIENT copies the owner bytes before this call returns.
+        let bound = unsafe {
+            libsqlite3_sys::sqlite3_bind_text(
+                statement.0,
+                1,
+                owner.as_ptr(),
+                -1,
+                libsqlite3_sys::SQLITE_TRANSIENT(),
+            )
+        };
+        if bound != libsqlite3_sys::SQLITE_OK {
+            return Err(FileControlError::SQLite(bound));
+        }
+        // SAFETY: the prepared statement and deadline context remain live.
+        let stepped = unsafe { libsqlite3_sys::sqlite3_step(statement.0) };
+        if stepped != libsqlite3_sys::SQLITE_DONE {
+            return Err(FileControlError::SQLite(stepped));
+        }
+        // SAFETY: this worker exclusively owns the connection.
+        let changed = unsafe { libsqlite3_sys::sqlite3_changes64(database.as_ptr()) };
+        u64::try_from(changed)
+            .map_err(|_| FileControlError::Handle("negative SQLite change count".to_owned()))
+    }
+
     /// Commits and returns the owned connection only after SQLite reaches autocommit.
     pub async fn commit(mut self) -> Result<Connection, FileControlError> {
         let result = commit_synchronously(
@@ -6807,6 +6887,135 @@ pub async fn set_busy_timeout(
     } else {
         Err(FileControlError::SQLite(result))
     }
+}
+
+struct RawDeadlineContext {
+    deadline: std::time::Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+unsafe extern "C" fn raw_deadline_progress(context: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: the raw operation owns this context for the complete registration.
+    let context = unsafe { &*context.cast::<RawDeadlineContext>() };
+    i32::from(
+        context.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= context.deadline,
+    )
+}
+
+struct RawStatement(*mut libsqlite3_sys::sqlite3_stmt);
+
+impl Drop for RawStatement {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns the prepared statement.
+        unsafe {
+            libsqlite3_sys::sqlite3_finalize(self.0);
+        }
+    }
+}
+
+struct ApplicationIdReadContext {
+    deadline: std::time::Instant,
+    cancelled: Arc<AtomicBool>,
+    value: Option<i64>,
+}
+
+unsafe extern "C" fn application_id_progress(context: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: the raw read owns this context for the complete registration.
+    let context = unsafe { &*context.cast::<ApplicationIdReadContext>() };
+    i32::from(
+        context.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= context.deadline,
+    )
+}
+
+unsafe extern "C" fn capture_application_id(
+    context: *mut std::ffi::c_void,
+    columns: i32,
+    values: *mut *mut std::ffi::c_char,
+    _names: *mut *mut std::ffi::c_char,
+) -> i32 {
+    if columns != 1 || values.is_null() {
+        return 1;
+    }
+    // SAFETY: SQLite supplies one value pointer for the callback invocation.
+    let value = unsafe { *values };
+    if value.is_null() {
+        return 1;
+    }
+    // SAFETY: SQLite supplies a NUL-terminated text representation.
+    let value = unsafe { std::ffi::CStr::from_ptr(value) };
+    let Some(value) = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return 1;
+    };
+    // SAFETY: the raw read owns this context for the callback lifetime.
+    unsafe { &mut *context.cast::<ApplicationIdReadContext>() }.value = Some(value);
+    0
+}
+
+struct RawProgressRegistration(LiveInterruptPointer);
+
+impl Drop for RawProgressRegistration {
+    fn drop(&mut self) {
+        // SAFETY: the registration guard remains within the locked handle scope.
+        unsafe {
+            libsqlite3_sys::sqlite3_progress_handler(
+                self.0.as_ptr(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+/// Reads `PRAGMA application_id` without releasing ownership across the absolute cutoff.
+pub async fn read_application_id_with_deadline(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    deadline: std::time::Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<i64, FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+    }
+    let database = LiveInterruptPointer(database.as_raw_handle());
+    let mut context = ApplicationIdReadContext {
+        deadline,
+        cancelled,
+        value: None,
+    };
+    // SAFETY: the locked handle and stack context remain live until registration clear.
+    unsafe {
+        libsqlite3_sys::sqlite3_progress_handler(
+            database.as_ptr(),
+            1,
+            Some(application_id_progress),
+            (&raw mut context).cast(),
+        );
+    }
+    let _registration = RawProgressRegistration(database);
+    // SAFETY: no await occurs between the cutoff check and raw dispatch.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_exec(
+            database.as_ptr(),
+            c"PRAGMA application_id".as_ptr(),
+            Some(capture_application_id),
+            (&raw mut context).cast(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    context.value.ok_or_else(|| {
+        FileControlError::Handle("PRAGMA application_id returned no value".to_owned())
+    })
 }
 
 /// Installs a commit hook that rolls back if SQLite's main file was moved.

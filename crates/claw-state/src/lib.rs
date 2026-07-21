@@ -1235,7 +1235,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("late-claim capacity directory");
         let path = database_path(&directory, "late-claim-capacity.sqlite");
-        let (entered, _release) = test_support::set_open_precommit_barrier(&path);
+        let (entered, release) = test_support::set_open_initialization_barrier(&path);
         let open_path = path.clone();
         let opening = tokio::spawn(async move {
             StateStore::open(
@@ -1245,7 +1245,7 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
             .await
-            .expect("open reaches precommit capacity fence");
+            .expect("open reaches pre-transaction capacity fence");
         let blockers = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "late-claim-capacity-blocker",
             60,
@@ -1253,6 +1253,7 @@ mod tests {
         )
         .await
         .expect("saturate late-claim cleanup capacity");
+        release.notify_one();
         let error = match opening.await.expect("capacity-bound open task joins") {
             Err(error) => error,
             Ok(store) => {
@@ -1283,6 +1284,98 @@ mod tests {
             .close()
             .await
             .expect("capacity-rejected store closes");
+    }
+
+    #[tokio::test]
+    async fn open_actor_survives_caller_runtime_drop_before_and_after_construction() {
+        const CHILD_ENV: &str = "GTA_CLAW_OPEN_ACTOR_RUNTIME_DROP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::open_actor_survives_caller_runtime_drop_before_and_after_construction")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated open actor runtime-drop test");
+            assert!(status.success(), "isolated open actor test failed");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("open actor runtime-drop directory");
+        let close_capacity = test_support::available_close_retention_slots();
+        for postcommit in [false, true] {
+            let path = database_path(
+                &directory,
+                if postcommit {
+                    "actor-postcommit.sqlite"
+                } else {
+                    "actor-initialization.sqlite"
+                },
+            );
+            let (entered, release) = if postcommit {
+                test_support::set_open_postcommit_hold_barrier(&path)
+            } else {
+                test_support::set_open_initialization_barrier(&path)
+            };
+            let drop_runtime = std::sync::Arc::new(tokio::sync::Notify::new());
+            let thread_drop = std::sync::Arc::clone(&drop_runtime);
+            let open_path = path.clone();
+            let caller = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build disposable caller runtime");
+                runtime.block_on(async move {
+                    let _opening = tokio::spawn(async move {
+                        StateStore::open(
+                            StoreConfig::new(open_path).with_open_timeout(Duration::from_secs(2)),
+                        )
+                        .await
+                    });
+                    thread_drop.notified().await;
+                });
+            });
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("runtime-independent actor reaches configured gate");
+            drop_runtime.notify_one();
+            tokio::task::spawn_blocking(move || caller.join())
+                .await
+                .expect("caller runtime thread joins")
+                .expect("caller runtime exits cleanly");
+            assert!(
+                StateStore::open(
+                    StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)),
+                )
+                .await
+                .is_err(),
+                "actor retains exclusive ownership after caller runtime destruction"
+            );
+            release.notify_one();
+            let reopened = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match StateStore::open(StoreConfig::new(&path)).await {
+                        Ok(store) => break store,
+                        Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("actor cleanup reopen failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("actor releases ownership after gate release");
+            reopened.close().await.expect("actor cleanup reopen closes");
+        }
+        assert_eq!(
+            test_support::available_close_retention_slots(),
+            close_capacity
+        );
+        assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
     }
 
     #[tokio::test]
@@ -1458,6 +1551,41 @@ mod tests {
             .close()
             .await
             .expect("recovered expired-undelivered store closes");
+    }
+
+    #[tokio::test]
+    async fn undelivered_cleanup_never_dispatches_sql_after_work_cutoff() {
+        let directory = tempfile::tempdir().expect("gated undelivered directory");
+        for after_delete in [false, true] {
+            let path = database_path(
+                &directory,
+                if after_delete {
+                    "gated-after-delete.sqlite"
+                } else {
+                    "gated-after-begin.sqlite"
+                },
+            );
+            let store = open(&path).await;
+            let (entered, release, deadline_state) =
+                test_support::handoff_gated_undelivered_store(store, after_delete).await;
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("undelivered cleanup reaches exact SQL boundary");
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            release.notify_one();
+            test_support::wait_for_undelivered_completion(&deadline_state).await;
+            let reopened = StateStore::open(StoreConfig::new(&path))
+                .await
+                .expect("gated undelivered store reopens");
+            assert!(
+                reopened.recovered_writer().is_some(),
+                "post-cutoff cleanup leaves a durable recoverable claim"
+            );
+            reopened
+                .close()
+                .await
+                .expect("gated undelivered store closes");
+        }
     }
 
     #[tokio::test]
