@@ -153,6 +153,13 @@ fn append_committed_cleanup(
     additional: impl std::fmt::Display,
 ) -> FileControlError {
     match error {
+        FileControlError::CommittedAfterDeadline(cleanup) => {
+            let cleanup = cleanup.map_or_else(
+                || additional.to_string(),
+                |cleanup| format!("{cleanup}; {additional}"),
+            );
+            FileControlError::CommittedAfterDeadline(Some(cleanup))
+        }
         FileControlError::CommittedWithCleanupFailure(cleanup) => {
             FileControlError::CommittedWithCleanupFailure(format!("{cleanup}; {additional}"))
         }
@@ -443,6 +450,7 @@ struct CleanupEnvelope {
     callback_retention: Option<Box<dyn RetainedDestructor>>,
     reservation: DropSlot<CleanupReservation>,
     retirement_reservation: DropSlot<TerminalCloseReservation>,
+    capacity_completion: Option<(Arc<AtomicU8>, u8)>,
 }
 
 struct CleanupExecutor {
@@ -669,6 +677,12 @@ static CLEANUP_EXECUTOR: std::sync::LazyLock<Result<CleanupExecutor, String>> =
                             job(&runtime);
                         })) {
                             Ok(()) => {
+                                if let Some((signal, completed_state)) =
+                                    envelope.capacity_completion.take()
+                                {
+                                    envelope.reservation.take();
+                                    signal.store(completed_state, Ordering::Release);
+                                }
                                 let retire = TerminalCloseEnvelope {
                                     job: DropSlot::new(Box::new(|_| {
                                         TerminalJobDisposition::Completed
@@ -1359,6 +1373,20 @@ impl BlockingCleanupOwner {
         Cleanup:
             FnMut(&tokio::runtime::Runtime, &mut TerminalCloseBatch, &Payload) + Send + 'static,
     {
+        self.handoff_payload_internal_with_completion(payload, None, cleanup)
+    }
+
+    fn handoff_payload_internal_with_completion<Payload, Cleanup>(
+        &mut self,
+        payload: Payload,
+        completion_signal: Option<(Arc<AtomicU8>, u8)>,
+        cleanup: Cleanup,
+    ) -> Result<(), String>
+    where
+        Payload: Send + 'static,
+        Cleanup:
+            FnMut(&tokio::runtime::Runtime, &mut TerminalCloseBatch, &Payload) + Send + 'static,
+    {
         let reservation = self
             .reservation
             .take()
@@ -1393,6 +1421,7 @@ impl BlockingCleanupOwner {
             callback_retention: Some(Box::new(cleanup)),
             reservation: DropSlot::new(reservation),
             retirement_reservation: DropSlot::new(retirement_reservation),
+            capacity_completion: completion_signal,
         };
         let executor = match CLEANUP_EXECUTOR.as_ref() {
             Ok(executor) => executor,
@@ -1445,6 +1474,7 @@ impl BlockingCleanupOwner {
             callback_retention: None,
             reservation: DropSlot::new(reservation),
             retirement_reservation: DropSlot::new(retirement_reservation),
+            capacity_completion: None,
         };
         let executor = match CLEANUP_EXECUTOR.as_ref() {
             Ok(executor) => executor,
@@ -1483,6 +1513,55 @@ impl Drop for BlockingCleanupOwner {
         self.terminal_closes.take();
         self.retirement_reservation.take();
     }
+}
+
+const OWNER_TERMINALLY_RETIRED: u8 = 2;
+
+async fn wait_for_cleanup_owner_retirement(
+    signal: &AtomicU8,
+    deadline: std::time::Instant,
+    operation: &'static str,
+) -> Result<(), FileControlError> {
+    while signal.load(Ordering::Acquire) != OWNER_TERMINALLY_RETIRED {
+        if std::time::Instant::now() >= deadline {
+            return Err(FileControlError::Handle(format!(
+                "{operation} owner terminal retirement exceeded its cleanup deadline"
+            )));
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+/// Installs the single BEGIN-worker retirement gate used by dependent crate tests.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn set_begin_worker_retirement_test_gate() -> (Arc<tokio::sync::Notify>, Arc<AtomicBool>) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(AtomicBool::new(false));
+    let mut gate = BEGIN_WORKER_RETIRE_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(gate.is_none(), "BEGIN worker retirement gate is unique");
+    *gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+    (entered, release)
+}
+
+/// Clears the dependent-crate BEGIN-worker retirement gate.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn clear_begin_worker_retirement_test_gate() {
+    BEGIN_WORKER_RETIRE_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+}
+
+/// Returns the exact number of globally charged cleanup owners for quota tests.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn active_cleanup_owner_count_for_test() -> usize {
+    ACTIVE_CLEANUP_JOBS.load(Ordering::Acquire)
 }
 
 /// Returns whether a Unix file has the expected owner/mode and no effective
@@ -1728,6 +1807,8 @@ pub async fn deserialize_readonly(
 pub struct BackupExecutionContext {
     /// Absolute operation deadline.
     pub deadline: std::time::Instant,
+    /// Absolute deadline for terminal worker retirement.
+    pub cleanup_deadline: std::time::Instant,
     /// Shared operation cancellation state.
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Maximum permitted SQLite page count.
@@ -1880,18 +1961,74 @@ where
     Destination: BeginOwnedConnection,
     Reservation: Send + 'static,
 {
-    type BackupWorkerResult<Source, Destination, Reservation> = Result<
-        (
-            Source,
-            Destination,
-            Reservation,
-            TerminalClosePermit,
-            TerminalClosePermit,
-        ),
-        FileControlError,
-    >;
+    struct BackupWorkerDelivery<Source, Destination, Reservation>
+    where
+        Source: BeginOwnedConnection,
+        Destination: BeginOwnedConnection,
+        Reservation: Send + 'static,
+    {
+        source: Option<Source>,
+        destination: Option<Destination>,
+        reservation: Option<Reservation>,
+        source_close: Option<TerminalClosePermit>,
+        destination_close: Option<TerminalClosePermit>,
+    }
 
-    struct BackupWorkerPayload<Source, Destination, Reservation> {
+    impl<Source, Destination, Reservation> BackupWorkerDelivery<Source, Destination, Reservation>
+    where
+        Source: BeginOwnedConnection,
+        Destination: BeginOwnedConnection,
+        Reservation: Send + 'static,
+    {
+        fn accept(mut self) -> (Source, Destination, Reservation) {
+            self.source_close.take();
+            self.destination_close.take();
+            (
+                self.source.take().expect("backup source is delivered once"),
+                self.destination
+                    .take()
+                    .expect("backup destination is delivered once"),
+                self.reservation
+                    .take()
+                    .expect("backup reservation is delivered once"),
+            )
+        }
+    }
+
+    impl<Source, Destination, Reservation> Drop
+        for BackupWorkerDelivery<Source, Destination, Reservation>
+    where
+        Source: BeginOwnedConnection,
+        Destination: BeginOwnedConnection,
+        Reservation: Send + 'static,
+    {
+        fn drop(&mut self) {
+            let (Some(source), Some(destination), Some(reservation)) = (
+                self.source.take(),
+                self.destination.take(),
+                self.reservation.take(),
+            ) else {
+                return;
+            };
+            let retention = Arc::new(std::sync::Mutex::new(Some(reservation)));
+            if let Some(permit) = self.source_close.take() {
+                let _ = permit.submit_retaining(source, Arc::clone(&retention));
+            }
+            if let Some(permit) = self.destination_close.take() {
+                let _ = permit.submit_retaining(destination, retention);
+            }
+        }
+    }
+
+    type BackupWorkerResult<Source, Destination, Reservation> =
+        Result<BackupWorkerDelivery<Source, Destination, Reservation>, FileControlError>;
+
+    struct BackupWorkerPayload<Source, Destination, Reservation>
+    where
+        Source: BeginOwnedConnection,
+        Destination: BeginOwnedConnection,
+        Reservation: Send + 'static,
+    {
         source: Option<Source>,
         destination: Option<Destination>,
         reservation: Option<Reservation>,
@@ -1903,9 +2040,11 @@ where
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
     let deadline = context.deadline;
+    let cleanup_deadline = context.cleanup_deadline;
     let delivery_cancelled = Arc::clone(&context.cancelled);
+    let worker_owner_retired = Arc::new(AtomicU8::new(0));
     worker_owner
-        .handoff_payload_internal(
+        .handoff_payload_internal_with_completion(
         std::sync::Mutex::new(BackupWorkerPayload {
             source: Some(source),
             destination: Some(destination),
@@ -1913,6 +2052,7 @@ where
             close_retention: None,
             result: Some(result_tx),
         }),
+        Some((Arc::clone(&worker_owner_retired), OWNER_TERMINALLY_RETIRED)),
         move |runtime, terminal_closes, payload| {
         let mut payload = payload
             .lock()
@@ -1968,30 +2108,13 @@ where
                 let destination_close_permit = destination_close_permit
                     .take()
                     .expect("backup destination close permit remains owned");
-                if let Err(error) = result_tx.send(Ok((
-                    source,
-                    destination,
-                    reservation,
-                    source_close_permit,
-                    destination_close_permit,
-                ))) && let Ok((
-                    source,
-                    destination,
-                    reservation,
-                    source_close_permit,
-                    destination_close_permit,
-                )) = error.0
-                {
-                    let retention = Arc::new(std::sync::Mutex::new(Some(reservation)));
-                    let source_close =
-                        source_close_permit.submit_retaining(source, Arc::clone(&retention));
-                    let destination_close = destination_close_permit
-                        .submit_retaining(destination, Arc::clone(&retention));
-                    payload.close_retention = Some(retention);
-                    let cutoff = std::time::Instant::now() + TERMINAL_CLOSE_TIMEOUT;
-                    let _ = source_close.wait(cutoff);
-                    let _ = destination_close.wait(cutoff);
-                }
+                let _ = result_tx.send(Ok(BackupWorkerDelivery {
+                    source: Some(source),
+                    destination: Some(destination),
+                    reservation: Some(reservation),
+                    source_close: Some(source_close_permit),
+                    destination_close: Some(destination_close_permit),
+                }));
             }
             Err(error) => {
                 let source = payload.source.take().expect("backup source remains owned");
@@ -2032,35 +2155,51 @@ where
         },
         )
         .map_err(FileControlError::Handle)?;
-    let cleanup_cutoff = deadline + std::time::Duration::from_secs(5);
     loop {
         match result_rx.try_recv() {
-            Ok(Ok((
-                source,
-                destination,
-                reservation,
-                source_close_permit,
-                destination_close_permit,
-            ))) => {
+            Ok(Ok(delivery)) => {
                 if delivery_cancelled.load(Ordering::Acquire)
                     || std::time::Instant::now() >= deadline
                 {
-                    let retention = Arc::new(std::sync::Mutex::new(Some(reservation)));
-                    let source_close =
-                        source_close_permit.submit_retaining(source, Arc::clone(&retention));
-                    let destination_close = destination_close_permit
-                        .submit_retaining(destination, Arc::clone(&retention));
-                    let cutoff = std::time::Instant::now() + TERMINAL_CLOSE_TIMEOUT;
-                    let _ = source_close.wait(cutoff);
-                    let _ = destination_close.wait(cutoff);
+                    drop(delivery);
                     return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
                 }
-                drop((source_close_permit, destination_close_permit));
-                return Ok((source, destination, reservation));
+                if let Err(retirement) = wait_for_cleanup_owner_retirement(
+                    &worker_owner_retired,
+                    cleanup_deadline,
+                    "logical backup worker",
+                )
+                .await
+                {
+                    drop(delivery);
+                    return Err(retirement);
+                }
+                if delivery_cancelled.load(Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline
+                {
+                    drop(delivery);
+                    return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+                }
+                return Ok(delivery.accept());
             }
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => {
+                return Err(
+                    match wait_for_cleanup_owner_retirement(
+                        &worker_owner_retired,
+                        cleanup_deadline,
+                        "logical backup worker",
+                    )
+                    .await
+                    {
+                        Ok(()) => error,
+                        Err(retirement) => {
+                            FileControlError::Handle(format!("{error}; {retirement}"))
+                        }
+                    },
+                );
+            }
             Err(std::sync::mpsc::TryRecvError::Empty)
-                if std::time::Instant::now() < cleanup_cutoff =>
+                if std::time::Instant::now() < cleanup_deadline =>
             {
                 tokio::task::yield_now().await;
             }
@@ -3898,13 +4037,15 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         let identity_veto_fallback = Arc::new(std::sync::Mutex::new(None));
         let worker_identity_veto_fallback = Arc::clone(&identity_veto_fallback);
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let commit_owner_retired = Arc::new(AtomicU8::new(0));
         cleanup_owner
-            .handoff_payload_internal(
+            .handoff_payload_internal_with_completion(
                 std::sync::Mutex::new(CommitWorkerPayload {
                     connection: Some(connection),
                     token: Some(token),
                     result: Some(result_tx),
                 }),
+                Some((Arc::clone(&commit_owner_retired), OWNER_TERMINALLY_RETIRED)),
                 move |runtime, terminal_closes, payload| {
                     let mut payload = payload
                         .lock()
@@ -4179,20 +4320,80 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                     loop {
                         match CommitDelivery::cleanup_result(&cleanup) {
                             Some(cleanup) => {
-                                return Err(FileControlError::CommittedAfterDeadline(cleanup));
+                                let primary = FileControlError::CommittedAfterDeadline(cleanup);
+                                return Err(
+                                    match wait_for_cleanup_owner_retirement(
+                                        &commit_owner_retired,
+                                        cleanup_deadline,
+                                        "COMMIT worker",
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => primary,
+                                        Err(retirement) => {
+                                            append_committed_cleanup(primary, retirement)
+                                        }
+                                    },
+                                );
                             }
                             None if std::time::Instant::now() < cleanup_deadline => {
                                 tokio::task::yield_now().await;
                             }
                             None => {
-                                return Err(FileControlError::CommittedAfterDeadline(Some(
+                                let primary = FileControlError::CommittedAfterDeadline(Some(
                                     "late COMMIT result cleanup exceeded its cutoff".to_owned(),
-                                )));
+                                ));
+                                return Err(
+                                    match wait_for_cleanup_owner_retirement(
+                                        &commit_owner_retired,
+                                        cleanup_deadline,
+                                        "COMMIT worker",
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => primary,
+                                        Err(retirement) => {
+                                            append_committed_cleanup(primary, retirement)
+                                        }
+                                    },
+                                );
                             }
                         }
                     }
                 }
                 Ok(Ok(delivery)) => {
+                    if let Err(retirement) = wait_for_cleanup_owner_retirement(
+                        &commit_owner_retired,
+                        cleanup_deadline,
+                        "COMMIT worker",
+                    )
+                    .await
+                    {
+                        drop(delivery);
+                        return Err(FileControlError::CommittedAfterDeadline(Some(
+                            retirement.to_string(),
+                        )));
+                    }
+                    if delivery_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                        || std::time::Instant::now() >= deadline
+                    {
+                        let cleanup = delivery.request_cleanup();
+                        loop {
+                            match CommitDelivery::cleanup_result(&cleanup) {
+                                Some(cleanup) => {
+                                    return Err(FileControlError::CommittedAfterDeadline(cleanup));
+                                }
+                                None if std::time::Instant::now() < cleanup_deadline => {
+                                    tokio::task::yield_now().await;
+                                }
+                                None => {
+                                    return Err(FileControlError::CommittedAfterDeadline(Some(
+                                        "late COMMIT result cleanup exceeded its cutoff".to_owned(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
                     return delivery.accept().map(|connection| {
                         (
                             connection,
@@ -4202,7 +4403,20 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                         )
                     });
                 }
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    return Err(
+                        match wait_for_cleanup_owner_retirement(
+                            &commit_owner_retired,
+                            cleanup_deadline,
+                            "COMMIT worker",
+                        )
+                        .await
+                        {
+                            Ok(()) => error,
+                            Err(retirement) => append_committed_cleanup(error, retirement),
+                        },
+                    );
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= cleanup_deadline {
                         if let Some(veto) = identity_veto_fallback
@@ -5678,12 +5892,18 @@ static FAIL_AUTHORIZER_DETACH_GENERATIONS: std::sync::LazyLock<
 static FAIL_BEGIN_BUSY_RESTORE_NONCES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 type ApplicationIdPostExecGate = (Arc<tokio::sync::Notify>, Arc<AtomicBool>);
 #[cfg(test)]
 static APPLICATION_ID_POST_EXEC_TEST_GATE: std::sync::LazyLock<
     std::sync::Mutex<Option<ApplicationIdPostExecGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(any(test, feature = "test-hooks"))]
+static BEGIN_WORKER_RETIRE_TEST_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<ApplicationIdPostExecGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
+static BEGIN_WORKER_RETIRE_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[cfg(test)]
 static DROPPED_AUTHORIZER_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, usize>>,
@@ -5820,6 +6040,7 @@ struct OwnedBeginGuard<Connection: BeginOwnedConnection> {
     command: Option<std::sync::mpsc::Sender<BeginWorkerCommand>>,
     database: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
     cancellation: Arc<BeginCancellation>,
+    worker_owner_retired: Arc<AtomicU8>,
     cleanup_owner: Option<BlockingCleanupOwner>,
     armed: bool,
 }
@@ -5890,23 +6111,38 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
         ),
         FileControlError,
     > {
-        self.command
-            .take()
-            .ok_or_else(|| FileControlError::Handle("BEGIN command channel is missing".to_owned()))?
-            .send(BeginWorkerCommand::Accept(state))
-            .map_err(|_| {
-                FileControlError::Handle("BEGIN worker stopped before accept".to_owned())
-            })?;
-        let result = match self.receive_worker_result().await? {
+        let command = match self.command.take() {
+            Some(command) => command,
+            None => {
+                return Err(self
+                    .finish_failed_worker(FileControlError::Handle(
+                        "BEGIN command channel is missing".to_owned(),
+                    ))
+                    .await);
+            }
+        };
+        if command.send(BeginWorkerCommand::Accept(state)).is_err() {
+            return Err(self
+                .finish_failed_worker(FileControlError::Handle(
+                    "BEGIN worker stopped before accept".to_owned(),
+                ))
+                .await);
+        }
+        let worker_result = match self.receive_worker_result().await {
+            Ok(result) => result,
+            Err(primary) => return Err(self.finish_failed_worker(primary).await),
+        };
+        let result = match worker_result {
             BeginWorkerOutput::Accepted(connection, identity, authorizer_address) => {
                 (connection, identity, authorizer_address)
             }
             BeginWorkerOutput::Terminal(close, primary) => {
-                return Err(primary.unwrap_or_else(|| {
+                let primary = primary.unwrap_or_else(|| {
                     FileControlError::Handle(format!(
                         "BEGIN worker discarded the connection; terminal close: {close:?}"
                     ))
-                }));
+                });
+                return Err(self.finish_failed_worker(primary).await);
             }
         };
         let cleanup_owner = self
@@ -5919,17 +6155,64 @@ impl<Connection: BeginOwnedConnection> OwnedBeginGuard<Connection> {
 
     async fn join_failure(mut self) -> Result<(), FileControlError> {
         self.command.take();
-        if let BeginWorkerOutput::Terminal(close, primary) = self.receive_worker_result().await?
+        let worker_result = match self.receive_worker_result().await {
+            Ok(result) => result,
+            Err(primary) => return Err(self.finish_failed_worker(primary).await),
+        };
+        let primary = if let BeginWorkerOutput::Terminal(close, primary) = worker_result
             && close != TerminalCloseOutcome::Closed
         {
-            return Err(FileControlError::Handle(primary.map_or_else(
+            Some(FileControlError::Handle(primary.map_or_else(
                 || format!("BEGIN terminal cleanup degraded: {close:?}"),
                 |primary| format!("{primary}; terminal cleanup degraded: {close:?}"),
-            )));
+            )))
+        } else {
+            None
+        };
+        match primary {
+            Some(primary) => Err(self.finish_failed_worker(primary).await),
+            None => {
+                let owner = self.shutdown_cleanup_owner();
+                let retirement = wait_for_cleanup_owner_retirement(
+                    &self.worker_owner_retired,
+                    self.cancellation.cleanup_deadline(),
+                    "BEGIN worker",
+                )
+                .await;
+                self.armed = false;
+                match (owner, retirement) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(owner), Ok(())) => Err(owner),
+                    (Ok(()), Err(retirement)) => Err(retirement),
+                    (Err(owner), Err(retirement)) => {
+                        Err(FileControlError::Handle(format!("{owner}; {retirement}")))
+                    }
+                }
+            }
         }
-        self.shutdown_cleanup_owner()?;
+    }
+
+    async fn finish_failed_worker(&mut self, primary: FileControlError) -> FileControlError {
+        let owner = self.shutdown_cleanup_owner();
+        let retirement = wait_for_cleanup_owner_retirement(
+            &self.worker_owner_retired,
+            self.cancellation.cleanup_deadline(),
+            "BEGIN worker",
+        )
+        .await;
         self.armed = false;
-        Ok(())
+        match (owner, retirement) {
+            (Ok(()), Ok(())) => primary,
+            (Err(owner), Ok(())) => {
+                FileControlError::Handle(format!("{primary}; BEGIN cleanup owner: {owner}"))
+            }
+            (Ok(()), Err(retirement)) => {
+                FileControlError::Handle(format!("{primary}; {retirement}"))
+            }
+            (Err(owner), Err(retirement)) => FileControlError::Handle(format!(
+                "{primary}; BEGIN cleanup owner: {owner}; {retirement}"
+            )),
+        }
     }
 
     fn shutdown_cleanup_owner(&mut self) -> Result<(), FileControlError> {
@@ -6305,9 +6588,11 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
     let (command_tx, command_rx) = std::sync::mpsc::channel();
     let (worker_result_tx, worker_result_rx) = std::sync::mpsc::sync_channel(0);
+    let worker_owner_retired = Arc::new(AtomicU8::new(0));
     worker_owner
-        .handoff_payload_internal(
+        .handoff_payload_internal_with_completion(
             std::sync::Mutex::new(Some(connection)),
+            Some((Arc::clone(&worker_owner_retired), 2)),
             move |runtime, terminal_closes, connection| {
                 let mut connection = connection
                     .lock()
@@ -6349,6 +6634,18 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
                         BeginWorkerOutput::Terminal(_, _) => {}
                     }
                 }
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Some((entered, release)) = BEGIN_WORKER_RETIRE_TEST_GATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(|(entered, release)| (Arc::clone(entered), Arc::clone(release)))
+                {
+                    entered.notify_one();
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                }
             },
         )
         .map_err(FileControlError::Handle)?;
@@ -6357,6 +6654,7 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         command: Some(command_tx),
         database,
         cancellation: Arc::clone(&cancellation),
+        worker_owner_retired: Arc::clone(&worker_owner_retired),
         cleanup_owner: Some(cleanup_owner),
         armed: true,
     };
@@ -6389,8 +6687,13 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         Ok(identity) => identity,
         Err(error) => {
             if cancellation.is_cancelled() {
-                drop(guard);
-                return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+                let primary = FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT);
+                return Err(match guard.join_failure().await {
+                    Ok(()) => primary,
+                    Err(cleanup) => FileControlError::Handle(format!(
+                        "{primary}; terminal cleanup failed: {cleanup}"
+                    )),
+                });
             }
             let primary = if cancellation.stopped_by_work_or_cancellation()
                 && matches!(
@@ -6412,8 +6715,12 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
     if cancellation.is_expired() {
         let primary = FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT);
         if cancellation.is_cancelled() {
-            drop(guard);
-            return Err(primary);
+            return Err(match guard.join_failure().await {
+                Ok(()) => primary,
+                Err(cleanup) => FileControlError::Handle(format!(
+                    "{primary}; terminal cleanup failed: {cleanup}"
+                )),
+            });
         }
         if let Err(cleanup) = guard.join_failure().await {
             return Err(FileControlError::Handle(format!(
@@ -6439,6 +6746,16 @@ async fn begin_manual_transaction_inner<Connection: BeginOwnedConnection>(
         cleanup_owner: Some(cleanup_owner),
         post_commit_owner: Some(post_commit_owner),
     };
+    if let Err(error) = wait_for_cleanup_owner_retirement(
+        &worker_owner_retired,
+        cancellation.cleanup_deadline(),
+        "BEGIN worker",
+    )
+    .await
+    {
+        drop(transaction);
+        return Err(error);
+    }
     if cancellation.is_expired() {
         let cleanup_cutoff = tokio::time::Instant::from_std(cancellation.cleanup_deadline());
         let rollback = tokio::time::timeout_at(cleanup_cutoff, transaction.rollback()).await;
@@ -9831,6 +10148,194 @@ mod deadline_tests {
         pool.close().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn begin_waits_for_worker_owner_terminal_retirement() {
+        if run_in_isolated_child(
+            "deadline_tests::begin_waits_for_worker_owner_terminal_retirement",
+            "GTA_CLAW_BEGIN_RETIREMENT_CHILD",
+        ) {
+            return;
+        }
+        let _serial = BEGIN_WORKER_RETIRE_TEST_SERIAL.lock().await;
+        struct GateGuard {
+            release: Arc<AtomicBool>,
+        }
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.release.store(true, Ordering::Release);
+                BEGIN_WORKER_RETIRE_TEST_GATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open BEGIN retirement pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire BEGIN retirement connection");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(AtomicBool::new(false));
+        *BEGIN_WORKER_RETIRE_TEST_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        let _guard = GateGuard {
+            release: Arc::clone(&release),
+        };
+        let mut task = tokio::spawn(async move {
+            begin_manual_pool_transaction(connection, std::time::Duration::from_secs(1)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("BEGIN worker publishes result before retirement");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "BEGIN cannot return while its worker owner remains charged"
+        );
+        release.store(true, Ordering::Release);
+        task.await
+            .expect("BEGIN retirement task joins")
+            .expect("BEGIN returns after worker retirement")
+            .rollback()
+            .await
+            .expect("BEGIN retirement transaction rolls back");
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn begin_error_and_cancellation_wait_for_worker_owner_retirement() {
+        if run_in_isolated_child(
+            "deadline_tests::begin_error_and_cancellation_wait_for_worker_owner_retirement",
+            "GTA_CLAW_BEGIN_TERMINAL_RETIREMENT_CHILD",
+        ) {
+            return;
+        }
+        let _serial = BEGIN_WORKER_RETIRE_TEST_SERIAL.lock().await;
+        struct GateGuard {
+            release: Arc<AtomicBool>,
+        }
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.release.store(true, Ordering::Release);
+                BEGIN_WORKER_RETIRE_TEST_GATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+
+        {
+            let directory = tempfile::tempdir().expect("BEGIN error retirement directory");
+            let path = directory.path().join("begin-error-retirement.sqlite");
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(2)
+                .connect_with(
+                    sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(&path)
+                        .create_if_missing(true),
+                )
+                .await
+                .expect("open BEGIN error retirement pool");
+            let mut blocker = pool.acquire().await.expect("acquire BEGIN error blocker");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *blocker)
+                .await
+                .expect("hold BEGIN error write lock");
+            let waiter = pool.acquire().await.expect("acquire BEGIN error waiter");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(AtomicBool::new(false));
+            *BEGIN_WORKER_RETIRE_TEST_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((Arc::clone(&entered), Arc::clone(&release)));
+            let guard = GateGuard {
+                release: Arc::clone(&release),
+            };
+            let mut task = tokio::spawn(async move {
+                begin_manual_pool_transaction(waiter, std::time::Duration::ZERO).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+                .await
+                .expect("failed BEGIN publishes its terminal result before retirement");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+                    .await
+                    .is_err(),
+                "failed BEGIN cannot return before worker owner retirement"
+            );
+            release.store(true, Ordering::Release);
+            task.await
+                .expect("failed BEGIN retirement task joins")
+                .expect_err("contended BEGIN remains an error");
+            drop(guard);
+            sqlx::query("ROLLBACK")
+                .execute(&mut *blocker)
+                .await
+                .expect("release BEGIN error write lock");
+            drop(blocker);
+            pool.close().await;
+        }
+
+        {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open cancelled BEGIN retirement pool");
+            let connection = pool
+                .acquire()
+                .await
+                .expect("acquire cancelled BEGIN connection");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(AtomicBool::new(false));
+            *BEGIN_WORKER_RETIRE_TEST_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((Arc::clone(&entered), Arc::clone(&release)));
+            let _guard = GateGuard {
+                release: Arc::clone(&release),
+            };
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut task = tokio::spawn(async move {
+                begin_manual_pool_transaction_with_restore_deadlines(
+                    connection,
+                    work_deadline,
+                    cleanup_deadline,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                    Some(cancelled),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+                .await
+                .expect("cancelled BEGIN publishes its terminal result before retirement");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut task)
+                    .await
+                    .is_err(),
+                "cancelled BEGIN cannot return before worker owner retirement"
+            );
+            release.store(true, Ordering::Release);
+            let error = task
+                .await
+                .expect("cancelled BEGIN retirement task joins")
+                .expect_err("cancelled BEGIN remains an error");
+            assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_INTERRUPT));
+            pool.close().await;
+        }
+    }
+
     unsafe extern "C" fn reject_hookless_commit(_context: *mut std::ffi::c_void) -> i32 {
         1
     }
@@ -10343,7 +10848,7 @@ mod deadline_tests {
             install_begin_gate(BeginTestStage::AfterFailureOutcome, &mut waiter, &path).await;
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = Arc::clone(&cancelled);
-        let begin = tokio::spawn(async move {
+        let mut begin = tokio::spawn(async move {
             begin_manual_pool_transaction_with_restore(
                 waiter,
                 std::time::Duration::from_millis(30),
@@ -10356,21 +10861,27 @@ mod deadline_tests {
             .await
             .expect("worker sends failure before terminal connection close");
         cancelled.store(true, Ordering::Release);
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), begin)
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut begin)
+                .await
+                .is_err(),
+            "cancellation cannot return while the BEGIN worker owner remains charged"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire())
+                .await
+                .is_err(),
+            "the gated worker retains actual connection capacity"
+        );
+        release.store(true, Ordering::Release);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), begin)
             .await
-            .expect("external cancellation wins without runtime starvation")
+            .expect("external cancellation completes after terminal worker retirement")
             .expect("worker-error task joins");
         assert!(matches!(
             result,
             Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
         ));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire())
-                .await
-                .is_err(),
-            "cleanup owner retains capacity while terminal close is gated"
-        );
-        release.store(true, Ordering::Release);
         tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
             .await
             .expect("terminal cleanup restores worker-error pool capacity")
@@ -11583,6 +12094,7 @@ mod deadline_tests {
             &mut baseline_destination,
             &BackupExecutionContext {
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                cleanup_deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 max_pages: 10_000,
                 source_busy_timeout: std::time::Duration::ZERO,
@@ -11609,6 +12121,8 @@ mod deadline_tests {
                     &mut destination,
                     &BackupExecutionContext {
                         deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        cleanup_deadline: std::time::Instant::now()
+                            + std::time::Duration::from_secs(2),
                         cancelled: Arc::new(AtomicBool::new(false)),
                         max_pages: 10_000,
                         source_busy_timeout: std::time::Duration::ZERO,
@@ -11687,6 +12201,7 @@ mod deadline_tests {
                 &mut destination,
                 &BackupExecutionContext {
                     deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    cleanup_deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     max_pages: 1,
                     source_busy_timeout: std::time::Duration::ZERO,
@@ -12243,6 +12758,7 @@ mod deadline_tests {
                 ))))),
                 reservation: DropSlot::new(CleanupReservation),
                 retirement_reservation: DropSlot::new(TerminalCloseReservation::new()),
+                capacity_completion: None,
             };
             assert!(try_send_cleanup_envelope(&sender, envelope, &healthy).is_err());
             assert!(!healthy.load(Ordering::Acquire));
@@ -12323,6 +12839,7 @@ mod deadline_tests {
                 callback_retention: None,
                 reservation: DropSlot::new(CleanupReservation),
                 retirement_reservation: DropSlot::new(TerminalCloseReservation::new()),
+                capacity_completion: None,
             })
             .expect("queue ownership test accepts one job");
         drop(receiver);

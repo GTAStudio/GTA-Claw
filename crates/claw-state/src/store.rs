@@ -84,10 +84,15 @@ type StateCleanupJob = Box<
 type StateCleanupRetentionSignal = Option<Arc<std::sync::atomic::AtomicU8>>;
 #[cfg(not(test))]
 type StateCleanupRetentionSignal = ();
+#[cfg(test)]
+const NO_STATE_CLEANUP_RETENTION_SIGNAL: StateCleanupRetentionSignal = None;
+#[cfg(not(test))]
+const NO_STATE_CLEANUP_RETENTION_SIGNAL: StateCleanupRetentionSignal = ();
 
 struct StateCleanupEnvelope {
     job: Option<StateCleanupJob>,
     permit: Option<claw_sqlite_file_control::ExternalCleanupPermit>,
+    completion_signal: Option<Arc<std::sync::atomic::AtomicU8>>,
     #[cfg(test)]
     retained_signal: StateCleanupRetentionSignal,
 }
@@ -331,7 +336,12 @@ fn run_state_cleanup_envelope(
     match result {
         Ok(true) => {
             #[cfg(test)]
-            let completion_signal = envelope.retained_signal.clone();
+            let completion_signal = envelope
+                .completion_signal
+                .clone()
+                .or_else(|| envelope.retained_signal.clone());
+            #[cfg(not(test))]
+            let completion_signal = envelope.completion_signal.clone();
             let job = envelope
                 .job
                 .take()
@@ -340,14 +350,11 @@ fn run_state_cleanup_envelope(
                 .permit
                 .take()
                 .expect("completed state cleanup permit remains owned");
-            #[cfg(test)]
             let _ = if let Some(signal) = completion_signal {
                 permit.retire_with_completion_signal(Box::new(job), signal, 2)
             } else {
                 permit.retire(Box::new(job))
             };
-            #[cfg(not(test))]
-            let _ = permit.retire(Box::new(job));
         }
         Ok(false) => retain_state_cleanup(envelope),
         Err(panic) => {
@@ -514,6 +521,63 @@ where
     })
 }
 
+fn handoff_state_payload_with_completion<Payload>(
+    owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    payload: Payload,
+    completion_signal: Arc<std::sync::atomic::AtomicU8>,
+    cleanup: fn(
+        &tokio::runtime::Runtime,
+        &mut claw_sqlite_file_control::TerminalCloseBatch,
+        &Payload,
+    ),
+) -> Result<(), String>
+where
+    Payload: Send + 'static,
+{
+    handoff_state_payload_decide_with_signal(
+        owner,
+        payload,
+        NO_STATE_CLEANUP_RETENTION_SIGNAL,
+        Some(completion_signal),
+        move |runtime, terminal_closes, payload| {
+            cleanup(runtime, terminal_closes, payload);
+            true
+        },
+    )
+}
+
+struct StateOwnerRetirementReceipt {
+    signal: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl StateOwnerRetirementReceipt {
+    fn new() -> Self {
+        Self {
+            signal: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    fn signal(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        Arc::clone(&self.signal)
+    }
+
+    async fn wait(
+        &self,
+        deadline: std::time::Instant,
+        operation: &'static str,
+    ) -> Result<(), String> {
+        while self.signal.load(std::sync::atomic::Ordering::Acquire) != 2 {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{operation} owner terminal retirement exceeded its cleanup deadline"
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+}
+
 fn handoff_state_payload_decide<Payload, Cleanup>(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     payload: Payload,
@@ -529,13 +593,20 @@ where
         + Send
         + 'static,
 {
-    handoff_state_payload_decide_with_signal(owner, payload, Default::default(), cleanup)
+    handoff_state_payload_decide_with_signal(
+        owner,
+        payload,
+        NO_STATE_CLEANUP_RETENTION_SIGNAL,
+        None,
+        cleanup,
+    )
 }
 
 fn handoff_state_payload_decide_with_signal<Payload, Cleanup>(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     payload: Payload,
-    retained_signal: StateCleanupRetentionSignal,
+    #[cfg_attr(not(test), allow(unused_variables))] retained_signal: StateCleanupRetentionSignal,
+    completion_signal: Option<Arc<std::sync::atomic::AtomicU8>>,
     mut cleanup: Cleanup,
 ) -> Result<(), String>
 where
@@ -548,14 +619,13 @@ where
         + Send
         + 'static,
 {
-    #[cfg(not(test))]
-    let _ = retained_signal;
     let permit = owner.into_external_cleanup()?;
     let envelope = StateCleanupEnvelope {
         job: Some(Box::new(move |runtime, permit| {
             cleanup(runtime, permit.terminal_closes(), &payload)
         })),
         permit: Some(permit),
+        completion_signal,
         #[cfg(test)]
         retained_signal,
     };
@@ -962,6 +1032,13 @@ struct BeforeAcquireOwnerTestBarrier {
 static BEFORE_ACQUIRE_OWNER_TEST_BARRIER: std::sync::LazyLock<
     Mutex<Option<BeforeAcquireOwnerTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static EARLY_VERIFIER_RETIRE_PATHS: std::sync::LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static EARLY_VERIFIER_RETIRE_TEST_BARRIER: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, OpenAdmissionTestBarrier>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static EXPIRED_UNDELIVERED_BEGIN_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -2067,20 +2144,24 @@ impl StateStore {
                 field: "open timeout",
                 reason: "is too large for the monotonic clock",
             })?;
-        let mut cleanup_budget = config
+        let cleanup_budget = config
             .open_timeout
             .checked_div(5)
             .unwrap_or(Duration::ZERO)
             .min(Duration::from_millis(100));
         #[cfg(test)]
-        if let Ok(path) = resolve_database_path(&config.path)
-            && let Some(configured) = OPEN_TEST_CLEANUP_BUDGET
-                .lock()
-                .expect("open test cleanup budget lock poisoned")
-                .remove(&path)
-        {
-            cleanup_budget = configured.min(config.open_timeout);
-        }
+        let cleanup_budget = {
+            let mut cleanup_budget = cleanup_budget;
+            if let Ok(path) = resolve_database_path(&config.path)
+                && let Some(configured) = OPEN_TEST_CLEANUP_BUDGET
+                    .lock()
+                    .expect("open test cleanup budget lock poisoned")
+                    .remove(&path)
+            {
+                cleanup_budget = configured.min(config.open_timeout);
+            }
+            cleanup_budget
+        };
         let cancel_at = deadline
             .checked_sub(cleanup_budget)
             .unwrap_or(tokio::time::Instant::now());
@@ -2563,7 +2644,8 @@ impl StateStore {
                                 }
                             }
                         }
-                        let (verified_tx, verified_rx) = std::sync::mpsc::sync_channel(0);
+                        let verified = Arc::new(std::sync::Mutex::new(None));
+                        let verifier_retired = StateOwnerRetirementReceipt::new();
                         struct IdentityVerificationPayload {
                             parent_path: PathBuf,
                             parent: Arc<File>,
@@ -2573,10 +2655,9 @@ impl StateStore {
                             lock_file: Arc<File>,
                             lock_identity: Option<Vec<u8>>,
                             ready: Arc<std::sync::atomic::AtomicBool>,
-                            result: std::sync::mpsc::SyncSender<Result<(), StateError>>,
-                            undelivered: std::sync::Mutex<Option<Result<(), StateError>>>,
+                            result: Arc<std::sync::Mutex<Option<Result<(), StateError>>>>,
                         }
-                        handoff_state_payload(
+                        handoff_state_payload_with_completion(
                             owner,
                             IdentityVerificationPayload {
                                 parent_path,
@@ -2587,9 +2668,9 @@ impl StateStore {
                                 lock_file,
                                 lock_identity,
                                 ready,
-                                result: verified_tx,
-                                undelivered: std::sync::Mutex::new(None),
+                                result: Arc::clone(&verified),
                             },
+                            verifier_retired.signal(),
                             |_, _, payload| {
                                 let verified =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2641,39 +2722,55 @@ impl StateStore {
                                             ))
                                         },
                                     );
-                                if let Err(verified) = payload.result.send(verified) {
-                                    *payload
-                                        .undelivered
+                                *payload
+                                    .result
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(verified);
+                                #[cfg(test)]
+                                if EARLY_VERIFIER_RETIRE_PATHS
+                                    .lock()
+                                    .expect("early verifier retire path set lock poisoned")
+                                    .remove(&payload.path)
+                                {
+                                    let barrier = EARLY_VERIFIER_RETIRE_TEST_BARRIER
                                         .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(verified.0);
+                                        .expect("early verifier retire barrier lock poisoned")
+                                        .get(&payload.path)
+                                        .map(|barrier| {
+                                            (
+                                                Arc::clone(&barrier.entered),
+                                                Arc::clone(&barrier.release),
+                                            )
+                                        });
+                                    if let Some((entered, release)) = barrier {
+                                        entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                        while !release.load(std::sync::atomic::Ordering::Acquire) {
+                                            std::thread::yield_now();
+                                        }
+                                        EARLY_VERIFIER_RETIRE_TEST_BARRIER
+                                            .lock()
+                                            .expect("early verifier retire barrier lock poisoned")
+                                            .remove(&payload.path);
+                                    }
                                 }
                             },
                         )
                         .map_err(sqlx::Error::Protocol)?;
-                        let verified = loop {
-                            match verified_rx.try_recv() {
-                                Ok(verified) => break verified,
-                                Err(std::sync::mpsc::TryRecvError::Empty)
-                                    if deadline_state.permits_sqlite_work()
-                                        && std::time::Instant::now() < admission_deadline =>
-                                {
-                                    tokio::task::yield_now().await;
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    return Err(sqlx::Error::Protocol(
-                                    "state store open deadline expired during identity verification"
+                        verifier_retired
+                            .wait(admission_deadline, "before-acquire identity verifier")
+                            .await
+                            .map_err(sqlx::Error::Protocol)?;
+                        let verified = verified
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                            .ok_or_else(|| {
+                                sqlx::Error::Protocol(
+                                    "before-acquire identity owner retired without a result"
                                         .to_owned(),
-                                ));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    return Err(sqlx::Error::Protocol(
-                                        "before-acquire identity owner stopped without result"
-                                            .to_owned(),
-                                    ));
-                                }
-                            }
-                        };
+                                )
+                            })?;
                         verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
                         verify_sqlite_connection_identity(connection).await?;
                         Ok(true)
@@ -5877,6 +5974,7 @@ impl SnapshotCleanupGuard {
             owner,
             std::sync::Mutex::new(guard),
             retained_signal,
+            None,
             |_, _, guard| {
                 let mut guard = guard
                     .lock()
@@ -5909,6 +6007,7 @@ impl SnapshotCleanupGuard {
                 undelivered: std::sync::Mutex::new(None),
             },
             retained_signal,
+            None,
             |_, _, payload| {
                 let mut guard = payload
                     .guard
@@ -7748,8 +7847,10 @@ impl OwnedSqliteConnectionGuard {
                 },
             )))
         });
+        let retirement_deadline = self.cancellation.as_ref().map(|state| state.deadline);
+        let retirement = StateOwnerRetirementReceipt::new();
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
-        handoff_state_payload(
+        handoff_state_payload_with_completion(
             cleanup_owner,
             std::sync::Mutex::new(OwnedConnectionClosePayload {
                 connection: Some(connection),
@@ -7759,6 +7860,7 @@ impl OwnedSqliteConnectionGuard {
                 terminal_retention,
                 result: Some(done_tx),
             }),
+            retirement.signal(),
             |_runtime, terminal_closes, payload| {
                 let mut payload = payload
                     .lock()
@@ -7798,6 +7900,12 @@ impl OwnedSqliteConnectionGuard {
                 }
             }
         };
+        let retirement_deadline = retirement_deadline
+            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(1));
+        retirement
+            .wait(retirement_deadline, "owned SQLite connection cleanup")
+            .await
+            .map_err(sqlx::Error::Protocol)?;
         if let Some(lease) = backup_lease.as_mut() {
             lease
                 .cleanup()
@@ -10231,6 +10339,7 @@ async fn inspect_database(
             snapshot_memory,
             claw_sqlite_file_control::BackupExecutionContext {
                 deadline,
+                cleanup_deadline: inspection_deadline.into_std(),
                 cancelled,
                 max_pages,
                 source_busy_timeout: Duration::ZERO,
@@ -12046,6 +12155,9 @@ async fn materialize_authenticated_snapshot(
         Arc::clone(&operation_reservation),
         claw_sqlite_file_control::BackupExecutionContext {
             deadline,
+            cleanup_deadline: deadline_state
+                .as_ref()
+                .map_or(deadline, |state| state.deadline),
             cancelled: Arc::clone(&cancelled),
             max_pages,
             source_busy_timeout: Duration::ZERO,
@@ -13320,6 +13432,7 @@ async fn backup_pool(
         operation_reservation,
         claw_sqlite_file_control::BackupExecutionContext {
             deadline: deadline.into_std(),
+            cleanup_deadline: deadline_state.deadline,
             cancelled: Arc::clone(&deadline_state.cancelled),
             max_pages,
             source_busy_timeout,
@@ -14715,6 +14828,39 @@ pub(crate) mod test_support {
             .clear();
     }
 
+    pub(crate) fn set_early_verifier_retire_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let path = super::resolve_database_path(path).expect("resolve early verifier retire path");
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            super::EARLY_VERIFIER_RETIRE_PATHS
+                .lock()
+                .expect("early verifier retire path set lock poisoned")
+                .insert(path.clone()),
+            "early verifier retire path is configured once"
+        );
+        assert!(
+            super::EARLY_VERIFIER_RETIRE_TEST_BARRIER
+                .lock()
+                .expect("early verifier retire barrier lock poisoned")
+                .insert(
+                    path,
+                    super::OpenAdmissionTestBarrier {
+                        entered: std::sync::Arc::clone(&entered),
+                        release: std::sync::Arc::clone(&release),
+                    },
+                )
+                .is_none(),
+            "early verifier retire barrier is configured once"
+        );
+        (entered, release)
+    }
+
     pub(crate) fn reseal_backup_fixture(path: &Path) {
         let path = super::resolve_database_path(path).expect("resolve backup fixture path");
         #[cfg(unix)]
@@ -15214,6 +15360,7 @@ pub(crate) mod test_support {
                     unrelated_owner,
                     std::sync::Arc::clone(&unrelated_release),
                     Some(std::sync::Arc::clone(&unrelated_signal)),
+                    None,
                     |_, _, release| release.load(std::sync::atomic::Ordering::Acquire),
                 )
                 .expect("submit unrelated retained cleanup");

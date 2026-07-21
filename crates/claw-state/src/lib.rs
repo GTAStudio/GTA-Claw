@@ -1331,6 +1331,11 @@ mod tests {
         })
         .await
         .expect("seven opens reach the true eight-owner peak");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            56,
+            "seven admitted opens hold exactly eight owners each"
+        );
         for index in 7..32 {
             let path = database_path(&directory, &format!("quota-open-{index}.sqlite"));
             opens.spawn(async move { StateStore::open(StoreConfig::new(path)).await });
@@ -1342,6 +1347,11 @@ mod tests {
         })
         .await
         .expect("remaining admitted opens queue before global owner acquisition");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            56,
+            "the remaining twenty-five quota waiters hold no cleanup owners"
+        );
         let unrelated = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "open-quota-unrelated-cleanup",
             7,
@@ -1349,11 +1359,21 @@ mod tests {
         )
         .await
         .expect("seven peak opens preserve seven unrelated cleanup slots");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            63,
+            "the exact open peak leaves room for seven unrelated owners"
+        );
         for owner in unrelated {
             owner
                 .shutdown()
                 .expect("complete unrelated cleanup reservation");
         }
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            56,
+            "unrelated owners retire without changing the seven open peaks"
+        );
         peak_release.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         tokio::time::timeout(Duration::from_secs(2), async {
             while test_support::open_transaction_waiters() == 25 {
@@ -1386,8 +1406,169 @@ mod tests {
         for owner in all {
             owner.shutdown().expect("release quota capacity proof");
         }
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            0,
+            "quota proof retires every cleanup owner"
+        );
         test_support::clear_before_acquire_owner_barrier();
         test_support::clear_open_admission_barrier();
+    }
+
+    #[tokio::test]
+    async fn open_waits_for_earlier_verifier_retirement_before_seven_set() {
+        const CHILD_ENV: &str = "GTA_CLAW_EARLY_VERIFIER_RETIREMENT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::open_waits_for_earlier_verifier_retirement_before_seven_set")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated earlier-verifier retirement test");
+            assert!(
+                status.success(),
+                "isolated earlier-verifier retirement test failed"
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("verifier retirement directory");
+        let path = database_path(&directory, "verifier-retirement.sqlite");
+        let (retire_entered, retire_release) =
+            test_support::set_early_verifier_retire_barrier(&path);
+        let (peak_entered, peak_release) = test_support::set_before_acquire_owner_barrier();
+        let open_path = path.clone();
+        let opening =
+            tokio::spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while retire_entered.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("earlier verifier computes its result before retirement");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            1,
+            "only the gated earlier verifier remains charged"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            peak_entered.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "open cannot acquire the seven-set before earlier verifier retirement"
+        );
+        retire_release.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while peak_entered.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seven-set proceeds after exact verifier retirement");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            8,
+            "the newest verifier is the only owner overlapping the seven-set"
+        );
+        peak_release.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        opening
+            .await
+            .expect("verifier-retirement open task joins")
+            .expect("verifier-retirement store opens")
+            .close()
+            .await
+            .expect("verifier-retirement store closes");
+        test_support::clear_before_acquire_owner_barrier();
+    }
+
+    #[tokio::test]
+    async fn open_waits_for_sidecar_worker_retirement_before_seven_set() {
+        const CHILD_ENV: &str = "GTA_CLAW_SIDECAR_RETIREMENT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::open_waits_for_sidecar_worker_retirement_before_seven_set")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated sidecar retirement test");
+            assert!(status.success(), "isolated sidecar retirement test failed");
+            return;
+        }
+
+        struct GateGuard {
+            sidecar_release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            peak_release: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.sidecar_release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.peak_release
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                claw_sqlite_file_control::clear_begin_worker_retirement_test_gate();
+                test_support::clear_before_acquire_owner_barrier();
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("sidecar retirement directory");
+        let path = database_path(&directory, "sidecar-retirement.sqlite");
+        let (sidecar_entered, sidecar_release) =
+            claw_sqlite_file_control::set_begin_worker_retirement_test_gate();
+        let (peak_entered, peak_release) = test_support::set_before_acquire_owner_barrier();
+        let _guard = GateGuard {
+            sidecar_release: std::sync::Arc::clone(&sidecar_release),
+            peak_release: std::sync::Arc::clone(&peak_release),
+        };
+        let opening = tokio::spawn(async move { StateStore::open(StoreConfig::new(path)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), sidecar_entered.notified())
+            .await
+            .expect("sidecar BEGIN publishes its resource delivery before retirement");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            3,
+            "the sidecar BEGIN owns exactly its worker and two transferred owners"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            peak_entered.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "open cannot acquire the seven-set before sidecar worker retirement"
+        );
+
+        sidecar_release.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while peak_entered.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seven-set proceeds after exact sidecar worker retirement");
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            8,
+            "only the newest verifier overlaps the sidecar-success seven-set"
+        );
+        peak_release.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        opening
+            .await
+            .expect("sidecar-retirement open task joins")
+            .expect("sidecar-retirement store opens")
+            .close()
+            .await
+            .expect("sidecar-retirement store closes");
     }
 
     #[tokio::test]
@@ -1532,6 +1713,11 @@ mod tests {
             close_capacity
         );
         assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+        assert_eq!(
+            claw_sqlite_file_control::active_cleanup_owner_count_for_test(),
+            0,
+            "caller runtime drops leave no cleanup owner charged"
+        );
     }
 
     #[tokio::test]
