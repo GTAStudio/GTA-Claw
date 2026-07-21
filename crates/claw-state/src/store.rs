@@ -44,6 +44,8 @@ static BACKUP_CLEANUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore
 static RESTORE_CLEANUP_ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 static STATE_OPEN_ADMISSION: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(STATE_OPEN_ADMISSION_LIMIT);
+static OPEN_TRANSACTION_ADMISSION: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(OPEN_TRANSACTION_ADMISSION_LIMIT);
 static SNAPSHOT_MEMORY_ADMISSION: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(PROCESS_SNAPSHOT_PEAK_UNITS);
 #[cfg(test)]
@@ -107,6 +109,9 @@ struct StateCleanupExecutor {
 
 const STATE_CLEANUP_THREADS: usize = 16;
 const STATE_OPEN_ADMISSION_LIMIT: usize = 32;
+// Eight seven-owner open transactions consume at most 56 of 64 global cleanup
+// slots, preserving eight slots for unrelated atomic cleanup reservations.
+const OPEN_TRANSACTION_ADMISSION_LIMIT: usize = 8;
 const MAX_STATE_CLEANUP_JOBS: usize = 64;
 const MAX_STATE_CLOSE_RETENTIONS: usize = 64;
 const MAX_WRITER_LOCK_CONTENT_BYTES: u64 = 4096;
@@ -865,6 +870,10 @@ static OPEN_AFTER_ACK_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
+static OPEN_AFTER_ACK_CANCEL_ON_RELEASE: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
 static OPEN_CLEANUP_TEST_BARRIER: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, MigrationTestBarrier>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -1271,6 +1280,7 @@ pub struct StateStore {
     busy_timeout: Duration,
     close_timeout: Duration,
     undelivered_cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    open_transaction_admission: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
 impl Drop for StateStore {
@@ -1278,6 +1288,7 @@ impl Drop for StateStore {
         if let Some(owner) = self.undelivered_cleanup_owner.take() {
             let _ = owner.shutdown();
         }
+        self.open_transaction_admission.take();
         if let Some(ownership) = self.ownership.take() {
             ownership.retain();
         }
@@ -1864,6 +1875,7 @@ struct OpenStoreDelivery {
     store: Option<StateStore>,
     cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
     open_admission: Option<tokio::sync::SemaphorePermit<'static>>,
+    transaction_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     deadline: tokio::time::Instant,
     deadline_state: Arc<OpenDeadlineState>,
 }
@@ -1877,19 +1889,22 @@ impl OpenStoreDelivery {
     fn accept(mut self) -> StateStore {
         self.cleanup_owner.take();
         self.open_admission.take();
+        self.transaction_admission.take();
         self.store.take().expect("delivered store remains owned")
     }
 }
 
 impl Drop for OpenStoreDelivery {
     fn drop(&mut self) {
-        let (Some(owner), Some(store), Some(open_admission)) = (
+        let (Some(owner), Some(mut store), Some(open_admission), Some(transaction_admission)) = (
             self.cleanup_owner.take(),
             self.store.take(),
             self.open_admission.take(),
+            self.transaction_admission.take(),
         ) else {
             return;
         };
+        store.open_transaction_admission = Some(transaction_admission);
         let _ = handoff_undelivered_store(
             owner,
             store,
@@ -1946,12 +1961,17 @@ async fn run_open_lifecycle_actor(
                 return Ok(OpenLifecycleTerminal::Cleaned);
             }
             #[cfg(test)]
-            wait_at_open_after_ack_test_barrier(store.path()).await;
+            wait_at_open_after_ack_test_barrier(store.path(), &deadline_state).await;
+            let transaction_admission = store
+                .open_transaction_admission
+                .take()
+                .expect("opened store retains its transaction admission");
             Ok(OpenLifecycleTerminal::Delivery(Box::new(
                 OpenStoreDelivery {
                     store: Some(store),
                     cleanup_owner: Some(undelivered_cleanup_owner),
                     open_admission: Some(open_admission),
+                    transaction_admission: Some(transaction_admission),
                     deadline,
                     deadline_state,
                 },
@@ -2024,7 +2044,7 @@ impl StateStore {
         wait_at_open_admission_test_barrier().await;
         let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
         let (delivery_ack_tx, delivery_ack_rx) = tokio::sync::oneshot::channel();
-        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (terminal_tx, mut terminal_rx) = tokio::sync::oneshot::channel();
         let mut delivery_ack_tx = Some(delivery_ack_tx);
         let actor_runtime = OPEN_LIFECYCLE_RUNTIME.as_ref().map_err(|error| {
             database(
@@ -2083,22 +2103,55 @@ impl StateStore {
                                     ),
                                 )
                             })?;
-                        let delivery = terminal_rx
-                            .await
-                            .map_err(|_| {
-                                database(
-                                    "receive state open actor terminal receipt",
-                                    sqlx::Error::Protocol(
-                                        "open lifecycle actor stopped without receipt".to_owned(),
-                                    ),
+                        let delivery = tokio::select! {
+                            biased;
+                            () = tokio::time::sleep_until(cancel_at) => {
+                                deadline_state
+                                    .expired
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                                deadline_state.cancel();
+                                let error = open_timeout_error(
+                                    terminal_rx,
+                                    deadline,
+                                    &deadline_state,
+                                    timeout_ms,
                                 )
-                            })?
-                            .map_err(|cleanup| {
-                                database(
-                                    "complete state open actor",
-                                    sqlx::Error::Protocol(cleanup),
-                                )
-                            })?;
+                                .await;
+                                cancellation_guard.disarm();
+                                return Err(error);
+                            }
+                            delivery = &mut terminal_rx => {
+                                delivery
+                                    .map_err(|_| {
+                                        database(
+                                            "receive state open actor terminal receipt",
+                                            sqlx::Error::Protocol(
+                                                "open lifecycle actor stopped without receipt"
+                                                    .to_owned(),
+                                            ),
+                                        )
+                                    })?
+                                    .map_err(|cleanup| {
+                                        database(
+                                            "complete state open actor",
+                                            sqlx::Error::Protocol(cleanup),
+                                        )
+                                    })?
+                            }
+                        };
+                        if deadline_state
+                            .cancelled
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            || tokio::time::Instant::now() >= cancel_at
+                        {
+                            drop(delivery);
+                            deadline_state
+                                .expired
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            deadline_state.cancel();
+                            cancellation_guard.disarm();
+                            return Err(deadline_state.timeout_error());
+                        }
                         let store = match delivery {
                             OpenLifecycleTerminal::Delivery(delivery) => delivery.accept(),
                             OpenLifecycleTerminal::Cleaned => {
@@ -2693,6 +2746,7 @@ impl StateStore {
             busy_timeout: config.busy_timeout,
             close_timeout: config.close_timeout,
             undelivered_cleanup_owner: Some(initialized.undelivered_cleanup_owner),
+            open_transaction_admission: Some(initialized.open_transaction_admission),
         })
     }
 
@@ -9854,6 +9908,7 @@ enum InspectedDatabase {
 struct InitializedDatabase {
     recovered_writer: Option<RecoveredWriterLock>,
     undelivered_cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    open_transaction_admission: tokio::sync::SemaphorePermit<'static>,
 }
 
 impl std::fmt::Debug for InitializedDatabase {
@@ -10188,6 +10243,7 @@ async fn initialize_database(
 }
 
 struct OpenTransactionOwners {
+    admission: tokio::sync::SemaphorePermit<'static>,
     primary_begin: Vec<claw_sqlite_file_control::BlockingCleanupOwner>,
     late_begin: Vec<claw_sqlite_file_control::BlockingCleanupOwner>,
     undelivered: claw_sqlite_file_control::BlockingCleanupOwner,
@@ -10196,6 +10252,18 @@ struct OpenTransactionOwners {
 async fn reserve_open_transaction_owners(
     deadline_state: &OpenDeadlineState,
 ) -> Result<OpenTransactionOwners, StateError> {
+    let admission = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline_state.work_cutoff),
+        OPEN_TRANSACTION_ADMISSION.acquire(),
+    )
+    .await
+    .map_err(|_| deadline_state.timeout_error())?
+    .map_err(|_| {
+        database(
+            "acquire open transaction admission",
+            sqlx::Error::Protocol("open transaction admission is closed".to_owned()),
+        )
+    })?;
     let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
         "state-open-transaction",
         7,
@@ -10217,6 +10285,7 @@ async fn reserve_open_transaction_owners(
         .expect("undelivered cleanup owner was reserved");
     let late_begin = owners.split_off(3);
     Ok(OpenTransactionOwners {
+        admission,
         primary_begin: owners,
         late_begin,
         undelivered,
@@ -10425,6 +10494,7 @@ async fn initialize_fresh_database(
     #[cfg(not(test))]
     let _ = path;
     let OpenTransactionOwners {
+        admission: open_transaction_admission,
         primary_begin,
         late_begin: late_begin_owners,
         undelivered: undelivered_cleanup_owner,
@@ -10583,6 +10653,7 @@ async fn initialize_fresh_database(
     Ok(InitializedDatabase {
         recovered_writer,
         undelivered_cleanup_owner,
+        open_transaction_admission,
     })
 }
 
@@ -11007,6 +11078,7 @@ async fn apply_migrations(
     }
 
     let OpenTransactionOwners {
+        admission: open_transaction_admission,
         primary_begin,
         late_begin: late_begin_owners,
         undelivered: undelivered_cleanup_owner,
@@ -11163,6 +11235,7 @@ async fn apply_migrations(
     Ok(InitializedDatabase {
         recovered_writer,
         undelivered_cleanup_owner,
+        open_transaction_admission,
     })
 }
 
@@ -11292,7 +11365,7 @@ async fn wait_at_open_postcommit_test_barrier(path: &Path, deadline_state: &Open
 }
 
 #[cfg(test)]
-async fn wait_at_open_after_ack_test_barrier(path: &Path) {
+async fn wait_at_open_after_ack_test_barrier(path: &Path, deadline_state: &OpenDeadlineState) {
     let barrier = OPEN_AFTER_ACK_TEST_BARRIER
         .lock()
         .expect("open after-ack barrier lock poisoned")
@@ -11305,6 +11378,13 @@ async fn wait_at_open_after_ack_test_barrier(path: &Path) {
             .lock()
             .expect("open after-ack barrier lock poisoned")
             .remove(path);
+        if OPEN_AFTER_ACK_CANCEL_ON_RELEASE
+            .lock()
+            .expect("open after-ack cancel set lock poisoned")
+            .remove(path)
+        {
+            deadline_state.cancel();
+        }
     }
 }
 
@@ -14674,6 +14754,25 @@ pub(crate) mod test_support {
             "open after-ack barrier is configured once"
         );
         (entered, release)
+    }
+
+    pub(crate) fn set_open_after_ack_cancel_barrier(
+        path: &Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let barrier = set_open_after_ack_barrier(path);
+        let path =
+            super::resolve_database_path(path).expect("resolve after-ack cancel barrier path");
+        assert!(
+            super::OPEN_AFTER_ACK_CANCEL_ON_RELEASE
+                .lock()
+                .expect("open after-ack cancel set lock poisoned")
+                .insert(path),
+            "open after-ack cancellation is configured once"
+        );
+        barrier
     }
 
     pub(crate) fn set_open_cleanup_barrier(

@@ -1287,6 +1287,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_transaction_quota_preserves_unrelated_cleanup_headroom() {
+        const CHILD_ENV: &str = "GTA_CLAW_OPEN_TRANSACTION_QUOTA_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::open_transaction_quota_preserves_unrelated_cleanup_headroom")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated open transaction quota test");
+            assert!(
+                status.success(),
+                "isolated open transaction quota test failed"
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("open transaction quota directory");
+        let (admitted, admission_release) = test_support::set_open_admission_barrier();
+        let mut opens = tokio::task::JoinSet::new();
+        let mut entered_gates = Vec::new();
+        let mut releases = Vec::new();
+        for index in 0..8 {
+            let path = database_path(&directory, &format!("quota-open-{index}.sqlite"));
+            let (entered, release) = test_support::set_open_precommit_barrier(&path);
+            let open_path = path.clone();
+            opens.spawn(async move { StateStore::open(StoreConfig::new(open_path)).await });
+            entered_gates.push((index, entered));
+            releases.push(release);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while admitted.load(std::sync::atomic::Ordering::Acquire) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight opens bypass test-only concurrency throttle");
+        admission_release.store(true, std::sync::atomic::Ordering::Release);
+        for (index, entered) in entered_gates {
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("reservation-bearing open {index} reaches precommit gate")
+                });
+        }
+        let unrelated = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "open-quota-unrelated-cleanup",
+            7,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("eight opens preserve seven unrelated cleanup slots");
+
+        let ninth_path = database_path(&directory, "quota-open-ninth.sqlite");
+        let (ninth_entered, ninth_release) = test_support::set_open_precommit_barrier(&ninth_path);
+        opens.spawn(async move { StateStore::open(StoreConfig::new(ninth_path)).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ninth_entered.notified())
+                .await
+                .is_err(),
+            "ninth open waits fairly before owning global cleanup slots"
+        );
+        for owner in unrelated {
+            owner
+                .shutdown()
+                .expect("complete unrelated cleanup reservation");
+        }
+        releases.remove(0).notify_one();
+        tokio::time::timeout(Duration::from_secs(2), ninth_entered.notified())
+            .await
+            .expect("ninth open progresses after one quota permit is released");
+        for release in releases {
+            release.notify_one();
+        }
+        ninth_release.notify_one();
+
+        let mut stores = Vec::new();
+        while let Some(opened) = opens.join_next().await {
+            stores.push(
+                opened
+                    .expect("quota-bound open task joins")
+                    .expect("quota-bound open succeeds"),
+            );
+        }
+        assert_eq!(stores.len(), 9);
+        for store in stores {
+            store.close().await.expect("quota-bound store closes");
+        }
+        let all = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "open-quota-capacity-proof",
+            64,
+            std::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("open quota releases every global cleanup slot");
+        for owner in all {
+            owner.shutdown().expect("release quota capacity proof");
+        }
+        test_support::clear_open_admission_barrier();
+    }
+
+    #[tokio::test]
     async fn open_actor_survives_caller_runtime_drop_before_and_after_construction() {
         const CHILD_ENV: &str = "GTA_CLAW_OPEN_ACTOR_RUNTIME_DROP_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -1428,6 +1534,78 @@ mod tests {
             close_capacity
         );
         assert_eq!(test_support::retained_state_cleanup_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn final_store_delivery_obeys_deadline_tie_and_cancellation() {
+        let directory = tempfile::tempdir().expect("final delivery deadline directory");
+        for mode in ["deadline", "tie", "cancel"] {
+            let path = database_path(&directory, &format!("final-delivery-{mode}.sqlite"));
+            let (entered, release) = if mode == "cancel" {
+                test_support::set_open_after_ack_cancel_barrier(&path)
+            } else {
+                test_support::set_open_after_ack_barrier(&path)
+            };
+            let timeout = if mode == "cancel" {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(300)
+            };
+            let started = tokio::time::Instant::now();
+            let open_path = path.clone();
+            let opening = tokio::spawn(async move {
+                StateStore::open(StoreConfig::new(open_path).with_open_timeout(timeout)).await
+            });
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("open reaches after-ack delivery gate");
+            assert!(
+                StateStore::open(
+                    StoreConfig::new(&path).with_open_timeout(Duration::from_millis(50)),
+                )
+                .await
+                .is_err(),
+                "actor retains ownership before final delivery"
+            );
+            match mode {
+                "deadline" => tokio::time::sleep(Duration::from_millis(350)).await,
+                "tie" => {
+                    let cancel_at = started + Duration::from_millis(240);
+                    tokio::time::sleep_until(cancel_at).await;
+                }
+                "cancel" => {}
+                _ => unreachable!(),
+            }
+            release.notify_one();
+            assert_eq!(
+                opening
+                    .await
+                    .expect("deadline-bound final delivery task joins")
+                    .err()
+                    .expect("late or cancelled final delivery returns timeout"),
+                StateError::OperationTimedOut {
+                    operation: "state store open",
+                    timeout_ms: u64::try_from(timeout.as_millis()).expect("timeout fits u64"),
+                }
+            );
+            let reopened = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match StateStore::open(StoreConfig::new(&path)).await {
+                        Ok(store) => break store,
+                        Err(StateError::StoreLocked { .. } | StateError::FileSystem { .. }) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("final delivery cleanup reopen failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("final delivery cleanup releases ownership");
+            reopened
+                .close()
+                .await
+                .expect("final delivery cleanup reopen closes");
+        }
     }
 
     #[tokio::test]
