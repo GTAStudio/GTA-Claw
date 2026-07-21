@@ -44,6 +44,8 @@ mod tests {
     use super::*;
     use crate::store::test_support;
 
+    static ISOLATED_SQLITE_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(windows)]
     static SECURED_TEST_DIRECTORIES: LazyLock<Mutex<HashSet<PathBuf>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -1277,6 +1279,9 @@ mod tests {
     async fn open_timeout_after_commit_handoffs_claim_cleanup_before_return() {
         const CHILD_ENV: &str = "GTA_CLAW_POSTCOMMIT_HANDOFF_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
             let executable = std::env::current_exe().expect("current state test executable");
             let status = Command::new(executable)
                 .arg("--exact")
@@ -2346,6 +2351,9 @@ mod tests {
     async fn close_retention_capacity_is_bounded_and_reusable() {
         const CHILD_ENV: &str = "GTA_CLAW_CLOSE_RETENTION_CAPACITY_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
             let executable = std::env::current_exe().expect("current state test executable");
             let status = Command::new(executable)
                 .arg("--exact")
@@ -2551,6 +2559,9 @@ mod tests {
     async fn production_open_admission_preserves_cleanup_headroom() {
         const CHILD_ENV: &str = "GTA_CLAW_OPEN_HEADROOM_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
             let executable = std::env::current_exe().expect("current state test executable");
             let status = Command::new(executable)
                 .arg("--exact")
