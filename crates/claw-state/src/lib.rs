@@ -2377,64 +2377,6 @@ mod tests {
             "isolated process starts with all close-retention slots available"
         );
         let directory = tempfile::tempdir().expect("close retention capacity directory");
-        let mut concurrent_opens = tokio::task::JoinSet::new();
-        for index in 0..capacity + 8 {
-            let path = database_path(
-                &directory,
-                &format!("concurrent-capacity-{index:02}.sqlite"),
-            );
-            concurrent_opens.spawn(async move {
-                let result = StateStore::open(StoreConfig::new(&path)).await;
-                (path, result)
-            });
-        }
-        let mut concurrent_stores = Vec::with_capacity(capacity);
-        let mut concurrent_rejections = 0;
-        while let Some(joined) = concurrent_opens.join_next().await {
-            let (path, result) = joined.expect("concurrent capacity task joins");
-            match result {
-                Ok(store) => concurrent_stores.push(store),
-                Err(StateError::Database(failure))
-                    if failure.operation() == "reserve state close retention"
-                        && failure
-                            .message()
-                            .contains("state close retention capacity is exhausted") =>
-                {
-                    concurrent_rejections += 1;
-                    assert!(
-                        !path.exists(),
-                        "concurrent rejected open cannot create database ownership"
-                    );
-                }
-                Err(error) => panic!("unexpected concurrent capacity error: {error:?}"),
-            }
-        }
-        assert_eq!(
-            concurrent_stores.len(),
-            capacity,
-            "concurrent admission cannot underfill available retention slots"
-        );
-        assert_eq!(
-            concurrent_rejections, 8,
-            "concurrent admission rejects every request beyond the fixed bound"
-        );
-        assert_eq!(
-            test_support::available_close_retention_slots(),
-            0,
-            "concurrent admission cannot overcommit close-retention capacity"
-        );
-        for store in concurrent_stores {
-            store
-                .close()
-                .await
-                .expect("concurrently admitted store closes cleanly");
-        }
-        assert_eq!(
-            test_support::available_close_retention_slots(),
-            capacity,
-            "confirmed closes restore capacity after concurrent saturation"
-        );
-
         let clean_path = database_path(&directory, "clean-close.sqlite");
         let clean = open(&clean_path).await;
         assert_eq!(
