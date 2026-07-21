@@ -2348,6 +2348,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run explicitly by the P03b close-retention capacity gate"]
     async fn close_retention_capacity_is_bounded_and_reusable() {
         const CHILD_ENV: &str = "GTA_CLAW_CLOSE_RETENTION_CAPACITY_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -2358,6 +2359,7 @@ mod tests {
             let status = Command::new(executable)
                 .arg("--exact")
                 .arg("tests::close_retention_capacity_is_bounded_and_reusable")
+                .arg("--ignored")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
                 .env(CHILD_ENV, "1")
@@ -2498,6 +2500,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run explicitly by the P03b open-admission headroom gate"]
     async fn production_open_admission_preserves_cleanup_headroom() {
         const CHILD_ENV: &str = "GTA_CLAW_OPEN_HEADROOM_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -2508,6 +2511,7 @@ mod tests {
             let status = Command::new(executable)
                 .arg("--exact")
                 .arg("tests::production_open_admission_preserves_cleanup_headroom")
+                .arg("--ignored")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
                 .env(CHILD_ENV, "1")
