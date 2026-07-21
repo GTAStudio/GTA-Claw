@@ -3854,6 +3854,16 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                 )
                                 .await
                             };
+                            if let Err(error @ FileControlError::IdentityCommitVetoed(_, _)) =
+                                &commit
+                            {
+                                *worker_identity_veto_fallback
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(error.clone());
+                            }
+                            #[cfg(test)]
+                            wait_at_commit_restore_test_gate(token.generation);
                             let restore_ms =
                                 i32::try_from(restore_busy_timeout.as_millis()).unwrap_or(i32::MAX);
                             let restored = connection
@@ -4003,10 +4013,6 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                                     | FileControlError::CommitOutcomeUncertain(_, _)
                             );
                             if identity_veto {
-                                *worker_identity_veto_fallback
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(error.clone());
                                 let _ = submit_terminal_identity_veto_close(
                                     terminal_permit
                                         .take()
@@ -4872,10 +4878,43 @@ static FAIL_COMMIT_GENERATIONS: std::sync::LazyLock<
 static ROLLBACK_SYNCHRONOUS_CALLS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, unix))]
+struct CommitRestoreTestGate {
+    entered: Arc<AtomicBool>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+#[cfg(all(test, unix))]
+static COMMIT_RESTORE_TEST_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, CommitRestoreTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static FORCE_IMPLICIT_ROLLBACK_GENERATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(all(test, unix))]
+fn wait_at_commit_restore_test_gate(generation: u64) {
+    let gate = COMMIT_RESTORE_TEST_GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&generation)
+        .map(|gate| (Arc::clone(&gate.entered), Arc::clone(&gate.release)));
+    if let Some((entered, release)) = gate {
+        entered.store(true, Ordering::Release);
+        let (released, changed) = &*release;
+        let mut released = released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = changed
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+fn wait_at_commit_restore_test_gate(_generation: u64) {}
 
 #[cfg(test)]
 struct PrepareDeliveryTestGate {
@@ -8340,6 +8379,58 @@ mod deadline_tests {
         )
     }
 
+    #[cfg(unix)]
+    struct CommitRestoreGateRegistration {
+        generation: u64,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for CommitRestoreGateRegistration {
+        fn drop(&mut self) {
+            let (released, changed) = &*self.release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+            COMMIT_RESTORE_TEST_GATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.generation);
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_commit_restore_gate<Connection: BeginOwnedConnection>(
+        transaction: &ManualTransaction<Connection>,
+    ) -> (CommitRestoreGateRegistration, Arc<AtomicBool>) {
+        let generation = transaction
+            .token
+            .as_ref()
+            .expect("commit restore gate token remains owned")
+            .generation;
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let previous = COMMIT_RESTORE_TEST_GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                generation,
+                CommitRestoreTestGate {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        assert!(previous.is_none(), "commit restore gate is unique");
+        (
+            CommitRestoreGateRegistration {
+                generation,
+                release,
+            },
+            entered,
+        )
+    }
+
     async fn wait_for_atomic(flag: &AtomicBool, operation: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !flag.load(Ordering::Acquire) {
@@ -9076,8 +9167,7 @@ mod deadline_tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn proven_identity_commit_veto_closes_without_second_rollback() {
+    async fn exercise_proven_identity_commit_veto(stall_restore: bool) {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         use xattr::FileExt as _;
@@ -9212,17 +9302,44 @@ mod deadline_tests {
             .get(&generation)
             .copied()
             .unwrap_or_default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let error = transaction
-            .commit_with_deadline(
-                deadline,
-                deadline + std::time::Duration::from_secs(1),
-                Arc::new(AtomicBool::new(false)),
-                std::time::Duration::from_millis(500),
-                None,
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let cleanup_deadline = deadline + std::time::Duration::from_millis(100);
+        let error = if stall_restore {
+            let (restore_gate, restore_entered) = install_commit_restore_gate(&transaction);
+            let commit = tokio::spawn(async move {
+                transaction
+                    .commit_with_deadline(
+                        deadline,
+                        cleanup_deadline,
+                        Arc::new(AtomicBool::new(false)),
+                        std::time::Duration::from_millis(500),
+                        None,
+                    )
+                    .await
+            });
+            wait_for_atomic(
+                &restore_entered,
+                "identity veto reaches busy-handler restoration",
             )
-            .await
-            .expect_err("identity hook vetoes exact COMMIT");
+            .await;
+            let error = commit
+                .await
+                .expect("stalled identity veto commit task joins")
+                .expect_err("proven veto survives restore stall");
+            drop(restore_gate);
+            error
+        } else {
+            transaction
+                .commit_with_deadline(
+                    deadline,
+                    cleanup_deadline,
+                    Arc::new(AtomicBool::new(false)),
+                    std::time::Duration::from_millis(500),
+                    None,
+                )
+                .await
+                .expect_err("identity hook vetoes exact COMMIT")
+        };
         let FileControlError::IdentityCommitVetoed(veto, cleanup) = error else {
             panic!("expected proven identity veto");
         };
@@ -9231,7 +9348,16 @@ mod deadline_tests {
             veto.reason(),
             "SQLite writer lock identity xattr is missing during COMMIT"
         );
-        assert!(cleanup.is_none());
+        if stall_restore {
+            assert!(
+                cleanup
+                    .as_deref()
+                    .is_some_and(|cleanup| cleanup.contains("cleanup cutoff")),
+                "restore stall preserves typed veto with cleanup detail: {cleanup:?}"
+            );
+        } else {
+            assert!(cleanup.is_none());
+        }
         assert!(
             !ACTIVE_MANUAL_TRANSACTIONS
                 .lock()
@@ -9312,6 +9438,18 @@ mod deadline_tests {
             "stale veto provenance cannot affect a later COMMIT attempt"
         );
         pool.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proven_identity_commit_veto_closes_without_second_rollback() {
+        exercise_proven_identity_commit_veto(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proven_identity_commit_veto_survives_restore_stall() {
+        exercise_proven_identity_commit_veto(true).await;
     }
 
     #[tokio::test]
