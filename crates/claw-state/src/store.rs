@@ -7157,29 +7157,93 @@ mod open_deadline_tests {
         }
     }
 
-    #[test]
-    fn close_writer_failure_paths_use_absolute_rollback_deadline() {
-        let source = include_str!("store.rs");
-        let release = source
-            .split("async fn release_close_writer_claim")
-            .nth(1)
-            .and_then(|source| source.split("async fn close_final_connection").next())
-            .expect("locate close writer release helper");
-        assert_eq!(
-            release
-                .matches("rollback_with_deadline(cleanup_deadline)")
-                .count(),
-            2,
-            "both deletion failure paths reuse the original hard cleanup deadline"
-        );
-        assert!(
-            !release.contains("transaction.rollback().await"),
-            "close writer failure cannot create a fresh relative rollback budget"
-        );
-        assert!(
-            release.matches("append_operation_cleanup(").count() >= 2,
-            "both rollback failures preserve typed primary and cleanup evidence"
-        );
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_writer_failure_paths_use_absolute_rollback_deadline() {
+        if run_in_isolated_child(
+            "store::open_deadline_tests::close_writer_failure_paths_use_absolute_rollback_deadline",
+            "GTA_CLAW_CLOSE_WRITER_ROLLBACK_CHILD",
+        ) {
+            return;
+        }
+
+        for failure in ["row-count", "statement"] {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open close writer rollback pool");
+            if failure == "row-count" {
+                sqlx::raw_sql(
+                    "CREATE TABLE claw_writer_lock(
+                        singleton INTEGER PRIMARY KEY,
+                        owner TEXT NOT NULL,
+                        acquired_at_ms INTEGER NOT NULL
+                     );
+                     INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+                     VALUES (1, 'actual-owner', 1);",
+                )
+                .execute(&pool)
+                .await
+                .expect("seed mismatched close writer row");
+            }
+            let connection = pool
+                .acquire()
+                .await
+                .expect("acquire close writer rollback connection");
+            let started = std::time::Instant::now();
+            let work_deadline = started + Duration::from_millis(200);
+            let cleanup_deadline = started + Duration::from_secs(1);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let release = release_close_writer_claim(
+                connection,
+                "wrong-owner",
+                work_deadline,
+                cleanup_deadline,
+                Duration::from_secs(1),
+            )
+            .await;
+            assert!(!release.released);
+            assert!(release.connection.is_some());
+            let reason = release
+                .reason
+                .expect("close writer deletion failure remains typed");
+            if failure == "row-count" {
+                assert!(matches!(reason, StateError::InvalidMigrationHistory { .. }));
+            } else {
+                let StateError::Database(failure) = reason else {
+                    panic!("statement deletion failure remains a typed database error");
+                };
+                assert_eq!(failure.operation(), "release application writer lock");
+            }
+            let mut replacement = release
+                .connection
+                .expect("successful absolute rollback returns the owned connection");
+            if failure == "row-count" {
+                assert_eq!(
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT owner FROM claw_writer_lock WHERE singleton = 1"
+                    )
+                    .fetch_one(&mut *replacement)
+                    .await
+                    .expect("read rolled-back stale writer claim"),
+                    "actual-owner",
+                    "mismatched writer deletion remains rolled back"
+                );
+            } else {
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM sqlite_schema
+                         WHERE type = 'table' AND name = 'claw_writer_lock'"
+                    )
+                    .fetch_one(&mut *replacement)
+                    .await
+                    .expect("inspect statement-error rollback schema"),
+                    0
+                );
+            }
+            drop(replacement);
+            pool.close().await;
+        }
     }
 }
 
@@ -8162,10 +8226,12 @@ impl<'store> StoreOperationConnection<'store> {
                     ),
                 )
             })?;
+        verified?;
+        self.identity.verify_generation()?;
         if std::time::Instant::now() >= self.deadline.into_std() {
             return Err(self.expire());
         }
-        verified.and_then(|()| self.identity.verify_generation())
+        Ok(())
     }
 
     async fn finish(mut self) -> Result<(), StateError> {
@@ -15091,6 +15157,11 @@ pub(crate) mod test_support {
 
     pub(crate) fn pool(store: &StateStore) -> &SqlitePool {
         store.pool()
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn lock_path(store: &StateStore) -> std::path::PathBuf {
+        store.lock_path.clone()
     }
 
     #[cfg(windows)]

@@ -6213,6 +6213,15 @@ mod tests {
             .await
             .expect("checkpoint identity runtime fixture opens"),
         );
+        let mut marked = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("acquire checkpoint identity marker connection");
+        sqlx::query("CREATE TEMP TABLE checkpoint_connection_marker(value INTEGER)")
+            .execute(&mut *marked)
+            .await
+            .expect("mark exact checkpoint connection");
+        drop(marked);
 
         let (entered, release) = test_support::set_checkpoint_identity_barrier();
         let guard = GateGuard {
@@ -6250,11 +6259,97 @@ mod tests {
             "checkpoint identity timeout preserves its typed primary: {error:?}"
         );
         drop(guard);
+        let mut replacement = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("acquire replacement after identity timeout");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_temp_schema
+                 WHERE type = 'table' AND name = 'checkpoint_connection_marker'"
+            )
+            .fetch_one(&mut *replacement)
+            .await
+            .expect("inspect timeout replacement marker"),
+            0,
+            "timed-out checkpoint connection is closed, not repooled"
+        );
+        drop(replacement);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            test_support::pool(&store).num_idle(),
+            1,
+            "terminal close cannot add delayed idle capacity"
+        );
         store
             .checkpoint()
             .await
             .expect("checkpoint recovers after identity timeout");
 
+        let mut marked = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("acquire generation-mismatch marker connection");
+        sqlx::query("CREATE TEMP TABLE checkpoint_connection_marker(value INTEGER)")
+            .execute(&mut *marked)
+            .await
+            .expect("mark generation-mismatch checkpoint connection");
+        drop(marked);
+        let (entered, release) = test_support::set_checkpoint_identity_barrier();
+        let guard = GateGuard {
+            release: std::sync::Arc::clone(&release),
+        };
+        let checkpoint_store = std::sync::Arc::clone(&store);
+        let checkpoint = tokio::spawn(async move { checkpoint_store.checkpoint().await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("generation mismatch reaches bounded identity worker");
+        test_support::invalidate_writer_generation(&store);
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        release.store(true, std::sync::atomic::Ordering::Release);
+        let error = checkpoint
+            .await
+            .expect("generation mismatch checkpoint task joins")
+            .expect_err("reported writer generation mismatch fails closed");
+        assert!(matches!(
+            error,
+            StateError::InvalidPath {
+                reason: "state writer generation is no longer live",
+                ..
+            }
+        ));
+        test_support::restore_writer_generation(&store);
+        drop(guard);
+        let mut replacement = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("acquire generation-mismatch replacement");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_temp_schema
+                 WHERE type = 'table' AND name = 'checkpoint_connection_marker'"
+            )
+            .fetch_one(&mut *replacement)
+            .await
+            .expect("inspect generation-mismatch replacement marker"),
+            0,
+            "generation-mismatched checkpoint connection is never repooled"
+        );
+        drop(replacement);
+        store
+            .checkpoint()
+            .await
+            .expect("checkpoint recovers after generation restoration");
+
+        let mut marked = test_support::pool(&store)
+            .acquire()
+            .await
+            .expect("acquire runtime-drop marker connection");
+        sqlx::query("CREATE TEMP TABLE checkpoint_connection_marker(value INTEGER)")
+            .execute(&mut *marked)
+            .await
+            .expect("mark runtime-drop checkpoint connection");
+        drop(marked);
         let (entered, release) = test_support::set_checkpoint_identity_barrier();
         let _guard = GateGuard {
             release: std::sync::Arc::clone(&release),
@@ -6294,12 +6389,38 @@ mod tests {
             "connection remains owned while identity verification is gated"
         );
         release.store(true, std::sync::atomic::Ordering::Release);
-        let replacement =
+        let mut replacement =
             tokio::time::timeout(Duration::from_secs(1), test_support::pool(&store).acquire())
                 .await
                 .expect("identity retirement releases pool capacity")
                 .expect("replacement connection is available");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_temp_schema
+                 WHERE type = 'table' AND name = 'checkpoint_connection_marker'"
+            )
+            .fetch_one(&mut *replacement)
+            .await
+            .expect("inspect runtime-drop replacement marker"),
+            0,
+            "runtime-dropped checkpoint connection is closed, not repooled"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                test_support::pool(&store).acquire(),
+            )
+            .await
+            .is_err(),
+            "max-one pool exposes no delayed duplicate idle connection"
+        );
         drop(replacement);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            test_support::pool(&store).num_idle(),
+            1,
+            "terminalized runtime-drop connection cannot increase idle capacity later"
+        );
         std::sync::Arc::try_unwrap(store)
             .ok()
             .expect("checkpoint identity test releases store")
@@ -7463,24 +7584,67 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn checkpoint_rejects_parent_or_wal_replaced_after_native_operation() {
+    async fn checkpoint_identity_mismatch_wins_after_work_cutoff() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        for mutation in ["parent", "wal"] {
+        const CHILD_ENV: &str = "GTA_CLAW_CHECKPOINT_IDENTITY_MISMATCH_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("tests::checkpoint_identity_mismatch_wins_after_work_cutoff")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated checkpoint identity mismatch test");
+            assert!(
+                status.success(),
+                "isolated checkpoint identity mismatch test failed"
+            );
+            return;
+        }
+
+        struct IdentityGateGuard {
+            release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Drop for IdentityGateGuard {
+            fn drop(&mut self) {
+                self.release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                store::test_support::clear_checkpoint_identity_barrier();
+            }
+        }
+
+        for mutation in ["parent", "database", "lock", "wal"] {
             let directory = tempfile::tempdir().expect("temporary directory");
             let path = database_path(&directory, &format!("checkpoint-{mutation}.sqlite"));
-            let owner = std::sync::Arc::new(open(&path).await);
+            let owner = std::sync::Arc::new(
+                StateStore::open(
+                    StoreConfig::new(&path)
+                        .with_operation_timeout(Duration::from_millis(500))
+                        .with_close_timeout(Duration::from_millis(1_500)),
+                )
+                .await
+                .expect("checkpoint identity fixture opens"),
+            );
             owner
                 .sessions()
                 .create(&session(&format!("checkpoint-{mutation}-row"), 1))
                 .await
                 .expect("create checkpoint identity WAL frame");
-            let (entered, release) = store::test_support::set_checkpoint_barrier(&path);
+            let (entered, release) = store::test_support::set_checkpoint_identity_barrier();
+            let gate = IdentityGateGuard {
+                release: std::sync::Arc::clone(&release),
+            };
             let checkpoint_owner = std::sync::Arc::clone(&owner);
             let checkpoint = tokio::spawn(async move { checkpoint_owner.checkpoint().await });
             tokio::time::timeout(Duration::from_secs(1), entered.notified())
                 .await
-                .expect("checkpoint reaches post-native identity barrier");
+                .expect("checkpoint reaches bounded post-native identity verifier");
 
             let detached = if mutation == "parent" {
                 let parent = directory.path();
@@ -7489,6 +7653,22 @@ mod tests {
                 fs::create_dir(parent).expect("create replacement checkpoint parent");
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
                     .expect("secure replacement checkpoint parent");
+                detached
+            } else if mutation == "database" {
+                let detached = path.with_extension("database-detached");
+                fs::rename(&path, &detached).expect("detach checkpoint database pathname");
+                fs::write(&path, b"replacement database")
+                    .expect("create replacement checkpoint database");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                    .expect("secure replacement checkpoint database");
+                detached
+            } else if mutation == "lock" {
+                let lock = store::test_support::lock_path(&owner);
+                let detached = lock.with_extension("lock-detached");
+                fs::rename(&lock, &detached).expect("detach checkpoint lock pathname");
+                fs::write(&lock, b"replacement lock").expect("create replacement checkpoint lock");
+                fs::set_permissions(&lock, fs::Permissions::from_mode(0o600))
+                    .expect("secure replacement checkpoint lock");
                 detached
             } else {
                 let wal = sidecar(&path, "-wal");
@@ -7499,7 +7679,8 @@ mod tests {
                     .expect("secure replacement checkpoint WAL");
                 detached
             };
-            release.notify_one();
+            tokio::time::sleep(Duration::from_millis(550)).await;
+            release.store(true, std::sync::atomic::Ordering::Release);
             let error = checkpoint
                 .await
                 .expect("checkpoint identity task joins")
@@ -7513,11 +7694,39 @@ mod tests {
                     ),
                 "checkpoint preserves the identity-failure primary: {error:?}"
             );
+            assert!(
+                !matches!(
+                    &error,
+                    StateError::OperationTimedOut {
+                        operation: "checkpoint SQLite WAL",
+                        ..
+                    }
+                ) && !matches!(
+                    &error,
+                    StateError::OperationCleanupFailed { primary, .. }
+                        if matches!(
+                            &**primary,
+                            StateError::OperationTimedOut {
+                                operation: "checkpoint SQLite WAL",
+                                ..
+                            }
+                        )
+                ),
+                "reported identity mismatch wins after the work cutoff: {error:?}"
+            );
+            drop(gate);
 
             if mutation == "parent" {
                 fs::remove_dir(directory.path()).expect("remove replacement checkpoint parent");
                 fs::rename(&detached, directory.path())
                     .expect("restore checkpoint parent identity");
+            } else if mutation == "database" {
+                fs::remove_file(&path).expect("remove replacement checkpoint database");
+                fs::rename(&detached, &path).expect("restore checkpoint database identity");
+            } else if mutation == "lock" {
+                let lock = store::test_support::lock_path(&owner);
+                fs::remove_file(&lock).expect("remove replacement checkpoint lock");
+                fs::rename(&detached, &lock).expect("restore checkpoint lock identity");
             } else {
                 let wal = sidecar(&path, "-wal");
                 match fs::remove_file(&wal) {
