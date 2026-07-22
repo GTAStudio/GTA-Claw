@@ -4,6 +4,8 @@ use sha2::{Digest as _, Sha256};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::ptr::NonNull;
+#[cfg(test)]
+use std::sync::atomic::AtomicI32;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
@@ -246,7 +248,13 @@ static CHECKPOINT_RESULT_TEST_GATE: std::sync::LazyLock<
     std::sync::Mutex<Option<CheckpointTestGate>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
+static CHECKPOINT_BEFORE_CLASSIFY_TEST_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<CheckpointTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
 static FAIL_CHECKPOINT_BUSY_RESTORE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static CHECKPOINT_NATIVE_RESULT_OVERRIDE: AtomicI32 = AtomicI32::new(libsqlite3_sys::SQLITE_OK);
 
 // SAFETY: the backup handle is exclusively owned and both SQLite connections
 // remain mutably borrowed until it is finished.
@@ -2104,6 +2112,14 @@ fn classify_checkpoint_result(
     cancellation: &CheckpointCancellation,
 ) -> Result<NativeCheckpointReport, FileControlError> {
     let primary = result & 0xff;
+    if result != libsqlite3_sys::SQLITE_OK
+        && !matches!(
+            primary,
+            libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT
+        )
+    {
+        return Err(FileControlError::SQLite(result));
+    }
     let latched = cancellation.stop_cause.load(Ordering::Acquire);
     let cause = if latched == CHECKPOINT_STOP_NONE
         && matches!(
@@ -2129,9 +2145,7 @@ fn classify_checkpoint_result(
             checkpointed_frames: i64::from(checkpointed_frames),
         });
     }
-    if result != libsqlite3_sys::SQLITE_OK {
-        return Err(FileControlError::SQLite(result));
-    }
+    debug_assert_eq!(result, libsqlite3_sys::SQLITE_OK);
     if cancellation.is_cancelled() || std::time::Instant::now() >= cancellation.work_deadline {
         let _ = cancellation.latch_stop_cause(std::time::Instant::now());
         return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
@@ -2142,6 +2156,15 @@ fn classify_checkpoint_result(
         ),
         log_frames: i64::from(log_frames),
         checkpointed_frames: i64::from(checkpointed_frames),
+    })
+}
+
+fn checkpoint_error_requires_terminal_close(error: &FileControlError) -> bool {
+    error.code().is_some_and(|code| {
+        !matches!(
+            code & 0xff,
+            libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT
+        )
     })
 }
 
@@ -2207,6 +2230,17 @@ fn run_native_checkpoint<Connection: BeginOwnedConnection>(
                 &raw mut log_frames,
                 &raw mut checkpointed_frames,
             )
+        };
+        #[cfg(test)]
+        let result = {
+            let overridden =
+                CHECKPOINT_NATIVE_RESULT_OVERRIDE.swap(libsqlite3_sys::SQLITE_OK, Ordering::AcqRel);
+            wait_at_checkpoint_test_gate(&CHECKPOINT_BEFORE_CLASSIFY_TEST_GATE);
+            if overridden == libsqlite3_sys::SQLITE_OK {
+                result
+            } else {
+                overridden
+            }
         };
         drop(interrupt_registration);
         let checkpoint =
@@ -2281,6 +2315,18 @@ pub async fn checkpoint_owned_connection<Connection: BeginOwnedConnection>(
                     .take()
                     .expect("checkpoint result sender remains owned");
                 match checkpoint {
+                    Ok(Err(error)) if checkpoint_error_requires_terminal_close(&error) => {
+                        let close = close_permit
+                            .take()
+                            .expect("unsafe checkpoint terminal close permit remains owned")
+                            .close(
+                                payload
+                                    .connection
+                                    .take()
+                                    .expect("unsafe checkpoint connection remains owned"),
+                            );
+                        let _ = result_tx.send(CheckpointWorkerOutput::Terminal(error, close));
+                    }
                     Ok(result) => {
                         let delivery = CheckpointDelivery {
                             connection: payload.connection.take(),
@@ -5062,7 +5108,38 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
     }
 
     /// Rolls back and returns the owned connection only after SQLite reaches autocommit.
-    pub async fn rollback(mut self) -> Result<Connection, FileControlError> {
+    pub async fn rollback(self) -> Result<Connection, FileControlError> {
+        self.rollback_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            "terminal rollback was Quarantined after its fixed cleanup cutoff",
+        )
+        .await
+    }
+
+    /// Rolls back with one immutable absolute terminal cleanup deadline.
+    pub async fn rollback_with_deadline(
+        self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<Connection, FileControlError> {
+        self.rollback_until(
+            cleanup_deadline,
+            "terminal rollback exceeded its immutable cleanup deadline",
+        )
+        .await
+    }
+
+    async fn rollback_until(
+        mut self,
+        cleanup_deadline: std::time::Instant,
+        timeout_error: &'static str,
+    ) -> Result<Connection, FileControlError> {
+        let mut late_delivery_permit = Some(
+            self.cleanup_owner
+                .as_mut()
+                .expect("rollback cleanup owner remains owned")
+                .take_terminal_permit()
+                .expect("late rollback delivery close capacity was pre-reserved"),
+        );
         let permit = self
             .cleanup_owner
             .as_mut()
@@ -5088,18 +5165,33 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
             TerminalRollbackCompletion::Return(result_tx),
         )
         .map_err(FileControlError::Handle)?;
-        tokio::time::timeout(std::time::Duration::from_secs(1), result_rx)
-            .await
-            .map_err(|_| {
-                FileControlError::Handle(
-                    "terminal rollback was Quarantined after its fixed cleanup cutoff".to_owned(),
-                )
-            })?
-            .map_err(|_| {
-                FileControlError::Handle(
-                    "terminal rollback owner stopped without result".to_owned(),
-                )
-            })?
+        let result =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(cleanup_deadline), result_rx)
+                .await
+                .map_err(|_| FileControlError::Handle(timeout_error.to_owned()))?
+                .map_err(|_| {
+                    FileControlError::Handle(
+                        "terminal rollback owner stopped without result".to_owned(),
+                    )
+                })?;
+        if std::time::Instant::now() >= cleanup_deadline {
+            return Err(match result {
+                Ok(connection) => {
+                    let close = late_delivery_permit
+                        .take()
+                        .expect("late rollback close permit remains owned")
+                        .close(connection);
+                    FileControlError::Handle(format!(
+                        "{timeout_error}; late rollback connection close: {close:?}"
+                    ))
+                }
+                Err(error) => FileControlError::Handle(format!(
+                    "{timeout_error}; late rollback result: {error}"
+                )),
+            });
+        }
+        late_delivery_permit.take();
+        result
     }
 }
 
@@ -11444,6 +11536,76 @@ mod deadline_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_preserves_extended_native_errors_and_discards() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_preserves_extended_native_errors_and_discards",
+            "GTA_CLAW_OWNED_CHECKPOINT_NATIVE_ERRORS_CHILD",
+        ) {
+            return;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open native checkpoint error pool");
+        for result in [
+            libsqlite3_sys::SQLITE_IOERR | (1 << 8),
+            libsqlite3_sys::SQLITE_CORRUPT | (1 << 8),
+            libsqlite3_sys::SQLITE_READONLY | (1 << 8),
+        ] {
+            let (_gate, entered, release) =
+                install_checkpoint_test_gate(&CHECKPOINT_BEFORE_CLASSIFY_TEST_GATE);
+            let connection = pool
+                .acquire()
+                .await
+                .expect("acquire native checkpoint error connection");
+            let owner = BlockingCleanupOwner::acquire("native-checkpoint-error")
+                .await
+                .expect("reserve native checkpoint error owner");
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let task_cancelled = Arc::clone(&cancelled);
+            let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            CHECKPOINT_NATIVE_RESULT_OVERRIDE.store(result, Ordering::Release);
+            let checkpoint = tokio::spawn(checkpoint_owned_connection(
+                owner,
+                connection,
+                CheckpointExecutionContext {
+                    work_deadline,
+                    cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                    busy_timeout: std::time::Duration::from_millis(50),
+                    restore_busy_timeout: std::time::Duration::from_millis(250),
+                    cancelled: task_cancelled,
+                },
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+                .await
+                .expect("native checkpoint error reaches classification gate");
+            cancelled.store(true, Ordering::Release);
+            release.store(true, Ordering::Release);
+            let outcome = checkpoint
+                .await
+                .expect("native checkpoint error task joins")
+                .expect("native checkpoint error terminalizes");
+            let OwnedCheckpointOutcome::Terminal { error, close } = outcome else {
+                panic!("unsafe native checkpoint error must discard its connection");
+            };
+            assert_eq!(
+                error.code(),
+                Some(result),
+                "unrelated extended native code wins over cancellation"
+            );
+            assert_eq!(close, TerminalCloseOutcome::Closed);
+            let replacement =
+                tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                    .await
+                    .expect("terminal discard releases pool capacity")
+                    .expect("replacement connection is available after unsafe native error");
+            drop(replacement);
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_checkpoint_reservation_fits_max_open_peak_headroom() {
         if run_in_isolated_child(
             "deadline_tests::owned_checkpoint_reservation_fits_max_open_peak_headroom",
@@ -14823,6 +14985,129 @@ mod deadline_tests {
         }
         let _executor_serial = Arc::clone(&EXECUTOR_TEST_SERIAL).lock_owned().await;
         run_rollback_stall_matrix(RollbackTestStage::BeforeSqliteExec, 3).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_absolute_deadline_retains_ownership_until_release() {
+        if run_in_isolated_child(
+            "deadline_tests::rollback_absolute_deadline_retains_ownership_until_release",
+            "GTA_CLAW_ABSOLUTE_ROLLBACK_CHILD",
+        ) {
+            return;
+        }
+        let _executor_serial = Arc::clone(&EXECUTOR_TEST_SERIAL).lock_owned().await;
+        let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open absolute rollback connection");
+        sqlx::raw_sql(
+            "CREATE TABLE claw_writer_lock(
+                singleton INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                acquired_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO claw_writer_lock(singleton, owner, acquired_at_ms)
+             VALUES (1, 'actual-owner', 1);",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("seed absolute rollback writer row");
+        let mut transaction =
+            begin_manual_transaction(connection, std::time::Duration::from_secs(1), None)
+                .await
+                .expect("begin absolute rollback transaction");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let work_deadline = started + std::time::Duration::from_millis(200);
+        let cleanup_deadline = started + std::time::Duration::from_millis(300);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            transaction
+                .delete_writer_claim_with_deadline("wrong-owner", work_deadline, cancelled,)
+                .await
+                .expect("mismatched writer deletion completes"),
+            0,
+            "writer deletion failure selects the rollback path"
+        );
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (registration, entered) = install_rollback_gate(
+            &transaction,
+            RollbackTestStage::BeforeSqliteExec,
+            false,
+            false,
+            Arc::clone(&release),
+        );
+        let rollback = tokio::spawn(transaction.rollback_with_deadline(cleanup_deadline));
+        wait_for_atomic(&entered, "absolute rollback gate").await;
+        let error = rollback
+            .await
+            .expect("absolute rollback task joins")
+            .expect_err("absolute rollback reaches its original cleanup deadline");
+        assert!(error.to_string().contains("immutable cleanup deadline"));
+        assert!(
+            BlockingCleanupOwner::acquire_set(
+                "absolute-rollback-held-capacity",
+                64,
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
+            )
+            .await
+            .is_err(),
+            "expired rollback retains cleanup ownership while native work is gated"
+        );
+        registration.release();
+        let all = BlockingCleanupOwner::acquire_set(
+            "absolute-rollback-capacity-recovery",
+            64,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("released rollback restores every cleanup slot");
+        for owner in all {
+            owner.shutdown().expect("release rollback capacity proof");
+        }
+
+        let connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("open late absolute rollback connection");
+        let transaction =
+            begin_manual_transaction(connection, std::time::Duration::from_secs(1), None)
+                .await
+                .expect("begin late absolute rollback transaction");
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (registration, entered) = install_rollback_gate(
+            &transaction,
+            RollbackTestStage::BeforeSqliteExec,
+            false,
+            false,
+            Arc::clone(&release),
+        );
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_millis(75);
+        let mut rollback = Box::pin(transaction.rollback_with_deadline(cleanup_deadline));
+        tokio::select! {
+            result = &mut rollback => panic!("late rollback completed before its gate: {result:?}"),
+            () = async {
+                while !entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            registration.release();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let error = rollback
+            .await
+            .expect_err("late rollback result cannot bypass its absolute deadline");
+        assert!(
+            error.to_string().contains("immutable cleanup deadline")
+                && error
+                    .to_string()
+                    .contains("late rollback connection close: Closed"),
+            "late reusable rollback connection is terminally closed: {error}"
+        );
+        release_thread
+            .join()
+            .expect("late rollback release thread joins");
     }
 
     #[test]

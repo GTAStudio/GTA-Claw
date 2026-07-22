@@ -578,6 +578,21 @@ impl StateOwnerRetirementReceipt {
     }
 }
 
+#[cfg(test)]
+fn wait_at_checkpoint_identity_test_gate() {
+    let gate = CHECKPOINT_IDENTITY_TEST_CONTROL
+        .lock()
+        .expect("checkpoint identity test control lock poisoned")
+        .as_ref()
+        .map(|control| (Arc::clone(&control.entered), Arc::clone(&control.release)));
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        while !release.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+}
+
 fn handoff_state_payload_decide<Payload, Cleanup>(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     payload: Payload,
@@ -1051,6 +1066,16 @@ struct OwnedCloseCutoffTestControl {
 #[cfg(test)]
 static OWNED_CLOSE_CUTOFF_TEST_CONTROL: std::sync::LazyLock<
     Mutex<Option<OwnedCloseCutoffTestControl>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+#[derive(Clone)]
+struct CheckpointIdentityTestControl {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(test)]
+static CHECKPOINT_IDENTITY_TEST_CONTROL: std::sync::LazyLock<
+    Mutex<Option<CheckpointIdentityTestControl>>,
 > = std::sync::LazyLock::new(|| Mutex::new(None));
 #[cfg(test)]
 static EXPIRED_UNDELIVERED_BEGIN_DISPATCHES: std::sync::atomic::AtomicUsize =
@@ -3953,7 +3978,7 @@ impl StateStore {
         };
         #[cfg(all(test, unix))]
         wait_at_checkpoint_test_barrier(&self.path).await;
-        if let Err(error) = operation.identity.verify() {
+        if let Err(error) = operation.verify_checkpoint_identity(cleanup_deadline).await {
             return Err(operation.fail(error).await);
         }
         let report = match result {
@@ -4217,7 +4242,7 @@ impl StateStore {
                 .await;
                 connection = release.connection;
                 if let Some(reason) = release.reason {
-                    reasons.push(reason);
+                    reasons.push(reason.to_string());
                 }
                 release.released
             } else {
@@ -4308,7 +4333,7 @@ impl StateStore {
 struct CloseWriterRelease {
     connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
     released: bool,
-    reason: Option<String>,
+    reason: Option<StateError>,
 }
 
 async fn release_close_writer_claim(
@@ -4337,8 +4362,9 @@ async fn release_close_writer_claim(
                 return CloseWriterRelease {
                     connection: None,
                     released: false,
-                    reason: Some(format!(
-                        "begin application writer release transaction failed: {error}"
+                    reason: Some(file_control_database(
+                        "begin application writer release transaction",
+                        error,
                     )),
                 };
             }
@@ -4349,35 +4375,41 @@ async fn release_close_writer_claim(
     let released = match released {
         Ok(1) => true,
         Ok(_) => {
-            return match transaction.rollback().await {
+            let primary = StateError::InvalidMigrationHistory {
+                reason: "application writer lock ownership changed unexpectedly".to_owned(),
+            };
+            return match transaction.rollback_with_deadline(cleanup_deadline).await {
                 Ok(connection) => CloseWriterRelease {
                     connection: Some(connection),
                     released: false,
-                    reason: Some(
-                        "application writer lock ownership changed unexpectedly".to_owned(),
-                    ),
+                    reason: Some(primary),
                 },
                 Err(cleanup) => CloseWriterRelease {
                     connection: None,
                     released: false,
-                    reason: Some(format!(
-                        "application writer lock ownership changed unexpectedly; rollback failed: {cleanup}"
+                    reason: Some(append_operation_cleanup(
+                        "rollback mismatched close writer deletion",
+                        primary,
+                        cleanup.to_string(),
                     )),
                 },
             };
         }
         Err(error) => {
-            return match transaction.rollback().await {
+            let primary = file_control_database("release application writer lock", error);
+            return match transaction.rollback_with_deadline(cleanup_deadline).await {
                 Ok(connection) => CloseWriterRelease {
                     connection: Some(connection),
                     released: false,
-                    reason: Some(format!("application writer release failed: {error}")),
+                    reason: Some(primary),
                 },
                 Err(cleanup) => CloseWriterRelease {
                     connection: None,
                     released: false,
-                    reason: Some(format!(
-                        "application writer release failed: {error}; rollback failed: {cleanup}"
+                    reason: Some(append_operation_cleanup(
+                        "rollback failed close writer deletion",
+                        primary,
+                        cleanup.to_string(),
                     )),
                 },
             };
@@ -4402,16 +4434,18 @@ async fn release_close_writer_claim(
             Err(cleanup) => CloseWriterRelease {
                 connection: Some(connection),
                 released,
-                reason: Some(format!(
-                    "application writer release post-COMMIT owner failed: {cleanup}"
+                reason: Some(database(
+                    "release application writer post-COMMIT owner",
+                    sqlx::Error::Protocol(cleanup),
                 )),
             },
         },
         Err(error) => CloseWriterRelease {
             connection: None,
             released: false,
-            reason: Some(format!(
-                "commit application writer release transaction failed: {error}"
+            reason: Some(file_control_database(
+                "commit application writer release transaction",
+                error,
             )),
         },
     }
@@ -7122,6 +7156,31 @@ mod open_deadline_tests {
                 .expect("release owned close cutoff capacity proof");
         }
     }
+
+    #[test]
+    fn close_writer_failure_paths_use_absolute_rollback_deadline() {
+        let source = include_str!("store.rs");
+        let release = source
+            .split("async fn release_close_writer_claim")
+            .nth(1)
+            .and_then(|source| source.split("async fn close_final_connection").next())
+            .expect("locate close writer release helper");
+        assert_eq!(
+            release
+                .matches("rollback_with_deadline(cleanup_deadline)")
+                .count(),
+            2,
+            "both deletion failure paths reuse the original hard cleanup deadline"
+        );
+        assert!(
+            !release.contains("transaction.rollback().await"),
+            "close writer failure cannot create a fresh relative rollback budget"
+        );
+        assert!(
+            release.matches("append_operation_cleanup(").count() >= 2,
+            "both rollback failures preserve typed primary and cleanup evidence"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -7661,6 +7720,7 @@ struct BackupConnectionGuard {
     connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
     cancellation: Option<Arc<OpenDeadlineState>>,
     cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    retirement_fence: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 impl BackupConnectionGuard {
@@ -7673,11 +7733,26 @@ impl BackupConnectionGuard {
             connection: Some(connection),
             cancellation: Some(cancellation),
             cleanup_owner: Some(cleanup_owner),
+            retirement_fence: None,
         }
+    }
+
+    fn retain_until(&mut self, signal: Arc<std::sync::atomic::AtomicU8>) {
+        assert!(
+            self.retirement_fence.replace(signal).is_none(),
+            "connection retirement fence is installed once"
+        );
     }
 
     fn release_reusable(mut self) -> Result<(), StateError> {
         self.cancellation = None;
+        if let Some(signal) = self.retirement_fence.take() {
+            assert_eq!(
+                signal.load(std::sync::atomic::Ordering::Acquire),
+                2,
+                "reusable connection waits for verification retirement"
+            );
+        }
         let connection = self
             .connection
             .take()
@@ -7706,13 +7781,19 @@ impl BackupConnectionGuard {
             (self.connection.take(), self.cleanup_owner.take())
         {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let retirement_fence = self.retirement_fence.take();
             if handoff_state_payload(
                 cleanup_owner,
-                std::sync::Mutex::new((Some(connection), Some(done_tx))),
+                std::sync::Mutex::new((Some(connection), Some(done_tx), retirement_fence)),
                 |_runtime, terminal_closes, payload| {
                     let mut payload = payload
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(signal) = payload.2.take() {
+                        while signal.load(std::sync::atomic::Ordering::Acquire) != 2 {
+                            std::thread::yield_now();
+                        }
+                    }
                     let permit = terminal_closes
                         .take_permit()
                         .expect("discard close capacity was pre-reserved");
@@ -7766,18 +7847,25 @@ impl Drop for BackupConnectionGuard {
                     .cancelled
                     .store(true, std::sync::atomic::Ordering::Release);
             }
+            let retirement_fence = self.retirement_fence.take();
             let _ = handoff_state_payload(
                 cleanup_owner,
-                std::sync::Mutex::new(Some(connection)),
-                |_runtime, terminal_closes, connection| {
-                    let mut connection = connection
+                std::sync::Mutex::new((Some(connection), retirement_fence)),
+                |_runtime, terminal_closes, payload| {
+                    let mut payload = payload
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(signal) = payload.1.take() {
+                        while signal.load(std::sync::atomic::Ordering::Acquire) != 2 {
+                            std::thread::yield_now();
+                        }
+                    }
                     let permit = terminal_closes
                         .take_permit()
                         .expect("backup drop close capacity was pre-reserved");
                     let _ = permit.close(
-                        connection
+                        payload
+                            .0
                             .take()
                             .expect("dropped backup connection remains owned"),
                     );
@@ -8001,6 +8089,85 @@ impl<'store> StoreOperationConnection<'store> {
         .unwrap_or(claw_sqlite_file_control::TerminalCloseOutcome::Quarantined)
     }
 
+    async fn verify_checkpoint_identity(
+        &mut self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<(), StateError> {
+        struct CheckpointIdentityPayload {
+            identity: OwnedOperationalIdentity,
+            result: Arc<std::sync::Mutex<Option<Result<(), StateError>>>>,
+        }
+
+        let identity = self
+            .final_identity
+            .take()
+            .expect("checkpoint final identity remains owned");
+        let identity_owner = self
+            .final_identity_owner
+            .take()
+            .expect("checkpoint final identity owner remains reserved");
+        let retirement = StateOwnerRetirementReceipt::new();
+        self.connection
+            .as_mut()
+            .expect("checkpoint connection guard remains owned")
+            .retain_until(retirement.signal());
+        let result = Arc::new(std::sync::Mutex::new(None));
+        handoff_state_payload_with_completion(
+            identity_owner,
+            CheckpointIdentityPayload {
+                identity,
+                result: Arc::clone(&result),
+            },
+            retirement.signal(),
+            |_, _, payload| {
+                #[cfg(test)]
+                wait_at_checkpoint_identity_test_gate();
+                *payload
+                    .result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(payload.identity.verify());
+            },
+        )
+        .map_err(|cleanup| StateError::OperationCleanupFailed {
+            operation: self.deadline_state.operation,
+            primary: Box::new(database(
+                "handoff checkpoint identity verification",
+                sqlx::Error::Protocol(cleanup.clone()),
+            )),
+            cleanup,
+        })?;
+        if let Err(cleanup) = retirement
+            .wait(
+                cleanup_deadline,
+                "checkpoint filesystem identity verification",
+            )
+            .await
+        {
+            return Err(StateError::OperationCleanupFailed {
+                operation: self.deadline_state.operation,
+                primary: Box::new(self.deadline_state.timeout_error()),
+                cleanup,
+            });
+        }
+        let verified = result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                database(
+                    "checkpoint filesystem identity verification",
+                    sqlx::Error::Protocol(
+                        "checkpoint identity owner retired without a result".to_owned(),
+                    ),
+                )
+            })?;
+        if std::time::Instant::now() >= self.deadline.into_std() {
+            return Err(self.expire());
+        }
+        verified.and_then(|()| self.identity.verify_generation())
+    }
+
     async fn finish(mut self) -> Result<(), StateError> {
         let mut connection = self
             .connection
@@ -8034,23 +8201,21 @@ impl<'store> StoreOperationConnection<'store> {
                 close,
             ));
         }
-        let final_identity = self
-            .final_identity
-            .take()
-            .expect("final state identity remains owned");
-        let final_identity_owner = self
-            .final_identity_owner
-            .take()
-            .expect("final state identity owner remains reserved");
-        let verified = run_bounded_filesystem(
-            final_identity_owner,
-            self.deadline,
-            self.deadline_state.operation,
-            self.deadline_state.timeout_ms,
-            move || final_identity.verify(),
-        )
-        .await
-        .and_then(|()| self.identity.verify_generation());
+        let verified = if let (Some(final_identity), Some(final_identity_owner)) =
+            (self.final_identity.take(), self.final_identity_owner.take())
+        {
+            run_bounded_filesystem(
+                final_identity_owner,
+                self.deadline,
+                self.deadline_state.operation,
+                self.deadline_state.timeout_ms,
+                move || final_identity.verify(),
+            )
+            .await
+            .and_then(|()| self.identity.verify_generation())
+        } else {
+            self.identity.verify_generation()
+        };
         if let Err(error) = verified {
             let close = self.discard(connection).await;
             return Err(compose_terminal_close(
@@ -15696,6 +15861,33 @@ pub(crate) mod test_support {
                 },
             );
         (entered, release)
+    }
+
+    pub(crate) fn set_checkpoint_identity_barrier() -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let previous = super::CHECKPOINT_IDENTITY_TEST_CONTROL
+            .lock()
+            .expect("checkpoint identity test control lock poisoned")
+            .replace(super::CheckpointIdentityTestControl {
+                entered: std::sync::Arc::clone(&entered),
+                release: std::sync::Arc::clone(&release),
+            });
+        assert!(
+            previous.is_none(),
+            "checkpoint identity barrier is configured once"
+        );
+        (entered, release)
+    }
+
+    pub(crate) fn clear_checkpoint_identity_barrier() {
+        super::CHECKPOINT_IDENTITY_TEST_CONTROL
+            .lock()
+            .expect("checkpoint identity test control lock poisoned")
+            .take();
     }
 
     pub(crate) fn invalidate_writer_generation(store: &super::StateStore) {

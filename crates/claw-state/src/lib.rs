@@ -6167,6 +6167,147 @@ mod tests {
         store.close().await.expect("close configured-busy fixture");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_identity_verification_retains_connection_across_deadline_and_runtime_drop()
+    {
+        const CHILD_ENV: &str = "GTA_CLAW_CHECKPOINT_IDENTITY_RUNTIME_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _isolated = ISOLATED_SQLITE_GLOBAL_TEST_LOCK
+                .lock()
+                .expect("isolated SQLite global test lock poisoned");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg(
+                    "tests::checkpoint_identity_verification_retains_connection_across_deadline_and_runtime_drop",
+                )
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("run isolated checkpoint identity test");
+            assert!(status.success(), "isolated checkpoint identity test failed");
+            return;
+        }
+
+        struct GateGuard {
+            release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                self.release
+                    .store(true, std::sync::atomic::Ordering::Release);
+                test_support::clear_checkpoint_identity_barrier();
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "checkpoint-identity-runtime.sqlite");
+        let store = std::sync::Arc::new(
+            StateStore::open(
+                StoreConfig::new(&path)
+                    .with_max_connections(1)
+                    .with_operation_timeout(Duration::from_millis(500))
+                    .with_close_timeout(Duration::from_millis(1_500)),
+            )
+            .await
+            .expect("checkpoint identity runtime fixture opens"),
+        );
+
+        let (entered, release) = test_support::set_checkpoint_identity_barrier();
+        let guard = GateGuard {
+            release: std::sync::Arc::clone(&release),
+        };
+        let checkpoint_store = std::sync::Arc::clone(&store);
+        let checkpoint = tokio::spawn(async move { checkpoint_store.checkpoint().await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("checkpoint reaches bounded identity worker");
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        release.store(true, std::sync::atomic::Ordering::Release);
+        let error = checkpoint
+            .await
+            .expect("checkpoint identity timeout task joins")
+            .expect_err("identity verification crossing work cutoff times out");
+        assert!(
+            matches!(
+                &error,
+                StateError::OperationTimedOut {
+                    operation: "checkpoint SQLite WAL",
+                    timeout_ms: 500,
+                }
+            ) || matches!(
+                &error,
+                StateError::OperationCleanupFailed { primary, .. }
+                    if matches!(
+                        &**primary,
+                        StateError::OperationTimedOut {
+                            operation: "checkpoint SQLite WAL",
+                            timeout_ms: 500,
+                        }
+                    )
+            ),
+            "checkpoint identity timeout preserves its typed primary: {error:?}"
+        );
+        drop(guard);
+        store
+            .checkpoint()
+            .await
+            .expect("checkpoint recovers after identity timeout");
+
+        let (entered, release) = test_support::set_checkpoint_identity_barrier();
+        let _guard = GateGuard {
+            release: std::sync::Arc::clone(&release),
+        };
+        let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel(0);
+        let checkpoint_store = std::sync::Arc::clone(&store);
+        let caller = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build disposable checkpoint identity runtime");
+            let _checkpoint = runtime.spawn(async move { checkpoint_store.checkpoint().await });
+            drop_rx
+                .recv()
+                .expect("checkpoint identity runtime-drop request arrives");
+            drop(runtime);
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("runtime-drop checkpoint reaches identity worker");
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        drop_tx
+            .send(())
+            .expect("request checkpoint identity runtime destruction");
+        tokio::task::spawn_blocking(move || caller.join())
+            .await
+            .expect("checkpoint identity caller join is not cancelled")
+            .expect("checkpoint identity caller exits cleanly");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                test_support::pool(&store).acquire(),
+            )
+            .await
+            .is_err(),
+            "connection remains owned while identity verification is gated"
+        );
+        release.store(true, std::sync::atomic::Ordering::Release);
+        let replacement =
+            tokio::time::timeout(Duration::from_secs(1), test_support::pool(&store).acquire())
+                .await
+                .expect("identity retirement releases pool capacity")
+                .expect("replacement connection is available");
+        drop(replacement);
+        std::sync::Arc::try_unwrap(store)
+            .ok()
+            .expect("checkpoint identity test releases store")
+            .close()
+            .await
+            .expect("checkpoint identity runtime fixture closes");
+    }
+
     #[tokio::test]
     async fn repository_update_deadline_includes_preliminary_read() {
         let directory = tempfile::tempdir().expect("temporary directory");
