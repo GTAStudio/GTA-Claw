@@ -3890,54 +3890,96 @@ impl StateStore {
 
     /// Checkpoints and truncates the WAL.
     pub async fn checkpoint(&self) -> Result<CheckpointReport, StateError> {
-        let mut operation = StoreOperationConnection::acquire(
+        let mut operation = StoreOperationConnection::acquire_checkpoint(
             self.pool(),
             self.operational_identity(),
             "checkpoint SQLite WAL",
         )
         .await?;
-        let remaining = operation
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .min(operation.identity.busy_timeout);
-        if let Err(error) = operation.configure_busy_timeout(remaining).await {
-            return Err(operation.fail(error).await);
-        }
-        let row = deadline_first(operation.deadline, async {
-            let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .fetch_one(&mut *operation.sqlite())
-                .await
-                .map_err(|error| database("checkpoint SQLite WAL", error))?;
-            #[cfg(all(test, unix))]
-            wait_at_checkpoint_test_barrier(&self.path).await;
-            Ok::<_, StateError>(row)
-        })
+        let work_deadline = operation.deadline.into_std();
+        let cleanup_deadline = work_deadline
+            .checked_add(operation.identity.cleanup_timeout)
+            .ok_or(StateError::InvalidValue {
+                field: "checkpoint cleanup timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+        let connection = operation.take_checkpoint_connection();
+        let worker_owner = operation.take_checkpoint_worker_owner();
+        let checkpoint = claw_sqlite_file_control::checkpoint_owned_connection(
+            worker_owner,
+            connection,
+            claw_sqlite_file_control::CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline,
+                busy_timeout: operation.identity.busy_timeout,
+                restore_busy_timeout: operation.identity.busy_timeout,
+                cancelled: Arc::clone(&operation.deadline_state.cancelled),
+            },
+        )
         .await;
-        let row = match row {
-            Ok(Ok(row)) => row,
-            Ok(Err(error)) => {
-                let error = if tokio::time::Instant::now() >= operation.deadline {
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(cleanup) => {
+                let primary = if std::time::Instant::now() >= work_deadline {
                     operation.expire()
                 } else {
-                    error
+                    file_control_database("checkpoint SQLite WAL", cleanup.clone())
                 };
-                return Err(operation.fail(error).await);
-            }
-            Err(_) => {
-                let error = operation.expire();
-                return Err(operation.fail(error).await);
+                return Err(operation.fail_without_connection(append_operation_cleanup(
+                    "checkpoint SQLite WAL",
+                    primary,
+                    cleanup.to_string(),
+                )));
             }
         };
-        let report = CheckpointReport {
-            busy: row.get(0),
-            log_frames: row.get(1),
-            checkpointed_frames: row.get(2),
+        let result = match checkpoint {
+            claw_sqlite_file_control::OwnedCheckpointOutcome::Reusable { connection, result } => {
+                operation.restore_checkpoint_connection(connection);
+                result
+            }
+            claw_sqlite_file_control::OwnedCheckpointOutcome::Terminal { error, close } => {
+                let primary =
+                    if error.code() == Some(9) && std::time::Instant::now() >= work_deadline {
+                        operation.expire()
+                    } else {
+                        file_control_database("checkpoint SQLite WAL", error)
+                    };
+                return Err(operation.fail_without_connection(compose_terminal_close(
+                    "checkpoint SQLite WAL",
+                    primary,
+                    close,
+                )));
+            }
         };
-        if let Err(error) = operation
-            .configure_busy_timeout(operation.identity.busy_timeout)
-            .await
-        {
+        #[cfg(all(test, unix))]
+        wait_at_checkpoint_test_barrier(&self.path).await;
+        if let Err(error) = operation.identity.verify() {
             return Err(operation.fail(error).await);
+        }
+        let report = match result {
+            Ok(report) => CheckpointReport {
+                busy: report.busy,
+                log_frames: report.log_frames,
+                checkpointed_frames: report.checkpointed_frames,
+            },
+            Err(error) => {
+                let primary = if error.code() == Some(9)
+                    && (std::time::Instant::now() >= work_deadline
+                        || operation
+                            .deadline_state
+                            .cancelled
+                            .load(std::sync::atomic::Ordering::Acquire))
+                {
+                    operation.expire()
+                } else {
+                    file_control_database("checkpoint SQLite WAL", error)
+                };
+                return Err(operation.fail(primary).await);
+            }
+        };
+        if std::time::Instant::now() >= work_deadline {
+            let primary = operation.expire();
+            return Err(operation.fail(primary).await);
         }
         operation.finish().await?;
         Ok(report)
@@ -3952,7 +3994,19 @@ impl StateStore {
         mut self,
         application_lock_already_released: bool,
     ) -> Result<CheckpointReport, StateError> {
-        let deadline = tokio::time::Instant::now() + self.close_timeout;
+        let close_started = tokio::time::Instant::now();
+        let deadline = close_started + self.close_timeout;
+        let mut checkpoint_cleanup_tail = self
+            .close_timeout
+            .checked_div(5)
+            .unwrap_or(Duration::ZERO)
+            .min(Duration::from_millis(100));
+        if checkpoint_cleanup_tail.is_zero() {
+            checkpoint_cleanup_tail = self.close_timeout.min(Duration::from_nanos(1));
+        }
+        let checkpoint_work_cutoff = deadline
+            .checked_sub(checkpoint_cleanup_tail)
+            .unwrap_or(close_started);
         let mut ownership = StateStoreCloseGuard {
             ownership: self.ownership.take(),
             terminal_confirmed: false,
@@ -3986,8 +4040,31 @@ impl StateStore {
                 false
             }
         };
+        let mut checkpoint_owner = if identity_valid {
+            // Close needs one worker owner, leaving seven of the eight peak headroom slots.
+            match claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+                "claw-state-close-checkpoint",
+                1,
+                checkpoint_work_cutoff.into_std(),
+            )
+            .await
+            {
+                Ok(mut owners) => owners.pop(),
+                Err(error) => {
+                    reasons.push(format!("reserve close checkpoint owner failed: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut connection = if identity_valid {
-            match tokio::time::timeout_at(deadline, ownership.ownership().pool.acquire()).await {
+            match tokio::time::timeout_at(
+                checkpoint_work_cutoff,
+                ownership.ownership().pool.acquire(),
+            )
+            .await
+            {
                 Ok(Ok(connection)) => Some(connection),
                 Ok(Err(error)) => {
                     reasons.push(format!(
@@ -3997,8 +4074,9 @@ impl StateStore {
                     None
                 }
                 Err(_) => {
-                    reasons
-                        .push("acquire final close connection exceeded close deadline".to_owned());
+                    reasons.push(
+                        "acquire final close connection exceeded checkpoint work cutoff".to_owned(),
+                    );
                     None
                 }
             }
@@ -4020,104 +4098,130 @@ impl StateStore {
         })
         .await;
 
-        let mut checkpoint_expired = false;
-        let checkpoint = if let Some(connection) = connection.as_mut() {
-            let remaining = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .min(self.busy_timeout);
-            let progress_deadline = deadline.into_std();
-            let setup = deadline_first(deadline, async {
-                claw_sqlite_file_control::set_busy_timeout(connection, remaining)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let mut handle = connection
-                    .lock_handle()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                handle.set_progress_handler(100, move || {
-                    std::time::Instant::now() < progress_deadline
-                });
-                Ok::<(), String>(())
-            })
-            .await;
-            if !matches!(setup, Ok(Ok(()))) {
-                checkpoint_expired = matches!(setup, Err(()));
-                reasons.push(match setup {
-                    Ok(Err(error)) => format!("configure bounded checkpoint: {error}"),
-                    Err(()) => "checkpoint setup exceeded close deadline".to_owned(),
-                    Ok(Ok(())) => unreachable!(),
-                });
-                None
-            } else {
-                let checkpoint_result = deadline_first(
-                    deadline,
-                    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").fetch_one(&mut **connection),
+        let mut checkpoint_terminal_closed = false;
+        let checkpoint = if let Some(worker_owner) = checkpoint_owner.take() {
+            if let Some(checkpoint_connection) = connection.take() {
+                match claw_sqlite_file_control::checkpoint_owned_connection(
+                    worker_owner,
+                    checkpoint_connection,
+                    claw_sqlite_file_control::CheckpointExecutionContext {
+                        work_deadline: checkpoint_work_cutoff.into_std(),
+                        cleanup_deadline: deadline.into_std(),
+                        busy_timeout: self.busy_timeout,
+                        restore_busy_timeout: self.busy_timeout,
+                        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
                 )
-                .await;
-                match checkpoint_result {
-                    Ok(Ok(row)) => {
-                        let report = CheckpointReport {
-                            busy: row.get(0),
-                            log_frames: row.get(1),
-                            checkpointed_frames: row.get(2),
-                        };
-                        if report.busy == 0 {
-                            Some(report)
-                        } else {
-                            reasons.push(format!(
-                            "checkpoint remained busy with {} WAL frames and {} checkpointed frames",
-                            report.log_frames, report.checkpointed_frames
-                        ));
-                            None
+                .await
+                {
+                    Ok(claw_sqlite_file_control::OwnedCheckpointOutcome::Reusable {
+                        connection: returned,
+                        result,
+                    }) => {
+                        connection = Some(returned);
+                        match result {
+                            Ok(report) if report.busy == 0 => Some(CheckpointReport {
+                                busy: report.busy,
+                                log_frames: report.log_frames,
+                                checkpointed_frames: report.checkpointed_frames,
+                            }),
+                            Ok(report) => {
+                                reasons.push(format!(
+                                    "checkpoint remained busy with {} WAL frames and {} checkpointed frames",
+                                    report.log_frames, report.checkpointed_frames
+                                ));
+                                None
+                            }
+                            Err(error)
+                                if error.code() == Some(9)
+                                    && std::time::Instant::now()
+                                        >= checkpoint_work_cutoff.into_std() =>
+                            {
+                                reasons.push(
+                                    "checkpoint exceeded its immutable work cutoff".to_owned(),
+                                );
+                                None
+                            }
+                            Err(error) => {
+                                reasons.push(format!("checkpoint failed: {error}"));
+                                None
+                            }
                         }
                     }
-                    Ok(Err(error)) => {
+                    Ok(claw_sqlite_file_control::OwnedCheckpointOutcome::Terminal {
+                        error,
+                        close,
+                    }) => {
+                        checkpoint_terminal_closed =
+                            close == claw_sqlite_file_control::TerminalCloseOutcome::Closed;
                         reasons.push(format!(
-                            "checkpoint failed: {}",
-                            database("checkpoint SQLite WAL", error)
+                            "checkpoint connection was terminally discarded: {error}; close={close:?}"
                         ));
                         None
                     }
-                    Err(()) => {
-                        checkpoint_expired = true;
-                        reasons.push("checkpoint exceeded close deadline".to_owned());
+                    Err(error) => {
+                        reasons.push(format!(
+                            "checkpoint worker retained terminal ownership: {error}"
+                        ));
                         None
                     }
                 }
+            } else {
+                let _ = worker_owner.shutdown();
+                None
             }
         } else {
             None
         };
+        let mut cleanup_identity_valid = identity_valid;
+        if connection.is_some()
+            && let Err(error) = verify_directory_path_identity(
+                &self.database_parent_path,
+                &ownership.ownership().database_parent,
+            )
+            .and_then(|()| verify_path_identity(&self.path, &ownership.ownership().database_file))
+            .and_then(|()| {
+                verify_store_lock_binding(
+                    &self.path,
+                    &ownership.ownership().database_file,
+                    &self.lock_path,
+                    &ownership.ownership().lock_file,
+                    self.lock_identity.as_deref(),
+                )
+            })
+            .and_then(|()| validate_sqlite_sidecars(&self.path, self.lock_identity.as_deref()))
+        {
+            cleanup_identity_valid = false;
+            reasons.push(format!(
+                "post-checkpoint database identity unavailable: {error}"
+            ));
+        }
+        let writer_cleanup_tail = checkpoint_cleanup_tail
+            .checked_div(5)
+            .filter(|tail| !tail.is_zero())
+            .unwrap_or_else(|| checkpoint_cleanup_tail.min(Duration::from_nanos(1)));
+        let writer_work_cutoff = deadline
+            .checked_sub(writer_cleanup_tail)
+            .unwrap_or(checkpoint_work_cutoff);
         let application_lock_released = if application_lock_already_released {
             true
-        } else if checkpoint_expired {
-            false
-        } else if let Some(connection) = connection.as_mut() {
-            let release_result = deadline_first(
-                deadline,
-                sqlx::query("DELETE FROM claw_writer_lock WHERE singleton = 1 AND owner = ?")
-                    .bind(&self.owner)
-                    .execute(&mut **connection),
-            )
-            .await;
-            match release_result {
-                Ok(Ok(released)) if released.rows_affected() == 1 => true,
-                Ok(Ok(_)) => {
-                    reasons
-                        .push("application writer lock ownership changed unexpectedly".to_owned());
-                    false
+        } else if cleanup_identity_valid {
+            if let Some(writer_connection) = connection.take() {
+                let release = release_close_writer_claim(
+                    writer_connection,
+                    &self.owner,
+                    writer_work_cutoff.into_std(),
+                    deadline.into_std(),
+                    self.busy_timeout,
+                )
+                .await;
+                connection = release.connection;
+                if let Some(reason) = release.reason {
+                    reasons.push(reason);
                 }
-                Ok(Err(error)) => {
-                    reasons.push(format!(
-                        "application writer release failed: {}",
-                        database("release application writer lock", error)
-                    ));
-                    false
-                }
-                Err(()) => {
-                    reasons.push("application writer release exceeded close deadline".to_owned());
-                    false
-                }
+                release.released
+            } else {
+                false
             }
         } else {
             false
@@ -4132,7 +4236,7 @@ impl StateStore {
                 }
             }
         } else {
-            false
+            checkpoint_terminal_closed
         };
 
         let pool_drain_completed = pool_closed_immediately
@@ -4198,6 +4302,118 @@ impl StateStore {
                 reason: reasons.join("; "),
             }),
         }
+    }
+}
+
+struct CloseWriterRelease {
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+    released: bool,
+    reason: Option<String>,
+}
+
+async fn release_close_writer_claim(
+    connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    owner: &str,
+    work_deadline: std::time::Instant,
+    cleanup_deadline: std::time::Instant,
+    busy_timeout: Duration,
+) -> CloseWriterRelease {
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let begin_busy_timeout =
+        busy_timeout.min(work_deadline.saturating_duration_since(std::time::Instant::now()));
+    let mut transaction =
+        match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
+            connection,
+            work_deadline,
+            cleanup_deadline,
+            begin_busy_timeout,
+            busy_timeout,
+            Some(Arc::clone(&cancelled)),
+        )
+        .await
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return CloseWriterRelease {
+                    connection: None,
+                    released: false,
+                    reason: Some(format!(
+                        "begin application writer release transaction failed: {error}"
+                    )),
+                };
+            }
+        };
+    let released = transaction
+        .delete_writer_claim_with_deadline(owner, work_deadline, Arc::clone(&cancelled))
+        .await;
+    let released = match released {
+        Ok(1) => true,
+        Ok(_) => {
+            return match transaction.rollback().await {
+                Ok(connection) => CloseWriterRelease {
+                    connection: Some(connection),
+                    released: false,
+                    reason: Some(
+                        "application writer lock ownership changed unexpectedly".to_owned(),
+                    ),
+                },
+                Err(cleanup) => CloseWriterRelease {
+                    connection: None,
+                    released: false,
+                    reason: Some(format!(
+                        "application writer lock ownership changed unexpectedly; rollback failed: {cleanup}"
+                    )),
+                },
+            };
+        }
+        Err(error) => {
+            return match transaction.rollback().await {
+                Ok(connection) => CloseWriterRelease {
+                    connection: Some(connection),
+                    released: false,
+                    reason: Some(format!("application writer release failed: {error}")),
+                },
+                Err(cleanup) => CloseWriterRelease {
+                    connection: None,
+                    released: false,
+                    reason: Some(format!(
+                        "application writer release failed: {error}; rollback failed: {cleanup}"
+                    )),
+                },
+            };
+        }
+    };
+    let commit = transaction
+        .commit_with_deadline(
+            work_deadline,
+            cleanup_deadline,
+            cancelled,
+            busy_timeout,
+            None,
+        )
+        .await;
+    match commit {
+        Ok((connection, post_commit_owner)) => match post_commit_owner.shutdown() {
+            Ok(()) => CloseWriterRelease {
+                connection: Some(connection),
+                released,
+                reason: None,
+            },
+            Err(cleanup) => CloseWriterRelease {
+                connection: Some(connection),
+                released,
+                reason: Some(format!(
+                    "application writer release post-COMMIT owner failed: {cleanup}"
+                )),
+            },
+        },
+        Err(error) => CloseWriterRelease {
+            connection: None,
+            released: false,
+            reason: Some(format!(
+                "commit application writer release transaction failed: {error}"
+            )),
+        },
     }
 }
 
@@ -7578,6 +7794,7 @@ struct StoreOperationConnection<'store> {
     deadline: tokio::time::Instant,
     final_identity: Option<OwnedOperationalIdentity>,
     final_identity_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    checkpoint_worker_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
 }
 
 fn compose_terminal_close(
@@ -7602,6 +7819,25 @@ impl<'store> StoreOperationConnection<'store> {
         identity: OperationalIdentity<'store>,
         operation: &'static str,
     ) -> Result<Self, StateError> {
+        Self::acquire_internal(pool, identity, operation, false).await
+    }
+
+    async fn acquire_checkpoint(
+        pool: &'store SqlitePool,
+        identity: OperationalIdentity<'store>,
+        operation: &'static str,
+    ) -> Result<Self, StateError> {
+        // Four atomic owners (worker, connection cleanup, and two identity checks)
+        // fit within the eight slots preserved by the seven-open peak.
+        Self::acquire_internal(pool, identity, operation, true).await
+    }
+
+    async fn acquire_internal(
+        pool: &'store SqlitePool,
+        identity: OperationalIdentity<'store>,
+        operation: &'static str,
+        reserve_checkpoint_worker: bool,
+    ) -> Result<Self, StateError> {
         let timeout_ms = u64::try_from(identity.operation_timeout.as_millis()).unwrap_or(u64::MAX);
         let deadline = tokio::time::Instant::now()
             .checked_add(identity.operation_timeout)
@@ -7623,7 +7859,7 @@ impl<'store> StoreOperationConnection<'store> {
         });
         let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "claw-state-operation-connection",
-            3,
+            if reserve_checkpoint_worker { 4 } else { 3 },
             deadline.into_std(),
         )
         .await
@@ -7637,6 +7873,11 @@ impl<'store> StoreOperationConnection<'store> {
                 )
             }
         })?;
+        let checkpoint_worker_owner = reserve_checkpoint_worker.then(|| {
+            owners
+                .pop()
+                .expect("state checkpoint worker owner was reserved")
+        });
         let final_identity_owner = owners.pop().expect("final state identity owner");
         let initial_identity_owner = owners.pop().expect("initial state identity owner");
         let cleanup_owner = owners.pop().expect("state operation cleanup owner");
@@ -7700,6 +7941,7 @@ impl<'store> StoreOperationConnection<'store> {
             deadline,
             final_identity: Some(final_identity),
             final_identity_owner: Some(final_identity_owner),
+            checkpoint_worker_owner,
         })
     }
 
@@ -7709,26 +7951,42 @@ impl<'store> StoreOperationConnection<'store> {
             .expect("state operation connection remains owned")
     }
 
+    fn take_checkpoint_connection(&mut self) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+        self.connection
+            .as_mut()
+            .expect("checkpoint operation guard remains owned")
+            .connection
+            .take()
+            .expect("checkpoint connection remains owned")
+    }
+
+    fn restore_checkpoint_connection(
+        &mut self,
+        connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    ) {
+        assert!(
+            self.connection
+                .as_mut()
+                .expect("checkpoint operation guard remains owned")
+                .connection
+                .replace(connection)
+                .is_none(),
+            "checkpoint connection is restored once"
+        );
+    }
+
+    fn take_checkpoint_worker_owner(&mut self) -> claw_sqlite_file_control::BlockingCleanupOwner {
+        self.checkpoint_worker_owner
+            .take()
+            .expect("checkpoint worker owner remains reserved")
+    }
+
     fn expire(&self) -> StateError {
         self.deadline_state
             .expired
             .store(true, std::sync::atomic::Ordering::Release);
         self.deadline_state.cancel();
         self.deadline_state.timeout_error()
-    }
-
-    async fn configure_busy_timeout(&mut self, timeout: Duration) -> Result<(), StateError> {
-        let operation = self.deadline_state.operation;
-        match deadline_first(
-            self.deadline,
-            claw_sqlite_file_control::set_busy_timeout(self.sqlite(), timeout),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(file_control_database(operation, error)),
-            Err(()) => Err(self.expire()),
-        }
     }
 
     async fn discard(
@@ -7832,6 +8090,11 @@ impl<'store> StoreOperationConnection<'store> {
                 format!("terminal connection close: {close:?}"),
             )
         }
+    }
+
+    fn fail_without_connection(self, primary: StateError) -> StateError {
+        self.deadline_state.cancel();
+        primary
     }
 }
 

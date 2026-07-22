@@ -1342,6 +1342,18 @@ mod tests {
         })
         .await
         .expect("remaining admitted opens queue before global owner acquisition");
+        let checkpoint_reservation = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "open-quota-checkpoint-reservation",
+            4,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("public checkpoint four-owner set fits seven-open peak headroom");
+        for owner in checkpoint_reservation {
+            owner
+                .shutdown()
+                .expect("release checkpoint peak-headroom proof");
+        }
         let unrelated = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "open-quota-unrelated-cleanup",
             7,
@@ -1350,12 +1362,12 @@ mod tests {
         .await
         .expect("seven peak opens preserve seven unrelated cleanup slots");
         let final_headroom = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
-            "open-quota-final-headroom-proof",
+            "open-quota-close-checkpoint-proof",
             1,
             std::time::Instant::now() + Duration::from_secs(1),
         )
         .await
-        .expect("seven eight-owner opens leave exactly one additional cleanup slot");
+        .expect("close checkpoint worker fits beside seven unrelated cleanup owners");
         claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
             "open-quota-overcommit-proof",
             1,
@@ -3211,6 +3223,75 @@ mod tests {
         let next = open(&path).await;
         assert!(next.recovered_writer().is_none());
         next.close().await.expect("next owner closes cleanly");
+    }
+
+    #[tokio::test]
+    async fn close_checkpoint_work_cutoff_preserves_cleanup_tail() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "close-checkpoint-tail.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path)
+                .with_busy_timeout(Duration::from_secs(5))
+                .with_close_timeout(Duration::from_millis(500)),
+        )
+        .await
+        .expect("close cleanup-tail store opens");
+        store
+            .sessions()
+            .create(&session("close-tail-session", 1))
+            .await
+            .expect("create close cleanup-tail WAL frame");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(1));
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open close cleanup-tail reader");
+        reader
+            .execute("BEGIN")
+            .await
+            .expect("begin close-tail reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish close cleanup-tail snapshot");
+
+        let started = std::time::Instant::now();
+        let error = store
+            .close()
+            .await
+            .expect_err("checkpoint work cutoff degrades but terminalizes close");
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "checkpoint cannot consume a second relative close budget"
+        );
+        assert!(
+            matches!(
+                &error,
+                StateError::CloseDegraded {
+                    checkpoint_completed: false,
+                    application_lock_released: true,
+                    final_connection_closed: true,
+                    pool_closed: true,
+                    os_lock_released: true,
+                    ..
+                }
+            ),
+            "cleanup tail releases every close ownership layer: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("immutable work cutoff"),
+            "close degradation records checkpoint work expiry: {error}"
+        );
+        reader
+            .execute("ROLLBACK")
+            .await
+            .expect("release tail reader");
+        reader.close().await.expect("close tail reader");
+        let reopened = open(&path).await;
+        assert!(reopened.recovered_writer().is_none());
+        reopened.close().await.expect("close-tail store reopens");
     }
 
     #[tokio::test]
@@ -5970,20 +6051,29 @@ mod tests {
             .expect("create WAL frame behind reader");
 
         let started = std::time::Instant::now();
-        assert!(matches!(
-            store
-                .checkpoint()
-                .await
-                .expect_err("busy checkpoint reaches operation deadline"),
+        let checkpoint_error = store
+            .checkpoint()
+            .await
+            .expect_err("busy checkpoint reaches operation deadline");
+        let timeout = StateError::OperationTimedOut {
+            operation: "checkpoint SQLite WAL",
+            timeout_ms: 500,
+        };
+        match checkpoint_error {
+            error @ StateError::OperationTimedOut { .. } => assert_eq!(error, timeout),
             StateError::OperationCleanupFailed {
                 operation: "checkpoint SQLite WAL",
                 primary,
-                ref cleanup,
-            } if *primary == StateError::OperationTimedOut {
-                operation: "checkpoint SQLite WAL",
-                timeout_ms: 500,
-            } && cleanup.contains("Quarantined")
-        ));
+                cleanup,
+            } => {
+                assert_eq!(*primary, timeout);
+                assert!(
+                    !cleanup.is_empty(),
+                    "terminal checkpoint evidence remains explicit"
+                );
+            }
+            error => panic!("unexpected checkpoint timeout error: {error:?}"),
+        }
         assert!(started.elapsed() < Duration::from_secs(1));
         reader
             .execute("ROLLBACK")
@@ -6011,6 +6101,70 @@ mod tests {
             .close()
             .await
             .expect("checkpoint deadline fixture closes");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_configured_busy_cutoff_reports_busy_and_recovers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "checkpoint-configured-busy.sqlite");
+        let store = StateStore::open(
+            StoreConfig::new(&path)
+                .with_max_connections(2)
+                .with_busy_timeout(Duration::from_millis(25))
+                .with_operation_timeout(Duration::from_secs(1)),
+        )
+        .await
+        .expect("configured-busy checkpoint fixture opens");
+        store
+            .sessions()
+            .create(&session("configured-busy-before-reader", 1))
+            .await
+            .expect("seed configured-busy reader snapshot");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(1));
+        let mut reader = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open configured-busy checkpoint reader");
+        reader.execute("BEGIN").await.expect("begin busy reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish configured-busy reader snapshot");
+        store
+            .sessions()
+            .create(&session("configured-busy-after-reader", 2))
+            .await
+            .expect("create configured-busy WAL frame");
+
+        let report = store
+            .checkpoint()
+            .await
+            .expect("configured busy cutoff is a conventional report");
+        assert_eq!(report.busy, 1);
+        assert_eq!(
+            store
+                .settings()
+                .await
+                .expect("checkpoint restores configured connection settings")
+                .busy_timeout_ms,
+            25
+        );
+        reader
+            .execute("ROLLBACK")
+            .await
+            .expect("release configured-busy reader");
+        reader.close().await.expect("close configured-busy reader");
+        assert_eq!(
+            store
+                .checkpoint()
+                .await
+                .expect("checkpoint immediately recovers after reader release")
+                .busy,
+            0
+        );
+        store.close().await.expect("close configured-busy fixture");
     }
 
     #[tokio::test]
@@ -7147,7 +7301,15 @@ mod tests {
             .await
             .expect("checkpoint task joins")
             .expect_err("post-operation replacement fails closed");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(
+            matches!(&error, StateError::InvalidPath { .. })
+                || matches!(
+                    &error,
+                    StateError::OperationCleanupFailed { primary, .. }
+                        if matches!(&**primary, StateError::InvalidPath { .. })
+                ),
+            "checkpoint preserves the identity-failure primary: {error:?}"
+        );
         fs::remove_file(&path).expect("remove replacement database name");
         fs::rename(&detached, &path).expect("restore database identity for clean close");
         std::sync::Arc::try_unwrap(owner)
@@ -7156,6 +7318,81 @@ mod tests {
             .close()
             .await
             .expect("checkpoint fixture closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_rejects_parent_or_wal_replaced_after_native_operation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for mutation in ["parent", "wal"] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = database_path(&directory, &format!("checkpoint-{mutation}.sqlite"));
+            let owner = std::sync::Arc::new(open(&path).await);
+            owner
+                .sessions()
+                .create(&session(&format!("checkpoint-{mutation}-row"), 1))
+                .await
+                .expect("create checkpoint identity WAL frame");
+            let (entered, release) = store::test_support::set_checkpoint_barrier(&path);
+            let checkpoint_owner = std::sync::Arc::clone(&owner);
+            let checkpoint = tokio::spawn(async move { checkpoint_owner.checkpoint().await });
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("checkpoint reaches post-native identity barrier");
+
+            let detached = if mutation == "parent" {
+                let parent = directory.path();
+                let detached = parent.with_extension("checkpoint-parent-detached");
+                fs::rename(parent, &detached).expect("detach checkpoint parent directory");
+                fs::create_dir(parent).expect("create replacement checkpoint parent");
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .expect("secure replacement checkpoint parent");
+                detached
+            } else {
+                let wal = sidecar(&path, "-wal");
+                let detached = sidecar(&path, "-wal-detached");
+                fs::rename(&wal, &detached).expect("detach checkpoint WAL pathname");
+                fs::write(&wal, b"replacement WAL").expect("create replacement checkpoint WAL");
+                fs::set_permissions(&wal, fs::Permissions::from_mode(0o600))
+                    .expect("secure replacement checkpoint WAL");
+                detached
+            };
+            release.notify_one();
+            let error = checkpoint
+                .await
+                .expect("checkpoint identity task joins")
+                .expect_err("post-native identity replacement fails closed");
+            assert!(
+                matches!(&error, StateError::InvalidPath { .. })
+                    || matches!(
+                        &error,
+                        StateError::OperationCleanupFailed { primary, .. }
+                            if matches!(&**primary, StateError::InvalidPath { .. })
+                    ),
+                "checkpoint preserves the identity-failure primary: {error:?}"
+            );
+
+            if mutation == "parent" {
+                fs::remove_dir(directory.path()).expect("remove replacement checkpoint parent");
+                fs::rename(&detached, directory.path())
+                    .expect("restore checkpoint parent identity");
+            } else {
+                let wal = sidecar(&path, "-wal");
+                match fs::remove_file(&wal) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove replacement checkpoint WAL: {error}"),
+                }
+                fs::rename(&detached, &wal).expect("restore checkpoint WAL identity");
+            }
+            std::sync::Arc::try_unwrap(owner)
+                .ok()
+                .expect("checkpoint identity task released store")
+                .close()
+                .await
+                .expect("checkpoint identity fixture closes");
+        }
     }
 
     #[cfg(unix)]

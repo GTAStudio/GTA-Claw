@@ -231,6 +231,22 @@ struct BackupTestControl {
 static BACKUP_TEST_CONTROLS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, BackupTestControl>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+type CheckpointTestGate = (Arc<tokio::sync::Notify>, Arc<AtomicBool>);
+#[cfg(test)]
+static CHECKPOINT_BEFORE_NATIVE_TEST_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<CheckpointTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
+static CHECKPOINT_BUSY_SLEEP_TEST_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<CheckpointTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
+static CHECKPOINT_RESULT_TEST_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<CheckpointTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
+static FAIL_CHECKPOINT_BUSY_RESTORE: AtomicBool = AtomicBool::new(false);
 
 // SAFETY: the backup handle is exclusively owned and both SQLite connections
 // remain mutably borrowed until it is finished.
@@ -1784,6 +1800,600 @@ pub struct BackupExecutionContext {
     pub source_busy_timeout: std::time::Duration,
     /// Busy timeout restored on the destination connection.
     pub destination_busy_timeout: std::time::Duration,
+}
+
+/// Immutable deadlines and cancellation state for one owned WAL checkpoint.
+pub struct CheckpointExecutionContext {
+    /// Last instant at which native checkpoint work may succeed.
+    pub work_deadline: std::time::Instant,
+    /// Last instant at which the worker must deliver or retain terminal ownership.
+    pub cleanup_deadline: std::time::Instant,
+    /// Configured SQLite busy wait budget captured before dispatch.
+    pub busy_timeout: std::time::Duration,
+    /// Busy timeout restored before a connection can be reused.
+    pub restore_busy_timeout: std::time::Duration,
+    /// Shared external cancellation state.
+    pub cancelled: Arc<AtomicBool>,
+}
+
+/// Native WAL checkpoint frame counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCheckpointReport {
+    /// One when the checkpoint remained busy or incomplete.
+    pub busy: i64,
+    /// WAL frames observed by SQLite, or `-1` when unavailable.
+    pub log_frames: i64,
+    /// Frames checkpointed by SQLite, or `-1` when unavailable.
+    pub checkpointed_frames: i64,
+}
+
+/// Terminal ownership disposition from an owned WAL checkpoint worker.
+pub enum OwnedCheckpointOutcome<Connection: BeginOwnedConnection> {
+    /// The connection was restored and can be identity-checked by the caller.
+    Reusable {
+        /// Exclusively owned connection returned after handler restoration.
+        connection: Connection,
+        /// Native checkpoint report or typed operation failure.
+        result: Result<NativeCheckpointReport, FileControlError>,
+    },
+    /// The connection could not be proven reusable and was terminally closed.
+    Terminal {
+        /// Primary checkpoint or handler-restoration failure.
+        error: FileControlError,
+        /// Physical close disposition.
+        close: TerminalCloseOutcome,
+    },
+}
+
+const CHECKPOINT_STOP_NONE: u8 = 0;
+const CHECKPOINT_STOP_CANCELLED: u8 = 1;
+const CHECKPOINT_STOP_WORK_DEADLINE: u8 = 2;
+const CHECKPOINT_STOP_BUSY_DEADLINE: u8 = 3;
+
+struct CheckpointCancellation {
+    local: AtomicBool,
+    external: Arc<AtomicBool>,
+    work_deadline: std::time::Instant,
+    busy_deadline: Option<std::time::Instant>,
+    stop_cause: AtomicU8,
+}
+
+#[cfg(test)]
+fn wait_at_checkpoint_test_gate(
+    gate: &'static std::sync::LazyLock<std::sync::Mutex<Option<CheckpointTestGate>>>,
+) {
+    let gate = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|(entered, release)| (Arc::clone(entered), Arc::clone(release)));
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        while !release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl CheckpointCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.local.load(Ordering::Acquire) || self.external.load(Ordering::Acquire)
+    }
+
+    fn latch_stop_cause(&self, now: std::time::Instant) -> u8 {
+        let observed = if self.is_cancelled() {
+            CHECKPOINT_STOP_CANCELLED
+        } else if now >= self.work_deadline {
+            CHECKPOINT_STOP_WORK_DEADLINE
+        } else if self.busy_deadline.is_none_or(|deadline| now >= deadline) {
+            CHECKPOINT_STOP_BUSY_DEADLINE
+        } else {
+            CHECKPOINT_STOP_NONE
+        };
+        if observed != CHECKPOINT_STOP_NONE {
+            let _ = self.stop_cause.compare_exchange(
+                CHECKPOINT_STOP_NONE,
+                observed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        self.stop_cause.load(Ordering::Acquire)
+    }
+}
+
+unsafe extern "C" fn checkpoint_busy_handler(
+    context: *mut std::ffi::c_void,
+    _prior_calls: std::ffi::c_int,
+) -> std::ffi::c_int {
+    // SAFETY: the owned worker retains this Arc-backed context until unregistration.
+    let cancellation = unsafe { &*context.cast::<CheckpointCancellation>() };
+    if cancellation.latch_stop_cause(std::time::Instant::now()) != CHECKPOINT_STOP_NONE {
+        return 0;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    #[cfg(test)]
+    wait_at_checkpoint_test_gate(&CHECKPOINT_BUSY_SLEEP_TEST_GATE);
+    i32::from(cancellation.latch_stop_cause(std::time::Instant::now()) == CHECKPOINT_STOP_NONE)
+}
+
+unsafe extern "C" fn checkpoint_progress_handler(context: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: the owned worker retains this Arc-backed context until unregistration.
+    let cancellation = unsafe { &*context.cast::<CheckpointCancellation>() };
+    let cause = cancellation.latch_stop_cause(std::time::Instant::now());
+    i32::from(matches!(
+        cause,
+        CHECKPOINT_STOP_CANCELLED | CHECKPOINT_STOP_WORK_DEADLINE
+    ))
+}
+
+struct CheckpointHandlerRegistration {
+    database: LiveInterruptPointer,
+    restore_busy_timeout_ms: i32,
+    active: bool,
+}
+
+impl CheckpointHandlerRegistration {
+    fn clear_and_restore(&mut self) -> Result<(), FileControlError> {
+        if !self.active {
+            return Ok(());
+        }
+        // SAFETY: the worker exclusively owns the locked connection and both contexts are live.
+        unsafe {
+            libsqlite3_sys::sqlite3_progress_handler(
+                self.database.as_ptr(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
+        }
+        // SAFETY: the same locked connection remains exclusively owned.
+        let cleared = unsafe {
+            libsqlite3_sys::sqlite3_busy_handler(self.database.as_ptr(), None, std::ptr::null_mut())
+        };
+        if cleared != libsqlite3_sys::SQLITE_OK {
+            return Err(FileControlError::SQLite(cleared));
+        }
+        #[cfg(test)]
+        if FAIL_CHECKPOINT_BUSY_RESTORE.swap(false, Ordering::AcqRel) {
+            return Err(FileControlError::Handle(
+                "injected checkpoint busy-timeout restore failure".to_owned(),
+            ));
+        }
+        // SAFETY: restoring the configured timeout also installs SQLite's built-in handler.
+        let restored = unsafe {
+            libsqlite3_sys::sqlite3_busy_timeout(
+                self.database.as_ptr(),
+                self.restore_busy_timeout_ms,
+            )
+        };
+        if restored != libsqlite3_sys::SQLITE_OK {
+            return Err(FileControlError::SQLite(restored));
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for CheckpointHandlerRegistration {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: this guard cannot outlive the worker's locked connection handle.
+            unsafe {
+                libsqlite3_sys::sqlite3_progress_handler(
+                    self.database.as_ptr(),
+                    0,
+                    None,
+                    std::ptr::null_mut(),
+                );
+                libsqlite3_sys::sqlite3_busy_handler(
+                    self.database.as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+}
+
+struct CheckpointRequestGuard {
+    cancellation: Arc<CheckpointCancellation>,
+    interrupt: Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
+    armed: bool,
+}
+
+impl CheckpointRequestGuard {
+    fn interrupt(&self) {
+        let pointer = self
+            .interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pointer) = pointer.as_ref() {
+            // SAFETY: SQLite permits interrupt from another thread, and the slot
+            // lock prevents registration clear and connection close until return.
+            unsafe {
+                libsqlite3_sys::sqlite3_interrupt(pointer.as_ptr());
+            }
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.local.store(true, Ordering::Release);
+        let _ = self
+            .cancellation
+            .latch_stop_cause(std::time::Instant::now());
+        self.interrupt();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CheckpointRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel();
+        }
+    }
+}
+
+struct CheckpointDelivery<Connection: BeginOwnedConnection> {
+    connection: Option<Connection>,
+    result: Option<Result<NativeCheckpointReport, FileControlError>>,
+    close_permit: Option<TerminalClosePermit>,
+}
+
+impl<Connection: BeginOwnedConnection> CheckpointDelivery<Connection> {
+    fn result_is_ok(&self) -> bool {
+        self.result.as_ref().is_some_and(Result::is_ok)
+    }
+
+    fn accept(mut self) -> (Connection, Result<NativeCheckpointReport, FileControlError>) {
+        self.close_permit.take();
+        (
+            self.connection
+                .take()
+                .expect("checkpoint connection is delivered once"),
+            self.result
+                .take()
+                .expect("checkpoint result is delivered once"),
+        )
+    }
+}
+
+impl<Connection: BeginOwnedConnection> Drop for CheckpointDelivery<Connection> {
+    fn drop(&mut self) {
+        if let (Some(connection), Some(permit)) = (self.connection.take(), self.close_permit.take())
+        {
+            let _ = permit.submit(connection);
+        }
+    }
+}
+
+enum CheckpointWorkerOutput<Connection: BeginOwnedConnection> {
+    Reusable(CheckpointDelivery<Connection>),
+    Terminal(FileControlError, TerminalCloseOutcome),
+}
+
+fn checkpoint_delivery_deadline_error(
+    cancellation: &CheckpointCancellation,
+    work_deadline: std::time::Instant,
+    cleanup_deadline: std::time::Instant,
+    reject_late_success: bool,
+) -> Option<FileControlError> {
+    let now = std::time::Instant::now();
+    if now >= cleanup_deadline {
+        Some(FileControlError::Handle(
+            "checkpoint delivery exceeded its immutable cleanup deadline".to_owned(),
+        ))
+    } else if reject_late_success && cancellation.is_cancelled() {
+        Some(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
+    } else if reject_late_success && now >= work_deadline {
+        let _ = cancellation.latch_stop_cause(now);
+        Some(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT))
+    } else {
+        None
+    }
+}
+
+fn classify_checkpoint_result(
+    result: i32,
+    log_frames: i32,
+    checkpointed_frames: i32,
+    cancellation: &CheckpointCancellation,
+) -> Result<NativeCheckpointReport, FileControlError> {
+    let primary = result & 0xff;
+    let latched = cancellation.stop_cause.load(Ordering::Acquire);
+    let cause = if latched == CHECKPOINT_STOP_NONE
+        && matches!(
+            primary,
+            libsqlite3_sys::SQLITE_BUSY | libsqlite3_sys::SQLITE_INTERRUPT
+        ) {
+        cancellation.latch_stop_cause(std::time::Instant::now())
+    } else {
+        latched
+    };
+    if matches!(
+        cause,
+        CHECKPOINT_STOP_CANCELLED | CHECKPOINT_STOP_WORK_DEADLINE
+    ) {
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+    }
+    if primary == libsqlite3_sys::SQLITE_BUSY
+        || (primary == libsqlite3_sys::SQLITE_INTERRUPT && cause == CHECKPOINT_STOP_BUSY_DEADLINE)
+    {
+        return Ok(NativeCheckpointReport {
+            busy: 1,
+            log_frames: i64::from(log_frames),
+            checkpointed_frames: i64::from(checkpointed_frames),
+        });
+    }
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    if cancellation.is_cancelled() || std::time::Instant::now() >= cancellation.work_deadline {
+        let _ = cancellation.latch_stop_cause(std::time::Instant::now());
+        return Err(FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT));
+    }
+    Ok(NativeCheckpointReport {
+        busy: i64::from(
+            log_frames >= 0 && checkpointed_frames >= 0 && checkpointed_frames < log_frames,
+        ),
+        log_frames: i64::from(log_frames),
+        checkpointed_frames: i64::from(checkpointed_frames),
+    })
+}
+
+fn run_native_checkpoint<Connection: BeginOwnedConnection>(
+    runtime: &tokio::runtime::Runtime,
+    connection: &mut Connection,
+    cancellation: &Arc<CheckpointCancellation>,
+    interrupt: &Arc<std::sync::Mutex<Option<LiveInterruptPointer>>>,
+    restore_busy_timeout_ms: i32,
+) -> Result<Result<NativeCheckpointReport, FileControlError>, FileControlError> {
+    #[cfg(test)]
+    wait_at_checkpoint_test_gate(&CHECKPOINT_BEFORE_NATIVE_TEST_GATE);
+    runtime.block_on(async {
+        let mut database = connection
+            .sqlite()
+            .lock_handle()
+            .await
+            .map_err(|error| FileControlError::Handle(error.to_string()))?;
+        let now = std::time::Instant::now();
+        if cancellation.is_cancelled() || now >= cancellation.work_deadline {
+            let _ = cancellation.latch_stop_cause(now);
+            return Ok(Err(FileControlError::SQLite(
+                libsqlite3_sys::SQLITE_INTERRUPT,
+            )));
+        }
+        let database = LiveInterruptPointer(database.as_raw_handle());
+        let context = Arc::clone(cancellation);
+        // SAFETY: the locked connection and Arc-backed context outlive both registrations.
+        let busy = unsafe {
+            libsqlite3_sys::sqlite3_busy_handler(
+                database.as_ptr(),
+                Some(checkpoint_busy_handler),
+                Arc::as_ptr(&context).cast_mut().cast(),
+            )
+        };
+        if busy != libsqlite3_sys::SQLITE_OK {
+            return Err(FileControlError::SQLite(busy));
+        }
+        // SAFETY: the same locked connection and context remain live through unregistration.
+        unsafe {
+            libsqlite3_sys::sqlite3_progress_handler(
+                database.as_ptr(),
+                100,
+                Some(checkpoint_progress_handler),
+                Arc::as_ptr(&context).cast_mut().cast(),
+            );
+        }
+        let mut handlers = CheckpointHandlerRegistration {
+            database,
+            restore_busy_timeout_ms,
+            active: true,
+        };
+        let interrupt_registration =
+            LiveInterruptRegistration::publish(Arc::clone(interrupt), database);
+        let mut log_frames = -1;
+        let mut checkpointed_frames = -1;
+        // SAFETY: the worker exclusively owns the locked live handle and output pointers.
+        let result = unsafe {
+            libsqlite3_sys::sqlite3_wal_checkpoint_v2(
+                database.as_ptr(),
+                c"main".as_ptr(),
+                libsqlite3_sys::SQLITE_CHECKPOINT_TRUNCATE,
+                &raw mut log_frames,
+                &raw mut checkpointed_frames,
+            )
+        };
+        drop(interrupt_registration);
+        let checkpoint =
+            classify_checkpoint_result(result, log_frames, checkpointed_frames, cancellation);
+        handlers.clear_and_restore()?;
+        Ok(checkpoint)
+    })
+}
+
+/// Runs `sqlite3_wal_checkpoint_v2` while a runtime-independent worker owns the connection.
+pub async fn checkpoint_owned_connection<Connection: BeginOwnedConnection>(
+    mut worker_owner: BlockingCleanupOwner,
+    connection: Connection,
+    context: CheckpointExecutionContext,
+) -> Result<OwnedCheckpointOutcome<Connection>, FileControlError> {
+    struct CheckpointWorkerPayload<Connection: BeginOwnedConnection> {
+        connection: Option<Connection>,
+        result: Option<std::sync::mpsc::SyncSender<CheckpointWorkerOutput<Connection>>>,
+    }
+
+    let restore_busy_timeout_ms = i32::try_from(context.restore_busy_timeout.as_millis())
+        .map_err(|_| FileControlError::Handle("busy timeout is too large".to_owned()))?;
+    let started = std::time::Instant::now();
+    let busy_deadline = (!context.busy_timeout.is_zero()).then(|| {
+        started
+            .checked_add(context.busy_timeout)
+            .unwrap_or(context.work_deadline)
+            .min(context.work_deadline)
+    });
+    let cancellation = Arc::new(CheckpointCancellation {
+        local: AtomicBool::new(false),
+        external: context.cancelled,
+        work_deadline: context.work_deadline,
+        busy_deadline,
+        stop_cause: AtomicU8::new(CHECKPOINT_STOP_NONE),
+    });
+    let interrupt = Arc::new(std::sync::Mutex::new(None));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+    let worker_cancellation = Arc::clone(&cancellation);
+    let worker_interrupt = Arc::clone(&interrupt);
+    let worker_owner_retired = Arc::new(AtomicU8::new(0));
+    worker_owner
+        .handoff_payload_internal_with_completion(
+            std::sync::Mutex::new(CheckpointWorkerPayload {
+                connection: Some(connection),
+                result: Some(result_tx),
+            }),
+            Some((Arc::clone(&worker_owner_retired), OWNER_TERMINALLY_RETIRED)),
+            move |runtime, terminal_closes, payload| {
+                let mut payload = payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut close_permit = Some(
+                    terminal_closes
+                        .take_permit()
+                        .expect("checkpoint close capacity was pre-reserved"),
+                );
+                let checkpoint = run_native_checkpoint(
+                    runtime,
+                    payload
+                        .connection
+                        .as_mut()
+                        .expect("checkpoint connection remains owned"),
+                    &worker_cancellation,
+                    &worker_interrupt,
+                    restore_busy_timeout_ms,
+                );
+                #[cfg(test)]
+                wait_at_checkpoint_test_gate(&CHECKPOINT_RESULT_TEST_GATE);
+                let result_tx = payload
+                    .result
+                    .take()
+                    .expect("checkpoint result sender remains owned");
+                match checkpoint {
+                    Ok(result) => {
+                        let delivery = CheckpointDelivery {
+                            connection: payload.connection.take(),
+                            result: Some(result),
+                            close_permit: close_permit.take(),
+                        };
+                        let _ = result_tx.send(CheckpointWorkerOutput::Reusable(delivery));
+                    }
+                    Err(error) => {
+                        let close = close_permit
+                            .take()
+                            .expect("checkpoint terminal close permit remains owned")
+                            .close(
+                                payload
+                                    .connection
+                                    .take()
+                                    .expect("failed checkpoint connection remains owned"),
+                            );
+                        let _ = result_tx.send(CheckpointWorkerOutput::Terminal(error, close));
+                    }
+                }
+            },
+        )
+        .map_err(FileControlError::Handle)?;
+    let mut request = CheckpointRequestGuard {
+        cancellation: Arc::clone(&cancellation),
+        interrupt,
+        armed: true,
+    };
+    loop {
+        let now = std::time::Instant::now();
+        if cancellation.is_cancelled() {
+            request.cancel();
+        } else if now >= context.work_deadline {
+            let _ = cancellation.latch_stop_cause(now);
+            request.interrupt();
+        }
+        match result_rx.try_recv() {
+            Ok(CheckpointWorkerOutput::Reusable(delivery)) => {
+                let reject_late_success = delivery.result_is_ok();
+                if let Some(error) = checkpoint_delivery_deadline_error(
+                    &cancellation,
+                    context.work_deadline,
+                    context.cleanup_deadline,
+                    reject_late_success,
+                ) {
+                    drop(delivery);
+                    let _ = wait_for_cleanup_owner_retirement(
+                        &worker_owner_retired,
+                        context.cleanup_deadline,
+                        "checkpoint worker",
+                    )
+                    .await;
+                    return Err(error);
+                }
+                if let Err(error) = wait_for_cleanup_owner_retirement(
+                    &worker_owner_retired,
+                    context.cleanup_deadline,
+                    "checkpoint worker",
+                )
+                .await
+                {
+                    drop(delivery);
+                    return Err(error);
+                }
+                if let Some(error) = checkpoint_delivery_deadline_error(
+                    &cancellation,
+                    context.work_deadline,
+                    context.cleanup_deadline,
+                    reject_late_success,
+                ) {
+                    drop(delivery);
+                    return Err(error);
+                }
+                request.disarm();
+                let (connection, result) = delivery.accept();
+                return Ok(OwnedCheckpointOutcome::Reusable { connection, result });
+            }
+            Ok(CheckpointWorkerOutput::Terminal(error, close)) => {
+                wait_for_cleanup_owner_retirement(
+                    &worker_owner_retired,
+                    context.cleanup_deadline,
+                    "checkpoint worker",
+                )
+                .await?;
+                if std::time::Instant::now() >= context.cleanup_deadline {
+                    return Err(FileControlError::Handle(
+                        "checkpoint terminal result exceeded its immutable cleanup deadline"
+                            .to_owned(),
+                    ));
+                }
+                request.disarm();
+                return Ok(OwnedCheckpointOutcome::Terminal { error, close });
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if std::time::Instant::now() < context.cleanup_deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                request.cancel();
+                return Err(FileControlError::Handle(
+                    "checkpoint worker exceeded its immutable cleanup deadline".to_owned(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                request.cancel();
+                return Err(FileControlError::Handle(
+                    "checkpoint worker stopped without a terminal result".to_owned(),
+                ));
+            }
+        }
+    }
 }
 
 async fn backup_main_database(
@@ -9325,6 +9935,45 @@ mod deadline_tests {
         true
     }
 
+    struct CheckpointTestGateRegistration {
+        gate: &'static std::sync::LazyLock<std::sync::Mutex<Option<CheckpointTestGate>>>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Drop for CheckpointTestGateRegistration {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::Release);
+            self.gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+
+    fn install_checkpoint_test_gate(
+        gate: &'static std::sync::LazyLock<std::sync::Mutex<Option<CheckpointTestGate>>>,
+    ) -> (
+        CheckpointTestGateRegistration,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicBool>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(AtomicBool::new(false));
+        let previous = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((Arc::clone(&entered), Arc::clone(&release)));
+        assert!(previous.is_none(), "checkpoint test gate is unique");
+        (
+            CheckpointTestGateRegistration {
+                gate,
+                release: Arc::clone(&release),
+            },
+            entered,
+            release,
+        )
+    }
+
     async fn manual_transaction_connection(path: &std::path::Path) -> sqlx::SqliteConnection {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(path)
@@ -10369,6 +11018,780 @@ mod deadline_tests {
             wait_for_cleanup_owner_count(0, "cancelled BEGIN terminal retirement").await;
             pool.close().await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_succeeds_and_restores_busy_timeout() {
+        let directory = tempfile::tempdir().expect("owned checkpoint directory");
+        let path = directory.path().join("owned-checkpoint.sqlite");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("open owned checkpoint pool");
+        sqlx::raw_sql(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE value(id INTEGER);
+             INSERT INTO value VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed owned checkpoint WAL");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire owned checkpoint connection");
+        let worker_owner = BlockingCleanupOwner::acquire("owned-checkpoint-success")
+            .await
+            .expect("reserve owned checkpoint worker");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let outcome = checkpoint_owned_connection(
+            worker_owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_millis(50),
+                restore_busy_timeout: std::time::Duration::from_millis(321),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+        .expect("owned checkpoint worker completes");
+        let OwnedCheckpointOutcome::Reusable {
+            mut connection,
+            result,
+        } = outcome
+        else {
+            panic!("successful checkpoint must return a reusable connection");
+        };
+        assert_eq!(
+            result.expect("owned checkpoint succeeds").busy,
+            0,
+            "uncontended native checkpoint completes"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("read restored checkpoint busy timeout"),
+            321
+        );
+        drop(connection);
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_distinguishes_busy_and_work_cutoffs() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_distinguishes_busy_and_work_cutoffs",
+            "GTA_CLAW_OWNED_CHECKPOINT_DEADLINES_CHILD",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("checkpoint deadline directory");
+        let path = directory.path().join("checkpoint-deadlines.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .expect("open checkpoint deadline pool");
+        sqlx::raw_sql(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE value(id INTEGER);
+             INSERT INTO value VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed checkpoint deadline WAL");
+        let mut reader = sqlx::SqliteConnection::connect_with(&options.clone().read_only(true))
+            .await
+            .expect("open checkpoint deadline reader");
+        sqlx::query("BEGIN")
+            .execute(&mut reader)
+            .await
+            .expect("begin checkpoint reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM value")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish checkpoint reader snapshot");
+        sqlx::query("INSERT INTO value VALUES (2)")
+            .execute(&pool)
+            .await
+            .expect("append WAL frame behind reader");
+
+        let connection = pool.acquire().await.expect("acquire busy checkpoint owner");
+        let owner = BlockingCleanupOwner::acquire("configured-busy-checkpoint")
+            .await
+            .expect("reserve configured-busy checkpoint owner");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let outcome = checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_millis(20),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+        .expect("configured-busy checkpoint terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = outcome else {
+            panic!("configured busy expiry keeps the connection reusable");
+        };
+        assert_eq!(result.expect("configured busy expiry is a report").busy, 1);
+        drop(connection);
+
+        let (release_gate, busy_entered, busy_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_BUSY_SLEEP_TEST_GATE);
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire released-reader checkpoint owner");
+        let owner = BlockingCleanupOwner::acquire("released-reader-checkpoint")
+            .await
+            .expect("reserve released-reader checkpoint owner");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let checkpoint = tokio::spawn(checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_secs(1),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), busy_entered.notified())
+            .await
+            .expect("released-reader checkpoint reaches busy callback");
+        sqlx::query("ROLLBACK")
+            .execute(&mut reader)
+            .await
+            .expect("release reader before checkpoint cutoff");
+        busy_release.store(true, Ordering::Release);
+        let outcome = checkpoint
+            .await
+            .expect("released-reader checkpoint task joins")
+            .expect("released-reader checkpoint terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = outcome else {
+            panic!("released reader keeps checkpoint connection reusable");
+        };
+        assert_eq!(
+            result.expect("reader released before cutoff succeeds").busy,
+            0
+        );
+        drop(connection);
+        drop(release_gate);
+
+        sqlx::query("BEGIN")
+            .execute(&mut reader)
+            .await
+            .expect("restart checkpoint reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM value")
+            .fetch_one(&mut reader)
+            .await
+            .expect("reestablish checkpoint reader snapshot");
+        sqlx::query("INSERT INTO value VALUES (3)")
+            .execute(&pool)
+            .await
+            .expect("append second WAL frame behind reader");
+        let (_work_gate, busy_entered, busy_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_BUSY_SLEEP_TEST_GATE);
+        let connection = pool.acquire().await.expect("acquire work-cutoff owner");
+        let owner = BlockingCleanupOwner::acquire("work-cutoff-checkpoint")
+            .await
+            .expect("reserve work-cutoff checkpoint owner");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let checkpoint = tokio::spawn(checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_secs(1),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), busy_entered.notified())
+            .await
+            .expect("checkpoint busy callback reaches post-sleep gate");
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        busy_release.store(true, Ordering::Release);
+        let outcome = checkpoint
+            .await
+            .expect("work-cutoff checkpoint task joins")
+            .expect("work-cutoff checkpoint terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = outcome else {
+            panic!("work cutoff restores the checkpoint connection");
+        };
+        assert_eq!(
+            result
+                .expect_err("work cutoff remains a typed interrupt")
+                .code(),
+            Some(libsqlite3_sys::SQLITE_INTERRUPT)
+        );
+        drop(connection);
+        sqlx::query("ROLLBACK")
+            .execute(&mut reader)
+            .await
+            .expect("release checkpoint reader");
+        reader.close().await.expect("close checkpoint reader");
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_scheduling_and_caller_drop_do_not_rebase_or_repool() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_scheduling_and_caller_drop_do_not_rebase_or_repool",
+            "GTA_CLAW_OWNED_CHECKPOINT_HANDOFF_CHILD",
+        ) {
+            return;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open checkpoint handoff pool");
+        let (schedule_gate, schedule_entered, schedule_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_BEFORE_NATIVE_TEST_GATE);
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire delayed checkpoint connection");
+        let owner = BlockingCleanupOwner::acquire("delayed-checkpoint")
+            .await
+            .expect("reserve delayed checkpoint owner");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_millis(75);
+        let delayed = tokio::spawn(checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_secs(1),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            schedule_entered.notified(),
+        )
+        .await
+        .expect("checkpoint worker reaches scheduling gate");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        schedule_release.store(true, Ordering::Release);
+        let outcome = delayed
+            .await
+            .expect("delayed checkpoint task joins")
+            .expect("delayed checkpoint returns its typed failure");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = outcome else {
+            panic!("delayed checkpoint failure restores the connection");
+        };
+        assert_eq!(
+            result
+                .expect_err("delayed scheduling preserves the original cutoff")
+                .code(),
+            Some(libsqlite3_sys::SQLITE_INTERRUPT)
+        );
+        drop(connection);
+        drop(schedule_gate);
+
+        let (late_gate, late_entered, late_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_RESULT_TEST_GATE);
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire late-delivery checkpoint connection");
+        let owner = BlockingCleanupOwner::acquire("late-delivery-checkpoint")
+            .await
+            .expect("reserve late-delivery checkpoint owner");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_millis(75);
+        let late_delivery = tokio::spawn(checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_millis(50),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), late_entered.notified())
+            .await
+            .expect("checkpoint reaches late result-delivery gate");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        late_release.store(true, Ordering::Release);
+        match late_delivery
+            .await
+            .expect("late-delivery checkpoint task joins")
+        {
+            Err(error) => assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_INTERRUPT)),
+            Ok(_) => panic!("checkpoint cannot accept a result after its work deadline"),
+        }
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("late delivery terminal close releases pool capacity")
+            .expect("replacement connection is available after late delivery");
+        drop(replacement);
+        drop(late_gate);
+
+        let (_result_gate, result_entered, result_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_RESULT_TEST_GATE);
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire dropped-caller checkpoint connection");
+        let owner = BlockingCleanupOwner::acquire("dropped-caller-checkpoint")
+            .await
+            .expect("reserve dropped-caller checkpoint owner");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let checkpoint = tokio::spawn(checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_millis(50),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), result_entered.notified())
+            .await
+            .expect("checkpoint worker reaches result handoff gate");
+        checkpoint.abort();
+        match checkpoint.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("checkpoint caller task must be cancelled"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire())
+                .await
+                .is_err(),
+            "connection cannot repool before worker terminalization"
+        );
+        result_release.store(true, Ordering::Release);
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("worker handoff releases pool capacity")
+            .expect("replacement connection is available");
+        drop(replacement);
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_restore_failure_discards_connection() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_restore_failure_discards_connection",
+            "GTA_CLAW_OWNED_CHECKPOINT_RESTORE_CHILD",
+        ) {
+            return;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open checkpoint restore-failure pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire checkpoint restore-failure connection");
+        let owner = BlockingCleanupOwner::acquire("checkpoint-restore-failure")
+            .await
+            .expect("reserve checkpoint restore-failure owner");
+        FAIL_CHECKPOINT_BUSY_RESTORE.store(true, Ordering::Release);
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let outcome = checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_millis(50),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+        .expect("restore-failure checkpoint terminalizes");
+        let OwnedCheckpointOutcome::Terminal { error, close } = outcome else {
+            panic!("restore failure must terminally discard the connection");
+        };
+        assert!(error.to_string().contains("restore failure"));
+        assert_eq!(close, TerminalCloseOutcome::Closed);
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("restore-failure discard releases pool capacity")
+            .expect("replacement connection is available");
+        drop(replacement);
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_reservation_fits_max_open_peak_headroom() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_reservation_fits_max_open_peak_headroom",
+            "GTA_CLAW_OWNED_CHECKPOINT_CAPACITY_CHILD",
+        ) {
+            return;
+        }
+        let blockers = BlockingCleanupOwner::acquire_set(
+            "checkpoint-max-open-peak",
+            56,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("model seven exact eight-owner open peaks");
+        let worker_owner = BlockingCleanupOwner::acquire("checkpoint-headroom-worker")
+            .await
+            .expect("one checkpoint worker fits open peak headroom");
+        let unrelated = BlockingCleanupOwner::acquire_set(
+            "checkpoint-headroom-unrelated",
+            7,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("checkpoint worker preserves seven unrelated owner slots");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open checkpoint headroom pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire checkpoint headroom connection");
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let outcome = checkpoint_owned_connection(
+            worker_owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::ZERO,
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+        .expect("checkpoint headroom worker terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = outcome else {
+            panic!("headroom checkpoint returns a reusable connection");
+        };
+        assert_eq!(result.expect("headroom checkpoint succeeds").busy, 0);
+        drop(connection);
+        for owner in unrelated {
+            owner.shutdown().expect("release unrelated headroom owner");
+        }
+        for owner in blockers {
+            owner.shutdown().expect("release modeled open peak owner");
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_survives_caller_runtime_destruction() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_survives_caller_runtime_destruction",
+            "GTA_CLAW_OWNED_CHECKPOINT_RUNTIME_DROP_CHILD",
+        ) {
+            return;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open runtime-drop checkpoint pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire runtime-drop checkpoint connection");
+        let owner = BlockingCleanupOwner::acquire("runtime-drop-checkpoint")
+            .await
+            .expect("reserve runtime-drop checkpoint owner");
+        let (_gate, result_entered, result_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_RESULT_TEST_GATE);
+        let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel(0);
+        let caller = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build disposable checkpoint caller runtime");
+            let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let _task = runtime.spawn(checkpoint_owned_connection(
+                owner,
+                connection,
+                CheckpointExecutionContext {
+                    work_deadline,
+                    cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                    busy_timeout: std::time::Duration::from_millis(50),
+                    restore_busy_timeout: std::time::Duration::from_millis(250),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+            ));
+            drop_rx
+                .recv()
+                .expect("runtime-drop checkpoint release arrives");
+            drop(runtime);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), result_entered.notified())
+            .await
+            .expect("runtime-drop checkpoint reaches result gate");
+        drop_tx
+            .send(())
+            .expect("request checkpoint caller runtime destruction");
+        tokio::task::spawn_blocking(move || caller.join())
+            .await
+            .expect("runtime-drop caller join is not cancelled")
+            .expect("runtime-drop caller exits cleanly");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire())
+                .await
+                .is_err(),
+            "runtime destruction cannot repool the in-flight connection"
+        );
+        result_release.store(true, Ordering::Release);
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+            .await
+            .expect("runtime-independent checkpoint cleanup releases pool capacity")
+            .expect("replacement connection is available after runtime drop");
+        drop(replacement);
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_native_checkpointer_reports_busy_without_repooling() {
+        if run_in_isolated_child(
+            "deadline_tests::concurrent_native_checkpointer_reports_busy_without_repooling",
+            "GTA_CLAW_CONCURRENT_NATIVE_CHECKPOINT_CHILD",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("concurrent checkpoint directory");
+        let path = directory.path().join("concurrent-checkpoint.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(options.clone())
+            .await
+            .expect("open concurrent checkpoint pool");
+        sqlx::raw_sql(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE value(id INTEGER);
+             INSERT INTO value VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed concurrent checkpoint WAL");
+        let mut reader = sqlx::SqliteConnection::connect_with(&options.clone().read_only(true))
+            .await
+            .expect("open concurrent checkpoint reader");
+        sqlx::query("BEGIN")
+            .execute(&mut reader)
+            .await
+            .expect("begin concurrent checkpoint reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM value")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish concurrent checkpoint snapshot");
+        sqlx::query("INSERT INTO value VALUES (2)")
+            .execute(&pool)
+            .await
+            .expect("append concurrent checkpoint WAL frame");
+        let (_gate, first_entered, first_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_BUSY_SLEEP_TEST_GATE);
+        let first_connection = pool.acquire().await.expect("acquire first checkpointer");
+        let first_owner = BlockingCleanupOwner::acquire("first-native-checkpointer")
+            .await
+            .expect("reserve first checkpointer owner");
+        let first_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let first = tokio::spawn(checkpoint_owned_connection(
+            first_owner,
+            first_connection,
+            CheckpointExecutionContext {
+                work_deadline: first_deadline,
+                cleanup_deadline: first_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_secs(1),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_entered.notified())
+            .await
+            .expect("first native checkpointer holds the checkpoint lock");
+        CHECKPOINT_BUSY_SLEEP_TEST_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+
+        let second_connection = pool.acquire().await.expect("acquire second checkpointer");
+        let second_owner = BlockingCleanupOwner::acquire("second-native-checkpointer")
+            .await
+            .expect("reserve second checkpointer owner");
+        let second_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let second = checkpoint_owned_connection(
+            second_owner,
+            second_connection,
+            CheckpointExecutionContext {
+                work_deadline: second_deadline,
+                cleanup_deadline: second_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::ZERO,
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+        .expect("second native checkpointer terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = second else {
+            panic!("concurrent SQLITE_BUSY keeps second connection reusable");
+        };
+        assert_eq!(
+            result
+                .expect("concurrent checkpointer is a busy report")
+                .busy,
+            1
+        );
+        drop(connection);
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut reader)
+            .await
+            .expect("release concurrent checkpoint reader");
+        first_release.store(true, Ordering::Release);
+        let first = first
+            .await
+            .expect("first native checkpointer task joins")
+            .expect("first native checkpointer terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = first else {
+            panic!("first native checkpointer remains reusable");
+        };
+        assert_eq!(result.expect("first checkpointer completes").busy, 0);
+        drop(connection);
+        reader
+            .close()
+            .await
+            .expect("close concurrent checkpoint reader");
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_checkpoint_external_cancellation_interrupts_and_joins() {
+        if run_in_isolated_child(
+            "deadline_tests::owned_checkpoint_external_cancellation_interrupts_and_joins",
+            "GTA_CLAW_OWNED_CHECKPOINT_CANCEL_CHILD",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("cancelled checkpoint directory");
+        let path = directory.path().join("cancelled-checkpoint.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .expect("open cancelled checkpoint pool");
+        sqlx::raw_sql(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE value(id INTEGER);
+             INSERT INTO value VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed cancelled checkpoint WAL");
+        let mut reader = sqlx::SqliteConnection::connect_with(&options.clone().read_only(true))
+            .await
+            .expect("open cancelled checkpoint reader");
+        sqlx::query("BEGIN")
+            .execute(&mut reader)
+            .await
+            .expect("begin cancelled checkpoint reader");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM value")
+            .fetch_one(&mut reader)
+            .await
+            .expect("establish cancelled checkpoint snapshot");
+        sqlx::query("INSERT INTO value VALUES (2)")
+            .execute(&pool)
+            .await
+            .expect("append cancelled checkpoint WAL frame");
+        let (_gate, busy_entered, busy_release) =
+            install_checkpoint_test_gate(&CHECKPOINT_BUSY_SLEEP_TEST_GATE);
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire cancelled checkpoint connection");
+        let owner = BlockingCleanupOwner::acquire("cancelled-native-checkpoint")
+            .await
+            .expect("reserve cancelled checkpoint owner");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let checkpoint = tokio::spawn(checkpoint_owned_connection(
+            owner,
+            connection,
+            CheckpointExecutionContext {
+                work_deadline,
+                cleanup_deadline: work_deadline + std::time::Duration::from_secs(1),
+                busy_timeout: std::time::Duration::from_secs(1),
+                restore_busy_timeout: std::time::Duration::from_millis(250),
+                cancelled: task_cancelled,
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), busy_entered.notified())
+            .await
+            .expect("cancelled checkpoint reaches busy callback");
+        cancelled.store(true, Ordering::Release);
+        busy_release.store(true, Ordering::Release);
+        let outcome = checkpoint
+            .await
+            .expect("cancelled checkpoint task joins")
+            .expect("cancelled checkpoint terminalizes");
+        let OwnedCheckpointOutcome::Reusable { connection, result } = outcome else {
+            panic!("cancelled checkpoint restores a reusable connection");
+        };
+        assert_eq!(
+            result
+                .expect_err("external cancellation remains a typed interrupt")
+                .code(),
+            Some(libsqlite3_sys::SQLITE_INTERRUPT)
+        );
+        drop(connection);
+        sqlx::query("ROLLBACK")
+            .execute(&mut reader)
+            .await
+            .expect("release cancelled checkpoint reader");
+        reader
+            .close()
+            .await
+            .expect("close cancelled checkpoint reader");
+        let replacement = pool
+            .acquire()
+            .await
+            .expect("cancelled checkpoint connection is reusable");
+        drop(replacement);
+        pool.close().await;
     }
 
     unsafe extern "C" fn reject_hookless_commit(_context: *mut std::ffi::c_void) -> i32 {
