@@ -3716,8 +3716,42 @@ impl<Connection: BeginOwnedConnection> Drop for CommitDelivery<Connection> {
     }
 }
 
+struct RollbackDelivery<Connection: BeginOwnedConnection> {
+    connection: Option<Connection>,
+    close_permit: Option<TerminalClosePermit>,
+}
+
+impl<Connection: BeginOwnedConnection> RollbackDelivery<Connection> {
+    fn accept(mut self) -> Connection {
+        self.close_permit.take();
+        self.connection
+            .take()
+            .expect("rollback connection is accepted once")
+    }
+
+    fn retain_for_terminal_close(mut self) {
+        if let (Some(connection), Some(permit)) = (self.connection.take(), self.close_permit.take())
+        {
+            let _ = permit.submit(connection);
+        }
+    }
+}
+
+impl<Connection: BeginOwnedConnection> Drop for RollbackDelivery<Connection> {
+    fn drop(&mut self) {
+        if let (Some(connection), Some(permit)) = (self.connection.take(), self.close_permit.take())
+        {
+            let _ = permit.submit(connection);
+        }
+    }
+}
+
 enum TerminalRollbackCompletion<Connection: BeginOwnedConnection> {
-    Return(tokio::sync::oneshot::Sender<Result<Connection, FileControlError>>),
+    Return {
+        result:
+            tokio::sync::oneshot::Sender<Result<RollbackDelivery<Connection>, FileControlError>>,
+        close_permit: Option<TerminalClosePermit>,
+    },
     ReportCommit {
         result: std::sync::mpsc::SyncSender<Result<CommitDelivery<Connection>, FileControlError>>,
         primary: FileControlError,
@@ -3803,7 +3837,7 @@ fn send_terminal_rollback_error<Connection: BeginOwnedConnection>(
     close: Option<&TerminalCloseOutcome>,
 ) {
     match completion {
-        TerminalRollbackCompletion::Return(result) => {
+        TerminalRollbackCompletion::Return { result, .. } => {
             let error = match (rollback, close) {
                 (Some(rollback), Some(close)) => {
                     FileControlError::Handle(format!("{rollback}; terminal close: {close:?}"))
@@ -3899,29 +3933,25 @@ fn run_terminal_rollback<Connection: BeginOwnedConnection>(
         .take()
         .expect("terminal rollback completion is single-use")
     {
-        TerminalRollbackCompletion::Return(result) => {
-            let state = Arc::clone(
-                &payload
-                    .connection
-                    .as_ref()
-                    .expect("successful rollback retains its connection")
-                    .state,
-            );
+        TerminalRollbackCompletion::Return {
+            result,
+            mut close_permit,
+        } => {
             payload.token.take();
             let connection = payload
                 .connection
                 .take()
                 .expect("successful rollback retains its connection")
                 .inner;
-            match result.send(Ok(connection)) {
+            let delivery = RollbackDelivery {
+                connection: Some(connection),
+                close_permit: close_permit.take(),
+            };
+            match result.send(Ok(delivery)) {
                 Ok(()) => TerminalJobDisposition::Completed,
-                Err(Ok(connection)) => {
-                    payload.connection = Some(TransactionConnection {
-                        inner: connection,
-                        state,
-                    });
-                    let (_, disposition) = terminal_close_transaction(&mut payload, runtime);
-                    disposition
+                Err(Ok(delivery)) => {
+                    delivery.retain_for_terminal_close();
+                    TerminalJobDisposition::Completed
                 }
                 Err(Err(_)) => TerminalJobDisposition::Completed,
             }
@@ -5133,13 +5163,12 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         cleanup_deadline: std::time::Instant,
         timeout_error: &'static str,
     ) -> Result<Connection, FileControlError> {
-        let mut late_delivery_permit = Some(
-            self.cleanup_owner
-                .as_mut()
-                .expect("rollback cleanup owner remains owned")
-                .take_terminal_permit()
-                .expect("late rollback delivery close capacity was pre-reserved"),
-        );
+        let late_delivery_permit = self
+            .cleanup_owner
+            .as_mut()
+            .expect("rollback cleanup owner remains owned")
+            .take_terminal_permit()
+            .expect("late rollback delivery close capacity was pre-reserved");
         let permit = self
             .cleanup_owner
             .as_mut()
@@ -5162,7 +5191,10 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
             permit,
             connection,
             token,
-            TerminalRollbackCompletion::Return(result_tx),
+            TerminalRollbackCompletion::Return {
+                result: result_tx,
+                close_permit: Some(late_delivery_permit),
+            },
         )
         .map_err(FileControlError::Handle)?;
         let result =
@@ -5176,13 +5208,10 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                 })?;
         if std::time::Instant::now() >= cleanup_deadline {
             return Err(match result {
-                Ok(connection) => {
-                    let close = late_delivery_permit
-                        .take()
-                        .expect("late rollback close permit remains owned")
-                        .close(connection);
+                Ok(delivery) => {
+                    delivery.retain_for_terminal_close();
                     FileControlError::Handle(format!(
-                        "{timeout_error}; late rollback connection close: {close:?}"
+                        "{timeout_error}; late rollback connection retained for terminal close"
                     ))
                 }
                 Err(error) => FileControlError::Handle(format!(
@@ -5190,8 +5219,7 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                 )),
             });
         }
-        late_delivery_permit.take();
-        result
+        result.map(RollbackDelivery::accept)
     }
 }
 
@@ -9862,6 +9890,53 @@ mod deadline_tests {
     struct RollbackGateRegistration {
         generation: u64,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    struct BufferedRollbackTimeoutRace {
+        receiver: tokio::sync::oneshot::Receiver<
+            Result<RollbackDelivery<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError>,
+        >,
+        sender: Option<
+            tokio::sync::oneshot::Sender<
+                Result<
+                    RollbackDelivery<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+                    FileControlError,
+                >,
+            >,
+        >,
+        delivery: Option<RollbackDelivery<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
+        sent: Arc<AtomicBool>,
+        delivered: bool,
+    }
+
+    impl std::future::Future for BufferedRollbackTimeoutRace {
+        type Output = Result<
+            Result<RollbackDelivery<sqlx::pool::PoolConnection<sqlx::Sqlite>>, FileControlError>,
+            tokio::sync::oneshot::error::RecvError,
+        >;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if self.delivered {
+                return std::task::Poll::Pending;
+            }
+            if let std::task::Poll::Ready(result) =
+                std::pin::Pin::new(&mut self.receiver).poll(context)
+            {
+                return std::task::Poll::Ready(result);
+            }
+            if let (Some(sender), Some(delivery)) = (self.sender.take(), self.delivery.take()) {
+                assert!(
+                    sender.send(Ok(delivery)).is_ok(),
+                    "buffered rollback delivery send succeeds"
+                );
+                self.sent.store(true, Ordering::Release);
+                self.delivered = true;
+            }
+            std::task::Poll::Pending
+        }
     }
 
     impl RollbackGateRegistration {
@@ -15102,12 +15177,201 @@ mod deadline_tests {
             error.to_string().contains("immutable cleanup deadline")
                 && error
                     .to_string()
-                    .contains("late rollback connection close: Closed"),
-            "late reusable rollback connection is terminally closed: {error}"
+                    .contains("late rollback connection retained for terminal close"),
+            "late reusable rollback connection is transferred to terminal close: {error}"
         );
         release_thread
             .join()
             .expect("late rollback release thread joins");
+        let all = BlockingCleanupOwner::acquire_set(
+            "late-rollback-close-capacity-recovery",
+            64,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("late rollback terminal close restores every cleanup slot");
+        for owner in all {
+            owner
+                .shutdown()
+                .expect("release late rollback capacity proof");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_rollback_delivery_timeout_closes_instead_of_repooling() {
+        if run_in_isolated_child(
+            "deadline_tests::buffered_rollback_delivery_timeout_closes_instead_of_repooling",
+            "GTA_CLAW_BUFFERED_ROLLBACK_TIMEOUT_CHILD",
+        ) {
+            return;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open buffered rollback timeout pool");
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("acquire buffered rollback connection");
+        let original_nonce = {
+            let mut handle = connection
+                .lock_handle()
+                .await
+                .expect("lock buffered rollback connection");
+            connection_lifetime_nonce(LiveInterruptPointer(handle.as_raw_handle()))
+                .expect("read buffered rollback connection nonce")
+        };
+        let mut owner = BlockingCleanupOwner::acquire("buffered-rollback-timeout")
+            .await
+            .expect("reserve buffered rollback close owner");
+        let close_permit = owner
+            .take_terminal_permit()
+            .expect("buffered rollback close capacity was pre-reserved");
+        let delivery = RollbackDelivery {
+            connection: Some(connection),
+            close_permit: Some(close_permit),
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        let race = BufferedRollbackTimeoutRace {
+            receiver,
+            sender: Some(sender),
+            delivery: Some(delivery),
+            sent: Arc::clone(&sent),
+            delivered: false,
+        };
+        assert!(
+            tokio::time::timeout_at(
+                tokio::time::Instant::now() - std::time::Duration::from_millis(1),
+                race,
+            )
+            .await
+            .is_err(),
+            "expired timeout branch wins after the empty receiver poll"
+        );
+        assert!(
+            sent.load(Ordering::Acquire),
+            "worker delivery was buffered before timeout dropped the receiver"
+        );
+        owner
+            .shutdown()
+            .expect("release buffered rollback cleanup owner");
+        let mut replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                .await
+                .expect("terminal close permits replacement acquisition")
+                .expect("replacement connection opens");
+        let replacement_nonce = {
+            let mut handle = replacement
+                .lock_handle()
+                .await
+                .expect("lock replacement rollback connection");
+            connection_lifetime_nonce(LiveInterruptPointer(handle.as_raw_handle()))
+                .expect("read replacement rollback connection nonce")
+        };
+        assert_ne!(
+            replacement_nonce, original_nonce,
+            "buffered timed-out connection was physically closed, not repooled"
+        );
+        drop(replacement);
+        pool.close().await;
+        let all = BlockingCleanupOwner::acquire_set(
+            "buffered-rollback-timeout-capacity-proof",
+            64,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("buffered rollback terminal close releases all capacity");
+        for owner in all {
+            owner
+                .shutdown()
+                .expect("release buffered rollback capacity proof");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_delivery_survives_caller_runtime_drop() {
+        if run_in_isolated_child(
+            "deadline_tests::rollback_delivery_survives_caller_runtime_drop",
+            "GTA_CLAW_ROLLBACK_RUNTIME_DROP_CHILD",
+        ) {
+            return;
+        }
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open rollback runtime-drop pool");
+        let connection = pool
+            .acquire()
+            .await
+            .expect("acquire rollback runtime-drop connection");
+        let transaction =
+            begin_manual_pool_transaction(connection, std::time::Duration::from_secs(1))
+                .await
+                .expect("begin rollback runtime-drop transaction");
+        let original_nonce = transaction
+            .token
+            .as_ref()
+            .expect("runtime-drop rollback token remains owned")
+            .connection_nonce;
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (registration, entered) = install_rollback_gate(
+            &transaction,
+            RollbackTestStage::BeforeSqliteExec,
+            false,
+            false,
+            Arc::clone(&release),
+        );
+        let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel(0);
+        let caller = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build disposable rollback caller runtime");
+            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let _rollback = runtime.spawn(transaction.rollback_with_deadline(cleanup_deadline));
+            drop_rx
+                .recv()
+                .expect("rollback runtime-drop request arrives");
+            drop(runtime);
+        });
+        wait_for_atomic(&entered, "runtime-drop rollback gate").await;
+        drop_tx
+            .send(())
+            .expect("request rollback caller runtime destruction");
+        tokio::task::spawn_blocking(move || caller.join())
+            .await
+            .expect("rollback caller join is not cancelled")
+            .expect("rollback caller runtime exits cleanly");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire())
+                .await
+                .is_err(),
+            "runtime drop cannot repool the gated rollback connection"
+        );
+        registration.release();
+        let mut replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire())
+                .await
+                .expect("runtime-drop terminal close permits replacement")
+                .expect("replacement rollback connection opens");
+        let replacement_nonce = {
+            let mut handle = replacement
+                .lock_handle()
+                .await
+                .expect("lock runtime-drop replacement connection");
+            connection_lifetime_nonce(LiveInterruptPointer(handle.as_raw_handle()))
+                .expect("read runtime-drop replacement nonce")
+        };
+        assert_ne!(
+            replacement_nonce, original_nonce,
+            "runtime-dropped rollback connection was physically closed"
+        );
+        drop(replacement);
+        pool.close().await;
     }
 
     #[test]
