@@ -11,10 +11,17 @@ use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePoolOptions,
+    SqliteSynchronous,
+};
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 
 use crate::error::{database, database_code};
+#[cfg(target_os = "linux")]
+use crate::linux_protected::{LinuxProtectedSpec, ProtectedNamespace};
+#[cfg(target_os = "linux")]
+use crate::protected_catalog::{self, SelectorCell, SlotObservation, SnapshotMetadata};
 use crate::{
     AuthenticationRepository, DeviceRepository, SessionRepository, StateError, TaskRepository,
 };
@@ -51,8 +58,215 @@ static SNAPSHOT_MEMORY_ADMISSION: tokio::sync::Semaphore =
 #[cfg(test)]
 static TEST_OPEN_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+#[derive(Clone)]
+enum StoreProfile {
+    PortablePrivate,
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    LinuxProtected(LinuxProtectedSpec),
+}
+
+#[derive(Clone)]
+enum ActiveStoreProfile {
+    PortablePrivate,
+    #[cfg(target_os = "linux")]
+    LinuxProtected(Arc<ProtectedNamespace>),
+}
+
+impl ActiveStoreProfile {
+    const fn is_protected(&self) -> bool {
+        match self {
+            Self::PortablePrivate => false,
+            #[cfg(target_os = "linux")]
+            Self::LinuxProtected(_) => true,
+        }
+    }
+
+    fn writer_owner(&self) -> Result<String, StateError> {
+        match self {
+            Self::PortablePrivate => writer_owner(),
+            #[cfg(target_os = "linux")]
+            Self::LinuxProtected(namespace) => Ok(namespace.writer_owner()),
+        }
+    }
+
+    fn verify_filesystem(
+        &self,
+        database_parent: (&Path, &File),
+        database: (&Path, &File),
+        lock: (&Path, &File),
+        lock_identity: Option<&[u8]>,
+        validate_sidecars: bool,
+    ) -> Result<(), StateError> {
+        let (database_parent_path, database_parent) = database_parent;
+        let (database_path, database_file) = database;
+        let (lock_path, lock_file) = lock;
+        match self {
+            Self::PortablePrivate => {
+                verify_directory_path_identity(database_parent_path, database_parent)
+                    .and_then(|()| verify_path_identity(database_path, database_file))
+                    .and_then(|()| verify_path_identity(lock_path, lock_file))
+                    .and_then(|()| {
+                        verify_store_lock_binding(
+                            database_path,
+                            database_file,
+                            lock_path,
+                            lock_file,
+                            lock_identity,
+                        )
+                    })
+                    .and_then(|()| {
+                        if validate_sidecars {
+                            validate_sqlite_sidecars(database_path, lock_identity)
+                        } else {
+                            Ok(())
+                        }
+                    })
+            }
+            #[cfg(target_os = "linux")]
+            Self::LinuxProtected(namespace) => namespace.verify(),
+        }
+    }
+
+    fn secure_sidecars(
+        &self,
+        database_path: &Path,
+        lock_identity: Option<&[u8]>,
+    ) -> Result<(), StateError> {
+        match self {
+            Self::PortablePrivate => secure_sqlite_sidecars(database_path, lock_identity),
+            #[cfg(target_os = "linux")]
+            Self::LinuxProtected(namespace) => namespace.verify(),
+        }
+    }
+
+    async fn verify_connection(
+        &self,
+        connection: &mut SqliteConnection,
+    ) -> Result<(), sqlx::Error> {
+        verify_sqlite_connection_identity(connection).await?;
+        #[cfg(target_os = "linux")]
+        if let Self::LinuxProtected(namespace) = self {
+            namespace
+                .verify()
+                .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+            let vfs = claw_sqlite_file_control::main_database_vfs_name(connection)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+            if vfs != "unix-excl" {
+                return Err(sqlx::Error::Protocol(format!(
+                    "LinuxProtected requires exact unix-excl VFS, found {vfs}"
+                )));
+            }
+            #[cfg(test)]
+            if FAIL_PROTECTED_PERSIST_WAL.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return Err(sqlx::Error::Protocol(
+                    "injected LinuxProtected PERSIST_WAL verification failure".to_owned(),
+                ));
+            }
+            claw_sqlite_file_control::enable_persistent_wal(connection)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+            let locking_mode = sqlx::query_scalar::<_, String>("PRAGMA locking_mode")
+                .fetch_one(&mut *connection)
+                .await?;
+            if locking_mode != "exclusive" {
+                return Err(sqlx::Error::Protocol(format!(
+                    "LinuxProtected requires exclusive locking mode, found {locking_mode}"
+                )));
+            }
+            let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+                .fetch_one(&mut *connection)
+                .await?;
+            if journal_mode != "wal" {
+                return Err(sqlx::Error::Protocol(format!(
+                    "LinuxProtected requires WAL journal mode, found {journal_mode}"
+                )));
+            }
+            namespace
+                .verify()
+                .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
+        }
+        Ok(())
+    }
+
+    async fn install_commit_guard(
+        &self,
+        connection: &mut SqliteConnection,
+        database_parent: (&Path, &File),
+        database: (&Path, &File),
+        lock: (&Path, &File),
+        expected_identity: Option<&[u8]>,
+        writer_generation: (Arc<AtomicU64>, u64),
+    ) -> Result<(), sqlx::Error> {
+        match self {
+            Self::PortablePrivate => {
+                install_store_commit_guard(
+                    connection,
+                    database_parent,
+                    database,
+                    lock,
+                    expected_identity,
+                    writer_generation,
+                )
+                .await
+            }
+            #[cfg(target_os = "linux")]
+            Self::LinuxProtected(_) => {
+                let _ = (
+                    database_parent,
+                    database,
+                    lock,
+                    expected_identity,
+                    writer_generation,
+                );
+                claw_sqlite_file_control::install_moved_commit_guard(connection)
+                    .await
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn protected_namespace(&self) -> Option<&Arc<ProtectedNamespace>> {
+        match self {
+            Self::PortablePrivate => None,
+            Self::LinuxProtected(namespace) => Some(namespace),
+        }
+    }
+}
+
 struct SnapshotMemoryReservation {
     _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ProtectedSnapshotReceipt {
+    pub(crate) generation: u64,
+    pub(crate) slot: u8,
+    pub(crate) byte_count: u64,
+    pub(crate) digest: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ProtectedSnapshotCleanupLease {
+    namespace: Arc<ProtectedNamespace>,
+    slot: u8,
+    cleanup_deadline: tokio::time::Instant,
+    cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+    retention: Arc<std::sync::Mutex<Option<ProtectedSnapshotRetention>>>,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ProtectedSnapshotRetention {
+    _memory: SnapshotMemoryReservation,
+    _admission: tokio::sync::SemaphorePermit<'static>,
+    _publication: tokio::sync::OwnedMutexGuard<()>,
 }
 
 struct RestoreMaterializationReservation {
@@ -140,6 +354,7 @@ struct StateCloseRetention {
     _database_file: File,
     _database_parent: File,
     _pool_identity_handles: PoolIdentityHandleGuard,
+    _profile: ActiveStoreProfile,
 }
 
 struct PoolIdentityHandles {
@@ -203,6 +418,7 @@ struct StateStoreOwnership {
     database_parent: File,
     close_retention: StateCloseRetentionReservation,
     pool_identity_handles: PoolIdentityHandleGuard,
+    profile: ActiveStoreProfile,
 }
 
 impl StateStoreOwnership {
@@ -214,6 +430,7 @@ impl StateStoreOwnership {
             _database_file: self.database_file,
             _database_parent: self.database_parent,
             _pool_identity_handles: self.pool_identity_handles,
+            _profile: self.profile,
         });
     }
 }
@@ -686,6 +903,133 @@ async fn reserve_snapshot_memory(
     Ok(SnapshotMemoryReservation { _permit: permit })
 }
 
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl ProtectedSnapshotCleanupLease {
+    async fn cleanup_slot(&mut self) -> Result<(), StateError> {
+        struct ProtectedScrubPayload {
+            namespace: Arc<ProtectedNamespace>,
+            slot: u8,
+            _retention: Arc<std::sync::Mutex<Option<ProtectedSnapshotRetention>>>,
+            result: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), StateError>>>>,
+        }
+
+        if !self.armed {
+            return Ok(());
+        }
+        let owner = self.cleanup_owner.take().ok_or_else(|| {
+            database(
+                "scrub LinuxProtected snapshot slot",
+                sqlx::Error::Protocol("snapshot scrub cleanup owner is missing".to_owned()),
+            )
+        })?;
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let submitted = handoff_state_payload_decide(
+            owner,
+            ProtectedScrubPayload {
+                namespace: Arc::clone(&self.namespace),
+                slot: self.slot,
+                _retention: Arc::clone(&self.retention),
+                result: std::sync::Mutex::new(Some(result_tx)),
+            },
+            |_, _, payload| {
+                let result = payload.namespace.scrub_slot(payload.slot);
+                if let Some(result_tx) = payload
+                    .result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = result_tx.send(result.clone());
+                }
+                result.is_ok()
+            },
+        );
+        self.armed = false;
+        submitted.map_err(|error| {
+            database(
+                "submit LinuxProtected snapshot scrub",
+                sqlx::Error::Protocol(error),
+            )
+        })?;
+        loop {
+            match result_rx.try_recv() {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if tokio::time::Instant::now() < self.cleanup_deadline =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return Err(StateError::OperationTimedOut {
+                        operation: "LinuxProtected snapshot cleanup",
+                        timeout_ms: 0,
+                    });
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(database(
+                        "receive LinuxProtected snapshot scrub",
+                        sqlx::Error::Protocol(
+                            "snapshot scrub owner stopped without a result".to_owned(),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn disarm_without_scrub(&mut self) -> Result<(), String> {
+        self.armed = false;
+        if let Some(owner) = self.cleanup_owner.take() {
+            owner.shutdown()?;
+        }
+        Ok(())
+    }
+
+    fn detach_cleanup_internal(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let Some(owner) = self.cleanup_owner.take() else {
+            return;
+        };
+        let payload = (
+            Arc::clone(&self.namespace),
+            self.slot,
+            Arc::clone(&self.retention),
+        );
+        let _ = handoff_state_payload_decide(owner, payload, |_, _, payload| {
+            let _retention = &payload.2;
+            payload.0.scrub_slot(payload.1).is_ok()
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl claw_sqlite_file_control::SnapshotCleanupLease for ProtectedSnapshotCleanupLease {
+    fn cleanup(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move { self.cleanup_slot().await.map_err(|error| error.to_string()) })
+    }
+
+    fn take_terminal_retention(&mut self) -> Option<Box<dyn Send>> {
+        Some(Box::new(Arc::clone(&self.retention)))
+    }
+
+    fn detach_cleanup(&mut self) {
+        self.detach_cleanup_internal();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProtectedSnapshotCleanupLease {
+    fn drop(&mut self) {
+        self.detach_cleanup_internal();
+    }
+}
+
 async fn run_bounded_filesystem<T, Operation>(
     owner: claw_sqlite_file_control::BlockingCleanupOwner,
     deadline: tokio::time::Instant,
@@ -1029,6 +1373,71 @@ static FAIL_SNAPSHOT_CLEANUP_AFTER_RENAME: std::sync::LazyLock<
 static FAIL_TRUSTED_SEAL_AFTER_UNLINK: std::sync::LazyLock<
     Mutex<std::collections::HashMap<PathBuf, CountedFailure>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, target_os = "linux"))]
+static PROTECTED_SNAPSHOT_TEST_FAILURES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, u8>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, target_os = "linux"))]
+struct ProtectedSnapshotTestGate {
+    stage: u8,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    slot: Arc<std::sync::atomic::AtomicU8>,
+}
+#[cfg(all(test, target_os = "linux"))]
+static PROTECTED_SNAPSHOT_TEST_GATES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, ProtectedSnapshotTestGate>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(all(test, target_os = "linux"))]
+static FAIL_PROTECTED_PERSIST_WAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_protected_snapshot_test_failure(path: &Path, stage: u8) -> bool {
+    let mut failures = PROTECTED_SNAPSHOT_TEST_FAILURES
+        .lock()
+        .expect("protected snapshot failure map lock poisoned");
+    if failures.get(path).copied() == Some(stage) {
+        failures.remove(path);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+async fn wait_at_protected_snapshot_test_gate(
+    path: &Path,
+    stage: u8,
+    slot: u8,
+    deadline: tokio::time::Instant,
+) {
+    let gate = PROTECTED_SNAPSHOT_TEST_GATES
+        .lock()
+        .expect("protected snapshot gate map lock poisoned")
+        .get(path)
+        .filter(|gate| gate.stage == stage)
+        .map(|gate| {
+            (
+                Arc::clone(&gate.entered),
+                Arc::clone(&gate.release),
+                Arc::clone(&gate.slot),
+            )
+        });
+    let Some((entered, release, observed_slot)) = gate else {
+        return;
+    };
+    observed_slot.store(slot + 1, std::sync::atomic::Ordering::Release);
+    entered.notify_one();
+    tokio::select! {
+        () = release.notified() => {}
+        () = tokio::time::sleep_until(deadline) => {}
+    }
+    PROTECTED_SNAPSHOT_TEST_GATES
+        .lock()
+        .expect("protected snapshot gate map lock poisoned")
+        .remove(path);
+}
 #[cfg(test)]
 static OPEN_ADMISSION_TEST_BARRIER: std::sync::LazyLock<Mutex<Option<OpenAdmissionTestBarrier>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
@@ -1446,6 +1855,7 @@ pub struct StateStore {
     close_timeout: Duration,
     undelivered_cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
     open_transaction_admission: Option<tokio::sync::SemaphorePermit<'static>>,
+    profile: ActiveStoreProfile,
 }
 
 impl Drop for StateStore {
@@ -1497,6 +1907,7 @@ pub(crate) struct OperationalIdentity<'store> {
     lock_file: &'store File,
     lock_identity: Option<&'store [u8]>,
     writer_generation: &'store AtomicU64,
+    profile: &'store ActiveStoreProfile,
     pub(crate) busy_timeout: Duration,
     pub(crate) operation_timeout: Duration,
     pub(crate) cleanup_timeout: Duration,
@@ -1510,6 +1921,7 @@ struct OwnedOperationalIdentity {
     lock_path: PathBuf,
     lock_file: File,
     lock_identity: Option<Vec<u8>>,
+    profile: ActiveStoreProfile,
 }
 
 impl OperationalIdentity<'_> {
@@ -1521,6 +1933,18 @@ impl OperationalIdentity<'_> {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn verify_protected(self) -> Result<(), StateError> {
+        if self.profile.is_protected() {
+            self.verify()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) const fn is_protected(self) -> bool {
+        self.profile.is_protected()
     }
 
     fn capture_owned(self) -> Result<OwnedOperationalIdentity, StateError> {
@@ -1546,44 +1970,31 @@ impl OperationalIdentity<'_> {
                 file_error("clone state operation lock identity", self.lock_path, error)
             })?,
             lock_identity: self.lock_identity.map(<[u8]>::to_vec),
+            profile: self.profile.clone(),
         })
     }
 
     pub(crate) fn verify(self) -> Result<(), StateError> {
         self.verify_generation()?;
-        verify_directory_path_identity(self.database_parent_path, self.database_parent)
-            .and_then(|()| verify_path_identity(self.database_path, self.database_file))
-            .and_then(|()| verify_path_identity(self.lock_path, self.lock_file))
-            .and_then(|()| {
-                verify_store_lock_binding(
-                    self.database_path,
-                    self.database_file,
-                    self.lock_path,
-                    self.lock_file,
-                    self.lock_identity,
-                )
-            })
-            .and_then(|()| validate_sqlite_sidecars(self.database_path, self.lock_identity))
+        self.profile.verify_filesystem(
+            (self.database_parent_path, self.database_parent),
+            (self.database_path, self.database_file),
+            (self.lock_path, self.lock_file),
+            self.lock_identity,
+            true,
+        )
     }
 }
 
 impl OwnedOperationalIdentity {
     fn verify(&self) -> Result<(), StateError> {
-        verify_directory_path_identity(&self.database_parent_path, &self.database_parent)
-            .and_then(|()| verify_path_identity(&self.database_path, &self.database_file))
-            .and_then(|()| verify_path_identity(&self.lock_path, &self.lock_file))
-            .and_then(|()| {
-                verify_store_lock_binding(
-                    &self.database_path,
-                    &self.database_file,
-                    &self.lock_path,
-                    &self.lock_file,
-                    self.lock_identity.as_deref(),
-                )
-            })
-            .and_then(|()| {
-                validate_sqlite_sidecars(&self.database_path, self.lock_identity.as_deref())
-            })
+        self.profile.verify_filesystem(
+            (&self.database_parent_path, &self.database_parent),
+            (&self.database_path, &self.database_file),
+            (&self.lock_path, &self.lock_file),
+            self.lock_identity.as_deref(),
+            true,
+        )
     }
 }
 
@@ -2028,6 +2439,7 @@ async fn close_pool_after_open_failure(
 
 struct OpenLifecycleActorInput {
     config: StoreConfig,
+    profile: StoreProfile,
     close_retention: StateCloseRetentionReservation,
     open_admission: tokio::sync::SemaphorePermit<'static>,
     transaction_admission: tokio::sync::SemaphorePermit<'static>,
@@ -2086,6 +2498,7 @@ async fn run_open_lifecycle_actor(
 ) -> Result<OpenLifecycleTerminal, StateError> {
     let OpenLifecycleActorInput {
         config,
+        profile,
         close_retention,
         open_admission,
         transaction_admission,
@@ -2096,6 +2509,7 @@ async fn run_open_lifecycle_actor(
     } = input;
     match StateStore::open_inner(
         config,
+        profile,
         Arc::clone(&deadline_state),
         close_retention,
         transaction_admission,
@@ -2157,6 +2571,32 @@ async fn run_open_lifecycle_actor(
 impl StateStore {
     /// Opens an explicit on-disk database, acquires its writer lock, and migrates forward.
     pub async fn open(config: StoreConfig) -> Result<Self, StateError> {
+        Self::open_with_profile(config, StoreProfile::PortablePrivate).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn open_linux_protected(
+        config: StoreConfig,
+        directory: PathBuf,
+        expected_uid: u32,
+        expected_gid: u32,
+    ) -> Result<Self, StateError> {
+        Self::open_with_profile(
+            config,
+            StoreProfile::LinuxProtected(LinuxProtectedSpec::new(
+                directory,
+                expected_uid,
+                expected_gid,
+            )),
+        )
+        .await
+    }
+
+    async fn open_with_profile(
+        config: StoreConfig,
+        profile: StoreProfile,
+    ) -> Result<Self, StateError> {
         #[cfg(test)]
         let _test_open_permit = if open_admission_test_barrier_is_active() {
             None
@@ -2272,6 +2712,7 @@ impl StateStore {
         actor_runtime.spawn(async move {
             let result = run_open_lifecycle_actor(OpenLifecycleActorInput {
                 config,
+                profile,
                 close_retention,
                 open_admission,
                 transaction_admission,
@@ -2418,27 +2859,110 @@ impl StateStore {
 
     async fn open_inner(
         config: StoreConfig,
+        profile: StoreProfile,
         deadline_state: Arc<OpenDeadlineState>,
         close_retention: StateCloseRetentionReservation,
         transaction_admission: tokio::sync::SemaphorePermit<'static>,
     ) -> Result<Self, StateError> {
-        let path = resolve_database_path(&config.path)?;
-        let database_parent = pin_private_directory(&path)?;
+        let active_profile = match profile {
+            StoreProfile::PortablePrivate => ActiveStoreProfile::PortablePrivate,
+            #[cfg(target_os = "linux")]
+            StoreProfile::LinuxProtected(spec) => {
+                if config.max_connections != 1 {
+                    return Err(StateError::InvalidValue {
+                        field: "maximum connections",
+                        reason: "LinuxProtected requires exactly one connection",
+                    });
+                }
+                let namespace = ProtectedNamespace::open(&spec)?;
+                if config.path != namespace.database_path() {
+                    return Err(StateError::InvalidPath {
+                        path: config.path.clone(),
+                        reason: "LinuxProtected database path must be the fixed state.sqlite entry",
+                    });
+                }
+                if spec.directory() != namespace.directory_path() {
+                    return Err(StateError::InvalidPath {
+                        path: config.path.clone(),
+                        reason: "LinuxProtected directory identity changed during activation",
+                    });
+                }
+                ActiveStoreProfile::LinuxProtected(namespace)
+            }
+        };
+        let path = {
+            #[cfg(target_os = "linux")]
+            if let Some(namespace) = active_profile.protected_namespace() {
+                namespace.database_path().to_owned()
+            } else {
+                resolve_database_path(&config.path)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                resolve_database_path(&config.path)?
+            }
+        };
+        let database_parent = {
+            #[cfg(target_os = "linux")]
+            if let Some(namespace) = active_profile.protected_namespace() {
+                PinnedPrivateDirectory {
+                    path: namespace.directory_path().to_owned(),
+                    file: namespace.clone_parent()?,
+                }
+            } else {
+                pin_private_directory(&path)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                pin_private_directory(&path)?
+            }
+        };
         let database_parent_path = database_parent.path.clone();
-        let creation_lock = acquire_creation_lock(&path)?;
-        let database_file = open_database_file(&path)?;
-        reject_snapshot_staging_marker(&path, &database_file)?;
-        validate_private_database_file(&path, &database_file)?;
-        verify_path_identity(&path, &database_file)?;
-        reject_hard_link(&path, &database_file)?;
-        validate_preflight_sidecars(&path, &database_file)?;
-        let preflight_state = inspect_database(
-            &path,
-            &database_file,
-            false,
-            Some(Arc::clone(&deadline_state)),
-        )
-        .await?;
+        let creation_lock = if active_profile.is_protected() {
+            None
+        } else {
+            acquire_creation_lock(&path)?
+        };
+        let database_file = {
+            #[cfg(target_os = "linux")]
+            if let Some(namespace) = active_profile.protected_namespace() {
+                namespace.clone_database()?
+            } else {
+                open_database_file(&path)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                open_database_file(&path)?
+            }
+        };
+        let preflight_state = if active_profile.is_protected() {
+            active_profile.verify_filesystem(
+                (&database_parent_path, &database_parent.file),
+                (&path, &database_file),
+                (&path, &database_file),
+                None,
+                true,
+            )?;
+            #[cfg(target_os = "linux")]
+            {
+                InspectedDatabase::Existing { schema_version: 0 }
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("protected profiles are Linux-only")
+        } else {
+            reject_snapshot_staging_marker(&path, &database_file)?;
+            validate_private_database_file(&path, &database_file)?;
+            verify_path_identity(&path, &database_file)?;
+            reject_hard_link(&path, &database_file)?;
+            validate_preflight_sidecars(&path, &database_file)?;
+            inspect_database(
+                &path,
+                &database_file,
+                false,
+                Some(Arc::clone(&deadline_state)),
+            )
+            .await?
+        };
         prepare_windows_database_identity(&path)?;
         let allow_identity_initialization = (creation_lock.is_some()
             && matches!(preflight_state, InspectedDatabase::Fresh))
@@ -2446,24 +2970,48 @@ impl StateStore {
                 preflight_state,
                 InspectedDatabase::Existing { schema_version: 0 }
             );
-        let (lock_path, lock_file, process_identity) =
-            acquire_store_lock(&path, &database_file, allow_identity_initialization)?;
+        let (lock_path, lock_file, process_identity) = {
+            #[cfg(target_os = "linux")]
+            if let Some(namespace) = active_profile.protected_namespace() {
+                acquire_linux_protected_store_lock(namespace)?
+            } else {
+                acquire_store_lock(&path, &database_file, allow_identity_initialization)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                acquire_store_lock(&path, &database_file, allow_identity_initialization)?
+            }
+        };
         if !deadline_state.retain_open_cleanup() {
             return Err(deadline_state.timeout_error());
         }
         drop(creation_lock);
-        let lock_identity =
-            capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?;
-        let owner = writer_owner()?;
+        let lock_identity = if active_profile.is_protected() {
+            None
+        } else {
+            capture_store_lock_identity(&path, &database_file, &lock_path, &lock_file)?
+        };
+        let owner = active_profile.writer_owner()?;
         let writer_generation = Arc::new(AtomicU64::new(1));
-        verify_path_identity(&path, &database_file)?;
-        let locked_state = inspect_database(
-            &path,
-            &database_file,
-            false,
-            Some(Arc::clone(&deadline_state)),
-        )
-        .await?;
+        let locked_state = if active_profile.is_protected() {
+            active_profile.verify_filesystem(
+                (&database_parent_path, &database_parent.file),
+                (&path, &database_file),
+                (&lock_path, &lock_file),
+                None,
+                true,
+            )?;
+            preflight_state
+        } else {
+            verify_path_identity(&path, &database_file)?;
+            inspect_database(
+                &path,
+                &database_file,
+                false,
+                Some(Arc::clone(&deadline_state)),
+            )
+            .await?
+        };
 
         let remaining = deadline_state
             .deadline
@@ -2471,13 +3019,18 @@ impl StateStore {
         if remaining.is_zero() {
             return Err(deadline_state.timeout_error());
         }
-        let options = SqliteConnectOptions::new()
+        let mut options = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(false)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
             .busy_timeout(config.busy_timeout.min(remaining))
             .synchronous(config.synchronous.sqlx());
+        if active_profile.is_protected() {
+            options = options
+                .vfs("unix-excl")
+                .locking_mode(SqliteLockingMode::Exclusive);
+        }
         let configured_busy_timeout = config.busy_timeout;
         let verified_path = path.clone();
         let verified_parent_path = database_parent_path.clone();
@@ -2499,6 +3052,7 @@ impl StateStore {
         let connect_identity_handles = Arc::clone(&pool_identity_handles);
         let verified_lock_identity = lock_identity.clone();
         let verified_writer_generation = Arc::clone(&writer_generation);
+        let verified_profile = active_profile.clone();
         let connections_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connect_ready = Arc::clone(&connections_ready);
         let connect_deadline_state = Arc::clone(&deadline_state);
@@ -2508,14 +3062,20 @@ impl StateStore {
         let acquire_identity_handles = Arc::clone(&pool_identity_handles);
         let acquire_lock_identity = verified_lock_identity.clone();
         let acquire_writer_generation = Arc::clone(&verified_writer_generation);
+        let acquire_profile = active_profile.clone();
         let acquire_ready = Arc::clone(&connections_ready);
         let acquire_deadline_state = Arc::clone(&deadline_state);
         let live_acquire_timeout = config.acquire_timeout;
+        let pool_max_connections = if active_profile.is_protected() {
+            1
+        } else {
+            config.max_connections
+        };
         let pool = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline_state.deadline),
             SqlitePoolOptions::new()
                 .min_connections(1)
-                .max_connections(config.max_connections)
+                .max_connections(pool_max_connections)
                 .acquire_timeout(config.acquire_timeout)
                 .after_connect(move |connection, _metadata| {
                     let path = verified_path.clone();
@@ -2524,6 +3084,7 @@ impl StateStore {
                     let identity_handles = Arc::clone(&connect_identity_handles);
                     let lock_identity = verified_lock_identity.clone();
                     let writer_generation = Arc::clone(&verified_writer_generation);
+                    let profile = verified_profile.clone();
                     let ready = Arc::clone(&connect_ready);
                     let deadline_state = Arc::clone(&connect_deadline_state);
                     Box::pin(async move {
@@ -2558,20 +3119,16 @@ impl StateStore {
                                 "state writer generation is no longer live".to_owned(),
                             ));
                         }
-                        verify_directory_path_identity(&parent_path, &parent)
-                            .and_then(|()| verify_path_identity(&path, &file))
-                            .and_then(|()| verify_path_identity(&lock_path, &lock_file))
-                            .and_then(|()| {
-                                verify_store_lock_binding(
-                                    &path,
-                                    &file,
-                                    &lock_path,
-                                    &lock_file,
-                                    lock_identity.as_deref(),
-                                )
-                            })
+                        profile
+                            .verify_filesystem(
+                                (&parent_path, &parent),
+                                (&path, &file),
+                                (&lock_path, &lock_file),
+                                lock_identity.as_deref(),
+                                false,
+                            )
                             .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        verify_sqlite_connection_identity(connection).await?;
+                        profile.verify_connection(connection).await?;
                         if ready.load(std::sync::atomic::Ordering::Acquire) {
                             claw_sqlite_file_control::set_busy_timeout(
                                 connection,
@@ -2579,17 +3136,19 @@ impl StateStore {
                             )
                             .await
                             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-                            secure_sqlite_sidecars(&path, lock_identity.as_deref())
+                            profile
+                                .secure_sidecars(&path, lock_identity.as_deref())
                                 .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                            install_store_commit_guard(
-                                connection,
-                                (&parent_path, &parent),
-                                (&path, &file),
-                                (&lock_path, &lock_file),
-                                lock_identity.as_deref(),
-                                (Arc::clone(&writer_generation), 1),
-                            )
-                            .await?;
+                            profile
+                                .install_commit_guard(
+                                    connection,
+                                    (&parent_path, &parent),
+                                    (&path, &file),
+                                    (&lock_path, &lock_file),
+                                    lock_identity.as_deref(),
+                                    (Arc::clone(&writer_generation), 1),
+                                )
+                                .await?;
                         }
                         Ok(())
                     })
@@ -2601,6 +3160,7 @@ impl StateStore {
                     let identity_handles = Arc::clone(&acquire_identity_handles);
                     let lock_identity = acquire_lock_identity.clone();
                     let writer_generation = Arc::clone(&acquire_writer_generation);
+                    let profile = acquire_profile.clone();
                     let ready = Arc::clone(&acquire_ready);
                     let deadline_state = Arc::clone(&acquire_deadline_state);
                     Box::pin(async move {
@@ -2692,6 +3252,7 @@ impl StateStore {
                             lock_path: PathBuf,
                             lock_file: Arc<File>,
                             lock_identity: Option<Vec<u8>>,
+                            profile: ActiveStoreProfile,
                             ready: Arc<std::sync::atomic::AtomicBool>,
                             result: Arc<std::sync::Mutex<Option<Result<(), StateError>>>>,
                         }
@@ -2705,6 +3266,7 @@ impl StateStore {
                                 lock_path,
                                 lock_file,
                                 lock_identity,
+                                profile: profile.clone(),
                                 ready,
                                 result: Arc::clone(&verified),
                             },
@@ -2712,41 +3274,15 @@ impl StateStore {
                             |_, _, payload| {
                                 let verified =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        verify_directory_path_identity(
-                                            &payload.parent_path,
-                                            &payload.parent,
-                                        )
-                                        .and_then(|()| {
-                                            verify_path_identity(&payload.path, &payload.file)
-                                        })
-                                        .and_then(|()| {
-                                            verify_path_identity(
-                                                &payload.lock_path,
-                                                &payload.lock_file,
-                                            )
-                                        })
-                                        .and_then(|()| {
-                                            verify_store_lock_binding(
-                                                &payload.path,
-                                                &payload.file,
-                                                &payload.lock_path,
-                                                &payload.lock_file,
-                                                payload.lock_identity.as_deref(),
-                                            )
-                                        })
-                                        .and_then(|()| {
-                                            if payload
+                                        payload.profile.verify_filesystem(
+                                            (&payload.parent_path, &payload.parent),
+                                            (&payload.path, &payload.file),
+                                            (&payload.lock_path, &payload.lock_file),
+                                            payload.lock_identity.as_deref(),
+                                            payload
                                                 .ready
-                                                .load(std::sync::atomic::Ordering::Acquire)
-                                            {
-                                                validate_sqlite_sidecars(
-                                                    &payload.path,
-                                                    payload.lock_identity.as_deref(),
-                                                )
-                                            } else {
-                                                Ok(())
-                                            }
-                                        })
+                                                .load(std::sync::atomic::Ordering::Acquire),
+                                        )
                                     }))
                                     .unwrap_or_else(
                                         |panic| {
@@ -2810,7 +3346,7 @@ impl StateStore {
                                 )
                             })?;
                         verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        verify_sqlite_connection_identity(connection).await?;
+                        profile.verify_connection(connection).await?;
                         Ok(true)
                     })
                 })
@@ -2819,7 +3355,54 @@ impl StateStore {
         .await
         .map_err(|_| deadline_state.timeout_error())?
         .map_err(|error| database("open state database", error))?;
-        if let Err(error) = verify_path_identity(&path, &database_file) {
+        let pooled_identity = if active_profile.is_protected() {
+            active_profile.verify_filesystem(
+                (&database_parent_path, &database_parent.file),
+                (&path, &database_file),
+                (&lock_path, &lock_file),
+                lock_identity.as_deref(),
+                false,
+            )
+        } else {
+            verify_path_identity(&path, &database_file)
+        };
+        if let Err(error) = pooled_identity {
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+        }
+        #[cfg(target_os = "linux")]
+        let locked_state = if active_profile.is_protected() {
+            let inspected = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline_state.work_cutoff),
+                async {
+                    let mut connection = pool.acquire().await.map_err(|error| {
+                        database("acquire LinuxProtected inspection connection", error)
+                    })?;
+                    let inspected =
+                        inspect_database_connection(&mut connection, &path, false).await;
+                    drop(connection);
+                    inspected
+                },
+            )
+            .await
+            .map_err(|_| deadline_state.timeout_error());
+            match inspected {
+                Ok(Ok(inspected)) => inspected,
+                Ok(Err(error)) | Err(error) => {
+                    return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+                }
+            }
+        } else {
+            locked_state
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(namespace) = active_profile.protected_namespace()
+            && let Err(error) = namespace.recover_catalog(
+                namespace.catalog_identity(1),
+                Some(deadline_state.work_cutoff),
+                Some(deadline_state.cancelled.as_ref()),
+                deadline_state.timeout_ms,
+            )
+        {
             return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
         }
 
@@ -2925,17 +3508,18 @@ impl StateStore {
                 .map_err(|error| {
                     file_control_database("commit SQLite sidecar initialization", error)
                 })?;
-            secure_sqlite_sidecars(&path, lock_identity.as_deref())?;
-            install_store_commit_guard(
-                &mut initial,
-                (&database_parent_path, &database_parent.file),
-                (&path, &database_file),
-                (&lock_path, &lock_file),
-                lock_identity.as_deref(),
-                (Arc::clone(&writer_generation), 1),
-            )
-            .await
-            .map_err(|error| database("install initial commit guard", error))?;
+            active_profile.secure_sidecars(&path, lock_identity.as_deref())?;
+            active_profile
+                .install_commit_guard(
+                    &mut initial,
+                    (&database_parent_path, &database_parent.file),
+                    (&path, &database_file),
+                    (&lock_path, &lock_file),
+                    lock_identity.as_deref(),
+                    (Arc::clone(&writer_generation), 1),
+                )
+                .await
+                .map_err(|error| database("install initial commit guard", error))?;
             drop(initial);
             post_commit_owner.shutdown().map_err(|error| {
                 database(
@@ -2970,17 +3554,18 @@ impl StateStore {
                     sqlx::Error::Protocol(error.to_string()),
                 )
             })?;
-            secure_sqlite_sidecars(&path, lock_identity.as_deref())?;
-            install_store_commit_guard(
-                &mut configured_connection,
-                (&database_parent_path, &database_parent.file),
-                (&path, &database_file),
-                (&lock_path, &lock_file),
-                lock_identity.as_deref(),
-                (Arc::clone(&writer_generation), 1),
-            )
-            .await
-            .map_err(|error| database("install configured commit guard", error))?;
+            active_profile.secure_sidecars(&path, lock_identity.as_deref())?;
+            active_profile
+                .install_commit_guard(
+                    &mut configured_connection,
+                    (&database_parent_path, &database_parent.file),
+                    (&path, &database_file),
+                    (&lock_path, &lock_file),
+                    lock_identity.as_deref(),
+                    (Arc::clone(&writer_generation), 1),
+                )
+                .await
+                .map_err(|error| database("install configured commit guard", error))?;
             Ok::<(), StateError>(())
         }
         .await;
@@ -3002,6 +3587,32 @@ impl StateStore {
                 return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
             }
         };
+        if active_profile.is_protected()
+            && let Err(error) = active_profile
+                .secure_sidecars(&path, lock_identity.as_deref())
+                .and_then(|()| {
+                    active_profile.verify_filesystem(
+                        (&database_parent_path, &database_parent.file),
+                        (&path, &database_file),
+                        (&lock_path, &lock_file),
+                        lock_identity.as_deref(),
+                        true,
+                    )
+                })
+        {
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(namespace) = active_profile.protected_namespace()
+            && let Err(error) = namespace.recover_catalog(
+                namespace.catalog_identity(1),
+                Some(deadline_state.work_cutoff),
+                Some(deadline_state.cancelled.as_ref()),
+                deadline_state.timeout_ms,
+            )
+        {
+            return Err(close_pool_after_open_failure(&pool, &deadline_state, error).await);
+        }
         connections_ready.store(true, std::sync::atomic::Ordering::Release);
         Ok(Self {
             path,
@@ -3018,14 +3629,16 @@ impl StateStore {
                 database_parent: database_parent.file,
                 close_retention,
                 pool_identity_handles: pool_identity_guard,
+                profile: active_profile.clone(),
             }),
             writer_generation,
-            max_connections: config.max_connections,
+            max_connections: pool_max_connections,
             operation_timeout: config.operation_timeout,
             busy_timeout: config.busy_timeout,
             close_timeout: config.close_timeout,
             undelivered_cleanup_owner: Some(initialized.undelivered_cleanup_owner),
             open_transaction_admission: Some(initialized.open_transaction_admission),
+            profile: active_profile,
         })
     }
 
@@ -3086,6 +3699,7 @@ impl StateStore {
             lock_file: &ownership.lock_file,
             lock_identity: self.lock_identity.as_deref(),
             writer_generation: &self.writer_generation,
+            profile: &self.profile,
             busy_timeout: self.busy_timeout,
             operation_timeout: self.operation_timeout,
             cleanup_timeout: self.close_timeout,
@@ -3141,6 +3755,12 @@ impl StateStore {
     /// Creates a same-version, transactionally consistent snapshot sealed to
     /// the current machine and service identity.
     pub async fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), StateError> {
+        if self.profile.is_protected() {
+            return Err(StateError::InvalidPath {
+                path: destination.as_ref().to_owned(),
+                reason: "LinuxProtected snapshots use only the fixed internal catalog",
+            });
+        }
         let timeout_ms = u64::try_from(self.operation_timeout.as_millis()).map_err(|_| {
             StateError::InvalidValue {
                 field: "backup timeout",
@@ -3234,6 +3854,590 @@ impl StateStore {
             Some(self.operational_identity()),
         )
         .await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn publish_linux_protected_snapshot(
+        &self,
+    ) -> Result<ProtectedSnapshotReceipt, StateError> {
+        let namespace =
+            self.profile
+                .protected_namespace()
+                .cloned()
+                .ok_or_else(|| StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "fixed catalog publication requires LinuxProtected",
+                })?;
+        let timeout_ms = u64::try_from(self.operation_timeout.as_millis()).map_err(|_| {
+            StateError::InvalidValue {
+                field: "LinuxProtected snapshot timeout",
+                reason: "must fit in milliseconds",
+            }
+        })?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.operation_timeout)
+            .ok_or(StateError::InvalidValue {
+                field: "LinuxProtected snapshot timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+        let cleanup_deadline = deadline
+            .checked_add(self.close_timeout.max(Duration::from_secs(5)))
+            .ok_or(StateError::InvalidValue {
+                field: "LinuxProtected snapshot cleanup timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+        let deadline_state = Arc::new(OpenDeadlineState {
+            work_cutoff: deadline.into_std(),
+            deadline: cleanup_deadline.into_std(),
+            timeout_ms,
+            operation: "LinuxProtected snapshot publication",
+            busy_timeout: self.busy_timeout,
+            expired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            final_commit_state: std::sync::atomic::AtomicU8::new(0),
+            open_cleanup_state: std::sync::atomic::AtomicU8::new(0),
+        });
+        let mut cancellation_guard = OperationCancellationGuard::new(Arc::clone(&deadline_state));
+        let publication =
+            tokio::time::timeout_at(deadline, namespace.publication_gate().lock_owned())
+                .await
+                .map_err(|_| StateError::OperationTimedOut {
+                    operation: "LinuxProtected snapshot publication",
+                    timeout_ms,
+                })?;
+        self.operational_identity().verify()?;
+        let writer_generation = self.writer_generation.load(Ordering::Acquire);
+        if writer_generation != 1 {
+            return Err(StateError::InvalidPath {
+                path: self.path.clone(),
+                reason: "LinuxProtected writer generation is no longer live",
+            });
+        }
+        let catalog_identity = namespace.catalog_identity(writer_generation);
+
+        let snapshot_memory =
+            reserve_snapshot_memory(deadline, "LinuxProtected snapshot publication", timeout_ms)
+                .await?;
+        let admission = tokio::time::timeout_at(deadline, BACKUP_CLEANUP_ADMISSION.acquire())
+            .await
+            .map_err(|_| StateError::OperationTimedOut {
+                operation: "LinuxProtected snapshot publication",
+                timeout_ms,
+            })?
+            .map_err(|_| {
+                database(
+                    "acquire LinuxProtected snapshot cleanup admission",
+                    sqlx::Error::Protocol("snapshot cleanup admission closed".to_owned()),
+                )
+            })?;
+        let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+            "claw-state-linux-protected-snapshot",
+            8,
+            deadline.into_std(),
+        )
+        .await
+        .map_err(|error| {
+            if tokio::time::Instant::now() >= deadline {
+                StateError::OperationTimedOut {
+                    operation: "LinuxProtected snapshot publication",
+                    timeout_ms,
+                }
+            } else {
+                database(
+                    "reserve LinuxProtected snapshot owners",
+                    sqlx::Error::Protocol(error),
+                )
+            }
+        })?;
+        let prepare_owner = owners.pop().expect("catalog prepare owner was reserved");
+
+        let prepare_namespace = Arc::clone(&namespace);
+        let prepare_cancelled = Arc::clone(&deadline_state.cancelled);
+        let mut preparation = Some((publication, snapshot_memory, admission, owners));
+        let (plan, publication, snapshot_memory, admission, mut owners) = run_bounded_filesystem(
+            prepare_owner,
+            deadline,
+            "LinuxProtected snapshot publication",
+            timeout_ms,
+            move || {
+                let (publication, snapshot_memory, admission, owners) = preparation
+                    .take()
+                    .expect("catalog preparation consumes its retained resources once");
+                let current = prepare_namespace.recover_catalog(
+                    catalog_identity,
+                    Some(deadline.into_std()),
+                    Some(prepare_cancelled.as_ref()),
+                    timeout_ms,
+                )?;
+                let plan = prepare_namespace.publication_plan(current)?;
+                prepare_namespace.scrub_slot(plan.slot)?;
+                Ok((plan, publication, snapshot_memory, admission, owners))
+            },
+        )
+        .await?;
+        let selector_owner = owners.pop().expect("selector owner was reserved");
+        let metadata_owner = owners.pop().expect("metadata owner was reserved");
+        let scrub_owner = owners.pop().expect("slot scrub owner was reserved");
+        let finalization_owner = owners.pop().expect("finalization owner was reserved");
+        let destination_cleanup_owner = owners
+            .pop()
+            .expect("destination cleanup owner was reserved");
+        let source_cleanup_owner = owners.pop().expect("source cleanup owner was reserved");
+        let backup_worker_owner = owners.pop().expect("backup worker owner was reserved");
+        debug_assert!(owners.is_empty());
+        #[cfg(test)]
+        if take_protected_snapshot_test_failure(&self.path, 1) {
+            deadline_state.cancel();
+            return Err(StateError::OperationTimedOut {
+                operation: "LinuxProtected snapshot publication",
+                timeout_ms,
+            });
+        }
+
+        let source = tokio::time::timeout_at(deadline, self.pool().acquire())
+            .await
+            .map_err(|_| StateError::OperationTimedOut {
+                operation: "LinuxProtected snapshot publication",
+                timeout_ms,
+            })?
+            .map_err(|error| database("acquire LinuxProtected snapshot source", error))?;
+        let destination = tokio::time::timeout_at(
+            deadline,
+            SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .journal_mode(SqliteJournalMode::Off),
+            ),
+        )
+        .await
+        .map_err(|_| StateError::OperationTimedOut {
+            operation: "LinuxProtected snapshot publication",
+            timeout_ms,
+        })?
+        .map_err(|error| database("open LinuxProtected in-memory snapshot", error))?;
+        let mut source = source;
+        let max_pages = bounded_backup_max_pages(&mut source).await?;
+        let backup = claw_sqlite_file_control::backup_owned_main_database_with_cleanup_deadline(
+            backup_worker_owner,
+            source,
+            destination,
+            (snapshot_memory, admission),
+            claw_sqlite_file_control::BackupExecutionContext {
+                deadline: deadline.into_std(),
+                cancelled: Arc::clone(&deadline_state.cancelled),
+                max_pages,
+                source_busy_timeout: self.busy_timeout,
+                destination_busy_timeout: Duration::ZERO,
+            },
+            cleanup_deadline.into_std(),
+        )
+        .await;
+        let (source, destination, reservations) = match backup {
+            Ok(backup) => backup,
+            Err(error) => {
+                let namespace = Arc::clone(&namespace);
+                let cleanup = run_bounded_filesystem(
+                    scrub_owner,
+                    cleanup_deadline,
+                    "LinuxProtected snapshot cleanup",
+                    timeout_ms,
+                    move || namespace.scrub_slot(plan.slot),
+                )
+                .await;
+                let primary = file_control_database("copy LinuxProtected logical snapshot", error);
+                return Err(match cleanup {
+                    Ok(()) => primary,
+                    Err(cleanup) => append_operation_cleanup(
+                        "LinuxProtected snapshot publication",
+                        primary,
+                        cleanup.to_string(),
+                    ),
+                });
+            }
+        };
+        let mut lease = ProtectedSnapshotCleanupLease {
+            namespace: Arc::clone(&namespace),
+            slot: plan.slot,
+            cleanup_deadline,
+            cleanup_owner: Some(scrub_owner),
+            retention: Arc::new(std::sync::Mutex::new(Some(ProtectedSnapshotRetention {
+                _memory: reservations.0,
+                _admission: reservations.1,
+                _publication: publication,
+            }))),
+            armed: true,
+        };
+        let mut source = BackupConnectionGuard::new_cancellable(
+            source,
+            Arc::clone(&deadline_state),
+            source_cleanup_owner,
+        );
+        let mut destination = OwnedSqliteConnectionGuard::new_cancellable_with_owner(
+            destination,
+            Some(Arc::clone(&deadline_state)),
+            destination_cleanup_owner,
+        );
+        if let Err(primary) =
+            install_open_deadline_handler(&mut destination, Some(Arc::clone(&deadline_state))).await
+        {
+            let primary = discard_backup_connections_or_error(source, destination, primary).await;
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+        if let Err(primary) = validate_backup_connection(
+            namespace.slot_path(plan.slot),
+            &mut destination,
+            BackupValidationMode::LatestSource,
+        )
+        .await
+        {
+            let primary = discard_backup_connections_or_error(source, destination, primary).await;
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+        let output = match namespace.clone_slot(plan.slot) {
+            Ok(output) => output,
+            Err(primary) => {
+                let primary =
+                    discard_backup_connections_or_error(source, destination, primary).await;
+                return Err(match lease.cleanup_slot().await {
+                    Ok(()) => primary,
+                    Err(cleanup) => append_operation_cleanup(
+                        "LinuxProtected snapshot publication",
+                        primary,
+                        cleanup.to_string(),
+                    ),
+                });
+            }
+        };
+        let (destination, destination_owner) = destination.release_connection();
+        if let Err(cleanup) = destination_owner.shutdown() {
+            let close = source.discard().await;
+            let primary = append_operation_cleanup(
+                "LinuxProtected snapshot publication",
+                database(
+                    "release LinuxProtected destination cleanup owner",
+                    sqlx::Error::Protocol(cleanup),
+                ),
+                format!("source terminal close: {close:?}"),
+            );
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+        let finalized = claw_sqlite_file_control::finalize_owned_snapshot(
+            finalization_owner,
+            destination,
+            output,
+            lease,
+            claw_sqlite_file_control::SnapshotFinalizeContext {
+                output_path: namespace
+                    .slot_path(plan.slot)
+                    .to_string_lossy()
+                    .into_owned(),
+                deadline: deadline.into_std(),
+                cancelled: Arc::clone(&deadline_state.cancelled),
+                maximum_bytes: usize::try_from(protected_catalog::MAX_SNAPSHOT_BYTES)
+                    .expect("snapshot size cap fits usize"),
+            },
+        )
+        .await;
+        let (write_receipt, mut lease) = match finalized {
+            Ok(finalized) => finalized,
+            Err(error) => {
+                let close = source.discard().await;
+                let primary = file_control_database("finalize LinuxProtected held snapshot", error);
+                return Err(
+                    if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+                        primary
+                    } else {
+                        append_operation_cleanup(
+                            "LinuxProtected snapshot publication",
+                            primary,
+                            format!("source terminal close: {close:?}"),
+                        )
+                    },
+                );
+            }
+        };
+        let source_identity = self
+            .profile
+            .verify_connection(&mut source)
+            .await
+            .map_err(|error| database("reverify LinuxProtected snapshot source connection", error))
+            .and_then(|()| self.operational_identity().verify());
+        if let Err(primary) = source_identity {
+            let close = source.discard().await;
+            let primary = if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+                primary
+            } else {
+                append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    format!("source terminal close: {close:?}"),
+                )
+            };
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+        if let Err(primary) = source.release_reusable() {
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+        #[cfg(test)]
+        wait_at_protected_snapshot_test_gate(&self.path, 4, plan.slot, deadline).await;
+
+        let observation = SlotObservation {
+            byte_length: write_receipt.byte_count,
+            digest: write_receipt.digest,
+        };
+        let metadata = protected_catalog::encode_metadata(SnapshotMetadata {
+            slot: plan.slot,
+            generation: plan.generation,
+            identity: catalog_identity,
+            byte_length: write_receipt.byte_count,
+            digest: write_receipt.digest,
+        });
+        let selector = protected_catalog::encode_selector_cell(SelectorCell {
+            cell: plan.selector_cell,
+            slot: plan.slot,
+            generation: plan.generation,
+            metadata_digest: protected_catalog::digest(&metadata),
+        });
+        let metadata_namespace = Arc::clone(&namespace);
+        let metadata_cancelled = Arc::clone(&deadline_state.cancelled);
+        let mut metadata_lease = Some(lease);
+        let mut lease = run_bounded_filesystem(
+            metadata_owner,
+            deadline,
+            "LinuxProtected snapshot publication",
+            timeout_ms,
+            move || {
+                let lease = metadata_lease
+                    .take()
+                    .expect("metadata worker consumes the cleanup lease once");
+                let result = (|| {
+                    metadata_namespace.verify_slot(
+                        plan.slot,
+                        observation,
+                        Some(deadline.into_std()),
+                        Some(metadata_cancelled.as_ref()),
+                        timeout_ms,
+                    )?;
+                    metadata_namespace.write_metadata(plan.slot, &metadata)?;
+                    metadata_namespace.verify()
+                })();
+                match result {
+                    Ok(()) => Ok(lease),
+                    Err(error) => Err(error),
+                }
+            },
+        )
+        .await?;
+        #[cfg(test)]
+        if take_protected_snapshot_test_failure(&self.path, 2) {
+            namespace.fail_next_scrub();
+            let primary = database(
+                "inject LinuxProtected metadata failure",
+                sqlx::Error::Protocol("injected pre-selector metadata failure".to_owned()),
+            );
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline
+            || deadline_state
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let primary = StateError::OperationTimedOut {
+                operation: "LinuxProtected snapshot publication",
+                timeout_ms,
+            };
+            return Err(match lease.cleanup_slot().await {
+                Ok(()) => primary,
+                Err(cleanup) => append_operation_cleanup(
+                    "LinuxProtected snapshot publication",
+                    primary,
+                    cleanup.to_string(),
+                ),
+            });
+        }
+
+        let commit_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let worker_state = Arc::clone(&commit_state);
+        let selector_namespace = Arc::clone(&namespace);
+        let selector_cancelled = Arc::clone(&deadline_state.cancelled);
+        let selector_path = namespace.selector_path().to_owned();
+        #[cfg(test)]
+        let inject_uncertainty = take_protected_snapshot_test_failure(&self.path, 3);
+        #[cfg(not(test))]
+        let inject_uncertainty = false;
+        let mut lease = Some(lease);
+        let selector_result = run_bounded_filesystem_with_acceptance(
+            selector_owner,
+            cleanup_deadline,
+            deadline,
+            "LinuxProtected snapshot publication",
+            timeout_ms,
+            move || {
+                let mut lease = lease
+                    .take()
+                    .expect("selector worker consumes the cleanup lease once");
+                if selector_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline.into_std()
+                {
+                    if let Err(error) = selector_namespace.scrub_slot(plan.slot) {
+                        worker_state.store(3, std::sync::atomic::Ordering::Release);
+                        return Err(error);
+                    }
+                    let release = lease.disarm_without_scrub();
+                    worker_state.store(3, std::sync::atomic::Ordering::Release);
+                    release.map_err(|cleanup| {
+                        database(
+                            "release precommit LinuxProtected cleanup owner",
+                            sqlx::Error::Protocol(cleanup),
+                        )
+                    })?;
+                    return Err(StateError::OperationTimedOut {
+                        operation: "LinuxProtected snapshot publication",
+                        timeout_ms,
+                    });
+                }
+                if let Err(cleanup) = lease.disarm_without_scrub() {
+                    let primary = database(
+                        "release LinuxProtected snapshot scrub owner",
+                        sqlx::Error::Protocol(cleanup),
+                    );
+                    worker_state.store(3, std::sync::atomic::Ordering::Release);
+                    return match selector_namespace.scrub_slot(plan.slot) {
+                        Ok(()) => Err(primary),
+                        Err(scrub) => Err(append_operation_cleanup(
+                            "LinuxProtected snapshot publication",
+                            primary,
+                            scrub.to_string(),
+                        )),
+                    };
+                }
+                worker_state.store(1, std::sync::atomic::Ordering::Release);
+                if let Err(error) =
+                    selector_namespace.commit_selector_cell(plan.selector_cell, &selector)
+                {
+                    return Err(StateError::PublicationUncertain {
+                        path: selector_namespace.selector_path().to_owned(),
+                        reason: format!("selector commit may be partial: {error}"),
+                    });
+                }
+                if inject_uncertainty {
+                    return Err(StateError::PublicationUncertain {
+                        path: selector_namespace.selector_path().to_owned(),
+                        reason: "injected uncertainty after durable selector commit".to_owned(),
+                    });
+                }
+                let recovered = selector_namespace
+                    .recover_catalog(
+                        catalog_identity,
+                        Some(deadline.into_std()),
+                        Some(selector_cancelled.as_ref()),
+                        timeout_ms,
+                    )
+                    .map_err(|error| StateError::PublicationUncertain {
+                        path: selector_namespace.selector_path().to_owned(),
+                        reason: format!("committed selector failed recovery verification: {error}"),
+                    })?
+                    .ok_or_else(|| StateError::PublicationUncertain {
+                        path: selector_namespace.selector_path().to_owned(),
+                        reason: "committed selector recovered no generation".to_owned(),
+                    })?;
+                if recovered.metadata.generation != plan.generation
+                    || recovered.metadata.slot != plan.slot
+                    || recovered.metadata.byte_length != observation.byte_length
+                    || recovered.metadata.digest != observation.digest
+                    || selector_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline.into_std()
+                {
+                    return Err(StateError::PublicationUncertain {
+                        path: selector_namespace.selector_path().to_owned(),
+                        reason: "committed selector failed final generation, identity, or cutoff verification"
+                            .to_owned(),
+                    });
+                }
+                worker_state.store(2, std::sync::atomic::Ordering::Release);
+                Ok(ProtectedSnapshotReceipt {
+                    generation: plan.generation,
+                    slot: plan.slot,
+                    byte_count: observation.byte_length,
+                    digest: observation.digest,
+                })
+            },
+        )
+        .await;
+        match selector_result {
+            Ok(receipt) => {
+                cancellation_guard.disarm();
+                deadline_state
+                    .finished
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Ok(receipt)
+            }
+            Err(error)
+                if commit_state.load(std::sync::atomic::Ordering::Acquire) == 3
+                    && !matches!(error, StateError::PublicationUncertain { .. }) =>
+            {
+                cancellation_guard.disarm();
+                Err(error)
+            }
+            Err(error @ StateError::PublicationUncertain { .. }) => {
+                cancellation_guard.disarm();
+                Err(error)
+            }
+            Err(error) => {
+                deadline_state.cancel();
+                cancellation_guard.disarm();
+                Err(StateError::PublicationUncertain {
+                    path: selector_path,
+                    reason: format!(
+                        "selector worker stopped after publication became possible: {error}"
+                    ),
+                })
+            }
+        }
     }
 
     /// Restores a locally sealed backup to a destination that does not yet exist.
@@ -4044,21 +5248,37 @@ impl StateStore {
         {
             panic!("injected panic after state close ownership guard");
         }
+        #[cfg(target_os = "linux")]
+        let _protected_publication = if let Some(namespace) = self.profile.protected_namespace() {
+            match tokio::time::timeout_at(deadline, namespace.publication_gate().lock_owned()).await
+            {
+                Ok(publication) => Some(publication),
+                Err(_) => {
+                    return Err(StateError::CloseDegraded {
+                        checkpoint_completed: false,
+                        application_lock_released: application_lock_already_released,
+                        final_connection_closed: false,
+                        pool_closed: false,
+                        os_lock_released: false,
+                        reason: "LinuxProtected publication worker did not retire before the immutable close deadline; all store ownership remains retained"
+                            .to_owned(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let mut reasons = Vec::new();
-        let identity_valid = match verify_directory_path_identity(
-            &self.database_parent_path,
-            &ownership.ownership().database_parent,
-        )
-        .and_then(|()| verify_path_identity(&self.path, &ownership.ownership().database_file))
-        .and_then(|()| {
-            verify_store_lock_binding(
-                &self.path,
-                &ownership.ownership().database_file,
-                &self.lock_path,
-                &ownership.ownership().lock_file,
-                self.lock_identity.as_deref(),
-            )
-        }) {
+        let identity_valid = match self.profile.verify_filesystem(
+            (
+                &self.database_parent_path,
+                &ownership.ownership().database_parent,
+            ),
+            (&self.path, &ownership.ownership().database_file),
+            (&self.lock_path, &ownership.ownership().lock_file),
+            self.lock_identity.as_deref(),
+            false,
+        ) {
             Ok(()) => true,
             Err(error) => {
                 reasons.push(format!("database identity unavailable: {error}"));
@@ -4200,21 +5420,16 @@ impl StateStore {
         };
         let mut cleanup_identity_valid = identity_valid;
         if connection.is_some()
-            && let Err(error) = verify_directory_path_identity(
-                &self.database_parent_path,
-                &ownership.ownership().database_parent,
+            && let Err(error) = self.profile.verify_filesystem(
+                (
+                    &self.database_parent_path,
+                    &ownership.ownership().database_parent,
+                ),
+                (&self.path, &ownership.ownership().database_file),
+                (&self.lock_path, &ownership.ownership().lock_file),
+                self.lock_identity.as_deref(),
+                true,
             )
-            .and_then(|()| verify_path_identity(&self.path, &ownership.ownership().database_file))
-            .and_then(|()| {
-                verify_store_lock_binding(
-                    &self.path,
-                    &ownership.ownership().database_file,
-                    &self.lock_path,
-                    &ownership.ownership().lock_file,
-                    self.lock_identity.as_deref(),
-                )
-            })
-            .and_then(|()| validate_sqlite_sidecars(&self.path, self.lock_identity.as_deref()))
         {
             cleanup_identity_valid = false;
             reasons.push(format!(
@@ -4276,7 +5491,29 @@ impl StateStore {
         }
         let pool_closed =
             pool_drain_completed && (!final_connection_required || final_connection_closed);
-        let os_lock_released = if pool_closed {
+        let terminal_identity_valid = if pool_closed && self.profile.is_protected() {
+            match self.profile.verify_filesystem(
+                (
+                    &self.database_parent_path,
+                    &ownership.ownership().database_parent,
+                ),
+                (&self.path, &ownership.ownership().database_file),
+                (&self.lock_path, &ownership.ownership().lock_file),
+                self.lock_identity.as_deref(),
+                true,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    reasons.push(format!(
+                        "terminal LinuxProtected namespace verification failed: {error}"
+                    ));
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        let os_lock_released = if pool_closed && terminal_identity_valid {
             #[cfg(windows)]
             {
                 true
@@ -4295,13 +5532,16 @@ impl StateStore {
                 }
             }
         } else {
-            reasons.push(
+            reasons.push(if pool_closed {
+                "OS identity ownership retained because terminal namespace identity was not confirmed"
+                    .to_owned()
+            } else {
                 "OS identity ownership retained because terminal pool completion was not confirmed"
-                    .to_owned(),
-            );
+                    .to_owned()
+            });
             false
         };
-        if pool_closed {
+        if pool_closed && terminal_identity_valid {
             ownership.confirm_terminal_close();
         }
         match (
@@ -8071,9 +9311,11 @@ impl<'store> StoreOperationConnection<'store> {
                     .unwrap_or(claw_sqlite_file_control::TerminalCloseOutcome::Quarantined);
             return Err(compose_terminal_close(operation, error, close));
         }
-        let verified =
-            tokio::time::timeout_at(deadline, verify_sqlite_connection_identity(&mut connection))
-                .await;
+        let verified = tokio::time::timeout_at(
+            deadline,
+            identity.profile.verify_connection(&mut connection),
+        )
+        .await;
         if let Err(primary) = verified
             .map_err(|_| deadline_state.timeout_error())
             .and_then(|result| {
@@ -8250,7 +9492,7 @@ impl<'store> StoreOperationConnection<'store> {
         }
         let verified = tokio::time::timeout_at(
             self.deadline,
-            verify_sqlite_connection_identity(&mut connection),
+            self.identity.profile.verify_connection(&mut connection),
         )
         .await;
         let verified = match verified {
@@ -9808,6 +11050,41 @@ fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
             Err(file_error("acquire writer lock", path, error))
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_protected_store_lock(
+    namespace: &Arc<ProtectedNamespace>,
+) -> Result<(PathBuf, File, ProcessIdentityGuard), StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    namespace.verify()?;
+    let database_file = namespace.clone_database()?;
+    let metadata = database_file.metadata().map_err(|error| {
+        file_error(
+            "inspect LinuxProtected process identity",
+            namespace.database_path(),
+            error,
+        )
+    })?;
+    let identity = (metadata.dev(), metadata.ino());
+    if !PROCESS_IDENTITIES
+        .lock()
+        .expect("process identity registry lock poisoned")
+        .insert(identity)
+    {
+        return Err(StateError::StoreLocked {
+            path: namespace.writer_lock_path().to_owned(),
+        });
+    }
+    let guard = ProcessIdentityGuard {
+        identity: Some(identity),
+    };
+    let lock_path = namespace.writer_lock_path().to_owned();
+    let lock_file = namespace.clone_writer_lock()?;
+    acquire_private_lock(&lock_path, &lock_file)?;
+    namespace.verify()?;
+    Ok((lock_path, lock_file, guard))
 }
 
 #[cfg(unix)]
@@ -14223,9 +15500,11 @@ async fn backup_pool(
             );
         }
     };
-    let sqlite_identity = verify_sqlite_connection_identity(&mut connection)
-        .await
-        .map_err(|error| database("reverify backup source SQLite identity", error));
+    let sqlite_identity = match operational_identity {
+        Some(identity) => identity.profile.verify_connection(&mut connection).await,
+        None => verify_sqlite_connection_identity(&mut connection).await,
+    }
+    .map_err(|error| database("reverify backup source SQLite identity", error));
     let source_identity = sqlite_identity.and_then(|()| {
         operational_identity
             .map(OperationalIdentity::verify)
@@ -15141,6 +16420,8 @@ fn file_error(operation: &'static str, path: &Path, error: std::io::Error) -> St
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::sync::Arc;
 
     #[cfg(unix)]
     use sqlx::SqliteConnection;
@@ -15198,6 +16479,82 @@ pub(crate) mod test_support {
 
     pub(crate) fn owner(store: &StateStore) -> &str {
         &store.owner
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fail_protected_snapshot_at(path: &Path, stage: u8) {
+        assert!((1..=3).contains(&stage));
+        super::PROTECTED_SNAPSHOT_TEST_FAILURES
+            .lock()
+            .expect("protected snapshot failure map lock poisoned")
+            .insert(path.to_owned(), stage);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_protected_snapshot_gate(
+        path: &Path,
+    ) -> (
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicU8>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let slot = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let previous = super::PROTECTED_SNAPSHOT_TEST_GATES
+            .lock()
+            .expect("protected snapshot gate map lock poisoned")
+            .insert(
+                path.to_owned(),
+                super::ProtectedSnapshotTestGate {
+                    stage: 4,
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    slot: Arc::clone(&slot),
+                },
+            );
+        assert!(
+            previous.is_none(),
+            "protected snapshot gate is installed once"
+        );
+        (entered, release, slot)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear_protected_snapshot_gate(path: &Path) {
+        if let Some(gate) = super::PROTECTED_SNAPSHOT_TEST_GATES
+            .lock()
+            .expect("protected snapshot gate map lock poisoned")
+            .remove(path)
+        {
+            gate.release.notify_waiters();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn reject_protected_connection_and_close(
+        namespace: Arc<super::ProtectedNamespace>,
+        connection: SqliteConnection,
+        fail_persistent_wal: bool,
+    ) -> String {
+        super::FAIL_PROTECTED_PERSIST_WAL
+            .store(fail_persistent_wal, std::sync::atomic::Ordering::Release);
+        let owner = claw_sqlite_file_control::BlockingCleanupOwner::acquire(
+            "claw-state-protected-connection-rejection-test",
+        )
+        .await
+        .expect("reserve rejected protected connection cleanup owner");
+        let mut connection =
+            super::OwnedSqliteConnectionGuard::new_cancellable_with_owner(connection, None, owner);
+        let error = super::ActiveStoreProfile::LinuxProtected(namespace)
+            .verify_connection(&mut connection)
+            .await
+            .expect_err("invalid protected connection must be rejected");
+        connection
+            .close()
+            .await
+            .expect("rejected protected connection is terminally closed");
+        error.to_string()
     }
 
     #[cfg(unix)]

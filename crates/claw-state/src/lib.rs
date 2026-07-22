@@ -4,7 +4,11 @@
 //! OpenClaw parity or wire a runtime to the stored records.
 
 mod error;
+#[cfg(target_os = "linux")]
+mod linux_protected;
 mod model;
+#[cfg(any(target_os = "linux", test))]
+mod protected_catalog;
 mod repository;
 mod store;
 

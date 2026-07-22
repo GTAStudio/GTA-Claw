@@ -27,6 +27,50 @@ struct RepositoryDeadline {
     timeout_ms: u64,
 }
 
+#[cfg(test)]
+async fn wait_at_post_commit_test_barrier(owner: &str) {
+    let barrier = POST_COMMIT_TEST_BARRIERS
+        .lock()
+        .expect("post-commit test barriers lock poisoned")
+        .get(owner)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        POST_COMMIT_TEST_BARRIERS
+            .lock()
+            .expect("post-commit test barriers lock poisoned")
+            .remove(owner);
+    }
+}
+
+#[cfg(test)]
+async fn wait_at_protected_read_post_test_barrier() {
+    let barrier = PROTECTED_READ_POST_TEST_BARRIER
+        .lock()
+        .expect("protected read post-test barrier lock poisoned")
+        .as_ref()
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        PROTECTED_READ_POST_TEST_BARRIER
+            .lock()
+            .expect("protected read post-test barrier lock poisoned")
+            .take();
+    }
+}
+
 impl RepositoryDeadline {
     fn new(identity: OperationalIdentity<'_>) -> Result<Self, StateError> {
         let timeout_ms = u64::try_from(identity.operation_timeout.as_millis()).unwrap_or(u64::MAX);
@@ -55,6 +99,16 @@ impl RepositoryDeadline {
         StateError::OperationTimedOut {
             operation,
             timeout_ms: self.timeout_ms,
+        }
+    }
+
+    fn ensure_active(&self, operation: &'static str) -> Result<(), StateError> {
+        if std::time::Instant::now() >= self.deadline {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(self.timeout_error(operation))
+        } else {
+            Ok(())
         }
     }
 
@@ -97,8 +151,19 @@ async fn read_with_deadline<T>(
     operation: &'static str,
     future: impl std::future::Future<Output = Result<T, StateError>>,
 ) -> Result<T, StateError> {
+    if !identity.is_protected() {
+        let timing = RepositoryDeadline::new(identity)?;
+        return timing.run(operation, future).await;
+    }
     let timing = RepositoryDeadline::new(identity)?;
-    timing.run(operation, future).await
+    identity.verify_protected()?;
+    timing.ensure_active(operation)?;
+    let result = timing.run(operation, future).await;
+    #[cfg(test)]
+    wait_at_protected_read_post_test_barrier().await;
+    identity.verify_protected()?;
+    timing.ensure_active(operation)?;
+    result
 }
 
 struct VerifiedWriteTransaction {
@@ -318,6 +383,13 @@ static COMMIT_TEST_TAMPERS: LazyLock<Mutex<std::collections::HashSet<String>>> =
 #[cfg(test)]
 static COMMIT_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, WriteTestBarrier>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static POST_COMMIT_TEST_BARRIERS: LazyLock<
+    Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static PROTECTED_READ_POST_TEST_BARRIER: LazyLock<Mutex<Option<WriteTestBarrier>>> =
+    LazyLock::new(|| Mutex::new(None));
 #[cfg(all(test, unix))]
 static IDENTITY_INVALIDATION_TEST_BARRIERS: LazyLock<
     Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
@@ -1472,7 +1544,7 @@ async fn commit_verified(
     );
     let deadline = transaction.deadline;
     let timeout_ms = transaction.timeout_ms;
-    transaction
+    let committed = transaction
         .commit()
         .await
         .map(drop)
@@ -1514,7 +1586,30 @@ async fn commit_verified(
                 || database(operation, sqlx::Error::Protocol(other.to_string())),
                 |code| database_code(operation, code, other.to_string()),
             ),
-        })
+        });
+    committed?;
+    if identity.is_protected() {
+        #[cfg(test)]
+        wait_at_post_commit_test_barrier(owner).await;
+        identity
+            .verify_protected()
+            .map_err(|error| StateError::CommittedWithCleanupFailure {
+                operation,
+                cleanup: format!(
+                    "post-commit LinuxProtected identity verification failed: {error}"
+                ),
+            })?;
+        if std::time::Instant::now() >= deadline {
+            Err(StateError::CommittedAfterDeadline {
+                operation,
+                cleanup: None,
+            })
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2035,6 +2130,8 @@ pub(crate) mod test_support {
     };
     #[cfg(unix)]
     use super::{COMMIT_TEST_TAMPERS, IDENTITY_INVALIDATION_TEST_BARRIERS};
+    #[cfg(target_os = "linux")]
+    use super::{POST_COMMIT_TEST_BARRIERS, PROTECTED_READ_POST_TEST_BARRIER};
 
     pub(crate) struct RollbackCleanupTestRegistration {
         owner: String,
@@ -2161,6 +2258,44 @@ pub(crate) mod test_support {
                     release: Arc::clone(&release),
                 },
             );
+        (entered, release)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_post_commit_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        POST_COMMIT_TEST_BARRIERS
+            .lock()
+            .expect("post-commit test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_protected_read_post_barrier()
+    -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let previous = PROTECTED_READ_POST_TEST_BARRIER
+            .lock()
+            .expect("protected read post-test barrier lock poisoned")
+            .replace(WriteTestBarrier {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+        assert!(
+            previous.is_none(),
+            "protected read post-test barrier is installed once"
+        );
         (entered, release)
     }
 
