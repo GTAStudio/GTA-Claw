@@ -1704,6 +1704,93 @@ fn unix_identity_invalidation(
     })
 }
 
+/// Enables persistent WAL on the locked main database handle and verifies the
+/// setting through the same native file-control boundary.
+pub async fn enable_persistent_wal(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<(), FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let database = database.as_raw_handle();
+    let mut enabled = 1_i32;
+    // SAFETY: SQLx's locked handle is live, the schema name is static and
+    // NUL-terminated, and `enabled` remains writable for the complete call.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_file_control(
+            database.as_ptr(),
+            c"main".as_ptr(),
+            libsqlite3_sys::SQLITE_FCNTL_PERSIST_WAL,
+            (&raw mut enabled).cast(),
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+
+    let mut observed = -1_i32;
+    // SAFETY: the same locked live handle and output pointer remain valid.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_file_control(
+            database.as_ptr(),
+            c"main".as_ptr(),
+            libsqlite3_sys::SQLITE_FCNTL_PERSIST_WAL,
+            (&raw mut observed).cast(),
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    if observed != 1 {
+        return Err(FileControlError::Handle(
+            "SQLite main database did not retain persistent WAL mode".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns SQLite's native VFS stack name for the locked main database.
+pub async fn main_database_vfs_name(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<String, FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut name = std::ptr::null_mut::<std::ffi::c_char>();
+    // SAFETY: SQLx's locked handle is live, the schema name is static and
+    // NUL-terminated, and `name` remains writable for the complete call.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_file_control(
+            database.as_raw_handle().as_ptr(),
+            c"main".as_ptr(),
+            libsqlite3_sys::SQLITE_FCNTL_VFSNAME,
+            (&raw mut name).cast(),
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    let name = NonNull::new(name).ok_or_else(|| {
+        FileControlError::Handle("SQLite returned a null main-database VFS name".to_owned())
+    })?;
+    let allocation = SqliteAllocation(name.as_ptr().cast());
+    // SAFETY: a successful SQLITE_FCNTL_VFSNAME returns a NUL-terminated
+    // sqlite3_malloc allocation that remains live until `allocation` drops.
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .map_err(|_| FileControlError::Handle("SQLite VFS name is not valid UTF-8".to_owned()))?
+        .to_owned();
+    drop(allocation);
+    if name.is_empty() {
+        return Err(FileControlError::Handle(
+            "SQLite returned an empty main-database VFS name".to_owned(),
+        ));
+    }
+    Ok(name)
+}
+
 /// Returns whether SQLite reports that its open main database was moved or replaced.
 ///
 /// Once observed, invalidation remains latched for the connection lifetime.
