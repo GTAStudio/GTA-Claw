@@ -21,7 +21,10 @@ use crate::error::{database, database_code};
 #[cfg(target_os = "linux")]
 use crate::linux_protected::{LinuxProtectedSpec, ProtectedNamespace};
 #[cfg(target_os = "linux")]
-use crate::protected_catalog::{self, SelectorCell, SlotObservation, SnapshotMetadata};
+use crate::protected_catalog::{
+    self, RecoveredSnapshot, SelectorCell, SlotObservation, SnapshotMetadata,
+};
+use crate::protected_layout::DATABASE_NAME as LINUX_PROTECTED_DATABASE_NAME;
 use crate::{
     AuthenticationRepository, DeviceRepository, SessionRepository, StateError, TaskRepository,
 };
@@ -64,6 +67,12 @@ enum StoreProfile {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     LinuxProtected(LinuxProtectedSpec),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConfiguredStoreProfile {
+    PortablePrivate,
+    LinuxProtected { namespace: PathBuf },
 }
 
 #[derive(Clone)]
@@ -246,14 +255,94 @@ struct SnapshotMemoryReservation {
     _permit: tokio::sync::SemaphorePermit<'static>,
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct ProtectedSnapshotReceipt {
+/// Receipt for a validated immutable snapshot in the fixed LinuxProtected catalog.
+///
+/// The receipt intentionally contains no pathname. Its identity fields bind the
+/// catalog generation to the held database and writer-lock objects that were
+/// validated when the receipt was produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ProtectedSnapshotReceipt {
     pub(crate) generation: u64,
     pub(crate) slot: u8,
     pub(crate) byte_count: u64,
     pub(crate) digest: [u8; 32],
+    database_device: u64,
+    database_inode: u64,
+    writer_device: u64,
+    writer_inode: u64,
+    writer_generation: u64,
+}
+
+impl ProtectedSnapshotReceipt {
+    /// Returns the monotonic catalog generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the fixed catalog slot, either zero or one.
+    #[must_use]
+    pub const fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    /// Returns the validated snapshot byte length.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_count
+    }
+
+    /// Returns the SHA-256 digest of the validated snapshot bytes.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// Returns the device number of the held live database.
+    #[must_use]
+    pub const fn database_device(&self) -> u64 {
+        self.database_device
+    }
+
+    /// Returns the inode number of the held live database.
+    #[must_use]
+    pub const fn database_inode(&self) -> u64 {
+        self.database_inode
+    }
+
+    /// Returns the device number of the held fixed writer lock.
+    #[must_use]
+    pub const fn writer_device(&self) -> u64 {
+        self.writer_device
+    }
+
+    /// Returns the inode number of the held fixed writer lock.
+    #[must_use]
+    pub const fn writer_inode(&self) -> u64 {
+        self.writer_inode
+    }
+
+    /// Returns the live writer generation bound into the catalog metadata.
+    #[must_use]
+    pub const fn writer_generation(&self) -> u64 {
+        self.writer_generation
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn protected_snapshot_receipt(snapshot: RecoveredSnapshot) -> ProtectedSnapshotReceipt {
+    ProtectedSnapshotReceipt {
+        generation: snapshot.metadata.generation,
+        slot: snapshot.metadata.slot,
+        byte_count: snapshot.metadata.byte_length,
+        digest: snapshot.metadata.digest,
+        database_device: snapshot.metadata.identity.database_device,
+        database_inode: snapshot.metadata.identity.database_inode,
+        writer_device: snapshot.metadata.identity.writer_device,
+        writer_inode: snapshot.metadata.identity.writer_inode,
+        writer_generation: snapshot.metadata.identity.writer_generation,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1682,6 +1771,16 @@ pub enum SynchronousPolicy {
     Full,
 }
 
+/// Filesystem and SQLite security profile selected for a state store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StateProfile {
+    /// Service-private state with the existing arbitrary absolute database path.
+    PortablePrivate,
+    /// Fixed-name state inside a preprovisioned root-owned Linux namespace.
+    LinuxProtected,
+}
+
 impl SynchronousPolicy {
     const fn sqlx(self) -> SqliteSynchronous {
         match self {
@@ -1695,6 +1794,7 @@ impl SynchronousPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreConfig {
     path: PathBuf,
+    profile: ConfiguredStoreProfile,
     max_connections: u32,
     busy_timeout: Duration,
     acquire_timeout: Duration,
@@ -1715,6 +1815,42 @@ impl StoreConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
+            profile: ConfiguredStoreProfile::PortablePrivate,
+            max_connections: 1,
+            busy_timeout: Duration::from_secs(5),
+            acquire_timeout: Duration::from_secs(5),
+            open_timeout: Duration::from_secs(30),
+            operation_timeout: Duration::from_secs(30),
+            close_timeout: Duration::from_millis(1_500),
+            synchronous: SynchronousPolicy::Full,
+        }
+    }
+
+    /// Creates a LinuxProtected configuration from its namespace directory.
+    ///
+    /// The database, WAL, fixed writer lock, two snapshot slots, metadata
+    /// files, and selector are derived internally from the accepted fixed
+    /// eight-entry catalog. Runtime open binds the expected file ownership to
+    /// the process's effective service UID and GID; those credentials are not
+    /// root provisioner credentials. LinuxProtected requires exactly one
+    /// connection, and incompatible builder overrides are rejected at open.
+    ///
+    /// This profile prevents a compromised service UID from substituting
+    /// directory entries because the namespace is root-owned and not writable
+    /// by the service. It does not prevent direct content writes by a
+    /// compromised process that already holds service-file write authority.
+    /// Root, kernel, and mount compromise and forensic erasure are non-goals.
+    ///
+    /// The constructor is available on every platform so configuration code
+    /// remains portable. Opening it off Linux returns
+    /// [`crate::StateErrorKind::UnsupportedPlatform`].
+    #[must_use]
+    pub fn linux_protected(namespace: impl Into<PathBuf>) -> Self {
+        let namespace = namespace.into();
+        let path = namespace.join(LINUX_PROTECTED_DATABASE_NAME);
+        Self {
+            path,
+            profile: ConfiguredStoreProfile::LinuxProtected { namespace },
             max_connections: 1,
             busy_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
@@ -1778,6 +1914,15 @@ impl StoreConfig {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the selected state profile.
+    #[must_use]
+    pub const fn profile(&self) -> StateProfile {
+        match self.profile {
+            ConfiguredStoreProfile::PortablePrivate => StateProfile::PortablePrivate,
+            ConfiguredStoreProfile::LinuxProtected { .. } => StateProfile::LinuxProtected,
+        }
     }
 }
 
@@ -2588,7 +2733,28 @@ async fn run_open_lifecycle_actor(
 impl StateStore {
     /// Opens an explicit on-disk database, acquires its writer lock, and migrates forward.
     pub async fn open(config: StoreConfig) -> Result<Self, StateError> {
-        Self::open_with_profile(config, StoreProfile::PortablePrivate).await
+        let profile = match &config.profile {
+            ConfiguredStoreProfile::PortablePrivate => StoreProfile::PortablePrivate,
+            ConfiguredStoreProfile::LinuxProtected { namespace } => {
+                #[cfg(target_os = "linux")]
+                {
+                    StoreProfile::LinuxProtected(LinuxProtectedSpec::new(
+                        namespace.clone(),
+                        rustix::process::geteuid().as_raw(),
+                        rustix::process::getegid().as_raw(),
+                    ))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = namespace;
+                    return Err(StateError::InvalidValue {
+                        field: "state platform",
+                        reason: "opening LinuxProtected state requires Linux",
+                    });
+                }
+            }
+        };
+        Self::open_with_profile(config, profile).await
     }
 
     #[cfg(target_os = "linux")]
@@ -3671,6 +3837,16 @@ impl StateStore {
         self.recovered_writer.as_ref()
     }
 
+    /// Returns the active state security profile.
+    #[must_use]
+    pub const fn profile(&self) -> StateProfile {
+        if self.profile.is_protected() {
+            StateProfile::LinuxProtected
+        } else {
+            StateProfile::PortablePrivate
+        }
+    }
+
     fn ownership(&self) -> &StateStoreOwnership {
         self.ownership
             .as_ref()
@@ -3773,9 +3949,9 @@ impl StateStore {
     /// the current machine and service identity.
     pub async fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), StateError> {
         if self.profile.is_protected() {
-            return Err(StateError::InvalidPath {
-                path: destination.as_ref().to_owned(),
-                reason: "LinuxProtected snapshots use only the fixed internal catalog",
+            return Err(StateError::InvalidValue {
+                field: "state profile operation",
+                reason: "arbitrary-path snapshot publication is unavailable for LinuxProtected",
             });
         }
         let timeout_ms = u64::try_from(self.operation_timeout.as_millis()).map_err(|_| {
@@ -3873,8 +4049,25 @@ impl StateStore {
         .await
     }
 
+    /// Publishes a validated snapshot into the fixed LinuxProtected catalog.
+    ///
+    /// No destination path is accepted or returned. PortablePrivate stores
+    /// return [`crate::StateErrorKind::UnsupportedProfileOperation`].
+    pub async fn publish_protected_snapshot(&self) -> Result<ProtectedSnapshotReceipt, StateError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(StateError::InvalidValue {
+                field: "state profile operation",
+                reason: "fixed-catalog snapshot publication requires LinuxProtected",
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.publish_linux_protected_snapshot().await
+        }
+    }
+
     #[cfg(target_os = "linux")]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn publish_linux_protected_snapshot(
         &self,
     ) -> Result<ProtectedSnapshotReceipt, StateError> {
@@ -3882,9 +4075,9 @@ impl StateStore {
             self.profile
                 .protected_namespace()
                 .cloned()
-                .ok_or_else(|| StateError::InvalidPath {
-                    path: self.path.clone(),
-                    reason: "fixed catalog publication requires LinuxProtected",
+                .ok_or(StateError::InvalidValue {
+                    field: "state profile operation",
+                    reason: "fixed-catalog snapshot publication requires LinuxProtected",
                 })?;
         let timeout_ms = u64::try_from(self.operation_timeout.as_millis()).map_err(|_| {
             StateError::InvalidValue {
@@ -4416,12 +4609,7 @@ impl StateStore {
                     });
                 }
                 worker_state.store(2, std::sync::atomic::Ordering::Release);
-                Ok(ProtectedSnapshotReceipt {
-                    generation: plan.generation,
-                    slot: plan.slot,
-                    byte_count: observation.byte_length,
-                    digest: observation.digest,
-                })
+                Ok(protected_snapshot_receipt(recovered))
             },
         )
         .await;
@@ -4454,6 +4642,127 @@ impl StateStore {
                     ),
                 })
             }
+        }
+    }
+
+    /// Returns the latest validated receipt from the fixed LinuxProtected catalog.
+    ///
+    /// The returned immutable value contains no pathname. An empty catalog
+    /// returns `Ok(None)`. PortablePrivate stores return
+    /// [`crate::StateErrorKind::UnsupportedProfileOperation`].
+    pub async fn latest_protected_snapshot_receipt(
+        &self,
+    ) -> Result<Option<ProtectedSnapshotReceipt>, StateError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(StateError::InvalidValue {
+                field: "state profile operation",
+                reason: "latest fixed-catalog receipt requires LinuxProtected",
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let namespace =
+                self.profile
+                    .protected_namespace()
+                    .cloned()
+                    .ok_or(StateError::InvalidValue {
+                        field: "state profile operation",
+                        reason: "latest fixed-catalog receipt requires LinuxProtected",
+                    })?;
+            let timeout_ms = u64::try_from(self.operation_timeout.as_millis()).map_err(|_| {
+                StateError::InvalidValue {
+                    field: "LinuxProtected snapshot receipt timeout",
+                    reason: "must fit in milliseconds",
+                }
+            })?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.operation_timeout)
+                .ok_or(StateError::InvalidValue {
+                    field: "LinuxProtected snapshot receipt timeout",
+                    reason: "is too large for the monotonic clock",
+                })?;
+            let _publication =
+                tokio::time::timeout_at(deadline, namespace.publication_gate().lock_owned())
+                    .await
+                    .map_err(|_| StateError::OperationTimedOut {
+                        operation: "read latest LinuxProtected snapshot receipt",
+                        timeout_ms,
+                    })?;
+            self.operational_identity().verify()?;
+            let writer_generation = self.writer_generation.load(Ordering::Acquire);
+            if writer_generation != 1 {
+                return Err(StateError::InvalidPath {
+                    path: self.path.clone(),
+                    reason: "LinuxProtected writer generation is no longer live",
+                });
+            }
+            let identity = namespace.catalog_identity(writer_generation);
+            let final_identity = self.operational_identity().capture_owned()?;
+            let final_writer_generation = Arc::clone(&self.writer_generation);
+            if tokio::time::Instant::now() >= deadline {
+                return Err(StateError::OperationTimedOut {
+                    operation: "read latest LinuxProtected snapshot receipt",
+                    timeout_ms,
+                });
+            }
+            let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+                "claw-state-linux-protected-latest-receipt",
+                1,
+                deadline.into_std(),
+            )
+            .await
+            .map_err(|error| {
+                if tokio::time::Instant::now() >= deadline {
+                    StateError::OperationTimedOut {
+                        operation: "read latest LinuxProtected snapshot receipt",
+                        timeout_ms,
+                    }
+                } else {
+                    database(
+                        "reserve latest LinuxProtected receipt owner",
+                        sqlx::Error::Protocol(error),
+                    )
+                }
+            })?;
+            let owner = owners.pop().expect("latest receipt owner was reserved");
+            let receipt_namespace = Arc::clone(&namespace);
+            let recovered = run_bounded_filesystem(
+                owner,
+                deadline,
+                "read latest LinuxProtected snapshot receipt",
+                timeout_ms,
+                move || {
+                    let recovered = receipt_namespace.recover_catalog(
+                        identity,
+                        Some(deadline.into_std()),
+                        None,
+                        timeout_ms,
+                    )?;
+                    final_identity.verify()?;
+                    if final_writer_generation.load(Ordering::Acquire) != 1 {
+                        return Err(StateError::InvalidPath {
+                            path: receipt_namespace.database_path().to_owned(),
+                            reason: "LinuxProtected writer generation is no longer live",
+                        });
+                    }
+                    if std::time::Instant::now() >= deadline.into_std() {
+                        return Err(StateError::OperationTimedOut {
+                            operation: "read latest LinuxProtected snapshot receipt",
+                            timeout_ms,
+                        });
+                    }
+                    Ok(recovered)
+                },
+            )
+            .await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(StateError::OperationTimedOut {
+                    operation: "read latest LinuxProtected snapshot receipt",
+                    timeout_ms,
+                });
+            }
+            Ok(recovered.map(protected_snapshot_receipt))
         }
     }
 

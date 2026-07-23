@@ -11,6 +11,8 @@ repository.workspace = true
 claw-application.workspace = true
 claw-platform.workspace = true
 claw-protocol.workspace = true
+claw-state.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 [lints]
 workspace = true

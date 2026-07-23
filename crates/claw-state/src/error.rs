@@ -80,6 +80,20 @@ pub enum WriteOutcome {
     Uncertain,
 }
 
+/// Stable classification for state failures that require profile-aware handling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StateErrorKind {
+    /// The operation requires a different operating system.
+    UnsupportedPlatform,
+    /// The operation is incompatible with the configured state profile.
+    UnsupportedProfileOperation,
+    /// The process lacks the required operating-system privilege.
+    PrivilegeRequired,
+    /// Any existing state failure without a more specific additive classification.
+    Other,
+}
+
 /// Failures surfaced by the durable state boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateError {
@@ -265,6 +279,26 @@ pub enum StateError {
 }
 
 impl StateError {
+    /// Returns an additive stable classification without changing the exhaustive error enum.
+    #[must_use]
+    pub fn kind(&self) -> StateErrorKind {
+        match self {
+            Self::InvalidValue {
+                field: "state platform",
+                ..
+            } => StateErrorKind::UnsupportedPlatform,
+            Self::InvalidValue {
+                field: "state profile operation",
+                ..
+            } => StateErrorKind::UnsupportedProfileOperation,
+            Self::InvalidValue {
+                field: "state privilege",
+                ..
+            } => StateErrorKind::PrivilegeRequired,
+            _ => StateErrorKind::Other,
+        }
+    }
+
     /// Returns whether a failed write is known not to have committed, committed, or uncertain.
     #[must_use]
     pub fn write_outcome(&self) -> WriteOutcome {

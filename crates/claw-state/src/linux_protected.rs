@@ -6,32 +6,25 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteLockingMode, SqliteSynchronous};
+use sqlx::{Connection as _, Row as _, SqliteConnection};
 
 use crate::StateError;
+use crate::error::{database, database_code};
 use crate::protected_catalog::{
     self, CatalogIdentity, METADATA_LEN, PublicationPlan, RecoveredSnapshot, SELECTOR_CELL_LEN,
     SELECTOR_LEN, SlotObservation,
 };
-
-pub(crate) const DATABASE_NAME: &str = "state.sqlite";
-pub(crate) const WAL_NAME: &str = "state.sqlite-wal";
-pub(crate) const WRITER_LOCK_NAME: &str = "state.writer.lock";
-pub(crate) const SNAPSHOT_DATA_NAMES: [&str; 2] = ["snapshot-0.sqlite", "snapshot-1.sqlite"];
-pub(crate) const SNAPSHOT_METADATA_NAMES: [&str; 2] = ["snapshot-0.meta", "snapshot-1.meta"];
-pub(crate) const SELECTOR_NAME: &str = "snapshot.selector";
-pub(crate) const ENTRY_NAMES: [&str; 8] = [
-    DATABASE_NAME,
-    WAL_NAME,
+use crate::protected_layout::ENTRY_NAMES;
+#[cfg(test)]
+use crate::protected_layout::{
+    DATABASE_NAME, SELECTOR_NAME, SNAPSHOT_DATA_NAMES, SNAPSHOT_METADATA_NAMES, WAL_NAME,
     WRITER_LOCK_NAME,
-    SNAPSHOT_DATA_NAMES[0],
-    SNAPSHOT_METADATA_NAMES[0],
-    SNAPSHOT_DATA_NAMES[1],
-    SNAPSHOT_METADATA_NAMES[1],
-    SELECTOR_NAME,
-];
+};
+use crate::provision::LinuxProtectedInitialization;
 
 const DATABASE_INDEX: usize = 0;
 const WAL_INDEX: usize = 1;
@@ -91,6 +84,12 @@ struct FileIdentity {
     special_device: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamespacePurpose {
+    RuntimeService,
+    OfflineRoot,
+}
+
 impl FileIdentity {
     fn capture(path: &Path, file: &File, operation: &'static str) -> Result<Self, StateError> {
         let metadata = file
@@ -126,14 +125,31 @@ pub(crate) struct ProtectedNamespace {
     publication_gate: Arc<tokio::sync::Mutex<()>>,
     repository_admission: Arc<tokio::sync::Semaphore>,
     observed_generation: Mutex<Option<u64>>,
+    purpose: NamespacePurpose,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ProtectedNamespace {
     pub(crate) fn open(spec: &LinuxProtectedSpec) -> Result<Arc<Self>, StateError> {
+        Self::open_with_purpose(spec, NamespacePurpose::RuntimeService)
+    }
+
+    fn open_for_offline_initialization(spec: &LinuxProtectedSpec) -> Result<Arc<Self>, StateError> {
+        Self::open_with_purpose(spec, NamespacePurpose::OfflineRoot)
+    }
+
+    fn open_with_purpose(
+        spec: &LinuxProtectedSpec,
+        purpose: NamespacePurpose,
+    ) -> Result<Arc<Self>, StateError> {
+        if purpose == NamespacePurpose::OfflineRoot {
+            validate_root_credentials()?;
+        }
         validate_spec(spec)?;
-        validate_service_credentials(spec)?;
-        validate_ancestors(&spec.directory)?;
+        if purpose == NamespacePurpose::RuntimeService {
+            validate_service_credentials(spec)?;
+            validate_ancestors(&spec.directory)?;
+        }
         let parent = rustix::fs::open(
             &spec.directory,
             rustix::fs::OFlags::RDONLY
@@ -152,8 +168,18 @@ impl ProtectedNamespace {
         })?;
         let parent_identity =
             FileIdentity::capture(&spec.directory, &parent, "inspect LinuxProtected directory")?;
-        validate_parent(spec, &parent, parent_identity)?;
-        validate_filesystem(&spec.directory, &parent)?;
+        match purpose {
+            NamespacePurpose::RuntimeService => {
+                validate_parent(spec, &parent, parent_identity)?;
+                validate_filesystem(&spec.directory, &parent)?;
+            }
+            NamespacePurpose::OfflineRoot => {
+                validate_filesystem(&spec.directory, &parent)?;
+                validate_ancestors(&spec.directory)?;
+                validate_offline_ancestor_acls(&spec.directory)?;
+                validate_parent(spec, &parent, parent_identity)?;
+            }
+        }
         validate_exact_names(&spec.directory)?;
 
         let mut entries = Vec::with_capacity(ENTRY_NAMES.len());
@@ -191,7 +217,10 @@ impl ProtectedNamespace {
                 ));
             }
         }
-        validate_catalog_lengths(&entries)?;
+        match purpose {
+            NamespacePurpose::RuntimeService => validate_catalog_lengths(&entries)?,
+            NamespacePurpose::OfflineRoot => validate_offline_catalog_bounds(&entries)?,
+        }
 
         let namespace = Arc::new(Self {
             directory: spec.directory.clone(),
@@ -203,6 +232,7 @@ impl ProtectedNamespace {
             publication_gate: Arc::new(tokio::sync::Mutex::new(())),
             repository_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             observed_generation: Mutex::new(None),
+            purpose,
         });
         namespace.verify()?;
         Ok(namespace)
@@ -286,8 +316,11 @@ impl ProtectedNamespace {
             expected_uid: self.expected_uid,
             expected_gid: self.expected_gid,
         };
-        validate_service_credentials(&spec)?;
+        validate_credentials(&spec, self.purpose)?;
         validate_ancestors(&self.directory)?;
+        if self.purpose == NamespacePurpose::OfflineRoot {
+            validate_offline_ancestor_acls(&self.directory)?;
+        }
         validate_parent(&spec, &self.parent, self.parent_identity)?;
         validate_filesystem(&self.directory, &self.parent)?;
         let current_parent = rustix::fs::open(
@@ -372,7 +405,10 @@ impl ProtectedNamespace {
                 ));
             }
         }
-        validate_catalog_lengths(&self.entries)?;
+        match self.purpose {
+            NamespacePurpose::RuntimeService => validate_catalog_lengths(&self.entries)?,
+            NamespacePurpose::OfflineRoot => validate_offline_catalog_bounds(&self.entries)?,
+        }
         let final_parent = rustix::fs::open(
             &self.directory,
             rustix::fs::OFlags::RDONLY
@@ -703,6 +739,654 @@ impl ProtectedNamespace {
             digest: hasher.finalize().into(),
         })
     }
+
+    fn offline_state(
+        &self,
+        cutoff: Instant,
+        timeout_ms: u64,
+    ) -> Result<OfflineNamespaceState, StateError> {
+        self.verify()?;
+        let mut lengths = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            lengths.push(
+                entry
+                    .file
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .map_err(|error| {
+                        file_error(
+                            "inspect offline LinuxProtected entry length",
+                            &entry.path,
+                            error,
+                        )
+                    })?,
+            );
+        }
+        let lengths: [u64; 8] = lengths
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("the fixed namespace has eight entries"));
+        if lengths.iter().all(|length| *length == 0) {
+            return Ok(OfflineNamespaceState::Fresh);
+        }
+        if lengths[DATABASE_INDEX] == 0
+            || lengths[SELECTOR_INDEX] != SELECTOR_LEN as u64
+            || lengths[WRITER_LOCK_INDEX] != 0
+        {
+            return Err(invalid_path(
+                &self.directory,
+                "LinuxProtected namespace is partial rather than exactly fresh or initialized",
+            ));
+        }
+        self.validate_initialized_sqlite_files(cutoff, timeout_ms)?;
+        self.recover_catalog(self.catalog_identity(1), Some(cutoff), None, timeout_ms)?;
+        Ok(OfflineNamespaceState::Initialized)
+    }
+
+    fn captured_identities(&self) -> [FileIdentity; 8] {
+        std::array::from_fn(|index| self.entries[index].identity)
+    }
+
+    fn verify_captured_identities(&self, expected: [FileIdentity; 8]) -> Result<(), StateError> {
+        self.verify()?;
+        for (entry, expected) in self.entries.iter().zip(expected) {
+            let current = FileIdentity::capture(
+                &entry.path,
+                &entry.file,
+                "verify offline LinuxProtected entry identity",
+            )?;
+            if current != expected {
+                return Err(invalid_path(
+                    &entry.path,
+                    "LinuxProtected entry identity changed during offline initialization",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn initialize_empty_selector(&self) -> Result<(), StateError> {
+        let selector = &self.entries[SELECTOR_INDEX];
+        if selector
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect fresh LinuxProtected selector",
+                    &selector.path,
+                    error,
+                )
+            })?
+            .len()
+            != 0
+        {
+            return Err(invalid_path(
+                &selector.path,
+                "fresh LinuxProtected selector changed before initialization",
+            ));
+        }
+        write_all_at(&selector.file, &[0_u8; SELECTOR_LEN], 0)
+            .and_then(|()| selector.file.sync_all())
+            .map_err(|error| {
+                file_error(
+                    "initialize and sync fixed LinuxProtected selector",
+                    &selector.path,
+                    error,
+                )
+            })?;
+        self.parent.sync_all().map_err(|error| {
+            file_error(
+                "sync LinuxProtected namespace after selector initialization",
+                &self.directory,
+                error,
+            )
+        })?;
+        validate_catalog_lengths(&self.entries)
+    }
+
+    fn wal_length(&self) -> Result<u64, StateError> {
+        self.entries[WAL_INDEX]
+            .file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|error| {
+                file_error(
+                    "inspect offline LinuxProtected WAL length",
+                    &self.entries[WAL_INDEX].path,
+                    error,
+                )
+            })
+    }
+
+    fn validate_runtime_layout(&self, cutoff: Instant, timeout_ms: u64) -> Result<(), StateError> {
+        check_initializer_deadline(cutoff, timeout_ms)?;
+        self.verify()?;
+        check_initializer_deadline(cutoff, timeout_ms)?;
+        validate_catalog_lengths(&self.entries)?;
+        self.recover_catalog(self.catalog_identity(1), Some(cutoff), None, timeout_ms)?;
+        check_initializer_deadline(cutoff, timeout_ms)?;
+        Ok(())
+    }
+
+    fn validate_initialized_sqlite_files(
+        &self,
+        cutoff: Instant,
+        timeout_ms: u64,
+    ) -> Result<(), StateError> {
+        let database = &self.entries[DATABASE_INDEX];
+        let database_length = database
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect initialized LinuxProtected database length",
+                    &database.path,
+                    error,
+                )
+            })?
+            .len();
+        if database_length < 100 {
+            return Err(invalid_path(
+                &database.path,
+                "initialized LinuxProtected database has a truncated SQLite header",
+            ));
+        }
+        let mut header = [0_u8; 100];
+        read_exact_at(
+            &database.file,
+            &mut header,
+            0,
+            &database.path,
+            Some(cutoff),
+            None,
+            timeout_ms,
+        )?;
+        if !header.starts_with(b"SQLite format 3\0") || header[18] != 2 || header[19] != 2 {
+            return Err(invalid_path(
+                &database.path,
+                "initialized LinuxProtected database header is not a WAL-mode SQLite database",
+            ));
+        }
+        let encoded_page_size = u16::from_be_bytes([header[16], header[17]]);
+        let page_size = if encoded_page_size == 1 {
+            65_536_u64
+        } else {
+            u64::from(encoded_page_size)
+        };
+        if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+            return Err(invalid_path(
+                &database.path,
+                "initialized LinuxProtected database page size is invalid",
+            ));
+        }
+        validate_offline_wal(&self.entries[WAL_INDEX], page_size, cutoff, timeout_ms)
+    }
+}
+
+fn validate_offline_wal(
+    wal: &HeldEntry,
+    database_page_size: u64,
+    cutoff: Instant,
+    timeout_ms: u64,
+) -> Result<(), StateError> {
+    let length = wal
+        .file
+        .metadata()
+        .map_err(|error| file_error("inspect initialized LinuxProtected WAL", &wal.path, error))?
+        .len();
+    if length == 0 {
+        return Ok(());
+    }
+    if length < 32 {
+        return Err(invalid_path(
+            &wal.path,
+            "initialized LinuxProtected WAL header is truncated",
+        ));
+    }
+    let frame_size = 24_u64
+        .checked_add(database_page_size)
+        .ok_or_else(|| invalid_path(&wal.path, "LinuxProtected WAL frame size overflowed"))?;
+    let payload = length - 32;
+    if payload == 0 || payload % frame_size != 0 {
+        return Err(invalid_path(
+            &wal.path,
+            "initialized LinuxProtected WAL has a partial frame",
+        ));
+    }
+
+    let mut header = [0_u8; 32];
+    read_exact_at(
+        &wal.file,
+        &mut header,
+        0,
+        &wal.path,
+        Some(cutoff),
+        None,
+        timeout_ms,
+    )?;
+    let magic = u32::from_be_bytes(
+        header[0..4]
+            .try_into()
+            .expect("fixed WAL magic is in bounds"),
+    );
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683)
+        || u32::from_be_bytes(
+            header[4..8]
+                .try_into()
+                .expect("fixed WAL version is in bounds"),
+        ) != 3_007_000
+        || u64::from(u32::from_be_bytes(
+            header[8..12]
+                .try_into()
+                .expect("fixed WAL page size is in bounds"),
+        )) != database_page_size
+    {
+        return Err(invalid_path(
+            &wal.path,
+            "initialized LinuxProtected WAL header is invalid",
+        ));
+    }
+    let big_endian_checksum = magic & 1 != 0;
+    let mut checksum = wal_checksum(&header[..24], big_endian_checksum, [0, 0]);
+    if checksum != stored_wal_checksum(&header[24..32]) {
+        return Err(invalid_path(
+            &wal.path,
+            "initialized LinuxProtected WAL header checksum is invalid",
+        ));
+    }
+    let salts = &header[16..24];
+    let frame_count = payload / frame_size;
+    let page_size =
+        usize::try_from(database_page_size).expect("validated SQLite page size fits this platform");
+    let mut page = vec![0_u8; page_size];
+    for frame_index in 0..frame_count {
+        check_cutoff(&wal.path, Some(cutoff), None, timeout_ms)?;
+        let offset = 32_u64
+            .checked_add(frame_index.checked_mul(frame_size).ok_or_else(|| {
+                invalid_path(&wal.path, "LinuxProtected WAL frame offset overflowed")
+            })?)
+            .ok_or_else(|| invalid_path(&wal.path, "LinuxProtected WAL frame offset overflowed"))?;
+        let mut frame_header = [0_u8; 24];
+        read_exact_at(
+            &wal.file,
+            &mut frame_header,
+            offset,
+            &wal.path,
+            Some(cutoff),
+            None,
+            timeout_ms,
+        )?;
+        read_exact_at(
+            &wal.file,
+            &mut page,
+            offset + 24,
+            &wal.path,
+            Some(cutoff),
+            None,
+            timeout_ms,
+        )?;
+        let page_number = u32::from_be_bytes(
+            frame_header[0..4]
+                .try_into()
+                .expect("fixed WAL frame page number is in bounds"),
+        );
+        if !(1..=0xffff_fffe).contains(&page_number) || &frame_header[8..16] != salts {
+            return Err(invalid_path(
+                &wal.path,
+                "initialized LinuxProtected WAL frame identity is invalid",
+            ));
+        }
+        checksum = wal_checksum(&frame_header[..8], big_endian_checksum, checksum);
+        checksum = wal_checksum(&page, big_endian_checksum, checksum);
+        if checksum != stored_wal_checksum(&frame_header[16..24]) {
+            return Err(invalid_path(
+                &wal.path,
+                "initialized LinuxProtected WAL frame checksum is invalid",
+            ));
+        }
+    }
+    if wal
+        .file
+        .metadata()
+        .map_err(|error| file_error("reinspect initialized LinuxProtected WAL", &wal.path, error))?
+        .len()
+        != length
+    {
+        return Err(invalid_path(
+            &wal.path,
+            "initialized LinuxProtected WAL length changed during verification",
+        ));
+    }
+    Ok(())
+}
+
+fn wal_checksum(bytes: &[u8], big_endian: bool, mut checksum: [u32; 2]) -> [u32; 2] {
+    debug_assert!(!bytes.is_empty() && bytes.len().is_multiple_of(8));
+    for words in bytes.chunks_exact(8) {
+        let first = if big_endian {
+            u32::from_be_bytes(words[0..4].try_into().expect("first WAL checksum word"))
+        } else {
+            u32::from_le_bytes(words[0..4].try_into().expect("first WAL checksum word"))
+        };
+        let second = if big_endian {
+            u32::from_be_bytes(words[4..8].try_into().expect("second WAL checksum word"))
+        } else {
+            u32::from_le_bytes(words[4..8].try_into().expect("second WAL checksum word"))
+        };
+        checksum[0] = checksum[0].wrapping_add(first).wrapping_add(checksum[1]);
+        checksum[1] = checksum[1].wrapping_add(second).wrapping_add(checksum[0]);
+    }
+    checksum
+}
+
+fn stored_wal_checksum(bytes: &[u8]) -> [u32; 2] {
+    [
+        u32::from_be_bytes(
+            bytes[0..4]
+                .try_into()
+                .expect("first stored WAL checksum is in bounds"),
+        ),
+        u32::from_be_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("second stored WAL checksum is in bounds"),
+        ),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfflineNamespaceState {
+    Fresh,
+    Initialized,
+}
+
+const OFFLINE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+const OFFLINE_INITIALIZE_CLEANUP_TAIL: Duration = Duration::from_secs(5);
+
+pub(crate) fn initialize_offline(
+    directory: &Path,
+    service_uid: u32,
+    service_gid: u32,
+) -> Result<LinuxProtectedInitialization, StateError> {
+    let started = Instant::now();
+    let deadline =
+        started
+            .checked_add(OFFLINE_INITIALIZE_TIMEOUT)
+            .ok_or(StateError::InvalidValue {
+                field: "LinuxProtected offline initialization timeout",
+                reason: "is too large for the monotonic clock",
+            })?;
+    let work_cutoff = deadline
+        .checked_sub(OFFLINE_INITIALIZE_CLEANUP_TAIL)
+        .ok_or(StateError::InvalidValue {
+            field: "LinuxProtected offline initialization timeout",
+            reason: "does not leave a cleanup interval",
+        })?;
+    let timeout_ms = u64::try_from(OFFLINE_INITIALIZE_TIMEOUT.as_millis())
+        .expect("fixed offline timeout fits u64");
+    let spec = LinuxProtectedSpec::new(directory.to_owned(), service_uid, service_gid);
+    let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)?;
+    let state = namespace.offline_state(work_cutoff, timeout_ms)?;
+    let identities = namespace.captured_identities();
+    if Instant::now() >= work_cutoff {
+        return Err(StateError::OperationTimedOut {
+            operation: "initialize LinuxProtected state offline",
+            timeout_ms,
+        });
+    }
+    let worker_namespace = Arc::clone(&namespace);
+    let worker = std::thread::Builder::new()
+        .name("claw-state-offline-init".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    database(
+                        "create LinuxProtected offline initializer runtime",
+                        sqlx::Error::Protocol(error.to_string()),
+                    )
+                })?;
+            let result = runtime.block_on(run_offline_sqlite(
+                &worker_namespace,
+                state,
+                work_cutoff,
+                deadline,
+                timeout_ms,
+            ));
+            drop(runtime);
+            result
+        })
+        .map_err(|error| {
+            database(
+                "start LinuxProtected offline initializer thread",
+                sqlx::Error::Protocol(error.to_string()),
+            )
+        })?;
+    worker.join().map_err(|_| {
+        database(
+            "join LinuxProtected offline initializer thread",
+            sqlx::Error::Protocol("LinuxProtected offline initializer thread panicked".to_owned()),
+        )
+    })??;
+    namespace.verify_captured_identities(identities)?;
+    check_initializer_deadline(deadline, timeout_ms)?;
+
+    match state {
+        OfflineNamespaceState::Fresh => {
+            namespace.initialize_empty_selector()?;
+            check_initializer_deadline(deadline, timeout_ms)?;
+            namespace.verify_captured_identities(identities)?;
+            check_initializer_deadline(deadline, timeout_ms)?;
+            namespace.validate_runtime_layout(deadline, timeout_ms)?;
+            check_initializer_deadline(deadline, timeout_ms)?;
+            Ok(LinuxProtectedInitialization::Initialized)
+        }
+        OfflineNamespaceState::Initialized => {
+            namespace.validate_runtime_layout(deadline, timeout_ms)?;
+            check_initializer_deadline(deadline, timeout_ms)?;
+            Ok(LinuxProtectedInitialization::AlreadyInitialized)
+        }
+    }
+}
+
+fn check_initializer_deadline(deadline: Instant, timeout_ms: u64) -> Result<(), StateError> {
+    if Instant::now() >= deadline {
+        return Err(StateError::OperationTimedOut {
+            operation: "initialize LinuxProtected state offline",
+            timeout_ms,
+        });
+    }
+    Ok(())
+}
+
+async fn run_offline_sqlite(
+    namespace: &ProtectedNamespace,
+    state: OfflineNamespaceState,
+    work_cutoff: Instant,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<(), StateError> {
+    let options = SqliteConnectOptions::new()
+        .filename(namespace.database_path())
+        .create_if_missing(false)
+        .vfs("unix-excl")
+        .locking_mode(SqliteLockingMode::Exclusive)
+        .synchronous(SqliteSynchronous::Full)
+        .busy_timeout(Duration::from_secs(5));
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| database("open LinuxProtected database offline", error))?;
+
+    let mut result =
+        verify_offline_connection(namespace, &mut connection, state, work_cutoff).await;
+    if result.is_err() && Instant::now() >= work_cutoff {
+        result = Err(StateError::OperationTimedOut {
+            operation: "initialize LinuxProtected state offline",
+            timeout_ms,
+        });
+    }
+    let clear = clear_offline_progress_handler(&mut connection).await;
+    if let Err(cleanup) = clear {
+        result = Err(match result {
+            Ok(()) => cleanup,
+            Err(primary) => append_offline_cleanup(primary, cleanup),
+        });
+    }
+    let close = connection
+        .close()
+        .await
+        .map_err(|error| database("close LinuxProtected database offline", error));
+    if let Err(cleanup) = close {
+        result = Err(match result {
+            Ok(()) => cleanup,
+            Err(primary) => append_offline_cleanup(primary, cleanup),
+        });
+    }
+    result?;
+    namespace.verify()?;
+    if Instant::now() >= deadline {
+        return Err(StateError::OperationTimedOut {
+            operation: "initialize LinuxProtected state offline",
+            timeout_ms,
+        });
+    }
+    Ok(())
+}
+
+fn append_offline_cleanup(primary: StateError, cleanup: StateError) -> StateError {
+    StateError::OperationCleanupFailed {
+        operation: "initialize LinuxProtected state offline",
+        primary: Box::new(primary),
+        cleanup: cleanup.to_string(),
+    }
+}
+
+async fn clear_offline_progress_handler(
+    connection: &mut SqliteConnection,
+) -> Result<(), StateError> {
+    let mut handle = connection
+        .lock_handle()
+        .await
+        .map_err(|error| database("lock offline SQLite connection for cleanup", error))?;
+    handle.set_progress_handler(0, || true);
+    Ok(())
+}
+
+async fn verify_offline_connection(
+    namespace: &ProtectedNamespace,
+    connection: &mut SqliteConnection,
+    state: OfflineNamespaceState,
+    work_cutoff: Instant,
+) -> Result<(), StateError> {
+    claw_sqlite_file_control::enable_persistent_wal(connection)
+        .await
+        .map_err(|error| {
+            file_control_error(
+                "enable LinuxProtected offline persistent WAL handoff",
+                error,
+            )
+        })?;
+    claw_sqlite_file_control::disable_wal_checkpoint_on_close(connection)
+        .await
+        .map_err(|error| {
+            file_control_error("disable LinuxProtected offline checkpoint-on-close", error)
+        })?;
+    {
+        let mut handle = connection
+            .lock_handle()
+            .await
+            .map_err(|error| database("lock deadline-bound offline SQLite connection", error))?;
+        handle.set_progress_handler(100, move || Instant::now() < work_cutoff);
+    }
+    let vfs = claw_sqlite_file_control::main_database_vfs_name(connection)
+        .await
+        .map_err(|error| {
+            file_control_error("query LinuxProtected offline initializer VFS", error)
+        })?;
+    if vfs != "unix-excl" {
+        return Err(invalid_path(
+            namespace.database_path(),
+            "LinuxProtected offline initializer requires exact unix-excl VFS",
+        ));
+    }
+    let locking_mode = sqlx::query_scalar::<_, String>("PRAGMA locking_mode")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| database("query offline SQLite locking mode", error))?;
+    if locking_mode != "exclusive" {
+        return Err(invalid_path(
+            namespace.database_path(),
+            "LinuxProtected offline initializer requires exclusive locking mode",
+        ));
+    }
+    let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| database("query offline SQLite journal mode", error))?;
+    if journal_mode != "wal" {
+        return Err(invalid_path(
+            namespace.database_path(),
+            "LinuxProtected offline initializer requires WAL journal mode",
+        ));
+    }
+
+    if state == OfflineNamespaceState::Fresh {
+        sqlx::raw_sql(
+            "CREATE TABLE gta_claw_offline_initialization_probe(value INTEGER);
+             DROP TABLE gta_claw_offline_initialization_probe;",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| database("materialize offline SQLite WAL handoff", error))?;
+        let checkpoint = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| database("checkpoint offline SQLite WAL handoff", error))?;
+        let busy = checkpoint
+            .try_get::<i64, _>(0)
+            .map_err(|error| database("read offline checkpoint busy result", error))?;
+        if busy != 0 || namespace.wal_length()? != 0 {
+            return Err(invalid_path(
+                namespace.database_path(),
+                "fresh LinuxProtected WAL handoff did not checkpoint cleanly",
+            ));
+        }
+        let application_objects = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| database("verify empty offline SQLite schema", error))?;
+        if application_objects != 0 {
+            return Err(invalid_path(
+                namespace.database_path(),
+                "offline initialization left application schema objects",
+            ));
+        }
+    }
+
+    let integrity = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| database("verify offline SQLite integrity", error))?;
+    if integrity.as_slice() != ["ok"] {
+        return Err(invalid_path(
+            namespace.database_path(),
+            "LinuxProtected database failed offline SQLite integrity verification",
+        ));
+    }
+    Ok(())
+}
+
+fn file_control_error(
+    operation: &'static str,
+    error: claw_sqlite_file_control::FileControlError,
+) -> StateError {
+    match error.code() {
+        Some(code) => database_code(operation, code, error.to_string()),
+        None => database(operation, sqlx::Error::Protocol(error.to_string())),
+    }
 }
 
 pub(crate) const fn filesystem_magic_allowed(magic: u64) -> bool {
@@ -759,6 +1443,16 @@ fn validate_spec(spec: &LinuxProtectedSpec) -> Result<(), StateError> {
     Ok(())
 }
 
+fn validate_credentials(
+    spec: &LinuxProtectedSpec,
+    purpose: NamespacePurpose,
+) -> Result<(), StateError> {
+    match purpose {
+        NamespacePurpose::RuntimeService => validate_service_credentials(spec),
+        NamespacePurpose::OfflineRoot => validate_root_credentials(),
+    }
+}
+
 fn validate_service_credentials(spec: &LinuxProtectedSpec) -> Result<(), StateError> {
     if rustix::process::getuid().as_raw() != spec.expected_uid
         || rustix::process::geteuid().as_raw() != spec.expected_uid
@@ -778,6 +1472,16 @@ fn validate_service_credentials(spec: &LinuxProtectedSpec) -> Result<(), StateEr
             &spec.directory,
             "LinuxProtected expected service credentials do not match the process",
         ));
+    }
+    Ok(())
+}
+
+fn validate_root_credentials() -> Result<(), StateError> {
+    if !rustix::process::getuid().is_root() || !rustix::process::geteuid().is_root() {
+        return Err(StateError::InvalidValue {
+            field: "state privilege",
+            reason: "offline LinuxProtected initialization requires real and effective UID 0",
+        });
     }
     Ok(())
 }
@@ -842,6 +1546,50 @@ fn validate_ancestors(directory: &Path) -> Result<(), StateError> {
             return Err(invalid_path(
                 ancestor,
                 "LinuxProtected ancestors must be root-owned directories without group/other write or sticky bits",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_offline_ancestor_acls(directory: &Path) -> Result<(), StateError> {
+    for ancestor in directory.ancestors().skip(1) {
+        let file = rustix::fs::open(
+            ancestor,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            file_error(
+                "open LinuxProtected ancestor for offline ACL validation",
+                ancestor,
+                error.into(),
+            )
+        })?;
+        if !claw_sqlite_file_control::unix_file_has_trivial_acl(&file).map_err(|_| {
+            invalid_path(
+                ancestor,
+                "LinuxProtected ancestor ACL could not be validated offline",
+            )
+        })? {
+            return Err(invalid_path(
+                ancestor,
+                "LinuxProtected ancestors must have trivial ACLs for offline initialization",
+            ));
+        }
+        let identity = FileIdentity::capture(
+            ancestor,
+            &file,
+            "inspect LinuxProtected ancestor link count",
+        )?;
+        if identity.links == 0 {
+            return Err(invalid_path(
+                ancestor,
+                "LinuxProtected ancestor link count is invalid",
             ));
         }
     }
@@ -1027,6 +1775,85 @@ fn validate_catalog_lengths(entries: &[HeldEntry; 8]) -> Result<(), StateError> 
     Ok(())
 }
 
+fn validate_offline_catalog_bounds(entries: &[HeldEntry; 8]) -> Result<(), StateError> {
+    let writer_length = entries[WRITER_LOCK_INDEX]
+        .file
+        .metadata()
+        .map_err(|error| {
+            file_error(
+                "inspect offline fixed writer lock length",
+                &entries[WRITER_LOCK_INDEX].path,
+                error,
+            )
+        })?
+        .len();
+    if writer_length != 0 {
+        return Err(invalid_path(
+            &entries[WRITER_LOCK_INDEX].path,
+            "LinuxProtected fixed writer lock must be empty during offline initialization",
+        ));
+    }
+
+    let selector_length = entries[SELECTOR_INDEX]
+        .file
+        .metadata()
+        .map_err(|error| {
+            file_error(
+                "inspect offline fixed selector length",
+                &entries[SELECTOR_INDEX].path,
+                error,
+            )
+        })?
+        .len();
+    if selector_length != 0 && selector_length != SELECTOR_LEN as u64 {
+        return Err(invalid_path(
+            &entries[SELECTOR_INDEX].path,
+            "LinuxProtected selector is neither fresh nor initialized to its fixed length",
+        ));
+    }
+    for index in SLOT_METADATA_INDEX {
+        if entries[index]
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect offline snapshot metadata length",
+                    &entries[index].path,
+                    error,
+                )
+            })?
+            .len()
+            > METADATA_LEN as u64
+        {
+            return Err(invalid_path(
+                &entries[index].path,
+                "LinuxProtected snapshot metadata exceeds its fixed format bound",
+            ));
+        }
+    }
+    for index in SLOT_DATA_INDEX {
+        if entries[index]
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect offline snapshot slot length",
+                    &entries[index].path,
+                    error,
+                )
+            })?
+            .len()
+            > protected_catalog::MAX_SNAPSHOT_BYTES
+        {
+            return Err(invalid_path(
+                &entries[index].path,
+                "LinuxProtected snapshot slot exceeds its fixed size bound",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_exact_at(
     file: &File,
     mut output: &mut [u8],
@@ -1129,10 +1956,10 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use claw_domain::SessionId;
+    use sqlx::SqliteConnection;
     use sqlx::sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqliteSynchronous,
     };
-    use sqlx::{Connection as _, SqliteConnection};
 
     use crate::repository::test_support as repository_test_support;
     use crate::store::test_support;
@@ -1617,17 +2444,22 @@ mod tests {
             "create unknown protected entry",
         );
         assert_wrong_connection_profiles_are_terminally_rejected(namespace).await;
-        let config = StoreConfig::new(&database)
+        assert!(matches!(
+            StateStore::open(StoreConfig::linux_protected(namespace).with_max_connections(2)).await,
+            Err(StateError::InvalidValue {
+                field: "maximum connections",
+                reason: "LinuxProtected requires exactly one connection",
+            })
+        ));
+        let config = StoreConfig::linux_protected(namespace)
             .with_operation_timeout(Duration::from_secs(10))
             .with_close_timeout(Duration::from_millis(1_500));
-        let store = StateStore::open_linux_protected(
-            config.clone(),
-            namespace.to_owned(),
-            SERVICE_UID,
-            SERVICE_GID,
-        )
-        .await
-        .expect("open LinuxProtected state store");
+        assert_eq!(config.path(), database);
+        assert_eq!(config.profile(), crate::StateProfile::LinuxProtected);
+        let store = StateStore::open(config.clone())
+            .await
+            .expect("open LinuxProtected state store");
+        assert_eq!(store.profile(), crate::StateProfile::LinuxProtected);
         let fixed_owner = test_support::owner(&store).to_owned();
         assert!(fixed_owner.starts_with("linux-protected-v1:"));
         let settings = store.settings().await.expect("read protected settings");
@@ -1678,18 +2510,39 @@ mod tests {
         assert_eq!(exact_names(namespace), expected_names());
         assert_eq!(entry_identities(namespace), original_identities);
 
+        assert_eq!(
+            store
+                .latest_protected_snapshot_receipt()
+                .await
+                .expect("read empty protected catalog"),
+            None
+        );
         let first = store
-            .publish_linux_protected_snapshot()
+            .publish_protected_snapshot()
             .await
             .expect("publish first protected snapshot");
         assert_eq!((first.generation, first.slot), (1, 0));
         assert_snapshot_receipt(namespace, &first);
+        assert_eq!(
+            store
+                .latest_protected_snapshot_receipt()
+                .await
+                .expect("read first protected receipt"),
+            Some(first)
+        );
         let second = store
-            .publish_linux_protected_snapshot()
+            .publish_protected_snapshot()
             .await
             .expect("publish second protected snapshot");
         assert_eq!((second.generation, second.slot), (2, 1));
         assert_snapshot_receipt(namespace, &second);
+        assert_eq!(
+            store
+                .latest_protected_snapshot_receipt()
+                .await
+                .expect("read second protected receipt"),
+            Some(second)
+        );
 
         test_support::fail_protected_snapshot_at(&database, 1);
         assert!(matches!(
@@ -1814,9 +2667,9 @@ mod tests {
         assert_snapshot_receipt(namespace, &tenth);
         assert!(matches!(
             store.backup_to(namespace.join("forbidden")).await,
-            Err(StateError::InvalidPath {
-                reason: "LinuxProtected snapshots use only the fixed internal catalog",
-                ..
+            Err(StateError::InvalidValue {
+                field: "state profile operation",
+                reason: "arbitrary-path snapshot publication is unavailable for LinuxProtected",
             })
         ));
         assert_eq!(exact_names(namespace), expected_names());
@@ -1854,14 +2707,9 @@ mod tests {
         assert_eq!(exact_names(namespace), expected_names());
         assert_eq!(entry_identities(namespace), original_identities);
 
-        let reopened = StateStore::open_linux_protected(
-            config,
-            namespace.to_owned(),
-            SERVICE_UID,
-            SERVICE_GID,
-        )
-        .await
-        .expect("reopen protected store and recover catalog");
+        let reopened = StateStore::open(config)
+            .await
+            .expect("reopen protected store and recover catalog");
         assert_eq!(test_support::owner(&reopened), fixed_owner);
         assert_eq!(
             reopened
@@ -1871,8 +2719,14 @@ mod tests {
                 .expect("read protected session after reopen"),
             Some(session)
         );
+        let latest = reopened
+            .latest_protected_snapshot_receipt()
+            .await
+            .expect("recover latest protected receipt")
+            .expect("protected catalog remains populated");
+        assert_eq!((latest.generation(), latest.slot()), (10, 1));
         let eleventh = reopened
-            .publish_linux_protected_snapshot()
+            .publish_protected_snapshot()
             .await
             .expect("publish after catalog recovery");
         assert_eq!((eleventh.generation, eleventh.slot), (11, 0));
@@ -3152,6 +4006,53 @@ mod tests {
             "LinuxProtected acceptance requires a real/effective root driver"
         );
         let fixture = provision_root_fixture().await;
+        let database = fixture.namespace.join(DATABASE_NAME);
+        let mut uncheckpointed = SqliteConnection::connect_with(&protected_options(&database))
+            .await
+            .expect("open offline no-checkpoint fixture");
+        claw_sqlite_file_control::enable_persistent_wal(&mut uncheckpointed)
+            .await
+            .expect("persist offline no-checkpoint fixture WAL");
+        claw_sqlite_file_control::disable_wal_checkpoint_on_close(&mut uncheckpointed)
+            .await
+            .expect("disable fixture checkpoint-on-close");
+        sqlx::raw_sql(
+            "CREATE TABLE gta_claw_offline_close_probe(value INTEGER);
+             DROP TABLE gta_claw_offline_close_probe;",
+        )
+        .execute(&mut uncheckpointed)
+        .await
+        .expect("leave committed frames for offline close verification");
+        uncheckpointed
+            .close()
+            .await
+            .expect("close no-checkpoint fixture connection");
+        let database_before =
+            fs::read(&database).expect("read database before idempotent offline verification");
+        let wal_path = fixture.namespace.join(WAL_NAME);
+        let wal_before =
+            fs::read(&wal_path).expect("read WAL before idempotent offline verification");
+        assert!(
+            !wal_before.is_empty(),
+            "no-checkpoint fixture retains committed WAL frames"
+        );
+        assert_eq!(
+            crate::initialize_linux_protected_offline(
+                &fixture.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect("offline initializer runs safely inside a Tokio test runtime"),
+            LinuxProtectedInitialization::AlreadyInitialized
+        );
+        assert_eq!(
+            fs::read(&database).expect("reread database after offline verification"),
+            database_before
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("reread WAL after offline verification"),
+            wal_before
+        );
         let original_identities = entry_identities(&fixture.namespace);
         assert_child_success(
             service_child_command(

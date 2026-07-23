@@ -19,6 +19,7 @@ fn terminal_abort_commit_method_is_public<Connection: BeginOwnedConnection>(
 #[test]
 fn native_wal_and_vfs_controls_are_public() {
     let _enable = claw_sqlite_file_control::enable_persistent_wal;
+    let _disable_close_checkpoint = claw_sqlite_file_control::disable_wal_checkpoint_on_close;
     let _vfs_name = claw_sqlite_file_control::main_database_vfs_name;
 }
 

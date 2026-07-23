@@ -626,6 +626,8 @@ dependencies = [
  "claw-application",
  "claw-platform",
  "claw-protocol",
+ "claw-state",
+ "tokio",
 ]
 
 [[package]]

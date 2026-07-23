@@ -1750,6 +1750,40 @@ pub async fn enable_persistent_wal(
     Ok(())
 }
 
+/// Disables SQLite's implicit WAL checkpoint when this connection closes.
+///
+/// Callers that require a fixed WAL identity can perform an explicit bounded
+/// checkpoint and then close without allowing SQLite to start new checkpoint
+/// work during terminal cleanup.
+pub async fn disable_wal_checkpoint_on_close(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<(), FileControlError> {
+    let mut database = connection
+        .lock_handle()
+        .await
+        .map_err(|error| FileControlError::Handle(error.to_string()))?;
+    let mut observed = 0_i32;
+    // SAFETY: SQLx's locked handle is live, the integer option is valid for
+    // SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, and `observed` remains writable.
+    let result = unsafe {
+        libsqlite3_sys::sqlite3_db_config(
+            database.as_raw_handle().as_ptr(),
+            libsqlite3_sys::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            1_i32,
+            &raw mut observed,
+        )
+    };
+    if result != libsqlite3_sys::SQLITE_OK {
+        return Err(FileControlError::SQLite(result));
+    }
+    if observed != 1 {
+        return Err(FileControlError::Handle(
+            "SQLite did not disable WAL checkpoint-on-close".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Returns SQLite's native VFS stack name for the locked main database.
 pub async fn main_database_vfs_name(
     connection: &mut sqlx::SqliteConnection,

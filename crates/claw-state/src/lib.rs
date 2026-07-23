@@ -9,21 +9,24 @@ mod linux_protected;
 mod model;
 #[cfg(any(target_os = "linux", test))]
 mod protected_catalog;
+mod protected_layout;
+mod provision;
 mod repository;
 mod store;
 
-pub use error::{DatabaseFailure, StateError, WriteOutcome};
+pub use error::{DatabaseFailure, StateError, StateErrorKind, WriteOutcome};
 pub use model::{
     AuthenticationId, AuthenticationRecord, AuthenticationStatus, DeviceId, DeviceRecord, Page,
     PageCursor, PageRequest, SessionRecord, SessionStatus, TaskId, TaskRecord, TaskStatus,
     TimestampMs,
 };
+pub use provision::{LinuxProtectedInitialization, initialize_linux_protected_offline};
 pub use repository::{
     AuthenticationRepository, DeviceRepository, SessionRepository, TaskRepository,
 };
 pub use store::{
-    CheckpointReport, HealthReport, RecoveredWriterLock, StateStore, StoreConfig, StoreSettings,
-    SynchronousPolicy,
+    CheckpointReport, HealthReport, ProtectedSnapshotReceipt, RecoveredWriterLock, StateProfile,
+    StateStore, StoreConfig, StoreSettings, SynchronousPolicy,
 };
 
 #[cfg(test)]
@@ -470,6 +473,31 @@ mod tests {
         assert!(health.is_healthy());
         assert!(path.is_file());
         store.close().await.expect("store closes cleanly");
+    }
+
+    #[tokio::test]
+    async fn portable_profile_rejects_fixed_catalog_operations_explicitly() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = database_path(&directory, "portable-profile.sqlite");
+        let store = StateStore::open(StoreConfig::new(&path))
+            .await
+            .expect("portable store opens");
+        assert_eq!(store.profile(), StateProfile::PortablePrivate);
+        assert!(matches!(
+            store.publish_protected_snapshot().await,
+            Err(StateError::InvalidValue {
+                field: "state profile operation",
+                reason: "fixed-catalog snapshot publication requires LinuxProtected",
+            })
+        ));
+        assert!(matches!(
+            store.latest_protected_snapshot_receipt().await,
+            Err(StateError::InvalidValue {
+                field: "state profile operation",
+                reason: "latest fixed-catalog receipt requires LinuxProtected",
+            })
+        ));
+        store.close().await.expect("portable store closes");
     }
 
     #[tokio::test]
