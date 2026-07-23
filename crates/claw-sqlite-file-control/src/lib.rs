@@ -3808,6 +3808,23 @@ struct RollbackDelivery<Connection: BeginOwnedConnection> {
     close_permit: Option<TerminalClosePermit>,
 }
 
+#[derive(Clone, Copy)]
+enum RollbackSuccessDisposition {
+    ReusableLegacy,
+    TerminalProtected,
+}
+
+enum RollbackSuccess<Connection: BeginOwnedConnection> {
+    Reusable(Connection),
+    Terminal,
+}
+
+#[derive(Clone, Copy)]
+enum CommitAbortDisposition {
+    ReusableLegacy,
+    TerminalProtected,
+}
+
 impl<Connection: BeginOwnedConnection> RollbackDelivery<Connection> {
     fn accept(mut self) -> Connection {
         self.close_permit.take();
@@ -3820,6 +3837,29 @@ impl<Connection: BeginOwnedConnection> RollbackDelivery<Connection> {
         if let (Some(connection), Some(permit)) = (self.connection.take(), self.close_permit.take())
         {
             let _ = permit.submit(connection);
+        }
+    }
+
+    fn close_until(mut self, cleanup_deadline: std::time::Instant) -> TerminalCloseOutcome {
+        let (Some(connection), Some(mut permit)) =
+            (self.connection.take(), self.close_permit.take())
+        else {
+            return TerminalCloseOutcome::Panicked;
+        };
+        let retired = Arc::new(AtomicU8::new(0));
+        permit
+            .reservation
+            .as_mut()
+            .expect("rollback close permit retains its reservation")
+            .completion_signal = Some((Arc::clone(&retired), 2));
+        let close = permit.submit(connection).wait(cleanup_deadline);
+        while retired.load(Ordering::Acquire) != 2 && std::time::Instant::now() < cleanup_deadline {
+            std::thread::yield_now();
+        }
+        if retired.load(Ordering::Acquire) == 2 {
+            close
+        } else {
+            TerminalCloseOutcome::Quarantined
         }
     }
 }
@@ -4751,31 +4791,84 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
     /// Commits on the dedicated cleanup runtime with one immutable deadline and
     /// cancellation-aware SQLite busy handler.
     pub async fn commit_with_deadline(
-        mut self,
+        self,
         deadline: std::time::Instant,
         cleanup_deadline: std::time::Instant,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
         restore_busy_timeout: std::time::Duration,
         late_writer_owner: Option<String>,
     ) -> Result<(Connection, BlockingCleanupOwner), FileControlError> {
+        self.commit_with_deadline_inner(
+            deadline,
+            cleanup_deadline,
+            cancelled,
+            restore_busy_timeout,
+            late_writer_owner,
+            CommitAbortDisposition::ReusableLegacy,
+        )
+        .await
+    }
+
+    /// Commits with the same bounded delivery contract while terminal-closing
+    /// the exact connection after every successful pre-COMMIT rollback.
+    pub async fn commit_with_deadline_terminal_on_abort(
+        self,
+        deadline: std::time::Instant,
+        cleanup_deadline: std::time::Instant,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        restore_busy_timeout: std::time::Duration,
+        late_writer_owner: Option<String>,
+    ) -> Result<(Connection, BlockingCleanupOwner), FileControlError> {
+        self.commit_with_deadline_inner(
+            deadline,
+            cleanup_deadline,
+            cancelled,
+            restore_busy_timeout,
+            late_writer_owner,
+            CommitAbortDisposition::TerminalProtected,
+        )
+        .await
+    }
+
+    async fn commit_with_deadline_inner(
+        mut self,
+        deadline: std::time::Instant,
+        cleanup_deadline: std::time::Instant,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        restore_busy_timeout: std::time::Duration,
+        late_writer_owner: Option<String>,
+        abort_disposition: CommitAbortDisposition,
+    ) -> Result<(Connection, BlockingCleanupOwner), FileControlError> {
         if cancelled.load(std::sync::atomic::Ordering::Acquire)
             || std::time::Instant::now() >= deadline
         {
-            let rollback = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(cleanup_deadline),
-                self.rollback(),
-            )
-            .await;
-            return Err(match rollback {
-                Ok(Ok(_)) => FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT),
-                Ok(Err(error)) => FileControlError::Handle(format!(
-                    "SQLite COMMIT interrupted; terminal rollback failed: {error}"
-                )),
-                Err(_) => FileControlError::Handle(
-                    "SQLite COMMIT interrupted; terminal rollback exceeded cleanup cutoff"
-                        .to_owned(),
+            return match abort_disposition {
+                CommitAbortDisposition::ReusableLegacy => {
+                    let rollback = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(cleanup_deadline),
+                        self.rollback(),
+                    )
+                    .await;
+                    Err(match rollback {
+                        Ok(Ok(_)) => FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT),
+                        Ok(Err(error)) => FileControlError::Handle(format!(
+                            "SQLite COMMIT interrupted; terminal rollback failed: {error}"
+                        )),
+                        Err(_) => FileControlError::Handle(
+                            "SQLite COMMIT interrupted; terminal rollback exceeded cleanup cutoff"
+                                .to_owned(),
+                        ),
+                    })
+                }
+                CommitAbortDisposition::TerminalProtected => Err(
+                    match self.rollback_terminal_with_deadline(cleanup_deadline).await {
+                        Ok(()) => FileControlError::SQLite(libsqlite3_sys::SQLITE_INTERRUPT),
+                        Err(error) => FileControlError::Handle(format!(
+                            "SQLite COMMIT interrupted; terminal rollback failed: {error}"
+                        )),
+                    },
                 ),
-            });
+            };
         }
         let connection = self
             .connection
@@ -5226,11 +5319,19 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
 
     /// Rolls back and returns the owned connection only after SQLite reaches autocommit.
     pub async fn rollback(self) -> Result<Connection, FileControlError> {
-        self.rollback_until(
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            "terminal rollback was Quarantined after its fixed cleanup cutoff",
-        )
-        .await
+        match self
+            .rollback_until(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                "terminal rollback was Quarantined after its fixed cleanup cutoff",
+                RollbackSuccessDisposition::ReusableLegacy,
+            )
+            .await?
+        {
+            RollbackSuccess::Reusable(connection) => Ok(connection),
+            RollbackSuccess::Terminal => {
+                unreachable!("legacy rollback returns its reusable connection")
+            }
+        }
     }
 
     /// Rolls back with one immutable absolute terminal cleanup deadline.
@@ -5238,18 +5339,46 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
         self,
         cleanup_deadline: std::time::Instant,
     ) -> Result<Connection, FileControlError> {
-        self.rollback_until(
-            cleanup_deadline,
-            "terminal rollback exceeded its immutable cleanup deadline",
-        )
-        .await
+        match self
+            .rollback_until(
+                cleanup_deadline,
+                "terminal rollback exceeded its immutable cleanup deadline",
+                RollbackSuccessDisposition::ReusableLegacy,
+            )
+            .await?
+        {
+            RollbackSuccess::Reusable(connection) => Ok(connection),
+            RollbackSuccess::Terminal => {
+                unreachable!("legacy rollback returns its reusable connection")
+            }
+        }
+    }
+
+    async fn rollback_terminal_with_deadline(
+        self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<(), FileControlError> {
+        match self
+            .rollback_until(
+                cleanup_deadline,
+                "terminal rollback exceeded its immutable cleanup deadline",
+                RollbackSuccessDisposition::TerminalProtected,
+            )
+            .await?
+        {
+            RollbackSuccess::Terminal => Ok(()),
+            RollbackSuccess::Reusable(_) => {
+                unreachable!("protected rollback terminalizes its connection")
+            }
+        }
     }
 
     async fn rollback_until(
         mut self,
         cleanup_deadline: std::time::Instant,
         timeout_error: &'static str,
-    ) -> Result<Connection, FileControlError> {
+        success_disposition: RollbackSuccessDisposition,
+    ) -> Result<RollbackSuccess<Connection>, FileControlError> {
         let late_delivery_permit = self
             .cleanup_owner
             .as_mut()
@@ -5306,7 +5435,22 @@ impl<Connection: BeginOwnedConnection> ManualTransaction<Connection> {
                 )),
             });
         }
-        result.map(RollbackDelivery::accept)
+        match result {
+            Ok(delivery) => match success_disposition {
+                RollbackSuccessDisposition::ReusableLegacy => {
+                    Ok(RollbackSuccess::Reusable(delivery.accept()))
+                }
+                RollbackSuccessDisposition::TerminalProtected => {
+                    match delivery.close_until(cleanup_deadline) {
+                        TerminalCloseOutcome::Closed => Ok(RollbackSuccess::Terminal),
+                        close => Err(FileControlError::Handle(format!(
+                            "terminal rollback connection close failed: {close:?}"
+                        ))),
+                    }
+                }
+            },
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -10284,6 +10428,212 @@ mod deadline_tests {
             .await
             .expect("stage COMMIT delivery row");
         (pool, transaction)
+    }
+
+    async fn terminal_abort_fixture(
+        path: &std::path::Path,
+    ) -> (
+        sqlx::SqlitePool,
+        ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+    ) {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_millis(500));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open terminal-abort pool");
+        sqlx::query("CREATE TABLE terminal_abort_payload(value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create terminal-abort payload table");
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("acquire terminal-abort connection");
+        sqlx::query("CREATE TEMP TABLE terminal_abort_marker(value INTEGER)")
+            .execute(&mut *connection)
+            .await
+            .expect("create terminal-abort TEMP marker");
+        let mut transaction =
+            begin_manual_pool_transaction(connection, std::time::Duration::from_secs(1))
+                .await
+                .expect("begin terminal-abort transaction");
+        transaction
+            .execute("INSERT INTO terminal_abort_payload VALUES (1)")
+            .await
+            .expect("stage terminal-abort row");
+        (pool, transaction)
+    }
+
+    async fn assert_terminal_abort_replacement(
+        pool: &sqlx::SqlitePool,
+        expected_marker_count: i64,
+    ) {
+        let mut connection =
+            tokio::time::timeout(std::time::Duration::from_secs(2), pool.acquire())
+                .await
+                .expect("terminal-abort replacement acquire remains bounded")
+                .expect("acquire terminal-abort replacement");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_temp_master
+                 WHERE type = 'table' AND name = 'terminal_abort_marker'",
+            )
+            .fetch_one(&mut *connection)
+            .await
+            .expect("inspect terminal-abort TEMP marker"),
+            expected_marker_count,
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM terminal_abort_payload")
+                .fetch_one(&mut *connection)
+                .await
+                .expect("inspect rolled-back terminal-abort payload"),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_expired_commit_reuses_successfully_rolled_back_connection() {
+        let directory = tempfile::tempdir().expect("legacy terminal-abort directory");
+        let (pool, transaction) =
+            terminal_abort_fixture(&directory.path().join("legacy.sqlite")).await;
+        let deadline = std::time::Instant::now();
+        let error = transaction
+            .commit_with_deadline(
+                deadline,
+                deadline + std::time::Duration::from_secs(2),
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_millis(500),
+                None,
+            )
+            .await
+            .expect_err("legacy expired COMMIT rolls back");
+        assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_INTERRUPT));
+        assert_terminal_abort_replacement(&pool, 1).await;
+    }
+
+    #[tokio::test]
+    async fn protected_expired_commit_terminal_closes_successful_rollback() {
+        let directory = tempfile::tempdir().expect("protected deadline-abort directory");
+        let (pool, transaction) =
+            terminal_abort_fixture(&directory.path().join("deadline.sqlite")).await;
+        let deadline = std::time::Instant::now();
+        let error = transaction
+            .commit_with_deadline_terminal_on_abort(
+                deadline,
+                deadline + std::time::Duration::from_secs(2),
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_millis(500),
+                None,
+            )
+            .await
+            .expect_err("protected expired COMMIT rolls back and closes");
+        assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_INTERRUPT));
+        assert_terminal_abort_replacement(&pool, 0).await;
+    }
+
+    #[tokio::test]
+    async fn protected_cancelled_commit_terminal_closes_successful_rollback() {
+        let directory = tempfile::tempdir().expect("protected cancel-abort directory");
+        let (pool, transaction) =
+            terminal_abort_fixture(&directory.path().join("cancel.sqlite")).await;
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let error = transaction
+            .commit_with_deadline_terminal_on_abort(
+                deadline,
+                deadline + std::time::Duration::from_secs(1),
+                cancelled,
+                std::time::Duration::from_millis(500),
+                None,
+            )
+            .await
+            .expect_err("protected cancelled COMMIT rolls back and closes");
+        assert_eq!(error.code(), Some(libsqlite3_sys::SQLITE_INTERRUPT));
+        assert_terminal_abort_replacement(&pool, 0).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_terminal_abort_commit_retains_physical_close() {
+        let directory = tempfile::tempdir().expect("dropped terminal-abort directory");
+        let (pool, transaction) =
+            terminal_abort_fixture(&directory.path().join("drop.sqlite")).await;
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (registration, entered) = install_rollback_gate(
+            &transaction,
+            RollbackTestStage::BeforeSqliteExec,
+            false,
+            false,
+            Arc::clone(&release),
+        );
+        let deadline = std::time::Instant::now();
+        let commit = tokio::spawn(transaction.commit_with_deadline_terminal_on_abort(
+            deadline,
+            deadline + std::time::Duration::from_secs(2),
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_millis(500),
+            None,
+        ));
+        wait_for_atomic(&entered, "dropped terminal-abort rollback gate").await;
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("terminal-abort COMMIT task is cancelled")
+                .is_cancelled()
+        );
+        registration.release();
+        drop(registration);
+        assert_terminal_abort_replacement(&pool, 0).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_drop_terminal_abort_commit_retains_physical_close() {
+        let directory = tempfile::tempdir().expect("runtime terminal-abort directory");
+        let (pool, transaction) =
+            terminal_abort_fixture(&directory.path().join("runtime.sqlite")).await;
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (registration, entered) = install_rollback_gate(
+            &transaction,
+            RollbackTestStage::BeforeSqliteExec,
+            false,
+            false,
+            Arc::clone(&release),
+        );
+        let deadline = std::time::Instant::now();
+        let (drop_tx, drop_rx) = std::sync::mpsc::sync_channel(0);
+        let runtime_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build terminal-abort disposable runtime");
+            runtime.spawn(transaction.commit_with_deadline_terminal_on_abort(
+                deadline,
+                deadline + std::time::Duration::from_secs(2),
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_millis(500),
+                None,
+            ));
+            drop_rx
+                .recv()
+                .expect("receive terminal-abort runtime drop command");
+            drop(runtime);
+        });
+        wait_for_atomic(&entered, "runtime terminal-abort rollback gate").await;
+        drop_tx
+            .send(())
+            .expect("request terminal-abort runtime destruction");
+        runtime_thread
+            .join()
+            .expect("terminal-abort runtime thread joins");
+        registration.release();
+        drop(registration);
+        assert_terminal_abort_replacement(&pool, 0).await;
     }
 
     struct CommitResultTestRegistration {

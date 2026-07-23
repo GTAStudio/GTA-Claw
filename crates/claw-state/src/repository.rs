@@ -28,6 +28,28 @@ struct RepositoryDeadline {
 }
 
 #[cfg(test)]
+async fn wait_at_protected_commit_dispatch_test_barrier(owner: &str) {
+    let barrier = PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS
+        .lock()
+        .expect("protected commit dispatch test barriers lock poisoned")
+        .get(owner)
+        .map(|configured| {
+            (
+                Arc::clone(&configured.entered),
+                Arc::clone(&configured.release),
+            )
+        });
+    if let Some((entered, release)) = barrier {
+        entered.notify_one();
+        release.notified().await;
+        PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS
+            .lock()
+            .expect("protected commit dispatch test barriers lock poisoned")
+            .remove(owner);
+    }
+}
+
+#[cfg(test)]
 async fn wait_at_post_commit_test_barrier(owner: &str) {
     let barrier = POST_COMMIT_TEST_BARRIERS
         .lock()
@@ -467,6 +489,28 @@ impl VerifiedWriteTransaction {
             .await
     }
 
+    async fn commit_with_owner_terminal_on_abort(
+        mut self,
+    ) -> Result<
+        (
+            sqlx::pool::PoolConnection<sqlx::Sqlite>,
+            claw_sqlite_file_control::BlockingCleanupOwner,
+        ),
+        claw_sqlite_file_control::FileControlError,
+    > {
+        self.transaction
+            .take()
+            .expect("verified write transaction remains owned")
+            .commit_with_deadline_terminal_on_abort(
+                self.deadline,
+                self.cleanup_deadline,
+                Arc::clone(&self.cancelled),
+                self.restore_busy_timeout,
+                None,
+            )
+            .await
+    }
+
     async fn rollback_after_error(
         mut self,
         operation: &'static str,
@@ -577,6 +621,10 @@ static COMMIT_TEST_BARRIERS: LazyLock<Mutex<std::collections::HashMap<String, Wr
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 static POST_COMMIT_TEST_BARRIERS: LazyLock<
+    Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(test)]
+static PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS: LazyLock<
     Mutex<std::collections::HashMap<String, WriteTestBarrier>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
@@ -2063,10 +2111,13 @@ async fn commit_verified(
             .map(drop)
             .map_err(|error| map_verified_commit_error(error, operation, deadline, timeout_ms));
     }
-    let (connection, post_commit_owner) = transaction
-        .commit_with_owner()
-        .await
-        .map_err(|error| map_verified_commit_error(error, operation, deadline, timeout_ms))?;
+    #[cfg(test)]
+    wait_at_protected_commit_dispatch_test_barrier(owner).await;
+    let (connection, post_commit_owner) =
+        transaction
+            .commit_with_owner_terminal_on_abort()
+            .await
+            .map_err(|error| map_verified_commit_error(error, operation, deadline, timeout_ms))?;
     let connection = ProtectedConnectionGuard::new(
         connection,
         protected_cleanup_owner.expect("protected cleanup owner was reserved"),
@@ -2627,7 +2678,10 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::{COMMIT_TEST_TAMPERS, IDENTITY_INVALIDATION_TEST_BARRIERS};
     #[cfg(target_os = "linux")]
-    use super::{POST_COMMIT_TEST_BARRIERS, PROTECTED_READ_POST_TEST_BARRIER};
+    use super::{
+        POST_COMMIT_TEST_BARRIERS, PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS,
+        PROTECTED_READ_POST_TEST_BARRIER,
+    };
 
     pub(crate) struct RollbackCleanupTestRegistration {
         owner: String,
@@ -2766,6 +2820,25 @@ pub(crate) mod test_support {
         POST_COMMIT_TEST_BARRIERS
             .lock()
             .expect("post-commit test barriers lock poisoned")
+            .insert(
+                owner.to_owned(),
+                WriteTestBarrier {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        (entered, release)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_protected_commit_dispatch_barrier(
+        owner: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        PROTECTED_COMMIT_DISPATCH_TEST_BARRIERS
+            .lock()
+            .expect("protected commit dispatch test barriers lock poisoned")
             .insert(
                 owner.to_owned(),
                 WriteTestBarrier {

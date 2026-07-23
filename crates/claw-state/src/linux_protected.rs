@@ -2503,6 +2503,40 @@ mod tests {
                 .is_none()
         );
 
+        let dispatch_deadline_session = SessionRecord::new(
+            SessionId::new("lp2-protected-dispatch-deadline")
+                .expect("valid dispatch deadline session id"),
+            TimestampMs::new(26).expect("valid dispatch deadline timestamp"),
+        );
+        install_repository_temp_marker(&store).await;
+        let (dispatch_entered, dispatch_release) =
+            repository_test_support::set_protected_commit_dispatch_barrier(&owner);
+        let dispatch_store = Arc::clone(&store);
+        let dispatch_record = dispatch_deadline_session.clone();
+        let dispatch_write =
+            tokio::spawn(async move { dispatch_store.sessions().create(&dispatch_record).await });
+        tokio::time::timeout(Duration::from_secs(5), dispatch_entered.notified())
+            .await
+            .expect("protected write reaches owner-taken commit dispatch barrier");
+        assert_repository_pool_blocked(&store).await;
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        dispatch_release.notify_one();
+        let error = dispatch_write
+            .await
+            .expect("protected dispatch rollback task joins")
+            .expect_err("owner-taken pre-poll deadline must rollback");
+        assert!(matches!(error, StateError::OperationTimedOut { .. }));
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+        assert_replacement_connection(&store).await;
+        assert!(
+            store
+                .sessions()
+                .get(&dispatch_deadline_session.id)
+                .await
+                .expect("read dispatch-deadline rolled-back record")
+                .is_none()
+        );
+
         install_repository_temp_marker(&store).await;
         let (read_entered, _read_release) =
             repository_test_support::set_protected_read_post_barrier();
