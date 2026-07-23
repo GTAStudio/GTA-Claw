@@ -234,6 +234,12 @@ impl ActiveStoreProfile {
             Self::LinuxProtected(namespace) => Some(namespace),
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn protected_repository_admission(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.protected_namespace()
+            .map(|namespace| namespace.repository_admission())
+    }
 }
 
 struct SnapshotMemoryReservation {
@@ -1945,6 +1951,17 @@ impl OperationalIdentity<'_> {
 
     pub(crate) const fn is_protected(self) -> bool {
         self.profile.is_protected()
+    }
+
+    pub(crate) fn protected_repository_admission(self) -> Option<Arc<tokio::sync::Semaphore>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.profile.protected_repository_admission()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     fn capture_owned(self) -> Result<OwnedOperationalIdentity, StateError> {
@@ -9173,6 +9190,147 @@ impl Drop for BackupConnectionGuard {
                             .take()
                             .expect("dropped backup connection remains owned"),
                     );
+                },
+            );
+        }
+    }
+}
+
+pub(crate) struct ProtectedConnectionGuard {
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>,
+    cleanup_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
+}
+
+impl ProtectedConnectionGuard {
+    pub(crate) fn new(
+        connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+        cleanup_owner: claw_sqlite_file_control::BlockingCleanupOwner,
+    ) -> Self {
+        Self {
+            connection: Some(connection),
+            cleanup_owner: Some(cleanup_owner),
+        }
+    }
+
+    pub(crate) async fn accept(mut self) -> Result<(), String> {
+        let owner = self
+            .cleanup_owner
+            .take()
+            .expect("protected connection cleanup owner remains live");
+        if let Err(error) = owner.shutdown() {
+            let mut connection = self
+                .connection
+                .take()
+                .expect("protected connection remains live after owner failure");
+            connection.close_on_drop();
+            return match connection.close().await {
+                Ok(()) => Err(error),
+                Err(close) => Err(format!(
+                    "{error}; protected connection close after owner failure: {close}"
+                )),
+            };
+        }
+        drop(
+            self.connection
+                .take()
+                .expect("accepted protected connection remains live"),
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn discard_until(
+        mut self,
+        cleanup_deadline: std::time::Instant,
+    ) -> claw_sqlite_file_control::TerminalCloseOutcome {
+        let (Some(connection), Some(cleanup_owner)) =
+            (self.connection.take(), self.cleanup_owner.take())
+        else {
+            return claw_sqlite_file_control::TerminalCloseOutcome::Closed;
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let retirement = StateOwnerRetirementReceipt::new();
+        if handoff_state_payload_with_completion(
+            cleanup_owner,
+            std::sync::Mutex::new((Some(connection), Some(done_tx))),
+            retirement.signal(),
+            |_runtime, terminal_closes, payload| {
+                let mut payload = payload
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let permit = terminal_closes
+                    .take_permit()
+                    .expect("protected discard capacity was pre-reserved");
+                let connection = payload
+                    .0
+                    .take()
+                    .expect("protected discard connection remains owned");
+                let done_tx = payload
+                    .1
+                    .take()
+                    .expect("protected discard result remains owned");
+                let _ = done_tx.send(permit.close(connection));
+            },
+        )
+        .is_err()
+        {
+            return claw_sqlite_file_control::TerminalCloseOutcome::Quarantined;
+        }
+        let close =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(cleanup_deadline), done_rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(claw_sqlite_file_control::TerminalCloseOutcome::Quarantined);
+        if retirement
+            .wait(cleanup_deadline, "protected repository connection cleanup")
+            .await
+            .is_err()
+        {
+            claw_sqlite_file_control::TerminalCloseOutcome::Quarantined
+        } else {
+            close
+        }
+    }
+}
+
+impl std::ops::Deref for ProtectedConnectionGuard {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("protected connection remains live")
+            .as_ref()
+    }
+}
+
+impl std::ops::DerefMut for ProtectedConnectionGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_mut()
+            .expect("protected connection remains live")
+            .as_mut()
+    }
+}
+
+impl Drop for ProtectedConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take()
+            && let Some(cleanup_owner) = self.cleanup_owner.take()
+        {
+            let _ = handoff_state_payload(
+                cleanup_owner,
+                std::sync::Mutex::new(Some(connection)),
+                |_runtime, terminal_closes, payload| {
+                    let permit = terminal_closes
+                        .take_permit()
+                        .expect("protected drop close capacity was pre-reserved");
+                    let connection = payload
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("dropped protected connection remains owned");
+                    let _ = permit.close(connection);
                 },
             );
         }

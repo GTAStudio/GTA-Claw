@@ -1,5 +1,5 @@
 use claw_domain::SessionId;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use crate::error::{database, database_code};
 use crate::model::{finish_page, invalid_stored, validate_text};
-use crate::store::{OperationalIdentity, validate_operational_schema};
+use crate::store::{OperationalIdentity, ProtectedConnectionGuard, validate_operational_schema};
 use crate::{
     AuthenticationId, AuthenticationRecord, AuthenticationStatus, DeviceId, DeviceRecord, Page,
     PageCursor, PageRequest, SessionRecord, SessionStatus, StateError, TaskId, TaskRecord,
@@ -151,23 +151,187 @@ async fn read_with_deadline<T>(
     operation: &'static str,
     future: impl std::future::Future<Output = Result<T, StateError>>,
 ) -> Result<T, StateError> {
-    if !identity.is_protected() {
-        let timing = RepositoryDeadline::new(identity)?;
-        return timing.run(operation, future).await;
+    let timing = RepositoryDeadline::new(identity)?;
+    timing.run(operation, future).await
+}
+
+type ProtectedReadFuture<'connection, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, StateError>> + Send + 'connection>,
+>;
+
+async fn reserve_protected_connection_owner(
+    deadline: std::time::Instant,
+    operation: &'static str,
+    timeout_ms: u64,
+) -> Result<claw_sqlite_file_control::BlockingCleanupOwner, StateError> {
+    let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+        "claw-state-protected-repository-connection",
+        1,
+        deadline,
+    )
+    .await
+    .map_err(|error| {
+        if std::time::Instant::now() >= deadline {
+            StateError::OperationTimedOut {
+                operation,
+                timeout_ms,
+            }
+        } else {
+            database(
+                "reserve protected repository connection owner",
+                sqlx::Error::Protocol(error),
+            )
+        }
+    })?;
+    Ok(owners
+        .pop()
+        .expect("protected repository connection owner was reserved"))
+}
+
+async fn reserve_protected_write_owners(
+    deadline: std::time::Instant,
+    operation: &'static str,
+    timeout_ms: u64,
+) -> Result<
+    (
+        claw_sqlite_file_control::BlockingCleanupOwner,
+        Vec<claw_sqlite_file_control::BlockingCleanupOwner>,
+    ),
+    StateError,
+> {
+    let mut owners = claw_sqlite_file_control::BlockingCleanupOwner::acquire_set(
+        "claw-state-protected-repository-write",
+        4,
+        deadline,
+    )
+    .await
+    .map_err(|error| {
+        if std::time::Instant::now() >= deadline {
+            StateError::OperationTimedOut {
+                operation,
+                timeout_ms,
+            }
+        } else {
+            database(
+                "reserve complete protected repository write owner set",
+                sqlx::Error::Protocol(error),
+            )
+        }
+    })?;
+    let connection_owner = owners
+        .pop()
+        .expect("protected repository connection owner was reserved");
+    debug_assert_eq!(owners.len(), 3);
+    Ok((connection_owner, owners))
+}
+
+async fn acquire_protected_repository_admission(
+    identity: OperationalIdentity<'_>,
+    timing: &RepositoryDeadline,
+    operation: &'static str,
+) -> Result<tokio::sync::OwnedSemaphorePermit, StateError> {
+    let admission = identity.protected_repository_admission().ok_or_else(|| {
+        database(
+            "acquire protected repository admission",
+            sqlx::Error::Protocol("LinuxProtected repository admission is unavailable".to_owned()),
+        )
+    })?;
+    timing
+        .run(operation, async {
+            admission.acquire_owned().await.map_err(|_| {
+                database(
+                    "acquire protected repository admission",
+                    sqlx::Error::Protocol("protected repository admission is closed".to_owned()),
+                )
+            })
+        })
+        .await
+}
+
+async fn discard_protected_read_connection(
+    connection: ProtectedConnectionGuard,
+    cleanup_deadline: std::time::Instant,
+    operation: &'static str,
+    primary: StateError,
+) -> StateError {
+    let close = connection.discard_until(cleanup_deadline).await;
+    if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+        primary
+    } else {
+        StateError::OperationCleanupFailed {
+            operation,
+            primary: Box::new(primary),
+            cleanup: format!("protected repository terminal close: {close:?}"),
+        }
     }
+}
+
+async fn protected_read_with_deadline<T, Operation>(
+    pool: &SqlitePool,
+    identity: OperationalIdentity<'_>,
+    operation: &'static str,
+    execute: Operation,
+) -> Result<T, StateError>
+where
+    T: Send,
+    Operation: for<'connection> FnOnce(
+        &'connection mut SqliteConnection,
+    ) -> ProtectedReadFuture<'connection, T>,
+{
     let timing = RepositoryDeadline::new(identity)?;
     identity.verify_protected()?;
     timing.ensure_active(operation)?;
-    let result = timing.run(operation, future).await;
+    let admission = acquire_protected_repository_admission(identity, &timing, operation).await?;
+    let cleanup_owner =
+        reserve_protected_connection_owner(timing.deadline, operation, timing.timeout_ms).await?;
+    let connection = match timing
+        .run(operation, async {
+            pool.acquire()
+                .await
+                .map_err(|error| database(operation, error))
+        })
+        .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            drop(cleanup_owner);
+            drop(admission);
+            return Err(error);
+        }
+    };
+    let mut connection = ProtectedConnectionGuard::new(connection, cleanup_owner);
+    drop(admission);
+    let result = timing.run(operation, execute(&mut connection)).await;
     #[cfg(test)]
     wait_at_protected_read_post_test_barrier().await;
-    identity.verify_protected()?;
-    timing.ensure_active(operation)?;
-    result
+    let fence = identity
+        .verify_protected()
+        .and_then(|()| timing.ensure_active(operation));
+    let result = match fence {
+        Ok(()) => result,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(value) => match connection.accept().await {
+            Ok(()) => Ok(value),
+            Err(cleanup) => Err(database(
+                "release protected repository connection",
+                sqlx::Error::Protocol(cleanup),
+            )),
+        },
+        Err(primary) => Err(discard_protected_read_connection(
+            connection,
+            timing.cleanup_deadline,
+            operation,
+            primary,
+        )
+        .await),
+    }
 }
 
 struct VerifiedWriteTransaction {
     transaction: Option<PoolManualTransaction>,
+    protected_connection_owner: Option<claw_sqlite_file_control::BlockingCleanupOwner>,
     deadline: std::time::Instant,
     cleanup_deadline: std::time::Instant,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -271,11 +435,26 @@ impl VerifiedWriteTransaction {
     }
 
     async fn commit(
-        mut self,
+        self,
     ) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, claw_sqlite_file_control::FileControlError>
     {
-        let (connection, post_commit_owner) = self
-            .transaction
+        let (connection, post_commit_owner) = self.commit_with_owner().await?;
+        post_commit_owner
+            .shutdown()
+            .map_err(claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure)?;
+        Ok(connection)
+    }
+
+    async fn commit_with_owner(
+        mut self,
+    ) -> Result<
+        (
+            sqlx::pool::PoolConnection<sqlx::Sqlite>,
+            claw_sqlite_file_control::BlockingCleanupOwner,
+        ),
+        claw_sqlite_file_control::FileControlError,
+    > {
+        self.transaction
             .take()
             .expect("verified write transaction remains owned")
             .commit_with_deadline(
@@ -285,11 +464,7 @@ impl VerifiedWriteTransaction {
                 self.restore_busy_timeout,
                 None,
             )
-            .await?;
-        post_commit_owner
-            .shutdown()
-            .map_err(claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure)?;
-        Ok(connection)
+            .await
     }
 
     async fn rollback_after_error(
@@ -544,6 +719,28 @@ impl<'store> SessionRepository<'store> {
 
     /// Reads one session.
     pub async fn get(&self, id: &SessionId) -> Result<Option<SessionRecord>, StateError> {
+        if self.identity.is_protected() {
+            let id = id.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "read session",
+                move |connection| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "SELECT id, status, created_at_ms, updated_at_ms, version
+                             FROM sessions WHERE id = ?",
+                        )
+                        .bind(id.as_str())
+                        .fetch_optional(&mut *connection)
+                        .await
+                        .map_err(|error| database("read session", error))?;
+                        row.map(session_from_row).transpose()
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "read session", async {
             let row = sqlx::query(
                 "SELECT id, status, created_at_ms, updated_at_ms, version
@@ -560,6 +757,41 @@ impl<'store> SessionRepository<'store> {
 
     /// Lists sessions in stable creation-time and identifier order.
     pub async fn list(&self, request: &PageRequest) -> Result<Page<SessionRecord>, StateError> {
+        if self.identity.is_protected() {
+            let request = request.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "list sessions",
+                move |connection| {
+                    Box::pin(async move {
+                        let (after_time, after_id) = request.after_parts();
+                        let rows = sqlx::query(
+                            "SELECT id, status, created_at_ms, updated_at_ms, version
+                             FROM sessions
+                             WHERE (created_at_ms, id) > (?, ?)
+                             ORDER BY created_at_ms, id
+                             LIMIT ?",
+                        )
+                        .bind(after_time)
+                        .bind(after_id)
+                        .bind(request.query_limit())
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|error| database("list sessions", error))?;
+                        let items = rows
+                            .into_iter()
+                            .map(session_from_row)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(finish_page(items, request.limit(), |record| {
+                            PageCursor::new(record.created_at, record.id.as_str())
+                                .expect("persisted session id is a valid cursor")
+                        }))
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "list sessions", async {
             let (after_time, after_id) = request.after_parts();
             let rows = sqlx::query(
@@ -751,6 +983,28 @@ impl<'store> DeviceRepository<'store> {
 
     /// Reads one device.
     pub async fn get(&self, id: &DeviceId) -> Result<Option<DeviceRecord>, StateError> {
+        if self.identity.is_protected() {
+            let id = id.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "read device",
+                move |connection| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "SELECT id, display_name, created_at_ms, updated_at_ms, version
+                             FROM devices WHERE id = ?",
+                        )
+                        .bind(id.as_str())
+                        .fetch_optional(&mut *connection)
+                        .await
+                        .map_err(|error| database("read device", error))?;
+                        row.map(device_from_row).transpose()
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "read device", async {
             let row = sqlx::query(
                 "SELECT id, display_name, created_at_ms, updated_at_ms, version
@@ -767,6 +1021,41 @@ impl<'store> DeviceRepository<'store> {
 
     /// Lists devices in stable creation-time and identifier order.
     pub async fn list(&self, request: &PageRequest) -> Result<Page<DeviceRecord>, StateError> {
+        if self.identity.is_protected() {
+            let request = request.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "list devices",
+                move |connection| {
+                    Box::pin(async move {
+                        let (after_time, after_id) = request.after_parts();
+                        let rows = sqlx::query(
+                            "SELECT id, display_name, created_at_ms, updated_at_ms, version
+                             FROM devices
+                             WHERE (created_at_ms, id) > (?, ?)
+                             ORDER BY created_at_ms, id
+                             LIMIT ?",
+                        )
+                        .bind(after_time)
+                        .bind(after_id)
+                        .bind(request.query_limit())
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|error| database("list devices", error))?;
+                        let items = rows
+                            .into_iter()
+                            .map(device_from_row)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(finish_page(items, request.limit(), |record| {
+                            PageCursor::new(record.created_at, record.id.as_str())
+                                .expect("persisted device id is a valid cursor")
+                        }))
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "list devices", async {
             let (after_time, after_id) = request.after_parts();
             let rows = sqlx::query(
@@ -911,6 +1200,28 @@ impl<'store> AuthenticationRepository<'store> {
         &self,
         id: &AuthenticationId,
     ) -> Result<Option<AuthenticationRecord>, StateError> {
+        if self.identity.is_protected() {
+            let id = id.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "read authentication",
+                move |connection| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
+                             FROM authentication_records WHERE id = ?",
+                        )
+                        .bind(id.as_str())
+                        .fetch_optional(&mut *connection)
+                        .await
+                        .map_err(|error| database("read authentication", error))?;
+                        row.map(authentication_from_row).transpose()
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "read authentication", async {
             let row = sqlx::query(
                 "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
@@ -931,6 +1242,44 @@ impl<'store> AuthenticationRepository<'store> {
         device_id: &DeviceId,
         request: &PageRequest,
     ) -> Result<Page<AuthenticationRecord>, StateError> {
+        if self.identity.is_protected() {
+            let device_id = device_id.clone();
+            let request = request.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "list authentications",
+                move |connection| {
+                    Box::pin(async move {
+                        let (after_time, after_id) = request.after_parts();
+                        let rows = sqlx::query(
+                            "SELECT id, device_id, provider, subject, status, created_at_ms, updated_at_ms, version
+                             FROM authentication_records
+                             WHERE device_id = ?
+                               AND (created_at_ms, id) > (?, ?)
+                             ORDER BY created_at_ms, id
+                             LIMIT ?",
+                        )
+                        .bind(device_id.as_str())
+                        .bind(after_time)
+                        .bind(after_id)
+                        .bind(request.query_limit())
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|error| database("list authentications", error))?;
+                        let items = rows
+                            .into_iter()
+                            .map(authentication_from_row)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(finish_page(items, request.limit(), |record| {
+                            PageCursor::new(record.created_at, record.id.as_str())
+                                .expect("persisted authentication id is a valid cursor")
+                        }))
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "list authentications", async {
             let (after_time, after_id) = request.after_parts();
             let rows = sqlx::query(
@@ -1085,6 +1434,28 @@ impl<'store> TaskRepository<'store> {
 
     /// Reads one task.
     pub async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, StateError> {
+        if self.identity.is_protected() {
+            let id = id.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "read task",
+                move |connection| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
+                             FROM tasks WHERE id = ?",
+                        )
+                        .bind(id.as_str())
+                        .fetch_optional(&mut *connection)
+                        .await
+                        .map_err(|error| database("read task", error))?;
+                        row.map(task_from_row).transpose()
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "read task", async {
             let row = sqlx::query(
                 "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
@@ -1105,6 +1476,44 @@ impl<'store> TaskRepository<'store> {
         session_id: &SessionId,
         request: &PageRequest,
     ) -> Result<Page<TaskRecord>, StateError> {
+        if self.identity.is_protected() {
+            let session_id = session_id.clone();
+            let request = request.clone();
+            return protected_read_with_deadline(
+                self.pool,
+                self.identity,
+                "list tasks",
+                move |connection| {
+                    Box::pin(async move {
+                        let (after_time, after_id) = request.after_parts();
+                        let rows = sqlx::query(
+                            "SELECT id, session_id, kind, payload, status, created_at_ms, updated_at_ms, version
+                             FROM tasks
+                             WHERE session_id = ?
+                               AND (created_at_ms, id) > (?, ?)
+                             ORDER BY created_at_ms, id
+                             LIMIT ?",
+                        )
+                        .bind(session_id.as_str())
+                        .bind(after_time)
+                        .bind(after_id)
+                        .bind(request.query_limit())
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|error| database("list tasks", error))?;
+                        let items = rows
+                            .into_iter()
+                            .map(task_from_row)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(finish_page(items, request.limit(), |record| {
+                            PageCursor::new(record.created_at, record.id.as_str())
+                                .expect("persisted task id is a valid cursor")
+                        }))
+                    })
+                },
+            )
+            .await;
+        }
         read_with_deadline(self.identity, "list tasks", async {
             let (after_time, after_id) = request.after_parts();
             let rows = sqlx::query(
@@ -1227,6 +1636,19 @@ async fn begin_verified_write_with_deadline(
     operation: &'static str,
     timing: RepositoryDeadline,
 ) -> Result<VerifiedWriteTransaction, StateError> {
+    let protected = identity.is_protected();
+    let protected_admission = if protected {
+        Some(acquire_protected_repository_admission(identity, &timing, operation).await?)
+    } else {
+        None
+    };
+    let (protected_connection_owner, protected_transaction_owners) = if protected {
+        let (connection_owner, transaction_owners) =
+            reserve_protected_write_owners(timing.deadline, operation, timing.timeout_ms).await?;
+        (Some(connection_owner), Some(transaction_owners))
+    } else {
+        (None, None)
+    };
     let connection = timing
         .run(operation, async {
             pool.acquire()
@@ -1240,8 +1662,19 @@ async fn begin_verified_write_with_deadline(
         cancelled,
         timeout_ms,
     } = timing;
-    let active =
-        match claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
+    let begin = if let Some(owners) = protected_transaction_owners {
+        claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines_and_owners(
+            connection,
+            deadline,
+            cleanup_deadline,
+            identity.busy_timeout,
+            identity.busy_timeout,
+            Some(Arc::clone(&cancelled)),
+            owners,
+        )
+        .await
+    } else {
+        claw_sqlite_file_control::begin_manual_pool_transaction_with_restore_deadlines(
             connection,
             deadline,
             cleanup_deadline,
@@ -1250,24 +1683,27 @@ async fn begin_verified_write_with_deadline(
             Some(Arc::clone(&cancelled)),
         )
         .await
-        {
-            Ok(active) => active,
-            Err(error) => {
-                let begin_operation = "lock and verify application writer";
-                if std::time::Instant::now() >= deadline || error.code() == Some(9) {
-                    return Err(StateError::OperationTimedOut {
-                        operation,
-                        timeout_ms,
-                    });
-                }
-                return Err(error.code().map_or_else(
-                    || database(begin_operation, sqlx::Error::Protocol(error.to_string())),
-                    |code| database_code(begin_operation, code, error.to_string()),
-                ));
+    };
+    let active = match begin {
+        Ok(active) => active,
+        Err(error) => {
+            let begin_operation = "lock and verify application writer";
+            if std::time::Instant::now() >= deadline || error.code() == Some(9) {
+                return Err(StateError::OperationTimedOut {
+                    operation,
+                    timeout_ms,
+                });
             }
-        };
+            return Err(error.code().map_or_else(
+                || database(begin_operation, sqlx::Error::Protocol(error.to_string())),
+                |code| database_code(begin_operation, code, error.to_string()),
+            ));
+        }
+    };
+    drop(protected_admission);
     let mut transaction = VerifiedWriteTransaction {
         transaction: Some(active),
+        protected_connection_owner,
         deadline,
         cleanup_deadline,
         cancelled,
@@ -1437,6 +1873,53 @@ async fn wait_at_identity_invalidation_test_barrier(owner: &str) {
     }
 }
 
+fn map_verified_commit_error(
+    error: claw_sqlite_file_control::FileControlError,
+    operation: &'static str,
+    deadline: std::time::Instant,
+    timeout_ms: u64,
+) -> StateError {
+    match error {
+        claw_sqlite_file_control::FileControlError::CommittedAfterDeadline(cleanup) => {
+            StateError::CommittedAfterDeadline { operation, cleanup }
+        }
+        claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure(cleanup) => {
+            StateError::CommittedWithCleanupFailure { operation, cleanup }
+        }
+        claw_sqlite_file_control::FileControlError::CommitOutcomeUncertain(code, message) => {
+            StateError::CommitOutcomeUncertain {
+                operation,
+                code,
+                message,
+            }
+        }
+        claw_sqlite_file_control::FileControlError::IdentityCommitVetoed(veto, cleanup) => {
+            let primary = StateError::InvalidPath {
+                path: veto.path().to_owned(),
+                reason: veto.reason(),
+            };
+            match cleanup {
+                Some(cleanup) => StateError::OperationCleanupFailed {
+                    operation,
+                    primary: Box::new(primary),
+                    cleanup,
+                },
+                None => primary,
+            }
+        }
+        other if other.code() == Some(9) && std::time::Instant::now() >= deadline => {
+            StateError::OperationTimedOut {
+                operation,
+                timeout_ms,
+            }
+        }
+        other => other.code().map_or_else(
+            || database(operation, sqlx::Error::Protocol(other.to_string())),
+            |code| database_code(operation, code, other.to_string()),
+        ),
+    }
+}
+
 async fn commit_verified(
     mut transaction: VerifiedWriteTransaction,
     owner: &str,
@@ -1535,6 +2018,17 @@ async fn commit_verified(
         operation,
         transaction.ensure_within_deadline(operation)
     );
+    let protected = identity.is_protected();
+    let protected_cleanup_owner = if protected {
+        Some(
+            transaction
+                .protected_connection_owner
+                .take()
+                .expect("protected connection owner was reserved before pool acquisition"),
+        )
+    } else {
+        None
+    };
     #[cfg(test)]
     wait_at_commit_test_barrier(owner).await;
     rollback_on_error!(
@@ -1543,73 +2037,58 @@ async fn commit_verified(
         transaction.ensure_within_deadline(operation)
     );
     let deadline = transaction.deadline;
+    let cleanup_deadline = transaction.cleanup_deadline;
     let timeout_ms = transaction.timeout_ms;
-    let committed = transaction
-        .commit()
-        .await
-        .map(drop)
-        .map_err(|error| match error {
-            claw_sqlite_file_control::FileControlError::CommittedAfterDeadline(cleanup) => {
-                StateError::CommittedAfterDeadline { operation, cleanup }
-            }
-            claw_sqlite_file_control::FileControlError::CommittedWithCleanupFailure(cleanup) => {
-                StateError::CommittedWithCleanupFailure { operation, cleanup }
-            }
-            claw_sqlite_file_control::FileControlError::CommitOutcomeUncertain(code, message) => {
-                StateError::CommitOutcomeUncertain {
-                    operation,
-                    code,
-                    message,
-                }
-            }
-            claw_sqlite_file_control::FileControlError::IdentityCommitVetoed(veto, cleanup) => {
-                let primary = StateError::InvalidPath {
-                    path: veto.path().to_owned(),
-                    reason: veto.reason(),
-                };
-                match cleanup {
-                    Some(cleanup) => StateError::OperationCleanupFailed {
-                        operation,
-                        primary: Box::new(primary),
-                        cleanup,
-                    },
-                    None => primary,
-                }
-            }
-            other if other.code() == Some(9) && std::time::Instant::now() >= deadline => {
-                StateError::OperationTimedOut {
-                    operation,
-                    timeout_ms,
-                }
-            }
-            other => other.code().map_or_else(
-                || database(operation, sqlx::Error::Protocol(other.to_string())),
-                |code| database_code(operation, code, other.to_string()),
-            ),
-        });
-    committed?;
-    if identity.is_protected() {
-        #[cfg(test)]
-        wait_at_post_commit_test_barrier(owner).await;
-        identity
-            .verify_protected()
-            .map_err(|error| StateError::CommittedWithCleanupFailure {
-                operation,
-                cleanup: format!(
-                    "post-commit LinuxProtected identity verification failed: {error}"
-                ),
-            })?;
-        if std::time::Instant::now() >= deadline {
-            Err(StateError::CommittedAfterDeadline {
-                operation,
-                cleanup: None,
-            })
-        } else {
-            Ok(())
-        }
-    } else {
-        Ok(())
+    if !protected {
+        return transaction
+            .commit()
+            .await
+            .map(drop)
+            .map_err(|error| map_verified_commit_error(error, operation, deadline, timeout_ms));
     }
+    let (connection, post_commit_owner) = transaction
+        .commit_with_owner()
+        .await
+        .map_err(|error| map_verified_commit_error(error, operation, deadline, timeout_ms))?;
+    let connection = ProtectedConnectionGuard::new(
+        connection,
+        protected_cleanup_owner.expect("protected cleanup owner was reserved"),
+    );
+    if let Err(cleanup) = post_commit_owner.shutdown() {
+        let close = connection.discard_until(cleanup_deadline).await;
+        let cleanup = if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+            cleanup
+        } else {
+            format!("{cleanup}; protected terminal close: {close:?}")
+        };
+        return Err(StateError::CommittedWithCleanupFailure { operation, cleanup });
+    }
+    #[cfg(test)]
+    wait_at_post_commit_test_barrier(owner).await;
+    if let Err(error) = identity.verify_protected() {
+        let close = connection.discard_until(cleanup_deadline).await;
+        let mut cleanup =
+            format!("post-commit LinuxProtected identity verification failed: {error}");
+        if close != claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+            cleanup.push_str(&format!("; protected terminal close: {close:?}"));
+        }
+        return Err(StateError::CommittedWithCleanupFailure { operation, cleanup });
+    }
+    if std::time::Instant::now() >= deadline {
+        let close = connection.discard_until(cleanup_deadline).await;
+        return Err(StateError::CommittedAfterDeadline {
+            operation,
+            cleanup: (close != claw_sqlite_file_control::TerminalCloseOutcome::Closed)
+                .then(|| format!("protected terminal close: {close:?}")),
+        });
+    }
+    connection
+        .accept()
+        .await
+        .map_err(|cleanup| StateError::CommittedWithCleanupFailure {
+            operation,
+            cleanup: format!("release protected post-commit connection owner failed: {cleanup}"),
+        })
 }
 
 #[cfg(test)]
@@ -2281,6 +2760,17 @@ pub(crate) mod test_support {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn clear_post_commit_barrier(owner: &str) {
+        if let Some(barrier) = POST_COMMIT_TEST_BARRIERS
+            .lock()
+            .expect("post-commit test barriers lock poisoned")
+            .remove(owner)
+        {
+            barrier.release.notify_waiters();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_protected_read_post_barrier()
     -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -2297,6 +2787,17 @@ pub(crate) mod test_support {
             "protected read post-test barrier is installed once"
         );
         (entered, release)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear_protected_read_post_barrier() {
+        if let Some(barrier) = PROTECTED_READ_POST_TEST_BARRIER
+            .lock()
+            .expect("protected read post-test barrier lock poisoned")
+            .take()
+        {
+            barrier.release.notify_waiters();
+        }
     }
 
     pub(crate) fn set_read_barrier(

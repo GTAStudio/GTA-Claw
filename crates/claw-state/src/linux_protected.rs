@@ -124,6 +124,7 @@ pub(crate) struct ProtectedNamespace {
     expected_uid: u32,
     expected_gid: u32,
     publication_gate: Arc<tokio::sync::Mutex<()>>,
+    repository_admission: Arc<tokio::sync::Semaphore>,
     observed_generation: Mutex<Option<u64>>,
 }
 
@@ -200,6 +201,7 @@ impl ProtectedNamespace {
             expected_uid: spec.expected_uid,
             expected_gid: spec.expected_gid,
             publication_gate: Arc::new(tokio::sync::Mutex::new(())),
+            repository_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             observed_generation: Mutex::new(None),
         });
         namespace.verify()?;
@@ -272,6 +274,10 @@ impl ProtectedNamespace {
 
     pub(crate) fn publication_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.publication_gate)
+    }
+
+    pub(crate) fn repository_admission(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.repository_admission)
     }
 
     pub(crate) fn verify(&self) -> Result<(), StateError> {
@@ -1136,6 +1142,7 @@ mod tests {
     const SERVICE_CHILD_ENV: &str = "GTA_CLAW_LP2_SERVICE_CHILD";
     const NAMESPACE_ENV: &str = "GTA_CLAW_LP2_NAMESPACE";
     const READY_ENV: &str = "GTA_CLAW_LP2_READY";
+    const CONTROL_ENV: &str = "GTA_CLAW_LP2_CONTROL";
     const NORMAL_CHILD: &str = "normal";
     const CRASH_CHILD: &str = "crash";
     const LOCK_PROBE_CHILD: &str = "lock-probe";
@@ -1144,6 +1151,7 @@ mod tests {
     const GROUP_MISMATCH_CHILD: &str = "group-mismatch";
     const DEADLINE_CHILD: &str = "deadline";
     const REPOSITORY_OUTCOME_CHILD: &str = "repository-outcome";
+    const REPOSITORY_TEMP_MARKER: &str = "lp2_post_fence_marker";
     const ROOT_TEST_NAME: &str =
         "linux_protected::tests::linux_protected_root_lifecycle_and_catalog";
     const SERVICE_UID: u32 = 65_534;
@@ -1153,6 +1161,7 @@ mod tests {
         outer: PathBuf,
         namespace: PathBuf,
         ready: PathBuf,
+        control: PathBuf,
     }
 
     struct ChildGuard(Option<Child>);
@@ -1167,6 +1176,12 @@ mod tests {
             child.kill().expect("send SIGKILL to protected child");
             let status = child.wait().expect("reap protected child");
             assert_eq!(status.signal(), Some(9));
+        }
+
+        fn wait_success(&mut self, operation: &str) {
+            let mut child = self.0.take().expect("protected child remains owned");
+            let status = child.wait().expect("wait for protected child");
+            assert!(status.success(), "{operation} failed with {status}");
         }
     }
 
@@ -1432,19 +1447,28 @@ mod tests {
             provisioned_identities
         );
         let ready = outer.join("service.ready");
-        File::create(&ready).expect("precreate service readiness file");
-        fs::set_permissions(&ready, fs::Permissions::from_mode(0o600))
-            .expect("secure service readiness file");
-        chown(&ready, Some(SERVICE_UID), Some(SERVICE_GID))
-            .expect("assign readiness file to service");
+        let control = outer.join("service.control");
+        for path in [&ready, &control] {
+            File::create(path).expect("precreate service control file");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("secure service control file");
+            chown(path, Some(SERVICE_UID), Some(SERVICE_GID))
+                .expect("assign control file to service");
+        }
         RootFixture {
             outer,
             namespace,
             ready,
+            control,
         }
     }
 
-    fn service_child_command(namespace: &Path, ready: &Path, mode: &str) -> Command {
+    fn service_child_command(
+        namespace: &Path,
+        ready: &Path,
+        control: &Path,
+        mode: &str,
+    ) -> Command {
         let mut command = Command::new("/usr/bin/setpriv");
         command
             .arg(format!("--reuid={SERVICE_UID}"))
@@ -1464,6 +1488,7 @@ mod tests {
             .env(SERVICE_CHILD_ENV, mode)
             .env(NAMESPACE_ENV, namespace)
             .env(READY_ENV, ready)
+            .env(CONTROL_ENV, control)
             .env_remove(ROOT_DRIVER_ENV);
         command
     }
@@ -1488,6 +1513,7 @@ mod tests {
             .env_remove(SERVICE_CHILD_ENV)
             .env_remove(NAMESPACE_ENV)
             .env_remove(READY_ENV)
+            .env_remove(CONTROL_ENV)
             .output()
             .expect("passwordless sudo -n is required for LinuxProtected acceptance");
         assert!(
@@ -2162,7 +2188,108 @@ mod tests {
         store.close().await.expect("close deadline protected store");
     }
 
-    async fn run_repository_outcome_service(namespace: &Path) {
+    async fn install_repository_temp_marker(store: &StateStore) {
+        let mut connection = test_support::pool(store)
+            .acquire()
+            .await
+            .expect("acquire sole connection for TEMP marker");
+        sqlx::query("CREATE TEMP TABLE lp2_post_fence_marker(value INTEGER)")
+            .execute(&mut *connection)
+            .await
+            .expect("create TEMP marker on sole protected connection");
+    }
+
+    async fn assert_repository_pool_blocked(store: &StateStore) {
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            test_support::pool(store).acquire(),
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(Err(error)) => panic!("blocked protected acquire failed early: {error}"),
+            Ok(Ok(mut connection)) => {
+                let marker = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_temp_master
+                     WHERE type = 'table' AND name = ?",
+                )
+                .bind(REPOSITORY_TEMP_MARKER)
+                .fetch_one(&mut *connection)
+                .await
+                .expect("inspect unexpectedly reacquired TEMP marker");
+                panic!("protected post-fence released its sole connection early; marker={marker}");
+            }
+        }
+    }
+
+    async fn assert_replacement_connection(store: &StateStore) {
+        let mut replacement =
+            tokio::time::timeout(Duration::from_secs(5), test_support::pool(store).acquire())
+                .await
+                .expect("replacement protected connection acquire remains bounded")
+                .expect("acquire replacement protected connection");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_temp_master
+                 WHERE type = 'table' AND name = ?",
+            )
+            .bind(REPOSITORY_TEMP_MARKER)
+            .fetch_one(&mut *replacement)
+            .await
+            .expect("inspect replacement TEMP schema"),
+            0,
+            "terminally discarded connection cannot carry its TEMP marker into replacement",
+        );
+        assert_repository_pool_blocked(store).await;
+        drop(replacement);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while test_support::pool(store).num_idle() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement returns exactly one idle protected connection");
+        assert_eq!(test_support::pool(store).size(), 1);
+        assert_eq!(test_support::pool(store).num_idle(), 1);
+    }
+
+    fn write_control_value(path: &Path, value: &str) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open preprovisioned repository control file");
+        std::io::Write::write_all(&mut file, value.as_bytes())
+            .expect("write repository control value");
+        file.sync_all().expect("sync repository control value");
+    }
+
+    fn read_control_value(path: &Path) -> String {
+        fs::read_to_string(path)
+            .expect("read repository control value")
+            .trim()
+            .to_owned()
+    }
+
+    async fn request_root_repository_action(
+        ready: &Path,
+        control: &Path,
+        request: &str,
+        acknowledgement: &str,
+    ) {
+        write_control_value(ready, request);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while read_control_value(control) != acknowledgement {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("root did not acknowledge repository action {request} as {acknowledgement}")
+        });
+    }
+
+    async fn run_repository_outcome_service(namespace: &Path, ready: &Path, control: &Path) {
         assert_service_credentials();
         let config = service_config(namespace).with_operation_timeout(Duration::from_millis(500));
         let store = Arc::new(
@@ -2187,6 +2314,28 @@ mod tests {
             .create(&read_session)
             .await
             .expect("seed protected read deadline record");
+        install_repository_temp_marker(&store).await;
+        let (read_entered, read_release) =
+            repository_test_support::set_protected_read_post_barrier();
+        let read_store = Arc::clone(&store);
+        let read_id = read_session.id.clone();
+        let read = tokio::spawn(async move { read_store.sessions().get(&read_id).await });
+        tokio::time::timeout(Duration::from_secs(5), read_entered.notified())
+            .await
+            .expect("protected read reaches post-read identity barrier");
+        assert_repository_pool_blocked(&store).await;
+        request_root_repository_action(ready, control, "read-tamper", "read-tampered").await;
+        read_release.notify_one();
+        assert!(matches!(
+            read.await
+                .expect("protected identity read task joins")
+                .expect_err("protected post-read identity mismatch must fail"),
+            StateError::InvalidPath { .. }
+        ));
+        request_root_repository_action(ready, control, "read-restore", "read-restored").await;
+        assert_replacement_connection(&store).await;
+
+        install_repository_temp_marker(&store).await;
         let (read_entered, read_release) =
             repository_test_support::set_protected_read_post_barrier();
         let read_store = Arc::clone(&store);
@@ -2195,6 +2344,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), read_entered.notified())
             .await
             .expect("protected read reaches post-read deadline barrier");
+        assert_repository_pool_blocked(&store).await;
         tokio::time::sleep(Duration::from_millis(550)).await;
         read_release.notify_one();
         assert!(matches!(
@@ -2203,6 +2353,7 @@ mod tests {
                 .expect_err("protected post-read deadline must expire"),
             StateError::OperationTimedOut { .. }
         ));
+        assert_replacement_connection(&store).await;
 
         let identity_session = SessionRecord::new(
             SessionId::new("lp2-protected-committed-identity")
@@ -2211,6 +2362,7 @@ mod tests {
         );
         let (commit_entered, commit_release) =
             repository_test_support::set_post_commit_barrier(&owner);
+        install_repository_temp_marker(&store).await;
         let identity_store = Arc::clone(&store);
         let identity_record = identity_session.clone();
         let identity_write =
@@ -2218,9 +2370,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), commit_entered.notified())
             .await
             .expect("protected write reaches post-commit identity barrier");
-        let metadata_path = namespace.join(SNAPSHOT_METADATA_NAMES[0]);
-        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o640))
-            .expect("inject post-commit protected identity mismatch");
+        assert_repository_pool_blocked(&store).await;
+        request_root_repository_action(ready, control, "commit-tamper", "commit-tampered").await;
         commit_release.notify_one();
         let error = identity_write
             .await
@@ -2231,8 +2382,8 @@ mod tests {
             StateError::CommittedWithCleanupFailure { .. }
         ));
         assert_eq!(error.write_outcome(), WriteOutcome::Committed);
-        fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o600))
-            .expect("restore post-commit protected identity");
+        request_root_repository_action(ready, control, "commit-restore", "commit-restored").await;
+        assert_replacement_connection(&store).await;
         assert_eq!(
             store
                 .sessions()
@@ -2249,6 +2400,7 @@ mod tests {
         );
         let (commit_entered, commit_release) =
             repository_test_support::set_post_commit_barrier(&owner);
+        install_repository_temp_marker(&store).await;
         let deadline_store = Arc::clone(&store);
         let deadline_record = deadline_session.clone();
         let deadline_write =
@@ -2256,6 +2408,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), commit_entered.notified())
             .await
             .expect("protected write reaches post-commit deadline barrier");
+        assert_repository_pool_blocked(&store).await;
         tokio::time::sleep(Duration::from_millis(550)).await;
         commit_release.notify_one();
         let error = deadline_write
@@ -2264,6 +2417,7 @@ mod tests {
             .expect_err("late protected commit delivery must be reported");
         assert!(matches!(error, StateError::CommittedAfterDeadline { .. }));
         assert_eq!(error.write_outcome(), WriteOutcome::Committed);
+        assert_replacement_connection(&store).await;
         assert_eq!(
             store
                 .sessions()
@@ -2272,6 +2426,103 @@ mod tests {
                 .expect("read deadline-committed record"),
             Some(deadline_session)
         );
+
+        install_repository_temp_marker(&store).await;
+        let (read_entered, _read_release) =
+            repository_test_support::set_protected_read_post_barrier();
+        let cancelled_read_store = Arc::clone(&store);
+        let cancelled_read_id = read_session.id.clone();
+        let cancelled_read = tokio::spawn(async move {
+            cancelled_read_store
+                .sessions()
+                .get(&cancelled_read_id)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), read_entered.notified())
+            .await
+            .expect("cancelled protected read reaches post-read barrier");
+        assert_repository_pool_blocked(&store).await;
+        cancelled_read.abort();
+        assert!(
+            cancelled_read
+                .await
+                .expect_err("protected read task is cancelled")
+                .is_cancelled()
+        );
+        repository_test_support::clear_protected_read_post_barrier();
+        assert_replacement_connection(&store).await;
+
+        let cancelled_session = SessionRecord::new(
+            SessionId::new("lp2-protected-committed-cancelled")
+                .expect("valid cancelled commit session id"),
+            TimestampMs::new(23).expect("valid cancelled commit timestamp"),
+        );
+        install_repository_temp_marker(&store).await;
+        let (commit_entered, _commit_release) =
+            repository_test_support::set_post_commit_barrier(&owner);
+        let cancelled_write_store = Arc::clone(&store);
+        let cancelled_record = cancelled_session.clone();
+        let cancelled_write = tokio::spawn(async move {
+            cancelled_write_store
+                .sessions()
+                .create(&cancelled_record)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), commit_entered.notified())
+            .await
+            .expect("cancelled protected write reaches post-commit barrier");
+        assert_repository_pool_blocked(&store).await;
+        cancelled_write.abort();
+        assert!(
+            cancelled_write
+                .await
+                .expect_err("protected write task is cancelled")
+                .is_cancelled()
+        );
+        repository_test_support::clear_post_commit_barrier(&owner);
+        assert_replacement_connection(&store).await;
+        assert_eq!(
+            store
+                .sessions()
+                .get(&cancelled_session.id)
+                .await
+                .expect("read caller-cancelled committed record"),
+            Some(cancelled_session)
+        );
+
+        install_repository_temp_marker(&store).await;
+        let (runtime_entered, _runtime_release) =
+            repository_test_support::set_protected_read_post_barrier();
+        let runtime_store = Arc::clone(&store);
+        let runtime_read_id = read_session.id.clone();
+        let (drop_runtime_tx, drop_runtime_rx) = std::sync::mpsc::sync_channel(0);
+        let runtime_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build protected read disposable runtime");
+            runtime.spawn(async move {
+                let _ = runtime_store.sessions().get(&runtime_read_id).await;
+            });
+            drop_runtime_rx
+                .recv()
+                .expect("receive protected runtime drop command");
+            drop(runtime);
+        });
+        tokio::time::timeout(Duration::from_secs(5), runtime_entered.notified())
+            .await
+            .expect("runtime-dropped protected read reaches post-read barrier");
+        assert_repository_pool_blocked(&store).await;
+        drop_runtime_tx
+            .send(())
+            .expect("request protected caller runtime destruction");
+        runtime_thread
+            .join()
+            .expect("protected caller runtime thread joins");
+        repository_test_support::clear_protected_read_post_barrier();
+        assert_replacement_connection(&store).await;
+
         assert_eq!(exact_names(namespace), expected_names());
         assert_eq!(entry_identities(namespace), original_identities);
         Arc::try_unwrap(store)
@@ -2291,6 +2542,51 @@ mod tests {
         );
     }
 
+    fn wait_for_control_value(path: &Path, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while read_control_value(path) != expected {
+            assert!(
+                Instant::now() < deadline,
+                "repository control did not reach {expected}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn exercise_repository_outcome_root(fixture: &RootFixture) {
+        write_control_value(&fixture.ready, "");
+        write_control_value(&fixture.control, "");
+        let child = service_child_command(
+            &fixture.namespace,
+            &fixture.ready,
+            &fixture.control,
+            REPOSITORY_OUTCOME_CHILD,
+        )
+        .spawn()
+        .expect("start protected repository outcome child");
+        let mut child = ChildGuard::new(child);
+        let metadata = fixture.namespace.join(SNAPSHOT_METADATA_NAMES[0]);
+        for (request, mode, acknowledgement) in [
+            ("read-tamper", 0o640, "read-tampered"),
+            ("read-restore", 0o600, "read-restored"),
+            ("commit-tamper", 0o640, "commit-tampered"),
+            ("commit-restore", 0o600, "commit-restored"),
+        ] {
+            wait_for_control_value(&fixture.ready, request);
+            fs::set_permissions(&metadata, fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|error| panic!("apply root repository action {request}: {error}"));
+            write_control_value(&fixture.control, acknowledgement);
+        }
+        child.wait_success("LinuxProtected repository outcome lifecycle");
+        assert_eq!(
+            fs::metadata(metadata)
+                .expect("inspect restored repository metadata")
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
     fn exercise_hard_death_root(fixture: &RootFixture) {
         OpenOptions::new()
             .write(true)
@@ -2300,9 +2596,14 @@ mod tests {
             .sync_all()
             .expect("sync reset readiness file");
         let identities = entry_identities(&fixture.namespace);
-        let child = service_child_command(&fixture.namespace, &fixture.ready, CRASH_CHILD)
-            .spawn()
-            .expect("start hard-death protected child");
+        let child = service_child_command(
+            &fixture.namespace,
+            &fixture.ready,
+            &fixture.control,
+            CRASH_CHILD,
+        )
+        .spawn()
+        .expect("start hard-death protected child");
         let mut child = ChildGuard::new(child);
         let deadline = Instant::now() + Duration::from_secs(15);
         while fs::metadata(&fixture.ready)
@@ -2317,18 +2618,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, LOCK_PROBE_CHILD)
-                .output()
-                .expect("run protected process-exclusion probe"),
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                LOCK_PROBE_CHILD,
+            )
+            .output()
+            .expect("run protected process-exclusion probe"),
             "protected process-exclusion probe",
         );
         child.kill_and_wait();
         assert_eq!(exact_names(&fixture.namespace), expected_names());
         assert_eq!(entry_identities(&fixture.namespace), identities);
         assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, RECOVERY_CHILD)
-                .output()
-                .expect("run protected hard-death recovery"),
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                RECOVERY_CHILD,
+            )
+            .output()
+            .expect("run protected hard-death recovery"),
             "protected hard-death recovery",
         );
         assert_eq!(exact_names(&fixture.namespace), expected_names());
@@ -2703,6 +3014,9 @@ mod tests {
             let ready = PathBuf::from(
                 std::env::var_os(READY_ENV).expect("service child receives readiness path"),
             );
+            let control = PathBuf::from(
+                std::env::var_os(CONTROL_ENV).expect("service child receives control path"),
+            );
             match mode.to_str().expect("service child mode is UTF-8") {
                 NORMAL_CHILD => exercise_service_store(&namespace).await,
                 CRASH_CHILD => run_crash_service(&namespace, &ready).await,
@@ -2711,7 +3025,9 @@ mod tests {
                 RUNTIME_DROP_CHILD => run_runtime_drop_service(&namespace),
                 GROUP_MISMATCH_CHILD => run_group_mismatch_service(&namespace).await,
                 DEADLINE_CHILD => run_deadline_service(&namespace).await,
-                REPOSITORY_OUTCOME_CHILD => run_repository_outcome_service(&namespace).await,
+                REPOSITORY_OUTCOME_CHILD => {
+                    run_repository_outcome_service(&namespace, &ready, &control).await
+                }
                 other => panic!("unknown LinuxProtected service child mode: {other}"),
             }
             return;
@@ -2726,39 +3042,54 @@ mod tests {
         let fixture = provision_root_fixture().await;
         let original_identities = entry_identities(&fixture.namespace);
         assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, GROUP_MISMATCH_CHILD)
-                .output()
-                .expect("run supplementary-group rejection child"),
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                GROUP_MISMATCH_CHILD,
+            )
+            .output()
+            .expect("run supplementary-group rejection child"),
             "LinuxProtected supplementary-group rejection",
         );
         assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, NORMAL_CHILD)
-                .output()
-                .expect("run LinuxProtected service child"),
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                NORMAL_CHILD,
+            )
+            .output()
+            .expect("run LinuxProtected service child"),
             "LinuxProtected service lifecycle",
         );
         assert_eq!(exact_names(&fixture.namespace), expected_names());
         assert_eq!(entry_identities(&fixture.namespace), original_identities);
-        assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, REPOSITORY_OUTCOME_CHILD)
-                .output()
-                .expect("run LinuxProtected repository outcome child"),
-            "LinuxProtected repository outcome lifecycle",
-        );
+        exercise_repository_outcome_root(&fixture);
         assert_eq!(exact_names(&fixture.namespace), expected_names());
         assert_eq!(entry_identities(&fixture.namespace), original_identities);
         assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, RUNTIME_DROP_CHILD)
-                .output()
-                .expect("run LinuxProtected runtime-drop child"),
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                RUNTIME_DROP_CHILD,
+            )
+            .output()
+            .expect("run LinuxProtected runtime-drop child"),
             "LinuxProtected runtime-drop lifecycle",
         );
         assert_eq!(exact_names(&fixture.namespace), expected_names());
         assert_eq!(entry_identities(&fixture.namespace), original_identities);
         assert_child_success(
-            service_child_command(&fixture.namespace, &fixture.ready, DEADLINE_CHILD)
-                .output()
-                .expect("run LinuxProtected deadline child"),
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                DEADLINE_CHILD,
+            )
+            .output()
+            .expect("run LinuxProtected deadline child"),
             "LinuxProtected immutable deadline lifecycle",
         );
         assert_eq!(exact_names(&fixture.namespace), expected_names());
