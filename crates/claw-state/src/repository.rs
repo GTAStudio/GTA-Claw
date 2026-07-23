@@ -482,8 +482,10 @@ impl VerifiedWriteTransaction {
         }
         #[cfg(test)]
         self.rollback_cleanup_test.take();
+        let protected_connection_owner = self.protected_connection_owner.take();
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
+        let cleanup_deadline = self.cleanup_deadline;
         let transaction = self
             .transaction
             .take()
@@ -495,8 +497,23 @@ impl VerifiedWriteTransaction {
         .await
         {
             Ok(Ok(connection)) => {
-                drop(connection);
-                primary
+                if let Some(owner) = protected_connection_owner {
+                    let close = ProtectedConnectionGuard::new(connection, owner)
+                        .discard_until(cleanup_deadline)
+                        .await;
+                    if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+                        primary
+                    } else {
+                        StateError::OperationCleanupFailed {
+                            operation,
+                            primary: Box::new(primary),
+                            cleanup: format!("protected rollback terminal close: {close:?}"),
+                        }
+                    }
+                } else {
+                    drop(connection);
+                    primary
+                }
             }
             Ok(Err(error)) => StateError::OperationCleanupFailed {
                 operation,
@@ -2018,6 +2035,13 @@ async fn commit_verified(
         operation,
         transaction.ensure_within_deadline(operation)
     );
+    #[cfg(test)]
+    wait_at_commit_test_barrier(owner).await;
+    rollback_on_error!(
+        transaction,
+        operation,
+        transaction.ensure_within_deadline(operation)
+    );
     let protected = identity.is_protected();
     let protected_cleanup_owner = if protected {
         Some(
@@ -2029,13 +2053,6 @@ async fn commit_verified(
     } else {
         None
     };
-    #[cfg(test)]
-    wait_at_commit_test_barrier(owner).await;
-    rollback_on_error!(
-        transaction,
-        operation,
-        transaction.ensure_within_deadline(operation)
-    );
     let deadline = transaction.deadline;
     let cleanup_deadline = transaction.cleanup_deadline;
     let timeout_ms = transaction.timeout_ms;

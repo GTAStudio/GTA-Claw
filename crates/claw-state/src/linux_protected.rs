@@ -2427,6 +2427,82 @@ mod tests {
             Some(deadline_session)
         );
 
+        let rollback_session = SessionRecord::new(
+            SessionId::new("lp2-protected-rolled-back-identity")
+                .expect("valid rollback identity session id"),
+            TimestampMs::new(24).expect("valid rollback identity timestamp"),
+        );
+        install_repository_temp_marker(&store).await;
+        let (write_entered, write_release) = repository_test_support::set_write_barrier(&owner);
+        let rollback_store = Arc::clone(&store);
+        let rollback_record = rollback_session.clone();
+        let rollback_write =
+            tokio::spawn(async move { rollback_store.sessions().create(&rollback_record).await });
+        tokio::time::timeout(Duration::from_secs(5), write_entered.notified())
+            .await
+            .expect("protected write reaches pre-commit rollback barrier");
+        assert_repository_pool_blocked(&store).await;
+        request_root_repository_action(ready, control, "rollback-tamper", "rollback-tampered")
+            .await;
+        write_release.notify_one();
+        let error = rollback_write
+            .await
+            .expect("protected rollback task joins")
+            .expect_err("pre-commit protected identity mismatch must rollback");
+        assert!(
+            matches!(error, StateError::InvalidPath { .. }),
+            "protected rollback must preserve the exact identity failure: {error:?}"
+        );
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+        request_root_repository_action(ready, control, "rollback-restore", "rollback-restored")
+            .await;
+        assert_replacement_connection(&store).await;
+        assert!(
+            store
+                .sessions()
+                .get(&rollback_session.id)
+                .await
+                .expect("read rolled-back protected record")
+                .is_none()
+        );
+
+        let rollback_deadline_session = SessionRecord::new(
+            SessionId::new("lp2-protected-rolled-back-deadline")
+                .expect("valid rollback deadline session id"),
+            TimestampMs::new(25).expect("valid rollback deadline timestamp"),
+        );
+        install_repository_temp_marker(&store).await;
+        let (commit_entered, commit_release) = repository_test_support::set_commit_barrier(&owner);
+        let rollback_deadline_store = Arc::clone(&store);
+        let rollback_deadline_record = rollback_deadline_session.clone();
+        let rollback_deadline_write = tokio::spawn(async move {
+            rollback_deadline_store
+                .sessions()
+                .create(&rollback_deadline_record)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), commit_entered.notified())
+            .await
+            .expect("protected write reaches pre-commit deadline barrier");
+        assert_repository_pool_blocked(&store).await;
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        commit_release.notify_one();
+        let error = rollback_deadline_write
+            .await
+            .expect("protected deadline rollback task joins")
+            .expect_err("pre-commit protected deadline must rollback");
+        assert!(matches!(error, StateError::OperationTimedOut { .. }));
+        assert_eq!(error.write_outcome(), WriteOutcome::NotCommitted);
+        assert_replacement_connection(&store).await;
+        assert!(
+            store
+                .sessions()
+                .get(&rollback_deadline_session.id)
+                .await
+                .expect("read deadline-rolled-back protected record")
+                .is_none()
+        );
+
         install_repository_temp_marker(&store).await;
         let (read_entered, _read_release) =
             repository_test_support::set_protected_read_post_barrier();
@@ -2571,6 +2647,8 @@ mod tests {
             ("read-restore", 0o600, "read-restored"),
             ("commit-tamper", 0o640, "commit-tampered"),
             ("commit-restore", 0o600, "commit-restored"),
+            ("rollback-tamper", 0o640, "rollback-tampered"),
+            ("rollback-restore", 0o600, "rollback-restored"),
         ] {
             wait_for_control_value(&fixture.ready, request);
             fs::set_permissions(&metadata, fs::Permissions::from_mode(mode))
