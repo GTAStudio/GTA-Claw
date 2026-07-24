@@ -94,8 +94,22 @@ enum OfflineInitializerTestStage {
     MarkerCleanup,
     FinalValidation,
     RollbackTruncate,
-    RollbackEntryFailure,
+    RollbackEntrySyncFailure,
     RollbackSync,
+}
+
+#[cfg(test)]
+impl OfflineInitializerTestStage {
+    const fn failure_reason(self) -> &'static str {
+        match self {
+            Self::SelectorSync => "injected SelectorSync stage failure",
+            Self::SelectorParentSync => "injected SelectorParentSync stage failure",
+            Self::MarkerCleanup => "injected MarkerCleanup stage failure",
+            Self::FinalValidation => "injected FinalValidation stage failure",
+            Self::RollbackEntrySyncFailure => "injected RollbackEntrySyncFailure stage failure",
+            _ => "injected private offline initializer stage failure",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,10 +122,7 @@ fn fail_offline_initializer_stage(
         .expect("offline initializer fault schedule lock poisoned");
     if scheduled.first() == Some(&stage) {
         scheduled.remove(0);
-        Err(invalid_path(
-            path,
-            "injected private offline initializer stage failure",
-        ))
+        Err(invalid_path(path, stage.failure_reason()))
     } else {
         Ok(())
     }
@@ -1515,20 +1526,29 @@ impl ProtectedNamespace {
             SELECTOR_INDEX,
         ] {
             let entry = &self.entries[index];
-            if first_error.is_none()
+            if let Err(error) = entry.file.set_len(0) {
+                first_error = Some(file_error(
+                    "truncate fresh LinuxProtected entry during failed initialization",
+                    &entry.path,
+                    error,
+                ));
+                continue;
+            }
+            if index == DATABASE_INDEX
+                && first_error.is_none()
                 && let Err(error) = fail_offline_initializer_stage(
-                    OfflineInitializerTestStage::RollbackEntryFailure,
+                    OfflineInitializerTestStage::RollbackEntrySyncFailure,
                     &entry.path,
                 )
             {
                 first_error = Some(error);
                 continue;
             }
-            if let Err(error) = entry.file.set_len(0).and_then(|()| entry.file.sync_all())
+            if let Err(error) = entry.file.sync_all()
                 && first_error.is_none()
             {
                 first_error = Some(file_error(
-                    "restore fresh LinuxProtected entry after failed initialization",
+                    "sync fresh LinuxProtected entry during failed initialization",
                     &entry.path,
                     error,
                 ));
@@ -5978,11 +5998,13 @@ mod tests {
             .expect_err("scheduled initializer stage must fail");
             if stage == OfflineInitializerTestStage::SelectorSync {
                 assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
-                assert!(
-                    matches!(error, StateError::PublicationUncertain { .. }),
-                    "SelectorSync must report publication uncertainty: {error:?}"
-                );
-                assert!(error.to_string().contains("durability was confirmed"));
+                let StateError::PublicationUncertain { path, reason } = &error else {
+                    panic!("SelectorSync must report publication uncertainty: {error:?}");
+                };
+                assert_eq!(path, &fixture.namespace.join(SELECTOR_NAME));
+                assert!(reason.contains("durability was confirmed"));
+                assert!(reason.contains(stage.failure_reason()));
+                assert!(error.to_string().contains("publication state is uncertain"));
             } else if matches!(
                 stage,
                 OfflineInitializerTestStage::SelectorParentSync
@@ -5990,9 +6012,15 @@ mod tests {
                     | OfflineInitializerTestStage::FinalValidation
             ) {
                 assert_eq!(error.write_outcome(), WriteOutcome::Committed);
+                let StateError::CommittedWithCleanupFailure { operation, cleanup } = &error else {
+                    panic!("{stage:?} must report committed cleanup degradation: {error:?}");
+                };
+                assert_eq!(*operation, "initialize LinuxProtected state offline");
+                assert!(cleanup.contains(stage.failure_reason()));
                 assert!(
-                    matches!(error, StateError::CommittedWithCleanupFailure { .. }),
-                    "{stage:?} must report committed cleanup degradation: {error:?}"
+                    error
+                        .to_string()
+                        .contains("post-commit finalization failed")
                 );
             } else {
                 assert!(
@@ -6061,10 +6089,6 @@ mod tests {
                 OfflineInitializerTestStage::PrepSync,
                 OfflineInitializerTestStage::RollbackSync,
             ),
-            (
-                OfflineInitializerTestStage::PrepSync,
-                OfflineInitializerTestStage::RollbackEntryFailure,
-            ),
         ] {
             let fixture = fresh_root_fixture();
             let identities = entry_identities(&fixture.namespace);
@@ -6086,11 +6110,7 @@ mod tests {
                     .is_empty()
             );
             assert_eq!(entry_identities(&fixture.namespace), identities);
-            if matches!(
-                rollback,
-                OfflineInitializerTestStage::RollbackSync
-                    | OfflineInitializerTestStage::RollbackEntryFailure
-            ) {
+            if rollback == OfflineInitializerTestStage::RollbackSync {
                 assert_eq!(
                     fs::metadata(fixture.namespace.join(SNAPSHOT_METADATA_NAMES[1]))
                         .expect("inspect retained rollback prep record")
@@ -6109,6 +6129,87 @@ mod tests {
                 LinuxProtectedInitialization::Initialized
             );
         }
+
+        let rollback_entry = fresh_root_fixture();
+        schedule_offline_initializer_fault(OfflineInitializerTestStage::DeathAfterPrep);
+        crate::initialize_linux_protected_offline(
+            &rollback_entry.namespace,
+            SERVICE_UID,
+            SERVICE_GID,
+        )
+        .expect_err("death-after-prep fixture must stop after durable prep");
+        let spec =
+            LinuxProtectedSpec::new(rollback_entry.namespace.clone(), SERVICE_UID, SERVICE_GID);
+        let preflight =
+            OfflineNamespacePreflight::open(&spec).expect("open rollback-entry preflight");
+        let writer_lock = crate::store::acquire_linux_protected_offline_lock(&preflight)
+            .expect("lock rollback-entry fixture");
+        let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)
+            .expect("hold rollback-entry namespace");
+        let captured = namespace.captured_identities();
+        let identities = entry_identities(&rollback_entry.namespace);
+        let expected_prep = namespace.initializer_prep_record();
+        assert_eq!(
+            fs::read(rollback_entry.namespace.join(SNAPSHOT_METADATA_NAMES[1]))
+                .expect("read durable rollback prep record"),
+            expected_prep,
+            "rollback fixture requires exact durable prep bytes"
+        );
+        let database_path = rollback_entry.namespace.join(DATABASE_NAME);
+        let database = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("open rollback sentinel database");
+        write_all_at(&database, b"rollback-sentinel", 0)
+            .and_then(|()| database.sync_all())
+            .expect("durably populate rollback nonmarker sentinel");
+        assert_eq!(
+            fs::read(&database_path).expect("read rollback nonmarker sentinel"),
+            b"rollback-sentinel"
+        );
+        schedule_offline_initializer_fault(OfflineInitializerTestStage::RollbackEntrySyncFailure);
+        let error = rollback_started_fresh(
+            &namespace,
+            captured,
+            invalid_path(&database_path, "injected post-prep primary failure"),
+        );
+        assert!(
+            matches!(error, StateError::OperationCleanupFailed { .. }),
+            "entry sync failure must degrade rollback: {error:?}"
+        );
+        assert!(
+            OFFLINE_INITIALIZER_TEST_FAULT
+                .lock()
+                .expect("offline initializer fault schedule lock poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(rollback_entry.namespace.join(SNAPSHOT_METADATA_NAMES[1]))
+                .expect("reread retained rollback prep record"),
+            expected_prep,
+            "nonmarker rollback sync failure must retain exact prep bytes"
+        );
+        assert_eq!(
+            fs::metadata(&database_path)
+                .expect("inspect actually truncated rollback database")
+                .len(),
+            0,
+            "rollback entry truncate must occur before injected sync failure"
+        );
+        assert_eq!(entry_identities(&rollback_entry.namespace), identities);
+        drop(namespace);
+        drop(writer_lock);
+        drop(preflight);
+        assert_eq!(
+            crate::initialize_linux_protected_offline(
+                &rollback_entry.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect("public retry resumes retained real rollback residue"),
+            LinuxProtectedInitialization::Initialized
+        );
 
         let sparse = fresh_root_fixture();
         assert_eq!(
