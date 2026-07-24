@@ -627,6 +627,7 @@ dependencies = [
  "claw-platform",
  "claw-protocol",
  "claw-state",
+ "sqlx",
  "tokio",
 ]
 

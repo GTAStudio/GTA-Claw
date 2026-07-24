@@ -14,5 +14,8 @@ claw-protocol.workspace = true
 claw-state.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
+[dev-dependencies]
+sqlx.workspace = true
+
 [lints]
 workspace = true

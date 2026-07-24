@@ -1,5 +1,7 @@
 //! Process-level checks for daemon lifecycle modes.
 
+#[cfg(any(unix, windows))]
+use sqlx::Connection as _;
 #[cfg(windows)]
 use std::io::Write;
 use std::io::{BufRead, BufReader, Read};
@@ -144,6 +146,138 @@ fn portable_serve_command(arguments: &[std::ffi::OsString]) -> Command {
         command.creation_flags(0x0000_0200);
     }
     command
+}
+
+#[cfg(any(unix, windows))]
+fn prepare_slow_portable_database(fixture: &StateFixture) {
+    let mut probe_arguments = portable_arguments(&fixture.database);
+    probe_arguments.insert(0, "--probe".into());
+    let mut probe = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    probe.args(probe_arguments);
+    let probe = bounded_output(&mut probe, Duration::from_secs(15));
+    assert!(
+        probe.status.success(),
+        "initialize slow portable fixture: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let script = "import sqlite3,sys\np=sys.argv[1]\nc=sqlite3.connect(p)\nc.execute('PRAGMA journal_mode=DELETE')\nc.execute(\"INSERT INTO sessions(id,status,created_at_ms,updated_at_ms,version) VALUES ('opening-session','active',1,1,1)\")\nc.execute(\"INSERT INTO tasks(id,session_id,kind,payload,status,created_at_ms,updated_at_ms,version) VALUES ('opening-task','opening-session','fixture',CAST(zeroblob(33554432) AS TEXT),'pending',1,1,1)\")\nc.commit()\nc.close()\n";
+    #[cfg(unix)]
+    let python = "/usr/bin/python3";
+    #[cfg(windows)]
+    let python = "python.exe";
+    let mut populate = Command::new(python);
+    populate.arg("-c").arg(script).arg(&fixture.database);
+    let populate = bounded_output(&mut populate, Duration::from_secs(30));
+    assert!(
+        populate.status.success(),
+        "populate slow portable fixture: {}",
+        String::from_utf8_lossy(&populate.stderr)
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn spawn_portable_open_locker(fixture: &StateFixture) -> ChildGuard {
+    let ready = fixture.directory.join("portable-locker.ready");
+    let script = "import pathlib,sqlite3,sys,time\np,ready=sys.argv[1:]\nc=sqlite3.connect(p)\nc.execute('PRAGMA journal_mode=DELETE')\nc.execute('BEGIN EXCLUSIVE')\nc.execute(\"UPDATE sessions SET updated_at_ms=updated_at_ms WHERE id='opening-session'\")\npathlib.Path(ready).write_bytes(b'ready')\ntime.sleep(30)\n";
+    #[cfg(unix)]
+    let python = "/usr/bin/python3";
+    #[cfg(windows)]
+    let python = "python.exe";
+    let child = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(&fixture.database)
+        .arg(&ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start portable database locker");
+    let mut child = ChildGuard(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.is_file() {
+        if let Some(status) = child.0.try_wait().expect("read portable locker status") {
+            let mut stderr = Vec::new();
+            child
+                .0
+                .stderr
+                .take()
+                .expect("portable locker stderr is piped")
+                .read_to_end(&mut stderr)
+                .expect("read portable locker stderr");
+            panic!(
+                "portable locker exited before readiness: {status}; {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "portable locker did not reach its exclusive transaction"
+        );
+        thread::yield_now();
+    }
+    child
+}
+
+#[cfg(any(unix, windows))]
+struct PortableCloseStall {
+    runtime: tokio::runtime::Runtime,
+    connection: Option<sqlx::SqliteConnection>,
+}
+
+#[cfg(any(unix, windows))]
+impl PortableCloseStall {
+    fn start(database: &Path) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create close-stall runtime");
+        let connection = runtime.block_on(async {
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(database)
+                .create_if_missing(false)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(5));
+            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .expect("open close-stall SQLite helper");
+            sqlx::query(
+                "INSERT INTO tasks(
+                    id, session_id, kind, payload, status,
+                    created_at_ms, updated_at_ms, version
+                 ) VALUES (
+                    'close-stall-task', 'opening-session', 'fixture', 'held',
+                    'pending', 2, 2, 1
+                 )",
+            )
+            .execute(&mut connection)
+            .await
+            .expect("commit close-stall WAL frame");
+            sqlx::query("BEGIN")
+                .execute(&mut connection)
+                .await
+                .expect("begin close-stall read transaction");
+            let _: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE id = 'close-stall-task'")
+                    .fetch_one(&mut connection)
+                    .await
+                    .expect("pin close-stall WAL snapshot");
+            connection
+        });
+        Self {
+            runtime,
+            connection: Some(connection),
+        }
+    }
+
+    fn release(mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            self.runtime.block_on(async {
+                let _ = sqlx::query("ROLLBACK").execute(&mut connection).await;
+                let _ = connection.close().await;
+            });
+        }
+    }
 }
 
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -384,7 +518,7 @@ fn read_lines_bounded(
     })?
 }
 
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+#[cfg(any(unix, windows))]
 fn spawn_line_receiver(reader: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -399,6 +533,21 @@ fn spawn_line_receiver(reader: impl Read + Send + 'static) -> mpsc::Receiver<Str
         }
     });
     receiver
+}
+
+#[cfg(any(unix, windows))]
+fn wait_for_lifecycle_phase(lines: &mpsc::Receiver<String>, phase: &str, timeout: Duration) {
+    let expected = format!("gta-claw lifecycle {phase}\n");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = lines
+            .recv_timeout(remaining)
+            .unwrap_or_else(|_| panic!("daemon did not report lifecycle phase {phase}"));
+        if line.replace("\r\n", "\n") == expected {
+            return;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -448,7 +597,7 @@ fn wait_for_process_fact(mut fact: impl FnMut() -> bool, timeout: Duration, fail
 }
 
 #[cfg(target_os = "linux")]
-fn deliver_consumed_then_repeated_signal(process_id: u32, signal_name: &str, signal_number: u32) {
+fn deliver_consumed_signal(process_id: u32, signal_name: &str, signal_number: u32) {
     signal(process_id, "STOP");
     wait_for_process_fact(
         || process_is_stopped(process_id),
@@ -467,7 +616,6 @@ fn deliver_consumed_then_repeated_signal(process_id: u32, signal_name: &str, sig
         Duration::from_secs(2),
         "first shutdown signal was not consumed",
     );
-    signal(process_id, signal_name);
 }
 
 #[cfg(windows)]
@@ -533,6 +681,15 @@ fn signal(process_id: u32, signal: &str) {
             .borrow_mut()
             .get_or_insert_with(WindowsSignalBroker::new)
             .send(process_id);
+    });
+}
+
+#[cfg(windows)]
+fn prepare_signal_broker() {
+    WINDOWS_SIGNAL_BROKER.with(|broker| {
+        broker
+            .borrow_mut()
+            .get_or_insert_with(WindowsSignalBroker::new);
     });
 }
 
@@ -870,7 +1027,7 @@ fn install_uncommitted_rewind_database(fixture: &ProtectedFixture) {
     let ready = fixture.outer.join("rewind.ready");
     fs::copy(fixture.namespace.join("state.sqlite"), &source)
         .expect("copy migrated database for rewind fixture");
-    let script = "import os,sqlite3,sys,time\npath,ready=sys.argv[1:]\nc=sqlite3.connect(path)\nc.execute('PRAGMA journal_mode=WAL')\nc.execute('PRAGMA wal_autocheckpoint=0')\nc.execute('PRAGMA wal_checkpoint(TRUNCATE)')\nc.close()\nc=sqlite3.connect(path)\nc.execute('PRAGMA journal_mode=WAL')\nc.execute('PRAGMA wal_autocheckpoint=0')\nc.execute('PRAGMA cache_size=1')\nc.execute('BEGIN IMMEDIATE')\nc.execute('CREATE TABLE rewind_fixture(value BLOB NOT NULL)')\nfor _ in range(256):\n c.execute('INSERT INTO rewind_fixture VALUES (zeroblob(65536))')\n if os.path.exists(path+'-wal') and os.path.getsize(path+'-wal')>32:\n  open(ready,'wb').close(); break\ntime.sleep(30)\n";
+    let script = "import os,sqlite3,sys,time\npath,ready=sys.argv[1:]\nc=sqlite3.connect(path)\nc.execute('PRAGMA journal_mode=WAL')\nc.execute('PRAGMA wal_autocheckpoint=0')\nc.execute('PRAGMA wal_checkpoint(TRUNCATE)')\nwal_inode=os.stat(path+'-wal').st_ino\nc.execute('PRAGMA cache_size=1')\nc.execute('BEGIN IMMEDIATE')\nc.execute('CREATE TABLE rewind_fixture(value BLOB NOT NULL)')\nfor _ in range(256):\n c.execute('INSERT INTO rewind_fixture VALUES (zeroblob(65536))')\n if os.path.exists(path+'-wal') and os.path.getsize(path+'-wal')>32:\n  assert os.stat(path+'-wal').st_ino==wal_inode\n  open(ready,'wb').write(str(wal_inode).encode())\n  break\ntime.sleep(30)\n";
     let child = Command::new("/usr/bin/python3")
         .arg("-c")
         .arg(script)
@@ -1319,6 +1476,67 @@ fn portable_probe_opens_health_checks_and_closes_state() {
 
 #[cfg(any(unix, windows))]
 #[test]
+fn state_signal_at_opening_never_announces_ready() {
+    let fixture = StateFixture::new();
+    prepare_slow_portable_database(&fixture);
+    let mut locker = spawn_portable_open_locker(&fixture);
+    let arguments = portable_arguments(&fixture.database);
+    #[cfg(windows)]
+    prepare_signal_broker();
+    let child = portable_serve_command(&arguments)
+        .spawn()
+        .expect("opening-phase daemon starts");
+    let mut child = ChildGuard(child);
+    let stderr_lines = spawn_line_receiver(child.0.stderr.take().expect("opening stderr is piped"));
+    wait_for_lifecycle_phase(&stderr_lines, "state-open-pending", Duration::from_secs(5));
+    #[cfg(unix)]
+    signal(child.0.id(), "TERM");
+    #[cfg(windows)]
+    signal(child.0.id(), "BREAK");
+    wait_for_lifecycle_phase(&stderr_lines, "shutdown-requested", Duration::from_secs(5));
+    locker
+        .0
+        .kill()
+        .expect("release portable opening database lock");
+    locker.0.wait().expect("reap portable opening locker");
+    let status = wait_for_exit(&mut child.0, Duration::from_secs(10));
+    if status.is_none() {
+        child
+            .0
+            .kill()
+            .expect("terminate unbounded opening-phase shutdown");
+    }
+    assert!(
+        status.is_some_and(|status| status.code() == Some(0)),
+        "opening-phase shutdown did not exit cleanly with code 0"
+    );
+    let mut stdout = Vec::new();
+    child
+        .0
+        .stdout
+        .take()
+        .expect("opening stdout is piped")
+        .read_to_end(&mut stdout)
+        .expect("read opening-phase stdout");
+    assert!(
+        !String::from_utf8_lossy(&stdout).contains("ready protocol="),
+        "daemon announced readiness after opening-phase shutdown"
+    );
+
+    let mut probe_arguments = arguments;
+    probe_arguments.insert(0, "--probe".into());
+    let mut probe = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    probe.args(probe_arguments);
+    let probe = bounded_output(&mut probe, Duration::from_secs(10));
+    assert!(
+        probe.status.success(),
+        "opening-phase shutdown retained state ownership: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
 fn portable_serve_handles_signals_excludes_second_writer_and_releases_lock() {
     #[cfg(unix)]
     let signal_names = ["TERM", "INT"].as_slice();
@@ -1332,6 +1550,8 @@ fn portable_serve_handles_signals_excludes_second_writer_and_releases_lock() {
             .expect("state-backed daemon starts");
         let mut child = ChildGuard(child);
         let stdout = child.0.stdout.take().expect("daemon stdout is piped");
+        let _stderr_lines =
+            spawn_line_receiver(child.0.stderr.take().expect("daemon stderr is piped"));
         let lines = read_lines_bounded(stdout, 2, Duration::from_secs(10))
             .expect("read state-backed readiness and health");
         assert_eq!(lines[0], "ready protocol=1\n");
@@ -1377,34 +1597,38 @@ fn portable_serve_handles_signals_excludes_second_writer_and_releases_lock() {
     }
 
     let fixture = StateFixture::new();
+    prepare_slow_portable_database(&fixture);
     let arguments = portable_arguments(&fixture.database);
     let child = portable_serve_command(&arguments)
         .spawn()
         .expect("state-backed escalation daemon starts");
     let mut child = ChildGuard(child);
     let stdout = child.0.stdout.take().expect("daemon stdout is piped");
-    #[cfg(not(target_os = "linux"))]
     let stderr_lines = spawn_line_receiver(child.0.stderr.take().expect("daemon stderr is piped"));
     let lines = read_lines_bounded(stdout, 2, Duration::from_secs(10))
         .expect("read escalation readiness and health");
     assert_eq!(lines[0], "ready protocol=1\n");
+    let close_stall = PortableCloseStall::start(&fixture.database);
     #[cfg(unix)]
     let escalation_signal = "TERM";
     #[cfg(windows)]
     let escalation_signal = "BREAK";
     #[cfg(target_os = "linux")]
-    deliver_consumed_then_repeated_signal(child.0.id(), escalation_signal, 15);
+    deliver_consumed_signal(child.0.id(), escalation_signal, 15);
     #[cfg(not(target_os = "linux"))]
-    {
-        signal(child.0.id(), escalation_signal);
-        assert_eq!(
-            stderr_lines
-                .recv_timeout(Duration::from_secs(5))
-                .expect("first portable shutdown signal is acknowledged"),
-            "shutdown requested\n"
-        );
-        signal(child.0.id(), escalation_signal);
-    }
+    signal(child.0.id(), escalation_signal);
+    wait_for_lifecycle_phase(&stderr_lines, "shutdown-requested", Duration::from_secs(5));
+    wait_for_lifecycle_phase(&stderr_lines, "state-close-pending", Duration::from_secs(5));
+    assert!(
+        child
+            .0
+            .try_wait()
+            .expect("read close-stalled daemon status")
+            .is_none(),
+        "daemon exited while close was observably stalled"
+    );
+    let escalated_at = Instant::now();
+    signal(child.0.id(), escalation_signal);
     let status = wait_for_exit(&mut child.0, Duration::from_secs(5));
     if status.is_none() {
         child
@@ -1413,9 +1637,14 @@ fn portable_serve_handles_signals_excludes_second_writer_and_releases_lock() {
             .expect("terminate unbounded portable escalation");
     }
     assert!(
-        status.is_some_and(|status| !status.success()),
-        "second portable shutdown signal produced a clean exit"
+        status.is_some_and(|status| status.code() == Some(2)),
+        "second portable shutdown signal did not produce exact exit code 2"
     );
+    assert!(
+        escalated_at.elapsed() < Duration::from_millis(450),
+        "second portable shutdown signal did not exit immediately"
+    );
+    close_stall.release();
     let mut probe_arguments = arguments;
     probe_arguments.insert(0, "--probe".into());
     let mut probe_command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
@@ -1665,10 +1894,13 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
             .spawn()
             .expect("start slow-open protected daemon");
         let mut child = ChildGuard(child);
+        let stderr_lines =
+            spawn_line_receiver(child.0.stderr.take().expect("slow-open stderr is piped"));
         let acknowledgement = slow_open.outer.join("service.locked");
         let mut monitor =
             spawn_writer_lock_stop_monitor(&slow_open.namespace, child.0.id(), &acknowledgement);
         File::create(&gate).expect("release slow-open service gate");
+        wait_for_lifecycle_phase(&stderr_lines, "state-open-pending", Duration::from_secs(5));
         wait_for_writer_stop(
             &acknowledgement,
             &mut child.0,
@@ -1677,6 +1909,7 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
         );
         signal(child.0.id(), "TERM");
         signal(child.0.id(), "CONT");
+        wait_for_lifecycle_phase(&stderr_lines, "shutdown-requested", Duration::from_secs(10));
         let status = wait_for_exit(&mut child.0, Duration::from_secs(10));
         if status.is_none() {
             child
@@ -2126,10 +2359,15 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
             .expect("start protected daemon for second-signal escalation");
         let mut child = ChildGuard(child);
         let stdout = child.0.stdout.take().expect("protected stdout is piped");
+        let stderr_lines =
+            spawn_line_receiver(child.0.stderr.take().expect("protected stderr is piped"));
         let lines = read_lines_bounded(stdout, 2, Duration::from_secs(10))
             .expect("read protected readiness before escalation");
         assert_eq!(lines[0], "ready protocol=1\n");
-        deliver_consumed_then_repeated_signal(child.0.id(), "TERM", 15);
+        deliver_consumed_signal(child.0.id(), "TERM", 15);
+        wait_for_lifecycle_phase(&stderr_lines, "shutdown-requested", Duration::from_secs(5));
+        let escalated_at = Instant::now();
+        signal(child.0.id(), "TERM");
         let status = wait_for_exit(&mut child.0, Duration::from_secs(5));
         if status.is_none() {
             child
@@ -2138,10 +2376,8 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
                 .expect("terminate unbounded escalated shutdown");
         }
         let status = status.expect("escalated shutdown is bounded");
-        assert!(
-            !status.success(),
-            "second shutdown signal produced a false clean exit"
-        );
+        assert_eq!(status.code(), Some(2));
+        assert!(escalated_at.elapsed() < Duration::from_millis(450));
         let released = bounded_output(
             &mut protected_service_command(&escalated.namespace, true),
             Duration::from_secs(15),

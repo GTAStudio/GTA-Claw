@@ -1,6 +1,4 @@
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
@@ -31,13 +29,25 @@ const WAL_INDEX: usize = 1;
 const WRITER_LOCK_INDEX: usize = 2;
 const SLOT_DATA_INDEX: [usize; 2] = [3, 5];
 const SLOT_METADATA_INDEX: [usize; 2] = [4, 6];
+const PREP_RECORD_INDEX: usize = SLOT_METADATA_INDEX[1];
 const SELECTOR_INDEX: usize = 7;
+const PREP_RECORD_LEN: usize = 128;
+const PREP_RECORD_MAGIC: &[u8; 16] = b"CLAW-INIT-PREP01";
 const SQLITE_PENDING_BYTE: u64 = 0x4000_0000;
 const MAX_RAW_SCHEMA_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_RAW_INDEX_KEY_BYTES: usize = 4 * 1024;
 const MAX_RAW_APPLICATION_ROW_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RAW_TEXT_FIELD_BYTES: usize = MAX_RAW_APPLICATION_ROW_BYTES;
 const MAX_RAW_ID_BYTES: usize = 128;
+// Offline verification is deliberately bounded by the fixed protected-catalog
+// publication ceiling rather than trusting page/frame counts from service-owned bytes.
+const MAX_OFFLINE_DATABASE_BYTES: u64 = protected_catalog::MAX_SNAPSHOT_BYTES;
+const MAX_OFFLINE_WAL_BYTES: u64 = 2 * protected_catalog::MAX_SNAPSHOT_BYTES;
+const MAX_OFFLINE_WAL_FRAMES: usize = 262_144;
+const MAX_OFFLINE_SCHEMA_ROWS: usize = 32;
+const MAX_OFFLINE_APPLICATION_ROWS: u64 = 262_144;
+const MAX_OFFLINE_BTREE_CELLS: u64 = 1_000_000;
+const MAX_OFFLINE_FREELIST_PAGES: u32 = 65_536;
 
 const EXT_FAMILY_MAGIC: u64 = 0x0000_ef53;
 const XFS_MAGIC: u64 = 0x5846_5342;
@@ -56,6 +66,62 @@ struct ProtectedIoTestGate {
 #[cfg(test)]
 static PROTECTED_IO_TEST_GATES: std::sync::LazyLock<Mutex<HashMap<PathBuf, ProtectedIoTestGate>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static OFFLINE_INITIALIZER_TEST_FAULT: std::sync::LazyLock<
+    Mutex<Vec<OfflineInitializerTestStage>>,
+> = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfflineInitializerTestStage {
+    PrepPrefix,
+    PrepWrite,
+    PrepSync,
+    DeathAfterPrep,
+    TransitionBeforeWal,
+    Transition,
+    Identity,
+    HandlerCleanup,
+    Close,
+    WalSync,
+    DatabaseSync,
+    Deadline,
+    RawValidation,
+    SelectorData,
+    SelectorWrite,
+    SelectorPartialWrite,
+    SelectorSync,
+    MarkerCleanup,
+    FinalValidation,
+    RollbackTruncate,
+    RollbackSync,
+}
+
+#[cfg(test)]
+fn fail_offline_initializer_stage(
+    stage: OfflineInitializerTestStage,
+    path: &Path,
+) -> Result<(), StateError> {
+    let mut scheduled = OFFLINE_INITIALIZER_TEST_FAULT
+        .lock()
+        .expect("offline initializer fault schedule lock poisoned");
+    if scheduled.first() == Some(&stage) {
+        scheduled.remove(0);
+        Err(invalid_path(
+            path,
+            "injected private offline initializer stage failure",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn fail_offline_initializer_stage(
+    _stage: OfflineInitializerTestStage,
+    _path: &Path,
+) -> Result<(), StateError> {
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct LinuxProtectedSpec {
@@ -816,7 +882,11 @@ impl ProtectedNamespace {
                 "LinuxProtected entry exceeds its fixed format bound",
             ));
         }
-        let mut bytes = vec![0_u8; length];
+        let mut bytes = try_zeroed_vec(
+            &entry.path,
+            length,
+            "allocate bounded LinuxProtected entry buffer failed",
+        )?;
         read_exact_at(
             &entry.file,
             &mut bytes,
@@ -907,36 +977,89 @@ impl ProtectedNamespace {
         cutoff: Instant,
         timeout_ms: u64,
     ) -> Result<OfflineNamespaceState, StateError> {
-        self.verify()?;
-        let mut lengths = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
-            lengths.push(
-                entry
-                    .file
-                    .metadata()
-                    .map(|metadata| metadata.len())
-                    .map_err(|error| {
-                        file_error(
-                            "inspect offline LinuxProtected entry length",
-                            &entry.path,
-                            error,
-                        )
-                    })?,
-            );
+        self.verify_security()?;
+        let mut lengths = [0_u64; ENTRY_NAMES.len()];
+        for (length, entry) in lengths.iter_mut().zip(&self.entries) {
+            *length = entry
+                .file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .map_err(|error| {
+                    file_error(
+                        "inspect offline LinuxProtected entry length",
+                        &entry.path,
+                        error,
+                    )
+                })?;
         }
-        let lengths: [u64; 8] = lengths
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("the fixed namespace has eight entries"));
         if lengths.iter().all(|length| *length == 0) {
             return Ok(OfflineNamespaceState::Fresh);
         }
-        if lengths[DATABASE_INDEX] == 0
-            || lengths[SELECTOR_INDEX] != SELECTOR_LEN as u64
-            || lengths[WRITER_LOCK_INDEX] != 0
-        {
+        if lengths[WRITER_LOCK_INDEX] != 0 {
             return Err(invalid_path(
                 &self.directory,
                 "LinuxProtected namespace is partial rather than exactly fresh or initialized",
+            ));
+        }
+        let selector =
+            self.read_entry(SELECTOR_INDEX, SELECTOR_LEN, Some(cutoff), None, timeout_ms)?;
+        let prep = self.read_entry(
+            PREP_RECORD_INDEX,
+            METADATA_LEN,
+            Some(cutoff),
+            None,
+            timeout_ms,
+        )?;
+        let expected_prep = self.initializer_prep_record();
+        let prep_prefix =
+            prep.len() <= PREP_RECORD_LEN && prep.as_slice() == &expected_prep[..prep.len()];
+        let other_initializer_catalog_empty = SLOT_DATA_INDEX
+            .into_iter()
+            .chain([SLOT_METADATA_INDEX[0]])
+            .all(|index| lengths[index] == 0);
+
+        if prep_prefix && !prep.is_empty() {
+            if !other_initializer_catalog_empty
+                || lengths[WAL_INDEX] != 0
+                || selector.iter().any(|byte| *byte != 0)
+            {
+                return Err(invalid_path(
+                    &self.directory,
+                    "LinuxProtected initializer prep record accompanies unknown state",
+                ));
+            }
+            if prep.len() < PREP_RECORD_LEN {
+                if lengths[DATABASE_INDEX] != 0 || !selector.is_empty() {
+                    return Err(invalid_path(
+                        &self.directory,
+                        "partial LinuxProtected prep record accompanies touched state",
+                    ));
+                }
+                return Ok(OfflineNamespaceState::PreparingFresh);
+            }
+            if lengths[DATABASE_INDEX] == 0 {
+                if !selector.is_empty() {
+                    return Err(invalid_path(
+                        self.selector_path(),
+                        "pre-transition LinuxProtected selector is not empty",
+                    ));
+                }
+                return Ok(OfflineNamespaceState::PreparedFresh);
+            }
+            self.validate_prepared_fresh_sqlite(cutoff, timeout_ms)?;
+            return if selector.len() == SELECTOR_LEN {
+                Ok(OfflineNamespaceState::InitializedFresh)
+            } else {
+                Ok(OfflineNamespaceState::TransitionedFresh)
+            };
+        }
+        if selector.len() < SELECTOR_LEN
+            || lengths[DATABASE_INDEX] == 0
+            || lengths[SELECTOR_INDEX] != SELECTOR_LEN as u64
+        {
+            return Err(invalid_path(
+                &self.directory,
+                "LinuxProtected namespace is neither resumable nor initialized",
             ));
         }
         self.validate_initialized_sqlite_files(cutoff, timeout_ms)?;
@@ -948,8 +1071,134 @@ impl ProtectedNamespace {
         std::array::from_fn(|index| self.entries[index].identity)
     }
 
+    fn initializer_prep_record(&self) -> [u8; PREP_RECORD_LEN] {
+        let mut record = [0_u8; PREP_RECORD_LEN];
+        record[..16].copy_from_slice(PREP_RECORD_MAGIC);
+        record[16..20].copy_from_slice(&1_u32.to_be_bytes());
+        record[20..24].copy_from_slice(&(PREP_RECORD_LEN as u32).to_be_bytes());
+        record[24..28].copy_from_slice(&(SELECTOR_LEN as u32).to_be_bytes());
+        record[28..32].copy_from_slice(&(ENTRY_NAMES.len() as u32).to_be_bytes());
+        record[32..40].copy_from_slice(&1_u64.to_be_bytes());
+        let mut identities = Sha256::new();
+        for entry in &self.entries {
+            identities.update((entry.name.len() as u64).to_be_bytes());
+            identities.update(entry.name.as_bytes());
+            identities.update(entry.identity.device.to_be_bytes());
+            identities.update(entry.identity.inode.to_be_bytes());
+            identities.update(entry.identity.mode.to_be_bytes());
+            identities.update(entry.identity.uid.to_be_bytes());
+            identities.update(entry.identity.gid.to_be_bytes());
+            identities.update(entry.identity.links.to_be_bytes());
+            identities.update(entry.identity.special_device.to_be_bytes());
+        }
+        record[40..72].copy_from_slice(&identities.finalize());
+        let checksum = Sha256::digest(&record[..96]);
+        record[96..].copy_from_slice(&checksum);
+        record
+    }
+
+    fn initialize_prep_record(&self) -> Result<(), StateError> {
+        let entry = &self.entries[PREP_RECORD_INDEX];
+        let expected = self.initializer_prep_record();
+        let length = entry
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect LinuxProtected initializer prep record",
+                    &entry.path,
+                    error,
+                )
+            })?
+            .len();
+        if length > PREP_RECORD_LEN as u64 {
+            return Err(invalid_path(
+                &entry.path,
+                "LinuxProtected initializer prep record exceeds its fixed length",
+            ));
+        }
+        let existing = self.read_entry(PREP_RECORD_INDEX, PREP_RECORD_LEN, None, None, 0)?;
+        if existing.as_slice() != &expected[..existing.len()] {
+            return Err(invalid_path(
+                &entry.path,
+                "LinuxProtected initializer prep record prefix is invalid",
+            ));
+        }
+        if existing.is_empty()
+            && let Err(error) =
+                fail_offline_initializer_stage(OfflineInitializerTestStage::PrepPrefix, &entry.path)
+        {
+            write_all_at(&entry.file, &expected[..32], 0)
+                .and_then(|()| entry.file.sync_all())
+                .map_err(|cleanup| StateError::OperationCleanupFailed {
+                    operation: "inject LinuxProtected prep prefix",
+                    primary: Box::new(invalid_path(
+                        &entry.path,
+                        "injected private offline initializer stage failure",
+                    )),
+                    cleanup: cleanup.to_string(),
+                })?;
+            return Err(error);
+        }
+        fail_offline_initializer_stage(OfflineInitializerTestStage::PrepWrite, &entry.path)?;
+        write_all_at(&entry.file, &expected[existing.len()..], length).map_err(|error| {
+            file_error(
+                "write LinuxProtected initializer prep record",
+                &entry.path,
+                error,
+            )
+        })?;
+        fail_offline_initializer_stage(OfflineInitializerTestStage::PrepSync, &entry.path)?;
+        entry.file.sync_all().map_err(|error| {
+            file_error(
+                "sync LinuxProtected initializer prep record",
+                &entry.path,
+                error,
+            )
+        })?;
+        self.parent.sync_all().map_err(|error| {
+            file_error(
+                "sync LinuxProtected namespace after prep record",
+                &self.directory,
+                error,
+            )
+        })?;
+        let reread = self.read_entry(PREP_RECORD_INDEX, PREP_RECORD_LEN, None, None, 0)?;
+        if reread.as_slice() != expected {
+            return Err(invalid_path(
+                &entry.path,
+                "LinuxProtected initializer prep record failed exact reread",
+            ));
+        }
+        Ok(())
+    }
+
+    fn cleanup_prep_record(&self) -> Result<(), StateError> {
+        let entry = &self.entries[PREP_RECORD_INDEX];
+        fail_offline_initializer_stage(OfflineInitializerTestStage::MarkerCleanup, &entry.path)?;
+        entry
+            .file
+            .set_len(0)
+            .and_then(|()| entry.file.sync_all())
+            .map_err(|error| {
+                file_error(
+                    "remove LinuxProtected initializer prep record",
+                    &entry.path,
+                    error,
+                )
+            })?;
+        self.parent.sync_all().map_err(|error| {
+            file_error(
+                "sync LinuxProtected namespace after prep cleanup",
+                &self.directory,
+                error,
+            )
+        })?;
+        Ok(())
+    }
+
     fn verify_captured_identities(&self, expected: [FileIdentity; 8]) -> Result<(), StateError> {
-        self.verify()?;
+        self.verify_security()?;
         for (entry, expected) in self.entries.iter().zip(expected) {
             let current = FileIdentity::capture(
                 &entry.path,
@@ -968,7 +1217,7 @@ impl ProtectedNamespace {
 
     fn initialize_empty_selector(&self) -> Result<(), StateError> {
         let selector = &self.entries[SELECTOR_INDEX];
-        if selector
+        let length = selector
             .file
             .metadata()
             .map_err(|error| {
@@ -978,23 +1227,55 @@ impl ProtectedNamespace {
                     error,
                 )
             })?
-            .len()
-            != 0
-        {
+            .len();
+        if length > SELECTOR_LEN as u64 {
             return Err(invalid_path(
                 &selector.path,
-                "fresh LinuxProtected selector changed before initialization",
+                "prepared LinuxProtected selector exceeds its fixed commit length",
             ));
         }
-        write_all_at(&selector.file, &[0_u8; SELECTOR_LEN], 0)
+        let existing = self.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
+        if existing.iter().any(|byte| *byte != 0) {
+            return Err(invalid_path(
+                &selector.path,
+                "prepared LinuxProtected selector contains nonzero bytes",
+            ));
+        }
+        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorData, &selector.path)?;
+        let offset = usize::try_from(length).expect("bounded selector length fits usize");
+        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorWrite, &selector.path)?;
+        if let Err(error) = fail_offline_initializer_stage(
+            OfflineInitializerTestStage::SelectorPartialWrite,
+            &selector.path,
+        ) {
+            let partial = offset + (SELECTOR_LEN - offset).div_ceil(2);
+            write_all_at(
+                &selector.file,
+                &[0_u8; SELECTOR_LEN][offset..partial],
+                length,
+            )
             .and_then(|()| selector.file.sync_all())
-            .map_err(|error| {
-                file_error(
-                    "initialize and sync fixed LinuxProtected selector",
+            .map_err(|cleanup| StateError::OperationCleanupFailed {
+                operation: "inject partial LinuxProtected selector commit",
+                primary: Box::new(invalid_path(
                     &selector.path,
-                    error,
-                )
+                    "injected private offline initializer stage failure",
+                )),
+                cleanup: cleanup.to_string(),
             })?;
+            return Err(error);
+        }
+        write_all_at(&selector.file, &[0_u8; SELECTOR_LEN][offset..], length).map_err(|error| {
+            file_error(
+                "initialize fixed LinuxProtected selector",
+                &selector.path,
+                error,
+            )
+        })?;
+        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorSync, &selector.path)?;
+        selector.file.sync_all().map_err(|error| {
+            file_error("sync fixed LinuxProtected selector", &selector.path, error)
+        })?;
         self.parent.sync_all().map_err(|error| {
             file_error(
                 "sync LinuxProtected namespace after selector initialization",
@@ -1019,13 +1300,13 @@ impl ProtectedNamespace {
             })
     }
 
-    fn validate_fresh_sqlite_handoff(
+    fn validate_prepared_fresh_sqlite(
         &self,
         cutoff: Instant,
         timeout_ms: u64,
     ) -> Result<(), StateError> {
         check_initializer_deadline(cutoff, timeout_ms)?;
-        self.verify()?;
+        self.verify_security()?;
         self.validate_initialized_sqlite_files(cutoff, timeout_ms)?;
         if self.wal_length()? != 0 {
             return Err(invalid_path(
@@ -1033,7 +1314,236 @@ impl ProtectedNamespace {
                 "fresh LinuxProtected handoff must leave the precreated WAL at zero length",
             ));
         }
+        let database = &self.entries[DATABASE_INDEX];
+        let length = database
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect prepared LinuxProtected database length",
+                    &database.path,
+                    error,
+                )
+            })?
+            .len();
+        if length != 4096 {
+            return Err(invalid_path(
+                &database.path,
+                "prepared LinuxProtected database is not the exact minimal handoff image",
+            ));
+        }
+        let mut page = [0_u8; 4096];
+        read_exact_at(
+            &database.file,
+            &mut page,
+            0,
+            &database.path,
+            Some(cutoff),
+            None,
+            timeout_ms,
+        )?;
+        if !minimal_fresh_handoff_page(&page) {
+            return Err(invalid_path(
+                &database.path,
+                "prepared LinuxProtected database bytes do not match the minimal empty-schema handoff",
+            ));
+        }
         check_initializer_deadline(cutoff, timeout_ms)
+    }
+
+    fn recovery_fresh_state(&self) -> Result<OfflineNamespaceState, StateError> {
+        self.verify_security()?;
+        let mut lengths = [0_u64; ENTRY_NAMES.len()];
+        for (length, entry) in lengths.iter_mut().zip(&self.entries) {
+            *length = entry
+                .file
+                .metadata()
+                .map_err(|error| {
+                    file_error(
+                        "inspect recoverable LinuxProtected initializer state",
+                        &entry.path,
+                        error,
+                    )
+                })?
+                .len();
+        }
+        if lengths.iter().all(|length| *length == 0) {
+            return Ok(OfflineNamespaceState::Fresh);
+        }
+        let other_catalog_empty = SLOT_DATA_INDEX
+            .into_iter()
+            .chain([SLOT_METADATA_INDEX[0]])
+            .all(|index| lengths[index] == 0);
+        if lengths[WAL_INDEX] != 0
+            || lengths[WRITER_LOCK_INDEX] != 0
+            || lengths[SELECTOR_INDEX] > SELECTOR_LEN as u64
+            || !other_catalog_empty
+        {
+            return Err(invalid_path(
+                &self.directory,
+                "failed fresh initialization is not safely recoverable",
+            ));
+        }
+        let prep = self.read_entry(PREP_RECORD_INDEX, PREP_RECORD_LEN, None, None, 0)?;
+        let expected = self.initializer_prep_record();
+        if prep.is_empty() {
+            if lengths[DATABASE_INDEX] == 4096 && lengths[SELECTOR_INDEX] == SELECTOR_LEN as u64 {
+                let mut database = [0_u8; 4096];
+                read_exact_at(
+                    &self.entries[DATABASE_INDEX].file,
+                    &mut database,
+                    0,
+                    &self.entries[DATABASE_INDEX].path,
+                    None,
+                    None,
+                    0,
+                )?;
+                let selector = self.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
+                if minimal_fresh_handoff_page(&database)
+                    && selector.len() == SELECTOR_LEN
+                    && selector.iter().all(|byte| *byte == 0)
+                {
+                    return Ok(OfflineNamespaceState::Initialized);
+                }
+            }
+            return Err(invalid_path(
+                &self.directory,
+                "touched fresh initialization has no prep record",
+            ));
+        }
+        if prep.as_slice() != &expected[..prep.len()] {
+            return Err(invalid_path(
+                &self.entries[PREP_RECORD_INDEX].path,
+                "failed fresh initialization prep record is invalid",
+            ));
+        }
+        if prep.len() < PREP_RECORD_LEN {
+            if lengths[DATABASE_INDEX] == 0 && lengths[SELECTOR_INDEX] == 0 {
+                return Ok(OfflineNamespaceState::PreparingFresh);
+            }
+            return Err(invalid_path(
+                &self.directory,
+                "partial prep record accompanies touched initializer state",
+            ));
+        }
+        if lengths[DATABASE_INDEX] == 0 {
+            if lengths[SELECTOR_INDEX] == 0 {
+                return Ok(OfflineNamespaceState::PreparedFresh);
+            }
+            return Err(invalid_path(
+                &self.directory,
+                "pre-transition prep record accompanies selector bytes",
+            ));
+        }
+        if lengths[DATABASE_INDEX] != 4096 {
+            return Err(invalid_path(
+                &self.directory,
+                "failed fresh initialization database is not the minimal handoff",
+            ));
+        }
+        let mut database = [0_u8; 4096];
+        read_exact_at(
+            &self.entries[DATABASE_INDEX].file,
+            &mut database,
+            0,
+            &self.entries[DATABASE_INDEX].path,
+            None,
+            None,
+            0,
+        )?;
+        let selector = self.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
+        if !minimal_fresh_handoff_page(&database) || selector.iter().any(|byte| *byte != 0) {
+            return Err(invalid_path(
+                &self.directory,
+                "failed fresh initialization does not match the exact resumable image",
+            ));
+        }
+        if selector.len() == SELECTOR_LEN {
+            Ok(OfflineNamespaceState::InitializedFresh)
+        } else {
+            Ok(OfflineNamespaceState::TransitionedFresh)
+        }
+    }
+
+    fn restore_exact_fresh(
+        &self,
+        expected: [FileIdentity; ENTRY_NAMES.len()],
+    ) -> Result<(), StateError> {
+        self.verify_captured_identities(expected)?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::RollbackTruncate,
+            &self.directory,
+        )?;
+        let mut first_error = None;
+        for index in [
+            WAL_INDEX,
+            DATABASE_INDEX,
+            SLOT_DATA_INDEX[0],
+            SLOT_METADATA_INDEX[0],
+            SLOT_DATA_INDEX[1],
+            SELECTOR_INDEX,
+        ] {
+            let entry = &self.entries[index];
+            if let Err(error) = entry.file.set_len(0).and_then(|()| entry.file.sync_all())
+                && first_error.is_none()
+            {
+                first_error = Some(file_error(
+                    "restore fresh LinuxProtected entry after failed initialization",
+                    &entry.path,
+                    error,
+                ));
+            }
+        }
+        if first_error.is_none() {
+            fail_offline_initializer_stage(
+                OfflineInitializerTestStage::RollbackSync,
+                &self.directory,
+            )?;
+        }
+        let prep = &self.entries[PREP_RECORD_INDEX];
+        if let Err(error) = prep.file.set_len(0).and_then(|()| prep.file.sync_all())
+            && first_error.is_none()
+        {
+            first_error = Some(file_error(
+                "remove LinuxProtected prep record after fresh rollback",
+                &prep.path,
+                error,
+            ));
+        }
+        if let Err(error) = self.parent.sync_all()
+            && first_error.is_none()
+        {
+            first_error = Some(file_error(
+                "sync LinuxProtected namespace after fresh rollback",
+                &self.directory,
+                error,
+            ));
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.verify_captured_identities(expected)?;
+        for entry in &self.entries {
+            if entry
+                .file
+                .metadata()
+                .map_err(|error| {
+                    file_error(
+                        "verify restored fresh LinuxProtected entry",
+                        &entry.path,
+                        error,
+                    )
+                })?
+                .len()
+                != 0
+            {
+                return Err(invalid_path(
+                    &entry.path,
+                    "failed initialization did not restore exact fresh bytes",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_runtime_layout(&self, cutoff: Instant, timeout_ms: u64) -> Result<(), StateError> {
@@ -1063,6 +1573,11 @@ impl ProtectedNamespace {
                 )
             })?
             .len();
+        if database_length > MAX_OFFLINE_DATABASE_BYTES {
+            return Err(offline_resource_error(
+                "initialized LinuxProtected database exceeds the offline verification bound",
+            ));
+        }
         if database_length < 100 {
             return Err(invalid_path(
                 &database.path,
@@ -1106,7 +1621,11 @@ impl ProtectedNamespace {
         let physical_pages = database_length / page_size;
         let page_size =
             usize::try_from(page_size).expect("validated SQLite page size fits this platform");
-        let mut page_one = vec![0_u8; page_size];
+        let mut page_one = try_zeroed_vec(
+            &database.path,
+            page_size,
+            "allocate bounded SQLite page-one buffer failed",
+        )?;
         read_exact_at(
             &database.file,
             &mut page_one,
@@ -1166,7 +1685,7 @@ impl ProtectedNamespace {
 struct WalObservation {
     committed_pages: Option<u32>,
     page_one: Option<Vec<u8>>,
-    frames: BTreeMap<u32, u64>,
+    frames: HashMap<u32, u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1263,11 +1782,25 @@ fn parse_sqlite_header(
             "initialized LinuxProtected database has zero logical pages",
         ));
     }
+    let logical_bytes = u64::from(logical_pages)
+        .checked_mul(expected_page_size as u64)
+        .ok_or_else(|| invalid_path(path, "SQLite logical database size overflowed"))?;
+    if logical_bytes > MAX_OFFLINE_DATABASE_BYTES {
+        return Err(offline_resource_error(
+            "SQLite logical database exceeds the offline verification bound",
+        ));
+    }
+    let freelist_pages = read_be_u32(page_one, 36);
+    if freelist_pages > MAX_OFFLINE_FREELIST_PAGES {
+        return Err(offline_resource_error(
+            "SQLite freelist exceeds the offline verification bound",
+        ));
+    }
     Ok(SqliteHeader {
         logical_pages,
         reserved_bytes,
         freelist_trunk: read_be_u32(page_one, 32),
-        freelist_pages: read_be_u32(page_one, 36),
+        freelist_pages,
         schema_format,
         encoding,
         user_version: read_be_u32(page_one, 60),
@@ -1278,7 +1811,7 @@ fn parse_sqlite_header(
 struct DatabaseImage<'namespace> {
     database: &'namespace HeldEntry,
     wal: &'namespace HeldEntry,
-    wal_frames: &'namespace BTreeMap<u32, u64>,
+    wal_frames: &'namespace HashMap<u32, u64>,
     page_size: usize,
     usable_size: usize,
     physical_pages: u64,
@@ -1295,7 +1828,11 @@ impl DatabaseImage<'_> {
                 "SQLite page reference is outside the logical database",
             ));
         }
-        let mut page = vec![0_u8; self.page_size];
+        let mut page = try_zeroed_vec(
+            &self.database.path,
+            self.page_size,
+            "allocate bounded SQLite page buffer failed",
+        )?;
         if let Some(offset) = self.wal_frames.get(&page_number) {
             read_exact_at(
                 &self.wal.file,
@@ -1337,9 +1874,13 @@ impl DatabaseImage<'_> {
         page_number: u32,
         reason: &'static str,
     ) -> Result<(), StateError> {
-        if page_number == 0 || page_number > self.logical_pages || !claimed.insert(page_number) {
+        if page_number == 0 || page_number > self.logical_pages || claimed.contains(&page_number) {
             return Err(invalid_path(&self.database.path, reason));
         }
+        claimed
+            .try_reserve(1)
+            .map_err(|_| offline_resource_error("allocate bounded SQLite page-claim set failed"))?;
+        claimed.insert(page_number);
         Ok(())
     }
 
@@ -1355,14 +1896,26 @@ fn validate_database_image(
     header: SqliteHeader,
 ) -> Result<(), StateError> {
     let mut claimed = HashSet::new();
+    claimed
+        .try_reserve(usize::try_from(image.logical_pages).map_err(|_| {
+            invalid_path(
+                &image.database.path,
+                "SQLite logical page count exceeds platform bounds",
+            )
+        })?)
+        .map_err(|_| offline_resource_error("allocate bounded SQLite page-claim set failed"))?;
     validate_page_availability(image)?;
     let pending_byte_page = image.pending_byte_page();
     if pending_byte_page <= image.logical_pages {
         claimed.insert(pending_byte_page);
     }
-    let schema_records = validate_table_btree(image, 1, true, &mut claimed)?;
+    let mut btree_cells = 0_u64;
+    let schema_records = validate_table_btree(image, 1, true, &mut claimed, &mut btree_cells)?;
     let schema_objects = validate_schema_records(&image.database.path, schema_records, header)?;
     let mut unique_roots = HashSet::new();
+    unique_roots
+        .try_reserve(schema_objects.len())
+        .map_err(|_| offline_resource_error("allocate bounded SQLite schema-root set failed"))?;
     let mut index_counts = BTreeMap::new();
     for object in &schema_objects {
         if object.root == 1 || !unique_roots.insert(object.root) {
@@ -1373,10 +1926,16 @@ fn validate_database_image(
         }
         match object.btree {
             SchemaBtree::Table => {
-                validate_table_btree(image, object.root, false, &mut claimed)?;
+                validate_table_btree(image, object.root, false, &mut claimed, &mut btree_cells)?;
             }
             SchemaBtree::Index(columns) => {
-                let count = validate_index_btree(image, object.root, columns, &mut claimed)?;
+                let count = validate_index_btree(
+                    image,
+                    object.root,
+                    columns,
+                    &mut claimed,
+                    &mut btree_cells,
+                )?;
                 index_counts.insert(object.name.as_str(), count);
             }
         }
@@ -1409,7 +1968,8 @@ fn validate_page_availability(image: &DatabaseImage<'_>) -> Result<(), StateErro
     let missing_pages = image.logical_pages - physical_pages - u32::from(pending_is_missing);
     let available = image
         .wal_frames
-        .range((physical_pages + 1)..=image.logical_pages)
+        .keys()
+        .filter(|page| **page > physical_pages && **page <= image.logical_pages)
         .count();
     if usize::try_from(missing_pages).ok() != Some(available) {
         return Err(invalid_path(
@@ -1417,23 +1977,12 @@ fn validate_page_availability(image: &DatabaseImage<'_>) -> Result<(), StateErro
             "logical SQLite pages are absent from both main database and committed WAL",
         ));
     }
-    let mut expected = physical_pages + 1;
-    for page in image
-        .wal_frames
-        .range((physical_pages + 1)..=image.logical_pages)
-        .map(|(page, _)| *page)
-    {
-        if pending_is_missing && expected == pending {
-            expected += 1;
-        }
-        if page != expected {
+    for expected in (physical_pages + 1)..=image.logical_pages {
+        if expected != pending && !image.wal_frames.contains_key(&expected) {
             return Err(invalid_path(
                 &image.database.path,
                 "committed WAL does not supply every logical page beyond the main database",
             ));
-        }
-        if expected != image.logical_pages {
-            expected += 1;
         }
     }
     Ok(())
@@ -1580,11 +2129,24 @@ fn finish_btree_page(
     Ok(())
 }
 
+fn charge_btree_cells(path: &Path, consumed: &mut u64, cells: usize) -> Result<(), StateError> {
+    *consumed = consumed
+        .checked_add(cells as u64)
+        .ok_or_else(|| invalid_path(path, "SQLite b-tree cell budget overflowed"))?;
+    if *consumed > MAX_OFFLINE_BTREE_CELLS {
+        return Err(offline_resource_error(
+            "SQLite b-tree cells exceed the offline verification bound",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_table_btree(
     image: &DatabaseImage<'_>,
     root: u32,
     collect_schema: bool,
     claimed: &mut HashSet<u32>,
+    btree_cells: &mut u64,
 ) -> Result<Vec<SchemaRecord>, StateError> {
     let mut schema_records = Vec::new();
     walk_table_btree(
@@ -1592,8 +2154,17 @@ fn validate_table_btree(
         root,
         claimed,
         collect_schema.then_some(MAX_RAW_SCHEMA_PAYLOAD_BYTES),
+        btree_cells,
         &mut |_, payload| {
             if let Some(payload) = payload {
+                if schema_records.len() == MAX_OFFLINE_SCHEMA_ROWS {
+                    return Err(offline_resource_error(
+                        "sqlite_schema exceeds the offline row bound",
+                    ));
+                }
+                schema_records.try_reserve(1).map_err(|_| {
+                    offline_resource_error("allocate bounded sqlite_schema records failed")
+                })?;
                 schema_records.push(parse_sqlite_schema_record(&image.database.path, payload)?);
             }
             Ok(())
@@ -1607,20 +2178,34 @@ fn walk_table_btree(
     root: u32,
     claimed: &mut HashSet<u32>,
     payload_limit: Option<usize>,
+    btree_cells: &mut u64,
     inspect: &mut impl FnMut(i64, Option<&[u8]>) -> Result<(), StateError>,
 ) -> Result<(), StateError> {
-    let mut stack = vec![TableTask {
-        page: root,
-        depth: 0,
-        root: true,
-        bounds: TableBounds {
-            minimum_exclusive: None,
-            maximum_inclusive: None,
+    let mut stack = Vec::new();
+    try_push_vec(
+        &image.database.path,
+        &mut stack,
+        TableTask {
+            page: root,
+            depth: 0,
+            root: true,
+            bounds: TableBounds {
+                minimum_exclusive: None,
+                maximum_inclusive: None,
+            },
         },
-    }];
+        "allocate bounded SQLite table traversal stack failed",
+    )?;
     let mut leaf_depth = None;
     while let Some(task) = stack.pop() {
         let mut page = read_btree_page(image, claimed, task.page)?;
+        charge_btree_cells(&image.database.path, btree_cells, page.cell_count)?;
+        try_reserve_vec(
+            &image.database.path,
+            &mut page.occupied,
+            page.cell_count,
+            "allocate bounded SQLite table occupancy ranges failed",
+        )?;
         if !matches!(page.page_type, 0x05 | 0x0d) {
             return Err(invalid_path(
                 &image.database.path,
@@ -1633,8 +2218,22 @@ fn walk_table_btree(
                 "non-root SQLite table b-tree page is empty",
             ));
         }
-        let mut keys = Vec::with_capacity(page.cell_count);
-        let mut children = Vec::with_capacity(page.cell_count + 1);
+        let mut keys = Vec::new();
+        try_reserve_vec(
+            &image.database.path,
+            &mut keys,
+            page.cell_count,
+            "allocate bounded SQLite table keys failed",
+        )?;
+        let mut children = Vec::new();
+        try_reserve_vec(
+            &image.database.path,
+            &mut children,
+            page.cell_count.checked_add(1).ok_or_else(|| {
+                invalid_path(&image.database.path, "SQLite table child count overflowed")
+            })?,
+            "allocate bounded SQLite table children failed",
+        )?;
         for index in 0..page.cell_count {
             let offset = btree_cell_offset(image, &page, index)?;
             let (end, key, payload) = if page.page_type == 0x05 {
@@ -1694,23 +2293,28 @@ fn walk_table_btree(
             validate_page_reference(image, right)?;
             children.push(right);
             for child_index in (0..children.len()).rev() {
-                stack.push(TableTask {
-                    page: children[child_index],
-                    depth: task.depth + 1,
-                    root: false,
-                    bounds: TableBounds {
-                        minimum_exclusive: if child_index == 0 {
-                            task.bounds.minimum_exclusive
-                        } else {
-                            Some(keys[child_index - 1])
-                        },
-                        maximum_inclusive: if child_index < keys.len() {
-                            Some(keys[child_index])
-                        } else {
-                            task.bounds.maximum_inclusive
+                try_push_vec(
+                    &image.database.path,
+                    &mut stack,
+                    TableTask {
+                        page: children[child_index],
+                        depth: task.depth + 1,
+                        root: false,
+                        bounds: TableBounds {
+                            minimum_exclusive: if child_index == 0 {
+                                task.bounds.minimum_exclusive
+                            } else {
+                                Some(keys[child_index - 1])
+                            },
+                            maximum_inclusive: if child_index < keys.len() {
+                                Some(keys[child_index])
+                            } else {
+                                task.bounds.maximum_inclusive
+                            },
                         },
                     },
-                });
+                    "allocate bounded SQLite table traversal stack failed",
+                )?;
             }
         } else if leaf_depth
             .replace(task.depth)
@@ -1731,18 +2335,32 @@ fn validate_index_btree(
     root: u32,
     columns: &'static [IndexColumn],
     claimed: &mut HashSet<u32>,
+    btree_cells: &mut u64,
 ) -> Result<u64, StateError> {
-    let mut stack = vec![IndexTask {
-        page: root,
-        depth: 0,
-        root: true,
-        minimum_exclusive: None,
-        maximum_exclusive: None,
-    }];
+    let mut stack = Vec::new();
+    try_push_vec(
+        &image.database.path,
+        &mut stack,
+        IndexTask {
+            page: root,
+            depth: 0,
+            root: true,
+            minimum_exclusive: None,
+            maximum_exclusive: None,
+        },
+        "allocate bounded SQLite index traversal stack failed",
+    )?;
     let mut leaf_depth = None;
     let mut entries = 0_u64;
     while let Some(task) = stack.pop() {
         let mut page = read_btree_page(image, claimed, task.page)?;
+        charge_btree_cells(&image.database.path, btree_cells, page.cell_count)?;
+        try_reserve_vec(
+            &image.database.path,
+            &mut page.occupied,
+            page.cell_count,
+            "allocate bounded SQLite index occupancy ranges failed",
+        )?;
         if !matches!(page.page_type, 0x02 | 0x0a) {
             return Err(invalid_path(
                 &image.database.path,
@@ -1755,11 +2373,25 @@ fn validate_index_btree(
                 "non-root SQLite index b-tree page is empty",
             ));
         }
-        let mut keys = Vec::with_capacity(page.cell_count);
+        let mut keys = Vec::new();
+        try_reserve_vec(
+            &image.database.path,
+            &mut keys,
+            page.cell_count,
+            "allocate bounded SQLite index keys failed",
+        )?;
         entries = entries
             .checked_add(page.cell_count as u64)
             .ok_or_else(|| invalid_path(&image.database.path, "SQLite index count overflowed"))?;
-        let mut children = Vec::with_capacity(page.cell_count + 1);
+        let mut children = Vec::new();
+        try_reserve_vec(
+            &image.database.path,
+            &mut children,
+            page.cell_count.checked_add(1).ok_or_else(|| {
+                invalid_path(&image.database.path, "SQLite index child count overflowed")
+            })?,
+            "allocate bounded SQLite index children failed",
+        )?;
         for index in 0..page.cell_count {
             let offset = btree_cell_offset(image, &page, index)?;
             let payload_offset = if page.page_type == 0x02 {
@@ -1819,21 +2451,40 @@ fn validate_index_btree(
             validate_page_reference(image, right)?;
             children.push(right);
             for child_index in (0..children.len()).rev() {
-                stack.push(IndexTask {
-                    page: children[child_index],
-                    depth: task.depth + 1,
-                    root: false,
-                    minimum_exclusive: if child_index == 0 {
-                        task.minimum_exclusive.clone()
-                    } else {
-                        Some(keys[child_index - 1].clone())
+                let minimum_exclusive = if child_index == 0 {
+                    task.minimum_exclusive
+                        .as_ref()
+                        .map(|key| try_clone_index_key(&image.database.path, key))
+                        .transpose()?
+                } else {
+                    Some(try_clone_index_key(
+                        &image.database.path,
+                        &keys[child_index - 1],
+                    )?)
+                };
+                let maximum_exclusive = if child_index < keys.len() {
+                    Some(try_clone_index_key(
+                        &image.database.path,
+                        &keys[child_index],
+                    )?)
+                } else {
+                    task.maximum_exclusive
+                        .as_ref()
+                        .map(|key| try_clone_index_key(&image.database.path, key))
+                        .transpose()?
+                };
+                try_push_vec(
+                    &image.database.path,
+                    &mut stack,
+                    IndexTask {
+                        page: children[child_index],
+                        depth: task.depth + 1,
+                        root: false,
+                        minimum_exclusive,
+                        maximum_exclusive,
                     },
-                    maximum_exclusive: if child_index < keys.len() {
-                        Some(keys[child_index].clone())
-                    } else {
-                        task.maximum_exclusive.clone()
-                    },
-                });
+                    "allocate bounded SQLite index traversal stack failed",
+                )?;
             }
         } else if leaf_depth
             .replace(task.depth)
@@ -1872,7 +2523,12 @@ fn validate_freeblocks(
                 "SQLite b-tree freeblock chain is invalid",
             ));
         }
-        ranges.push((offset, offset + size));
+        try_push_vec(
+            &image.database.path,
+            &mut ranges,
+            (offset, offset + size),
+            "allocate bounded SQLite freeblock ranges failed",
+        )?;
         previous = offset;
         offset = next;
     }
@@ -1901,8 +2557,7 @@ fn validate_cell_payload(
         )
     })?;
     if collect_limit.is_some_and(|limit| payload_size > limit) {
-        return Err(invalid_path(
-            &image.database.path,
+        return Err(offline_resource_error(
             "SQLite metadata key payload exceeds the offline verification bound",
         ));
     }
@@ -1937,10 +2592,7 @@ fn validate_cell_payload(
         Some(_) => {
             let mut payload = Vec::new();
             payload.try_reserve_exact(payload_size).map_err(|_| {
-                invalid_path(
-                    &image.database.path,
-                    "SQLite metadata key payload allocation failed",
-                )
+                offline_resource_error("SQLite metadata key payload allocation failed")
             })?;
             Some(payload)
         }
@@ -2000,6 +2652,11 @@ fn validate_freelist(
         count = count.checked_add(1).ok_or_else(|| {
             invalid_path(&image.database.path, "SQLite freelist count overflowed")
         })?;
+        if count > MAX_OFFLINE_FREELIST_PAGES {
+            return Err(offline_resource_error(
+                "SQLite freelist traversal exceeds the offline verification bound",
+            ));
+        }
         let page = image.read_page(trunk)?;
         let next = read_be_u32(&page, 0);
         let leaves = read_be_u32(&page, 4);
@@ -2020,6 +2677,11 @@ fn validate_freelist(
             count = count.checked_add(1).ok_or_else(|| {
                 invalid_path(&image.database.path, "SQLite freelist count overflowed")
             })?;
+            if count > MAX_OFFLINE_FREELIST_PAGES {
+                return Err(offline_resource_error(
+                    "SQLite freelist traversal exceeds the offline verification bound",
+                ));
+            }
         }
         trunk = next;
     }
@@ -2109,25 +2771,28 @@ fn validate_schema_records(
         ));
     }
     let mut expected = expected_schema_objects(path, header.user_version)?;
-    let mut observed = HashSet::with_capacity(records.len());
-    let mut validated = Vec::with_capacity(records.len());
+    let mut validated = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut validated,
+        records.len(),
+        "allocate bounded schema-object records failed",
+    )?;
     for record in records {
-        if !observed.insert(record.name.clone()) {
-            return Err(invalid_path(
-                path,
-                "sqlite_schema contains duplicate object names",
-            ));
-        }
         let Some(definition) = expected.remove(&record.name) else {
             return Err(invalid_path(
                 path,
                 "sqlite_schema contains an object outside the accepted migration catalog",
             ));
         };
+        let normalized_sql = record
+            .sql
+            .as_deref()
+            .map(|sql| normalize_schema_sql(path, sql))
+            .transpose()?;
         if record.kind != definition.kind
             || record.table != definition.table
-            || record.sql.as_deref().map(normalize_schema_sql)
-                != definition.sql.as_deref().map(normalize_schema_sql)
+            || normalized_sql != definition.sql
         {
             return Err(invalid_path(
                 path,
@@ -2168,7 +2833,7 @@ fn expected_schema_objects(
             .map(str::trim)
             .filter(|sql| !sql.is_empty())
         {
-            let mut sql = normalize_schema_sql(statement);
+            let mut sql = normalize_schema_sql(path, statement)?;
             if let Some(suffix) = sql.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
                 sql = format!("CREATE TABLE {suffix}");
             }
@@ -2259,8 +2924,18 @@ fn accepted_index_columns(name: &str) -> Option<&'static [IndexColumn]> {
     }
 }
 
-fn normalize_schema_sql(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+fn normalize_schema_sql(_path: &Path, sql: &str) -> Result<String, StateError> {
+    let mut normalized = String::new();
+    normalized
+        .try_reserve(sql.len())
+        .map_err(|_| offline_resource_error("allocate bounded normalized schema SQL failed"))?;
+    for token in sql.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(token);
+    }
+    Ok(normalized)
 }
 
 fn parse_sqlite_schema_record(path: &Path, payload: &[u8]) -> Result<SchemaRecord, StateError> {
@@ -2306,7 +2981,13 @@ fn parse_index_key(
             "SQLite index key has the wrong number of fields",
         ));
     }
-    let mut values = Vec::with_capacity(fields.len());
+    let mut values = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut values,
+        fields.len(),
+        "allocate bounded SQLite index values failed",
+    )?;
     for (field, column) in fields.iter().zip(columns) {
         values.push(match column {
             IndexColumn::Integer => IndexValue::Integer(
@@ -2314,9 +2995,11 @@ fn parse_index_key(
                     invalid_path(path, "SQLite index integer key is unexpectedly null")
                 })?,
             ),
-            IndexColumn::Text => IndexValue::Text(
-                decode_sqlite_text_bytes(path, field, "SQLite index text key")?.to_vec(),
-            ),
+            IndexColumn::Text => IndexValue::Text(try_clone_bytes(
+                path,
+                decode_sqlite_text_bytes(path, field, "SQLite index text key")?,
+                "allocate bounded SQLite index text key failed",
+            )?),
         });
     }
     Ok(IndexKey(values))
@@ -2344,21 +3027,45 @@ fn verify_application_records(
         .collect::<BTreeMap<_, _>>();
     let mut unique_ids = HashSet::new();
     let mut migration_rows = 0_u32;
+    let mut application_rows = 0_u64;
+    let mut verification_cells = 0_u64;
     for table in schema
         .iter()
         .filter(|object| matches!(object.btree, SchemaBtree::Table))
     {
         let mut row_count = 0_u64;
         let mut table_claimed = HashSet::new();
+        table_claimed
+            .try_reserve(usize::try_from(image.logical_pages).map_err(|_| {
+                invalid_path(
+                    &image.database.path,
+                    "SQLite logical page count exceeds platform bounds",
+                )
+            })?)
+            .map_err(|_| {
+                offline_resource_error("allocate bounded application page-claim set failed")
+            })?;
         walk_table_btree(
             image,
             table.root,
             &mut table_claimed,
             Some(MAX_RAW_APPLICATION_ROW_BYTES),
+            &mut verification_cells,
             &mut |rowid, payload| {
                 row_count = row_count.checked_add(1).ok_or_else(|| {
                     invalid_path(&image.database.path, "SQLite table row count overflowed")
                 })?;
+                application_rows = application_rows.checked_add(1).ok_or_else(|| {
+                    invalid_path(
+                        &image.database.path,
+                        "SQLite application row count overflowed",
+                    )
+                })?;
+                if application_rows > MAX_OFFLINE_APPLICATION_ROWS {
+                    return Err(offline_resource_error(
+                        "SQLite application rows exceed the offline verification bound",
+                    ));
+                }
                 let payload = payload.ok_or_else(|| {
                     invalid_path(
                         &image.database.path,
@@ -2372,13 +3079,28 @@ fn verify_application_records(
                     payload,
                     user_version,
                 )?;
-                if let Some(id) = logical.unique_id
-                    && !unique_ids.insert((table.name.clone(), id))
-                {
-                    return Err(invalid_path(
-                        &image.database.path,
-                        "SQLite application primary key is duplicated",
-                    ));
+                if let Some(id) = logical.unique_id {
+                    let table_identity = match table.name.as_str() {
+                        "sessions" => 1_u8,
+                        "devices" => 2,
+                        "authentication_records" => 3,
+                        "tasks" => 4,
+                        _ => {
+                            return Err(invalid_path(
+                                &image.database.path,
+                                "SQLite application identifier belongs to an unexpected table",
+                            ));
+                        }
+                    };
+                    unique_ids.try_reserve(1).map_err(|_| {
+                        offline_resource_error("allocate bounded application identifier set failed")
+                    })?;
+                    if !unique_ids.insert((table_identity, id)) {
+                        return Err(invalid_path(
+                            &image.database.path,
+                            "SQLite application primary key is duplicated",
+                        ));
+                    }
                 }
                 migration_rows += u32::from(logical.migration);
                 for (index_name, key) in logical.indexes {
@@ -2476,6 +3198,18 @@ fn validate_application_record(
     let fields = parse_sqlite_record(path, payload, expected_fields)?;
     let mut indexes = Vec::new();
     let mut references = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut indexes,
+        2,
+        "allocate bounded application index mappings failed",
+    )?;
+    try_reserve_vec(
+        path,
+        &mut references,
+        1,
+        "allocate bounded application references failed",
+    )?;
     let mut unique_id = None;
     let mut migration = false;
     match table {
@@ -2531,19 +3265,33 @@ fn validate_application_record(
             }
             indexes.push((
                 "sqlite_autoindex_sessions_1",
-                IndexKey(vec![
-                    IndexValue::Text(id.clone()),
-                    IndexValue::Integer(rowid),
-                ]),
+                try_index_key(
+                    path,
+                    [
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &id,
+                            "allocate bounded session index identifier failed",
+                        )?),
+                        IndexValue::Integer(rowid),
+                    ],
+                )?,
             ));
             if user_version >= 2 {
                 indexes.push((
                     "sessions_creation_order",
-                    IndexKey(vec![
-                        IndexValue::Integer(created),
-                        IndexValue::Text(id.clone()),
-                        IndexValue::Integer(rowid),
-                    ]),
+                    try_index_key(
+                        path,
+                        [
+                            IndexValue::Integer(created),
+                            IndexValue::Text(try_clone_bytes(
+                                path,
+                                &id,
+                                "allocate bounded session ordering identifier failed",
+                            )?),
+                            IndexValue::Integer(rowid),
+                        ],
+                    )?,
                 ));
             }
             unique_id = Some(id);
@@ -2563,19 +3311,33 @@ fn validate_application_record(
             }
             indexes.push((
                 "sqlite_autoindex_devices_1",
-                IndexKey(vec![
-                    IndexValue::Text(id.clone()),
-                    IndexValue::Integer(rowid),
-                ]),
+                try_index_key(
+                    path,
+                    [
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &id,
+                            "allocate bounded device index identifier failed",
+                        )?),
+                        IndexValue::Integer(rowid),
+                    ],
+                )?,
             ));
             if user_version >= 2 {
                 indexes.push((
                     "devices_creation_order",
-                    IndexKey(vec![
-                        IndexValue::Integer(created),
-                        IndexValue::Text(id.clone()),
-                        IndexValue::Integer(rowid),
-                    ]),
+                    try_index_key(
+                        path,
+                        [
+                            IndexValue::Integer(created),
+                            IndexValue::Text(try_clone_bytes(
+                                path,
+                                &id,
+                                "allocate bounded device ordering identifier failed",
+                            )?),
+                            IndexValue::Integer(rowid),
+                        ],
+                    )?,
                 ));
             }
             unique_id = Some(id);
@@ -2608,19 +3370,37 @@ fn validate_application_record(
             }
             indexes.push((
                 "sqlite_autoindex_authentication_records_1",
-                IndexKey(vec![
-                    IndexValue::Text(id.clone()),
-                    IndexValue::Integer(rowid),
-                ]),
+                try_index_key(
+                    path,
+                    [
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &id,
+                            "allocate bounded authentication index identifier failed",
+                        )?),
+                        IndexValue::Integer(rowid),
+                    ],
+                )?,
             ));
             indexes.push((
                 "authentication_records_device_order",
-                IndexKey(vec![
-                    IndexValue::Text(device_id.clone()),
-                    IndexValue::Integer(created),
-                    IndexValue::Text(id.clone()),
-                    IndexValue::Integer(rowid),
-                ]),
+                try_index_key(
+                    path,
+                    [
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &device_id,
+                            "allocate bounded authentication device identifier failed",
+                        )?),
+                        IndexValue::Integer(created),
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &id,
+                            "allocate bounded authentication ordering identifier failed",
+                        )?),
+                        IndexValue::Integer(rowid),
+                    ],
+                )?,
             ));
             references.push(("sqlite_autoindex_devices_1", device_id));
             unique_id = Some(id);
@@ -2651,19 +3431,37 @@ fn validate_application_record(
             }
             indexes.push((
                 "sqlite_autoindex_tasks_1",
-                IndexKey(vec![
-                    IndexValue::Text(id.clone()),
-                    IndexValue::Integer(rowid),
-                ]),
+                try_index_key(
+                    path,
+                    [
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &id,
+                            "allocate bounded task index identifier failed",
+                        )?),
+                        IndexValue::Integer(rowid),
+                    ],
+                )?,
             ));
             indexes.push((
                 "tasks_session_order",
-                IndexKey(vec![
-                    IndexValue::Text(session_id.clone()),
-                    IndexValue::Integer(created),
-                    IndexValue::Text(id.clone()),
-                    IndexValue::Integer(rowid),
-                ]),
+                try_index_key(
+                    path,
+                    [
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &session_id,
+                            "allocate bounded task session identifier failed",
+                        )?),
+                        IndexValue::Integer(created),
+                        IndexValue::Text(try_clone_bytes(
+                            path,
+                            &id,
+                            "allocate bounded task ordering identifier failed",
+                        )?),
+                        IndexValue::Integer(rowid),
+                    ],
+                )?,
             ));
             references.push(("sqlite_autoindex_sessions_1", session_id));
             unique_id = Some(id);
@@ -2746,14 +3544,16 @@ fn required_text(
 ) -> Result<String, StateError> {
     let bytes = decode_sqlite_text_bytes(path, field, "SQLite application text")?;
     if bytes.len() > maximum {
-        return Err(invalid_path(
-            path,
+        return Err(offline_resource_error(
             "SQLite application text exceeds its offline verification bound",
         ));
     }
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| invalid_path(path, "SQLite application text is not valid UTF-8"))
+    try_utf8_owned(
+        path,
+        bytes,
+        "SQLite application text is not valid UTF-8",
+        "allocate bounded SQLite application text failed",
+    )
 }
 
 fn optional_text(
@@ -2792,8 +3592,28 @@ fn read_index_search_page(
             "SQLite index search reached a non-index page",
         ));
     }
-    let mut keys = Vec::with_capacity(page.cell_count);
-    let mut children = Vec::with_capacity(page.cell_count + 1);
+    try_reserve_vec(
+        &image.database.path,
+        &mut page.occupied,
+        page.cell_count,
+        "allocate bounded SQLite search occupancy ranges failed",
+    )?;
+    let mut keys = Vec::new();
+    try_reserve_vec(
+        &image.database.path,
+        &mut keys,
+        page.cell_count,
+        "allocate bounded SQLite search keys failed",
+    )?;
+    let mut children = Vec::new();
+    try_reserve_vec(
+        &image.database.path,
+        &mut children,
+        page.cell_count.checked_add(1).ok_or_else(|| {
+            invalid_path(&image.database.path, "SQLite search child count overflowed")
+        })?,
+        "allocate bounded SQLite search children failed",
+    )?;
     for index in 0..page.cell_count {
         let offset = btree_cell_offset(image, &page, index)?;
         let payload_offset = if page.page_type == 0x02 {
@@ -2900,7 +3720,13 @@ fn parse_sqlite_record<'payload>(
     if header_size < header_varint || header_size > payload.len() {
         return Err(invalid_path(path, "SQLite record header is invalid"));
     }
-    let mut serials = Vec::with_capacity(maximum_fields);
+    let mut serials = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut serials,
+        maximum_fields,
+        "allocate bounded SQLite record serials failed",
+    )?;
     let mut cursor = header_varint;
     while cursor < header_size {
         if serials.len() == maximum_fields {
@@ -2917,7 +3743,13 @@ fn parse_sqlite_record<'payload>(
         return Err(invalid_path(path, "SQLite record header is malformed"));
     }
     let mut data = header_size;
-    let mut fields = Vec::with_capacity(serials.len());
+    let mut fields = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut fields,
+        serials.len(),
+        "allocate bounded SQLite record fields failed",
+    )?;
     for serial in serials {
         let length = sqlite_serial_length(path, serial)?;
         ensure_slice(path, payload, data, length)?;
@@ -2942,9 +3774,12 @@ fn decode_sqlite_text(
     field_name: &'static str,
 ) -> Result<String, StateError> {
     let bytes = decode_sqlite_text_bytes(path, field, field_name)?;
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| invalid_path(path, "SQLite schema text is not valid UTF-8"))
+    try_utf8_owned(
+        path,
+        bytes,
+        "SQLite schema text is not valid UTF-8",
+        "allocate bounded SQLite schema text failed",
+    )
 }
 
 fn decode_sqlite_text_bytes<'field>(
@@ -3074,6 +3909,114 @@ fn ensure_slice(path: &Path, bytes: &[u8], offset: usize, length: usize) -> Resu
     Ok(())
 }
 
+fn offline_resource_error(reason: &'static str) -> StateError {
+    StateError::InvalidValue {
+        field: "LinuxProtected offline verification resources",
+        reason,
+    }
+}
+
+fn try_zeroed_vec(
+    _path: &Path,
+    length: usize,
+    reason: &'static str,
+) -> Result<Vec<u8>, StateError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| offline_resource_error(reason))?;
+    bytes.resize(length, 0);
+    Ok(bytes)
+}
+
+fn try_reserve_vec<T>(
+    _path: &Path,
+    values: &mut Vec<T>,
+    additional: usize,
+    reason: &'static str,
+) -> Result<(), StateError> {
+    values
+        .try_reserve(additional)
+        .map_err(|_| offline_resource_error(reason))
+}
+
+fn try_push_vec<T>(
+    path: &Path,
+    values: &mut Vec<T>,
+    value: T,
+    reason: &'static str,
+) -> Result<(), StateError> {
+    if values.len() == values.capacity() {
+        try_reserve_vec(path, values, 1, reason)?;
+    }
+    values.push(value);
+    Ok(())
+}
+
+fn try_utf8_owned(
+    path: &Path,
+    bytes: &[u8],
+    utf8_reason: &'static str,
+    allocation_reason: &'static str,
+) -> Result<String, StateError> {
+    let value = std::str::from_utf8(bytes).map_err(|_| invalid_path(path, utf8_reason))?;
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| offline_resource_error(allocation_reason))?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn try_clone_bytes(
+    _path: &Path,
+    bytes: &[u8],
+    reason: &'static str,
+) -> Result<Vec<u8>, StateError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| offline_resource_error(reason))?;
+    cloned.extend_from_slice(bytes);
+    Ok(cloned)
+}
+
+fn try_clone_index_key(path: &Path, key: &IndexKey) -> Result<IndexKey, StateError> {
+    let mut values = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut values,
+        key.0.len(),
+        "allocate bounded SQLite index bound failed",
+    )?;
+    for value in &key.0 {
+        values.push(match value {
+            IndexValue::Integer(value) => IndexValue::Integer(*value),
+            IndexValue::Text(value) => IndexValue::Text(try_clone_bytes(
+                path,
+                value,
+                "allocate bounded SQLite index text bound failed",
+            )?),
+        });
+    }
+    Ok(IndexKey(values))
+}
+
+fn try_index_key<const N: usize>(
+    path: &Path,
+    values: [IndexValue; N],
+) -> Result<IndexKey, StateError> {
+    let mut key = Vec::new();
+    try_reserve_vec(
+        path,
+        &mut key,
+        N,
+        "allocate bounded SQLite application index key failed",
+    )?;
+    key.extend(values);
+    Ok(IndexKey(key))
+}
+
 fn read_be_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes(
         bytes[offset..offset + 2]
@@ -3090,6 +4033,19 @@ fn read_be_u32(bytes: &[u8], offset: usize) -> u32 {
     )
 }
 
+fn minimal_fresh_handoff_page(page: &[u8; 4096]) -> bool {
+    page.starts_with(b"SQLite format 3\0")
+        && read_be_u16(page, 16) == 4096
+        && page[18..24] == [2, 2, 0, 64, 32, 32]
+        && read_be_u32(page, 24) == 1
+        && read_be_u32(page, 28) == 1
+        && page[32..92].iter().all(|byte| *byte == 0)
+        && read_be_u32(page, 92) == 1
+        && read_be_u32(page, 96) != 0
+        && page[100..108] == [0x0d, 0, 0, 0, 0, 0x10, 0, 0]
+        && page[108..].iter().all(|byte| *byte == 0)
+}
+
 fn validate_offline_wal(
     wal: &HeldEntry,
     database_page_size: u64,
@@ -3101,11 +4057,16 @@ fn validate_offline_wal(
         .metadata()
         .map_err(|error| file_error("inspect initialized LinuxProtected WAL", &wal.path, error))?
         .len();
+    if length > MAX_OFFLINE_WAL_BYTES {
+        return Err(offline_resource_error(
+            "initialized LinuxProtected WAL exceeds the offline verification bound",
+        ));
+    }
     if length <= 32 {
         return Ok(WalObservation {
             committed_pages: None,
             page_one: None,
-            frames: BTreeMap::new(),
+            frames: HashMap::new(),
         });
     }
     let frame_size = 24_u64
@@ -3155,13 +4116,33 @@ fn validate_offline_wal(
     }
     let salts = &header[16..24];
     let frame_count = payload / frame_size;
+    let frame_capacity = usize::try_from(frame_count).map_err(|_| {
+        invalid_path(
+            &wal.path,
+            "initialized LinuxProtected WAL frame count exceeds platform bounds",
+        )
+    })?;
+    if frame_capacity > MAX_OFFLINE_WAL_FRAMES {
+        return Err(offline_resource_error(
+            "initialized LinuxProtected WAL frame count exceeds the offline verification bound",
+        ));
+    }
     let page_size =
         usize::try_from(database_page_size).expect("validated SQLite page size fits this platform");
-    let mut page = vec![0_u8; page_size];
+    let mut page = try_zeroed_vec(
+        &wal.path,
+        page_size,
+        "allocate bounded LinuxProtected WAL page buffer",
+    )?;
     let mut latest_commit = None;
-    let mut committed_frames = BTreeMap::new();
-    let mut pending_frames = BTreeMap::new();
-    let mut transaction_max_page = 0_u32;
+    let mut committed_frames = HashMap::new();
+    let mut pending_frames = HashMap::new();
+    committed_frames
+        .try_reserve(frame_capacity)
+        .map_err(|_| offline_resource_error("allocate bounded committed WAL frame map failed"))?;
+    pending_frames
+        .try_reserve(frame_capacity)
+        .map_err(|_| offline_resource_error("allocate bounded pending WAL frame map failed"))?;
     for frame_index in 0..frame_count {
         check_cutoff(&wal.path, Some(cutoff), None, timeout_ms)?;
         let offset = 32_u64
@@ -3202,7 +4183,6 @@ fn validate_offline_wal(
             break;
         }
         checksum = next_checksum;
-        transaction_max_page = transaction_max_page.max(page_number);
         pending_frames.insert(page_number, offset + 24);
         let database_pages = u32::from_be_bytes(
             frame_header[4..8]
@@ -3210,18 +4190,10 @@ fn validate_offline_wal(
                 .expect("fixed WAL commit size is in bounds"),
         );
         if database_pages != 0 {
-            if database_pages < transaction_max_page {
-                return Err(invalid_path(
-                    &wal.path,
-                    "initialized LinuxProtected WAL commit size omits a transaction page",
-                ));
-            }
             latest_commit = Some(database_pages);
-            for (page_number, frame_offset) in std::mem::take(&mut pending_frames) {
+            for (page_number, frame_offset) in pending_frames.drain() {
                 committed_frames.insert(page_number, frame_offset);
             }
-            committed_frames.retain(|page_number, _| *page_number <= database_pages);
-            transaction_max_page = 0;
         }
     }
     if wal
@@ -3236,10 +4208,17 @@ fn validate_offline_wal(
             "initialized LinuxProtected WAL length changed during verification",
         ));
     }
+    if let Some(database_pages) = latest_commit {
+        committed_frames.retain(|page_number, _| *page_number <= database_pages);
+    }
     let committed_page_one = committed_frames
         .get(&1)
         .map(|offset| {
-            let mut bytes = vec![0_u8; page_size];
+            let mut bytes = try_zeroed_vec(
+                &wal.path,
+                page_size,
+                "allocate bounded committed WAL page-one buffer failed",
+            )?;
             read_exact_at(
                 &wal.file,
                 &mut bytes,
@@ -3296,11 +4275,64 @@ fn stored_wal_checksum(bytes: &[u8]) -> [u32; 2] {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OfflineNamespaceState {
     Fresh,
+    PreparingFresh,
+    PreparedFresh,
+    TransitionedFresh,
+    InitializedFresh,
     Initialized,
 }
 
 const OFFLINE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const OFFLINE_INITIALIZE_CLEANUP_TAIL: Duration = Duration::from_secs(5);
+
+struct RetainedOfflineInitializer {
+    worker: std::thread::JoinHandle<Result<(), StateError>>,
+    _writer_lock: crate::store::LinuxProtectedOfflineLock,
+    namespace: Arc<ProtectedNamespace>,
+    identities: [FileIdentity; ENTRY_NAMES.len()],
+    may_rollback: bool,
+}
+
+fn spawn_offline_initializer_reaper() -> Result<
+    (
+        std::sync::mpsc::SyncSender<RetainedOfflineInitializer>,
+        std::thread::JoinHandle<()>,
+    ),
+    StateError,
+> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<RetainedOfflineInitializer>(1);
+    let reaper = std::thread::Builder::new()
+        .name("claw-state-offline-init-reaper".to_owned())
+        .spawn(move || {
+            let Ok(retained) = receiver.recv() else {
+                return;
+            };
+            let terminal = retained.worker.join();
+            let safe_to_release = match terminal {
+                Ok(_) => match retained.namespace.recovery_fresh_state() {
+                    Ok(_) => true,
+                    Err(_) if retained.may_rollback => retained
+                        .namespace
+                        .restore_exact_fresh(retained.identities)
+                        .is_ok(),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if safe_to_release {
+                drop(retained._writer_lock);
+            } else {
+                std::mem::forget(retained._writer_lock);
+            }
+        })
+        .map_err(|error| {
+            database(
+                "start LinuxProtected offline initializer reaper",
+                sqlx::Error::Protocol(error.to_string()),
+            )
+        })?;
+    Ok((sender, reaper))
+}
 
 pub(crate) fn initialize_offline(
     directory: &Path,
@@ -3325,17 +4357,47 @@ pub(crate) fn initialize_offline(
         .expect("fixed offline timeout fits u64");
     let spec = LinuxProtectedSpec::new(directory.to_owned(), service_uid, service_gid);
     let preflight = OfflineNamespacePreflight::open(&spec)?;
-    let _writer_lock = crate::store::acquire_linux_protected_offline_lock(&preflight)?;
+    let writer_lock = crate::store::acquire_linux_protected_offline_lock(&preflight)?;
     let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)?;
     preflight.verify_locked_namespace(&namespace)?;
     let state = namespace.offline_state(work_cutoff, timeout_ms)?;
     let identities = namespace.captured_identities();
-    if state == OfflineNamespaceState::Initialized {
-        namespace.verify_captured_identities(identities)?;
-        check_initializer_deadline(deadline, timeout_ms)?;
-        namespace.validate_runtime_layout(deadline, timeout_ms)?;
-        check_initializer_deadline(deadline, timeout_ms)?;
-        return Ok(LinuxProtectedInitialization::AlreadyInitialized);
+    let started_fresh = state == OfflineNamespaceState::Fresh;
+    match state {
+        OfflineNamespaceState::Initialized => {
+            namespace.verify_captured_identities(identities)?;
+            check_initializer_deadline(deadline, timeout_ms)?;
+            namespace.validate_runtime_layout(deadline, timeout_ms)?;
+            check_initializer_deadline(deadline, timeout_ms)?;
+            return Ok(LinuxProtectedInitialization::AlreadyInitialized);
+        }
+        OfflineNamespaceState::InitializedFresh => {
+            return settle_initialized_fresh(&namespace, identities, deadline, timeout_ms);
+        }
+        OfflineNamespaceState::TransitionedFresh => {
+            return finish_transitioned_fresh(
+                &namespace,
+                identities,
+                work_cutoff,
+                deadline,
+                timeout_ms,
+            );
+        }
+        OfflineNamespaceState::Fresh | OfflineNamespaceState::PreparingFresh => {
+            let started_fresh = state == OfflineNamespaceState::Fresh;
+            if let Err(primary) = namespace.initialize_prep_record() {
+                return Err(if started_fresh {
+                    rollback_started_fresh(&namespace, identities, primary)
+                } else {
+                    classify_prepared_failure(&namespace, primary)
+                });
+            }
+            fail_offline_initializer_stage(
+                OfflineInitializerTestStage::DeathAfterPrep,
+                namespace.database_path(),
+            )?;
+        }
+        OfflineNamespaceState::PreparedFresh => {}
     }
     if Instant::now() >= work_cutoff {
         return Err(StateError::OperationTimedOut {
@@ -3343,7 +4405,9 @@ pub(crate) fn initialize_offline(
             timeout_ms,
         });
     }
+    let (reaper, reaper_thread) = spawn_offline_initializer_reaper()?;
     let worker_namespace = Arc::clone(&namespace);
+    let (completion, completed) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("claw-state-offline-init".to_owned())
         .spawn(move || {
@@ -3363,6 +4427,7 @@ pub(crate) fn initialize_offline(
                 timeout_ms,
             ));
             drop(runtime);
+            let _ = completion.send(());
             result
         })
         .map_err(|error| {
@@ -3371,22 +4436,296 @@ pub(crate) fn initialize_offline(
                 sqlx::Error::Protocol(error.to_string()),
             )
         })?;
-    worker.join().map_err(|_| {
-        database(
-            "join LinuxProtected offline initializer thread",
-            sqlx::Error::Protocol("LinuxProtected offline initializer thread panicked".to_owned()),
-        )
-    })??;
-    namespace.verify_captured_identities(identities)?;
-    check_initializer_deadline(deadline, timeout_ms)?;
-    namespace.validate_fresh_sqlite_handoff(deadline, timeout_ms)?;
-    namespace.initialize_empty_selector()?;
-    check_initializer_deadline(deadline, timeout_ms)?;
-    namespace.verify_captured_identities(identities)?;
-    check_initializer_deadline(deadline, timeout_ms)?;
-    namespace.validate_runtime_layout(deadline, timeout_ms)?;
-    check_initializer_deadline(deadline, timeout_ms)?;
-    Ok(LinuxProtectedInitialization::Initialized)
+    match completed.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let retained = RetainedOfflineInitializer {
+                worker,
+                _writer_lock: writer_lock,
+                namespace: Arc::clone(&namespace),
+                identities,
+                may_rollback: started_fresh,
+            };
+            if let Err(error) = reaper.try_send(retained) {
+                let retained = match error {
+                    std::sync::mpsc::TrySendError::Full(retained)
+                    | std::sync::mpsc::TrySendError::Disconnected(retained) => retained,
+                };
+                std::mem::forget(retained);
+                return Err(StateError::OperationCleanupFailed {
+                    operation: "retain timed-out LinuxProtected initializer",
+                    primary: Box::new(StateError::OperationTimedOut {
+                        operation: "initialize LinuxProtected state offline",
+                        timeout_ms,
+                    }),
+                    cleanup:
+                        "offline initializer reaper disconnected; worker and fixed lock were intentionally leaked"
+                            .to_owned(),
+                });
+            }
+            drop(reaper);
+            drop(reaper_thread);
+            return Err(StateError::OperationTimedOut {
+                operation: "initialize LinuxProtected state offline",
+                timeout_ms,
+            });
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+    }
+    let worker_result = match worker.join() {
+        Ok(result) => result,
+        Err(_) => {
+            drop(reaper);
+            let _ = reaper_thread.join();
+            std::mem::forget(writer_lock);
+            return Err(StateError::OperationCleanupFailed {
+            operation: "initialize LinuxProtected state offline",
+            primary: Box::new(database(
+                "join LinuxProtected offline initializer thread",
+                sqlx::Error::Protocol(
+                    "LinuxProtected offline initializer thread panicked".to_owned(),
+                ),
+            )),
+            cleanup:
+                "initializer worker panicked; terminal SQLite retirement was not proven, so the fixed lock was intentionally retained"
+                    .to_owned(),
+            });
+        }
+    };
+    drop(reaper);
+    let _ = reaper_thread.join();
+    if let Err(primary) = worker_result {
+        return Err(settle_failed_fresh_transition(
+            &namespace,
+            identities,
+            primary,
+            started_fresh,
+        ));
+    }
+    finish_transitioned_fresh(&namespace, identities, work_cutoff, deadline, timeout_ms)
+}
+
+fn finish_transitioned_fresh(
+    namespace: &ProtectedNamespace,
+    identities: [FileIdentity; ENTRY_NAMES.len()],
+    work_cutoff: Instant,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<LinuxProtectedInitialization, StateError> {
+    let precommit = (|| {
+        namespace.verify_captured_identities(identities)?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::Deadline,
+            namespace.database_path(),
+        )?;
+        check_initializer_deadline(work_cutoff, timeout_ms)?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::WalSync,
+            &namespace.entries[WAL_INDEX].path,
+        )?;
+        namespace.entries[WAL_INDEX]
+            .file
+            .sync_all()
+            .map_err(|error| {
+                file_error(
+                    "sync transitioned LinuxProtected WAL",
+                    &namespace.entries[WAL_INDEX].path,
+                    error,
+                )
+            })?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::DatabaseSync,
+            namespace.database_path(),
+        )?;
+        namespace.entries[DATABASE_INDEX]
+            .file
+            .sync_all()
+            .map_err(|error| {
+                file_error(
+                    "sync transitioned LinuxProtected database",
+                    namespace.database_path(),
+                    error,
+                )
+            })?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::RawValidation,
+            namespace.database_path(),
+        )?;
+        namespace.validate_prepared_fresh_sqlite(work_cutoff, timeout_ms)?;
+        check_initializer_deadline(work_cutoff, timeout_ms)?;
+        namespace.initialize_empty_selector()
+    })();
+    if let Err(primary) = precommit {
+        return Err(classify_prepared_failure(namespace, primary));
+    }
+
+    let committed = (|| {
+        let selector = namespace.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
+        if selector.len() != SELECTOR_LEN || selector.iter().any(|byte| *byte != 0) {
+            return Err(invalid_path(
+                namespace.selector_path(),
+                "committed LinuxProtected selector failed exact reread",
+            ));
+        }
+        namespace.cleanup_prep_record()?;
+        check_initializer_deadline(deadline, timeout_ms)?;
+        namespace.verify_captured_identities(identities)?;
+        check_initializer_deadline(deadline, timeout_ms)?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::FinalValidation,
+            namespace.database_path(),
+        )?;
+        namespace.validate_runtime_layout(deadline, timeout_ms)?;
+        check_initializer_deadline(deadline, timeout_ms)
+    })();
+    match committed {
+        Ok(()) => Ok(LinuxProtectedInitialization::Initialized),
+        Err(primary) => Err(classify_committed_initializer_failure(namespace, primary)),
+    }
+}
+
+fn settle_initialized_fresh(
+    namespace: &ProtectedNamespace,
+    identities: [FileIdentity; ENTRY_NAMES.len()],
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<LinuxProtectedInitialization, StateError> {
+    let result = (|| {
+        namespace.verify_captured_identities(identities)?;
+        namespace.validate_prepared_fresh_sqlite(deadline, timeout_ms)?;
+        let selector = &namespace.entries[SELECTOR_INDEX];
+        let bytes = namespace.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
+        if bytes.len() != SELECTOR_LEN || bytes.iter().any(|byte| *byte != 0) {
+            return Err(invalid_path(
+                &selector.path,
+                "ambiguous LinuxProtected selector is not the exact commit value",
+            ));
+        }
+        selector.file.sync_all().map_err(|error| {
+            file_error(
+                "settle ambiguous LinuxProtected selector durability",
+                &selector.path,
+                error,
+            )
+        })?;
+        namespace.parent.sync_all().map_err(|error| {
+            file_error(
+                "sync LinuxProtected namespace after selector settlement",
+                &namespace.directory,
+                error,
+            )
+        })?;
+        namespace.cleanup_prep_record()?;
+        namespace.validate_runtime_layout(deadline, timeout_ms)
+    })();
+    match result {
+        Ok(()) => Ok(LinuxProtectedInitialization::AlreadyInitialized),
+        Err(primary) => Err(classify_committed_initializer_failure(namespace, primary)),
+    }
+}
+
+fn rollback_started_fresh(
+    namespace: &ProtectedNamespace,
+    identities: [FileIdentity; ENTRY_NAMES.len()],
+    primary: StateError,
+) -> StateError {
+    match namespace.restore_exact_fresh(identities) {
+        Ok(()) => primary,
+        Err(cleanup) => StateError::OperationCleanupFailed {
+            operation: "rollback failed LinuxProtected fresh preparation",
+            primary: Box::new(primary),
+            cleanup: cleanup.to_string(),
+        },
+    }
+}
+
+fn settle_failed_fresh_transition(
+    namespace: &ProtectedNamespace,
+    identities: [FileIdentity; ENTRY_NAMES.len()],
+    primary: StateError,
+    may_rollback: bool,
+) -> StateError {
+    match namespace.recovery_fresh_state() {
+        Ok(
+            OfflineNamespaceState::Fresh
+            | OfflineNamespaceState::PreparingFresh
+            | OfflineNamespaceState::PreparedFresh
+            | OfflineNamespaceState::TransitionedFresh
+            | OfflineNamespaceState::InitializedFresh
+            | OfflineNamespaceState::Initialized,
+        ) => primary,
+        Err(classification) if may_rollback => match namespace.restore_exact_fresh(identities) {
+            Ok(()) => primary,
+            Err(rollback) => StateError::OperationCleanupFailed {
+                operation: "restore failed LinuxProtected fresh initialization",
+                primary: Box::new(primary),
+                cleanup: format!(
+                    "post-transition classification failed: {classification}; exact fresh rollback failed: {rollback}"
+                ),
+            },
+        },
+        Err(classification) => StateError::OperationCleanupFailed {
+            operation: "retain unclassifiable resumed LinuxProtected initialization",
+            primary: Box::new(primary),
+            cleanup: format!(
+                "initializer did not originate from exact Fresh, so unknown bytes were retained: {classification}"
+            ),
+        },
+    }
+}
+
+fn classify_prepared_failure(namespace: &ProtectedNamespace, primary: StateError) -> StateError {
+    match namespace.recovery_fresh_state() {
+        Ok(
+            OfflineNamespaceState::PreparingFresh
+            | OfflineNamespaceState::PreparedFresh
+            | OfflineNamespaceState::TransitionedFresh
+            | OfflineNamespaceState::InitializedFresh
+            | OfflineNamespaceState::Initialized,
+        ) => primary,
+        Ok(OfflineNamespaceState::Fresh) => StateError::OperationCleanupFailed {
+            operation: "resume prepared LinuxProtected initialization",
+            primary: Box::new(primary),
+            cleanup: "prepared state unexpectedly reverted to fresh".to_owned(),
+        },
+        Err(classification) => StateError::OperationCleanupFailed {
+            operation: "resume prepared LinuxProtected initialization",
+            primary: Box::new(primary),
+            cleanup: format!("selector precommit state became unclassifiable: {classification}"),
+        },
+    }
+}
+
+fn classify_committed_initializer_failure(
+    namespace: &ProtectedNamespace,
+    primary: StateError,
+) -> StateError {
+    match namespace.recovery_fresh_state() {
+        Ok(OfflineNamespaceState::Initialized | OfflineNamespaceState::InitializedFresh) => {
+            StateError::OperationCleanupFailed {
+            operation: "finalize committed LinuxProtected initialization",
+            primary: Box::new(primary),
+            cleanup:
+                "selector commit is visible as Initialized; rerun is idempotent and will report AlreadyInitialized"
+                    .to_owned(),
+        }
+        }
+        Ok(
+            OfflineNamespaceState::PreparingFresh
+            | OfflineNamespaceState::PreparedFresh
+            | OfflineNamespaceState::TransitionedFresh,
+        ) => primary,
+        Ok(OfflineNamespaceState::Fresh) => StateError::OperationCleanupFailed {
+            operation: "finalize committed LinuxProtected initialization",
+            primary: Box::new(primary),
+            cleanup: "selector commit unexpectedly reverted to Fresh".to_owned(),
+        },
+        Err(classification) => StateError::OperationCleanupFailed {
+            operation: "finalize committed LinuxProtected initialization",
+            primary: Box::new(primary),
+            cleanup: format!("selector commit outcome is unclassifiable: {classification}"),
+        },
+    }
 }
 
 fn check_initializer_deadline(deadline: Instant, timeout_ms: u64) -> Result<(), StateError> {
@@ -3428,18 +4767,26 @@ async fn run_offline_sqlite(
             timeout_ms,
         });
     }
+    let injected_clear = fail_offline_initializer_stage(
+        OfflineInitializerTestStage::HandlerCleanup,
+        namespace.database_path(),
+    );
     let clear = clear_offline_progress_handler(&mut connection).await;
-    if let Err(cleanup) = clear {
+    for cleanup in [injected_clear.err(), clear.err()].into_iter().flatten() {
         result = Err(match result {
             Ok(()) => cleanup,
             Err(primary) => append_offline_cleanup(primary, cleanup),
         });
     }
+    let injected_close = fail_offline_initializer_stage(
+        OfflineInitializerTestStage::Close,
+        namespace.database_path(),
+    );
     let close = connection
         .close()
         .await
         .map_err(|error| database("close LinuxProtected database offline", error));
-    if let Err(cleanup) = close {
+    for cleanup in [injected_close.err(), close.err()].into_iter().flatten() {
         result = Err(match result {
             Ok(()) => cleanup,
             Err(primary) => append_offline_cleanup(primary, cleanup),
@@ -3534,6 +4881,10 @@ async fn verify_offline_connection(
         ));
     }
     verify_offline_live_identity(namespace, connection).await?;
+    fail_offline_initializer_stage(
+        OfflineInitializerTestStage::TransitionBeforeWal,
+        namespace.database_path(),
+    )?;
     let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
         .fetch_one(&mut *connection)
         .await
@@ -3544,6 +4895,14 @@ async fn verify_offline_connection(
             "LinuxProtected offline initializer requires WAL journal mode",
         ));
     }
+    fail_offline_initializer_stage(
+        OfflineInitializerTestStage::Transition,
+        namespace.database_path(),
+    )?;
+    fail_offline_initializer_stage(
+        OfflineInitializerTestStage::Identity,
+        namespace.database_path(),
+    )?;
     verify_offline_live_identity(namespace, connection).await?;
 
     Ok(())
@@ -4441,6 +5800,7 @@ mod tests {
                     .expect("preallocate fixed selector cells");
             }
         }
+
         for name in ENTRY_NAMES {
             let path = namespace.join(name);
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
@@ -4477,6 +5837,242 @@ mod tests {
             ready,
             control,
         }
+    }
+
+    fn fresh_root_fixture() -> RootFixture {
+        assert!(
+            rustix::process::getuid().is_root() && rustix::process::geteuid().is_root(),
+            "fresh LinuxProtected fixture requires real and effective UID 0"
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time follows Unix epoch")
+            .as_nanos();
+        let outer = PathBuf::from(format!(
+            "/var/lib/gta-claw-lp3-fault-{}-{nonce}",
+            std::process::id()
+        ));
+        let namespace = outer.join("state");
+        fs::create_dir(&outer).expect("create fresh fixture ancestor");
+        chown(&outer, Some(0), Some(0)).expect("own fresh fixture ancestor");
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o755))
+            .expect("secure fresh fixture ancestor");
+        fs::create_dir(&namespace).expect("create fresh protected namespace");
+        for name in ENTRY_NAMES {
+            let path = namespace.join(name);
+            File::create(&path).unwrap_or_else(|error| panic!("precreate fresh {name}: {error}"));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|error| panic!("secure fresh {name}: {error}"));
+            chown(&path, Some(SERVICE_UID), Some(SERVICE_GID))
+                .unwrap_or_else(|error| panic!("own fresh {name}: {error}"));
+        }
+        chown(&namespace, Some(0), Some(SERVICE_GID))
+            .expect("assign fresh namespace service group");
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o750))
+            .expect("secure fresh protected namespace");
+        RootFixture {
+            ready: outer.join("unused.ready"),
+            control: outer.join("unused.control"),
+            outer,
+            namespace,
+        }
+    }
+
+    fn schedule_offline_initializer_fault(stage: OfflineInitializerTestStage) {
+        schedule_offline_initializer_faults(&[stage]);
+    }
+
+    fn schedule_offline_initializer_faults(stages: &[OfflineInitializerTestStage]) {
+        let mut scheduled = OFFLINE_INITIALIZER_TEST_FAULT
+            .lock()
+            .expect("offline initializer fault schedule lock poisoned");
+        assert!(scheduled.is_empty());
+        scheduled.extend_from_slice(stages);
+    }
+
+    fn exercise_offline_initializer_fault_matrix() {
+        for stage in [
+            OfflineInitializerTestStage::PrepPrefix,
+            OfflineInitializerTestStage::PrepWrite,
+            OfflineInitializerTestStage::PrepSync,
+            OfflineInitializerTestStage::DeathAfterPrep,
+            OfflineInitializerTestStage::TransitionBeforeWal,
+            OfflineInitializerTestStage::Transition,
+            OfflineInitializerTestStage::Identity,
+            OfflineInitializerTestStage::HandlerCleanup,
+            OfflineInitializerTestStage::Close,
+            OfflineInitializerTestStage::WalSync,
+            OfflineInitializerTestStage::DatabaseSync,
+            OfflineInitializerTestStage::Deadline,
+            OfflineInitializerTestStage::RawValidation,
+            OfflineInitializerTestStage::SelectorData,
+            OfflineInitializerTestStage::SelectorWrite,
+            OfflineInitializerTestStage::SelectorPartialWrite,
+            OfflineInitializerTestStage::SelectorSync,
+            OfflineInitializerTestStage::MarkerCleanup,
+            OfflineInitializerTestStage::FinalValidation,
+        ] {
+            let fixture = fresh_root_fixture();
+            let identities = entry_identities(&fixture.namespace);
+            schedule_offline_initializer_fault(stage);
+            crate::initialize_linux_protected_offline(&fixture.namespace, SERVICE_UID, SERVICE_GID)
+                .unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error,
+                            StateError::InvalidPath { .. }
+                                | StateError::OperationCleanupFailed { .. }
+                        ),
+                        "{stage:?} returned the wrong injected failure: {error:?}"
+                    );
+                    LinuxProtectedInitialization::Initialized
+                });
+            assert!(
+                OFFLINE_INITIALIZER_TEST_FAULT
+                    .lock()
+                    .expect("offline initializer fault schedule lock poisoned")
+                    .is_empty(),
+                "{stage:?} was not reached"
+            );
+            assert_eq!(exact_names(&fixture.namespace), expected_names());
+            assert_eq!(entry_identities(&fixture.namespace), identities);
+
+            let resumed = crate::initialize_linux_protected_offline(
+                &fixture.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .unwrap_or_else(|error| panic!("{stage:?} did not resume safely: {error:?}"));
+            let expected = if matches!(
+                stage,
+                OfflineInitializerTestStage::SelectorSync
+                    | OfflineInitializerTestStage::MarkerCleanup
+                    | OfflineInitializerTestStage::FinalValidation
+            ) {
+                LinuxProtectedInitialization::AlreadyInitialized
+            } else {
+                LinuxProtectedInitialization::Initialized
+            };
+            assert_eq!(resumed, expected, "{stage:?} resumed from the wrong state");
+            assert_eq!(
+                crate::initialize_linux_protected_offline(
+                    &fixture.namespace,
+                    SERVICE_UID,
+                    SERVICE_GID,
+                )
+                .expect("completed fault fixture is idempotent"),
+                LinuxProtectedInitialization::AlreadyInitialized
+            );
+            assert_eq!(entry_identities(&fixture.namespace), identities);
+            assert_eq!(exact_names(&fixture.namespace), expected_names());
+            let database =
+                fs::read(fixture.namespace.join(DATABASE_NAME)).expect("read fault database");
+            assert!(!database.windows(6).any(|bytes| bytes == b"CREATE"));
+            assert!(
+                !database
+                    .windows(16)
+                    .any(|bytes| bytes == b"claw_writer_lock")
+            );
+        }
+
+        for (trigger, rollback) in [
+            (
+                OfflineInitializerTestStage::PrepWrite,
+                OfflineInitializerTestStage::RollbackTruncate,
+            ),
+            (
+                OfflineInitializerTestStage::PrepSync,
+                OfflineInitializerTestStage::RollbackSync,
+            ),
+        ] {
+            let fixture = fresh_root_fixture();
+            let identities = entry_identities(&fixture.namespace);
+            schedule_offline_initializer_faults(&[trigger, rollback]);
+            let error = crate::initialize_linux_protected_offline(
+                &fixture.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect_err("rollback stage failure must remain explicit");
+            assert!(
+                matches!(error, StateError::OperationCleanupFailed { .. }),
+                "rollback stage returned the wrong error: {error:?}"
+            );
+            assert!(
+                OFFLINE_INITIALIZER_TEST_FAULT
+                    .lock()
+                    .expect("offline initializer fault schedule lock poisoned")
+                    .is_empty()
+            );
+            assert_eq!(entry_identities(&fixture.namespace), identities);
+            assert_eq!(
+                crate::initialize_linux_protected_offline(
+                    &fixture.namespace,
+                    SERVICE_UID,
+                    SERVICE_GID,
+                )
+                .expect("rollback-stage residue remains resumable"),
+                LinuxProtectedInitialization::Initialized
+            );
+        }
+
+        let sparse = fresh_root_fixture();
+        assert_eq!(
+            crate::initialize_linux_protected_offline(&sparse.namespace, SERVICE_UID, SERVICE_GID,)
+                .expect("initialize sparse-bound fixture"),
+            LinuxProtectedInitialization::Initialized
+        );
+        let identities = entry_identities(&sparse.namespace);
+        let database_path = sparse.namespace.join(DATABASE_NAME);
+        let database = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("open sparse-bound database");
+        database
+            .set_len(MAX_OFFLINE_DATABASE_BYTES)
+            .expect("extend sparse-bound database without allocation");
+        write_all_at(
+            &database,
+            &(MAX_OFFLINE_FREELIST_PAGES + 1).to_be_bytes(),
+            36,
+        )
+        .and_then(|()| database.sync_all())
+        .expect("persist oversized sparse freelist declaration");
+        let mut first_page = [0_u8; 4096];
+        database
+            .read_at(&mut first_page, 0)
+            .expect("read sparse-bound first page");
+        let error =
+            crate::initialize_linux_protected_offline(&sparse.namespace, SERVICE_UID, SERVICE_GID)
+                .expect_err("oversized sparse freelist must fail safely");
+        assert!(
+            matches!(error, StateError::InvalidValue { .. }),
+            "oversized sparse freelist returned the wrong error: {error:?}"
+        );
+        assert_eq!(
+            fs::metadata(&database_path)
+                .expect("inspect sparse-bound database")
+                .len(),
+            MAX_OFFLINE_DATABASE_BYTES
+        );
+        let mut reread = [0_u8; 4096];
+        database
+            .read_at(&mut reread, 0)
+            .expect("reread sparse-bound first page");
+        assert_eq!(reread, first_page);
+        assert_eq!(entry_identities(&sparse.namespace), identities);
+
+        let survivor = fresh_root_fixture();
+        assert_eq!(
+            crate::initialize_linux_protected_offline(
+                &survivor.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect("initializer process survives sparse-bound rejection"),
+            LinuxProtectedInitialization::Initialized
+        );
     }
 
     fn service_child_command(
@@ -6057,6 +7653,254 @@ mod tests {
     }
 
     #[test]
+    fn offline_initializer_source_contract_excludes_mutating_legacy_paths() {
+        let source = include_str!("linux_protected.rs");
+        let connection_start = source
+            .find("async fn verify_offline_connection(")
+            .expect("find fresh handoff actor");
+        let connection_end = source[connection_start..]
+            .find("\nasync fn verify_offline_live_identity(")
+            .map(|offset| connection_start + offset)
+            .expect("find end of fresh handoff actor");
+        let handoff = &source[connection_start..connection_end];
+        for forbidden in [
+            "CREATE ",
+            "DROP ",
+            "PRAGMA wal_checkpoint",
+            "sqlite3_wal_checkpoint",
+            "TRUNCATE",
+            "unlink",
+        ] {
+            assert!(
+                !handoff.contains(forbidden),
+                "fresh handoff actor contains forbidden operation {forbidden}"
+            );
+        }
+        let persistent = handoff
+            .find("enable_persistent_wal")
+            .expect("persistent WAL control is present");
+        let no_checkpoint = handoff
+            .find("disable_wal_checkpoint_on_close")
+            .expect("no-checkpoint control is present");
+        let transition = handoff
+            .find("PRAGMA journal_mode = WAL")
+            .expect("WAL transition is present");
+        assert!(persistent < transition);
+        assert!(no_checkpoint < transition);
+
+        let classify_start = source
+            .find("fn offline_state(")
+            .expect("find raw offline classifier");
+        let classify_end = source[classify_start..]
+            .find("\n    fn captured_identities(")
+            .map(|offset| classify_start + offset)
+            .expect("find end of raw offline classifier");
+        let classifier = &source[classify_start..classify_end];
+        for forbidden in [
+            "SqliteConnection",
+            "connect_with",
+            "enable_persistent_wal",
+            "disable_wal_checkpoint_on_close",
+            "tempfile",
+        ] {
+            assert!(
+                !classifier.contains(forbidden),
+                "initialized raw classifier contains forbidden operation {forbidden}"
+            );
+        }
+    }
+
+    fn minimal_sqlite_page() -> [u8; 4096] {
+        let mut page = [0_u8; 4096];
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+        page[18..24].copy_from_slice(&[2, 2, 0, 64, 32, 32]);
+        page[24..28].copy_from_slice(&1_u32.to_be_bytes());
+        page[28..32].copy_from_slice(&1_u32.to_be_bytes());
+        page[92..96].copy_from_slice(&1_u32.to_be_bytes());
+        page[96..100].copy_from_slice(&3_051_003_u32.to_be_bytes());
+        page[100..108].copy_from_slice(&[0x0d, 0, 0, 0, 0, 0x10, 0, 0]);
+        page
+    }
+
+    fn append_wal_frame(
+        wal: &mut Vec<u8>,
+        checksum: &mut [u32; 2],
+        page_number: u32,
+        database_pages: u32,
+        salts: [u8; 8],
+        page: &[u8; 4096],
+    ) {
+        let mut header = [0_u8; 24];
+        header[..4].copy_from_slice(&page_number.to_be_bytes());
+        header[4..8].copy_from_slice(&database_pages.to_be_bytes());
+        header[8..16].copy_from_slice(&salts);
+        *checksum = wal_checksum(&header[..8], false, *checksum);
+        *checksum = wal_checksum(page, false, *checksum);
+        header[16..20].copy_from_slice(&checksum[0].to_be_bytes());
+        header[20..24].copy_from_slice(&checksum[1].to_be_bytes());
+        wal.extend_from_slice(&header);
+        wal.extend_from_slice(page);
+    }
+
+    #[tokio::test]
+    async fn committed_wal_discards_spilled_pages_above_final_size() {
+        let temporary = tempfile::tempdir().expect("create WAL shrink fixture");
+        let database_path = temporary.path().join(DATABASE_NAME);
+        let wal_path = temporary.path().join(WAL_NAME);
+        let page_one = minimal_sqlite_page();
+        fs::write(&database_path, page_one).expect("write WAL shrink main database");
+
+        let salts = [0x21, 0x43, 0x65, 0x87, 0x10, 0x32, 0x54, 0x76];
+        let mut wal_header = [0_u8; 32];
+        wal_header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
+        wal_header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        wal_header[8..12].copy_from_slice(&4096_u32.to_be_bytes());
+        wal_header[16..24].copy_from_slice(&salts);
+        let mut checksum = wal_checksum(&wal_header[..24], false, [0, 0]);
+        wal_header[24..28].copy_from_slice(&checksum[0].to_be_bytes());
+        wal_header[28..32].copy_from_slice(&checksum[1].to_be_bytes());
+        let mut wal = wal_header.to_vec();
+        append_wal_frame(&mut wal, &mut checksum, 2, 0, salts, &[0x5a; 4096]);
+        append_wal_frame(&mut wal, &mut checksum, 1, 1, salts, &page_one);
+        fs::write(&wal_path, &wal).expect("write checksummed shrinking WAL");
+
+        let wal_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .expect("open shrinking WAL");
+        let wal_entry = HeldEntry {
+            name: WAL_NAME,
+            path: wal_path.clone(),
+            identity: FileIdentity::capture(&wal_path, &wal_file, "inspect shrinking WAL identity")
+                .expect("capture shrinking WAL identity"),
+            file: wal_file,
+        };
+        let observation = validate_offline_wal(
+            &wal_entry,
+            4096,
+            Instant::now() + Duration::from_secs(5),
+            5_000,
+        )
+        .expect("raw verifier accepts spill above final database size");
+        assert_eq!(observation.committed_pages, Some(1));
+        assert_eq!(observation.frames.keys().copied().collect::<Vec<_>>(), [1]);
+
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(false)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("SQLite 3.51.3 opens shrinking WAL");
+        claw_sqlite_file_control::disable_wal_checkpoint_on_close(&mut connection)
+            .await
+            .expect("retain shrinking WAL during cross-check");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA page_count")
+                .fetch_one(&mut connection)
+                .await
+                .expect("read effective shrinking WAL page count"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+                .fetch_one(&mut connection)
+                .await
+                .expect("cross-check shrinking WAL integrity"),
+            "ok"
+        );
+        connection
+            .close()
+            .await
+            .expect("close shrinking WAL cross-check");
+    }
+
+    #[tokio::test]
+    async fn committed_wal_shrink_then_regrow_retains_high_page() {
+        let temporary = tempfile::tempdir().expect("create WAL regrow fixture");
+        let database_path = temporary.path().join(DATABASE_NAME);
+        let wal_path = temporary.path().join(WAL_NAME);
+        let page_one = minimal_sqlite_page();
+        fs::write(&database_path, page_one).expect("write WAL regrow main database");
+
+        let salts = [0x11, 0x33, 0x55, 0x77, 0x20, 0x42, 0x64, 0x86];
+        let mut wal_header = [0_u8; 32];
+        wal_header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
+        wal_header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        wal_header[8..12].copy_from_slice(&4096_u32.to_be_bytes());
+        wal_header[16..24].copy_from_slice(&salts);
+        let mut checksum = wal_checksum(&wal_header[..24], false, [0, 0]);
+        wal_header[24..28].copy_from_slice(&checksum[0].to_be_bytes());
+        wal_header[28..32].copy_from_slice(&checksum[1].to_be_bytes());
+        let mut wal = wal_header.to_vec();
+        let page_two = [0_u8; 4096];
+        append_wal_frame(&mut wal, &mut checksum, 2, 2, salts, &page_two);
+        append_wal_frame(&mut wal, &mut checksum, 1, 1, salts, &page_one);
+        let mut regrown_page_one = page_one;
+        regrown_page_one[24..28].copy_from_slice(&3_u32.to_be_bytes());
+        regrown_page_one[28..32].copy_from_slice(&2_u32.to_be_bytes());
+        regrown_page_one[32..36].copy_from_slice(&2_u32.to_be_bytes());
+        regrown_page_one[36..40].copy_from_slice(&1_u32.to_be_bytes());
+        regrown_page_one[92..96].copy_from_slice(&3_u32.to_be_bytes());
+        append_wal_frame(&mut wal, &mut checksum, 1, 2, salts, &regrown_page_one);
+        fs::write(&wal_path, &wal).expect("write checksummed regrowing WAL");
+
+        let wal_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .expect("open regrowing WAL");
+        let wal_entry = HeldEntry {
+            name: WAL_NAME,
+            path: wal_path.clone(),
+            identity: FileIdentity::capture(&wal_path, &wal_file, "inspect regrowing WAL identity")
+                .expect("capture regrowing WAL identity"),
+            file: wal_file,
+        };
+        let observation = validate_offline_wal(
+            &wal_entry,
+            4096,
+            Instant::now() + Duration::from_secs(5),
+            5_000,
+        )
+        .expect("raw verifier retains high page across shrink and regrow");
+        assert_eq!(observation.committed_pages, Some(2));
+        assert!(observation.frames.contains_key(&1));
+        assert!(observation.frames.contains_key(&2));
+
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(false)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("SQLite 3.51.3 opens regrowing WAL");
+        claw_sqlite_file_control::disable_wal_checkpoint_on_close(&mut connection)
+            .await
+            .expect("retain regrowing WAL during cross-check");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA page_count")
+                .fetch_one(&mut connection)
+                .await
+                .expect("read effective regrown page count"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+                .fetch_one(&mut connection)
+                .await
+                .expect("cross-check regrowing WAL integrity"),
+            "ok"
+        );
+        connection
+            .close()
+            .await
+            .expect("close regrowing WAL cross-check");
+    }
+
+    #[test]
     fn namespace_identity_predicates_reject_every_security_field_mismatch() {
         let spec = LinuxProtectedSpec::new(
             PathBuf::from("/var/lib/gta-claw/state"),
@@ -6194,6 +8038,7 @@ mod tests {
             rustix::process::getuid().is_root() && rustix::process::geteuid().is_root(),
             "LinuxProtected acceptance requires a real/effective root driver"
         );
+        exercise_offline_initializer_fault_matrix();
         let fixture = provision_root_fixture().await;
         let database = fixture.namespace.join(DATABASE_NAME);
         let mut uncheckpointed = SqliteConnection::connect_with(&protected_options(&database))

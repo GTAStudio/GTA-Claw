@@ -303,7 +303,7 @@ fn serve_with_state(selection: &StateSelection, mut output: impl Write) -> io::R
     let opened = runtime.block_on(run_state_phase(
         &mut signals,
         &mut shutdown,
-        StateStore::open(selection.config()),
+        report_first_pending(StateStore::open(selection.config()), "state-open-pending"),
     ));
     let store = opened.map_err(|error| {
         let primary = state_failure("state open", error);
@@ -424,12 +424,33 @@ impl ShutdownState {
 
 fn observe_shutdown(shutdown: &mut ShutdownState, result: io::Result<()>) {
     if shutdown.observe(result) {
-        let _ = std::thread::Builder::new()
-            .name("claw-shutdown-diagnostic".to_owned())
-            .spawn(|| {
-                let _ = writeln!(io::stderr().lock(), "shutdown requested");
-            });
+        report_lifecycle_transition("shutdown-requested");
     }
+}
+
+fn report_lifecycle_transition(transition: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "gta-claw lifecycle {transition}");
+    let _ = stderr.flush();
+}
+
+async fn report_first_pending<F: std::future::Future>(
+    future: F,
+    transition: &'static str,
+) -> F::Output {
+    tokio::pin!(future);
+    let mut reported = false;
+    std::future::poll_fn(|context| match future.as_mut().poll(context) {
+        std::task::Poll::Pending => {
+            if !reported {
+                report_lifecycle_transition(transition);
+                reported = true;
+            }
+            std::task::Poll::Pending
+        }
+        std::task::Poll::Ready(output) => std::task::Poll::Ready(output),
+    })
+    .await
 }
 
 async fn run_state_phase<F: std::future::Future>(
@@ -459,7 +480,11 @@ fn close_state_store(
     shutdown: &mut ShutdownState,
     store: StateStore,
 ) -> io::Result<()> {
-    let close = runtime.block_on(run_state_phase(signals, shutdown, store.close()));
+    let close = runtime.block_on(run_state_phase(
+        signals,
+        shutdown,
+        report_first_pending(store.close(), "state-close-pending"),
+    ));
     signals.drain(shutdown);
     match (close, shutdown.terminal_error()) {
         (Ok(_), None) if signals.commit_clean_exit() => Ok(()),

@@ -22,7 +22,6 @@ const PROCESS_READY: u8 = 1;
 const PROCESS_STOPPING: u8 = 2;
 const PROCESS_CLEAN_EXIT: usize = 1 << (usize::BITS - 1);
 const PROCESS_SIGNAL_COUNT_MASK: usize = !PROCESS_CLEAN_EXIT;
-const SECOND_SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Monotonic native process-signal observer for daemon shutdown coordination.
 ///
@@ -256,9 +255,8 @@ extern "C" fn process_signal_handler(_signal: i32) {
     let errno = unsafe { *errno_pointer() };
     PROCESS_LIFECYCLE.store(PROCESS_STOPPING, Ordering::Release);
     let previous = PROCESS_SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
-    if previous & PROCESS_CLEAN_EXIT != 0 {
-        // SAFETY: graceful cleanup already committed to returning success, so
-        // this later delivery must own the final nonzero process boundary.
+    if previous & PROCESS_CLEAN_EXIT != 0 || previous & PROCESS_SIGNAL_COUNT_MASK >= 1 {
+        // SAFETY: a repeated signal is the immediate hard ownership boundary.
         unsafe { _exit(2) };
     }
     let fd = PROCESS_SIGNAL_WAKE_FD.load(Ordering::Relaxed);
@@ -291,13 +289,6 @@ fn install_process_signal_wakeup(wake: &Arc<tokio::sync::Notify>) -> std::io::Re
                     Ok(0) => break,
                     Ok(_) => {
                         wake.notify_waiters();
-                        if PROCESS_SIGNAL_COUNT.load(Ordering::Acquire) & PROCESS_SIGNAL_COUNT_MASK
-                            >= 2
-                        {
-                            std::thread::sleep(SECOND_SIGNAL_GRACE);
-                            // SAFETY: the watchdog is the final ownership boundary.
-                            unsafe { _exit(2) };
-                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
@@ -362,8 +353,8 @@ unsafe extern "system" fn process_console_handler(control: u32) -> i32 {
     if matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
         PROCESS_LIFECYCLE.store(PROCESS_STOPPING, Ordering::Release);
         let previous = PROCESS_SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
-        if previous & PROCESS_CLEAN_EXIT != 0 {
-            // SAFETY: graceful cleanup already committed to returning success.
+        if previous & PROCESS_CLEAN_EXIT != 0 || previous & PROCESS_SIGNAL_COUNT_MASK >= 1 {
+            // SAFETY: a repeated console event is the immediate hard boundary.
             unsafe {
                 windows_sys::Win32::System::Threading::TerminateProcess(
                     windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -405,20 +396,6 @@ fn install_process_signal_wakeup(wake: &Arc<tokio::sync::Notify>) -> std::io::Re
                 match unsafe { WaitForSingleObject(event, INFINITE) } {
                     WAIT_OBJECT_0 => {
                         wake.notify_waiters();
-                        if PROCESS_SIGNAL_COUNT.load(Ordering::Acquire) & PROCESS_SIGNAL_COUNT_MASK
-                            >= 2
-                        {
-                            std::thread::sleep(SECOND_SIGNAL_GRACE);
-                            // SAFETY: terminate the current process after the
-                            // fixed native escalation deadline.
-                            unsafe {
-                                windows_sys::Win32::System::Threading::TerminateProcess(
-                                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                                    2,
-                                );
-                            }
-                            break;
-                        }
                     }
                     _ => {
                         PROCESS_SIGNAL_WAKE_FAILED.store(true, Ordering::Release);
@@ -2228,6 +2205,89 @@ pub async fn disable_wal_checkpoint_on_close(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod fresh_handoff_tests {
+    use super::{disable_wal_checkpoint_on_close, enable_persistent_wal};
+    use sqlx::{Connection as _, SqliteConnection};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Operation {
+        PersistentWal,
+        NoCheckpointOnClose,
+        WalTransition,
+    }
+
+    #[tokio::test]
+    async fn controls_precede_transition_without_checkpoint_or_truncate() {
+        let temporary = tempfile::tempdir().expect("create fresh handoff control fixture");
+        let path = temporary.path().join("state.sqlite");
+        std::fs::File::create(&path).expect("precreate fresh handoff database");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open fresh handoff control fixture");
+        let mut operations = Vec::new();
+        enable_persistent_wal(&mut connection)
+            .await
+            .expect("enable persistent WAL before transition");
+        operations.push(Operation::PersistentWal);
+        disable_wal_checkpoint_on_close(&mut connection)
+            .await
+            .expect("disable close checkpoint before transition");
+        operations.push(Operation::NoCheckpointOnClose);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA journal_mode = MEMORY")
+                .fetch_one(&mut connection)
+                .await
+                .expect("enter memory journal mode"),
+            "memory"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
+                .fetch_one(&mut connection)
+                .await
+                .expect("perform fresh WAL transition"),
+            "wal"
+        );
+        operations.push(Operation::WalTransition);
+        connection
+            .close()
+            .await
+            .expect("close fresh handoff fixture");
+        assert_eq!(
+            operations,
+            [
+                Operation::PersistentWal,
+                Operation::NoCheckpointOnClose,
+                Operation::WalTransition,
+            ]
+        );
+
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub async fn enable_persistent_wal(")
+            .expect("find persistent WAL control");
+        let end = source[start..]
+            .find("#[cfg(all(test, unix))]\nmod fresh_handoff_tests")
+            .map(|offset| start + offset)
+            .expect("find end of fresh controls");
+        let controls = &source[start..end];
+        for forbidden in [
+            "sqlite3_wal_checkpoint",
+            "PRAGMA wal_checkpoint",
+            "TRUNCATE",
+            "unlink(",
+        ] {
+            assert!(
+                !controls.contains(forbidden),
+                "fresh controls contain forbidden operation {forbidden}"
+            );
+        }
+    }
 }
 
 /// Returns SQLite's native VFS stack name for the locked main database.
