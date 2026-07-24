@@ -77,6 +77,152 @@ static OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT: std::sync::LazyLock<
 #[cfg(test)]
 static OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OfflineInitializerReaperTestState {
+    worker_transitioned: bool,
+    caller_handoff: bool,
+    release_worker: bool,
+    classifier_failed: bool,
+    namespace_retained: bool,
+}
+#[cfg(test)]
+struct OfflineInitializerReaperTestGate {
+    state: Mutex<OfflineInitializerReaperTestState>,
+    changed: std::sync::Condvar,
+}
+#[cfg(test)]
+static OFFLINE_INITIALIZER_REAPER_TEST_GATE: std::sync::LazyLock<
+    Mutex<Option<Arc<OfflineInitializerReaperTestGate>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+impl OfflineInitializerReaperTestGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OfflineInitializerReaperTestState::default()),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn wait_for(&self, observe: fn(OfflineInitializerReaperTestState) -> bool, operation: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned");
+        while !observe(*state) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{operation} timed out");
+            let (next, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("offline initializer reaper test gate lock poisoned");
+            state = next;
+            assert!(
+                !wait.timed_out() || observe(*state),
+                "{operation} timed out"
+            );
+        }
+    }
+
+    fn record_worker_transition_and_wait(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned");
+        state.worker_transitioned = true;
+        self.changed.notify_all();
+        while !state.release_worker {
+            state = self
+                .changed
+                .wait(state)
+                .expect("offline initializer reaper test gate lock poisoned");
+        }
+    }
+
+    fn record_caller_handoff(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned");
+        state.caller_handoff = true;
+        self.changed.notify_all();
+    }
+
+    fn release_worker(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned");
+        state.release_worker = true;
+        self.changed.notify_all();
+    }
+
+    fn record_classifier_failure(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned");
+        state.classifier_failed = true;
+        self.changed.notify_all();
+    }
+
+    fn record_namespace_retention(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned");
+        state.namespace_retained = true;
+        self.changed.notify_all();
+    }
+
+    fn snapshot(&self) -> OfflineInitializerReaperTestState {
+        *self
+            .state
+            .lock()
+            .expect("offline initializer reaper test gate lock poisoned")
+    }
+}
+
+#[cfg(test)]
+fn offline_initializer_reaper_test_gate() -> Option<Arc<OfflineInitializerReaperTestGate>> {
+    OFFLINE_INITIALIZER_REAPER_TEST_GATE
+        .lock()
+        .expect("offline initializer reaper test gate registry lock poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn install_offline_initializer_reaper_test_gate() -> Arc<OfflineInitializerReaperTestGate> {
+    let gate = Arc::new(OfflineInitializerReaperTestGate::new());
+    let previous = OFFLINE_INITIALIZER_REAPER_TEST_GATE
+        .lock()
+        .expect("offline initializer reaper test gate registry lock poisoned")
+        .replace(Arc::clone(&gate));
+    assert!(
+        previous.is_none(),
+        "offline initializer reaper test gate is single-use"
+    );
+    gate
+}
+
+#[cfg(test)]
+fn remove_offline_initializer_reaper_test_gate(gate: &Arc<OfflineInitializerReaperTestGate>) {
+    let installed = OFFLINE_INITIALIZER_REAPER_TEST_GATE
+        .lock()
+        .expect("offline initializer reaper test gate registry lock poisoned")
+        .take()
+        .expect("offline initializer reaper test gate remains installed");
+    assert!(Arc::ptr_eq(&installed, gate));
+}
+
+#[cfg(test)]
+fn record_offline_initializer_reaper_classifier_failure() {
+    if let Some(gate) = offline_initializer_reaper_test_gate() {
+        gate.record_classifier_failure();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OfflineInitializerTestStage {
@@ -1412,8 +1558,43 @@ impl ProtectedNamespace {
         check_initializer_deadline(cutoff, timeout_ms)
     }
 
+    #[cfg(test)]
+    fn fail_recovery_classification_for_test(&self) -> Result<(), StateError> {
+        if !offline_initializer_fault_is_next(OfflineInitializerTestStage::RecoveryClassification) {
+            return Ok(());
+        }
+        let snapshot = self
+            .entries
+            .iter()
+            .map(|entry| {
+                std::fs::read(&entry.path).map_err(|error| {
+                    file_error(
+                        "capture LinuxProtected classifier-error test snapshot",
+                        &entry.path,
+                        error,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let previous = OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
+            .lock()
+            .expect("offline initializer classification snapshot lock poisoned")
+            .replace(snapshot);
+        assert!(
+            previous.is_none(),
+            "offline initializer classification snapshot is single-use"
+        );
+        record_offline_initializer_reaper_classifier_failure();
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::RecoveryClassification,
+            &self.directory,
+        )
+    }
+
     fn recovery_fresh_state(&self) -> Result<OfflineNamespaceState, StateError> {
         self.verify_security()?;
+        #[cfg(test)]
+        self.fail_recovery_classification_for_test()?;
         let mut lengths = [0_u64; ENTRY_NAMES.len()];
         for (length, entry) in lengths.iter_mut().zip(&self.entries) {
             *length = entry
@@ -4383,12 +4564,48 @@ fn retain_offline_namespace(
     identities: [FileIdentity; ENTRY_NAMES.len()],
 ) {
     #[cfg(test)]
-    OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(gate) = offline_initializer_reaper_test_gate() {
+            gate.record_namespace_retention();
+        }
+    }
     std::mem::forget(RetainedOfflineNamespace {
         _writer_lock: writer_lock,
         _namespace: namespace,
         _identities: identities,
     });
+}
+
+#[cfg(test)]
+fn block_completed_offline_initializer_for_reaper_test(result: &Result<(), StateError>) {
+    if let Some(gate) = offline_initializer_reaper_test_gate() {
+        assert!(
+            result.is_ok(),
+            "reaper test worker must complete the exact transition before blocking"
+        );
+        gate.record_worker_transition_and_wait();
+    }
+}
+
+#[cfg(test)]
+fn offline_initializer_completion_wait_for_test(deadline: Instant) -> Duration {
+    let Some(gate) = offline_initializer_reaper_test_gate() else {
+        return deadline.saturating_duration_since(Instant::now());
+    };
+    gate.wait_for(
+        |state| state.worker_transitioned,
+        "wait for exact transition before reaper handoff",
+    );
+    Duration::ZERO
+}
+
+#[cfg(test)]
+fn record_offline_initializer_reaper_handoff() {
+    if let Some(gate) = offline_initializer_reaper_test_gate() {
+        gate.record_caller_handoff();
+    }
 }
 
 fn spawn_offline_initializer_reaper() -> Result<
@@ -4531,6 +4748,8 @@ pub(crate) fn initialize_offline(
                 timeout_ms,
             ));
             drop(runtime);
+            #[cfg(test)]
+            block_completed_offline_initializer_for_reaper_test(&result);
             let _ = completion.send(());
             result
         })
@@ -4540,7 +4759,11 @@ pub(crate) fn initialize_offline(
                 sqlx::Error::Protocol(error.to_string()),
             )
         })?;
-    match completed.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+    #[cfg(not(test))]
+    let completion_wait = deadline.saturating_duration_since(Instant::now());
+    #[cfg(test)]
+    let completion_wait = offline_initializer_completion_wait_for_test(deadline);
+    match completed.recv_timeout(completion_wait) {
         Ok(()) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let retained = RetainedOfflineInitializer {
@@ -4567,6 +4790,8 @@ pub(crate) fn initialize_offline(
                             .to_owned(),
                 });
             }
+            #[cfg(test)]
+            record_offline_initializer_reaper_handoff();
             drop(reaper);
             drop(reaper_thread);
             return Err(StateError::OperationTimedOut {
@@ -4772,55 +4997,13 @@ enum FailedFreshTransitionSettlement {
     RetainLock(StateError),
 }
 
-#[cfg(test)]
-fn inject_failed_transition_classifier_fault(
-    namespace: &ProtectedNamespace,
-    classification: Result<OfflineNamespaceState, StateError>,
-) -> Result<OfflineNamespaceState, StateError> {
-    if matches!(
-        &classification,
-        Ok(OfflineNamespaceState::TransitionedFresh)
-    ) && offline_initializer_fault_is_next(OfflineInitializerTestStage::RecoveryClassification)
-    {
-        let snapshot = namespace
-            .entries
-            .iter()
-            .map(|entry| {
-                std::fs::read(&entry.path).map_err(|error| {
-                    file_error(
-                        "capture LinuxProtected classifier-error test snapshot",
-                        &entry.path,
-                        error,
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let previous = OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
-            .lock()
-            .expect("offline initializer classification snapshot lock poisoned")
-            .replace(snapshot);
-        assert!(
-            previous.is_none(),
-            "offline initializer classification snapshot is single-use"
-        );
-        fail_offline_initializer_stage(
-            OfflineInitializerTestStage::RecoveryClassification,
-            &namespace.directory,
-        )?;
-    }
-    classification
-}
-
 fn settle_failed_fresh_transition(
     namespace: &ProtectedNamespace,
     identities: [FileIdentity; ENTRY_NAMES.len()],
     primary: StateError,
     may_rollback: bool,
 ) -> FailedFreshTransitionSettlement {
-    let classification = namespace.recovery_fresh_state();
-    #[cfg(test)]
-    let classification = inject_failed_transition_classifier_fault(namespace, classification);
-    match classification {
+    match namespace.recovery_fresh_state() {
         // Exact-Fresh provenance permits discarding this invocation's own precommit handoff.
         Ok(OfflineNamespaceState::TransitionedFresh) if may_rollback => {
             FailedFreshTransitionSettlement::ReleaseLock(
@@ -6541,6 +6724,135 @@ mod tests {
             classifier_identities
         );
         assert_eq!(exact_names(&classifier_error.namespace), classifier_names);
+
+        let reaper_error = fresh_root_fixture();
+        let reaper_identities = entry_identities(&reaper_error.namespace);
+        let reaper_names = exact_names(&reaper_error.namespace);
+        let retained_before =
+            OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
+                .lock()
+                .expect("offline initializer classification snapshot lock poisoned")
+                .take()
+                .is_none()
+        );
+        let reaper_gate = install_offline_initializer_reaper_test_gate();
+        schedule_offline_initializer_faults(&[
+            OfflineInitializerTestStage::RecoveryClassification,
+            OfflineInitializerTestStage::RollbackTruncate,
+        ]);
+        assert_eq!(
+            crate::initialize_linux_protected_offline(
+                &reaper_error.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect_err("gated exact transition must transfer to the timeout reaper"),
+            StateError::OperationTimedOut {
+                operation: "initialize LinuxProtected state offline",
+                timeout_ms: 30_000,
+            }
+        );
+        assert_eq!(
+            reaper_gate.snapshot(),
+            OfflineInitializerReaperTestState {
+                worker_transitioned: true,
+                caller_handoff: true,
+                ..OfflineInitializerReaperTestState::default()
+            },
+            "caller must hand the blocked exact-transition worker to the reaper"
+        );
+        reaper_gate.release_worker();
+        reaper_gate.wait_for(
+            |state| state.namespace_retained,
+            "wait for reaper classifier-error retention",
+        );
+        assert_eq!(
+            reaper_gate.snapshot(),
+            OfflineInitializerReaperTestState {
+                worker_transitioned: true,
+                caller_handoff: true,
+                release_worker: true,
+                classifier_failed: true,
+                namespace_retained: true,
+            },
+            "reaper must classify, fail closed, and retain the complete ownership bundle"
+        );
+        remove_offline_initializer_reaper_test_gate(&reaper_gate);
+        {
+            let mut scheduled = OFFLINE_INITIALIZER_TEST_FAULT
+                .lock()
+                .expect("offline initializer fault schedule lock poisoned");
+            assert_eq!(
+                scheduled.as_slice(),
+                &[OfflineInitializerTestStage::RollbackTruncate],
+                "reaper classifier uncertainty must not enter destructive rollback"
+            );
+            scheduled.clear();
+        }
+        let reaper_snapshot = OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
+            .lock()
+            .expect("offline initializer classification snapshot lock poisoned")
+            .take()
+            .expect("capture exact state inside the reaper classifier");
+        let reaper_snapshot_lengths = reaper_snapshot
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(entry_bytes(&reaper_error.namespace), reaper_snapshot);
+        assert_eq!(
+            entry_lengths(&reaper_error.namespace),
+            reaper_snapshot_lengths
+        );
+        assert_eq!(entry_identities(&reaper_error.namespace), reaper_identities);
+        assert_eq!(exact_names(&reaper_error.namespace), reaper_names);
+        let spec =
+            LinuxProtectedSpec::new(reaper_error.namespace.clone(), SERVICE_UID, SERVICE_GID);
+        let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)
+            .expect("inspect reaper-retained namespace");
+        assert_eq!(
+            namespace
+                .recovery_fresh_state()
+                .expect("independently classify reaper-retained image"),
+            OfflineNamespaceState::TransitionedFresh
+        );
+        let retained_bytes = entry_bytes(&reaper_error.namespace);
+        assert_eq!(
+            retained_bytes[PREP_RECORD_INDEX],
+            namespace.initializer_prep_record()
+        );
+        let database_page: &[u8; 4096] = retained_bytes[DATABASE_INDEX]
+            .as_slice()
+            .try_into()
+            .expect("reaper-retained database is exactly one page");
+        assert!(minimal_fresh_handoff_page(database_page));
+        assert!(retained_bytes[WAL_INDEX].is_empty());
+        assert!(retained_bytes[SELECTOR_INDEX].is_empty());
+        drop(namespace);
+        assert_eq!(
+            OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES.load(std::sync::atomic::Ordering::SeqCst),
+            retained_before + 1,
+            "reaper classifier uncertainty must retain the held namespace bundle"
+        );
+        assert_eq!(
+            crate::initialize_linux_protected_offline(
+                &reaper_error.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect_err("reaper retention must keep the fixed lock"),
+            StateError::StoreLocked {
+                path: reaper_error.namespace.join(WRITER_LOCK_NAME),
+            }
+        );
+        assert_eq!(entry_bytes(&reaper_error.namespace), retained_bytes);
+        assert_eq!(
+            entry_lengths(&reaper_error.namespace),
+            reaper_snapshot_lengths
+        );
+        assert_eq!(entry_identities(&reaper_error.namespace), reaper_identities);
+        assert_eq!(exact_names(&reaper_error.namespace), reaper_names);
 
         let sparse = fresh_root_fixture();
         assert_eq!(
