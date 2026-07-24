@@ -7,19 +7,24 @@ use claw_application::Application;
 use claw_platform::NativeSystemProbe;
 use claw_state::{
     ProcessSignalCounter, StateStore, StoreConfig, initialize_linux_protected_offline,
+    prepare_linux_protected_offline, provision_linux_protected_offline,
 };
 
 const LEGACY_USAGE: &str = "usage: gta-claw-daemon [--probe]";
 const HELP: &str = "\
 usage: gta-claw-daemon [--probe] [--state-profile <portable-private|linux-protected> --state-path <absolute-path>]
+       gta-claw-daemon --provision-linux-protected --state-path <absolute-namespace> --service-uid <nonzero-uid> --service-gid <nonzero-gid>
        gta-claw-daemon --initialize-linux-protected --state-path <absolute-namespace> --service-uid <nonzero-uid> --service-gid <nonzero-gid>
+       gta-claw-daemon --prepare-linux-protected --state-path <absolute-namespace> --service-uid <nonzero-uid> --service-gid <nonzero-gid>
        gta-claw-daemon --help";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DaemonMode {
     Serve,
     Probe,
+    ProvisionLinuxProtected,
     InitializeLinuxProtected,
+    PrepareLinuxProtected,
     Help,
 }
 
@@ -81,7 +86,7 @@ fn parse_nonzero_id(value: &str, flag: &'static str) -> io::Result<u32> {
             _ => "service identity must be a nonzero decimal u32",
         })
     })?;
-    if parsed == 0 {
+    if parsed == 0 || parsed == u32::MAX {
         return Err(parse_error(match flag {
             "--service-uid" => "--service-uid must be a nonzero decimal u32",
             "--service-gid" => "--service-gid must be a nonzero decimal u32",
@@ -98,7 +103,9 @@ where
 {
     let mut arguments = arguments.into_iter().map(Into::into);
     let mut probe = false;
+    let mut provision = false;
     let mut initialize = false;
+    let mut prepare = false;
     let mut help = false;
     let mut profile = None;
     let mut path = None;
@@ -109,9 +116,17 @@ where
         match argument.as_str() {
             "--probe" if !probe => probe = true,
             "--probe" => return Err(parse_error("duplicate --probe")),
+            "--provision-linux-protected" if !provision => provision = true,
+            "--provision-linux-protected" => {
+                return Err(parse_error("duplicate --provision-linux-protected"));
+            }
             "--initialize-linux-protected" if !initialize => initialize = true,
             "--initialize-linux-protected" => {
                 return Err(parse_error("duplicate --initialize-linux-protected"));
+            }
+            "--prepare-linux-protected" if !prepare => prepare = true,
+            "--prepare-linux-protected" => {
+                return Err(parse_error("duplicate --prepare-linux-protected"));
             }
             "--help" if !help => help = true,
             "--help" => return Err(parse_error("duplicate --help")),
@@ -153,7 +168,9 @@ where
 
     if help {
         if probe
+            || provision
             || initialize
+            || prepare
             || profile.is_some()
             || path.is_some()
             || service_uid.is_some()
@@ -172,25 +189,39 @@ where
         });
     }
 
-    if initialize {
+    let privileged_mode_count = u8::from(provision) + u8::from(initialize) + u8::from(prepare);
+    if privileged_mode_count > 1 {
+        return Err(parse_error(
+            "LinuxProtected provisioning modes cannot be combined",
+        ));
+    }
+    if privileged_mode_count == 1 {
         if probe {
             return Err(parse_error(
-                "--initialize-linux-protected cannot be combined with --probe",
+                "LinuxProtected provisioning modes cannot be combined with --probe",
             ));
         }
         if profile == Some(RequestedStateProfile::PortablePrivate) {
             return Err(parse_error(
-                "--initialize-linux-protected is incompatible with portable-private",
+                "LinuxProtected provisioning modes are incompatible with portable-private",
             ));
         }
-        let namespace =
-            path.ok_or_else(|| parse_error("--initialize-linux-protected requires --state-path"))?;
-        let service_uid = service_uid
-            .ok_or_else(|| parse_error("--initialize-linux-protected requires --service-uid"))?;
-        let service_gid = service_gid
-            .ok_or_else(|| parse_error("--initialize-linux-protected requires --service-gid"))?;
+        let namespace = path
+            .ok_or_else(|| parse_error("LinuxProtected provisioning modes require --state-path"))?;
+        let service_uid = service_uid.ok_or_else(|| {
+            parse_error("LinuxProtected provisioning modes require --service-uid")
+        })?;
+        let service_gid = service_gid.ok_or_else(|| {
+            parse_error("LinuxProtected provisioning modes require --service-gid")
+        })?;
         return Ok(DaemonCommand {
-            mode: DaemonMode::InitializeLinuxProtected,
+            mode: if provision {
+                DaemonMode::ProvisionLinuxProtected
+            } else if initialize {
+                DaemonMode::InitializeLinuxProtected
+            } else {
+                DaemonMode::PrepareLinuxProtected
+            },
             state: None,
             initialize_namespace: Some(namespace),
             service_uid: Some(service_uid),
@@ -200,7 +231,7 @@ where
 
     if service_uid.is_some() || service_gid.is_some() {
         return Err(parse_error(
-            "--service-uid and --service-gid require --initialize-linux-protected",
+            "--service-uid and --service-gid require a LinuxProtected provisioning mode",
         ));
     }
     let state = match (profile, path) {
@@ -236,6 +267,33 @@ fn announce_ready(mut output: impl Write) -> io::Result<()> {
     writeln!(output, "{}", application.ready())?;
     writeln!(output, "{}", application.health())?;
     output.flush()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn notify_systemd_ready_to(socket_name: &std::ffi::OsStr) -> io::Result<()> {
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let bytes = socket_name.as_bytes();
+    let address = if let Some(abstract_name) = bytes.strip_prefix(b"@") {
+        SocketAddr::from_abstract_name(abstract_name)?
+    } else {
+        SocketAddr::from_pathname(std::path::Path::new(socket_name))?
+    };
+    let socket = UnixDatagram::unbound()?;
+    socket.send_to_addr(b"READY=1", &address)?;
+    Ok(())
+}
+
+fn notify_systemd_ready() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(socket_name) = std::env::var_os("NOTIFY_SOCKET") {
+            return notify_systemd_ready_to(&socket_name);
+        }
+    }
     Ok(())
 }
 
@@ -358,6 +416,16 @@ fn serve_with_state(selection: &StateSelection, mut output: impl Write) -> io::R
                 error,
             ));
         }
+    }
+    if let Err(error) = notify_systemd_ready() {
+        return Err(close_state_store_after_failure(
+            &runtime,
+            &mut signals,
+            &mut shutdown,
+            store,
+            "notify systemd readiness",
+            error,
+        ));
     }
     observe_shutdown(&mut shutdown, runtime.block_on(signals.wait()));
     close_state_store(&runtime, &mut signals, &mut shutdown, store)
@@ -575,6 +643,16 @@ where
             Some(selection) => probe_with_state(&selection, &mut output)?,
             None => probe(&mut output)?,
         },
+        DaemonMode::ProvisionLinuxProtected => {
+            let namespace = command
+                .initialize_namespace
+                .expect("validated provisioning namespace");
+            let service_uid = command.service_uid.expect("validated service UID");
+            let service_gid = command.service_gid.expect("validated service GID");
+            provision_linux_protected_offline(namespace, service_uid, service_gid)?;
+            writeln!(output, "Provisioned")?;
+            output.flush()?;
+        }
         DaemonMode::InitializeLinuxProtected => {
             let namespace = command
                 .initialize_namespace
@@ -582,6 +660,16 @@ where
             let service_uid = command.service_uid.expect("validated service UID");
             let service_gid = command.service_gid.expect("validated service GID");
             let result = initialize_linux_protected_offline(namespace, service_uid, service_gid)?;
+            writeln!(output, "{result:?}")?;
+            output.flush()?;
+        }
+        DaemonMode::PrepareLinuxProtected => {
+            let namespace = command
+                .initialize_namespace
+                .expect("validated preparation namespace");
+            let service_uid = command.service_uid.expect("validated service UID");
+            let service_gid = command.service_gid.expect("validated service GID");
+            let result = prepare_linux_protected_offline(namespace, service_uid, service_gid)?;
             writeln!(output, "{result:?}")?;
             output.flush()?;
         }
@@ -600,6 +688,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::notify_systemd_ready_to;
     use super::{DaemonMode, HELP, LEGACY_USAGE, RequestedStateProfile, parse_command, run};
 
     #[test]
@@ -680,19 +770,36 @@ mod tests {
     }
 
     #[test]
-    fn initializer_requires_nonzero_identity_and_has_no_mode_conflicts() {
+    fn privileged_state_modes_require_nonzero_identity_and_have_no_conflicts() {
         let root = if cfg!(windows) { r"C:\state" } else { "/state" };
-        let command = parse_command([
-            "--initialize-linux-protected",
-            "--state-path",
-            root,
-            "--service-uid",
-            "1001",
-            "--service-gid",
-            "1002",
-        ])
-        .expect("initializer parses");
-        assert_eq!(command.mode, DaemonMode::InitializeLinuxProtected);
+        for (flag, mode) in [
+            (
+                "--provision-linux-protected",
+                DaemonMode::ProvisionLinuxProtected,
+            ),
+            (
+                "--initialize-linux-protected",
+                DaemonMode::InitializeLinuxProtected,
+            ),
+            (
+                "--prepare-linux-protected",
+                DaemonMode::PrepareLinuxProtected,
+            ),
+        ] {
+            let command = parse_command([
+                flag,
+                "--state-profile",
+                "linux-protected",
+                "--state-path",
+                root,
+                "--service-uid",
+                "1001",
+                "--service-gid",
+                "1002",
+            ])
+            .expect("privileged state mode parses");
+            assert_eq!(command.mode, mode);
+        }
 
         for arguments in [
             vec![
@@ -718,6 +825,16 @@ mod tests {
             ],
             vec![
                 "--initialize-linux-protected",
+                "--prepare-linux-protected",
+                "--state-path",
+                root,
+                "--service-uid",
+                "1001",
+                "--service-gid",
+                "1002",
+            ],
+            vec![
+                "--provision-linux-protected",
                 "--state-path",
                 root,
                 "--service-uid",
@@ -749,5 +866,31 @@ mod tests {
         let error = parse_command(["--serve"]).expect_err("unknown mode must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), LEGACY_USAGE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_readiness_uses_the_configured_notify_socket() {
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!(
+            "gta-claw-notify-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        );
+        let address =
+            SocketAddr::from_abstract_name(name.as_bytes()).expect("create readiness address");
+        let receiver = UnixDatagram::bind_addr(&address).expect("bind readiness receiver");
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("bound readiness timeout");
+
+        let socket_name = std::ffi::OsString::from(format!("@{name}"));
+        notify_systemd_ready_to(&socket_name).expect("send readiness notification");
+
+        let mut buffer = [0_u8; 32];
+        let bytes = receiver.recv(&mut buffer).expect("receive readiness");
+        assert_eq!(&buffer[..bytes], b"READY=1");
     }
 }

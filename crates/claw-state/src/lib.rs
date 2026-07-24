@@ -22,7 +22,10 @@ pub use model::{
     PageCursor, PageRequest, SessionRecord, SessionStatus, TaskId, TaskRecord, TaskStatus,
     TimestampMs,
 };
-pub use provision::{LinuxProtectedInitialization, initialize_linux_protected_offline};
+pub use provision::{
+    LinuxProtectedInitialization, initialize_linux_protected_offline,
+    prepare_linux_protected_offline, provision_linux_protected_offline,
+};
 pub use repository::{
     AuthenticationRepository, DeviceRepository, SessionRepository, TaskRepository,
 };

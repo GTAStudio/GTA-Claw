@@ -1,0 +1,62 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+lock=/var/lib/gta-claw-protected/state.writer.lock
+ready_marker=/run/gta-claw-daemon.ready-for-replacement
+
+fail_readiness() {
+  reason="$1"
+  if ! rm -f "$ready_marker"; then
+    echo "gta-claw readiness marker could not be removed" >&2
+  fi
+  echo "$reason" >&2
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after readiness failure" >&2
+  fi
+  if systemctl is-active --quiet gta-claw-daemon.service; then
+    echo "gta-claw daemon remains active after readiness failure" >&2
+  fi
+  exit 1
+}
+
+if ! rm -f "$ready_marker"; then
+  fail_readiness "gta-claw stale readiness marker could not be removed"
+fi
+attempt=0
+while [ "$attempt" -lt 150 ]; do
+  if ! systemctl is-active --quiet gta-claw-daemon.service; then
+    fail_readiness "gta-claw daemon became inactive before readiness"
+  fi
+  if ! main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"; then
+    fail_readiness "gta-claw daemon MainPID could not be inspected"
+  fi
+  case "$main_pid" in
+    '' | 0 | *[!0-9]*)
+      fail_readiness "gta-claw daemon has no valid MainPID"
+      ;;
+  esac
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    fail_readiness "gta-claw writer-lock ownership could not be inspected"
+  fi
+  lock_pid="$(
+    printf '%s\n' "$locks" |
+      awk -v path="$lock" '$2 == path { print $1; exit }'
+  )"
+  if [ "$lock_pid" = "$main_pid" ]; then
+    if ! touch "$ready_marker"; then
+      fail_readiness "gta-claw readiness marker could not be created"
+    fi
+    exit 0
+  fi
+  if [ -n "$lock_pid" ]; then
+    fail_readiness "gta-claw writer lock is held by a different process"
+  fi
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+
+fail_readiness "gta-claw daemon did not own the writer lock before the readiness deadline"

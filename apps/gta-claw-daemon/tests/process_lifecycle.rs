@@ -1099,6 +1099,36 @@ fn initializer_command(namespace: &Path) -> Command {
 }
 
 #[cfg(target_os = "linux")]
+fn provision_command(namespace: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    command.args([
+        OsStr::new("--provision-linux-protected"),
+        OsStr::new("--state-path"),
+        namespace.as_os_str(),
+        OsStr::new("--service-uid"),
+        OsStr::new("65534"),
+        OsStr::new("--service-gid"),
+        OsStr::new("65534"),
+    ]);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_command(namespace: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    command.args([
+        OsStr::new("--prepare-linux-protected"),
+        OsStr::new("--state-path"),
+        namespace.as_os_str(),
+        OsStr::new("--service-uid"),
+        OsStr::new("65534"),
+        OsStr::new("--service-gid"),
+        OsStr::new("65534"),
+    ]);
+    command
+}
+
+#[cfg(target_os = "linux")]
 fn gated_initializer_command(namespace: &Path, gate: &Path) -> Command {
     let mut command = Command::new("/bin/sh");
     command
@@ -1717,6 +1747,86 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
     }
 
     {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time follows Unix epoch")
+            .as_nanos();
+        let outer = root_base
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/var/lib"))
+            .join(format!(
+                "gta-claw-lp4-provision-{}-{nonce}",
+                std::process::id()
+            ));
+        fs::create_dir(&outer).expect("create provisioning fixture ancestor");
+        chown(&outer, Some(0), Some(0)).expect("own provisioning fixture ancestor");
+        fs::set_permissions(&outer, fs::Permissions::from_mode(0o755))
+            .expect("secure provisioning fixture ancestor");
+        let namespace = outer.join("state");
+        let fixture = ProtectedFixture { outer, namespace };
+
+        let prepared = bounded_output(
+            &mut prepare_command(&fixture.namespace),
+            Duration::from_secs(20),
+        );
+        assert!(
+            prepared.status.success(),
+            "fresh provision-and-initialize failed: {}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
+        assert_eq!(prepared.stdout, b"Initialized\n");
+        assert_eq!(exact_names(&fixture.namespace), expected_protected_names());
+        let parent = fs::symlink_metadata(&fixture.namespace)
+            .expect("inspect provisioned protected namespace");
+        assert!(parent.file_type().is_dir());
+        assert_eq!(parent.uid(), 0);
+        assert_eq!(parent.gid(), SERVICE_GID);
+        assert_eq!(parent.mode() & 0o7777, 0o750);
+        for name in PROTECTED_NAMES {
+            let metadata = fs::symlink_metadata(fixture.namespace.join(name))
+                .unwrap_or_else(|error| panic!("inspect provisioned entry {name}: {error}"));
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.uid(), SERVICE_UID);
+            assert_eq!(metadata.gid(), SERVICE_GID);
+            assert_eq!(metadata.mode() & 0o7777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+        }
+        let identities = protected_identities(&fixture.namespace);
+        let bytes = protected_bytes(&fixture.namespace);
+        let repeated = bounded_output(
+            &mut prepare_command(&fixture.namespace),
+            Duration::from_secs(20),
+        );
+        assert!(
+            repeated.status.success(),
+            "idempotent provision-and-initialize failed: {}",
+            String::from_utf8_lossy(&repeated.stderr)
+        );
+        assert_eq!(repeated.stdout, b"AlreadyInitialized\n");
+        assert_eq!(protected_identities(&fixture.namespace), identities);
+        assert_eq!(protected_bytes(&fixture.namespace), bytes);
+    }
+
+    {
+        let partial = create_protected_fixture();
+        for name in PROTECTED_NAMES.iter().skip(1) {
+            fs::remove_file(partial.namespace.join(name))
+                .unwrap_or_else(|error| panic!("remove partial fixture entry {name}: {error}"));
+        }
+        let before = protected_namespace_snapshot(&partial.namespace);
+        let rejected = bounded_output(
+            &mut prepare_command(&partial.namespace),
+            Duration::from_secs(10),
+        );
+        assert!(
+            !rejected.status.success(),
+            "partial provisioned namespace unexpectedly passed"
+        );
+        assert!(rejected.stdout.is_empty());
+        assert_eq!(protected_namespace_snapshot(&partial.namespace), before);
+    }
+
+    {
         let concurrent = create_protected_fixture_with_depth(128);
         let identities = protected_identities(&concurrent.namespace);
         let gate = concurrent.outer.join("initializers.start");
@@ -2286,6 +2396,21 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
 
         if signal_name == "TERM" {
             let namespace_before = protected_namespace_snapshot(&fixture.namespace);
+            let provision = bounded_output(
+                &mut provision_command(&fixture.namespace),
+                Duration::from_secs(10),
+            );
+            assert!(!provision.status.success());
+            assert!(provision.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&provision.stderr).contains("StoreLocked"),
+                "live-service provisioner did not report StoreLocked: {}",
+                String::from_utf8_lossy(&provision.stderr)
+            );
+            assert_eq!(
+                protected_namespace_snapshot(&fixture.namespace),
+                namespace_before
+            );
             let initializer = bounded_output(
                 &mut initializer_command(&fixture.namespace),
                 Duration::from_secs(10),
@@ -2642,6 +2767,13 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
         )
         .expect("install symlinked protected entry");
         assert_initializer_rejected(&symlinked.namespace, "symlinked namespace");
+    }
+    {
+        let wrong_type = create_protected_fixture();
+        let path = wrong_type.namespace.join("snapshot-1.sqlite");
+        fs::remove_file(&path).expect("remove wrong-type target entry");
+        fs::create_dir(&path).expect("install directory at protected file name");
+        assert_initializer_rejected(&wrong_type.namespace, "wrong-type namespace");
     }
     {
         let hard_linked = create_protected_fixture();

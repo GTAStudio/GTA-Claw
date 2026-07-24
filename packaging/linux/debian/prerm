@@ -5,6 +5,14 @@ set -e
 if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   [ -d /run/systemd/system ]; then
   deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
+  if systemctl is-active --quiet gta-claw-daemon.service; then
+    echo "gta-claw daemon remains active after package stop" >&2
+    exit 1
+  fi
+  systemctl disable gta-claw-daemon.service >/dev/null
+  rm -f \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.was-active
 fi
 
 exit 0

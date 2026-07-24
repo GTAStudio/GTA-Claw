@@ -497,7 +497,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    8dbca08bd966c4fff889ebae5382d1de819dfdedaa81ed406db5da676f278c04 \
+    64b6e7684eccdf767faa29170027b0753fe4f10bd16caf734d43ff8de2481d11 \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \
@@ -518,7 +518,7 @@ validate_workflow() {
 
   assert_required_job \
     native-x86 \
-    cb0e04fca2614c6a4b7aaac15e35e61d0ead3270a8574190d28ec1fd3e7fd832 \
+    ba8a101838efa32c4207a94d2cab1693320b1e048eca007bf42f29e75a3955f6 \
     "$(printf '%s\n' \
       'Checkout' \
       'Install native package inspection tools' \
@@ -1053,12 +1053,44 @@ expect_actionlint_valid_validation_failure \
   "extra path entry" \
   "$tmp_dir/extra-path.yml"
 
-if grep -RInE '(^|[[:space:]])(npm|npx|node|nodejs|bun|pnpm)([[:space:]]|$)' \
-  "$SCRIPT_DIR" "$workflow" \
-  --include='*.sh' --include='*.yml'; then
-  echo "JavaScript runtime or package-manager command found in Linux packaging" >&2
+python3 "$SCRIPT_DIR/tests/reject-javascript-commands.py" "$SCRIPT_DIR"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'exec "/usr/bin/npm" install' \
+  'env NODE_ENV=production /usr/bin/node daemon.js' \
+  "/usr/bin/no\\" \
+  'de daemon.js' \
+  >"$tmp_dir/javascript-shell-fixture.sh"
+if python3 \
+  "$SCRIPT_DIR/tests/reject-javascript-commands.py" \
+  "$tmp_dir/javascript-shell-fixture.sh" \
+  >/dev/null 2>&1; then
+  echo "shell JavaScript-command policy accepted quoted, wrapped, or split commands" >&2
   exit 1
 fi
+mkdir -p "$tmp_dir/recursive-policy/nested"
+printf '%s\n' '#!/bin/sh' '/usr/bin/node daemon.js' \
+  >"$tmp_dir/recursive-policy/nested/omitted-surface.sh"
+if python3 \
+  "$SCRIPT_DIR/tests/reject-javascript-commands.py" \
+  "$tmp_dir/recursive-policy" \
+  >/dev/null 2>&1; then
+  echo "shell JavaScript-command policy omitted a recursively discovered script" >&2
+  exit 1
+fi
+yaml_command_pattern='(^|[^[:alnum:]_.-])(npm|npx|node|nodejs|bun|pnpm)([^[:alnum:]_.-]|$)'
+grep -Eq "$yaml_command_pattern" <<< 'command: ["/usr/bin/node", "daemon.js"]' ||
+  {
+    echo "YAML JavaScript-command policy misses absolute executable paths" >&2
+    exit 1
+  }
+for yaml in "$workflow" "$SCRIPT_DIR/oci/"*.yml "$SCRIPT_DIR/oci/"*.yaml; do
+  [[ -e "$yaml" ]] || continue
+  if grep -InE "$yaml_command_pattern" "$yaml"; then
+    echo "JavaScript runtime or package-manager command found in Linux YAML surface" >&2
+    exit 1
+  fi
+done
 
 if git -C "$REPO_ROOT" ls-files packaging/linux |
   grep -Ei '\.(deb|rpm|tar\.gz|oci|sig|asc|key|pem|crt|bin)$'; then

@@ -40,6 +40,9 @@ deb_architecture="$(deb_arch "$arch")"
 rpm_architecture="$(rpm_arch "$arch")"
 oci_architecture="$(oci_arch "$arch")"
 base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
+validate_oci_orchestration_contract \
+  "$LINUX_DIR/oci/compose.yaml" \
+  "$LINUX_DIR/oci/kubernetes.yaml"
 
 write_json() {
   local output="$1"
@@ -350,6 +353,8 @@ stage_documentation() {
   copy_regular_input "$LINUX_DIR/LICENSE.txt" "$destination/LICENSE.txt" 0644
   copy_regular_input "$LINUX_DIR/NOTICE.txt" "$destination/NOTICE.txt" 0644
   copy_regular_input "$LINUX_DIR/README.md" "$destination/README.md" 0644
+  copy_regular_input "$LINUX_DIR/oci/compose.yaml" "$destination/compose.yaml" 0644
+  copy_regular_input "$LINUX_DIR/oci/kubernetes.yaml" "$destination/kubernetes.yaml" 0644
   copy_verified_input "$BUILD_MANIFEST" "$destination/build-manifest.json" 0644
   copy_verified_input \
     "$BUILD_RUNTIME_MANIFEST" \
@@ -367,9 +372,52 @@ stage_documentation() {
 
 archive_stage="$WORK_DIR/archive/$base_name"
 ensure_output_directory "$archive_stage/bin"
+ensure_output_directory "$archive_stage/etc/gta-claw/credentials"
+ensure_output_directory "$archive_stage/lib/systemd/system"
+ensure_output_directory "$archive_stage/lib/systemd/system-preset"
+ensure_output_directory "$archive_stage/lib/sysusers.d"
+ensure_output_directory "$archive_stage/libexec"
 ensure_output_directory "$archive_stage/share/doc/gta-claw"
 copy_verified_input "$daemon_binary" "$archive_stage/bin/$LINUX_DAEMON_NAME" 0755
 copy_verified_input "$cli_binary" "$archive_stage/bin/$LINUX_CLI_NAME" 0755
+copy_regular_input "$LINUX_DIR/direct/install.sh" "$archive_stage/install.sh" 0755
+copy_regular_input "$LINUX_DIR/direct/uninstall.sh" "$archive_stage/uninstall.sh" 0755
+write_output_text \
+  "$archive_stage/package-version" \
+  0644 \
+  "$VERSION-$LINUX_PACKAGE_RELEASE"$'\n'
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-state-init" \
+  "$archive_stage/libexec/gta-claw-state-init" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-runtime-ready" \
+  "$archive_stage/libexec/gta-claw-runtime-ready" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw-daemon.service" \
+  "$archive_stage/lib/systemd/system/gta-claw-daemon.service" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw-state-init.service" \
+  "$archive_stage/lib/systemd/system/gta-claw-state-init.service" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/80-gta-claw.preset" \
+  "$archive_stage/lib/systemd/system-preset/80-gta-claw.preset" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/sysusers/gta-claw.conf" \
+  "$archive_stage/lib/sysusers.d/gta-claw.conf" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw.env" \
+  "$archive_stage/etc/gta-claw/gta-claw.env" \
+  0640
+copy_regular_input \
+  "$LINUX_DIR/systemd/daemon.conf" \
+  "$archive_stage/etc/gta-claw/credentials/daemon.conf" \
+  0600
 stage_documentation "$archive_stage/share/doc/gta-claw"
 generate_provenance \
   "$archive_stage" \
@@ -379,6 +427,25 @@ generate_provenance \
 generate_spdx "$archive_stage" "$archive_stage/sbom.spdx.json" "native-tar"
 write_sha256_manifest "$archive_stage" "$archive_stage/SHA256SUMS"
 normalize_tree "$archive_stage"
+chmod 0755 \
+  "$archive_stage/bin/$LINUX_DAEMON_NAME" \
+  "$archive_stage/bin/$LINUX_CLI_NAME" \
+  "$archive_stage/install.sh" \
+  "$archive_stage/uninstall.sh" \
+  "$archive_stage/libexec/gta-claw-state-init" \
+  "$archive_stage/libexec/gta-claw-runtime-ready"
+chmod 0640 "$archive_stage/etc/gta-claw/gta-claw.env"
+chmod 0600 "$archive_stage/etc/gta-claw/credentials/daemon.conf"
+validate_service_contract \
+  "$archive_stage/lib/systemd/system/gta-claw-daemon.service"
+validate_initializer_service_contract \
+  "$archive_stage/lib/systemd/system/gta-claw-state-init.service"
+validate_sysusers_contract "$archive_stage/lib/sysusers.d/gta-claw.conf"
+validate_initializer_wrapper_contract "$archive_stage/libexec/gta-claw-state-init"
+validate_runtime_ready_contract "$archive_stage/libexec/gta-claw-runtime-ready"
+validate_direct_lifecycle_contract \
+  "$archive_stage/install.sh" \
+  "$archive_stage/uninstall.sh"
 tar_artifact="$ARTIFACT_DIR/$base_name.tar.gz"
 create_deterministic_tar_gz "$(dirname "$archive_stage")" "$(basename "$archive_stage")" "$tar_artifact"
 
@@ -387,6 +454,7 @@ ensure_output_directory "$rootfs/usr/bin"
 ensure_output_directory "$rootfs/usr/libexec/gta-claw"
 ensure_output_directory "$rootfs/usr/lib/systemd/system"
 ensure_output_directory "$rootfs/usr/lib/systemd/system-preset"
+ensure_output_directory "$rootfs/usr/lib/sysusers.d"
 ensure_output_directory "$rootfs/usr/share/doc/gta-claw"
 ensure_output_directory "$rootfs/etc/gta-claw/credentials"
 copy_verified_input "$cli_binary" "$rootfs/usr/bin/$LINUX_CLI_NAME" 0755
@@ -399,9 +467,25 @@ copy_regular_input \
   "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service" \
   0644
 copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw-state-init.service" \
+  "$rootfs/usr/lib/systemd/system/gta-claw-state-init.service" \
+  0644
+copy_regular_input \
   "$LINUX_DIR/systemd/80-gta-claw.preset" \
   "$rootfs/usr/lib/systemd/system-preset/80-gta-claw.preset" \
   0644
+copy_regular_input \
+  "$LINUX_DIR/sysusers/gta-claw.conf" \
+  "$rootfs/usr/lib/sysusers.d/gta-claw.conf" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-state-init" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-state-init" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-runtime-ready" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready" \
+  0755
 copy_regular_input \
   "$LINUX_DIR/systemd/gta-claw.env" \
   "$rootfs/etc/gta-claw/gta-claw.env" \
@@ -426,9 +510,18 @@ write_sha256_manifest \
 normalize_tree "$rootfs"
 chmod 0755 "$rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
 chmod 0640 "$rootfs/etc/gta-claw/gta-claw.env"
 chmod 0600 "$rootfs/etc/gta-claw/credentials/daemon.conf"
 validate_service_contract "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service"
+validate_initializer_service_contract \
+  "$rootfs/usr/lib/systemd/system/gta-claw-state-init.service"
+validate_sysusers_contract "$rootfs/usr/lib/sysusers.d/gta-claw.conf"
+validate_initializer_wrapper_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+validate_runtime_ready_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
 reject_forbidden_runtime_content "$rootfs"
 
 deb_root="$WORK_DIR/deb-root"
@@ -447,7 +540,7 @@ Priority: optional
 Architecture: $deb_architecture
 Maintainer: GTAStudio <noreply@github.com>
 Installed-Size: $installed_size
-Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249)
+Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249), util-linux
 Homepage: https://github.com/GTAStudio/GTA-Claw
 Description: GTA Claw native Rust headless prototype
  Packages gta-claw-daemon and gta-claw-cli without the legacy JavaScript
@@ -459,6 +552,12 @@ cat >&"$OPEN_OUTPUT_FD" <<'EOF'
 /etc/gta-claw/gta-claw.env
 /etc/gta-claw/credentials/daemon.conf
 EOF
+finish_output_file
+open_output_file "$deb_root/DEBIAN/preinst" 0755
+sed \
+  "s/@PACKAGE_VERSION@/$VERSION-$LINUX_PACKAGE_RELEASE/g" \
+  "$LINUX_DIR/debian/preinst.in" \
+  >&"$OPEN_OUTPUT_FD"
 finish_output_file
 copy_regular_input "$LINUX_DIR/debian/postinst" "$deb_root/DEBIAN/postinst" 0755
 copy_regular_input "$LINUX_DIR/debian/prerm" "$deb_root/DEBIAN/prerm" 0755
@@ -474,7 +573,11 @@ open_output_file "$deb_root/DEBIAN/md5sums" 0644
 finish_output_file
 normalize_tree "$deb_root"
 chmod 0755 "$deb_root/DEBIAN"
-chmod 0755 "$deb_root/DEBIAN/postinst" "$deb_root/DEBIAN/prerm" "$deb_root/DEBIAN/postrm"
+chmod 0755 \
+  "$deb_root/DEBIAN/preinst" \
+  "$deb_root/DEBIAN/postinst" \
+  "$deb_root/DEBIAN/prerm" \
+  "$deb_root/DEBIAN/postrm"
 chmod 0644 "$deb_root/DEBIAN/control" "$deb_root/DEBIAN/conffiles" "$deb_root/DEBIAN/md5sums"
 chmod 0640 "$deb_root/etc/gta-claw/gta-claw.env"
 chmod 0600 "$deb_root/etc/gta-claw/credentials/daemon.conf"
@@ -544,6 +647,7 @@ Source0:        gta-claw-rootfs.tar
 Requires:       glibc >= $BUILD_GLIBC_REQUIREMENT
 Requires:       libgcc
 Requires:       systemd >= 249
+Requires:       util-linux
 
 %description
 Packages gta-claw-daemon and gta-claw-cli without a JavaScript runtime or
@@ -564,31 +668,63 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 %config(noreplace) %attr(0600,root,root) /etc/gta-claw/credentials/daemon.conf
 /usr/bin/gta-claw-cli
 /usr/libexec/gta-claw/gta-claw-daemon
+/usr/libexec/gta-claw/gta-claw-runtime-ready
+/usr/libexec/gta-claw/gta-claw-state-init
 /usr/lib/systemd/system/gta-claw-daemon.service
+/usr/lib/systemd/system/gta-claw-state-init.service
 /usr/lib/systemd/system-preset/80-gta-claw.preset
+/usr/lib/sysusers.d/gta-claw.conf
 /usr/share/doc/gta-claw
 
 %pre
 set -e
-if [ "\$1" -gt 1 ] && [ -d /run/systemd/system ]; then
-  if systemctl is-active --quiet gta-claw-daemon.service; then
-    touch /run/gta-claw-daemon.was-active
-  else
-    rm -f /run/gta-claw-daemon.was-active
+if rpm -q gta-claw >/dev/null 2>&1; then
+  rm -f \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.replacement
+  installed_versions="\$(rpm -q --qf '%%{VERSION}-%%{RELEASE}\n' gta-claw)"
+  new_version="$VERSION-$LINUX_PACKAGE_RELEASE"
+  while IFS= read -r installed_version; do
+    [ -n "\$installed_version" ] || continue
+    newest_version="\$(printf '%%s\n' "\$installed_version" "\$new_version" | sort -V | tail -n 1)"
+    if [ "\$installed_version" != "\$new_version" ] &&
+      [ "\$newest_version" = "\$installed_version" ]; then
+      echo "refusing gta-claw downgrade from \$installed_version to \$new_version" >&2
+      exit 1
+    fi
+  done <<GTA_CLAW_INSTALLED_VERSIONS
+\$installed_versions
+GTA_CLAW_INSTALLED_VERSIONS
+  touch /run/gta-claw-daemon.replacement
+  if [ -d /run/systemd/system ]; then
+    if systemctl is-active --quiet gta-claw-daemon.service; then
+      touch /run/gta-claw-daemon.was-active
+      systemctl stop gta-claw-daemon.service
+    fi
   fi
 else
+  rm -f \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.replacement
+  touch /run/gta-claw-daemon.fresh-install
   rm -f /run/gta-claw-daemon.was-active
 fi
 exit 0
 
 %post
 set -e
+touch /run/gta-claw-initialization-failed
+/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
+/usr/libexec/gta-claw/gta-claw-state-init
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1
-  if [ "\$1" -eq 1 ]; then
+  if [ -e /run/gta-claw-daemon.fresh-install ]; then
     systemctl preset gta-claw-daemon.service >/dev/null 2>&1
-  elif [ "\$1" -gt 1 ] && [ -e /run/gta-claw-daemon.was-active ]; then
+    rm -f /run/gta-claw-daemon.fresh-install
+  fi
+  if [ -e /run/gta-claw-daemon.was-active ]; then
     systemctl restart gta-claw-daemon.service >/dev/null 2>&1
+    /usr/libexec/gta-claw/gta-claw-runtime-ready
   fi
 fi
 exit 0
@@ -597,13 +733,41 @@ exit 0
 set -e
 if [ -d /run/systemd/system ]; then
   if [ "\$1" -eq 0 ]; then
-    systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
+    systemctl stop gta-claw-daemon.service >/dev/null 2>&1
     if systemctl is-active --quiet gta-claw-daemon.service; then
       exit 1
     fi
-  elif [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl is-active --quiet gta-claw-daemon.service
-    rm -f /run/gta-claw-daemon.was-active
+    systemctl disable gta-claw-daemon.service >/dev/null 2>&1
+    systemctl stop gta-claw-state-init.service >/dev/null 2>&1
+    rm -f \
+      /run/gta-claw-daemon.fresh-install \
+      /run/gta-claw-daemon.ready-for-replacement \
+      /run/gta-claw-initialization-failed \
+      /run/gta-claw-daemon.replacement \
+      /run/gta-claw-daemon.was-active
+  elif [ -e /run/gta-claw-daemon.replacement ]; then
+    if [ -e /run/gta-claw-daemon.was-active ]; then
+      test -e /run/gta-claw-daemon.ready-for-replacement
+      systemctl is-active --quiet gta-claw-daemon.service
+    fi
+  fi
+fi
+exit 0
+
+%posttrans
+set -e
+installed_count="\$(rpm -q --qf '%%{NAME}\n' gta-claw 2>/dev/null | wc -l | tr -d ' ')"
+if [ "\$installed_count" -eq 1 ]; then
+  if [ -e /run/gta-claw-daemon.ready-for-replacement ]; then
+    if [ ! -e /run/gta-claw-daemon.was-active ] ||
+      systemctl is-active --quiet gta-claw-daemon.service; then
+      rm -f \
+        /run/gta-claw-daemon.ready-for-replacement \
+        /run/gta-claw-daemon.replacement \
+        /run/gta-claw-daemon.was-active
+    fi
+  elif [ ! -e /run/gta-claw-daemon.was-active ]; then
+    rm -f /run/gta-claw-daemon.replacement
   fi
 fi
 exit 0
@@ -644,7 +808,7 @@ ensure_output_directory "$oci_rootfs/usr/share/doc/gta-claw"
 ensure_output_directory "$oci_rootfs/usr/share/licenses/libc6"
 ensure_output_directory "$oci_rootfs/usr/share/licenses/libgcc-s1"
 ensure_output_directory "$oci_rootfs/etc"
-ensure_output_directory "$oci_rootfs/var/lib/gta-claw"
+ensure_output_directory "$oci_rootfs/var/lib"
 ensure_output_directory "$oci_rootfs/var/cache/gta-claw"
 ensure_output_directory "$oci_rootfs/var/log/gta-claw"
 ensure_output_directory "$oci_rootfs/run/gta-claw"
@@ -704,7 +868,6 @@ chmod 0755 "$oci_rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
 chmod 0644 "$oci_rootfs/etc/passwd" "$oci_rootfs/etc/group"
 find "$oci_rootfs/lib" -type f -exec chmod 0755 {} +
 chmod 0700 \
-  "$oci_rootfs/var/lib/gta-claw" \
   "$oci_rootfs/var/cache/gta-claw" \
   "$oci_rootfs/var/log/gta-claw" \
   "$oci_rootfs/run/gta-claw"
@@ -744,7 +907,6 @@ open_output_file "$writable_layer" 0644
     --numeric-owner \
     --no-recursion \
     -cf - \
-    var/lib/gta-claw \
     var/cache/gta-claw \
     var/log/gta-claw \
     run/gta-claw
@@ -778,10 +940,16 @@ write_json "$oci_config_source" -n \
     config: {
       User: "65532:65532",
       Entrypoint: ["/usr/libexec/gta-claw/gta-claw-daemon"],
+      Cmd: [
+        "--state-profile",
+        "linux-protected",
+        "--state-path",
+        "/var/lib/gta-claw-protected"
+      ],
       WorkingDir: "/",
       Env: ["RUST_BACKTRACE=0"],
       Volumes: {
-        "/var/lib/gta-claw": {},
+        "/var/lib": {},
         "/var/cache/gta-claw": {},
         "/var/log/gta-claw": {},
         "/run/gta-claw": {}
@@ -793,7 +961,9 @@ write_json "$oci_config_source" -n \
         "org.opencontainers.image.revision": $revision,
         "org.opencontainers.image.source": "https://github.com/GTAStudio/GTA-Claw",
         "org.opencontainers.image.title": "gta-claw",
-        "org.opencontainers.image.version": $version
+        "org.opencontainers.image.version": $version,
+        "io.gta-claw.linux-protected.init": "/usr/libexec/gta-claw/gta-claw-daemon --prepare-linux-protected --state-path /var/lib/gta-claw-protected --service-uid 65532 --service-gid 65532",
+        "io.gta-claw.linux-protected.mode": "two-phase"
       }
     },
     rootfs: {
@@ -803,7 +973,7 @@ write_json "$oci_config_source" -n \
     history: [{
       created: $created,
       created_by: "packaging/linux/package.sh",
-      comment: "Node-free scratch OCI prototype"
+      comment: "Node-free scratch OCI two-phase runtime"
     }]
   }'
 oci_config_digest="$(sha256_file "$oci_config_source")"

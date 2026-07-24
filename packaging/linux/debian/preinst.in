@@ -1,0 +1,24 @@
+#!/bin/sh
+
+set -eu
+
+new_version='@PACKAGE_VERSION@'
+
+case "$1" in
+  install | upgrade)
+    old_version="${2:-}"
+    if [ -n "$old_version" ] &&
+      dpkg --compare-versions "$old_version" gt "$new_version"; then
+      echo "refusing gta-claw downgrade from $old_version to $new_version" >&2
+      exit 1
+    fi
+    if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+      if systemctl is-active --quiet gta-claw-daemon.service; then
+        touch /run/gta-claw-daemon.was-active
+        systemctl stop gta-claw-daemon.service
+      fi
+    fi
+    ;;
+esac
+
+exit 0

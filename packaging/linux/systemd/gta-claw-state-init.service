@@ -1,0 +1,42 @@
+[Unit]
+Description=Provision and initialize GTA Claw LinuxProtected state
+Documentation=file:/usr/share/doc/gta-claw/README.md
+After=local-fs.target systemd-sysusers.service
+Before=gta-claw-daemon.service
+Wants=systemd-sysusers.service
+RequiresMountsFor=/var/lib
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/libexec/gta-claw/gta-claw-state-init
+RemainAfterExit=yes
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+TimeoutStartSec=60s

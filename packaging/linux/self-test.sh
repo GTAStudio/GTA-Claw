@@ -12,6 +12,13 @@ require_linux
 for tool in gcc jq patchelf python3 readelf sha256sum tar; do
   require_tool "$tool"
 done
+[[ "$(sha256_file "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml")" == \
+  "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82" ]] ||
+  die "protected SQLite file-control manifest hash changed"
+if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
+  "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml"; then
+  die "protected SQLite file-control manifest exposes a test or raw-handle feature"
+fi
 initialize_output_root
 work="$OUTPUT_ROOT/tests"
 ensure_output_directory "$work"
@@ -223,16 +230,71 @@ expect_failure forbidden-runtime \
 
 cp "$SCRIPT_DIR/systemd/gta-claw-daemon.service" "$work/service-good"
 grep -v '^NoNewPrivileges=yes$' "$work/service-good" >"$work/service-weakened"
+grep -v '^User=gta-claw$' "$work/service-good" >"$work/service-dynamic"
 expect_success hardened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-good'"
 expect_failure weakened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-weakened'"
+expect_failure missing-static-user \
+  bash -c "source '$common'; validate_service_contract '$work/service-dynamic'"
 {
   cat "$work/service-good"
   printf 'Environment=API_TOKEN=plaintext\n'
 } >"$work/service-secret"
 expect_failure environment-secret \
   bash -c "source '$common'; validate_service_contract '$work/service-secret'"
+expect_success hardened-initializer-service \
+  bash -c "source '$common'; validate_initializer_service_contract '$SCRIPT_DIR/systemd/gta-claw-state-init.service'"
+expect_success static-sysusers \
+  bash -c "source '$common'; validate_sysusers_contract '$SCRIPT_DIR/sysusers/gta-claw.conf'"
+expect_success nonrepairing-initializer-wrapper \
+  bash -c "source '$common'; validate_initializer_wrapper_contract '$SCRIPT_DIR/libexec/gta-claw-state-init'"
+expect_success runtime-readiness-wrapper \
+  bash -c "source '$common'; validate_runtime_ready_contract '$SCRIPT_DIR/libexec/gta-claw-runtime-ready'"
+expect_success direct-lifecycle \
+  bash -c "source '$common'; validate_direct_lifecycle_contract '$SCRIPT_DIR/direct/install.sh' '$SCRIPT_DIR/direct/uninstall.sh'"
+expect_success oci-two-phase-orchestration \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+python3 - \
+  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/compose-root-runtime.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = '    user: "65532:65532"\n'
+assert source.count(needle) == 1
+Path(sys.argv[2]).write_text(source.replace(needle, '    user: "0:0"\n'), encoding="utf-8")
+PY
+expect_failure oci-compose-root-runtime \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-root-runtime.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+python3 - \
+  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/compose-unshared-state.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = "      - gta-claw-state:/var/lib\n"
+index = source.rfind(needle)
+assert index >= 0
+Path(sys.argv[2]).write_text(source[:index] + source[index + len(needle):], encoding="utf-8")
+PY
+expect_failure oci-compose-unshared-state \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-unshared-state.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+python3 - \
+  "$SCRIPT_DIR/oci/kubernetes.yaml" \
+  "$work/kubernetes-root-runtime.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = "            runAsUser: 65532\n"
+assert source.count(needle) == 1
+Path(sys.argv[2]).write_text(source.replace(needle, "            runAsUser: 0\n"), encoding="utf-8")
+PY
+expect_failure oci-kubernetes-root-runtime \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$work/kubernetes-root-runtime.yaml'"
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish
