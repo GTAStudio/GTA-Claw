@@ -70,6 +70,13 @@ static PROTECTED_IO_TEST_GATES: std::sync::LazyLock<Mutex<HashMap<PathBuf, Prote
 static OFFLINE_INITIALIZER_TEST_FAULT: std::sync::LazyLock<
     Mutex<Vec<OfflineInitializerTestStage>>,
 > = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+#[cfg(test)]
+static OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT: std::sync::LazyLock<
+    Mutex<Option<Vec<Vec<u8>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OfflineInitializerTestStage {
@@ -93,6 +100,8 @@ enum OfflineInitializerTestStage {
     SelectorParentSync,
     MarkerCleanup,
     FinalValidation,
+    #[cfg(test)]
+    RecoveryClassification,
     RollbackTruncate,
     RollbackEntrySyncFailure,
     RollbackSync,
@@ -106,6 +115,7 @@ impl OfflineInitializerTestStage {
             Self::SelectorParentSync => "injected SelectorParentSync stage failure",
             Self::MarkerCleanup => "injected MarkerCleanup stage failure",
             Self::FinalValidation => "injected FinalValidation stage failure",
+            Self::RecoveryClassification => "injected RecoveryClassification stage failure",
             Self::RollbackEntrySyncFailure => "injected RollbackEntrySyncFailure stage failure",
             _ => "injected private offline initializer stage failure",
         }
@@ -126,6 +136,15 @@ fn fail_offline_initializer_stage(
     } else {
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn offline_initializer_fault_is_next(stage: OfflineInitializerTestStage) -> bool {
+    OFFLINE_INITIALIZER_TEST_FAULT
+        .lock()
+        .expect("offline initializer fault schedule lock poisoned")
+        .first()
+        == Some(&stage)
 }
 
 #[cfg(not(test))]
@@ -4352,6 +4371,26 @@ struct RetainedOfflineInitializer {
     may_rollback: bool,
 }
 
+struct RetainedOfflineNamespace {
+    _writer_lock: crate::store::LinuxProtectedOfflineLock,
+    _namespace: Arc<ProtectedNamespace>,
+    _identities: [FileIdentity; ENTRY_NAMES.len()],
+}
+
+fn retain_offline_namespace(
+    writer_lock: crate::store::LinuxProtectedOfflineLock,
+    namespace: Arc<ProtectedNamespace>,
+    identities: [FileIdentity; ENTRY_NAMES.len()],
+) {
+    #[cfg(test)]
+    OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::mem::forget(RetainedOfflineNamespace {
+        _writer_lock: writer_lock,
+        _namespace: namespace,
+        _identities: identities,
+    });
+}
+
 fn spawn_offline_initializer_reaper() -> Result<
     (
         std::sync::mpsc::SyncSender<RetainedOfflineInitializer>,
@@ -4366,22 +4405,28 @@ fn spawn_offline_initializer_reaper() -> Result<
             let Ok(retained) = receiver.recv() else {
                 return;
             };
-            let terminal = retained.worker.join();
+            let RetainedOfflineInitializer {
+                worker,
+                _writer_lock: writer_lock,
+                namespace,
+                identities,
+                may_rollback,
+            } = retained;
+            let terminal = worker.join();
             let safe_to_release = match terminal {
-                Ok(_) => match retained.namespace.recovery_fresh_state() {
+                Ok(_) => match namespace.recovery_fresh_state() {
+                    Ok(OfflineNamespaceState::TransitionedFresh) if may_rollback => {
+                        namespace.restore_exact_fresh(identities).is_ok()
+                    }
                     Ok(_) => true,
-                    Err(_) if retained.may_rollback => retained
-                        .namespace
-                        .restore_exact_fresh(retained.identities)
-                        .is_ok(),
                     Err(_) => false,
                 },
                 Err(_) => false,
             };
             if safe_to_release {
-                drop(retained._writer_lock);
+                drop(writer_lock);
             } else {
-                std::mem::forget(retained._writer_lock);
+                retain_offline_namespace(writer_lock, namespace, identities);
             }
         })
         .map_err(|error| {
@@ -4554,12 +4599,15 @@ pub(crate) fn initialize_offline(
     drop(reaper);
     let _ = reaper_thread.join();
     if let Err(primary) = worker_result {
-        return Err(settle_failed_fresh_transition(
-            &namespace,
-            identities,
-            primary,
-            started_fresh,
-        ));
+        let settlement =
+            settle_failed_fresh_transition(&namespace, identities, primary, started_fresh);
+        return Err(match settlement {
+            FailedFreshTransitionSettlement::ReleaseLock(error) => error,
+            FailedFreshTransitionSettlement::RetainLock(error) => {
+                retain_offline_namespace(writer_lock, namespace, identities);
+                error
+            }
+        });
     }
     finish_transitioned_fresh(&namespace, identities, work_cutoff, deadline, timeout_ms)
 }
@@ -4719,51 +4767,94 @@ fn rollback_started_fresh(
     }
 }
 
+enum FailedFreshTransitionSettlement {
+    ReleaseLock(StateError),
+    RetainLock(StateError),
+}
+
+#[cfg(test)]
+fn inject_failed_transition_classifier_fault(
+    namespace: &ProtectedNamespace,
+    classification: Result<OfflineNamespaceState, StateError>,
+) -> Result<OfflineNamespaceState, StateError> {
+    if matches!(
+        &classification,
+        Ok(OfflineNamespaceState::TransitionedFresh)
+    ) && offline_initializer_fault_is_next(OfflineInitializerTestStage::RecoveryClassification)
+    {
+        let snapshot = namespace
+            .entries
+            .iter()
+            .map(|entry| {
+                std::fs::read(&entry.path).map_err(|error| {
+                    file_error(
+                        "capture LinuxProtected classifier-error test snapshot",
+                        &entry.path,
+                        error,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let previous = OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
+            .lock()
+            .expect("offline initializer classification snapshot lock poisoned")
+            .replace(snapshot);
+        assert!(
+            previous.is_none(),
+            "offline initializer classification snapshot is single-use"
+        );
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::RecoveryClassification,
+            &namespace.directory,
+        )?;
+    }
+    classification
+}
+
 fn settle_failed_fresh_transition(
     namespace: &ProtectedNamespace,
     identities: [FileIdentity; ENTRY_NAMES.len()],
     primary: StateError,
     may_rollback: bool,
-) -> StateError {
-    match namespace.recovery_fresh_state() {
+) -> FailedFreshTransitionSettlement {
+    let classification = namespace.recovery_fresh_state();
+    #[cfg(test)]
+    let classification = inject_failed_transition_classifier_fault(namespace, classification);
+    match classification {
         // Exact-Fresh provenance permits discarding this invocation's own precommit handoff.
         Ok(OfflineNamespaceState::TransitionedFresh) if may_rollback => {
-            match namespace.restore_exact_fresh(identities) {
-                Ok(()) => primary,
-                Err(rollback) => StateError::OperationCleanupFailed {
-                    operation: "restore failed LinuxProtected fresh initialization",
-                    primary: Box::new(primary),
-                    cleanup: format!(
-                        "post-transition state classified as TransitionedFresh and authorized exact fresh rollback; exact fresh rollback failed: {rollback}"
-                    ),
+            FailedFreshTransitionSettlement::ReleaseLock(
+                match namespace.restore_exact_fresh(identities) {
+                    Ok(()) => primary,
+                    Err(rollback) => StateError::OperationCleanupFailed {
+                        operation: "restore failed LinuxProtected fresh initialization",
+                        primary: Box::new(primary),
+                        cleanup: format!(
+                            "post-transition state classified as TransitionedFresh and authorized exact fresh rollback; exact fresh rollback failed: {rollback}"
+                        ),
+                    },
                 },
-            }
+            )
         }
-        Ok(OfflineNamespaceState::TransitionedFresh) => primary,
+        Ok(OfflineNamespaceState::TransitionedFresh) => {
+            FailedFreshTransitionSettlement::ReleaseLock(primary)
+        }
         Ok(
             OfflineNamespaceState::Fresh
             | OfflineNamespaceState::PreparingFresh
             | OfflineNamespaceState::PreparedFresh
             | OfflineNamespaceState::InitializedFresh
             | OfflineNamespaceState::Initialized,
-        ) => primary,
-        Err(classification) if may_rollback => match namespace.restore_exact_fresh(identities) {
-            Ok(()) => primary,
-            Err(rollback) => StateError::OperationCleanupFailed {
-                operation: "restore failed LinuxProtected fresh initialization",
+        ) => FailedFreshTransitionSettlement::ReleaseLock(primary),
+        Err(classification) => {
+            FailedFreshTransitionSettlement::RetainLock(StateError::OperationCleanupFailed {
+                operation: "retain unclassifiable LinuxProtected initialization",
                 primary: Box::new(primary),
                 cleanup: format!(
-                    "post-transition classification failed: {classification}; exact fresh rollback failed: {rollback}"
+                    "post-transition classification failed; destructive rollback was not authorized, so the held namespace, identities, and fixed lock were intentionally retained: {classification}"
                 ),
-            },
-        },
-        Err(classification) => StateError::OperationCleanupFailed {
-            operation: "retain unclassifiable resumed LinuxProtected initialization",
-            primary: Box::new(primary),
-            cleanup: format!(
-                "initializer did not originate from exact Fresh, so unknown bytes were retained: {classification}"
-            ),
-        },
+            })
+        }
     }
 }
 
@@ -5711,6 +5802,27 @@ mod tests {
         identities
     }
 
+    fn entry_bytes(path: &Path) -> Vec<Vec<u8>> {
+        ENTRY_NAMES
+            .iter()
+            .map(|name| {
+                fs::read(path.join(name))
+                    .unwrap_or_else(|error| panic!("read protected {name}: {error}"))
+            })
+            .collect()
+    }
+
+    fn entry_lengths(path: &Path) -> Vec<u64> {
+        ENTRY_NAMES
+            .iter()
+            .map(|name| {
+                fs::metadata(path.join(name))
+                    .unwrap_or_else(|error| panic!("inspect protected {name}: {error}"))
+                    .len()
+            })
+            .collect()
+    }
+
     fn held_fixture_entries(path: &Path) -> [HeldEntry; 8] {
         ENTRY_NAMES.map(|name| {
             let entry_path = path.join(name);
@@ -6015,7 +6127,10 @@ mod tests {
                     panic!("SelectorSync must report publication uncertainty: {error:?}");
                 };
                 let fault_path = fixture.namespace.join(SELECTOR_NAME);
-                let primary = invalid_path(&fault_path, stage.failure_reason());
+                let primary = format!(
+                    "invalid state path {}: injected SelectorSync stage failure",
+                    fault_path.display()
+                );
                 let expected_reason = format!(
                     "selector reached its full visible value before durability was confirmed: {primary}"
                 );
@@ -6043,18 +6158,25 @@ mod tests {
                 let StateError::CommittedWithCleanupFailure { operation, cleanup } = &error else {
                     panic!("{stage:?} must report committed cleanup degradation: {error:?}");
                 };
-                let fault_path = match stage {
-                    OfflineInitializerTestStage::SelectorParentSync => fixture.namespace.clone(),
-                    OfflineInitializerTestStage::MarkerCleanup => {
-                        fixture.namespace.join(SNAPSHOT_METADATA_NAMES[1])
-                    }
-                    OfflineInitializerTestStage::FinalValidation => {
-                        fixture.namespace.join(DATABASE_NAME)
-                    }
+                let (fault_path, fault_reason) = match stage {
+                    OfflineInitializerTestStage::SelectorParentSync => (
+                        fixture.namespace.clone(),
+                        "injected SelectorParentSync stage failure",
+                    ),
+                    OfflineInitializerTestStage::MarkerCleanup => (
+                        fixture.namespace.join(SNAPSHOT_METADATA_NAMES[1]),
+                        "injected MarkerCleanup stage failure",
+                    ),
+                    OfflineInitializerTestStage::FinalValidation => (
+                        fixture.namespace.join(DATABASE_NAME),
+                        "injected FinalValidation stage failure",
+                    ),
                     _ => unreachable!("post-sync diagnostic stage is exhaustively matched"),
                 };
-                let expected_cleanup =
-                    invalid_path(&fault_path, stage.failure_reason()).to_string();
+                let expected_cleanup = format!(
+                    "invalid state path {}: {fault_reason}",
+                    fault_path.display()
+                );
                 let expected_error = StateError::CommittedWithCleanupFailure {
                     operation: "initialize LinuxProtected state offline",
                     cleanup: expected_cleanup.clone(),
@@ -6197,16 +6319,20 @@ mod tests {
         else {
             panic!("entry sync failure must degrade production rollback: {error:?}");
         };
-        let expected_primary = invalid_path(
-            &database_path,
-            OfflineInitializerTestStage::Transition.failure_reason(),
+        let expected_primary = StateError::InvalidPath {
+            path: database_path.clone(),
+            reason: "injected private offline initializer stage failure",
+        };
+        let expected_primary_display = format!(
+            "invalid state path {}: injected private offline initializer stage failure",
+            database_path.display()
         );
-        let expected_rollback = invalid_path(
-            &database_path,
-            OfflineInitializerTestStage::RollbackEntrySyncFailure.failure_reason(),
+        let expected_rollback_display = format!(
+            "invalid state path {}: injected RollbackEntrySyncFailure stage failure",
+            database_path.display()
         );
         let expected_cleanup = format!(
-            "post-transition state classified as TransitionedFresh and authorized exact fresh rollback; exact fresh rollback failed: {expected_rollback}"
+            "post-transition state classified as TransitionedFresh and authorized exact fresh rollback; exact fresh rollback failed: {expected_rollback_display}"
         );
         assert_eq!(
             *operation,
@@ -6217,7 +6343,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "{expected_primary}; restore failed LinuxProtected fresh initialization cleanup failed: {expected_cleanup}"
+                "{expected_primary_display}; restore failed LinuxProtected fresh initialization cleanup failed: {expected_cleanup}"
             )
         );
         assert!(
@@ -6278,6 +6404,143 @@ mod tests {
             .expect("completed production rollback fixture is idempotent"),
             LinuxProtectedInitialization::AlreadyInitialized
         );
+
+        let classifier_error = fresh_root_fixture();
+        let classifier_identities = entry_identities(&classifier_error.namespace);
+        let classifier_names = exact_names(&classifier_error.namespace);
+        let retained_before =
+            OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
+                .lock()
+                .expect("offline initializer classification snapshot lock poisoned")
+                .take()
+                .is_none()
+        );
+        schedule_offline_initializer_faults(&[
+            OfflineInitializerTestStage::Transition,
+            OfflineInitializerTestStage::RecoveryClassification,
+            OfflineInitializerTestStage::RollbackTruncate,
+        ]);
+        let classifier_database = classifier_error.namespace.join(DATABASE_NAME);
+        let error = crate::initialize_linux_protected_offline(
+            &classifier_error.namespace,
+            SERVICE_UID,
+            SERVICE_GID,
+        )
+        .expect_err("classifier uncertainty must fail closed");
+        let expected_primary = StateError::InvalidPath {
+            path: classifier_database.clone(),
+            reason: "injected private offline initializer stage failure",
+        };
+        let expected_primary_display = format!(
+            "invalid state path {}: injected private offline initializer stage failure",
+            classifier_database.display()
+        );
+        let expected_classification_display = format!(
+            "invalid state path {}: injected RecoveryClassification stage failure",
+            classifier_error.namespace.display()
+        );
+        let expected_cleanup = format!(
+            "post-transition classification failed; destructive rollback was not authorized, so the held namespace, identities, and fixed lock were intentionally retained: {expected_classification_display}"
+        );
+        let expected_error = StateError::OperationCleanupFailed {
+            operation: "retain unclassifiable LinuxProtected initialization",
+            primary: Box::new(expected_primary.clone()),
+            cleanup: expected_cleanup.clone(),
+        };
+        assert_eq!(error, expected_error);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{expected_primary_display}; retain unclassifiable LinuxProtected initialization cleanup failed: {expected_cleanup}"
+            )
+        );
+        {
+            let mut scheduled = OFFLINE_INITIALIZER_TEST_FAULT
+                .lock()
+                .expect("offline initializer fault schedule lock poisoned");
+            assert_eq!(
+                scheduled.as_slice(),
+                &[OfflineInitializerTestStage::RollbackTruncate],
+                "classifier uncertainty must not enter destructive rollback"
+            );
+            scheduled.clear();
+        }
+        let classifier_snapshot = OFFLINE_INITIALIZER_TEST_CLASSIFICATION_SNAPSHOT
+            .lock()
+            .expect("offline initializer classification snapshot lock poisoned")
+            .take()
+            .expect("capture exact state before injected classifier uncertainty");
+        let classifier_snapshot_lengths = classifier_snapshot
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entry_bytes(&classifier_error.namespace),
+            classifier_snapshot,
+            "classifier uncertainty must preserve every held entry byte"
+        );
+        assert_eq!(
+            entry_lengths(&classifier_error.namespace),
+            classifier_snapshot_lengths,
+            "classifier uncertainty must preserve every held entry length"
+        );
+        assert_eq!(
+            entry_identities(&classifier_error.namespace),
+            classifier_identities
+        );
+        assert_eq!(exact_names(&classifier_error.namespace), classifier_names);
+        let spec =
+            LinuxProtectedSpec::new(classifier_error.namespace.clone(), SERVICE_UID, SERVICE_GID);
+        let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)
+            .expect("inspect retained classifier-error namespace");
+        assert_eq!(
+            namespace
+                .recovery_fresh_state()
+                .expect("reclassify retained exact transition"),
+            OfflineNamespaceState::TransitionedFresh
+        );
+        let retained_bytes = entry_bytes(&classifier_error.namespace);
+        assert_eq!(
+            retained_bytes[PREP_RECORD_INDEX],
+            namespace.initializer_prep_record()
+        );
+        let database_page: &[u8; 4096] = retained_bytes[DATABASE_INDEX]
+            .as_slice()
+            .try_into()
+            .expect("retained transition database is exactly one page");
+        assert!(minimal_fresh_handoff_page(database_page));
+        assert!(retained_bytes[WAL_INDEX].is_empty());
+        assert!(retained_bytes[SELECTOR_INDEX].is_empty());
+        drop(namespace);
+        assert_eq!(
+            OFFLINE_INITIALIZER_TEST_RETAINED_NAMESPACES.load(std::sync::atomic::Ordering::SeqCst),
+            retained_before + 1,
+            "classifier uncertainty must retain the held namespace bundle"
+        );
+        let retry = crate::initialize_linux_protected_offline(
+            &classifier_error.namespace,
+            SERVICE_UID,
+            SERVICE_GID,
+        )
+        .expect_err("fail-closed classifier uncertainty retains the fixed lock");
+        assert_eq!(
+            retry,
+            StateError::StoreLocked {
+                path: classifier_error.namespace.join(WRITER_LOCK_NAME),
+            }
+        );
+        assert_eq!(entry_bytes(&classifier_error.namespace), retained_bytes);
+        assert_eq!(
+            entry_lengths(&classifier_error.namespace),
+            classifier_snapshot_lengths
+        );
+        assert_eq!(
+            entry_identities(&classifier_error.namespace),
+            classifier_identities
+        );
+        assert_eq!(exact_names(&classifier_error.namespace), classifier_names);
 
         let sparse = fresh_root_fixture();
         assert_eq!(
