@@ -64,9 +64,11 @@ docker run --rm \
   --env GIT_WORK_TREE=/workspace \
   --env GIT_OPTIONAL_LOCKS=0 \
   --env "PACKAGING_IMAGE_ID=$packaging_image_id" \
-  --env GIT_CONFIG_COUNT=1 \
+  --env GIT_CONFIG_COUNT=2 \
   --env GIT_CONFIG_KEY_0=safe.directory \
   --env GIT_CONFIG_VALUE_0=/workspace \
+  --env GIT_CONFIG_KEY_1=core.autocrlf \
+  --env GIT_CONFIG_VALUE_1=true \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/gta-claw-target" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/git,target=/gta-claw-git,readonly" \
