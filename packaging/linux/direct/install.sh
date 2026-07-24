@@ -249,10 +249,10 @@ done
 /usr/libexec/gta-claw/gta-claw-state-init
 
 if [ -d /run/systemd/system ]; then
-  if ! systemctl daemon-reload; then
+  if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fail_install_runtime
   fi
-  if ! systemctl unmask --runtime gta-claw-daemon.service; then
+  if ! systemctl daemon-reload; then
     fail_install_runtime
   fi
   if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then

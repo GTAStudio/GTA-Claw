@@ -175,6 +175,9 @@ restore_remove_state() {
   if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fence_failed_remove_restore
   fi
+  if ! systemctl daemon-reload >/dev/null; then
+    fence_failed_remove_restore
+  fi
   if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
     fence_failed_remove_restore
   fi
@@ -220,10 +223,10 @@ case "$1" in
       systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
       /usr/libexec/gta-claw/gta-claw-state-init
       if [ -d /run/systemd/system ]; then
-        if ! systemctl --system daemon-reload >/dev/null; then
+        if ! systemctl unmask --runtime gta-claw-daemon.service; then
           fence_failed_runtime
         fi
-        if ! systemctl unmask --runtime gta-claw-daemon.service; then
+        if ! systemctl --system daemon-reload >/dev/null; then
           fence_failed_runtime
         fi
         if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then

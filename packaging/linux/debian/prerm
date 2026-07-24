@@ -97,6 +97,7 @@ restore_on_failure() {
   if [ "$prepared" -eq 0 ]; then
     systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
       fence_failed_restore
+    systemctl daemon-reload >/dev/null 2>&1 || fence_failed_restore
     systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
       fence_failed_restore
     restore_enablement >/dev/null 2>&1 || fence_failed_restore
