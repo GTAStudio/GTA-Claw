@@ -303,7 +303,7 @@ static_identity="$(id -u gta-claw):$(id -g gta-claw)"
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-direct_reinstall_snapshot="$(state_snapshot)"
+direct_reinstall_snapshot="$(state_identity_snapshot)"
 sudo mv /etc/gta-claw/gta-claw.env /etc/gta-claw/gta-claw.env.saved
 sudo ln -s /nonexistent/gta-claw.env /etc/gta-claw/gta-claw.env
 if sudo "$direct1/install.sh"; then
@@ -317,12 +317,12 @@ sudo rm /etc/gta-claw/gta-claw.env
 sudo mv /etc/gta-claw/gta-claw.env.saved /etc/gta-claw/gta-claw.env
 sudo "$direct1/install.sh"
 assert_active_restart "$direct_pid"
-assert_preserved "$direct_reinstall_snapshot"
+assert_identity_preserved "$direct_reinstall_snapshot"
 direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-direct_upgrade_snapshot="$(state_snapshot)"
+direct_upgrade_snapshot="$(state_identity_snapshot)"
 sudo "$direct2/install.sh"
 assert_active_restart "$direct_pid"
-assert_preserved "$direct_upgrade_snapshot"
+assert_identity_preserved "$direct_upgrade_snapshot"
 if sudo "$direct1/install.sh"; then
   die "direct deployment accepted a downgrade"
 fi
@@ -411,15 +411,15 @@ assert_protected_contract
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-deb_reinstall_snapshot="$(state_snapshot)"
+deb_reinstall_snapshot="$(state_identity_snapshot)"
 sudo dpkg -i "$deb1"
 assert_active_restart "$deb_pid"
-assert_preserved "$deb_reinstall_snapshot"
+assert_identity_preserved "$deb_reinstall_snapshot"
 deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-deb_upgrade_snapshot="$(state_snapshot)"
+deb_upgrade_snapshot="$(state_identity_snapshot)"
 sudo dpkg -i "$deb2"
 assert_active_restart "$deb_pid"
-assert_preserved "$deb_upgrade_snapshot"
+assert_identity_preserved "$deb_upgrade_snapshot"
 if sudo dpkg -i --force-downgrade "$deb1"; then
   die "Debian package accepted a downgrade"
 fi
@@ -531,15 +531,15 @@ assert_protected_contract
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-rpm_reinstall_snapshot="$(state_snapshot)"
+rpm_reinstall_snapshot="$(state_identity_snapshot)"
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm1"
 assert_active_restart "$rpm_pid"
-assert_preserved "$rpm_reinstall_snapshot"
+assert_identity_preserved "$rpm_reinstall_snapshot"
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-rpm_upgrade_snapshot="$(state_snapshot)"
+rpm_upgrade_snapshot="$(state_identity_snapshot)"
 sudo rpm -Uvh --nodeps "$rpm2"
 assert_active_restart "$rpm_pid"
-assert_preserved "$rpm_upgrade_snapshot"
+assert_identity_preserved "$rpm_upgrade_snapshot"
 if sudo rpm -Uvh --nodeps --oldpackage "$rpm1"; then
   die "RPM package accepted a downgrade"
 fi

@@ -160,6 +160,8 @@ restore_pre_failure() {
       else
         systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
           fence_failed_rollback
+        systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_rollback
         if [ "$old_initializer_active" -eq 1 ]; then
           systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
             fence_failed_rollback

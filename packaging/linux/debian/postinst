@@ -175,6 +175,9 @@ restore_remove_state() {
   if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fence_failed_remove_restore
   fi
+  if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+    fence_failed_remove_restore
+  fi
   if [ -e "$remove_was_enabled" ]; then
     if ! systemctl enable gta-claw-daemon.service >/dev/null; then
       fence_failed_remove_restore
@@ -221,6 +224,9 @@ case "$1" in
           fence_failed_runtime
         fi
         if ! systemctl unmask --runtime gta-claw-daemon.service; then
+          fence_failed_runtime
+        fi
+        if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
           fence_failed_runtime
         fi
         if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&

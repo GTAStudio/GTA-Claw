@@ -81,6 +81,9 @@ if [ -d /run/systemd/system ]; then
   if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fence_failed_runtime
   fi
+  if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+    fence_failed_runtime
+  fi
   if [ -e "$fresh_install" ]; then
     if ! systemctl preset gta-claw-daemon.service >/dev/null; then
       fence_failed_runtime

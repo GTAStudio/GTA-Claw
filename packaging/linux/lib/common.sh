@@ -949,6 +949,7 @@ validate_direct_lifecycle_contract() {
     'replacement_fence=$runtime_directory/replacement-fenced' \
     'stop_initializer_for_replacement' \
     'fail_install_runtime' \
+    'systemctl reset-failed gta-claw-daemon.service' \
     '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
     '/usr/libexec/gta-claw/gta-claw-state-init' \
     '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
