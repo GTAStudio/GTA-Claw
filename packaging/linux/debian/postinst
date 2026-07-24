@@ -93,18 +93,30 @@ stop_initializer_for_replacement() {
 fence_failed_runtime() {
   ensure_failure_fence
   touch "$replacement_fence"
-  systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
-  systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
-  systemctl stop gta-claw-state-init.service >/dev/null 2>&1 || true
+  if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon could not be runtime-masked after configure failure" >&2
+  fi
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after configure failure" >&2
+  fi
+  if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+    echo "gta-claw initializer stop failed after configure failure" >&2
+  fi
   verify_runtime_stopped
   exit 1
 }
 
 fence_failed_remove_restore() {
   ensure_failure_fence
-  systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
-  systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
-  systemctl stop gta-claw-state-init.service >/dev/null 2>&1 || true
+  if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon could not be runtime-masked after removal recovery failure" >&2
+  fi
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after removal recovery failure" >&2
+  fi
+  if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+    echo "gta-claw initializer stop failed after removal recovery failure" >&2
+  fi
   verify_runtime_stopped
   exit 1
 }

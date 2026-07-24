@@ -166,9 +166,15 @@ fail_install_runtime() {
   ensure_failure_fence
   touch "$replacement_fence"
   if [ -d /run/systemd/system ]; then
-    systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
-    systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
-    systemctl stop gta-claw-state-init.service >/dev/null 2>&1 || true
+    if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+      echo "gta-claw daemon could not be runtime-masked after install failure" >&2
+    fi
+    if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+      echo "gta-claw daemon stop failed after install failure" >&2
+    fi
+    if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+      echo "gta-claw initializer stop failed after install failure" >&2
+    fi
     verify_runtime_stopped
   else
     verify_writer_lock_released

@@ -54,10 +54,16 @@ fence_failed_restore() {
   if ! ensure_failure_fence; then
     echo "gta-claw removal recovery could not retain its failure fence" >&2
   fi
-  systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
-  systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
-  systemctl stop gta-claw-state-init.service >/dev/null 2>&1 || true
-  verify_runtime_stopped || true
+  if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon could not be runtime-masked after RPM recovery failure" >&2
+  fi
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after RPM recovery failure" >&2
+  fi
+  if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+    echo "gta-claw initializer stop failed after RPM recovery failure" >&2
+  fi
+  verify_runtime_stopped
   exit 1
 }
 

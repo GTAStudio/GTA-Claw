@@ -53,9 +53,15 @@ fail_readiness() {
   if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
     echo "gta-claw daemon stop failed after readiness failure" >&2
   fi
-  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null || true)"
-  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service 2>/dev/null || true)"
-  control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service 2>/dev/null || true)"
+  if ! active_state="$(systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null)"; then
+    active_state=unknown
+  fi
+  if ! main_pid="$(systemctl show -P MainPID gta-claw-daemon.service 2>/dev/null)"; then
+    main_pid=unknown
+  fi
+  if ! control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service 2>/dev/null)"; then
+    control_pid=unknown
+  fi
   case "$active_state:$main_pid:$control_pid" in
     inactive:0:0 | failed:0:0) ;;
     *) echo "gta-claw daemon remains $active_state with MainPID $main_pid and ControlPID $control_pid after readiness failure" >&2 ;;
