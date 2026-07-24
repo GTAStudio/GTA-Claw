@@ -6,10 +6,13 @@ on:
       - main
     paths:
       - ".github/workflows/linux-packaging.yml"
+      - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/windows-packaging.yml"
       - "packaging/linux/**"
       - "apps/**"
       - "crates/**"
       - "compat/**"
+      - "desktop/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "deny.toml"
@@ -18,10 +21,13 @@ on:
   pull_request:
     paths:
       - ".github/workflows/linux-packaging.yml"
+      - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/windows-packaging.yml"
       - "packaging/linux/**"
       - "apps/**"
       - "crates/**"
       - "compat/**"
+      - "desktop/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "deny.toml"
@@ -57,7 +63,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils gcc jq patchelf python3 rpm shellcheck
+            binutils gcc jq patchelf python3 python3-jsonschema python3-yaml rpm shellcheck
           archive="$RUNNER_TEMP/actionlint.tar.gz"
           curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
             --output "$archive" \
@@ -71,6 +77,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unsafe_source="$(
+            find packaging/linux -mindepth 1 \
+              ! -type d ! -type f -print -quit
+          )"
+          test -z "$unsafe_source" || {
+            echo "Linux packaging contains a symlink or special source: $unsafe_source" >&2
+            exit 1
+          }
+          source_policy=packaging/linux/tests/validate-source-surfaces.py
+          test -f "$source_policy" && test ! -L "$source_policy"
+          test "$(git ls-files --stage -- "$source_policy" | awk '{ print $1 }')" = 100755
+          python3 "$source_policy" packaging/linux
           find packaging/linux -type f -name '*.sh' -print0 |
             while IFS= read -r -d '' script; do
               bash -n "$script"
@@ -84,7 +102,12 @@ jobs:
             packaging/linux/debian/preinst.in \
             packaging/linux/debian/prerm \
             packaging/linux/libexec/gta-claw-runtime-ready \
-            packaging/linux/libexec/gta-claw-state-init; do
+            packaging/linux/libexec/gta-claw-state-init \
+            packaging/linux/rpm/post \
+            packaging/linux/rpm/posttrans \
+            packaging/linux/rpm/postun \
+            packaging/linux/rpm/pre.in \
+            packaging/linux/rpm/preun; do
             sh -n "$script"
             shellcheck -x "$script"
           done
@@ -190,7 +213,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils cpio jq python3 rpm
+            binutils cpio jq python3 python3-jsonschema python3-yaml rpm
 
       - name: Build twice in pinned Bookworm with different umasks
         id: build
@@ -427,7 +450,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils cpio jq python3 rpm
+            binutils cpio jq python3 python3-jsonschema python3-yaml rpm
 
       - name: Cross-build arm64 twice in pinned Bookworm
         id: build

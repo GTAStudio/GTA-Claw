@@ -1,0 +1,96 @@
+# shellcheck shell=sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+replacement_fence=$runtime_directory/replacement-fenced
+fresh_install=/run/gta-claw-daemon.fresh-install
+was_active=/run/gta-claw-daemon.was-active
+lock=/var/lib/gta-claw-protected/state.writer.lock
+
+lock_holder_pid() {
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    echo "gta-claw writer-lock ownership could not be inspected" >&2
+    exit 1
+  fi
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+ensure_failure_fence() {
+  if [ -L "$runtime_directory" ] ||
+    { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+    echo "gta-claw initialization runtime path is not a physical directory" >&2
+    exit 1
+  fi
+  if [ ! -e "$runtime_directory" ]; then
+    mkdir -m 0755 -- "$runtime_directory"
+  fi
+  if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+    exit 1
+  fi
+  if [ -L "$failure_marker" ] ||
+    { [ -e "$failure_marker" ] && [ ! -f "$failure_marker" ]; }; then
+    echo "gta-claw initialization failure marker is not a physical file" >&2
+    exit 1
+  fi
+  touch "$failure_marker"
+  chown 0:0 "$failure_marker"
+  chmod 0644 "$failure_marker"
+}
+
+verify_runtime_stopped() {
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid:$control_pid" in
+    inactive:0:0 | failed:0:0) ;;
+    *) return 1 ;;
+  esac
+  [ -z "$(lock_holder_pid)" ]
+}
+
+fence_failed_runtime() {
+  ensure_failure_fence
+  touch "$replacement_fence"
+  systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
+  systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
+  systemctl stop gta-claw-state-init.service >/dev/null 2>&1 || true
+  verify_runtime_stopped
+  exit 1
+}
+
+ensure_failure_fence
+touch "$replacement_fence"
+/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
+/usr/libexec/gta-claw/gta-claw-state-init
+if [ -d /run/systemd/system ]; then
+  if ! systemctl daemon-reload >/dev/null; then
+    fence_failed_runtime
+  fi
+  if ! systemctl unmask --runtime gta-claw-daemon.service; then
+    fence_failed_runtime
+  fi
+  if [ -e "$fresh_install" ]; then
+    if ! systemctl preset gta-claw-daemon.service >/dev/null; then
+      fence_failed_runtime
+    fi
+    rm -f "$fresh_install"
+  fi
+  if [ -e "$was_active" ]; then
+    if ! systemctl restart gta-claw-daemon.service >/dev/null; then
+      fence_failed_runtime
+    fi
+    if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+      fence_failed_runtime
+    fi
+  fi
+else
+  rm -f "$replacement_fence"
+fi
+
+exit 0

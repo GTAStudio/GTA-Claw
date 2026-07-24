@@ -392,12 +392,13 @@ assert_required_job() {
 
   actual_digest="$(
     printf '%s\n' "$block" |
+      tr -d '\r' |
       sha256sum |
       awk '{ print $1 }'
   )"
   [[ "$actual_digest" == "$expected_digest" ]] || {
-    printf '%s structure differs from the exact command/action allowlist\n' \
-      "$job" >&2
+    printf '%s structure differs from the exact command/action allowlist (expected %s, actual %s)\n' \
+      "$job" "$expected_digest" "$actual_digest" >&2
     return 1
   }
 }
@@ -437,10 +438,13 @@ validate_workflow() {
 
   expected="$(printf '%s\n' \
     '.github/workflows/linux-packaging.yml' \
+    '.github/workflows/macos-packaging.yml' \
+    '.github/workflows/windows-packaging.yml' \
     'packaging/linux/**' \
     'apps/**' \
     'crates/**' \
     'compat/**' \
+    'desktop/**' \
     'Cargo.lock' \
     'Cargo.toml' \
     'deny.toml' \
@@ -497,7 +501,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    64b6e7684eccdf767faa29170027b0753fe4f10bd16caf734d43ff8de2481d11 \
+    bd9b4fe92603082aa655a0bcc31ba983e4f567a08ded53b485b016e40ff67a20 \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \
@@ -518,7 +522,7 @@ validate_workflow() {
 
   assert_required_job \
     native-x86 \
-    ba8a101838efa32c4207a94d2cab1693320b1e048eca007bf42f29e75a3955f6 \
+    18293a5133aa6521e9edbda2025d8c3ed11f861104ca7e1bf71afdc213bdccdf \
     "$(printf '%s\n' \
       'Checkout' \
       'Install native package inspection tools' \
@@ -536,7 +540,7 @@ validate_workflow() {
 
   assert_required_job \
     cross-arm64 \
-    a813a82001df0461d87569206a31306702af423e23d02b0d524f1830300e4172 \
+    08e8afe33de18c9aa944d3397d3d3ef5df39efb993a4bf4edd520efe067e572c \
     "$(printf '%s\n' \
       'Checkout' \
       'Install arm64 cross and native package tools' \
@@ -1053,31 +1057,32 @@ expect_actionlint_valid_validation_failure \
   "extra path entry" \
   "$tmp_dir/extra-path.yml"
 
-python3 "$SCRIPT_DIR/tests/reject-javascript-commands.py" "$SCRIPT_DIR"
-printf '%s\n' \
-  '#!/bin/sh' \
-  'exec "/usr/bin/npm" install' \
-  'env NODE_ENV=production /usr/bin/node daemon.js' \
-  "/usr/bin/no\\" \
-  'de daemon.js' \
-  >"$tmp_dir/javascript-shell-fixture.sh"
-if python3 \
-  "$SCRIPT_DIR/tests/reject-javascript-commands.py" \
-  "$tmp_dir/javascript-shell-fixture.sh" \
+source_policy="$SCRIPT_DIR/tests/validate-source-surfaces.py"
+python3 "$source_policy" "$SCRIPT_DIR"
+mkdir -p "$tmp_dir/source-type-fixture"
+ln -s /bin/true "$tmp_dir/source-type-fixture/validator.sh"
+if python3 "$source_policy" --types-only "$tmp_dir/source-type-fixture" \
   >/dev/null 2>&1; then
-  echo "shell JavaScript-command policy accepted quoted, wrapped, or split commands" >&2
+  echo "Linux source policy accepted a /bin/true validator symlink" >&2
   exit 1
 fi
+rm "$tmp_dir/source-type-fixture/validator.sh"
+if python3 "$source_policy" --types-only /dev/null \
+  >/dev/null 2>&1; then
+  echo "Linux source policy accepted a special file" >&2
+  exit 1
+fi
+
+command_policy="$SCRIPT_DIR/tests/reject-javascript-commands.py"
+python3 "$command_policy" "$SCRIPT_DIR" "$workflow"
+python3 "$SCRIPT_DIR/tests/reject-javascript-commands-self-test.py"
 mkdir -p "$tmp_dir/recursive-policy/nested"
-printf '%s\n' '#!/bin/sh' '/usr/bin/node daemon.js' \
-  >"$tmp_dir/recursive-policy/nested/omitted-surface.sh"
-if python3 \
-  "$SCRIPT_DIR/tests/reject-javascript-commands.py" \
-  "$tmp_dir/recursive-policy" \
-  >/dev/null 2>&1; then
-  echo "shell JavaScript-command policy omitted a recursively discovered script" >&2
+ln -s /bin/true "$tmp_dir/recursive-policy/nested/validator.sh"
+if python3 "$command_policy" "$tmp_dir/recursive-policy" >/dev/null 2>&1; then
+  echo "command policy skipped a /bin/true command-surface symlink" >&2
   exit 1
 fi
+rm "$tmp_dir/recursive-policy/nested/validator.sh"
 yaml_command_pattern='(^|[^[:alnum:]_.-])(npm|npx|node|nodejs|bun|pnpm)([^[:alnum:]_.-]|$)'
 grep -Eq "$yaml_command_pattern" <<< 'command: ["/usr/bin/node", "daemon.js"]' ||
   {

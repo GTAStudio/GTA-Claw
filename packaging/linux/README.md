@@ -31,6 +31,10 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
   expressions, and copyright files are embedded in the SBOM and provenance.
   The second layer assigns cache, log, and runtime directories to uid/gid
   65532. It deliberately does not assign `/var/lib` to the runtime identity.
+- Compose, Kubernetes, and CRI fixtures bind both phases to the same
+  `ghcr.io/gtastudio/gta-claw@sha256:...` reference derived from the packaged
+  manifest. The CRI probe uses root initialization followed by a
+  `65532:65532` runtime whose only supplementary GID is redundant `65532`.
 - `provenance-ARCH.json` and `SHA256SUMS` for the final artifacts.
 
 Builds run in the digest-pinned Rust 1.97.0 Bookworm image using the immutable
@@ -92,8 +96,11 @@ rejected before service disruption; final removal stops/disables before
 executable unlink. Ordinary removal and Debian purge preserve protected state
 and the stable service identity. LP4 intentionally ships no automated state
 purge action. No hook executes network or dynamic code.
-The root wrapper creates `/run/gta-claw-initialization-failed` before every
-handoff, so failed direct, Debian, RPM, or manual initialization remains fenced.
+The root wrapper creates
+`/run/gta-claw-state-init/initialization-failed` before every handoff. The
+root-owned mode-0755 runtime directory is preserved by the initializer oneshot;
+only root can change the marker while the runtime can read it. Failed direct,
+Debian, RPM, or manual initialization therefore remains fenced.
 RPM may report `%post` failures as warnings, but the runtime unit still refuses
 startup until a later successful root initialization clears the marker.
 
@@ -152,6 +159,9 @@ mount the same PVC at `/var/lib`; do not set `fsGroup` or an ownership-changing
 CSI policy. The volume must expose an accepted ext/XFS/Btrfs/F2FS filesystem.
 The runtime volume remains writable for held-file I/O, but mode `0750` prevents
 UID 65532 from mutating the namespace directory.
+Generated orchestration rejects mutable tags, short image names, divergent
+phase digests, malformed YAML, and duplicate keys. The CRI probe also requires
+an explicit fully qualified `CRI_RUNTIME_ENDPOINT`.
 
 ## Output and release safety
 

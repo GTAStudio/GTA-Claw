@@ -2,6 +2,11 @@
 *.py text eol=lf
 Dockerfile* text eol=lf
 debian/* text eol=lf
+libexec/* text eol=lf
+rpm/* text eol=lf
+oci/*.in text eol=lf
+oci/*.json text eol=lf
+sysusers/* text eol=lf
 systemd/* text eol=lf
 *.allowlist text eol=lf
 *.txt text eol=lf

@@ -16,7 +16,7 @@ spec:
     spec:
       initContainers:
         - name: linux-protected-init
-          image: gta-claw:0.1.0
+          image: @OCI_IMAGE_REFERENCE@
           command: ["/usr/libexec/gta-claw/gta-claw-daemon"]
           args:
             - --prepare-linux-protected
@@ -38,7 +38,7 @@ spec:
               mountPath: /var/lib
       containers:
         - name: gta-claw
-          image: gta-claw:0.1.0
+          image: @OCI_IMAGE_REFERENCE@
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

@@ -7,12 +7,35 @@ export PATH
 
 daemon=/usr/libexec/gta-claw/gta-claw-daemon
 namespace=/var/lib/gta-claw-protected
-failure_marker=/run/gta-claw-initialization-failed
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
 
 if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
   echo "gta-claw protected initialization requires real and effective UID 0" >&2
   exit 1
 fi
+
+if [ -L "$runtime_directory" ] ||
+  { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+  echo "gta-claw initialization runtime path is not a physical directory" >&2
+  exit 1
+fi
+if [ ! -e "$runtime_directory" ]; then
+  mkdir -m 0755 -- "$runtime_directory"
+fi
+if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+  echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+  exit 1
+fi
+if [ -L "$failure_marker" ] ||
+  { [ -e "$failure_marker" ] && [ ! -f "$failure_marker" ]; }; then
+  echo "gta-claw initialization failure marker is not a physical file" >&2
+  exit 1
+fi
+touch "$failure_marker"
+chown 0:0 "$failure_marker"
+chmod 0644 "$failure_marker"
+
 if [ ! -x "$daemon" ]; then
   echo "gta-claw daemon is not executable: $daemon" >&2
   exit 1
@@ -31,8 +54,6 @@ if [ "$primary_gid" != "$service_gid" ]; then
   echo "gta-claw user primary GID does not match the named gta-claw group" >&2
   exit 1
 fi
-
-touch "$failure_marker"
 
 "$daemon" \
   --provision-linux-protected \

@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "name": "gta-claw-runtime",
+    "attempt": 0
+  },
+  "image": {
+    "image": "@OCI_IMAGE_REFERENCE@"
+  },
+  "command": [
+    "/usr/libexec/gta-claw/gta-claw-daemon",
+    "--probe",
+    "--state-profile",
+    "linux-protected",
+    "--state-path",
+    "/var/lib/gta-claw-protected"
+  ],
+  "mounts": [
+    {
+      "container_path": "/var/lib",
+      "host_path": "/var/lib/gta-claw-cri-probe",
+      "readonly": false,
+      "selinux_relabel": false,
+      "propagation": 0
+    }
+  ],
+  "log_path": "runtime.log",
+  "stdin": false,
+  "stdin_once": false,
+  "tty": false,
+  "linux": {
+    "security_context": {
+      "capabilities": {
+        "add_capabilities": [],
+        "drop_capabilities": ["ALL"]
+      },
+      "privileged": false,
+      "run_as_user": {"value": 65532},
+      "run_as_group": {"value": 65532},
+      "supplemental_groups": [65532],
+      "no_new_privs": true,
+      "readonly_rootfs": true
+    }
+  }
+}

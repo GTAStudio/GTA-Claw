@@ -1,0 +1,264 @@
+# shellcheck shell=sh disable=SC2317
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+new_version='@PACKAGE_VERSION@'
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+replacement_fence=$runtime_directory/replacement-fenced
+lock=/var/lib/gta-claw-protected/state.writer.lock
+replacement=/run/gta-claw-daemon.replacement
+ready=/run/gta-claw-daemon.ready-for-replacement
+was_active=/run/gta-claw-daemon.was-active
+fresh_install=/run/gta-claw-daemon.fresh-install
+installed=0
+prepared=0
+runtime_touched=0
+old_active=0
+old_initializer_active=0
+package_fenced=0
+
+ensure_failure_fence() {
+  if [ -L "$runtime_directory" ] ||
+    { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+    echo "gta-claw initialization runtime path is not a physical directory" >&2
+    exit 1
+  fi
+  if [ ! -e "$runtime_directory" ]; then
+    mkdir -m 0755 -- "$runtime_directory"
+  fi
+  if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+    exit 1
+  fi
+  if [ -L "$failure_marker" ] ||
+    { [ -e "$failure_marker" ] && [ ! -f "$failure_marker" ]; }; then
+    echo "gta-claw initialization failure marker is not a physical file" >&2
+    exit 1
+  fi
+  touch "$failure_marker"
+  chown 0:0 "$failure_marker"
+  chmod 0644 "$failure_marker"
+}
+
+lock_holder_pid() {
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    echo "gta-claw writer-lock ownership could not be inspected" >&2
+    exit 1
+  fi
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+verify_unit_stopped() {
+  unit="$1"
+  label="$2"
+  active_state="$(systemctl show -P ActiveState "$unit")"
+  main_pid="$(systemctl show -P MainPID "$unit")"
+  control_pid="$(systemctl show -P ControlPID "$unit")"
+  case "$active_state:$main_pid:$control_pid" in
+    inactive:0:0 | failed:0:0) ;;
+    *) {
+      echo "$label remains $active_state with MainPID $main_pid and ControlPID $control_pid" >&2
+      exit 1
+    } ;;
+  esac
+}
+
+verify_writer_lock_released() {
+  lock_pid="$(lock_holder_pid)"
+  if [ -n "$lock_pid" ]; then
+    echo "gta-claw writer lock remains held by PID $lock_pid" >&2
+    exit 1
+  fi
+}
+
+verify_runtime_stopped() {
+  verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+  verify_writer_lock_released
+}
+
+stop_initializer_for_replacement() {
+  initializer_load_state="$(systemctl show -P LoadState gta-claw-state-init.service)"
+  case "$initializer_load_state" in
+    loaded | masked)
+      initializer_active_state="$(systemctl show -P ActiveState gta-claw-state-init.service)"
+      case "$initializer_active_state" in
+        active | activating | reloading | deactivating)
+          old_initializer_active=1
+          ;;
+        inactive | failed) ;;
+        *) {
+          echo "unexpected gta-claw initializer state: $initializer_active_state" >&2
+          exit 1
+        } ;;
+      esac
+      systemctl stop gta-claw-state-init.service
+      verify_unit_stopped gta-claw-state-init.service "gta-claw initializer"
+      ;;
+    not-found) ;;
+    *) {
+      echo "unexpected gta-claw initializer load state: $initializer_load_state" >&2
+      exit 1
+    } ;;
+  esac
+}
+
+marker_state() {
+  if [ -e "$1" ]; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+restore_marker() {
+  path="$1"
+  existed="$2"
+  if [ "$existed" -eq 1 ]; then
+    touch "$path"
+  else
+    rm -f "$path"
+  fi
+}
+
+fence_failed_rollback() {
+  ensure_failure_fence
+  touch "$replacement_fence"
+  systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
+  systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
+  systemctl stop gta-claw-state-init.service >/dev/null 2>&1 || true
+  verify_runtime_stopped
+  exit 1
+}
+
+restore_pre_failure() {
+  status=$?
+  trap - 0 HUP INT TERM
+  if [ "$prepared" -eq 0 ] && [ "$runtime_touched" -eq 1 ]; then
+    restore_marker "$failure_marker" "$had_failure_marker"
+    restore_marker "$replacement_fence" "$had_replacement_fence"
+    restore_marker "$replacement" "$had_replacement"
+    restore_marker "$ready" "$had_ready"
+    restore_marker "$was_active" "$had_was_active"
+    restore_marker "$fresh_install" "$had_fresh_install"
+    if [ -d /run/systemd/system ]; then
+      if [ "$package_fenced" -eq 1 ]; then
+        systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_rollback
+        systemctl stop gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_rollback
+        verify_runtime_stopped
+      else
+        systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_rollback
+        if [ "$old_initializer_active" -eq 1 ]; then
+          systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
+            fence_failed_rollback
+        fi
+        if [ "$old_active" -eq 1 ]; then
+          systemctl start gta-claw-daemon.service >/dev/null 2>&1 ||
+            fence_failed_rollback
+          /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 ||
+            fence_failed_rollback
+          restore_marker "$ready" "$had_ready"
+        fi
+      fi
+    fi
+  fi
+  exit "$status"
+}
+
+if rpm -q gta-claw >/dev/null 2>&1; then
+  installed_versions="$(rpm -q --qf '%%{VERSION}-%%{RELEASE}\n' gta-claw)"
+  while IFS= read -r installed_version; do
+    [ -n "$installed_version" ] || continue
+    newest_version="$(
+      printf '%s\n' "$installed_version" "$new_version" | sort -V | tail -n 1
+    )"
+    if [ "$installed_version" != "$new_version" ] &&
+      [ "$newest_version" = "$installed_version" ]; then
+      echo "refusing gta-claw downgrade from $installed_version to $new_version" >&2
+      exit 1
+    fi
+  done <<GTA_CLAW_INSTALLED_VERSIONS
+$installed_versions
+GTA_CLAW_INSTALLED_VERSIONS
+  installed=1
+fi
+
+had_failure_marker="$(marker_state "$failure_marker")"
+had_replacement_fence="$(marker_state "$replacement_fence")"
+had_replacement="$(marker_state "$replacement")"
+had_ready="$(marker_state "$ready")"
+had_was_active="$(marker_state "$was_active")"
+had_fresh_install="$(marker_state "$fresh_install")"
+trap restore_pre_failure 0 HUP INT TERM
+ensure_failure_fence
+runtime_touched=1
+if [ "$installed" -eq 1 ]; then
+  rm -f "$ready" "$fresh_install"
+  touch "$replacement"
+else
+  rm -f "$ready" "$replacement"
+  touch "$fresh_install"
+fi
+
+if [ -d /run/systemd/system ]; then
+  load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+  case "$load_state" in
+    masked)
+      if [ "$had_replacement_fence" -ne 1 ] || [ "$had_failure_marker" -ne 1 ]; then
+        echo "refusing externally masked gta-claw daemon" >&2
+        exit 1
+      fi
+      package_fenced=1
+      if [ "$had_was_active" -eq 1 ]; then
+        old_active=1
+      fi
+      verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+      ;;
+    not-found)
+      if [ "$package_fenced" -eq 0 ]; then
+        rm -f "$was_active"
+      fi
+      touch "$replacement_fence"
+      systemctl mask --runtime gta-claw-daemon.service
+      verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+      ;;
+    loaded)
+      rm -f "$was_active"
+      active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+      case "$active_state" in
+        inactive | failed) ;;
+        active | activating | reloading | deactivating)
+          old_active=1
+          touch "$was_active"
+          ;;
+        *) {
+          echo "unexpected gta-claw daemon state before RPM replacement: $active_state" >&2
+          exit 1
+        } ;;
+      esac
+      touch "$replacement_fence"
+      systemctl mask --runtime gta-claw-daemon.service
+      systemctl stop gta-claw-daemon.service
+      verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+      ;;
+    *) {
+      echo "unexpected gta-claw daemon load state before RPM replacement: $load_state" >&2
+      exit 1
+    } ;;
+  esac
+  stop_initializer_for_replacement
+  verify_writer_lock_released
+else
+  touch "$replacement_fence"
+  verify_writer_lock_released
+fi
+
+prepared=1
+trap - 0 HUP INT TERM
+exit 0

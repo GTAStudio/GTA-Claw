@@ -40,9 +40,13 @@ deb_architecture="$(deb_arch "$arch")"
 rpm_architecture="$(rpm_arch "$arch")"
 oci_architecture="$(oci_arch "$arch")"
 base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
-validate_oci_orchestration_contract \
-  "$LINUX_DIR/oci/compose.yaml" \
-  "$LINUX_DIR/oci/kubernetes.yaml"
+validate_oci_orchestration_templates \
+  "$LINUX_DIR/oci/compose.yaml.in" \
+  "$LINUX_DIR/oci/kubernetes.yaml.in"
+validate_cri_fixture_templates \
+  "$LINUX_DIR/oci/cri-sandbox.json" \
+  "$LINUX_DIR/oci/cri-init.json.in" \
+  "$LINUX_DIR/oci/cri-runtime.json.in"
 
 write_json() {
   local output="$1"
@@ -64,6 +68,8 @@ write_json "$package_toolchain" -n \
   --arg gzip "$(dpkg-query -W -f='${Version}' gzip)" \
   --arg jq "$(dpkg-query -W -f='${Version}' jq)" \
   --arg python3 "$(dpkg-query -W -f='${Version}' python3)" \
+  --arg python3_jsonschema "$(dpkg-query -W -f='${Version}' python3-jsonschema)" \
+  --arg python3_yaml "$(dpkg-query -W -f='${Version}' python3-yaml)" \
   --arg cpio "$(dpkg-query -W -f='${Version}' cpio)" \
   '{
     schemaVersion: 1,
@@ -77,6 +83,8 @@ write_json "$package_toolchain" -n \
       gzip: $gzip,
       jq: $jq,
       python3: $python3,
+      "python3-jsonschema": $python3_jsonschema,
+      "python3-yaml": $python3_yaml,
       cpio: $cpio
     }
   }'
@@ -353,8 +361,6 @@ stage_documentation() {
   copy_regular_input "$LINUX_DIR/LICENSE.txt" "$destination/LICENSE.txt" 0644
   copy_regular_input "$LINUX_DIR/NOTICE.txt" "$destination/NOTICE.txt" 0644
   copy_regular_input "$LINUX_DIR/README.md" "$destination/README.md" 0644
-  copy_regular_input "$LINUX_DIR/oci/compose.yaml" "$destination/compose.yaml" 0644
-  copy_regular_input "$LINUX_DIR/oci/kubernetes.yaml" "$destination/kubernetes.yaml" 0644
   copy_verified_input "$BUILD_MANIFEST" "$destination/build-manifest.json" 0644
   copy_verified_input \
     "$BUILD_RUNTIME_MANIFEST" \
@@ -627,6 +633,21 @@ touch --date="@$SOURCE_DATE_EPOCH" "$rpm_source_temporary"
 publish_output_file "$rpm_source_temporary" "$rpm_source"
 rpm_spec="$rpm_work/SPECS/gta-claw.spec"
 changelog_date="$(LC_ALL=C date -u --date="@$SOURCE_DATE_EPOCH" '+%a %b %d %Y')"
+rpm_scriptlet_dir="$WORK_DIR/rpm-scriptlets"
+ensure_output_directory "$rpm_scriptlet_dir"
+rpm_pre="$rpm_scriptlet_dir/pre"
+open_output_file "$rpm_pre" 0755
+sed \
+  "s/@PACKAGE_VERSION@/$VERSION-$LINUX_PACKAGE_RELEASE/g" \
+  "$LINUX_DIR/rpm/pre.in" \
+  >&"$OPEN_OUTPUT_FD"
+finish_output_file
+for scriptlet in post preun posttrans postun; do
+  copy_regular_input \
+    "$LINUX_DIR/rpm/$scriptlet" \
+    "$rpm_scriptlet_dir/$scriptlet" \
+    0755
+done
 open_output_file "$rpm_spec" 0644
 cat >&"$OPEN_OUTPUT_FD" <<EOF
 %global debug_package %{nil}
@@ -677,107 +698,17 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/share/doc/gta-claw
 
 %pre
-set -e
-if rpm -q gta-claw >/dev/null 2>&1; then
-  rm -f \
-    /run/gta-claw-daemon.ready-for-replacement \
-    /run/gta-claw-daemon.replacement
-  installed_versions="\$(rpm -q --qf '%%{VERSION}-%%{RELEASE}\n' gta-claw)"
-  new_version="$VERSION-$LINUX_PACKAGE_RELEASE"
-  while IFS= read -r installed_version; do
-    [ -n "\$installed_version" ] || continue
-    newest_version="\$(printf '%%s\n' "\$installed_version" "\$new_version" | sort -V | tail -n 1)"
-    if [ "\$installed_version" != "\$new_version" ] &&
-      [ "\$newest_version" = "\$installed_version" ]; then
-      echo "refusing gta-claw downgrade from \$installed_version to \$new_version" >&2
-      exit 1
-    fi
-  done <<GTA_CLAW_INSTALLED_VERSIONS
-\$installed_versions
-GTA_CLAW_INSTALLED_VERSIONS
-  touch /run/gta-claw-daemon.replacement
-  if [ -d /run/systemd/system ]; then
-    if systemctl is-active --quiet gta-claw-daemon.service; then
-      touch /run/gta-claw-daemon.was-active
-      systemctl stop gta-claw-daemon.service
-    fi
-  fi
-else
-  rm -f \
-    /run/gta-claw-daemon.ready-for-replacement \
-    /run/gta-claw-daemon.replacement
-  touch /run/gta-claw-daemon.fresh-install
-  rm -f /run/gta-claw-daemon.was-active
-fi
-exit 0
-
-%post
-set -e
-touch /run/gta-claw-initialization-failed
-/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
-/usr/libexec/gta-claw/gta-claw-state-init
-if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1
-  if [ -e /run/gta-claw-daemon.fresh-install ]; then
-    systemctl preset gta-claw-daemon.service >/dev/null 2>&1
-    rm -f /run/gta-claw-daemon.fresh-install
-  fi
-  if [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl restart gta-claw-daemon.service >/dev/null 2>&1
-    /usr/libexec/gta-claw/gta-claw-runtime-ready
-  fi
-fi
-exit 0
-
-%preun
-set -e
-if [ -d /run/systemd/system ]; then
-  if [ "\$1" -eq 0 ]; then
-    systemctl stop gta-claw-daemon.service >/dev/null 2>&1
-    if systemctl is-active --quiet gta-claw-daemon.service; then
-      exit 1
-    fi
-    systemctl disable gta-claw-daemon.service >/dev/null 2>&1
-    systemctl stop gta-claw-state-init.service >/dev/null 2>&1
-    rm -f \
-      /run/gta-claw-daemon.fresh-install \
-      /run/gta-claw-daemon.ready-for-replacement \
-      /run/gta-claw-initialization-failed \
-      /run/gta-claw-daemon.replacement \
-      /run/gta-claw-daemon.was-active
-  elif [ -e /run/gta-claw-daemon.replacement ]; then
-    if [ -e /run/gta-claw-daemon.was-active ]; then
-      test -e /run/gta-claw-daemon.ready-for-replacement
-      systemctl is-active --quiet gta-claw-daemon.service
-    fi
-  fi
-fi
-exit 0
-
-%posttrans
-set -e
-installed_count="\$(rpm -q --qf '%%{NAME}\n' gta-claw 2>/dev/null | wc -l | tr -d ' ')"
-if [ "\$installed_count" -eq 1 ]; then
-  if [ -e /run/gta-claw-daemon.ready-for-replacement ]; then
-    if [ ! -e /run/gta-claw-daemon.was-active ] ||
-      systemctl is-active --quiet gta-claw-daemon.service; then
-      rm -f \
-        /run/gta-claw-daemon.ready-for-replacement \
-        /run/gta-claw-daemon.replacement \
-        /run/gta-claw-daemon.was-active
-    fi
-  elif [ ! -e /run/gta-claw-daemon.was-active ]; then
-    rm -f /run/gta-claw-daemon.replacement
-  fi
-fi
-exit 0
-
-%postun
-set -e
-if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1
-fi
-exit 0
+EOF
+cat "$rpm_pre" >&"$OPEN_OUTPUT_FD"
+printf '\n%%post\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/post" >&"$OPEN_OUTPUT_FD"
+printf '\n%%preun\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/preun" >&"$OPEN_OUTPUT_FD"
+printf '\n%%posttrans\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/posttrans" >&"$OPEN_OUTPUT_FD"
+printf '\n%%postun\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/postun" >&"$OPEN_OUTPUT_FD"
+cat >&"$OPEN_OUTPUT_FD" <<EOF
 
 %changelog
 * $changelog_date GTAStudio <noreply@github.com> - $VERSION-$LINUX_PACKAGE_RELEASE
@@ -1043,6 +974,39 @@ write_json "$oci_layout/oci-layout" -n '{imageLayoutVersion: "1.0.0"}'
 normalize_tree "$oci_layout"
 oci_artifact="$ARTIFACT_DIR/$base_name.oci.tar.gz"
 create_deterministic_tar_gz "$(dirname "$oci_layout")" "$(basename "$oci_layout")" "$oci_artifact"
+compose_artifact="$ARTIFACT_DIR/$base_name.compose.yaml"
+kubernetes_artifact="$ARTIFACT_DIR/$base_name.kubernetes.yaml"
+cri_sandbox_artifact="$ARTIFACT_DIR/$base_name.cri-sandbox.json"
+cri_init_artifact="$ARTIFACT_DIR/$base_name.cri-init.json"
+cri_runtime_artifact="$ARTIFACT_DIR/$base_name.cri-runtime.json"
+cri_probe_artifact="$ARTIFACT_DIR/$base_name.cri-probe.sh"
+render_oci_orchestration \
+  "$LINUX_DIR/oci/compose.yaml.in" \
+  "$compose_artifact" \
+  "$oci_manifest_digest"
+render_oci_orchestration \
+  "$LINUX_DIR/oci/kubernetes.yaml.in" \
+  "$kubernetes_artifact" \
+  "$oci_manifest_digest"
+validate_oci_orchestration_contract \
+  "$compose_artifact" \
+  "$kubernetes_artifact" \
+  "$oci_manifest_digest"
+copy_regular_input "$LINUX_DIR/oci/cri-sandbox.json" "$cri_sandbox_artifact" 0644
+render_oci_orchestration \
+  "$LINUX_DIR/oci/cri-init.json.in" \
+  "$cri_init_artifact" \
+  "$oci_manifest_digest"
+render_oci_orchestration \
+  "$LINUX_DIR/oci/cri-runtime.json.in" \
+  "$cri_runtime_artifact" \
+  "$oci_manifest_digest"
+copy_regular_input "$LINUX_DIR/oci/cri-probe.sh" "$cri_probe_artifact" 0755
+validate_cri_fixture_contract \
+  "$cri_sandbox_artifact" \
+  "$cri_init_artifact" \
+  "$cri_runtime_artifact" \
+  "$oci_manifest_digest"
 
 artifact_provenance="$ARTIFACT_DIR/provenance-$arch.json"
 write_json "$artifact_provenance" -n \
@@ -1062,6 +1026,18 @@ write_json "$artifact_provenance" -n \
   --arg rpm_sha "$(sha256_file "$rpm_artifact")" \
   --arg oci_name "$(basename "$oci_artifact")" \
   --arg oci_sha "$(sha256_file "$oci_artifact")" \
+  --arg compose_name "$(basename "$compose_artifact")" \
+  --arg compose_sha "$(sha256_file "$compose_artifact")" \
+  --arg kubernetes_name "$(basename "$kubernetes_artifact")" \
+  --arg kubernetes_sha "$(sha256_file "$kubernetes_artifact")" \
+  --arg cri_sandbox_name "$(basename "$cri_sandbox_artifact")" \
+  --arg cri_sandbox_sha "$(sha256_file "$cri_sandbox_artifact")" \
+  --arg cri_init_name "$(basename "$cri_init_artifact")" \
+  --arg cri_init_sha "$(sha256_file "$cri_init_artifact")" \
+  --arg cri_runtime_name "$(basename "$cri_runtime_artifact")" \
+  --arg cri_runtime_sha "$(sha256_file "$cri_runtime_artifact")" \
+  --arg cri_probe_name "$(basename "$cri_probe_artifact")" \
+  --arg cri_probe_sha "$(sha256_file "$cri_probe_artifact")" \
   '{
     schemaVersion: 1,
     source: {
@@ -1080,7 +1056,13 @@ write_json "$artifact_provenance" -n \
       {name: $tar_name, digest: {sha256: $tar_sha}},
       {name: $deb_name, digest: {sha256: $deb_sha}},
       {name: $rpm_name, digest: {sha256: $rpm_sha}},
-      {name: $oci_name, digest: {sha256: $oci_sha}}
+      {name: $oci_name, digest: {sha256: $oci_sha}},
+      {name: $compose_name, digest: {sha256: $compose_sha}},
+      {name: $kubernetes_name, digest: {sha256: $kubernetes_sha}},
+      {name: $cri_sandbox_name, digest: {sha256: $cri_sandbox_sha}},
+      {name: $cri_init_name, digest: {sha256: $cri_init_sha}},
+      {name: $cri_runtime_name, digest: {sha256: $cri_runtime_sha}},
+      {name: $cri_probe_name, digest: {sha256: $cri_probe_sha}}
     ]
   }'
 write_sha256_manifest "$ARTIFACT_DIR" "$ARTIFACT_DIR/SHA256SUMS"

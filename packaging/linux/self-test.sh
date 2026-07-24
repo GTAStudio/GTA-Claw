@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in gcc jq patchelf python3 readelf sha256sum tar; do
+for tool in gcc jq patchelf python3 readelf rpm rpmbuild sha256sum tar; do
   require_tool "$tool"
 done
 [[ "$(sha256_file "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml")" == \
@@ -253,10 +253,53 @@ expect_success runtime-readiness-wrapper \
   bash -c "source '$common'; validate_runtime_ready_contract '$SCRIPT_DIR/libexec/gta-claw-runtime-ready'"
 expect_success direct-lifecycle \
   bash -c "source '$common'; validate_direct_lifecycle_contract '$SCRIPT_DIR/direct/install.sh' '$SCRIPT_DIR/direct/uninstall.sh'"
+oci_test_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+validate_oci_orchestration_templates \
+  "$SCRIPT_DIR/oci/compose.yaml.in" \
+  "$SCRIPT_DIR/oci/kubernetes.yaml.in"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/compose.yaml.in" \
+  "$work/compose.yaml" \
+  "$oci_test_digest"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/kubernetes.yaml.in" \
+  "$work/kubernetes.yaml" \
+  "$oci_test_digest"
+validate_cri_fixture_templates \
+  "$SCRIPT_DIR/oci/cri-sandbox.json" \
+  "$SCRIPT_DIR/oci/cri-init.json.in" \
+  "$SCRIPT_DIR/oci/cri-runtime.json.in"
+cp -- "$SCRIPT_DIR/oci/cri-sandbox.json" "$work/cri-sandbox.json"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/cri-init.json.in" \
+  "$work/cri-init.json" \
+  "$oci_test_digest"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/cri-runtime.json.in" \
+  "$work/cri-runtime.json" \
+  "$oci_test_digest"
+validate_cri_fixture_contract \
+  "$work/cri-sandbox.json" \
+  "$work/cri-init.json" \
+  "$work/cri-runtime.json" \
+  "$oci_test_digest"
+python3 - "$work/cri-runtime.json" "$work/cri-runtime-foreign-group.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    fixture = json.load(source)
+fixture["linux"]["security_context"]["supplemental_groups"] = [65532, 0]
+with open(sys.argv[2], "w", encoding="utf-8") as output:
+    json.dump(fixture, output, sort_keys=True)
+    output.write("\n")
+PY
+expect_failure cri-foreign-supplementary-group \
+  bash -c "source '$common'; validate_cri_fixture_contract '$work/cri-sandbox.json' '$work/cri-init.json' '$work/cri-runtime-foreign-group.json' '$oci_test_digest'"
 expect_success oci-two-phase-orchestration \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 python3 - \
-  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/compose.yaml" \
   "$work/compose-root-runtime.yaml" <<'PY'
 from pathlib import Path
 import sys
@@ -267,9 +310,9 @@ assert source.count(needle) == 1
 Path(sys.argv[2]).write_text(source.replace(needle, '    user: "0:0"\n'), encoding="utf-8")
 PY
 expect_failure oci-compose-root-runtime \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-root-runtime.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-root-runtime.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 python3 - \
-  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/compose.yaml" \
   "$work/compose-unshared-state.yaml" <<'PY'
 from pathlib import Path
 import sys
@@ -281,9 +324,9 @@ assert index >= 0
 Path(sys.argv[2]).write_text(source[:index] + source[index + len(needle):], encoding="utf-8")
 PY
 expect_failure oci-compose-unshared-state \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-unshared-state.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-unshared-state.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 python3 - \
-  "$SCRIPT_DIR/oci/kubernetes.yaml" \
+  "$work/kubernetes.yaml" \
   "$work/kubernetes-root-runtime.yaml" <<'PY'
 from pathlib import Path
 import sys
@@ -294,7 +337,77 @@ assert source.count(needle) == 1
 Path(sys.argv[2]).write_text(source.replace(needle, "            runAsUser: 0\n"), encoding="utf-8")
 PY
 expect_failure oci-kubernetes-root-runtime \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$work/kubernetes-root-runtime.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes-root-runtime.yaml' '$oci_test_digest'"
+sed \
+  "0,\\|$LINUX_OCI_IMAGE_REPOSITORY@sha256:$oci_test_digest|s||$LINUX_OCI_IMAGE_REPOSITORY@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff|" \
+  "$work/compose.yaml" \
+  >"$work/compose-split-digest.yaml"
+expect_failure oci-compose-split-digest \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-split-digest.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+sed \
+  "s|$LINUX_OCI_IMAGE_REPOSITORY@sha256:|gta-claw@sha256:|g" \
+  "$work/compose.yaml" \
+  >"$work/compose-short-image.yaml"
+expect_failure oci-compose-short-image \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-short-image.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+{
+  cat "$work/kubernetes.yaml"
+  printf 'malformed: [\n'
+} >"$work/kubernetes-malformed.yaml"
+expect_failure oci-kubernetes-malformed-yaml \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes-malformed.yaml' '$oci_test_digest'"
+{
+  printf 'services: {}\n'
+  cat "$work/compose.yaml"
+} >"$work/compose-duplicate-key.yaml"
+expect_failure oci-compose-duplicate-key \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-duplicate-key.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+
+build_scriptlet_fixture() {
+  local name="$1"
+  local extra="$2"
+  local top="$work/rpm-$name"
+  local spec="$top/SPECS/$name.spec"
+  mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+  {
+    printf '%s\n' \
+      '%global debug_package %{nil}' \
+      "Name: $name" \
+      'Version: 1' \
+      'Release: 1' \
+      'Summary: scriptlet policy fixture' \
+      'License: MIT' \
+      'BuildArch: noarch' \
+      '%description' \
+      'scriptlet policy fixture' \
+      '%prep' \
+      '%build' \
+      '%install' \
+      'mkdir -p %{buildroot}/usr/share/gta-claw-test' \
+      'printf fixture >%{buildroot}/usr/share/gta-claw-test/value' \
+      '%files' \
+      '/usr/share/gta-claw-test/value' \
+      '%pre' ':' \
+      '%post' ':' \
+      '%preun' ':' \
+      '%posttrans' ':' \
+      '%postun' ':'
+    printf '%s\n' "$extra"
+  } >"$spec"
+  rpmbuild -bb --quiet --define "_topdir $top" "$spec" >/dev/null
+  find "$top/RPMS" -type f -name '*.rpm' -print -quit
+}
+
+pretrans_extra=$'%pretrans -p /usr/bin/no''de\nprocess.exit(0)'
+pretrans_rpm="$(build_scriptlet_fixture gta-claw-pretrans-test "$pretrans_extra")"
+if (reject_unexpected_rpm_scriptlets "$pretrans_rpm"); then
+  die "RPM scriptlet policy accepted a Node-powered pretrans"
+fi
+trigger_extra=$'%triggerin -- gta-claw-trigger-target\n:'
+trigger_rpm="$(build_scriptlet_fixture gta-claw-trigger-test "$trigger_extra")"
+if (reject_unexpected_rpm_scriptlets "$trigger_rpm"); then
+  die "RPM scriptlet policy accepted an extra trigger"
+fi
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish

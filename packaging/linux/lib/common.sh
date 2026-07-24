@@ -66,7 +66,7 @@ validate_absolute_path() {
 
 canonical_target_root() {
   local repository
-  local target="$REPO_ROOT/target"
+  local target="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
   local canonical
   if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
     "$SAFEIO_HELPER" check "$SAFEIO_TARGET_FD"
@@ -75,20 +75,21 @@ canonical_target_root() {
   fi
   repository="$(cd "$REPO_ROOT" && pwd -P)"
   [[ "$repository" == "$REPO_ROOT" ]] || die "repository root changed during validation"
-  [[ ! -L "$target" ]] || die "repository target directory must not be a symlink"
+  validate_absolute_path "$target" "canonical target directory"
+  [[ ! -L "$target" ]] || die "canonical target directory must not be a symlink"
   if [[ ! -e "$target" ]]; then
     mkdir -m 0700 -- "$target"
   fi
   [[ -d "$target" && ! -L "$target" ]] ||
-    die "repository target path is not a real directory"
+    die "canonical target path is not a real directory"
   [[ "$(stat -c '%u' "$target")" -eq "$(id -u)" ]] ||
-    die "repository target directory is not owned by the current user"
+    die "canonical target directory is not owned by the current user"
   chmod 0700 -- "$target"
   [[ "$(stat -c '%a' "$target")" == "700" ]] ||
     die "repository target directory is not private"
   canonical="$(cd "$target" && pwd -P)"
   [[ "$canonical" == "$target" ]] ||
-    die "repository target directory resolves outside the repository"
+    die "canonical target directory changed during validation"
   printf '%s\n' "$canonical"
 }
 
@@ -801,7 +802,7 @@ validate_service_contract() {
     'Requires=gta-claw-state-init.service' \
     'After=local-fs.target gta-claw-state-init.service' \
     'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
-    'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-initialization-failed' \
+    'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-state-init/initialization-failed' \
     'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'Type=notify' \
@@ -810,6 +811,7 @@ validate_service_contract() {
     'User=gta-claw' \
     'Group=gta-claw' \
     'SupplementaryGroups=' \
+    'ReadOnlyPaths=/run/gta-claw-state-init' \
     'ReadWritePaths=/var/lib/gta-claw-protected' \
     'NoNewPrivileges=yes' \
     'PrivateTmp=yes' \
@@ -849,7 +851,10 @@ validate_initializer_service_contract() {
     'Group=root' \
     'ExecStart=/usr/libexec/gta-claw/gta-claw-state-init' \
     'RemainAfterExit=yes' \
-    'ReadWritePaths=/var/lib' \
+    'RuntimeDirectory=gta-claw-state-init' \
+    'RuntimeDirectoryMode=0755' \
+    'RuntimeDirectoryPreserve=yes' \
+    'ReadWritePaths=/var/lib /run/gta-claw-state-init' \
     'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER' \
     'NoNewPrivileges=yes' \
     'ProtectSystem=strict' \
@@ -877,12 +882,17 @@ validate_sysusers_contract() {
 validate_initializer_wrapper_contract() {
   local wrapper="$1"
   local required
+  local marker_line
+  local daemon_line
   for required in \
     'namespace=/var/lib/gta-claw-protected' \
-    'failure_marker=/run/gta-claw-initialization-failed' \
+    'runtime_directory=/run/gta-claw-state-init' \
+    'failure_marker=$runtime_directory/initialization-failed' \
     'service_gid="$(getent group gta-claw | cut -d: -f3)"' \
     'if [ "$primary_gid" != "$service_gid" ]; then' \
     'touch "$failure_marker"' \
+    'chown 0:0 "$failure_marker"' \
+    'chmod 0644 "$failure_marker"' \
     '--provision-linux-protected' \
     '--initialize-linux-protected' \
     '--state-path "$namespace"' \
@@ -897,6 +907,10 @@ validate_initializer_wrapper_contract() {
     "$wrapper"; then
     die "initializer wrapper contains directory-entry repair logic"
   fi
+  marker_line="$(grep -nF 'touch "$failure_marker"' "$wrapper" | head -n 1 | cut -d: -f1)"
+  daemon_line="$(grep -nF 'if [ ! -x "$daemon" ]; then' "$wrapper" | head -n 1 | cut -d: -f1)"
+  [[ -n "$marker_line" && -n "$daemon_line" && "$marker_line" -lt "$daemon_line" ]] ||
+    die "initializer wrapper does not establish its failure fence before fallible initialization"
 }
 
 validate_runtime_ready_contract() {
@@ -907,6 +921,8 @@ validate_runtime_ready_contract() {
     'ready_marker=/run/gta-claw-daemon.ready-for-replacement' \
     'systemctl is-active --quiet gta-claw-daemon.service' \
     'main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"' \
+    'control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service' \
+    'ensure_failure_fence' \
     'lslocks --noheadings --notruncate --output PID,PATH' \
     'if [ "$lock_pid" = "$main_pid" ]; then' \
     'if ! main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"; then' \
@@ -923,7 +939,16 @@ validate_direct_lifecycle_contract() {
   for required in \
     'refusing gta-claw downgrade' \
     'validate_regular_or_absent /etc/gta-claw/gta-claw.env' \
-    'systemctl stop gta-claw-daemon.service' \
+    'ensure_failure_fence' \
+    'stop_runtime_for_replacement' \
+    'verify_runtime_stopped' \
+    'active | activating | reloading | deactivating)' \
+    'main_pid="$(systemctl show -P MainPID "$unit")"' \
+    'control_pid="$(systemctl show -P ControlPID "$unit")"' \
+    'lock_pid="$(lock_holder_pid)"' \
+    'replacement_fence=$runtime_directory/replacement-fenced' \
+    'stop_initializer_for_replacement' \
+    'fail_install_runtime' \
     '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
     '/usr/libexec/gta-claw/gta-claw-state-init' \
     '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
@@ -951,43 +976,101 @@ validate_direct_lifecycle_contract() {
   fi
 }
 
+validate_oci_manifest_digest() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]] ||
+    die "OCI manifest digest must be exactly 64 lowercase hexadecimal characters"
+}
+
+validate_oci_orchestration_templates() {
+  local compose="$1"
+  local kubernetes="$2"
+  local digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  assert_regular_file "$compose" "Compose orchestration template"
+  assert_regular_file "$kubernetes" "Kubernetes orchestration template"
+  python3 "$LINUX_DIR/tests/validate-orchestration.py" \
+    --template \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$compose" \
+    "$kubernetes"
+}
+
+render_oci_orchestration() {
+  local template="$1"
+  local output="$2"
+  local digest="$3"
+  local image
+  validate_oci_manifest_digest "$digest"
+  image="$LINUX_OCI_IMAGE_REPOSITORY@sha256:$digest"
+  open_output_file "$output" 0644
+  sed "s|@OCI_IMAGE_REFERENCE@|$image|g" "$template" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
+}
+
 validate_oci_orchestration_contract() {
   local compose="$1"
   local kubernetes="$2"
-  local required
-  [[ "$(sha256_file "$compose")" == \
-    "ccc36a0d038e6d90b8666b0cd39ed92422674aca239a050301f415bf9dc7d3fe" ]] ||
-    die "Compose orchestration differs from the exact reviewed two-phase contract"
-  [[ "$(sha256_file "$kubernetes")" == \
-    "4f74c28b28ee2a978dc07f7e7800de29237f2d361a4ed15f3ddd9b5e631f0e58" ]] ||
-    die "Kubernetes orchestration differs from the exact reviewed two-phase contract"
-  for required in \
-    'user: "0:0"' \
-    'user: "65532:65532"' \
-    '--prepare-linux-protected' \
-    'condition: service_completed_successfully' \
-    'gta-claw-state:/var/lib' \
-    'cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]'; do
-    grep -F -- "$required" "$compose" >/dev/null ||
-      die "Compose two-phase contract missing: $required"
+  local digest="$3"
+  validate_oci_manifest_digest "$digest"
+  python3 "$LINUX_DIR/tests/validate-orchestration.py" \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$compose" \
+    "$kubernetes"
+}
+
+validate_cri_fixture_templates() {
+  local digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  python3 "$LINUX_DIR/tests/validate-cri-fixtures.py" \
+    --template \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$1" \
+    "$2" \
+    "$3"
+}
+
+validate_cri_fixture_contract() {
+  local digest="$4"
+  validate_oci_manifest_digest "$digest"
+  python3 "$LINUX_DIR/tests/validate-cri-fixtures.py" \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$1" \
+    "$2" \
+    "$3"
+}
+
+reject_unexpected_rpm_scriptlets() {
+  local artifact="$1"
+  local unexpected_tag
+  local unexpected_script
+  local unexpected_program
+  local trigger_tag
+  for unexpected_tag in PRETRANS VERIFYSCRIPT; do
+    unexpected_script="$(rpm -qp --qf "%{$unexpected_tag}" "$artifact")"
+    [[ -z "$unexpected_script" || "$unexpected_script" == "(none)" ]] ||
+      die "RPM contains unexpected $unexpected_tag scriptlet"
+    unexpected_program="$(rpm -qp --qf "%{${unexpected_tag}PROG}" "$artifact")"
+    [[ -z "$unexpected_program" || "$unexpected_program" == "(none)" ]] ||
+      die "RPM contains an unexpected $unexpected_tag interpreter"
   done
-  for required in \
-    'initContainers:' \
-    'type: Recreate' \
-    '--prepare-linux-protected' \
-    'runAsUser: 0' \
-    'runAsUser: 65532' \
-    'runAsGroup: 65532' \
-    'readOnlyRootFilesystem: true' \
-    'mountPath: /var/lib' \
-    'add: [CHOWN, DAC_OVERRIDE, FOWNER]'; do
-    grep -F -- "$required" "$kubernetes" >/dev/null ||
-      die "Kubernetes two-phase contract missing: $required"
+  for trigger_tag in \
+    TRIGGERSCRIPTS \
+    TRIGGERCONDS \
+    TRIGGERNAME \
+    TRIGGERTYPE \
+    FILETRIGGERSCRIPTS \
+    FILETRIGGERCONDS \
+    FILETRIGGERNAME \
+    FILETRIGGERTYPE \
+    TRANSFILETRIGGERSCRIPTS \
+    TRANSFILETRIGGERCONDS \
+    TRANSFILETRIGGERNAME \
+    TRANSFILETRIGGERTYPE; do
+    [[ -z "$(rpm -qp --qf "[%{$trigger_tag}\n]" "$artifact")" ]] ||
+      die "RPM contains unexpected trigger metadata: $trigger_tag"
   done
-  if grep -Eq 'fsGroup|RollingUpdate|single[- ](stage|process)' \
-    "$compose" "$kubernetes"; then
-    die "OCI orchestration grants ownership mutation or claims single-process init"
-  fi
 }
 
 source "$LINUX_DIR/config.sh"

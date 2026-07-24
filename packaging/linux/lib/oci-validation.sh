@@ -284,12 +284,6 @@ validate_published_oci() {
     json \
     "$rootfs/usr/share/doc/gta-claw/package-toolchain.json" \
     >/dev/null
-  for orchestration in compose.yaml kubernetes.yaml; do
-    cmp -s \
-      "$LINUX_DIR/oci/$orchestration" \
-      "$rootfs/usr/share/doc/gta-claw/$orchestration" ||
-      die "published OCI orchestration differs from trusted source: $orchestration"
-  done
   [[ "$(sha256_file "$rootfs/usr/share/doc/gta-claw/build-manifest.json")" == \
     "$(sha256_file "$BUILD_MANIFEST")" ]] ||
     die "published OCI build manifest differs from authenticated build manifest"
@@ -404,9 +398,7 @@ validate_published_oci() {
         usr/share/doc/gta-claw/README.md \
         usr/share/doc/gta-claw/SHA256SUMS \
         usr/share/doc/gta-claw/build-manifest.json \
-        usr/share/doc/gta-claw/compose.yaml \
         usr/share/doc/gta-claw/gta-claw-daemon.socket.deferred \
-        usr/share/doc/gta-claw/kubernetes.yaml \
         usr/share/doc/gta-claw/package-toolchain.json \
         usr/share/doc/gta-claw/provenance.json \
         usr/share/doc/gta-claw/runtime-manifest.json \

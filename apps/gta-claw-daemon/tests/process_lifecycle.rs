@@ -1221,6 +1221,25 @@ fn assert_initializer_rejected(namespace: &Path, operation: &str) {
 }
 
 #[cfg(target_os = "linux")]
+fn assert_provisioner_rejected(namespace: &Path, operation: &str) {
+    let before = protected_namespace_snapshot(namespace);
+    let output = bounded_output(&mut provision_command(namespace), Duration::from_secs(10));
+    assert!(
+        !output.status.success(),
+        "{operation} unexpectedly passed offline provisioning"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "{operation} returned success-shaped stdout"
+    );
+    assert_eq!(
+        protected_namespace_snapshot(namespace),
+        before,
+        "{operation} mutated the rejected namespace"
+    );
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug, Eq, PartialEq)]
 struct ProtectedEntrySnapshot {
     name: OsString,
@@ -1805,6 +1824,24 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
         assert_eq!(repeated.stdout, b"AlreadyInitialized\n");
         assert_eq!(protected_identities(&fixture.namespace), identities);
         assert_eq!(protected_bytes(&fixture.namespace), bytes);
+    }
+
+    {
+        for (name, bytes, operation) in [
+            ("state.sqlite", b"partial-db".as_slice(), "partial database"),
+            ("state.sqlite-wal", b"partial-wal".as_slice(), "partial WAL"),
+            ("snapshot.selector", b"\0".as_slice(), "partial selector"),
+            (
+                "snapshot-1.meta",
+                b"unknown-marker".as_slice(),
+                "unknown initializer marker",
+            ),
+        ] {
+            let malformed = create_protected_fixture();
+            fs::write(malformed.namespace.join(name), bytes)
+                .unwrap_or_else(|error| panic!("write {operation} fixture: {error}"));
+            assert_provisioner_rejected(&malformed.namespace, operation);
+        }
     }
 
     {
@@ -2484,15 +2521,30 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
             .expect("start protected daemon for second-signal escalation");
         let mut child = ChildGuard(child);
         let stdout = child.0.stdout.take().expect("protected stdout is piped");
-        let stderr_lines =
+        let _stderr_lines =
             spawn_line_receiver(child.0.stderr.take().expect("protected stderr is piped"));
         let lines = read_lines_bounded(stdout, 2, Duration::from_secs(10))
             .expect("read protected readiness before escalation");
         assert_eq!(lines[0], "ready protocol=1\n");
-        deliver_consumed_signal(child.0.id(), "TERM", 15);
-        wait_for_lifecycle_phase(&stderr_lines, "shutdown-requested", Duration::from_secs(5));
-        let escalated_at = Instant::now();
+        signal(child.0.id(), "STOP");
+        wait_for_process_fact(
+            || process_is_stopped(child.0.id()),
+            Duration::from_secs(2),
+            "protected daemon did not stop before distinct queued signals",
+        );
         signal(child.0.id(), "TERM");
+        wait_for_process_fact(
+            || process_has_pending_signal(child.0.id(), 15),
+            Duration::from_secs(2),
+            "SIGTERM was not observably pending",
+        );
+        signal(child.0.id(), "INT");
+        wait_for_process_fact(
+            || process_has_pending_signal(child.0.id(), 2),
+            Duration::from_secs(2),
+            "SIGINT was not observably pending",
+        );
+        signal(child.0.id(), "CONT");
         let status = wait_for_exit(&mut child.0, Duration::from_secs(5));
         if status.is_none() {
             child
@@ -2502,7 +2554,6 @@ fn linux_protected_initializer_probe_and_serve_lifecycle() {
         }
         let status = status.expect("escalated shutdown is bounded");
         assert_eq!(status.code(), Some(2));
-        assert!(escalated_at.elapsed() < Duration::from_millis(450));
         let released = bounded_output(
             &mut protected_service_command(&escalated.namespace, true),
             Duration::from_secs(15),
