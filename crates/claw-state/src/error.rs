@@ -146,11 +146,11 @@ pub enum StateError {
         /// Existing destination.
         path: PathBuf,
     },
-    /// Snapshot publication completed but rollback could not restore a clean destination.
+    /// Publication reached visible bytes, but durability or rollback remains uncertain.
     PublicationUncertain {
-        /// Destination that may contain a published snapshot.
+        /// Publication target whose visible state may have changed.
         path: PathBuf,
-        /// Publication and rollback diagnostic.
+        /// Durability, finalization, or rollback diagnostic.
         reason: String,
     },
     /// Store shutdown completed with one or more durability or cleanup degradations.
@@ -244,11 +244,11 @@ pub enum StateError {
         /// Optional late cleanup degradation.
         cleanup: Option<String>,
     },
-    /// A write committed, but terminal connection cleanup degraded.
+    /// A write committed, but post-commit finalization or cleanup degraded.
     CommittedWithCleanupFailure {
         /// Write operation that became durable.
         operation: &'static str,
-        /// Terminal cleanup diagnostic.
+        /// Post-commit finalization or cleanup diagnostic.
         cleanup: String,
     },
     /// SQLite reported an error after durability became uncertain.
@@ -306,7 +306,9 @@ impl StateError {
             Self::CommittedAfterDeadline { .. } | Self::CommittedWithCleanupFailure { .. } => {
                 WriteOutcome::Committed
             }
-            Self::CommitOutcomeUncertain { .. } => WriteOutcome::Uncertain,
+            Self::PublicationUncertain { .. } | Self::CommitOutcomeUncertain { .. } => {
+                WriteOutcome::Uncertain
+            }
             Self::OperationCleanupFailed { primary, .. } => primary.write_outcome(),
             _ => WriteOutcome::NotCommitted,
         }
@@ -361,7 +363,7 @@ impl Display for StateError {
             Self::PublicationUncertain { path, reason } => {
                 write!(
                     formatter,
-                    "snapshot publication state is uncertain at {}: {reason}",
+                    "publication state is uncertain at {}: {reason}",
                     path.display()
                 )
             }
@@ -419,7 +421,7 @@ impl Display for StateError {
             Self::CommittedWithCleanupFailure { operation, cleanup } => {
                 write!(
                     formatter,
-                    "{operation} committed; terminal cleanup failed: {cleanup}"
+                    "{operation} committed; post-commit finalization failed: {cleanup}"
                 )
             }
             Self::CommitOutcomeUncertain {

@@ -90,6 +90,7 @@ enum OfflineInitializerTestStage {
     SelectorWrite,
     SelectorPartialWrite,
     SelectorSync,
+    SelectorParentSync,
     MarkerCleanup,
     FinalValidation,
     RollbackTruncate,
@@ -161,6 +162,12 @@ struct FileIdentity {
 enum NamespacePurpose {
     RuntimeService,
     OfflineRoot,
+}
+
+enum SelectorPublicationFailure {
+    Precommit(StateError),
+    Uncertain(StateError),
+    Committed(StateError),
 }
 
 impl FileIdentity {
@@ -1216,35 +1223,39 @@ impl ProtectedNamespace {
         Ok(())
     }
 
-    fn initialize_empty_selector(&self) -> Result<(), StateError> {
+    fn initialize_empty_selector(&self) -> Result<(), SelectorPublicationFailure> {
         let selector = &self.entries[SELECTOR_INDEX];
         let length = selector
             .file
             .metadata()
             .map_err(|error| {
-                file_error(
+                SelectorPublicationFailure::Precommit(file_error(
                     "inspect fresh LinuxProtected selector",
                     &selector.path,
                     error,
-                )
+                ))
             })?
             .len();
         if length > SELECTOR_LEN as u64 {
-            return Err(invalid_path(
+            return Err(SelectorPublicationFailure::Precommit(invalid_path(
                 &selector.path,
                 "prepared LinuxProtected selector exceeds its fixed commit length",
-            ));
+            )));
         }
-        let existing = self.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
+        let existing = self
+            .read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)
+            .map_err(SelectorPublicationFailure::Precommit)?;
         if existing.iter().any(|byte| *byte != 0) {
-            return Err(invalid_path(
+            return Err(SelectorPublicationFailure::Precommit(invalid_path(
                 &selector.path,
                 "prepared LinuxProtected selector contains nonzero bytes",
-            ));
+            )));
         }
-        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorData, &selector.path)?;
+        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorData, &selector.path)
+            .map_err(SelectorPublicationFailure::Precommit)?;
         let offset = usize::try_from(length).expect("bounded selector length fits usize");
-        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorWrite, &selector.path)?;
+        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorWrite, &selector.path)
+            .map_err(SelectorPublicationFailure::Precommit)?;
         if let Err(error) = fail_offline_initializer_stage(
             OfflineInitializerTestStage::SelectorPartialWrite,
             &selector.path,
@@ -1256,35 +1267,54 @@ impl ProtectedNamespace {
                 length,
             )
             .and_then(|()| selector.file.sync_all())
-            .map_err(|cleanup| StateError::OperationCleanupFailed {
-                operation: "inject partial LinuxProtected selector commit",
-                primary: Box::new(invalid_path(
-                    &selector.path,
-                    "injected private offline initializer stage failure",
-                )),
-                cleanup: cleanup.to_string(),
+            .map_err(|cleanup| {
+                SelectorPublicationFailure::Precommit(StateError::OperationCleanupFailed {
+                    operation: "inject partial LinuxProtected selector commit",
+                    primary: Box::new(invalid_path(
+                        &selector.path,
+                        "injected private offline initializer stage failure",
+                    )),
+                    cleanup: cleanup.to_string(),
+                })
             })?;
-            return Err(error);
+            return Err(SelectorPublicationFailure::Precommit(error));
         }
-        write_all_at(&selector.file, &[0_u8; SELECTOR_LEN][offset..], length).map_err(|error| {
-            file_error(
+        if let Err(error) = write_all_at(&selector.file, &[0_u8; SELECTOR_LEN][offset..], length) {
+            let primary = file_error(
                 "initialize fixed LinuxProtected selector",
                 &selector.path,
                 error,
-            )
-        })?;
-        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorSync, &selector.path)?;
+            );
+            let full_length = selector.file.metadata().map(|metadata| metadata.len());
+            return Err(match full_length {
+                Ok(length) if length < SELECTOR_LEN as u64 => {
+                    SelectorPublicationFailure::Precommit(primary)
+                }
+                _ => SelectorPublicationFailure::Uncertain(primary),
+            });
+        }
+        fail_offline_initializer_stage(OfflineInitializerTestStage::SelectorSync, &selector.path)
+            .map_err(SelectorPublicationFailure::Uncertain)?;
         selector.file.sync_all().map_err(|error| {
-            file_error("sync fixed LinuxProtected selector", &selector.path, error)
+            SelectorPublicationFailure::Uncertain(file_error(
+                "sync fixed LinuxProtected selector",
+                &selector.path,
+                error,
+            ))
         })?;
+        fail_offline_initializer_stage(
+            OfflineInitializerTestStage::SelectorParentSync,
+            &self.directory,
+        )
+        .map_err(SelectorPublicationFailure::Committed)?;
         self.parent.sync_all().map_err(|error| {
-            file_error(
+            SelectorPublicationFailure::Committed(file_error(
                 "sync LinuxProtected namespace after selector initialization",
                 &self.directory,
                 error,
-            )
+            ))
         })?;
-        validate_catalog_lengths(&self.entries)
+        validate_catalog_lengths(&self.entries).map_err(SelectorPublicationFailure::Committed)
     }
 
     fn wal_length(&self) -> Result<u64, StateError> {
@@ -4566,12 +4596,17 @@ fn finish_transitioned_fresh(
     if let Err(primary) = precommit {
         return Err(classify_prepared_failure(namespace, primary));
     }
-    if let Err(primary) = namespace.initialize_empty_selector() {
-        return Err(match namespace.recovery_fresh_state() {
-            Ok(OfflineNamespaceState::InitializedFresh | OfflineNamespaceState::Initialized) => {
-                classify_committed_initializer_failure(namespace, primary)
+    if let Err(failure) = namespace.initialize_empty_selector() {
+        return Err(match failure {
+            SelectorPublicationFailure::Precommit(primary) => {
+                classify_prepared_failure(namespace, primary)
             }
-            _ => classify_prepared_failure(namespace, primary),
+            SelectorPublicationFailure::Uncertain(primary) => {
+                selector_publication_uncertain(namespace, primary)
+            }
+            SelectorPublicationFailure::Committed(primary) => {
+                committed_initializer_cleanup(primary)
+            }
         });
     }
 
@@ -4606,38 +4641,47 @@ fn settle_initialized_fresh(
     deadline: Instant,
     timeout_ms: u64,
 ) -> Result<LinuxProtectedInitialization, StateError> {
-    let result = (|| {
-        namespace.verify_captured_identities(identities)?;
-        namespace.validate_prepared_fresh_sqlite(deadline, timeout_ms)?;
-        let selector = &namespace.entries[SELECTOR_INDEX];
-        let bytes = namespace.read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)?;
-        if bytes.len() != SELECTOR_LEN || bytes.iter().any(|byte| *byte != 0) {
-            return Err(invalid_path(
+    if let Err(primary) = namespace
+        .verify_captured_identities(identities)
+        .and_then(|()| namespace.validate_prepared_fresh_sqlite(deadline, timeout_ms))
+    {
+        return Err(selector_publication_uncertain(namespace, primary));
+    }
+    let selector = &namespace.entries[SELECTOR_INDEX];
+    let bytes = namespace
+        .read_entry(SELECTOR_INDEX, SELECTOR_LEN, None, None, 0)
+        .map_err(|primary| selector_publication_uncertain(namespace, primary))?;
+    if bytes.len() != SELECTOR_LEN || bytes.iter().any(|byte| *byte != 0) {
+        return Err(selector_publication_uncertain(
+            namespace,
+            invalid_path(
                 &selector.path,
                 "ambiguous LinuxProtected selector is not the exact commit value",
-            ));
-        }
-        selector.file.sync_all().map_err(|error| {
+            ),
+        ));
+    }
+    selector.file.sync_all().map_err(|error| {
+        selector_publication_uncertain(
+            namespace,
             file_error(
                 "settle ambiguous LinuxProtected selector durability",
                 &selector.path,
                 error,
-            )
-        })?;
-        namespace.parent.sync_all().map_err(|error| {
-            file_error(
-                "sync LinuxProtected namespace after selector settlement",
-                &namespace.directory,
-                error,
-            )
-        })?;
-        namespace.cleanup_prep_record()?;
-        namespace.validate_runtime_layout(deadline, timeout_ms)
-    })();
-    match result {
-        Ok(()) => Ok(LinuxProtectedInitialization::AlreadyInitialized),
-        Err(primary) => Err(classify_committed_initializer_failure(namespace, primary)),
-    }
+            ),
+        )
+    })?;
+    namespace.parent.sync_all().map_err(|error| {
+        committed_initializer_cleanup(file_error(
+            "sync LinuxProtected namespace after selector settlement",
+            &namespace.directory,
+            error,
+        ))
+    })?;
+    namespace
+        .cleanup_prep_record()
+        .and_then(|()| namespace.validate_runtime_layout(deadline, timeout_ms))
+        .map_err(committed_initializer_cleanup)?;
+    Ok(LinuxProtectedInitialization::AlreadyInitialized)
 }
 
 fn rollback_started_fresh(
@@ -4713,34 +4757,28 @@ fn classify_prepared_failure(namespace: &ProtectedNamespace, primary: StateError
 }
 
 fn classify_committed_initializer_failure(
+    _namespace: &ProtectedNamespace,
+    primary: StateError,
+) -> StateError {
+    committed_initializer_cleanup(primary)
+}
+
+fn selector_publication_uncertain(
     namespace: &ProtectedNamespace,
     primary: StateError,
 ) -> StateError {
-    match namespace.recovery_fresh_state() {
-        Ok(OfflineNamespaceState::Initialized | OfflineNamespaceState::InitializedFresh) => {
-            StateError::OperationCleanupFailed {
-            operation: "finalize committed LinuxProtected initialization",
-            primary: Box::new(primary),
-            cleanup:
-                "selector commit is visible as Initialized; rerun is idempotent and will report AlreadyInitialized"
-                    .to_owned(),
-        }
-        }
-        Ok(
-            OfflineNamespaceState::PreparingFresh
-            | OfflineNamespaceState::PreparedFresh
-            | OfflineNamespaceState::TransitionedFresh,
-        ) => primary,
-        Ok(OfflineNamespaceState::Fresh) => StateError::OperationCleanupFailed {
-            operation: "finalize committed LinuxProtected initialization",
-            primary: Box::new(primary),
-            cleanup: "selector commit unexpectedly reverted to Fresh".to_owned(),
-        },
-        Err(classification) => StateError::OperationCleanupFailed {
-            operation: "finalize committed LinuxProtected initialization",
-            primary: Box::new(primary),
-            cleanup: format!("selector commit outcome is unclassifiable: {classification}"),
-        },
+    StateError::PublicationUncertain {
+        path: namespace.selector_path().to_owned(),
+        reason: format!(
+            "selector reached its full visible value before durability was confirmed: {primary}"
+        ),
+    }
+}
+
+fn committed_initializer_cleanup(primary: StateError) -> StateError {
+    StateError::CommittedWithCleanupFailure {
+        operation: "initialize LinuxProtected state offline",
+        cleanup: primary.to_string(),
     }
 }
 
@@ -5925,6 +5963,7 @@ mod tests {
             OfflineInitializerTestStage::SelectorWrite,
             OfflineInitializerTestStage::SelectorPartialWrite,
             OfflineInitializerTestStage::SelectorSync,
+            OfflineInitializerTestStage::SelectorParentSync,
             OfflineInitializerTestStage::MarkerCleanup,
             OfflineInitializerTestStage::FinalValidation,
         ] {
@@ -5937,15 +5976,23 @@ mod tests {
                 SERVICE_GID,
             )
             .expect_err("scheduled initializer stage must fail");
-            if matches!(
+            if stage == OfflineInitializerTestStage::SelectorSync {
+                assert_eq!(error.write_outcome(), WriteOutcome::Uncertain);
+                assert!(
+                    matches!(error, StateError::PublicationUncertain { .. }),
+                    "SelectorSync must report publication uncertainty: {error:?}"
+                );
+                assert!(error.to_string().contains("durability was confirmed"));
+            } else if matches!(
                 stage,
-                OfflineInitializerTestStage::SelectorSync
+                OfflineInitializerTestStage::SelectorParentSync
                     | OfflineInitializerTestStage::MarkerCleanup
                     | OfflineInitializerTestStage::FinalValidation
             ) {
+                assert_eq!(error.write_outcome(), WriteOutcome::Committed);
                 assert!(
-                    matches!(error, StateError::OperationCleanupFailed { .. }),
-                    "{stage:?} must report a committed/uncertain outcome: {error:?}"
+                    matches!(error, StateError::CommittedWithCleanupFailure { .. }),
+                    "{stage:?} must report committed cleanup degradation: {error:?}"
                 );
             } else {
                 assert!(
@@ -5975,6 +6022,7 @@ mod tests {
             let expected = if matches!(
                 stage,
                 OfflineInitializerTestStage::SelectorSync
+                    | OfflineInitializerTestStage::SelectorParentSync
                     | OfflineInitializerTestStage::MarkerCleanup
                     | OfflineInitializerTestStage::FinalValidation
             ) {
@@ -7948,80 +7996,85 @@ mod tests {
 
     #[test]
     fn malformed_index_interior_child_field_rejects_without_panic() {
-        let temporary = tempfile::tempdir().expect("create malformed index fixture");
-        let database_path = temporary.path().join(DATABASE_NAME);
-        let wal_path = temporary.path().join(WAL_NAME);
-        let mut database_bytes = vec![0_u8; 3 * 4096];
-        let page = &mut database_bytes[4096..8192];
-        page[0] = 0x02;
-        page[3..5].copy_from_slice(&1_u16.to_be_bytes());
-        page[5..7].copy_from_slice(&4095_u16.to_be_bytes());
-        page[8..12].copy_from_slice(&3_u32.to_be_bytes());
-        page[12..14].copy_from_slice(&4095_u16.to_be_bytes());
-        page[4095] = 0xff;
-        fs::write(&database_path, &database_bytes).expect("write malformed index database");
-        fs::write(&wal_path, []).expect("write empty malformed index WAL");
-        let database_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&database_path)
-            .expect("open malformed index database");
-        let wal_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&wal_path)
-            .expect("open malformed index WAL");
-        let database_identity = FileIdentity::capture(
-            &database_path,
-            &database_file,
-            "capture malformed index database identity",
-        )
-        .expect("capture malformed index database identity");
-        let database_entry = HeldEntry {
-            name: DATABASE_NAME,
-            path: database_path.clone(),
-            file: database_file,
-            identity: database_identity,
-        };
-        let wal_entry = HeldEntry {
-            name: WAL_NAME,
-            path: wal_path,
-            identity: FileIdentity::capture(
-                &temporary.path().join(WAL_NAME),
-                &wal_file,
-                "capture malformed index WAL identity",
+        for cell_offset in [4093_u16, 4094, 4095] {
+            let temporary = tempfile::tempdir().expect("create malformed index fixture");
+            let database_path = temporary.path().join(DATABASE_NAME);
+            let wal_path = temporary.path().join(WAL_NAME);
+            let mut database_bytes = vec![0_u8; 3 * 4096];
+            let page = &mut database_bytes[4096..8192];
+            page[0] = 0x02;
+            page[3..5].copy_from_slice(&1_u16.to_be_bytes());
+            page[5..7].copy_from_slice(&cell_offset.to_be_bytes());
+            page[8..12].copy_from_slice(&3_u32.to_be_bytes());
+            page[12..14].copy_from_slice(&cell_offset.to_be_bytes());
+            page[usize::from(cell_offset)] = 0xff;
+            fs::write(&database_path, &database_bytes).expect("write malformed index database");
+            fs::write(&wal_path, []).expect("write empty malformed index WAL");
+            let database_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&database_path)
+                .expect("open malformed index database");
+            let wal_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .expect("open malformed index WAL");
+            let database_identity = FileIdentity::capture(
+                &database_path,
+                &database_file,
+                "capture malformed index database identity",
             )
-            .expect("capture malformed index WAL identity"),
-            file: wal_file,
-        };
-        let frames = HashMap::new();
-        let image = DatabaseImage {
-            database: &database_entry,
-            wal: &wal_entry,
-            wal_frames: &frames,
-            page_size: 4096,
-            usable_size: 4096,
-            physical_pages: 3,
-            logical_pages: 3,
-            cutoff: Instant::now() + Duration::from_secs(5),
-            timeout_ms: 5_000,
-        };
-        let mut claimed = HashSet::new();
-        let mut cells = 0;
-        let error = validate_index_btree(&image, 2, TEXT_ROWID_INDEX, &mut claimed, &mut cells)
-            .expect_err("malformed index child field must reject");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
-        let mut search_claimed = HashSet::new();
-        assert!(read_index_search_page(&image, 2, TEXT_ROWID_INDEX, &mut search_claimed).is_err());
-        assert_eq!(
-            fs::read(&database_path).expect("reread malformed index database"),
-            database_bytes
-        );
-        let after = fs::metadata(&database_path).expect("reinspect malformed index database");
-        assert_eq!(
-            (after.dev(), after.ino()),
-            (database_identity.device, database_identity.inode)
-        );
+            .expect("capture malformed index database identity");
+            let database_entry = HeldEntry {
+                name: DATABASE_NAME,
+                path: database_path.clone(),
+                file: database_file,
+                identity: database_identity,
+            };
+            let wal_entry = HeldEntry {
+                name: WAL_NAME,
+                path: wal_path,
+                identity: FileIdentity::capture(
+                    &temporary.path().join(WAL_NAME),
+                    &wal_file,
+                    "capture malformed index WAL identity",
+                )
+                .expect("capture malformed index WAL identity"),
+                file: wal_file,
+            };
+            let frames = HashMap::new();
+            let image = DatabaseImage {
+                database: &database_entry,
+                wal: &wal_entry,
+                wal_frames: &frames,
+                page_size: 4096,
+                usable_size: 4096,
+                physical_pages: 3,
+                logical_pages: 3,
+                cutoff: Instant::now() + Duration::from_secs(5),
+                timeout_ms: 5_000,
+            };
+            let mut claimed = HashSet::new();
+            let mut cells = 0;
+            let error = validate_index_btree(&image, 2, TEXT_ROWID_INDEX, &mut claimed, &mut cells)
+                .expect_err("malformed index child field must reject");
+            assert!(matches!(error, StateError::InvalidPath { .. }));
+            let mut search_claimed = HashSet::new();
+            let search_error =
+                read_index_search_page(&image, 2, TEXT_ROWID_INDEX, &mut search_claimed)
+                    .expect_err("malformed index search child field must reject");
+            assert!(matches!(search_error, StateError::InvalidPath { .. }));
+            assert_eq!(
+                fs::read(&database_path).expect("reread malformed index database"),
+                database_bytes
+            );
+            let after = fs::metadata(&database_path).expect("reinspect malformed index database");
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (database_identity.device, database_identity.inode)
+            );
+        }
     }
 
     #[test]
