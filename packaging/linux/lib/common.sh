@@ -66,7 +66,7 @@ validate_absolute_path() {
 
 canonical_target_root() {
   local repository
-  local target="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+  local target="${GTA_CLAW_TARGET_ROOT:-$REPO_ROOT/target}"
   local canonical
   if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
     "$SAFEIO_HELPER" check "$SAFEIO_TARGET_FD"
