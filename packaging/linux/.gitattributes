@@ -3,6 +3,9 @@
 Dockerfile* text eol=lf
 debian/* text eol=lf
 systemd/* text eol=lf
+libexec/* text eol=lf
+sysusers/* text eol=lf
+oci/* text eol=lf
 *.allowlist text eol=lf
 *.txt text eol=lf
 *.md text eol=lf

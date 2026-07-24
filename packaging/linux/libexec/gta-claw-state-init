@@ -1,0 +1,46 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+daemon=/usr/libexec/gta-claw/gta-claw-daemon
+namespace=/var/lib/gta-claw-protected
+
+if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
+  echo "gta-claw protected initialization requires real and effective UID 0" >&2
+  exit 1
+fi
+if [ ! -x "$daemon" ]; then
+  echo "gta-claw daemon is not executable: $daemon" >&2
+  exit 1
+fi
+
+service_uid="$(/usr/bin/id -u gta-claw)"
+primary_gid="$(/usr/bin/id -g gta-claw)"
+service_gid="$(getent group gta-claw | cut -d: -f3)"
+case "$service_uid:$service_gid" in
+  0:* | *:0 | *[!0-9:]* | :* | *:) {
+    echo "gta-claw service identity must have nonzero numeric UID and GID" >&2
+    exit 1
+  } ;;
+esac
+if [ "$primary_gid" != "$service_gid" ]; then
+  echo "gta-claw user primary GID does not match the named gta-claw group" >&2
+  exit 1
+fi
+
+"$daemon" \
+  --provision-linux-protected \
+  --state-path "$namespace" \
+  --service-uid "$service_uid" \
+  --service-gid "$service_gid"
+
+"$daemon" \
+  --initialize-linux-protected \
+  --state-path "$namespace" \
+  --service-uid "$service_uid" \
+  --service-gid "$service_gid"
+
+rm -f /run/gta-claw-initialization-failed

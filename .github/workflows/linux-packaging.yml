@@ -78,6 +78,16 @@ jobs:
               # intentionally use single quotes to prevent shell expansion.
               shellcheck -x -e SC1091,SC2016 "$script"
             done
+          for script in \
+            packaging/linux/debian/postinst \
+            packaging/linux/debian/postrm \
+            packaging/linux/debian/preinst.in \
+            packaging/linux/debian/prerm \
+            packaging/linux/libexec/gta-claw-runtime-ready \
+            packaging/linux/libexec/gta-claw-state-init; do
+            sh -n "$script"
+            shellcheck -x "$script"
+          done
           find packaging/linux -type f -name '*.py' -print0 |
             while IFS= read -r -d '' script; do
               python3 -c 'import sys; path = sys.argv[1]; compile(open(path, encoding="utf-8").read(), path, "exec")' "$script"
@@ -93,6 +103,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82  crates/claw-sqlite-file-control/Cargo.toml" |
+            sha256sum -c -
+          if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
+            crates/claw-sqlite-file-control/Cargo.toml; then
+            echo "protected SQLite file-control manifest exposes a test or raw-handle feature" >&2
+            exit 1
+          fi
           cargo metadata --locked --format-version 1 |
             jq -e '
               [.packages[].name |
@@ -293,6 +310,8 @@ jobs:
         run: |
           set -euo pipefail
           package="${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb"
+          state_dir="$RUNNER_TEMP/gta-claw-deb-state"
+          sudo install -d -o root -g 65532 -m 0750 "$state_dir"
           docker run --rm \
             --cap-drop ALL \
             --cap-add CHOWN \
@@ -301,6 +320,7 @@ jobs:
             --cap-add SETGID \
             --cap-add SETUID \
             --volume "$package:/tmp/gta-claw.deb:ro" \
+            --volume "$state_dir:/var/lib/gta-claw-protected" \
             debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df \
             bash -c '
               set -euo pipefail
@@ -316,12 +336,23 @@ jobs:
               rm -f /etc/apt/sources.list.d/*
               apt-get -o Acquire::Check-Valid-Until=false update
               apt-get -o Acquire::Check-Valid-Until=false install --no-install-recommends -y \
+                systemd
+              printf "%s\n" \
+                "g gta-claw 65532" \
+                "u gta-claw 65532:65532 \"GTA Claw service\" /nonexistent /usr/sbin/nologin" \
+                >/tmp/gta-claw-test.sysusers
+              systemd-sysusers /tmp/gta-claw-test.sysusers
+              apt-get -o Acquire::Check-Valid-Until=false install --no-install-recommends -y \
                 /tmp/gta-claw.deb
+              test "$(stat -c "%u:%g:%a" /var/lib/gta-claw-protected)" = "0:65532:750"
+              test "$(find /var/lib/gta-claw-protected -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
               /usr/bin/gta-claw-cli health | grep -F "healthy runtime="
               /usr/libexec/gta-claw/gta-claw-daemon --probe | grep -F "healthy runtime="
               apt-get remove -y gta-claw
               test ! -e /usr/libexec/gta-claw/gta-claw-daemon
+              test "$(find /var/lib/gta-claw-protected -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
             '
+          sudo rm -rf "$state_dir"
 
       - name: Verify systemd unit with packaged executable
         shell: bash
@@ -333,17 +364,26 @@ jobs:
           sudo install -D -m 0755 \
             "$build_root/$daemon" \
             /usr/libexec/gta-claw/gta-claw-daemon
-          systemd-analyze verify packaging/linux/systemd/gta-claw-daemon.service
+          sudo install -D -m 0755 \
+            packaging/linux/libexec/gta-claw-state-init \
+            /usr/libexec/gta-claw/gta-claw-state-init
+          systemd-analyze verify \
+            packaging/linux/systemd/gta-claw-state-init.service \
+            packaging/linux/systemd/gta-claw-daemon.service
           systemd-analyze security --offline=yes \
             packaging/linux/systemd/gta-claw-daemon.service |
             tee "$RUNNER_TEMP/systemd-security.txt"
           grep -F 'NoNewPrivileges=' "$RUNNER_TEMP/systemd-security.txt"
-          sudo rm -f /usr/libexec/gta-claw/gta-claw-daemon
+          sudo rm -f \
+            /usr/libexec/gta-claw/gta-claw-daemon \
+            /usr/libexec/gta-claw/gta-claw-state-init
 
       - name: Prove real Debian and RPM lifecycle
         shell: bash
         run: |
           ./packaging/linux/lifecycle-test.sh \
+            "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-linux-x86_64.tar.gz" \
+            "${{ steps.package.outputs.release2 }}/artifacts/gta-claw-0.1.0-linux-x86_64.tar.gz" \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb" \
             "${{ steps.package.outputs.release2 }}/artifacts/gta-claw_0.1.0-2_amd64.deb" \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-1.x86_64.rpm" \

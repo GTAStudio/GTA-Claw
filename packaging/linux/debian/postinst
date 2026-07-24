@@ -2,12 +2,31 @@
 
 set -e
 
+if [ "$1" = "configure" ]; then
+  if [ -z "${DPKG_ROOT:-}" ]; then
+    systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
+    /usr/libexec/gta-claw/gta-claw-state-init
+  fi
+fi
+
 if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] ||
   [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
   if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
     systemctl --system daemon-reload >/dev/null
-    if [ -n "${2:-}" ]; then
-      deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
+    if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&
+      [ ! -e /run/gta-claw-daemon.was-active ]; then
+      systemctl preset gta-claw-daemon.service >/dev/null
+    fi
+    if [ -e /run/gta-claw-daemon.was-active ]; then
+      systemctl reset-failed \
+        gta-claw-daemon.service \
+        gta-claw-state-init.service \
+        >/dev/null
+      deb-systemd-invoke restart gta-claw-daemon.service >/dev/null
+      /usr/libexec/gta-claw/gta-claw-runtime-ready
+      rm -f \
+        /run/gta-claw-daemon.ready-for-replacement \
+        /run/gta-claw-daemon.was-active
     fi
   fi
 fi

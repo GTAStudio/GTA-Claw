@@ -4655,6 +4655,183 @@ fn spawn_offline_initializer_reaper() -> Result<
     Ok((sender, reaper))
 }
 
+pub(crate) fn provision_offline(
+    directory: &Path,
+    service_uid: u32,
+    service_gid: u32,
+) -> Result<(), StateError> {
+    let spec = LinuxProtectedSpec::new(directory.to_owned(), service_uid, service_gid);
+    validate_root_credentials()?;
+    validate_spec(&spec)?;
+    validate_ancestors(directory)?;
+    validate_offline_ancestor_acls(directory)?;
+
+    let parent_path = directory
+        .parent()
+        .filter(|parent| *parent != directory)
+        .ok_or_else(|| invalid_path(directory, "LinuxProtected directory must have a parent"))?;
+    let name = directory
+        .file_name()
+        .ok_or_else(|| invalid_path(directory, "LinuxProtected directory must have a name"))?;
+    let provisioning_parent = rustix::fs::open(
+        parent_path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        file_error(
+            "open LinuxProtected provisioning parent",
+            parent_path,
+            error.into(),
+        )
+    })?;
+
+    let mut created_directory = false;
+    let protected_directory = match rustix::fs::openat(
+        &provisioning_parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(directory) => File::from(directory),
+        Err(error) if error == rustix::io::Errno::NOENT => {
+            validate_filesystem(directory, &provisioning_parent)?;
+            rustix::fs::mkdirat(
+                &provisioning_parent,
+                name,
+                rustix::fs::Mode::from_bits_truncate(0o750),
+            )
+            .map_err(|error| {
+                file_error("create LinuxProtected directory", directory, error.into())
+            })?;
+            created_directory = true;
+            rustix::fs::openat(
+                &provisioning_parent,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| {
+                file_error(
+                    "open created LinuxProtected directory",
+                    directory,
+                    error.into(),
+                )
+            })?
+        }
+        Err(error) => {
+            return Err(file_error(
+                "open LinuxProtected directory for provisioning",
+                directory,
+                error.into(),
+            ));
+        }
+    };
+
+    if created_directory {
+        rustix::fs::fchown(
+            &protected_directory,
+            Some(rustix::fs::Uid::ROOT),
+            Some(rustix::fs::Gid::from_raw(service_gid)),
+        )
+        .map_err(|error| {
+            file_error(
+                "set LinuxProtected directory ownership",
+                directory,
+                error.into(),
+            )
+        })?;
+        rustix::fs::fchmod(
+            &protected_directory,
+            rustix::fs::Mode::from_bits_truncate(0o750),
+        )
+        .map_err(|error| {
+            file_error("set LinuxProtected directory mode", directory, error.into())
+        })?;
+    }
+
+    let identity = FileIdentity::capture(
+        directory,
+        &protected_directory,
+        "inspect provisioned LinuxProtected directory",
+    )?;
+    validate_parent(&spec, &protected_directory, identity)?;
+    validate_filesystem(directory, &protected_directory)?;
+
+    let mut entries = std::fs::read_dir(directory).map_err(|error| {
+        file_error(
+            "enumerate provisioned LinuxProtected directory",
+            directory,
+            error,
+        )
+    })?;
+    let is_empty = entries
+        .next()
+        .transpose()
+        .map_err(|error| file_error("inspect provisioned LinuxProtected entry", directory, error))?
+        .is_none();
+    drop(entries);
+
+    if !is_empty {
+        drop(protected_directory);
+        ProtectedNamespace::open_for_offline_initialization(&spec)?;
+        return Ok(());
+    }
+
+    for name in ENTRY_NAMES {
+        let path = directory.join(name);
+        let entry = rustix::fs::openat(
+            &protected_directory,
+            name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+        )
+        .map(File::from)
+        .map_err(|error| file_error("create LinuxProtected entry", &path, error.into()))?;
+        rustix::fs::fchown(
+            &entry,
+            Some(rustix::fs::Uid::from_raw(service_uid)),
+            Some(rustix::fs::Gid::from_raw(service_gid)),
+        )
+        .map_err(|error| file_error("set LinuxProtected entry ownership", &path, error.into()))?;
+        rustix::fs::fchmod(&entry, rustix::fs::Mode::from_bits_truncate(0o600))
+            .map_err(|error| file_error("set LinuxProtected entry mode", &path, error.into()))?;
+        entry
+            .sync_all()
+            .map_err(|error| file_error("sync LinuxProtected entry", &path, error))?;
+    }
+    protected_directory
+        .sync_all()
+        .map_err(|error| file_error("sync LinuxProtected directory", directory, error))?;
+    if created_directory {
+        provisioning_parent.sync_all().map_err(|error| {
+            file_error(
+                "sync LinuxProtected provisioning parent",
+                parent_path,
+                error,
+            )
+        })?;
+    }
+    drop(protected_directory);
+    ProtectedNamespace::open_for_offline_initialization(&spec)?;
+    Ok(())
+}
+
 pub(crate) fn initialize_offline(
     directory: &Path,
     service_uid: u32,
@@ -4692,6 +4869,7 @@ pub(crate) fn initialize_offline(
             check_initializer_deadline(deadline, timeout_ms)?;
             return Ok(LinuxProtectedInitialization::AlreadyInitialized);
         }
+
         OfflineNamespaceState::InitializedFresh => {
             return settle_initialized_fresh(&namespace, identities, deadline, timeout_ms);
         }
@@ -5327,10 +5505,14 @@ fn wait_at_protected_io_test_gate(directory: &Path, stage: u8) {
 }
 
 fn validate_spec(spec: &LinuxProtectedSpec) -> Result<(), StateError> {
-    if spec.expected_uid == 0 || spec.expected_gid == 0 {
+    if spec.expected_uid == 0
+        || spec.expected_gid == 0
+        || spec.expected_uid == u32::MAX
+        || spec.expected_gid == u32::MAX
+    {
         return Err(invalid_path(
             &spec.directory,
-            "LinuxProtected service UID and GID must both be nonzero",
+            "LinuxProtected service UID and GID must both be valid nonzero Unix IDs",
         ));
     }
     if !spec.directory.is_absolute() {

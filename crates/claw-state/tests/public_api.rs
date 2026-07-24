@@ -11,6 +11,7 @@ use std::{
 use claw_state::{
     LinuxProtectedInitialization, ProtectedSnapshotReceipt, StateError, StateErrorKind,
     StateProfile, StateStore, StoreConfig, SynchronousPolicy, initialize_linux_protected_offline,
+    prepare_linux_protected_offline, provision_linux_protected_offline,
 };
 
 fn existing_store_config_surface_still_compiles(path: &Path) -> StoreConfig {
@@ -42,8 +43,11 @@ fn protected_store_methods_still_compile(store: &StateStore) {
 }
 
 fn protected_initializer_surface_still_compiles(namespace: &Path) {
+    let _: Result<(), StateError> = provision_linux_protected_offline(namespace, 65_534, 65_534);
     let _: Result<LinuxProtectedInitialization, StateError> =
         initialize_linux_protected_offline(namespace, 65_534, 65_534);
+    let _: Result<LinuxProtectedInitialization, StateError> =
+        prepare_linux_protected_offline(namespace, 65_534, 65_534);
 }
 
 #[cfg(target_os = "linux")]
@@ -120,6 +124,17 @@ async fn linux_protected_open_is_explicitly_unsupported_off_linux() {
 #[test]
 fn linux_protected_initializer_is_explicitly_unsupported_off_linux() {
     let namespace = std::env::temp_dir().join("gta-claw-linux-protected-init-unsupported");
+    let error = provision_linux_protected_offline(&namespace, 65_534, 65_534)
+        .expect_err("LinuxProtected provisioning must fail off Linux");
+    assert!(matches!(
+        &error,
+        StateError::InvalidValue {
+            field: "state platform",
+            reason: "offline LinuxProtected provisioning requires Linux",
+        }
+    ));
+    assert_eq!(error.kind(), StateErrorKind::UnsupportedPlatform);
+
     let error = initialize_linux_protected_offline(namespace, 65_534, 65_534)
         .expect_err("LinuxProtected initialization must fail off Linux");
     assert!(matches!(

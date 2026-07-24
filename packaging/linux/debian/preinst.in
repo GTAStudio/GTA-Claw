@@ -1,0 +1,54 @@
+#!/bin/sh
+
+set -eu
+
+new_version='@PACKAGE_VERSION@'
+
+assert_unit_inactive() {
+  unit="$1"
+  active_state="$(systemctl show -P ActiveState "$unit")"
+  main_pid="$(systemctl show -P MainPID "$unit")"
+  control_pid="$(systemctl show -P ControlPID "$unit")"
+  if { [ "$active_state" != inactive ] && [ "$active_state" != failed ]; } ||
+    [ "$main_pid" != 0 ] ||
+    [ "$control_pid" != 0 ]; then
+    echo "$unit is not in a process-free inactive state" >&2
+    exit 1
+  fi
+}
+
+case "$1" in
+  install | upgrade)
+    old_version="${2:-}"
+    if [ -n "$old_version" ] &&
+      dpkg --compare-versions "$old_version" gt "$new_version"; then
+      echo "refusing gta-claw downgrade from $old_version to $new_version" >&2
+      exit 1
+    fi
+    if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+      if ! daemon_load="$(systemctl show -P LoadState gta-claw-daemon.service 2>/dev/null)"; then
+        daemon_load=not-found
+      fi
+      if [ "$daemon_load" != not-found ]; then
+        daemon_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+        daemon_main="$(systemctl show -P MainPID gta-claw-daemon.service)"
+        daemon_control="$(systemctl show -P ControlPID gta-claw-daemon.service)"
+        if { [ "$daemon_state" != inactive ] && [ "$daemon_state" != failed ]; } ||
+          [ "$daemon_main" != 0 ] || [ "$daemon_control" != 0 ]; then
+          touch /run/gta-claw-daemon.was-active
+        fi
+        deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
+        assert_unit_inactive gta-claw-daemon.service
+      fi
+      if ! init_load="$(systemctl show -P LoadState gta-claw-state-init.service 2>/dev/null)"; then
+        init_load=not-found
+      fi
+      if [ "$init_load" != not-found ]; then
+        deb-systemd-invoke stop gta-claw-state-init.service >/dev/null
+        assert_unit_inactive gta-claw-state-init.service
+      fi
+    fi
+    ;;
+esac
+
+exit 0

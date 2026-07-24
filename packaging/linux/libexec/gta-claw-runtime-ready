@@ -1,0 +1,79 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+lock=/var/lib/gta-claw-protected/state.writer.lock
+ready_marker=/run/gta-claw-daemon.ready-for-replacement
+
+stop_unready_daemon() {
+  trap - EXIT HUP INT TERM
+  reason="$1"
+  if ! rm -f "$ready_marker"; then
+    echo "gta-claw readiness marker cleanup failed" >&2
+  fi
+  echo "$reason" >&2
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after readiness failure" >&2
+  fi
+  if ! active_state="$(systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null)"; then
+    active_state=unknown
+  fi
+  if ! main_pid="$(systemctl show -P MainPID gta-claw-daemon.service 2>/dev/null)"; then
+    main_pid=unknown
+  fi
+  if ! control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service 2>/dev/null)"; then
+    control_pid=unknown
+  fi
+  if { [ "$active_state" != inactive ] && [ "$active_state" != failed ]; } ||
+    [ "$main_pid" != 0 ] ||
+    [ "$control_pid" != 0 ]; then
+    echo "gta-claw daemon did not reach a process-free inactive state" >&2
+  fi
+  exit 1
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
+readiness_exit() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    stop_unready_daemon "gta-claw readiness inspection aborted"
+  fi
+}
+
+trap 'readiness_exit' EXIT
+trap 'stop_unready_daemon "gta-claw readiness inspection interrupted"' HUP INT TERM
+rm -f "$ready_marker"
+attempt=0
+while [ "$attempt" -lt 150 ]; do
+  if ! systemctl is-active --quiet gta-claw-daemon.service; then
+    stop_unready_daemon "gta-claw daemon became inactive before readiness"
+  fi
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  case "$main_pid" in
+    '' | 0 | *[!0-9]*)
+      stop_unready_daemon "gta-claw daemon has no valid MainPID"
+      ;;
+  esac
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    stop_unready_daemon "gta-claw writer-lock ownership could not be inspected"
+  fi
+  lock_pid="$(
+    printf '%s\n' "$locks" |
+      awk -v path="$lock" '$2 == path { print $1; exit }'
+  )"
+  if [ "$lock_pid" = "$main_pid" ]; then
+    touch "$ready_marker"
+    trap - EXIT HUP INT TERM
+    exit 0
+  fi
+  if [ -n "$lock_pid" ]; then
+    stop_unready_daemon "gta-claw writer lock is held by a different process"
+  fi
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+
+stop_unready_daemon "gta-claw daemon did not own the writer lock before the readiness deadline"

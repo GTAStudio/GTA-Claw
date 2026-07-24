@@ -798,7 +798,19 @@ validate_service_contract() {
   local service="$1"
   local required
   for required in \
-    'DynamicUser=yes' \
+    'Requires=gta-claw-state-init.service' \
+    'After=local-fs.target gta-claw-state-init.service' \
+    'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
+    'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-initialization-failed' \
+    'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
+    'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
+    'Type=notify' \
+    'NotifyAccess=main' \
+    'TimeoutStartSec=60s' \
+    'User=gta-claw' \
+    'Group=gta-claw' \
+    'SupplementaryGroups=' \
+    'ReadWritePaths=/var/lib/gta-claw-protected' \
     'NoNewPrivileges=yes' \
     'PrivateTmp=yes' \
     'PrivateDevices=yes' \
@@ -806,19 +818,161 @@ validate_service_contract() {
     'ProtectHome=yes' \
     'ProtectKernelTunables=yes' \
     'ProtectControlGroups=yes' \
-    'CapabilityBoundingSet=' \
+    'CapabilityBoundingSet=CAP_SETGID CAP_SETPCAP CAP_SETUID' \
     'RestrictAddressFamilies=AF_UNIX' \
     'IPAddressDeny=any' \
-    'SystemCallFilter=@system-service' \
+    'SystemCallFilter=@system-service setgroups setresgid setresuid' \
     'LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf'; do
     grep -Fx "$required" "$service" >/dev/null ||
       die "service hardening contract missing: $required"
   done
+  if grep -Eq '^(DynamicUser|StateDirectory)=' "$service"; then
+    die "runtime service grants dynamic identity or state-directory mutation authority"
+  fi
   if grep -Eiq 'Environment=.*(token|secret|password|private.?key)=' "$service"; then
     die "service embeds a secret-like environment literal"
   fi
-  if grep -Eq '^ExecStart=.*--(listen|socket|config|state|log)' "$service"; then
+  if grep -Eq '^ExecStart=.*--(listen|socket|config|log)' "$service"; then
     die "service invents a daemon runtime flag"
+  fi
+}
+
+validate_initializer_service_contract() {
+  local service="$1"
+  local required
+  for required in \
+    'After=local-fs.target systemd-sysusers.service' \
+    'Before=gta-claw-daemon.service' \
+    'RequiresMountsFor=/var/lib' \
+    'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-state-init' \
+    'StartLimitIntervalSec=0' \
+    'Type=oneshot' \
+    'User=root' \
+    'Group=root' \
+    'ExecStart=/usr/libexec/gta-claw/gta-claw-state-init' \
+    'RemainAfterExit=yes' \
+    'ReadWritePaths=/var/lib' \
+    'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER' \
+    'NoNewPrivileges=yes' \
+    'ProtectSystem=strict' \
+    'IPAddressDeny=any'; do
+    grep -Fx "$required" "$service" >/dev/null ||
+      die "initializer service contract missing: $required"
+  done
+}
+
+validate_sysusers_contract() {
+  local config="$1"
+  local expected
+  expected="$(
+    printf '%s\n' \
+      'g gta-claw -' \
+      'u gta-claw - "GTA Claw service" /nonexistent /usr/sbin/nologin'
+  )"
+  [[ "$(cat "$config")" == "$expected" ]] ||
+    die "sysusers contract must define only the locked gta-claw user and group"
+}
+
+validate_initializer_wrapper_contract() {
+  local wrapper="$1"
+  local required
+  for required in \
+    'namespace=/var/lib/gta-claw-protected' \
+    'service_gid="$(getent group gta-claw | cut -d: -f3)"' \
+    'if [ "$primary_gid" != "$service_gid" ]; then' \
+    '--provision-linux-protected' \
+    '--initialize-linux-protected' \
+    '--state-path "$namespace"' \
+    '--service-uid "$service_uid"' \
+    '--service-gid "$service_gid"'; do
+    grep -F -- "$required" "$wrapper" >/dev/null ||
+      die "initializer wrapper contract missing: $required"
+  done
+  if grep -Eq \
+    '(^|[[:space:]])(rm|unlink|mv|ln|chmod|chown)([[:space:]].*)?gta-claw-protected' \
+    "$wrapper"; then
+    die "initializer wrapper contains directory-entry repair logic"
+  fi
+}
+
+validate_runtime_ready_contract() {
+  local wrapper="$1"
+  local required
+  for required in \
+    'lock=/var/lib/gta-claw-protected/state.writer.lock' \
+    'ready_marker=/run/gta-claw-daemon.ready-for-replacement' \
+    'systemctl is-active --quiet gta-claw-daemon.service' \
+    'main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"' \
+    'lslocks --noheadings --notruncate --output PID,PATH' \
+    'if [ "$lock_pid" = "$main_pid" ]; then' \
+    'trap '\''stop_unready_daemon "gta-claw readiness inspection interrupted"'\'' HUP INT TERM'; do
+    grep -F -- "$required" "$wrapper" >/dev/null ||
+      die "runtime readiness contract missing: $required"
+  done
+}
+
+validate_direct_lifecycle_contract() {
+  local installer="$1"
+  local uninstaller="$2"
+  local required
+  for required in \
+    'refusing gta-claw downgrade' \
+    'validate_regular_or_absent /etc/gta-claw/gta-claw.env' \
+    'systemctl stop gta-claw-daemon.service' \
+    '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
+    '/usr/libexec/gta-claw/gta-claw-state-init' \
+    '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
+    'systemctl restart gta-claw-daemon.service'; do
+    grep -F -- "$required" "$installer" >/dev/null ||
+      die "direct installer lifecycle contract missing: $required"
+  done
+  grep -F 'preserved /var/lib/gta-claw-protected' "$uninstaller" >/dev/null ||
+    die "direct uninstaller does not declare protected-state preservation"
+  grep -F 'systemctl disable gta-claw-daemon.service' "$uninstaller" >/dev/null ||
+    die "direct uninstaller does not disable only after an explicit stop"
+  if grep -Eq 'rm .*gta-claw-protected|rm -[^[:space:]]*r.*gta-claw-protected' \
+    "$installer" "$uninstaller"; then
+    die "direct lifecycle scripts remove protected state"
+  fi
+  if grep -F 'systemctl disable --now' "$uninstaller" >/dev/null; then
+    die "direct uninstaller disables before proving the runtime stopped"
+  fi
+}
+
+validate_oci_orchestration_contract() {
+  local compose="$1"
+  local kubernetes="$2"
+  local required
+  python3 \
+    "$LINUX_DIR/tests/validate-orchestration.py" \
+    "$compose" \
+    "$kubernetes" ||
+    die "OCI orchestration semantic contract is invalid"
+  for required in \
+    'user: "0:0"' \
+    '--prepare-linux-protected' \
+    'condition: service_completed_successfully' \
+    'gta-claw-state:/var/lib' \
+    'cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]'; do
+    grep -F -- "$required" "$compose" >/dev/null ||
+      die "Compose two-phase contract missing: $required"
+  done
+  for required in \
+    'initContainers:' \
+    'type: Recreate' \
+    '--prepare-linux-protected' \
+    'runAsUser: 0' \
+    'runAsUser: 65532' \
+    'runAsGroup: 65532' \
+    'readOnlyRootFilesystem: true' \
+    'mountPath: /var/lib' \
+    'add: [CHOWN, DAC_OVERRIDE, FOWNER]'; do
+    grep -F -- "$required" "$kubernetes" >/dev/null ||
+      die "Kubernetes two-phase contract missing: $required"
+  done
+  if grep -Eq 'fsGroup|RollingUpdate|single[- ](stage|process)' \
+    "$compose" "$kubernetes"; then
+    die "OCI orchestration grants ownership mutation or claims single-process init"
   fi
 }
 

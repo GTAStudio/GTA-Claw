@@ -2,9 +2,29 @@
 
 set -e
 
+assert_unit_inactive() {
+  unit="$1"
+  active_state="$(systemctl show -P ActiveState "$unit")"
+  main_pid="$(systemctl show -P MainPID "$unit")"
+  control_pid="$(systemctl show -P ControlPID "$unit")"
+  if { [ "$active_state" != inactive ] && [ "$active_state" != failed ]; } ||
+    [ "$main_pid" != 0 ] ||
+    [ "$control_pid" != 0 ]; then
+    echo "$unit is not in a process-free inactive state" >&2
+    exit 1
+  fi
+}
+
 if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   [ -d /run/systemd/system ]; then
   deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
+  assert_unit_inactive gta-claw-daemon.service
+  deb-systemd-invoke stop gta-claw-state-init.service >/dev/null
+  assert_unit_inactive gta-claw-state-init.service
+  systemctl disable gta-claw-daemon.service >/dev/null
+  rm -f \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.was-active
 fi
 
 exit 0

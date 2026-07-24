@@ -12,6 +12,13 @@ require_linux
 for tool in gcc jq patchelf python3 readelf sha256sum tar; do
   require_tool "$tool"
 done
+[[ "$(sha256_file "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml")" == \
+  "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82" ]] ||
+  die "protected SQLite file-control manifest hash changed"
+if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
+  "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml"; then
+  die "protected SQLite file-control manifest exposes a test or raw-handle feature"
+fi
 initialize_output_root
 work="$OUTPUT_ROOT/tests"
 ensure_output_directory "$work"
@@ -223,16 +230,49 @@ expect_failure forbidden-runtime \
 
 cp "$SCRIPT_DIR/systemd/gta-claw-daemon.service" "$work/service-good"
 grep -v '^NoNewPrivileges=yes$' "$work/service-good" >"$work/service-weakened"
+grep -v '^User=gta-claw$' "$work/service-good" >"$work/service-dynamic"
 expect_success hardened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-good'"
 expect_failure weakened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-weakened'"
+expect_failure missing-static-user \
+  bash -c "source '$common'; validate_service_contract '$work/service-dynamic'"
 {
   cat "$work/service-good"
   printf 'Environment=API_TOKEN=plaintext\n'
 } >"$work/service-secret"
 expect_failure environment-secret \
   bash -c "source '$common'; validate_service_contract '$work/service-secret'"
+expect_success hardened-initializer-service \
+  bash -c "source '$common'; validate_initializer_service_contract '$SCRIPT_DIR/systemd/gta-claw-state-init.service'"
+expect_success static-sysusers \
+  bash -c "source '$common'; validate_sysusers_contract '$SCRIPT_DIR/sysusers/gta-claw.conf'"
+expect_success nonrepairing-initializer-wrapper \
+  bash -c "source '$common'; validate_initializer_wrapper_contract '$SCRIPT_DIR/libexec/gta-claw-state-init'"
+expect_success runtime-readiness-wrapper \
+  bash -c "source '$common'; validate_runtime_ready_contract '$SCRIPT_DIR/libexec/gta-claw-runtime-ready'"
+expect_success direct-lifecycle \
+  bash -c "source '$common'; validate_direct_lifecycle_contract '$SCRIPT_DIR/direct/install.sh' '$SCRIPT_DIR/direct/uninstall.sh'"
+expect_success oci-two-phase-orchestration \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+sed \
+  's/^    type: Recreate$/    # type: Recreate/' \
+  "$SCRIPT_DIR/oci/kubernetes.yaml" \
+  >"$work/kubernetes-comment-only.yaml"
+expect_failure kubernetes-comment-only-recreate \
+  python3 \
+  "$SCRIPT_DIR/tests/validate-orchestration.py" \
+  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/kubernetes-comment-only.yaml"
+sed \
+  's/^        condition: service_completed_successfully$/        # condition: service_completed_successfully/' \
+  "$SCRIPT_DIR/oci/compose.yaml" \
+  >"$work/compose-comment-only-condition.yaml"
+expect_failure compose-comment-only-condition \
+  python3 \
+  "$SCRIPT_DIR/tests/validate-orchestration.py" \
+  "$work/compose-comment-only-condition.yaml" \
+  "$SCRIPT_DIR/oci/kubernetes.yaml"
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish

@@ -43,6 +43,12 @@ verify_sha256_manifest "$artifact_dir" "$artifact_dir/SHA256SUMS"
 validate_archive_entries "$tar_artifact" gzip
 tar -tzf "$tar_artifact" | grep -Fx "$base_name/bin/$LINUX_DAEMON_NAME" >/dev/null
 tar -tzf "$tar_artifact" | grep -Fx "$base_name/bin/$LINUX_CLI_NAME" >/dev/null
+tar -tzf "$tar_artifact" | grep -Fx "$base_name/install.sh" >/dev/null
+tar -tzf "$tar_artifact" | grep -Fx "$base_name/uninstall.sh" >/dev/null
+tar -tzf "$tar_artifact" |
+  grep -Fx "$base_name/lib/systemd/system/gta-claw-state-init.service" >/dev/null
+tar -tzf "$tar_artifact" |
+  grep -Fx "$base_name/lib/sysusers.d/gta-claw.conf" >/dev/null
 tar -tzf "$tar_artifact" | grep -Fx "$base_name/provenance.json" >/dev/null
 tar -tzf "$tar_artifact" | grep -Fx "$base_name/sbom.spdx.json" >/dev/null
 tar -tzf "$tar_artifact" |
@@ -55,11 +61,25 @@ if tar --numeric-owner -tvzf "$tar_artifact" |
   awk '$2 != "0/0" { bad = 1 } END { exit !bad }'; then
   die "native archive contains non-root ownership"
 fi
+archive_root="$work_dir/archive/$base_name"
+validate_direct_lifecycle_contract \
+  "$archive_root/install.sh" \
+  "$archive_root/uninstall.sh"
+validate_service_contract \
+  "$archive_root/lib/systemd/system/gta-claw-daemon.service"
+validate_initializer_service_contract \
+  "$archive_root/lib/systemd/system/gta-claw-state-init.service"
+validate_sysusers_contract "$archive_root/lib/sysusers.d/gta-claw.conf"
+validate_initializer_wrapper_contract "$archive_root/libexec/gta-claw-state-init"
+validate_runtime_ready_contract "$archive_root/libexec/gta-claw-runtime-ready"
+[[ "$(stat -c '%a' "$archive_root/install.sh")" == "755" &&
+  "$(stat -c '%a' "$archive_root/uninstall.sh")" == "755" ]] ||
+  die "direct lifecycle scripts are not executable"
 
 [[ "$(dpkg-deb --field "$deb_artifact" Architecture)" == "$deb_architecture" ]] ||
   die "Debian architecture mismatch"
 [[ "$(dpkg-deb --field "$deb_artifact" Depends)" == \
-  "libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249)" ]] ||
+  "libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249), util-linux" ]] ||
   die "Debian dependencies do not match ELF-derived requirements"
 deb_contents="$(dpkg-deb --contents "$deb_artifact")"
 grep -F './usr/bin/gta-claw-cli' <<<"$deb_contents" >/dev/null
@@ -68,16 +88,27 @@ if grep -E '\./(var/(lib|cache|log)|run)/gta-claw/?$' <<<"$deb_contents"; then
   die "Debian package owns a systemd-managed runtime directory"
 fi
 deb_control_listing="$(dpkg-deb --ctrl-tarfile "$deb_artifact" | tar -tf - | LC_ALL=C sort)"
-for control_file in control conffiles md5sums postinst prerm postrm; do
+for control_file in control conffiles md5sums preinst postinst prerm postrm; do
   grep -Eq "(^|/)$control_file$" <<<"$deb_control_listing" ||
     die "Debian control archive is missing $control_file"
 done
 for script in postinst prerm postrm; do
-  cmp -s \
-    "$LINUX_DIR/debian/$script" \
+  cmp -s "$LINUX_DIR/debian/$script" \
     <(dpkg-deb --ctrl-tarfile "$deb_artifact" | tar -xOf - "./$script") ||
-    die "Debian maintainer script differs from reviewed source: $script"
-  if grep -Eq '\|\|[[:space:]]*(true|:)' "$LINUX_DIR/debian/$script"; then
+      die "Debian maintainer script differs from reviewed source: $script"
+done
+cmp -s \
+  <(
+    sed \
+      "s/@PACKAGE_VERSION@/$VERSION-$LINUX_PACKAGE_RELEASE/g" \
+      "$LINUX_DIR/debian/preinst.in"
+  ) \
+  <(dpkg-deb --ctrl-tarfile "$deb_artifact" | tar -xOf - ./preinst) ||
+  die "Debian preinst differs from reviewed template"
+for script in preinst postinst prerm postrm; do
+  extracted_script="$work_dir/deb-$script"
+  dpkg-deb --ctrl-tarfile "$deb_artifact" | tar -xOf - "./$script" >"$extracted_script"
+  if grep -Eq '\|\|[[:space:]]*(true|:)' "$extracted_script"; then
     die "Debian maintainer script swallows a lifecycle failure: $script"
   fi
 done
@@ -107,13 +138,26 @@ if rpm -qpl "$rpm_artifact" | grep -E '^/(var/(lib|cache|log)|run)/gta-claw/?$';
 fi
 rpm -qp --requires "$rpm_artifact" | grep -Fx "glibc >= $BUILD_GLIBC_REQUIREMENT" >/dev/null ||
   die "RPM glibc dependency does not match ELF-derived requirement"
+rpm -qp --requires "$rpm_artifact" | grep -Fx "util-linux" >/dev/null ||
+  die "RPM does not require the setpriv provider"
 rpm_scripts="$(rpm -qp --scripts "$rpm_artifact")"
 for contract in \
   'systemctl daemon-reload' \
   'systemctl preset gta-claw-daemon.service' \
   'systemctl restart gta-claw-daemon.service' \
+  'systemctl stop gta-claw-daemon.service' \
+  '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
+  '/usr/libexec/gta-claw/gta-claw-state-init' \
+  '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
+  'refusing gta-claw downgrade' \
+  'installed_versions=' \
+  'while IFS= read -r installed_version' \
+  '/run/gta-claw-daemon.replacement' \
+  '/run/gta-claw-daemon.ready-for-replacement' \
+  '/run/gta-claw-daemon.old-removal-succeeded' \
+  '/run/gta-claw-initialization-failed' \
   'systemctl is-active --quiet gta-claw-daemon.service' \
-  'systemctl disable --now gta-claw-daemon.service'; do
+  'systemctl disable gta-claw-daemon.service'; do
   grep -F "$contract" <<<"$rpm_scripts" >/dev/null ||
     die "RPM lifecycle script contract missing: $contract"
 done
@@ -161,10 +205,22 @@ jq -e \
 validate_elf_binary "$rootfs/usr/bin/$LINUX_CLI_NAME" "$arch"
 validate_elf_binary "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME" "$arch"
 validate_service_contract "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service"
+validate_initializer_service_contract \
+  "$rootfs/usr/lib/systemd/system/gta-claw-state-init.service"
+validate_sysusers_contract "$rootfs/usr/lib/sysusers.d/gta-claw.conf"
+validate_initializer_wrapper_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+validate_runtime_ready_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
+[[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-state-init")" == "755" ]] ||
+  die "initializer wrapper mode is not 0755"
+[[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready")" == "755" ]] ||
+  die "runtime readiness wrapper mode is not 0755"
 [[ ! -e "$rootfs/usr/lib/systemd/system/gta-claw-daemon.socket" ]] ||
   die "unsupported socket unit was installed"
 [[ "$(cat "$rootfs/usr/lib/systemd/system-preset/80-gta-claw.preset")" == \
-  "disable gta-claw-daemon.service" ]] || die "systemd preset contract mismatch"
+  $'disable gta-claw-daemon.service\ndisable gta-claw-state-init.service' ]] ||
+  die "systemd preset contract mismatch"
 [[ "$(stat -c '%a' "$rootfs/etc/gta-claw/gta-claw.env")" == "640" ]] ||
   die "environment file mode is not 0640"
 [[ "$(stat -c '%a' "$rootfs/etc/gta-claw/credentials/daemon.conf")" == "600" ]] ||

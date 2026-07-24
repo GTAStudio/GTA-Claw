@@ -7,22 +7,57 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in dpkg rpm systemctl; do
+for tool in dpkg flock rpm sha256sum systemctl tar; do
   require_tool "$tool"
 done
-[[ "$#" -eq 4 ]] ||
-  die "usage: lifecycle-test.sh DEB_RELEASE_1 DEB_RELEASE_2 RPM_RELEASE_1 RPM_RELEASE_2"
-deb1="$1"
-deb2="$2"
-rpm1="$3"
-rpm2="$4"
-for package in "$deb1" "$deb2" "$rpm1" "$rpm2"; do
+[[ "$#" -eq 6 ]] ||
+  die "usage: lifecycle-test.sh TAR_RELEASE_1 TAR_RELEASE_2 DEB_RELEASE_1 DEB_RELEASE_2 RPM_RELEASE_1 RPM_RELEASE_2"
+tar1="$1"
+tar2="$2"
+deb1="$3"
+deb2="$4"
+rpm1="$5"
+rpm2="$6"
+for package in "$tar1" "$tar2" "$deb1" "$deb2" "$rpm1" "$rpm2"; do
   assert_regular_unaliased "$package" "lifecycle package"
 done
 [[ "$(ps -p 1 -o comm= | tr -d ' ')" == "systemd" ]] ||
   die "lifecycle test requires systemd as PID 1"
 
+namespace=/var/lib/gta-claw-protected
+expected_names="$(
+  printf '%s\n' \
+    snapshot-0.meta \
+    snapshot-0.sqlite \
+    snapshot-1.meta \
+    snapshot-1.sqlite \
+    snapshot.selector \
+    state.sqlite \
+    state.sqlite-wal \
+    state.writer.lock
+)"
+direct_root="$(mktemp -d)"
+policy_installed=0
+
+install_policy_denial() {
+  local denied_action="$1"
+  [[ ! -e /usr/sbin/policy-rc.d && ! -L /usr/sbin/policy-rc.d ]] ||
+    die "lifecycle test will not replace an existing policy-rc.d"
+  printf '#!/bin/sh\n[ "${2:-}" = "%s" ] && exit 101\nexit 0\n' "$denied_action" |
+    sudo tee /usr/sbin/policy-rc.d >/dev/null
+  sudo chmod 0755 /usr/sbin/policy-rc.d
+  policy_installed=1
+}
+
+remove_policy_denial() {
+  if [[ "$policy_installed" -eq 1 ]]; then
+    sudo rm -f /usr/sbin/policy-rc.d
+    policy_installed=0
+  fi
+}
+
 cleanup() {
+  remove_policy_denial
   sudo rm -rf /etc/systemd/system/gta-claw-daemon.service.d
   sudo systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1 || true
   if dpkg-query -W gta-claw >/dev/null 2>&1; then
@@ -32,26 +67,134 @@ cleanup() {
     sudo rpm -e --nodeps gta-claw >/dev/null 2>&1 || true
   fi
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -rf "$direct_root"
 }
 trap cleanup EXIT INT TERM
 cleanup
+direct_root="$(mktemp -d)"
+[[ ! -e "$namespace" && ! -L "$namespace" ]] ||
+  die "lifecycle test requires an absent protected namespace"
 
 assert_disabled_and_inactive() {
   local state
   state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
-  [[ "$state" != "enabled" ]] || die "service was enabled on fresh package install"
+  [[ "$state" != "enabled" ]] || die "service was enabled on fresh install"
   ! systemctl is-active --quiet gta-claw-daemon.service ||
-    die "service was started on fresh package install"
+    die "service was started on fresh install"
+}
+
+assert_protected_contract() {
+  local service_gid
+  local service_uid
+  local actual_names
+  local name
+  service_uid="$(id -u gta-claw)"
+  service_gid="$(id -g gta-claw)"
+  [[ "$service_uid" =~ ^[1-9][0-9]*$ && "$service_gid" =~ ^[1-9][0-9]*$ ]] ||
+    die "static gta-claw identity is invalid"
+  [[ "$(sudo stat -c '%u:%g:%a' "$namespace")" == "0:$service_gid:750" ]] ||
+    die "protected namespace ownership or mode is invalid"
+  [[ -d "$namespace" && ! -L "$namespace" ]] ||
+    die "protected namespace is not a physical directory"
+  actual_names="$(
+    sudo find "$namespace" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+      LC_ALL=C sort
+  )"
+  [[ "$actual_names" == "$expected_names" ]] ||
+    die "protected namespace does not contain exactly the eight fixed names"
+  for name in $expected_names; do
+    path="$namespace/$name"
+    [[ -f "$path" && ! -L "$path" ]] ||
+      die "protected entry is not a physical regular file: $name"
+    [[ "$(sudo stat -c '%u:%g:%a:%h' "$path")" == \
+      "$service_uid:$service_gid:600:1" ]] ||
+      die "protected entry ownership, mode, or link count is invalid: $name"
+    sudo -u gta-claw test -w "$path" ||
+      die "service identity cannot write held file: $name"
+  done
+  sudo -u gta-claw test ! -w "$namespace" ||
+    die "service identity has directory-entry mutation authority"
+}
+
+state_snapshot() {
+  local name
+  sudo stat -c 'parent:%d:%i:%u:%g:%a' "$namespace"
+  for name in $expected_names; do
+    sudo stat -c "$name:%d:%i:%u:%g:%a:%h:%s" "$namespace/$name"
+    sudo sha256sum "$namespace/$name"
+  done
+}
+
+state_identity_snapshot() {
+  local name
+  sudo stat -c 'parent:%d:%i:%u:%g:%a' "$namespace"
+  for name in $expected_names; do
+    sudo stat -c "$name:%d:%i:%u:%g:%a:%h" "$namespace/$name"
+  done
+}
+
+assert_preserved() {
+  local expected="$1"
+  assert_protected_contract
+  [[ "$(state_snapshot)" == "$expected" ]] ||
+    die "ordinary removal changed protected state"
+}
+
+assert_identity_preserved() {
+  local expected="$1"
+  assert_protected_contract
+  [[ "$(state_identity_snapshot)" == "$expected" ]] ||
+    die "active removal replaced or deleted protected state entries"
+}
+
+reset_test_namespace() {
+  assert_protected_contract
+  ! systemctl is-active --quiet gta-claw-daemon.service ||
+    die "refusing fixture purge while daemon is active"
+  sudo rm -rf -- "$namespace"
+  [[ ! -e "$namespace" && ! -L "$namespace" ]] ||
+    die "test fixture namespace purge failed"
 }
 
 assert_active_restart() {
   local old_pid="$1"
   local new_pid
   systemctl is-active --quiet gta-claw-daemon.service ||
-    die "service is not active after package upgrade"
+    die "service is not active after replacement"
+  wait_for_writer_lock
   new_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
   [[ "$new_pid" =~ ^[1-9][0-9]*$ && "$new_pid" != "$old_pid" ]] ||
-    die "active service was not restarted during package upgrade"
+    die "active service was not restarted during replacement"
+}
+
+wait_for_writer_lock() {
+  local deadline=$((SECONDS + 15))
+  local status
+  while :; do
+    set +e
+    sudo -u gta-claw \
+      flock --conflict-exit-code 75 -n "$namespace/state.writer.lock" true
+    status=$?
+    set -e
+    case "$status" in
+      0)
+        ((SECONDS < deadline)) ||
+          die "runtime did not acquire the protected writer lock"
+        sleep 0.05
+        ;;
+      75) return 0 ;;
+      *) die "writer-lock probe failed with status $status" ;;
+    esac
+  done
+}
+
+assert_live_initializer_rejected() {
+  wait_for_writer_lock
+  if sudo /usr/libexec/gta-claw/gta-claw-state-init >/dev/null 2>&1; then
+    die "root initializer succeeded while the runtime held the writer lock"
+  fi
+  systemctl is-active --quiet gta-claw-daemon.service ||
+    die "live-contention check disturbed the runtime"
 }
 
 install_failure_dropin() {
@@ -69,29 +212,136 @@ remove_failure_dropin() {
   sudo systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 || true
 }
 
+mkdir "$direct_root/release1" "$direct_root/release2"
+tar -xzf "$tar1" -C "$direct_root/release1"
+tar -xzf "$tar2" -C "$direct_root/release2"
+direct1="$(find "$direct_root/release1" -mindepth 1 -maxdepth 1 -type d)"
+direct2="$(find "$direct_root/release2" -mindepth 1 -maxdepth 1 -type d)"
+sudo "$direct1/install.sh"
+assert_disabled_and_inactive
+assert_protected_contract
+static_identity="$(id -u gta-claw):$(id -g gta-claw)"
+sudo systemctl enable --now gta-claw-daemon.service
+assert_live_initializer_rejected
+direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo mv /etc/gta-claw/gta-claw.env /etc/gta-claw/gta-claw.env.saved
+sudo ln -s /nonexistent/gta-claw.env /etc/gta-claw/gta-claw.env
+if sudo "$direct1/install.sh"; then
+  die "direct deployment accepted a symlinked configuration destination"
+fi
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct configuration preflight stopped the active service"
+[[ "$(systemctl show -P MainPID gta-claw-daemon.service)" == "$direct_pid" ]] ||
+  die "direct configuration preflight restarted the active service"
+sudo rm /etc/gta-claw/gta-claw.env
+sudo mv /etc/gta-claw/gta-claw.env.saved /etc/gta-claw/gta-claw.env
+sudo "$direct1/install.sh"
+assert_active_restart "$direct_pid"
+direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo "$direct2/install.sh"
+assert_active_restart "$direct_pid"
+if sudo "$direct1/install.sh"; then
+  die "direct deployment accepted a downgrade"
+fi
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "rejected direct downgrade disturbed the active service"
+install_failure_dropin Service 'ExecStartPre=/bin/false'
+if sudo "$direct2/install.sh"; then
+  die "direct deployment swallowed a package-triggered restart failure"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct restart failure left the service active"
+remove_failure_dropin
+sudo systemctl start gta-claw-daemon.service
+wait_for_writer_lock
+sudo touch /run/gta-claw-daemon.was-active
+sudo systemctl stop gta-claw-daemon.service
+sudo touch "$namespace/state.sqlite-shm"
+if sudo "$direct2/install.sh"; then
+  die "direct deployment started after failed protected initialization"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct failed initialization left the service active"
+sudo rm "$namespace/state.sqlite-shm"
+sudo "$direct2/install.sh"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct retry did not resume the previously active service"
+wait_for_writer_lock
+install_failure_dropin Unit 'RefuseManualStop=yes'
+if sudo "$direct2/uninstall.sh"; then
+  die "direct removal swallowed an intentional stop failure"
+fi
+[[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "direct removal unlinked the daemon after stop failure"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct stop failure did not leave the daemon active"
+remove_failure_dropin
+direct_snapshot="$(state_identity_snapshot)"
+sudo "$direct2/uninstall.sh"
+assert_identity_preserved "$direct_snapshot"
+[[ ! -e /usr/libexec/gta-claw/gta-claw-daemon &&
+  ! -e /usr/lib/systemd/system/gta-claw-daemon.service ]] ||
+  die "direct removal left package-owned executable or unit"
+[[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
+  die "direct removal changed the static service identity"
+reset_test_namespace
+
+sudo "$direct1/install.sh"
+assert_disabled_and_inactive
+sudo "$direct2/install.sh"
+assert_disabled_and_inactive
+direct_inactive_snapshot="$(state_snapshot)"
+sudo "$direct2/uninstall.sh"
+assert_preserved "$direct_inactive_snapshot"
+reset_test_namespace
+
 sudo dpkg -i "$deb1"
 assert_disabled_and_inactive
+assert_protected_contract
+[[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
+  die "Debian install changed the static service identity"
+sudo systemctl enable --now gta-claw-daemon.service
+assert_live_initializer_rejected
+deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo dpkg -i "$deb1"
+assert_active_restart "$deb_pid"
+deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo dpkg -i "$deb2"
+assert_active_restart "$deb_pid"
+if sudo dpkg -i --force-downgrade "$deb1"; then
+  die "Debian package accepted a downgrade"
+fi
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "rejected Debian downgrade disturbed the active service"
+install_policy_denial restart
+if sudo dpkg -i "$deb2"; then
+  die "Debian replacement ignored a policy-denied restart"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "policy-denied Debian restart left the service active"
+remove_policy_denial
+sudo dpkg --configure gta-claw
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian restart recovery did not resume the service"
+wait_for_writer_lock
+sudo touch /run/gta-claw-daemon.was-active
+sudo systemctl stop gta-claw-daemon.service
+sudo touch "$namespace/state.sqlite-shm"
+if sudo dpkg -i "$deb2"; then
+  die "Debian reinstall swallowed protected initialization failure"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian failed initialization restarted the service"
+sudo rm "$namespace/state.sqlite-shm"
+sudo dpkg -i "$deb2"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian re-unpack retry did not preserve prior active state"
+sudo systemctl stop gta-claw-daemon.service
 install_failure_dropin Service 'ExecStartPre=/bin/false'
 if sudo systemctl start gta-claw-daemon.service; then
   die "intentional Debian start failure unexpectedly succeeded"
 fi
 remove_failure_dropin
-sudo systemctl enable --now gta-claw-daemon.service
-deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
-install_failure_dropin Service 'ExecStartPre=/bin/false'
-if sudo dpkg -i "$deb2"; then
-  die "Debian upgrade swallowed an intentional restart failure"
-fi
-[[ "$(dpkg-query -W -f='${Status}' gta-claw)" != "install ok installed" ]] ||
-  die "Debian package reported configured after restart failure"
-remove_failure_dropin
-sudo systemctl start gta-claw-daemon.service
-sudo dpkg --configure gta-claw
-assert_active_restart "$deb_pid"
-sudo systemctl stop gta-claw-daemon.service
-sudo dpkg -i --force-downgrade "$deb1"
-! systemctl is-active --quiet gta-claw-daemon.service ||
-  die "inactive service was started during Debian package replacement"
 sudo systemctl start gta-claw-daemon.service
 install_failure_dropin Unit 'RefuseManualStop=yes'
 if sudo dpkg --remove gta-claw; then
@@ -100,59 +350,138 @@ fi
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "Debian removal unlinked the daemon after stop failure"
 remove_failure_dropin
-sudo systemctl start gta-claw-daemon.service
+install_policy_denial stop
+if sudo dpkg --remove gta-claw; then
+  die "Debian removal ignored a policy-denied stop"
+fi
+[[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "policy-denied Debian removal unlinked the daemon"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "policy-denied Debian stop did not leave the daemon active"
+remove_policy_denial
+deb_snapshot="$(state_identity_snapshot)"
 sudo dpkg --remove gta-claw
-! systemctl is-active --quiet gta-claw-daemon.service ||
-  die "Debian removal left the daemon active"
-[[ ! -e /usr/libexec/gta-claw/gta-claw-daemon &&
-  ! -e /usr/lib/systemd/system/gta-claw-daemon.service ]] ||
-  die "Debian removal left package-owned executable or unit"
+assert_identity_preserved "$deb_snapshot"
 sudo dpkg --purge gta-claw
+assert_identity_preserved "$deb_snapshot"
+[[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
+  die "Debian removal changed the static service identity"
+reset_test_namespace
+
+sudo dpkg -i "$deb1"
+assert_disabled_and_inactive
+sudo dpkg -i "$deb2"
+assert_disabled_and_inactive
+deb_inactive_snapshot="$(state_snapshot)"
+sudo dpkg --remove gta-claw
+assert_preserved "$deb_inactive_snapshot"
+sudo dpkg --purge gta-claw
+assert_preserved "$deb_inactive_snapshot"
+reset_test_namespace
 
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
-install_failure_dropin Service 'ExecStartPre=/bin/false'
-if sudo systemctl start gta-claw-daemon.service; then
-  die "intentional RPM start failure unexpectedly succeeded"
-fi
-remove_failure_dropin
+assert_protected_contract
+[[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
+  die "RPM install changed the static service identity"
 sudo systemctl enable --now gta-claw-daemon.service
+assert_live_initializer_rejected
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm1"
+assert_active_restart "$rpm_pid"
+rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo rm /usr/lib/systemd/system/gta-claw-state-init.service
+sudo systemctl daemon-reload
+sudo rpm -Uvh --nodeps "$rpm2"
+assert_active_restart "$rpm_pid"
+if sudo rpm -Uvh --nodeps --oldpackage "$rpm1"; then
+  die "RPM package accepted a downgrade"
+fi
+[[ ! -e /run/gta-claw-daemon.replacement ]] ||
+  die "rejected RPM downgrade left a stale replacement marker"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "rejected RPM downgrade disturbed the active service"
 install_failure_dropin Service 'ExecStartPre=/bin/false'
-if sudo rpm -Uvh --nodeps "$rpm2"; then
-  die "RPM upgrade swallowed an intentional restart failure"
+if sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"; then
+  die "RPM replacement swallowed a package-triggered restart failure"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM restart failure left the service active"
+[[ "$(rpm -q gta-claw | wc -l)" -gt 1 ]] ||
+  die "RPM restart failure did not exercise the multi-instance guard"
+if sudo rpm -Uvh --nodeps --oldpackage "$rpm1"; then
+  die "RPM multi-instance state accepted a downgrade"
 fi
 remove_failure_dropin
-sudo systemctl start gta-claw-daemon.service
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
-assert_active_restart "$rpm_pid"
+[[ "$(rpm -q gta-claw | wc -l)" -eq 1 ]] ||
+  die "RPM restart recovery left duplicate package instances"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM restart retry did not preserve prior active state"
+wait_for_writer_lock
+sudo touch /run/gta-claw-daemon.was-active
 sudo systemctl stop gta-claw-daemon.service
-sudo rpm -Uvh --nodeps --oldpackage "$rpm1"
+sudo touch "$namespace/state.sqlite-journal"
+set +e
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+rpm_init_status=$?
+set -e
 ! systemctl is-active --quiet gta-claw-daemon.service ||
-  die "inactive service was started during RPM replacement"
-sudo systemctl start gta-claw-daemon.service
+  die "RPM failed initialization restarted the service"
+[[ -e /run/gta-claw-initialization-failed ]] ||
+  die "RPM failed initialization left no durable failure marker"
+if [[ "$rpm_init_status" -eq 0 ]]; then
+  echo "RPM reported failed %post as a warning; runtime remained fenced" >&2
+fi
+sudo rm "$namespace/state.sqlite-journal"
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+[[ "$(rpm -q gta-claw | wc -l)" -eq 1 ]] ||
+  die "RPM failed-init recovery left duplicate package instances"
+[[ ! -e /run/gta-claw-initialization-failed ]] ||
+  die "RPM recovery did not clear the initialization failure marker"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM init retry did not preserve prior active state"
+wait_for_writer_lock
 install_failure_dropin Unit 'RefuseManualStop=yes'
 if sudo rpm -e --nodeps gta-claw; then
   die "RPM removal swallowed an intentional stop failure"
 fi
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "RPM removal unlinked daemon after stop failure"
-systemctl is-active --quiet gta-claw-daemon.service ||
-  die "RPM removal stopped daemon despite refused stop"
 remove_failure_dropin
-sudo rpm -Uvh \
-  --nodeps \
-  --oldpackage \
-  --replacefiles \
-  --replacepkgs \
-  "$rpm1"
-sudo systemctl start gta-claw-daemon.service
+rpm_snapshot="$(state_identity_snapshot)"
 sudo rpm -e --nodeps gta-claw
-! systemctl is-active --quiet gta-claw-daemon.service ||
-  die "RPM removal left the daemon active"
-[[ ! -e /usr/libexec/gta-claw/gta-claw-daemon &&
-  ! -e /usr/lib/systemd/system/gta-claw-daemon.service ]] ||
-  die "RPM removal left package-owned executable or unit"
+assert_identity_preserved "$rpm_snapshot"
+[[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
+  die "RPM removal changed the static service identity"
+reset_test_namespace
+
+sudo rpm -ivh --nodeps "$rpm1"
+assert_disabled_and_inactive
+sudo rpm -Uvh --nodeps "$rpm2"
+assert_disabled_and_inactive
+rpm_inactive_snapshot="$(state_snapshot)"
+sudo rpm -e --nodeps gta-claw
+assert_preserved "$rpm_inactive_snapshot"
+reset_test_namespace
+
+sudo rpm -ivh --nodeps "$rpm1"
+sudo systemctl enable --now gta-claw-daemon.service
+wait_for_writer_lock
+install_failure_dropin Service 'ExecStartPre=/bin/false'
+if sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"; then
+  die "RPM failed-replacement removal fixture unexpectedly succeeded"
+fi
+remove_failure_dropin
+[[ "$(rpm -q gta-claw | wc -l)" -gt 1 ]] ||
+  die "RPM failed-replacement removal fixture has no duplicate instances"
+rpm_failed_snapshot="$(state_snapshot)"
+sudo rpm -e --nodeps --allmatches gta-claw
+assert_preserved "$rpm_failed_snapshot"
+[[ ! -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "RPM allmatches removal left the failed replacement installed"
+reset_test_namespace
 
 trap - EXIT INT TERM
-echo "Debian and RPM install/start/upgrade/remove lifecycle tests passed"
+rm -rf "$direct_root"
+echo "Tar, Debian, and RPM LinuxProtected lifecycle tests passed"

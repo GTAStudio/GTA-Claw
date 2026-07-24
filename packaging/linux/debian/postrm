@@ -9,6 +9,7 @@ fi
 
 if [ "$1" = "purge" ] && [ -x /usr/bin/deb-systemd-helper ]; then
   deb-systemd-helper purge gta-claw-daemon.service >/dev/null
+  deb-systemd-helper purge gta-claw-state-init.service >/dev/null
 fi
 
 exit 0
