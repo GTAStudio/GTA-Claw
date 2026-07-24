@@ -4726,11 +4726,24 @@ fn settle_failed_fresh_transition(
     may_rollback: bool,
 ) -> StateError {
     match namespace.recovery_fresh_state() {
+        // Exact-Fresh provenance permits discarding this invocation's own precommit handoff.
+        Ok(OfflineNamespaceState::TransitionedFresh) if may_rollback => {
+            match namespace.restore_exact_fresh(identities) {
+                Ok(()) => primary,
+                Err(rollback) => StateError::OperationCleanupFailed {
+                    operation: "restore failed LinuxProtected fresh initialization",
+                    primary: Box::new(primary),
+                    cleanup: format!(
+                        "post-transition state classified as TransitionedFresh and authorized exact fresh rollback; exact fresh rollback failed: {rollback}"
+                    ),
+                },
+            }
+        }
+        Ok(OfflineNamespaceState::TransitionedFresh) => primary,
         Ok(
             OfflineNamespaceState::Fresh
             | OfflineNamespaceState::PreparingFresh
             | OfflineNamespaceState::PreparedFresh
-            | OfflineNamespaceState::TransitionedFresh
             | OfflineNamespaceState::InitializedFresh
             | OfflineNamespaceState::Initialized,
         ) => primary,
@@ -6001,10 +6014,25 @@ mod tests {
                 let StateError::PublicationUncertain { path, reason } = &error else {
                     panic!("SelectorSync must report publication uncertainty: {error:?}");
                 };
-                assert_eq!(path, &fixture.namespace.join(SELECTOR_NAME));
-                assert!(reason.contains("durability was confirmed"));
-                assert!(reason.contains(stage.failure_reason()));
-                assert!(error.to_string().contains("publication state is uncertain"));
+                let fault_path = fixture.namespace.join(SELECTOR_NAME);
+                let primary = invalid_path(&fault_path, stage.failure_reason());
+                let expected_reason = format!(
+                    "selector reached its full visible value before durability was confirmed: {primary}"
+                );
+                let expected_error = StateError::PublicationUncertain {
+                    path: fault_path.clone(),
+                    reason: expected_reason.clone(),
+                };
+                assert_eq!(path, &fault_path);
+                assert_eq!(reason, &expected_reason);
+                assert_eq!(error, expected_error);
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "publication state is uncertain at {}: {expected_reason}",
+                        fault_path.display()
+                    )
+                );
             } else if matches!(
                 stage,
                 OfflineInitializerTestStage::SelectorParentSync
@@ -6015,12 +6043,30 @@ mod tests {
                 let StateError::CommittedWithCleanupFailure { operation, cleanup } = &error else {
                     panic!("{stage:?} must report committed cleanup degradation: {error:?}");
                 };
+                let fault_path = match stage {
+                    OfflineInitializerTestStage::SelectorParentSync => fixture.namespace.clone(),
+                    OfflineInitializerTestStage::MarkerCleanup => {
+                        fixture.namespace.join(SNAPSHOT_METADATA_NAMES[1])
+                    }
+                    OfflineInitializerTestStage::FinalValidation => {
+                        fixture.namespace.join(DATABASE_NAME)
+                    }
+                    _ => unreachable!("post-sync diagnostic stage is exhaustively matched"),
+                };
+                let expected_cleanup =
+                    invalid_path(&fault_path, stage.failure_reason()).to_string();
+                let expected_error = StateError::CommittedWithCleanupFailure {
+                    operation: "initialize LinuxProtected state offline",
+                    cleanup: expected_cleanup.clone(),
+                };
                 assert_eq!(*operation, "initialize LinuxProtected state offline");
-                assert!(cleanup.contains(stage.failure_reason()));
-                assert!(
-                    error
-                        .to_string()
-                        .contains("post-commit finalization failed")
+                assert_eq!(cleanup, &expected_cleanup);
+                assert_eq!(error, expected_error);
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "initialize LinuxProtected state offline committed; post-commit finalization failed: {expected_cleanup}"
+                    )
                 );
             } else {
                 assert!(
@@ -6131,13 +6177,56 @@ mod tests {
         }
 
         let rollback_entry = fresh_root_fixture();
-        schedule_offline_initializer_fault(OfflineInitializerTestStage::DeathAfterPrep);
-        crate::initialize_linux_protected_offline(
+        let identities = entry_identities(&rollback_entry.namespace);
+        let database_path = rollback_entry.namespace.join(DATABASE_NAME);
+        schedule_offline_initializer_faults(&[
+            OfflineInitializerTestStage::Transition,
+            OfflineInitializerTestStage::RollbackEntrySyncFailure,
+        ]);
+        let error = crate::initialize_linux_protected_offline(
             &rollback_entry.namespace,
             SERVICE_UID,
             SERVICE_GID,
         )
-        .expect_err("death-after-prep fixture must stop after durable prep");
+        .expect_err("post-transition rollback sync failure must remain explicit");
+        let StateError::OperationCleanupFailed {
+            operation,
+            primary,
+            cleanup,
+        } = &error
+        else {
+            panic!("entry sync failure must degrade production rollback: {error:?}");
+        };
+        let expected_primary = invalid_path(
+            &database_path,
+            OfflineInitializerTestStage::Transition.failure_reason(),
+        );
+        let expected_rollback = invalid_path(
+            &database_path,
+            OfflineInitializerTestStage::RollbackEntrySyncFailure.failure_reason(),
+        );
+        let expected_cleanup = format!(
+            "post-transition state classified as TransitionedFresh and authorized exact fresh rollback; exact fresh rollback failed: {expected_rollback}"
+        );
+        assert_eq!(
+            *operation,
+            "restore failed LinuxProtected fresh initialization"
+        );
+        assert_eq!(primary.as_ref(), &expected_primary);
+        assert_eq!(cleanup, &expected_cleanup);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{expected_primary}; restore failed LinuxProtected fresh initialization cleanup failed: {expected_cleanup}"
+            )
+        );
+        assert!(
+            OFFLINE_INITIALIZER_TEST_FAULT
+                .lock()
+                .expect("offline initializer fault schedule lock poisoned")
+                .is_empty(),
+            "production classifier did not route the post-transition failure through rollback"
+        );
         let spec =
             LinuxProtectedSpec::new(rollback_entry.namespace.clone(), SERVICE_UID, SERVICE_GID);
         let preflight =
@@ -6146,56 +6235,26 @@ mod tests {
             .expect("lock rollback-entry fixture");
         let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)
             .expect("hold rollback-entry namespace");
-        let captured = namespace.captured_identities();
-        let identities = entry_identities(&rollback_entry.namespace);
         let expected_prep = namespace.initializer_prep_record();
         assert_eq!(
-            fs::read(rollback_entry.namespace.join(SNAPSHOT_METADATA_NAMES[1]))
-                .expect("read durable rollback prep record"),
-            expected_prep,
-            "rollback fixture requires exact durable prep bytes"
-        );
-        let database_path = rollback_entry.namespace.join(DATABASE_NAME);
-        let database = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&database_path)
-            .expect("open rollback sentinel database");
-        write_all_at(&database, b"rollback-sentinel", 0)
-            .and_then(|()| database.sync_all())
-            .expect("durably populate rollback nonmarker sentinel");
-        assert_eq!(
-            fs::read(&database_path).expect("read rollback nonmarker sentinel"),
-            b"rollback-sentinel"
-        );
-        schedule_offline_initializer_fault(OfflineInitializerTestStage::RollbackEntrySyncFailure);
-        let error = rollback_started_fresh(
-            &namespace,
-            captured,
-            invalid_path(&database_path, "injected post-prep primary failure"),
-        );
-        assert!(
-            matches!(error, StateError::OperationCleanupFailed { .. }),
-            "entry sync failure must degrade rollback: {error:?}"
-        );
-        assert!(
-            OFFLINE_INITIALIZER_TEST_FAULT
-                .lock()
-                .expect("offline initializer fault schedule lock poisoned")
-                .is_empty()
+            namespace
+                .recovery_fresh_state()
+                .expect("classify partial production rollback"),
+            OfflineNamespaceState::PreparedFresh,
+            "database truncate plus retained prep must remain exactly resumable"
         );
         assert_eq!(
             fs::read(rollback_entry.namespace.join(SNAPSHOT_METADATA_NAMES[1]))
-                .expect("reread retained rollback prep record"),
+                .expect("read retained rollback prep record"),
             expected_prep,
-            "nonmarker rollback sync failure must retain exact prep bytes"
+            "production rollback sync failure must retain exact durable prep bytes"
         );
         assert_eq!(
             fs::metadata(&database_path)
                 .expect("inspect actually truncated rollback database")
                 .len(),
             0,
-            "rollback entry truncate must occur before injected sync failure"
+            "production rollback must truncate the real handoff database before injected sync failure"
         );
         assert_eq!(entry_identities(&rollback_entry.namespace), identities);
         drop(namespace);
@@ -6209,6 +6268,15 @@ mod tests {
             )
             .expect("public retry resumes retained real rollback residue"),
             LinuxProtectedInitialization::Initialized
+        );
+        assert_eq!(
+            crate::initialize_linux_protected_offline(
+                &rollback_entry.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect("completed production rollback fixture is idempotent"),
+            LinuxProtectedInitialization::AlreadyInitialized
         );
 
         let sparse = fresh_root_fixture();
