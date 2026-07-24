@@ -158,12 +158,14 @@ def expected_spdx(arguments, runtime_manifest):
     )
     excluded = {arguments.sbom, str(Path(arguments.sbom).with_name("SHA256SUMS"))}
     records = []
+    files = [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.relative_to(root).as_posix() not in excluded
+    ]
+    files.sort(key=lambda path: f"./{path.relative_to(root).as_posix()}")
     for index, path in enumerate(
-        sorted(
-            path
-            for path in root.rglob("*")
-            if path.is_file() and path.relative_to(root).as_posix() not in excluded
-        ),
+        files,
         start=1,
     ):
         relative = path.relative_to(root).as_posix()
@@ -324,9 +326,40 @@ def expected_artifact_provenance(
     }
 
 
-def compare(actual, expected, label):
+def first_difference(actual, expected, path="<root>"):
+    if type(actual) is not type(expected):
+        return f"{path}: type {type(actual).__name__} != {type(expected).__name__}"
+    if isinstance(actual, dict):
+        if actual.keys() != expected.keys():
+            return (
+                f"{path}: keys {sorted(actual)} != {sorted(expected)}"
+            )
+        for key in actual:
+            difference = first_difference(actual[key], expected[key], f"{path}.{key}")
+            if difference:
+                return difference
+        return None
+    if isinstance(actual, list):
+        if len(actual) != len(expected):
+            return f"{path}: length {len(actual)} != {len(expected)}"
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            difference = first_difference(
+                actual_item, expected_item, f"{path}[{index}]"
+            )
+            if difference:
+                return difference
+        return None
     if actual != expected:
-        raise ValueError(f"{label} differs from independently reconstructed metadata")
+        return f"{path}: {actual!r} != {expected!r}"
+    return None
+
+
+def compare(actual, expected, label):
+    difference = first_difference(actual, expected)
+    if difference:
+        raise ValueError(
+            f"{label} differs from independently reconstructed metadata: {difference}"
+        )
 
 
 def main():
