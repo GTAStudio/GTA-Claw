@@ -18,6 +18,7 @@ COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 libc = ctypes.CDLL(None, use_errno=True)
 RETURN_UID = int(os.environ.get("SAFEIO_RETURN_UID", str(os.getuid())))
 RETURN_GID = int(os.environ.get("SAFEIO_RETURN_GID", str(os.getgid())))
+TARGET_PATH = os.environ.get("SAFEIO_TARGET_PATH", "target")
 
 
 class OpenHow(ctypes.Structure):
@@ -108,14 +109,13 @@ def mkdirs(root_fd: int, relative: str, mode: int = 0o700) -> None:
 def open_repo_target() -> tuple[int, int]:
     repo_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | O_NOFOLLOW)
     try:
-        try:
-            os.mkdir("target", mode=0o700, dir_fd=repo_fd)
-        except FileExistsError:
-            pass
-        target_fd = os.open(
-            "target", os.O_RDONLY | os.O_DIRECTORY | O_NOFOLLOW, dir_fd=repo_fd
-        )
-        check_directory(target_fd, "repository target", owners=(RETURN_UID, os.getuid()))
+        if TARGET_PATH == "target":
+            try:
+                os.mkdir("target", mode=0o700, dir_fd=repo_fd)
+            except FileExistsError:
+                pass
+        target_fd = os.open(TARGET_PATH, os.O_RDONLY | os.O_DIRECTORY | O_NOFOLLOW)
+        check_directory(target_fd, "build target", owners=(RETURN_UID, os.getuid()))
         os.fchown(target_fd, os.getuid(), os.getgid())
         os.fchmod(target_fd, 0o700)
         return repo_fd, target_fd
@@ -184,6 +184,15 @@ def same_inode_at(parent_fd: int, name: str, opened_fd: int) -> bool:
     )
 
 
+def same_inode_path(path: str, opened_fd: int) -> bool:
+    path_info = os.stat(path, follow_symlinks=False)
+    opened_info = os.fstat(opened_fd)
+    return (path_info.st_dev, path_info.st_ino) == (
+        opened_info.st_dev,
+        opened_info.st_ino,
+    )
+
+
 def run_child(command: list[str], inherited: dict[str, int], extra: dict[str, str]) -> int:
     environment = os.environ.copy()
     pass_fds = []
@@ -218,7 +227,7 @@ def command_run_create(arguments: list[str]) -> int:
             {
                 "SAFEIO_OUTPUT_COMPONENT": component,
                 "SAFEIO_OUTPUT_REALPATH": os.path.abspath(
-                    os.path.join("target", component)
+                    os.path.join(TARGET_PATH, component)
                 ),
                 "OUTPUT_ROOT": f"/proc/self/fd/{output_fd}",
             },
@@ -231,8 +240,10 @@ def command_run_create(arguments: list[str]) -> int:
             os.close(output_fd)
         if lock:
             os.rmdir(lock, dir_fd=target_fd)
-        if not same_inode_at(repo_fd, "target", target_fd):
-            fail("repository target identity changed during transaction")
+        if not same_inode_path(TARGET_PATH, target_fd):
+            fail("build target identity changed during transaction")
+        if not same_inode_path(".", repo_fd):
+            fail("repository identity changed during transaction")
         os.fchown(target_fd, RETURN_UID, RETURN_GID)
         os.close(target_fd)
         os.close(repo_fd)
@@ -263,7 +274,7 @@ def command_run_package(arguments: list[str]) -> int:
                 "SAFEIO_BUILD_COMPONENT": build_component,
                 "SAFEIO_OUTPUT_COMPONENT": output_component,
                 "SAFEIO_OUTPUT_REALPATH": os.path.abspath(
-                    os.path.join("target", output_component)
+                    os.path.join(TARGET_PATH, output_component)
                 ),
                 "OUTPUT_ROOT": f"/proc/self/fd/{output_fd}",
             },
@@ -278,8 +289,10 @@ def command_run_package(arguments: list[str]) -> int:
             os.close(build_fd)
         if lock:
             os.rmdir(lock, dir_fd=target_fd)
-        if not same_inode_at(repo_fd, "target", target_fd):
-            fail("repository target identity changed during transaction")
+        if not same_inode_path(TARGET_PATH, target_fd):
+            fail("build target identity changed during transaction")
+        if not same_inode_path(".", repo_fd):
+            fail("repository identity changed during transaction")
         os.fchown(target_fd, RETURN_UID, RETURN_GID)
         os.close(target_fd)
         os.close(repo_fd)

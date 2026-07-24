@@ -46,12 +46,13 @@ docker run --rm \
   --security-opt no-new-privileges \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
+  --env SAFEIO_TARGET_PATH=/gta-claw-target \
   --env "PACKAGING_IMAGE_ID=$packaging_image_id" \
   --env GIT_CONFIG_COUNT=1 \
   --env GIT_CONFIG_KEY_0=safe.directory \
   --env GIT_CONFIG_VALUE_0=/workspace \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/workspace/target" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/gta-claw-target" \
   --workdir /workspace \
   "$image" \
   /usr/local/bin/gta-claw-safeio \
@@ -67,7 +68,7 @@ docker run --rm \
       "$3"
   ' \
   _ \
-  "/workspace/target/$archive_relative" \
+  "/gta-claw-target/$archive_relative" \
   "$arch" \
   "$expected_key_sha"
 cleanup_anchored_mounts

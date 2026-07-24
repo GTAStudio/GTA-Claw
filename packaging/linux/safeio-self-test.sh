@@ -12,9 +12,9 @@ initialize_output_root
 work="$OUTPUT_ROOT/work"
 ensure_output_directory "$work"
 
-actual="$REPO_ROOT/target/$SAFEIO_OUTPUT_COMPONENT"
-displaced="$REPO_ROOT/target/$SAFEIO_OUTPUT_COMPONENT.displaced"
-outside="$(mktemp -d /tmp/gta-claw-safeio-outside.XXXXXXXXXX)"
+actual="$SAFEIO_OUTPUT_REALPATH"
+displaced="$SAFEIO_OUTPUT_REALPATH.displaced"
+outside="$(mktemp -d "${TMPDIR:?TMPDIR is required}/gta-claw-safeio-outside.XXXXXXXXXX")"
 printf 'outside sentinel\n' >"$outside/sentinel"
 
 mv "$actual" "$displaced"

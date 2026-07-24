@@ -64,8 +64,9 @@ docker run --rm \
   --env GIT_CONFIG_VALUE_0=/workspace \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
+  --env SAFEIO_TARGET_PATH=/gta-claw-target \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/workspace/target" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/gta-claw-target" \
   --workdir /workspace \
   "$image_tag" \
   /usr/local/bin/gta-claw-safeio \
