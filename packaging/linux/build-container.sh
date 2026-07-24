@@ -39,13 +39,26 @@ environment_image_id="$(docker image inspect --format '{{.Id}}' "$image_tag")"
 [[ "$environment_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "pinned build environment produced an invalid image ID"
 
+git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
+git_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-dir)"
+if [[ "$git_dir" == "$git_common_dir" ]]; then
+  git_relative=""
+elif [[ "$git_dir" == "$git_common_dir/"* ]]; then
+  git_relative="${git_dir#"$git_common_dir/"}"
+else
+  die "worktree Git directory is outside the common Git directory"
+fi
+container_git_dir="/gta-claw-git${git_relative:+/$git_relative}"
 exec {repo_mount_fd}<"$REPO_ROOT"
 exec {target_mount_fd}<"$target_root"
+exec {git_mount_fd}<"$git_common_dir"
 repo_mount="/proc/$BASHPID/fd/$repo_mount_fd"
 target_mount="/proc/$BASHPID/fd/$target_mount_fd"
+git_mount="/proc/$BASHPID/fd/$git_mount_fd"
 repo_mount_id="$(stat -Lc '%d:%i' "$repo_mount")"
 target_mount_id="$(stat -Lc '%d:%i' "$target_mount")"
-create_anchored_mounts "$repo_mount" "$target_mount"
+git_mount_id="$(stat -Lc '%d:%i' "$git_mount")"
+create_anchored_mounts "$repo_mount" "$target_mount" "$git_mount"
 container_manifest="$(
 docker run --rm \
   --cap-drop ALL \
@@ -65,8 +78,12 @@ docker run --rm \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
   --env SAFEIO_TARGET_PATH=/gta-claw-target \
+  --env "GIT_DIR=$container_git_dir" \
+  --env GIT_WORK_TREE=/workspace \
+  --env GIT_OPTIONAL_LOCKS=0 \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/gta-claw-target" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/git,target=/gta-claw-git,readonly" \
   --workdir /workspace \
   "$image_tag" \
   /usr/local/bin/gta-claw-safeio \
@@ -86,6 +103,8 @@ cleanup_anchored_mounts
   die "repository path identity changed during container build"
 [[ "$(stat -Lc '%d:%i' "$target_root")" == "$target_mount_id" ]] ||
   die "target path identity changed during container build"
+[[ "$(stat -Lc '%d:%i' "$git_common_dir")" == "$git_mount_id" ]] ||
+  die "Git common directory identity changed during container build"
 [[ "$(stat -Lc '%d:%i' "$CARGO_TARGET_DIR")" == \
   "$(stat -Lc '%d:%i' "$target_mount/$target_relative")" ]] ||
   die "Cargo output component identity changed during container build"
