@@ -547,6 +547,16 @@ for scriptlet in \
   else
     sed 's/%%/%/g' "$LINUX_DIR/rpm/$source" >"$expected_script"
   fi
+  python3 -c '
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+content = path.read_bytes()
+if not content.endswith(b"\n"):
+    raise SystemExit("canonical RPM scriptlet source lacks a final newline")
+path.write_bytes(content[:-1])
+' "$expected_script"
   rpm -qp --qf "%{$tag}" "$rpm_artifact" >"$actual_script"
   cmp -s "$expected_script" "$actual_script" ||
     die "RPM $name scriptlet differs from canonical generated source"
