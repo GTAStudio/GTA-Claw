@@ -6,9 +6,9 @@ use crate::StateError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LinuxProtectedInitialization {
-    /// A fresh empty database and WAL were initialized for runtime handoff.
+    /// A fresh namespace, or exact initializer-owned progress, completed runtime handoff.
     Initialized,
-    /// The namespace was already initialized and was verified without migrations.
+    /// The namespace had already crossed the selector commit boundary and was verified.
     AlreadyInitialized,
 }
 
@@ -23,8 +23,10 @@ pub enum LinuxProtectedInitialization {
 ///
 /// The namespace must already contain exactly the accepted eight fixed regular
 /// files. A fresh namespace is initialized only when all eight entries,
-/// including the database and WAL, are empty. Any partial or unknown state is
-/// rejected rather than repaired. Off Linux this function returns
+/// including the database and WAL, are empty. Exact versioned initializer-owned
+/// preparation, transition, or committed-cleanup records can be resumed
+/// idempotently under the fixed writer lock. Every unknown, ambiguous, or
+/// noncanonical partial state is rejected rather than repaired. Off Linux this function returns
 /// [`crate::StateErrorKind::UnsupportedPlatform`].
 pub fn initialize_linux_protected_offline(
     namespace: impl AsRef<Path>,

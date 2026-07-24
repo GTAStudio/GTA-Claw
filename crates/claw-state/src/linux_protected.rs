@@ -93,6 +93,7 @@ enum OfflineInitializerTestStage {
     MarkerCleanup,
     FinalValidation,
     RollbackTruncate,
+    RollbackEntryFailure,
     RollbackSync,
 }
 
@@ -1484,6 +1485,15 @@ impl ProtectedNamespace {
             SELECTOR_INDEX,
         ] {
             let entry = &self.entries[index];
+            if first_error.is_none()
+                && let Err(error) = fail_offline_initializer_stage(
+                    OfflineInitializerTestStage::RollbackEntryFailure,
+                    &entry.path,
+                )
+            {
+                first_error = Some(error);
+                continue;
+            }
             if let Err(error) = entry.file.set_len(0).and_then(|()| entry.file.sync_all())
                 && first_error.is_none()
             {
@@ -1499,25 +1509,23 @@ impl ProtectedNamespace {
                 OfflineInitializerTestStage::RollbackSync,
                 &self.directory,
             )?;
-        }
-        let prep = &self.entries[PREP_RECORD_INDEX];
-        if let Err(error) = prep.file.set_len(0).and_then(|()| prep.file.sync_all())
-            && first_error.is_none()
-        {
-            first_error = Some(file_error(
-                "remove LinuxProtected prep record after fresh rollback",
-                &prep.path,
-                error,
-            ));
-        }
-        if let Err(error) = self.parent.sync_all()
-            && first_error.is_none()
-        {
-            first_error = Some(file_error(
-                "sync LinuxProtected namespace after fresh rollback",
-                &self.directory,
-                error,
-            ));
+            let prep = &self.entries[PREP_RECORD_INDEX];
+            if let Err(error) = prep.file.set_len(0).and_then(|()| prep.file.sync_all()) {
+                first_error = Some(file_error(
+                    "remove LinuxProtected prep record after fresh rollback",
+                    &prep.path,
+                    error,
+                ));
+            }
+            if first_error.is_none()
+                && let Err(error) = self.parent.sync_all()
+            {
+                first_error = Some(file_error(
+                    "sync LinuxProtected namespace after fresh rollback",
+                    &self.directory,
+                    error,
+                ));
+            }
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -3617,6 +3625,7 @@ fn read_index_search_page(
     for index in 0..page.cell_count {
         let offset = btree_cell_offset(image, &page, index)?;
         let payload_offset = if page.page_type == 0x02 {
+            ensure_range(image, offset, 4, image.usable_size)?;
             let child = read_be_u32(&page.bytes, offset);
             validate_page_reference(image, child)?;
             children.push(child);
@@ -4552,11 +4561,18 @@ fn finish_transitioned_fresh(
             namespace.database_path(),
         )?;
         namespace.validate_prepared_fresh_sqlite(work_cutoff, timeout_ms)?;
-        check_initializer_deadline(work_cutoff, timeout_ms)?;
-        namespace.initialize_empty_selector()
+        check_initializer_deadline(work_cutoff, timeout_ms)
     })();
     if let Err(primary) = precommit {
         return Err(classify_prepared_failure(namespace, primary));
+    }
+    if let Err(primary) = namespace.initialize_empty_selector() {
+        return Err(match namespace.recovery_fresh_state() {
+            Ok(OfflineNamespaceState::InitializedFresh | OfflineNamespaceState::Initialized) => {
+                classify_committed_initializer_failure(namespace, primary)
+            }
+            _ => classify_prepared_failure(namespace, primary),
+        });
     }
 
     let committed = (|| {
@@ -5915,18 +5931,31 @@ mod tests {
             let fixture = fresh_root_fixture();
             let identities = entry_identities(&fixture.namespace);
             schedule_offline_initializer_fault(stage);
-            crate::initialize_linux_protected_offline(&fixture.namespace, SERVICE_UID, SERVICE_GID)
-                .unwrap_or_else(|error| {
-                    assert!(
-                        matches!(
-                            error,
-                            StateError::InvalidPath { .. }
-                                | StateError::OperationCleanupFailed { .. }
-                        ),
-                        "{stage:?} returned the wrong injected failure: {error:?}"
-                    );
-                    LinuxProtectedInitialization::Initialized
-                });
+            let error = crate::initialize_linux_protected_offline(
+                &fixture.namespace,
+                SERVICE_UID,
+                SERVICE_GID,
+            )
+            .expect_err("scheduled initializer stage must fail");
+            if matches!(
+                stage,
+                OfflineInitializerTestStage::SelectorSync
+                    | OfflineInitializerTestStage::MarkerCleanup
+                    | OfflineInitializerTestStage::FinalValidation
+            ) {
+                assert!(
+                    matches!(error, StateError::OperationCleanupFailed { .. }),
+                    "{stage:?} must report a committed/uncertain outcome: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        StateError::InvalidPath { .. } | StateError::OperationCleanupFailed { .. }
+                    ),
+                    "{stage:?} returned the wrong injected failure: {error:?}"
+                );
+            }
             assert!(
                 OFFLINE_INITIALIZER_TEST_FAULT
                     .lock()
@@ -5984,6 +6013,10 @@ mod tests {
                 OfflineInitializerTestStage::PrepSync,
                 OfflineInitializerTestStage::RollbackSync,
             ),
+            (
+                OfflineInitializerTestStage::PrepSync,
+                OfflineInitializerTestStage::RollbackEntryFailure,
+            ),
         ] {
             let fixture = fresh_root_fixture();
             let identities = entry_identities(&fixture.namespace);
@@ -6005,6 +6038,19 @@ mod tests {
                     .is_empty()
             );
             assert_eq!(entry_identities(&fixture.namespace), identities);
+            if matches!(
+                rollback,
+                OfflineInitializerTestStage::RollbackSync
+                    | OfflineInitializerTestStage::RollbackEntryFailure
+            ) {
+                assert_eq!(
+                    fs::metadata(fixture.namespace.join(SNAPSHOT_METADATA_NAMES[1]))
+                        .expect("inspect retained rollback prep record")
+                        .len(),
+                    PREP_RECORD_LEN as u64,
+                    "rollback sync failure must retain prep provenance"
+                );
+            }
             assert_eq!(
                 crate::initialize_linux_protected_offline(
                     &fixture.namespace,
@@ -7898,6 +7944,84 @@ mod tests {
             .close()
             .await
             .expect("close regrowing WAL cross-check");
+    }
+
+    #[test]
+    fn malformed_index_interior_child_field_rejects_without_panic() {
+        let temporary = tempfile::tempdir().expect("create malformed index fixture");
+        let database_path = temporary.path().join(DATABASE_NAME);
+        let wal_path = temporary.path().join(WAL_NAME);
+        let mut database_bytes = vec![0_u8; 3 * 4096];
+        let page = &mut database_bytes[4096..8192];
+        page[0] = 0x02;
+        page[3..5].copy_from_slice(&1_u16.to_be_bytes());
+        page[5..7].copy_from_slice(&4095_u16.to_be_bytes());
+        page[8..12].copy_from_slice(&3_u32.to_be_bytes());
+        page[12..14].copy_from_slice(&4095_u16.to_be_bytes());
+        page[4095] = 0xff;
+        fs::write(&database_path, &database_bytes).expect("write malformed index database");
+        fs::write(&wal_path, []).expect("write empty malformed index WAL");
+        let database_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("open malformed index database");
+        let wal_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .expect("open malformed index WAL");
+        let database_identity = FileIdentity::capture(
+            &database_path,
+            &database_file,
+            "capture malformed index database identity",
+        )
+        .expect("capture malformed index database identity");
+        let database_entry = HeldEntry {
+            name: DATABASE_NAME,
+            path: database_path.clone(),
+            file: database_file,
+            identity: database_identity,
+        };
+        let wal_entry = HeldEntry {
+            name: WAL_NAME,
+            path: wal_path,
+            identity: FileIdentity::capture(
+                &temporary.path().join(WAL_NAME),
+                &wal_file,
+                "capture malformed index WAL identity",
+            )
+            .expect("capture malformed index WAL identity"),
+            file: wal_file,
+        };
+        let frames = HashMap::new();
+        let image = DatabaseImage {
+            database: &database_entry,
+            wal: &wal_entry,
+            wal_frames: &frames,
+            page_size: 4096,
+            usable_size: 4096,
+            physical_pages: 3,
+            logical_pages: 3,
+            cutoff: Instant::now() + Duration::from_secs(5),
+            timeout_ms: 5_000,
+        };
+        let mut claimed = HashSet::new();
+        let mut cells = 0;
+        let error = validate_index_btree(&image, 2, TEXT_ROWID_INDEX, &mut claimed, &mut cells)
+            .expect_err("malformed index child field must reject");
+        assert!(matches!(error, StateError::InvalidPath { .. }));
+        let mut search_claimed = HashSet::new();
+        assert!(read_index_search_page(&image, 2, TEXT_ROWID_INDEX, &mut search_claimed).is_err());
+        assert_eq!(
+            fs::read(&database_path).expect("reread malformed index database"),
+            database_bytes
+        );
+        let after = fs::metadata(&database_path).expect("reinspect malformed index database");
+        assert_eq!(
+            (after.dev(), after.ino()),
+            (database_identity.device, database_identity.inode)
+        );
     }
 
     #[test]
