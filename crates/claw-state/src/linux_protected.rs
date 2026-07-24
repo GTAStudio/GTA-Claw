@@ -1,8 +1,9 @@
 #[cfg(test)]
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteLockingMode, SqliteSynchronous};
-use sqlx::{Connection as _, Row as _, SqliteConnection};
+use sqlx::{Connection as _, SqliteConnection};
 
 use crate::StateError;
 use crate::error::{database, database_code};
@@ -18,11 +19,10 @@ use crate::protected_catalog::{
     self, CatalogIdentity, METADATA_LEN, PublicationPlan, RecoveredSnapshot, SELECTOR_CELL_LEN,
     SELECTOR_LEN, SlotObservation,
 };
-use crate::protected_layout::ENTRY_NAMES;
+use crate::protected_layout::{DATABASE_NAME, ENTRY_NAMES, WRITER_LOCK_NAME};
 #[cfg(test)]
 use crate::protected_layout::{
-    DATABASE_NAME, SELECTOR_NAME, SNAPSHOT_DATA_NAMES, SNAPSHOT_METADATA_NAMES, WAL_NAME,
-    WRITER_LOCK_NAME,
+    SELECTOR_NAME, SNAPSHOT_DATA_NAMES, SNAPSHOT_METADATA_NAMES, WAL_NAME,
 };
 use crate::provision::LinuxProtectedInitialization;
 
@@ -32,6 +32,12 @@ const WRITER_LOCK_INDEX: usize = 2;
 const SLOT_DATA_INDEX: [usize; 2] = [3, 5];
 const SLOT_METADATA_INDEX: [usize; 2] = [4, 6];
 const SELECTOR_INDEX: usize = 7;
+const SQLITE_PENDING_BYTE: u64 = 0x4000_0000;
+const MAX_RAW_SCHEMA_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_RAW_INDEX_KEY_BYTES: usize = 4 * 1024;
+const MAX_RAW_APPLICATION_ROW_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RAW_TEXT_FIELD_BYTES: usize = MAX_RAW_APPLICATION_ROW_BYTES;
+const MAX_RAW_ID_BYTES: usize = 128;
 
 const EXT_FAMILY_MAGIC: u64 = 0x0000_ef53;
 const XFS_MAGIC: u64 = 0x5846_5342;
@@ -112,6 +118,142 @@ struct HeldEntry {
     path: PathBuf,
     file: File,
     identity: FileIdentity,
+}
+
+pub(crate) struct OfflineNamespacePreflight {
+    database_path: PathBuf,
+    database: File,
+    database_identity: FileIdentity,
+    writer_lock_path: PathBuf,
+    writer_lock: File,
+    writer_lock_identity: FileIdentity,
+}
+
+impl OfflineNamespacePreflight {
+    pub(crate) fn open(spec: &LinuxProtectedSpec) -> Result<Self, StateError> {
+        validate_root_credentials()?;
+        validate_spec(spec)?;
+        let parent = rustix::fs::open(
+            &spec.directory,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            file_error(
+                "open LinuxProtected directory for offline lock",
+                &spec.directory,
+                error.into(),
+            )
+        })?;
+        let parent_identity = FileIdentity::capture(
+            &spec.directory,
+            &parent,
+            "inspect LinuxProtected directory for offline lock",
+        )?;
+        validate_filesystem(&spec.directory, &parent)?;
+        validate_ancestors(&spec.directory)?;
+        validate_offline_ancestor_acls(&spec.directory)?;
+        validate_parent(spec, &parent, parent_identity)?;
+
+        let open_entry = |name: &'static str| -> Result<(PathBuf, File, FileIdentity), StateError> {
+            let path = spec.directory.join(name);
+            let file = rustix::fs::openat(
+                &parent,
+                name,
+                rustix::fs::OFlags::RDWR
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| {
+                file_error(
+                    "open LinuxProtected offline lock entry",
+                    &path,
+                    error.into(),
+                )
+            })?;
+            let identity =
+                FileIdentity::capture(&path, &file, "inspect LinuxProtected offline lock entry")?;
+            validate_entry(spec, parent_identity.device, &path, &file, identity)?;
+            Ok((path, file, identity))
+        };
+        let (database_path, database, database_identity) = open_entry(DATABASE_NAME)?;
+        let (writer_lock_path, writer_lock, writer_identity) = open_entry(WRITER_LOCK_NAME)?;
+        if (database_identity.device, database_identity.inode)
+            == (writer_identity.device, writer_identity.inode)
+        {
+            return Err(invalid_path(
+                &writer_lock_path,
+                "LinuxProtected database and writer lock must have distinct identities",
+            ));
+        }
+        if writer_lock
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "inspect offline fixed writer lock length",
+                    &writer_lock_path,
+                    error,
+                )
+            })?
+            .len()
+            != 0
+        {
+            return Err(invalid_path(
+                &writer_lock_path,
+                "LinuxProtected fixed writer lock must be empty during offline initialization",
+            ));
+        }
+        Ok(Self {
+            database_path,
+            database,
+            database_identity,
+            writer_lock_path,
+            writer_lock,
+            writer_lock_identity: writer_identity,
+        })
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    pub(crate) fn writer_lock_path(&self) -> &Path {
+        &self.writer_lock_path
+    }
+
+    pub(crate) fn clone_database(&self) -> Result<File, StateError> {
+        clone_file(
+            &self.database,
+            &self.database_path,
+            "clone offline LinuxProtected database handle",
+        )
+    }
+
+    pub(crate) fn clone_writer_lock(&self) -> Result<File, StateError> {
+        clone_file(
+            &self.writer_lock,
+            &self.writer_lock_path,
+            "clone offline LinuxProtected writer-lock handle",
+        )
+    }
+
+    fn verify_locked_namespace(&self, namespace: &ProtectedNamespace) -> Result<(), StateError> {
+        if namespace.entries[DATABASE_INDEX].identity != self.database_identity
+            || namespace.entries[WRITER_LOCK_INDEX].identity != self.writer_lock_identity
+        {
+            return Err(invalid_path(
+                &namespace.directory,
+                "offline writer lock and held namespace do not name the same database identities",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -217,9 +359,8 @@ impl ProtectedNamespace {
                 ));
             }
         }
-        match purpose {
-            NamespacePurpose::RuntimeService => validate_catalog_lengths(&entries)?,
-            NamespacePurpose::OfflineRoot => validate_offline_catalog_bounds(&entries)?,
+        if purpose == NamespacePurpose::RuntimeService {
+            validate_catalog_lengths(&entries)?;
         }
 
         let namespace = Arc::new(Self {
@@ -234,7 +375,10 @@ impl ProtectedNamespace {
             observed_generation: Mutex::new(None),
             purpose,
         });
-        namespace.verify()?;
+        match purpose {
+            NamespacePurpose::RuntimeService => namespace.verify()?,
+            NamespacePurpose::OfflineRoot => namespace.verify_security()?,
+        }
         Ok(namespace)
     }
 
@@ -244,6 +388,14 @@ impl ProtectedNamespace {
 
     pub(crate) fn database_path(&self) -> &Path {
         &self.entries[DATABASE_INDEX].path
+    }
+
+    fn held_offline_database_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            self.parent.as_raw_fd(),
+            DATABASE_NAME
+        ))
     }
 
     pub(crate) fn writer_lock_path(&self) -> &Path {
@@ -311,6 +463,14 @@ impl ProtectedNamespace {
     }
 
     pub(crate) fn verify(&self) -> Result<(), StateError> {
+        self.verify_inner(true)
+    }
+
+    pub(crate) fn verify_security(&self) -> Result<(), StateError> {
+        self.verify_inner(false)
+    }
+
+    fn verify_inner(&self, validate_catalog: bool) -> Result<(), StateError> {
         let spec = LinuxProtectedSpec {
             directory: self.directory.clone(),
             expected_uid: self.expected_uid,
@@ -405,9 +565,11 @@ impl ProtectedNamespace {
                 ));
             }
         }
-        match self.purpose {
-            NamespacePurpose::RuntimeService => validate_catalog_lengths(&self.entries)?,
-            NamespacePurpose::OfflineRoot => validate_offline_catalog_bounds(&self.entries)?,
+        if validate_catalog {
+            match self.purpose {
+                NamespacePurpose::RuntimeService => validate_catalog_lengths(&self.entries)?,
+                NamespacePurpose::OfflineRoot => validate_offline_catalog_bounds(&self.entries)?,
+            }
         }
         let final_parent = rustix::fs::open(
             &self.directory,
@@ -857,6 +1019,23 @@ impl ProtectedNamespace {
             })
     }
 
+    fn validate_fresh_sqlite_handoff(
+        &self,
+        cutoff: Instant,
+        timeout_ms: u64,
+    ) -> Result<(), StateError> {
+        check_initializer_deadline(cutoff, timeout_ms)?;
+        self.verify()?;
+        self.validate_initialized_sqlite_files(cutoff, timeout_ms)?;
+        if self.wal_length()? != 0 {
+            return Err(invalid_path(
+                &self.entries[WAL_INDEX].path,
+                "fresh LinuxProtected handoff must leave the precreated WAL at zero length",
+            ));
+        }
+        check_initializer_deadline(cutoff, timeout_ms)
+    }
+
     fn validate_runtime_layout(&self, cutoff: Instant, timeout_ms: u64) -> Result<(), StateError> {
         check_initializer_deadline(cutoff, timeout_ms)?;
         self.verify()?;
@@ -918,8 +1097,1997 @@ impl ProtectedNamespace {
                 "initialized LinuxProtected database page size is invalid",
             ));
         }
-        validate_offline_wal(&self.entries[WAL_INDEX], page_size, cutoff, timeout_ms)
+        if database_length < page_size || database_length % page_size != 0 {
+            return Err(invalid_path(
+                &database.path,
+                "initialized LinuxProtected database does not contain complete SQLite pages",
+            ));
+        }
+        let physical_pages = database_length / page_size;
+        let page_size =
+            usize::try_from(page_size).expect("validated SQLite page size fits this platform");
+        let mut page_one = vec![0_u8; page_size];
+        read_exact_at(
+            &database.file,
+            &mut page_one,
+            0,
+            &database.path,
+            Some(cutoff),
+            None,
+            timeout_ms,
+        )?;
+        if database
+            .file
+            .metadata()
+            .map_err(|error| {
+                file_error(
+                    "reinspect initialized LinuxProtected database length",
+                    &database.path,
+                    error,
+                )
+            })?
+            .len()
+            != database_length
+        {
+            return Err(invalid_path(
+                &database.path,
+                "initialized LinuxProtected database length changed during verification",
+            ));
+        }
+        let wal = validate_offline_wal(
+            &self.entries[WAL_INDEX],
+            page_size as u64,
+            cutoff,
+            timeout_ms,
+        )?;
+        let effective_page_one = wal.page_one.as_deref().unwrap_or(&page_one);
+        let header = parse_sqlite_header(
+            &database.path,
+            effective_page_one,
+            page_size,
+            physical_pages,
+            wal.committed_pages,
+        )?;
+        let image = DatabaseImage {
+            database,
+            wal: &self.entries[WAL_INDEX],
+            wal_frames: &wal.frames,
+            page_size,
+            usable_size: page_size - usize::from(header.reserved_bytes),
+            physical_pages,
+            logical_pages: header.logical_pages,
+            cutoff,
+            timeout_ms,
+        };
+        validate_database_image(&image, effective_page_one, header)
     }
+}
+
+struct WalObservation {
+    committed_pages: Option<u32>,
+    page_one: Option<Vec<u8>>,
+    frames: BTreeMap<u32, u64>,
+}
+
+#[derive(Clone, Copy)]
+struct SqliteHeader {
+    logical_pages: u32,
+    reserved_bytes: u8,
+    freelist_trunk: u32,
+    freelist_pages: u32,
+    schema_format: u32,
+    encoding: u32,
+    user_version: u32,
+    application_id: u32,
+}
+
+fn parse_sqlite_header(
+    path: &Path,
+    page_one: &[u8],
+    expected_page_size: usize,
+    physical_pages: u64,
+    committed_wal_pages: Option<u32>,
+) -> Result<SqliteHeader, StateError> {
+    if page_one.len() != expected_page_size
+        || !page_one.starts_with(b"SQLite format 3\0")
+        || page_one[18] != 2
+        || page_one[19] != 2
+        || page_one[21] != 64
+        || page_one[22] != 32
+        || page_one[23] != 32
+    {
+        return Err(invalid_path(
+            path,
+            "initialized LinuxProtected database header is invalid",
+        ));
+    }
+    let encoded_page_size = u16::from_be_bytes([page_one[16], page_one[17]]);
+    let page_size = if encoded_page_size == 1 {
+        65_536
+    } else {
+        usize::from(encoded_page_size)
+    };
+    if page_size != expected_page_size {
+        return Err(invalid_path(
+            path,
+            "effective SQLite page one changes the database page size",
+        ));
+    }
+    let reserved_bytes = page_one[20];
+    let usable_size = page_size.saturating_sub(usize::from(reserved_bytes));
+    if usable_size < 480 {
+        return Err(invalid_path(
+            path,
+            "initialized LinuxProtected database usable page size is invalid",
+        ));
+    }
+    if page_one[72..92].iter().any(|byte| *byte != 0) {
+        return Err(invalid_path(
+            path,
+            "initialized LinuxProtected database reserved header bytes are nonzero",
+        ));
+    }
+    let schema_format = read_be_u32(page_one, 44);
+    let encoding = read_be_u32(page_one, 56);
+    if schema_format > 4 || encoding > 3 || (schema_format == 0) != (encoding == 0) {
+        return Err(invalid_path(
+            path,
+            "initialized LinuxProtected database schema format or encoding is invalid",
+        ));
+    }
+    if read_be_u32(page_one, 52) != 0 || read_be_u32(page_one, 64) != 0 {
+        return Err(invalid_path(
+            path,
+            "LinuxProtected offline verification does not accept auto-vacuum databases",
+        ));
+    }
+    let change_counter = read_be_u32(page_one, 24);
+    let version_valid_for = read_be_u32(page_one, 92);
+    let header_pages = read_be_u32(page_one, 28);
+    let physical_pages = u32::try_from(physical_pages).map_err(|_| {
+        invalid_path(
+            path,
+            "initialized LinuxProtected database page count exceeds SQLite bounds",
+        )
+    })?;
+    let logical_pages = committed_wal_pages.unwrap_or({
+        if header_pages != 0 && change_counter == version_valid_for {
+            header_pages
+        } else {
+            physical_pages
+        }
+    });
+    if logical_pages == 0 {
+        return Err(invalid_path(
+            path,
+            "initialized LinuxProtected database has zero logical pages",
+        ));
+    }
+    Ok(SqliteHeader {
+        logical_pages,
+        reserved_bytes,
+        freelist_trunk: read_be_u32(page_one, 32),
+        freelist_pages: read_be_u32(page_one, 36),
+        schema_format,
+        encoding,
+        user_version: read_be_u32(page_one, 60),
+        application_id: read_be_u32(page_one, 68),
+    })
+}
+
+struct DatabaseImage<'namespace> {
+    database: &'namespace HeldEntry,
+    wal: &'namespace HeldEntry,
+    wal_frames: &'namespace BTreeMap<u32, u64>,
+    page_size: usize,
+    usable_size: usize,
+    physical_pages: u64,
+    logical_pages: u32,
+    cutoff: Instant,
+    timeout_ms: u64,
+}
+
+impl DatabaseImage<'_> {
+    fn read_page(&self, page_number: u32) -> Result<Vec<u8>, StateError> {
+        if page_number == 0 || page_number > self.logical_pages {
+            return Err(invalid_path(
+                &self.database.path,
+                "SQLite page reference is outside the logical database",
+            ));
+        }
+        let mut page = vec![0_u8; self.page_size];
+        if let Some(offset) = self.wal_frames.get(&page_number) {
+            read_exact_at(
+                &self.wal.file,
+                &mut page,
+                *offset,
+                &self.wal.path,
+                Some(self.cutoff),
+                None,
+                self.timeout_ms,
+            )?;
+        } else {
+            if u64::from(page_number) > self.physical_pages {
+                return Err(invalid_path(
+                    &self.database.path,
+                    "logical SQLite page is absent from both main database and WAL",
+                ));
+            }
+            let offset = u64::from(page_number - 1)
+                .checked_mul(self.page_size as u64)
+                .ok_or_else(|| {
+                    invalid_path(&self.database.path, "SQLite page offset overflowed")
+                })?;
+            read_exact_at(
+                &self.database.file,
+                &mut page,
+                offset,
+                &self.database.path,
+                Some(self.cutoff),
+                None,
+                self.timeout_ms,
+            )?;
+        }
+        Ok(page)
+    }
+
+    fn claim_page(
+        &self,
+        claimed: &mut HashSet<u32>,
+        page_number: u32,
+        reason: &'static str,
+    ) -> Result<(), StateError> {
+        if page_number == 0 || page_number > self.logical_pages || !claimed.insert(page_number) {
+            return Err(invalid_path(&self.database.path, reason));
+        }
+        Ok(())
+    }
+
+    fn pending_byte_page(&self) -> u32 {
+        u32::try_from(SQLITE_PENDING_BYTE / self.page_size as u64 + 1)
+            .expect("SQLite pending-byte page fits u32")
+    }
+}
+
+fn validate_database_image(
+    image: &DatabaseImage<'_>,
+    _page_one: &[u8],
+    header: SqliteHeader,
+) -> Result<(), StateError> {
+    let mut claimed = HashSet::new();
+    validate_page_availability(image)?;
+    let pending_byte_page = image.pending_byte_page();
+    if pending_byte_page <= image.logical_pages {
+        claimed.insert(pending_byte_page);
+    }
+    let schema_records = validate_table_btree(image, 1, true, &mut claimed)?;
+    let schema_objects = validate_schema_records(&image.database.path, schema_records, header)?;
+    let mut unique_roots = HashSet::new();
+    let mut index_counts = BTreeMap::new();
+    for object in &schema_objects {
+        if object.root == 1 || !unique_roots.insert(object.root) {
+            return Err(invalid_path(
+                &image.database.path,
+                "sqlite_schema contains a duplicate or recursive root page",
+            ));
+        }
+        match object.btree {
+            SchemaBtree::Table => {
+                validate_table_btree(image, object.root, false, &mut claimed)?;
+            }
+            SchemaBtree::Index(columns) => {
+                let count = validate_index_btree(image, object.root, columns, &mut claimed)?;
+                index_counts.insert(object.name.as_str(), count);
+            }
+        }
+    }
+    validate_freelist(image, header, &mut claimed)?;
+    if claimed.len() != image.logical_pages as usize {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite logical database contains unreachable pages",
+        ));
+    }
+    verify_application_records(image, &schema_objects, &index_counts, header.user_version)?;
+    Ok(())
+}
+
+fn validate_page_availability(image: &DatabaseImage<'_>) -> Result<(), StateError> {
+    let physical_pages = u32::try_from(image.physical_pages.min(u64::from(u32::MAX)))
+        .expect("bounded physical page count fits u32");
+    let pending = image.pending_byte_page();
+    if image.wal_frames.contains_key(&pending) {
+        return Err(invalid_path(
+            &image.database.path,
+            "committed WAL contains SQLite's reserved pending-byte page",
+        ));
+    }
+    if image.logical_pages <= physical_pages {
+        return Ok(());
+    }
+    let pending_is_missing = pending > physical_pages && pending <= image.logical_pages;
+    let missing_pages = image.logical_pages - physical_pages - u32::from(pending_is_missing);
+    let available = image
+        .wal_frames
+        .range((physical_pages + 1)..=image.logical_pages)
+        .count();
+    if usize::try_from(missing_pages).ok() != Some(available) {
+        return Err(invalid_path(
+            &image.database.path,
+            "logical SQLite pages are absent from both main database and committed WAL",
+        ));
+    }
+    let mut expected = physical_pages + 1;
+    for page in image
+        .wal_frames
+        .range((physical_pages + 1)..=image.logical_pages)
+        .map(|(page, _)| *page)
+    {
+        if pending_is_missing && expected == pending {
+            expected += 1;
+        }
+        if page != expected {
+            return Err(invalid_path(
+                &image.database.path,
+                "committed WAL does not supply every logical page beyond the main database",
+            ));
+        }
+        if expected != image.logical_pages {
+            expected += 1;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct TableBounds {
+    minimum_exclusive: Option<i64>,
+    maximum_inclusive: Option<i64>,
+}
+
+struct TableTask {
+    page: u32,
+    depth: usize,
+    root: bool,
+    bounds: TableBounds,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum IndexValue {
+    Integer(i64),
+    Text(Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct IndexKey(Vec<IndexValue>);
+
+struct IndexTask {
+    page: u32,
+    depth: usize,
+    root: bool,
+    minimum_exclusive: Option<IndexKey>,
+    maximum_exclusive: Option<IndexKey>,
+}
+
+struct BtreePage {
+    bytes: Vec<u8>,
+    page_type: u8,
+    header_offset: usize,
+    pointer_start: usize,
+    cell_start: usize,
+    cell_count: usize,
+    occupied: Vec<(usize, usize)>,
+}
+
+fn read_btree_page(
+    image: &DatabaseImage<'_>,
+    claimed: &mut HashSet<u32>,
+    page_number: u32,
+) -> Result<BtreePage, StateError> {
+    image.claim_page(
+        claimed,
+        page_number,
+        "SQLite b-tree page is duplicated, reserved, or out of bounds",
+    )?;
+    let page = image.read_page(page_number)?;
+    let header_offset = if page_number == 1 { 100 } else { 0 };
+    if header_offset + 8 > image.usable_size {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite b-tree header is outside the usable page",
+        ));
+    }
+    let page_type = page[header_offset];
+    let header_length = match page_type {
+        0x02 | 0x05 => 12_usize,
+        0x0a | 0x0d => 8_usize,
+        _ => {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite b-tree page type is invalid",
+            ));
+        }
+    };
+    let first_freeblock = usize::from(read_be_u16(&page, header_offset + 1));
+    let cell_count = usize::from(read_be_u16(&page, header_offset + 3));
+    if cell_count > (image.page_size - 8) / 6 {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite b-tree cell count exceeds the format maximum",
+        ));
+    }
+    let encoded_cell_start = usize::from(read_be_u16(&page, header_offset + 5));
+    let cell_start = if encoded_cell_start == 0 {
+        65_536
+    } else {
+        encoded_cell_start
+    };
+    let pointer_start = header_offset + header_length;
+    let pointer_end = pointer_start
+        .checked_add(cell_count.checked_mul(2).ok_or_else(|| {
+            invalid_path(&image.database.path, "SQLite cell pointer count overflowed")
+        })?)
+        .ok_or_else(|| {
+            invalid_path(&image.database.path, "SQLite cell pointer array overflowed")
+        })?;
+    if page[header_offset + 7] > 60 || pointer_end > cell_start || cell_start > image.usable_size {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite b-tree page layout is invalid",
+        ));
+    }
+    let occupied = validate_freeblocks(image, &page, first_freeblock, pointer_end)?;
+    Ok(BtreePage {
+        bytes: page,
+        page_type,
+        header_offset,
+        pointer_start,
+        cell_start,
+        cell_count,
+        occupied,
+    })
+}
+
+fn btree_cell_offset(
+    image: &DatabaseImage<'_>,
+    page: &BtreePage,
+    index: usize,
+) -> Result<usize, StateError> {
+    let pointer = page.pointer_start + index * 2;
+    let offset = usize::from(read_be_u16(&page.bytes, pointer));
+    if offset < page.cell_start || offset >= image.usable_size {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite b-tree cell pointer is invalid",
+        ));
+    }
+    Ok(offset)
+}
+
+fn finish_btree_page(
+    image: &DatabaseImage<'_>,
+    mut occupied: Vec<(usize, usize)>,
+) -> Result<(), StateError> {
+    occupied.sort_unstable();
+    for pair in occupied.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite b-tree cells or freeblocks overlap",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_table_btree(
+    image: &DatabaseImage<'_>,
+    root: u32,
+    collect_schema: bool,
+    claimed: &mut HashSet<u32>,
+) -> Result<Vec<SchemaRecord>, StateError> {
+    let mut schema_records = Vec::new();
+    walk_table_btree(
+        image,
+        root,
+        claimed,
+        collect_schema.then_some(MAX_RAW_SCHEMA_PAYLOAD_BYTES),
+        &mut |_, payload| {
+            if let Some(payload) = payload {
+                schema_records.push(parse_sqlite_schema_record(&image.database.path, payload)?);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(schema_records)
+}
+
+fn walk_table_btree(
+    image: &DatabaseImage<'_>,
+    root: u32,
+    claimed: &mut HashSet<u32>,
+    payload_limit: Option<usize>,
+    inspect: &mut impl FnMut(i64, Option<&[u8]>) -> Result<(), StateError>,
+) -> Result<(), StateError> {
+    let mut stack = vec![TableTask {
+        page: root,
+        depth: 0,
+        root: true,
+        bounds: TableBounds {
+            minimum_exclusive: None,
+            maximum_inclusive: None,
+        },
+    }];
+    let mut leaf_depth = None;
+    while let Some(task) = stack.pop() {
+        let mut page = read_btree_page(image, claimed, task.page)?;
+        if !matches!(page.page_type, 0x05 | 0x0d) {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite table b-tree mixes table and index page types",
+            ));
+        }
+        if !task.root && page.cell_count == 0 {
+            return Err(invalid_path(
+                &image.database.path,
+                "non-root SQLite table b-tree page is empty",
+            ));
+        }
+        let mut keys = Vec::with_capacity(page.cell_count);
+        let mut children = Vec::with_capacity(page.cell_count + 1);
+        for index in 0..page.cell_count {
+            let offset = btree_cell_offset(image, &page, index)?;
+            let (end, key, payload) = if page.page_type == 0x05 {
+                ensure_range(image, offset, 4, image.usable_size)?;
+                let child = read_be_u32(&page.bytes, offset);
+                validate_page_reference(image, child)?;
+                children.push(child);
+                let (key, key_length) =
+                    read_sqlite_varint(&page.bytes, offset + 4, image.usable_size)?;
+                (offset + 4 + key_length, key as i64, None)
+            } else {
+                let (payload_size, payload_varint) =
+                    read_sqlite_varint(&page.bytes, offset, image.usable_size)?;
+                let rowid_start = offset + payload_varint;
+                let (rowid, rowid_varint) =
+                    read_sqlite_varint(&page.bytes, rowid_start, image.usable_size)?;
+                let payload = validate_cell_payload(
+                    image,
+                    &page.bytes,
+                    rowid_start + rowid_varint,
+                    payload_size,
+                    true,
+                    claimed,
+                    payload_limit,
+                )?;
+                (payload.0, rowid as i64, payload.1)
+            };
+            if task
+                .bounds
+                .minimum_exclusive
+                .is_some_and(|minimum| key <= minimum)
+                || task
+                    .bounds
+                    .maximum_inclusive
+                    .is_some_and(|maximum| key > maximum)
+                || keys.last().is_some_and(|previous| key <= *previous)
+            {
+                return Err(invalid_path(
+                    &image.database.path,
+                    "SQLite table b-tree rowids or separator keys are out of order",
+                ));
+            }
+            if end > image.usable_size {
+                return Err(invalid_path(
+                    &image.database.path,
+                    "SQLite b-tree cell exceeds the usable page",
+                ));
+            }
+            keys.push(key);
+            page.occupied.push((offset, end));
+            if page.page_type == 0x0d {
+                inspect(key, payload.as_deref())?;
+            }
+        }
+        if page.page_type == 0x05 {
+            let right = read_be_u32(&page.bytes, page.header_offset + 8);
+            validate_page_reference(image, right)?;
+            children.push(right);
+            for child_index in (0..children.len()).rev() {
+                stack.push(TableTask {
+                    page: children[child_index],
+                    depth: task.depth + 1,
+                    root: false,
+                    bounds: TableBounds {
+                        minimum_exclusive: if child_index == 0 {
+                            task.bounds.minimum_exclusive
+                        } else {
+                            Some(keys[child_index - 1])
+                        },
+                        maximum_inclusive: if child_index < keys.len() {
+                            Some(keys[child_index])
+                        } else {
+                            task.bounds.maximum_inclusive
+                        },
+                    },
+                });
+            }
+        } else if leaf_depth
+            .replace(task.depth)
+            .is_some_and(|depth| depth != task.depth)
+        {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite table b-tree leaves have inconsistent depths",
+            ));
+        }
+        finish_btree_page(image, page.occupied)?;
+    }
+    Ok(())
+}
+
+fn validate_index_btree(
+    image: &DatabaseImage<'_>,
+    root: u32,
+    columns: &'static [IndexColumn],
+    claimed: &mut HashSet<u32>,
+) -> Result<u64, StateError> {
+    let mut stack = vec![IndexTask {
+        page: root,
+        depth: 0,
+        root: true,
+        minimum_exclusive: None,
+        maximum_exclusive: None,
+    }];
+    let mut leaf_depth = None;
+    let mut entries = 0_u64;
+    while let Some(task) = stack.pop() {
+        let mut page = read_btree_page(image, claimed, task.page)?;
+        if !matches!(page.page_type, 0x02 | 0x0a) {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite index b-tree mixes table and index page types",
+            ));
+        }
+        if !task.root && page.cell_count == 0 {
+            return Err(invalid_path(
+                &image.database.path,
+                "non-root SQLite index b-tree page is empty",
+            ));
+        }
+        let mut keys = Vec::with_capacity(page.cell_count);
+        entries = entries
+            .checked_add(page.cell_count as u64)
+            .ok_or_else(|| invalid_path(&image.database.path, "SQLite index count overflowed"))?;
+        let mut children = Vec::with_capacity(page.cell_count + 1);
+        for index in 0..page.cell_count {
+            let offset = btree_cell_offset(image, &page, index)?;
+            let payload_offset = if page.page_type == 0x02 {
+                ensure_range(image, offset, 4, image.usable_size)?;
+                let child = read_be_u32(&page.bytes, offset);
+                validate_page_reference(image, child)?;
+                children.push(child);
+                offset + 4
+            } else {
+                offset
+            };
+            let (payload_size, payload_varint) =
+                read_sqlite_varint(&page.bytes, payload_offset, image.usable_size)?;
+            let payload = validate_cell_payload(
+                image,
+                &page.bytes,
+                payload_offset + payload_varint,
+                payload_size,
+                false,
+                claimed,
+                Some(MAX_RAW_INDEX_KEY_BYTES),
+            )?;
+            let key = parse_index_key(
+                &image.database.path,
+                payload
+                    .1
+                    .as_deref()
+                    .expect("bounded index payload collection is requested"),
+                columns,
+            )?;
+            if task
+                .minimum_exclusive
+                .as_ref()
+                .is_some_and(|minimum| key <= *minimum)
+                || task
+                    .maximum_exclusive
+                    .as_ref()
+                    .is_some_and(|maximum| key >= *maximum)
+                || keys.last().is_some_and(|previous| key <= *previous)
+            {
+                return Err(invalid_path(
+                    &image.database.path,
+                    "SQLite index keys or parent ranges are out of order",
+                ));
+            }
+            if payload.0 > image.usable_size {
+                return Err(invalid_path(
+                    &image.database.path,
+                    "SQLite index cell exceeds the usable page",
+                ));
+            }
+            page.occupied.push((offset, payload.0));
+            keys.push(key);
+        }
+        if page.page_type == 0x02 {
+            let right = read_be_u32(&page.bytes, page.header_offset + 8);
+            validate_page_reference(image, right)?;
+            children.push(right);
+            for child_index in (0..children.len()).rev() {
+                stack.push(IndexTask {
+                    page: children[child_index],
+                    depth: task.depth + 1,
+                    root: false,
+                    minimum_exclusive: if child_index == 0 {
+                        task.minimum_exclusive.clone()
+                    } else {
+                        Some(keys[child_index - 1].clone())
+                    },
+                    maximum_exclusive: if child_index < keys.len() {
+                        Some(keys[child_index].clone())
+                    } else {
+                        task.maximum_exclusive.clone()
+                    },
+                });
+            }
+        } else if leaf_depth
+            .replace(task.depth)
+            .is_some_and(|depth| depth != task.depth)
+        {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite index b-tree leaves have inconsistent depths",
+            ));
+        }
+        finish_btree_page(image, page.occupied)?;
+    }
+    Ok(entries)
+}
+
+fn validate_freeblocks(
+    image: &DatabaseImage<'_>,
+    page: &[u8],
+    mut offset: usize,
+    pointer_end: usize,
+) -> Result<Vec<(usize, usize)>, StateError> {
+    let mut ranges = Vec::new();
+    let mut previous = 0_usize;
+    while offset != 0 {
+        ensure_range(image, offset, 4, image.usable_size)?;
+        let next = usize::from(read_be_u16(page, offset));
+        let size = usize::from(read_be_u16(page, offset + 2));
+        if offset < pointer_end
+            || size < 4
+            || offset + size > image.usable_size
+            || offset <= previous
+            || (next != 0 && next <= offset)
+        {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite b-tree freeblock chain is invalid",
+            ));
+        }
+        ranges.push((offset, offset + size));
+        previous = offset;
+        offset = next;
+    }
+    Ok(ranges)
+}
+
+fn validate_cell_payload(
+    image: &DatabaseImage<'_>,
+    page: &[u8],
+    payload_start: usize,
+    payload_size: u64,
+    table_leaf: bool,
+    claimed: &mut HashSet<u32>,
+    collect_limit: Option<usize>,
+) -> Result<(usize, Option<Vec<u8>>), StateError> {
+    if payload_size > u64::from(u32::MAX) {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite cell payload exceeds SQLite format bounds",
+        ));
+    }
+    let payload_size = usize::try_from(payload_size).map_err(|_| {
+        invalid_path(
+            &image.database.path,
+            "SQLite cell payload exceeds platform bounds",
+        )
+    })?;
+    if collect_limit.is_some_and(|limit| payload_size > limit) {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite metadata key payload exceeds the offline verification bound",
+        ));
+    }
+    let min_local = ((image.usable_size - 12) * 32 / 255).saturating_sub(23);
+    let max_local = if table_leaf {
+        image.usable_size.saturating_sub(35)
+    } else {
+        ((image.usable_size - 12) * 64 / 255).saturating_sub(23)
+    };
+    let local = if payload_size <= max_local {
+        payload_size
+    } else {
+        let candidate = min_local + (payload_size - min_local) % (image.usable_size - 4);
+        if candidate > max_local {
+            min_local
+        } else {
+            candidate
+        }
+    };
+    let overflowed = payload_size > local;
+    let end = payload_start
+        .checked_add(local)
+        .and_then(|value| value.checked_add(usize::from(overflowed) * 4))
+        .ok_or_else(|| {
+            invalid_path(
+                &image.database.path,
+                "SQLite cell payload offset overflowed",
+            )
+        })?;
+    ensure_range(image, payload_start, end - payload_start, image.usable_size)?;
+    let mut payload = match collect_limit {
+        Some(_) => {
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(payload_size).map_err(|_| {
+                invalid_path(
+                    &image.database.path,
+                    "SQLite metadata key payload allocation failed",
+                )
+            })?;
+            Some(payload)
+        }
+        None => None,
+    };
+    if let Some(payload) = &mut payload {
+        payload.extend_from_slice(&page[payload_start..payload_start + local]);
+    }
+    let mut remaining = payload_size - local;
+    if remaining != 0 {
+        let mut overflow = read_be_u32(page, payload_start + local);
+        while remaining != 0 {
+            image.claim_page(
+                claimed,
+                overflow,
+                "SQLite overflow page is duplicated or out of bounds",
+            )?;
+            let overflow_page = image.read_page(overflow)?;
+            let next = read_be_u32(&overflow_page, 0);
+            let chunk = remaining.min(image.usable_size - 4);
+            if let Some(payload) = &mut payload {
+                payload.extend_from_slice(&overflow_page[4..4 + chunk]);
+            }
+            remaining -= chunk;
+            if remaining == 0 {
+                if next != 0 {
+                    return Err(invalid_path(
+                        &image.database.path,
+                        "SQLite overflow chain continues past its payload",
+                    ));
+                }
+            } else if next == 0 {
+                return Err(invalid_path(
+                    &image.database.path,
+                    "SQLite overflow chain ends before its payload",
+                ));
+            }
+            overflow = next;
+        }
+    }
+    Ok((end, payload))
+}
+
+fn validate_freelist(
+    image: &DatabaseImage<'_>,
+    header: SqliteHeader,
+    claimed: &mut HashSet<u32>,
+) -> Result<(), StateError> {
+    let mut trunk = header.freelist_trunk;
+    let mut count = 0_u32;
+    while trunk != 0 {
+        image.claim_page(
+            claimed,
+            trunk,
+            "SQLite freelist trunk is duplicated or out of bounds",
+        )?;
+        count = count.checked_add(1).ok_or_else(|| {
+            invalid_path(&image.database.path, "SQLite freelist count overflowed")
+        })?;
+        let page = image.read_page(trunk)?;
+        let next = read_be_u32(&page, 0);
+        let leaves = read_be_u32(&page, 4);
+        let maximum = (image.usable_size / 4).saturating_sub(2);
+        if leaves as usize > maximum {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite freelist trunk leaf count is invalid",
+            ));
+        }
+        for index in 0..leaves as usize {
+            let leaf = read_be_u32(&page, 8 + index * 4);
+            image.claim_page(
+                claimed,
+                leaf,
+                "SQLite freelist leaf is duplicated or out of bounds",
+            )?;
+            count = count.checked_add(1).ok_or_else(|| {
+                invalid_path(&image.database.path, "SQLite freelist count overflowed")
+            })?;
+        }
+        trunk = next;
+    }
+    if count != header.freelist_pages {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite freelist header count contradicts its pages",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum IndexColumn {
+    Integer,
+    Text,
+}
+
+const TEXT_ROWID_INDEX: &[IndexColumn] = &[IndexColumn::Text, IndexColumn::Integer];
+const TEXT_INTEGER_TEXT_ROWID_INDEX: &[IndexColumn] = &[
+    IndexColumn::Text,
+    IndexColumn::Integer,
+    IndexColumn::Text,
+    IndexColumn::Integer,
+];
+const INTEGER_TEXT_ROWID_INDEX: &[IndexColumn] = &[
+    IndexColumn::Integer,
+    IndexColumn::Text,
+    IndexColumn::Integer,
+];
+
+#[derive(Clone, Copy)]
+enum SchemaBtree {
+    Table,
+    Index(&'static [IndexColumn]),
+}
+
+struct SchemaRecord {
+    kind: String,
+    name: String,
+    table: String,
+    root: u32,
+    sql: Option<String>,
+}
+
+struct ValidatedSchemaObject {
+    name: String,
+    root: u32,
+    btree: SchemaBtree,
+}
+
+struct ExpectedSchemaObject {
+    kind: &'static str,
+    table: String,
+    sql: Option<String>,
+    btree: SchemaBtree,
+}
+
+struct RecordField<'payload> {
+    serial: u64,
+    bytes: &'payload [u8],
+}
+
+fn validate_schema_records(
+    path: &Path,
+    records: Vec<SchemaRecord>,
+    header: SqliteHeader,
+) -> Result<Vec<ValidatedSchemaObject>, StateError> {
+    if records.is_empty() {
+        if header.user_version != 0 || header.application_id != 0 {
+            return Err(invalid_path(
+                path,
+                "empty sqlite_schema contradicts the SQLite application header",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    if header.schema_format != 4
+        || header.encoding != 1
+        || header.user_version == 0
+        || header.user_version > crate::store::LATEST_SCHEMA_VERSION as u32
+        || header.application_id != crate::store::APPLICATION_ID as u32
+    {
+        return Err(invalid_path(
+            path,
+            "sqlite_schema contradicts the accepted application header",
+        ));
+    }
+    let mut expected = expected_schema_objects(path, header.user_version)?;
+    let mut observed = HashSet::with_capacity(records.len());
+    let mut validated = Vec::with_capacity(records.len());
+    for record in records {
+        if !observed.insert(record.name.clone()) {
+            return Err(invalid_path(
+                path,
+                "sqlite_schema contains duplicate object names",
+            ));
+        }
+        let Some(definition) = expected.remove(&record.name) else {
+            return Err(invalid_path(
+                path,
+                "sqlite_schema contains an object outside the accepted migration catalog",
+            ));
+        };
+        if record.kind != definition.kind
+            || record.table != definition.table
+            || record.sql.as_deref().map(normalize_schema_sql)
+                != definition.sql.as_deref().map(normalize_schema_sql)
+        {
+            return Err(invalid_path(
+                path,
+                "sqlite_schema object fields or SQL do not match the accepted migration catalog",
+            ));
+        }
+        validated.push(ValidatedSchemaObject {
+            name: record.name,
+            root: record.root,
+            btree: definition.btree,
+        });
+    }
+    if !expected.is_empty() {
+        return Err(invalid_path(
+            path,
+            "sqlite_schema omits objects required by its schema version",
+        ));
+    }
+    Ok(validated)
+}
+
+fn expected_schema_objects(
+    path: &Path,
+    version: u32,
+) -> Result<BTreeMap<String, ExpectedSchemaObject>, StateError> {
+    let mut expected = BTreeMap::new();
+    let sources = [
+        (0_u32, crate::store::MIGRATION_TABLE_SQL),
+        (1, include_str!("../migrations/0001_initial.sql")),
+        (2, include_str!("../migrations/0002_pagination_indexes.sql")),
+    ];
+    for (minimum_version, source) in sources {
+        if minimum_version > version {
+            continue;
+        }
+        for statement in source
+            .split(';')
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let mut sql = normalize_schema_sql(statement);
+            if let Some(suffix) = sql.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+                sql = format!("CREATE TABLE {suffix}");
+            }
+            let tokens = sql.split_whitespace().collect::<Vec<_>>();
+            let (kind, name, table, btree) = match tokens.as_slice() {
+                ["CREATE", "TABLE", name, ..] => (
+                    "table",
+                    (*name).to_owned(),
+                    (*name).to_owned(),
+                    SchemaBtree::Table,
+                ),
+                ["CREATE", "INDEX", name, "ON", table, ..] => {
+                    let table = table.split('(').next().unwrap_or(table).to_owned();
+                    let columns = accepted_index_columns(name).ok_or_else(|| {
+                        invalid_path(
+                            path,
+                            "accepted migration index has no raw key specification",
+                        )
+                    })?;
+                    (
+                        "index",
+                        (*name).to_owned(),
+                        table,
+                        SchemaBtree::Index(columns),
+                    )
+                }
+                _ => {
+                    return Err(invalid_path(
+                        path,
+                        "accepted migration SQL cannot be fingerprinted offline",
+                    ));
+                }
+            };
+            if expected
+                .insert(
+                    name,
+                    ExpectedSchemaObject {
+                        kind,
+                        table,
+                        sql: Some(sql),
+                        btree,
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid_path(
+                    path,
+                    "accepted migration catalog contains a duplicate object",
+                ));
+            }
+        }
+    }
+    if version >= 1 {
+        for (name, table) in [
+            ("sqlite_autoindex_sessions_1", "sessions"),
+            ("sqlite_autoindex_devices_1", "devices"),
+            (
+                "sqlite_autoindex_authentication_records_1",
+                "authentication_records",
+            ),
+            ("sqlite_autoindex_tasks_1", "tasks"),
+        ] {
+            expected.insert(
+                name.to_owned(),
+                ExpectedSchemaObject {
+                    kind: "index",
+                    table: table.to_owned(),
+                    sql: None,
+                    btree: SchemaBtree::Index(TEXT_ROWID_INDEX),
+                },
+            );
+        }
+    }
+    Ok(expected)
+}
+
+fn accepted_index_columns(name: &str) -> Option<&'static [IndexColumn]> {
+    match name {
+        "sqlite_autoindex_sessions_1"
+        | "sqlite_autoindex_devices_1"
+        | "sqlite_autoindex_authentication_records_1"
+        | "sqlite_autoindex_tasks_1" => Some(TEXT_ROWID_INDEX),
+        "authentication_records_device_order" | "tasks_session_order" => {
+            Some(TEXT_INTEGER_TEXT_ROWID_INDEX)
+        }
+        "sessions_creation_order" | "devices_creation_order" => Some(INTEGER_TEXT_ROWID_INDEX),
+        _ => None,
+    }
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_sqlite_schema_record(path: &Path, payload: &[u8]) -> Result<SchemaRecord, StateError> {
+    let fields = parse_sqlite_record(path, payload, 5)?;
+    if fields.len() != 5 {
+        return Err(invalid_path(
+            path,
+            "sqlite_schema record does not have five canonical columns",
+        ));
+    }
+    let kind = decode_sqlite_text(path, &fields[0], "sqlite_schema type")?;
+    let name = decode_sqlite_text(path, &fields[1], "sqlite_schema name")?;
+    let table = decode_sqlite_text(path, &fields[2], "sqlite_schema table name")?;
+    let root = decode_sqlite_integer(path, fields[3].serial, fields[3].bytes)?
+        .ok_or_else(|| invalid_path(path, "sqlite_schema root page is null"))?;
+    let root = u32::try_from(root)
+        .ok()
+        .filter(|root| *root != 0)
+        .ok_or_else(|| invalid_path(path, "sqlite_schema root page is outside SQLite bounds"))?;
+    let sql = if fields[4].serial == 0 {
+        None
+    } else {
+        Some(decode_sqlite_text(path, &fields[4], "sqlite_schema SQL")?)
+    };
+    Ok(SchemaRecord {
+        kind,
+        name,
+        table,
+        root,
+        sql,
+    })
+}
+
+fn parse_index_key(
+    path: &Path,
+    payload: &[u8],
+    columns: &[IndexColumn],
+) -> Result<IndexKey, StateError> {
+    let fields = parse_sqlite_record(path, payload, columns.len())?;
+    if fields.len() != columns.len() {
+        return Err(invalid_path(
+            path,
+            "SQLite index key has the wrong number of fields",
+        ));
+    }
+    let mut values = Vec::with_capacity(fields.len());
+    for (field, column) in fields.iter().zip(columns) {
+        values.push(match column {
+            IndexColumn::Integer => IndexValue::Integer(
+                decode_sqlite_integer(path, field.serial, field.bytes)?.ok_or_else(|| {
+                    invalid_path(path, "SQLite index integer key is unexpectedly null")
+                })?,
+            ),
+            IndexColumn::Text => IndexValue::Text(
+                decode_sqlite_text_bytes(path, field, "SQLite index text key")?.to_vec(),
+            ),
+        });
+    }
+    Ok(IndexKey(values))
+}
+
+struct LogicalRecord {
+    indexes: Vec<(&'static str, IndexKey)>,
+    references: Vec<(&'static str, Vec<u8>)>,
+    unique_id: Option<Vec<u8>>,
+    migration: bool,
+}
+
+fn verify_application_records(
+    image: &DatabaseImage<'_>,
+    schema: &[ValidatedSchemaObject],
+    index_counts: &BTreeMap<&str, u64>,
+    user_version: u32,
+) -> Result<(), StateError> {
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let mut expected_index_counts = index_counts
+        .keys()
+        .map(|name| (*name, 0_u64))
+        .collect::<BTreeMap<_, _>>();
+    let mut unique_ids = HashSet::new();
+    let mut migration_rows = 0_u32;
+    for table in schema
+        .iter()
+        .filter(|object| matches!(object.btree, SchemaBtree::Table))
+    {
+        let mut row_count = 0_u64;
+        let mut table_claimed = HashSet::new();
+        walk_table_btree(
+            image,
+            table.root,
+            &mut table_claimed,
+            Some(MAX_RAW_APPLICATION_ROW_BYTES),
+            &mut |rowid, payload| {
+                row_count = row_count.checked_add(1).ok_or_else(|| {
+                    invalid_path(&image.database.path, "SQLite table row count overflowed")
+                })?;
+                let payload = payload.ok_or_else(|| {
+                    invalid_path(
+                        &image.database.path,
+                        "SQLite application table leaf has no record payload",
+                    )
+                })?;
+                let logical = validate_application_record(
+                    &image.database.path,
+                    &table.name,
+                    rowid,
+                    payload,
+                    user_version,
+                )?;
+                if let Some(id) = logical.unique_id
+                    && !unique_ids.insert((table.name.clone(), id))
+                {
+                    return Err(invalid_path(
+                        &image.database.path,
+                        "SQLite application primary key is duplicated",
+                    ));
+                }
+                migration_rows += u32::from(logical.migration);
+                for (index_name, key) in logical.indexes {
+                    let index = schema_index(schema, index_name)?;
+                    let SchemaBtree::Index(columns) = index.btree else {
+                        unreachable!("accepted index object has index b-tree metadata");
+                    };
+                    if !index_contains_key(image, index.root, columns, &key)? {
+                        return Err(invalid_path(
+                            &image.database.path,
+                            "SQLite table row is missing its exact index entry",
+                        ));
+                    }
+                    let count = expected_index_counts.get_mut(index_name).ok_or_else(|| {
+                        invalid_path(
+                            &image.database.path,
+                            "SQLite application row targets an absent index",
+                        )
+                    })?;
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        invalid_path(
+                            &image.database.path,
+                            "SQLite expected index count overflowed",
+                        )
+                    })?;
+                }
+                for (index_name, prefix) in logical.references {
+                    let index = schema_index(schema, index_name)?;
+                    let SchemaBtree::Index(columns) = index.btree else {
+                        unreachable!("accepted reference index has index b-tree metadata");
+                    };
+                    if !index_contains_text_prefix(image, index.root, columns, &prefix)? {
+                        return Err(invalid_path(
+                            &image.database.path,
+                            "SQLite application row violates a foreign-key reference",
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if table.name == "claw_writer_lock" && row_count > 1 {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite application writer table has multiple singleton rows",
+            ));
+        }
+    }
+    if migration_rows != user_version {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite migration rows contradict the application user version",
+        ));
+    }
+    for (name, actual) in index_counts {
+        if expected_index_counts.get(name).copied() != Some(*actual) {
+            return Err(invalid_path(
+                &image.database.path,
+                "SQLite index contains missing or surplus application entries",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn schema_index<'schema>(
+    schema: &'schema [ValidatedSchemaObject],
+    name: &str,
+) -> Result<&'schema ValidatedSchemaObject, StateError> {
+    schema
+        .iter()
+        .find(|object| object.name == name)
+        .ok_or_else(|| invalid_path(Path::new("state.sqlite"), "accepted SQLite index is absent"))
+}
+
+fn validate_application_record(
+    path: &Path,
+    table: &str,
+    rowid: i64,
+    payload: &[u8],
+    user_version: u32,
+) -> Result<LogicalRecord, StateError> {
+    let expected_fields = match table {
+        "claw_schema_migrations" => 4,
+        "sessions" | "devices" => 5,
+        "authentication_records" | "tasks" => 8,
+        "claw_writer_lock" => 3,
+        _ => {
+            return Err(invalid_path(
+                path,
+                "SQLite application table is outside the accepted schema",
+            ));
+        }
+    };
+    let fields = parse_sqlite_record(path, payload, expected_fields)?;
+    let mut indexes = Vec::new();
+    let mut references = Vec::new();
+    let mut unique_id = None;
+    let mut migration = false;
+    match table {
+        "claw_schema_migrations" => {
+            require_field_count(path, &fields, 4)?;
+            require_rowid_alias(path, &fields[0])?;
+            let name = required_text(path, &fields[1], MAX_RAW_TEXT_FIELD_BYTES)?;
+            let checksum = required_text(path, &fields[2], 64)?;
+            let applied = required_integer(path, &fields[3])?;
+            if rowid <= 0 || rowid > i64::from(user_version) || applied < 0 {
+                return Err(invalid_path(
+                    path,
+                    "SQLite migration row values are invalid",
+                ));
+            }
+            let (expected_name, source) = match rowid {
+                1 => ("initial", include_str!("../migrations/0001_initial.sql")),
+                2 => (
+                    "pagination_indexes",
+                    include_str!("../migrations/0002_pagination_indexes.sql"),
+                ),
+                _ => {
+                    return Err(invalid_path(
+                        path,
+                        "SQLite migration version is unsupported",
+                    ));
+                }
+            };
+            if name != expected_name || checksum != migration_checksum(source) {
+                return Err(invalid_path(
+                    path,
+                    "SQLite migration row does not match the embedded migration",
+                ));
+            }
+            migration = true;
+        }
+        "sessions" => {
+            require_field_count(path, &fields, 5)?;
+            let id = required_id(path, &fields[0])?;
+            let status = required_text(path, &fields[1], 16)?;
+            let created = required_integer(path, &fields[2])?;
+            let updated = required_integer(path, &fields[3])?;
+            let version = required_integer(path, &fields[4])?;
+            if !matches!(status.as_str(), "active" | "archived")
+                || created < 0
+                || updated < created
+                || version < 1
+            {
+                return Err(invalid_path(
+                    path,
+                    "SQLite session row violates its constraints",
+                ));
+            }
+            indexes.push((
+                "sqlite_autoindex_sessions_1",
+                IndexKey(vec![
+                    IndexValue::Text(id.clone()),
+                    IndexValue::Integer(rowid),
+                ]),
+            ));
+            if user_version >= 2 {
+                indexes.push((
+                    "sessions_creation_order",
+                    IndexKey(vec![
+                        IndexValue::Integer(created),
+                        IndexValue::Text(id.clone()),
+                        IndexValue::Integer(rowid),
+                    ]),
+                ));
+            }
+            unique_id = Some(id);
+        }
+        "devices" => {
+            require_field_count(path, &fields, 5)?;
+            let id = required_id(path, &fields[0])?;
+            let display_name = required_text(path, &fields[1], MAX_RAW_TEXT_FIELD_BYTES)?;
+            let created = required_integer(path, &fields[2])?;
+            let updated = required_integer(path, &fields[3])?;
+            let version = required_integer(path, &fields[4])?;
+            if !valid_model_text(&display_name) || created < 0 || updated < created || version < 1 {
+                return Err(invalid_path(
+                    path,
+                    "SQLite device row violates its constraints",
+                ));
+            }
+            indexes.push((
+                "sqlite_autoindex_devices_1",
+                IndexKey(vec![
+                    IndexValue::Text(id.clone()),
+                    IndexValue::Integer(rowid),
+                ]),
+            ));
+            if user_version >= 2 {
+                indexes.push((
+                    "devices_creation_order",
+                    IndexKey(vec![
+                        IndexValue::Integer(created),
+                        IndexValue::Text(id.clone()),
+                        IndexValue::Integer(rowid),
+                    ]),
+                ));
+            }
+            unique_id = Some(id);
+        }
+        "authentication_records" => {
+            require_field_count(path, &fields, 8)?;
+            let id = required_id(path, &fields[0])?;
+            let device_id = required_id(path, &fields[1])?;
+            let provider = required_text(path, &fields[2], MAX_RAW_TEXT_FIELD_BYTES)?;
+            let subject = optional_text(path, &fields[3], MAX_RAW_TEXT_FIELD_BYTES)?;
+            let status = required_text(path, &fields[4], 16)?;
+            let created = required_integer(path, &fields[5])?;
+            let updated = required_integer(path, &fields[6])?;
+            let version = required_integer(path, &fields[7])?;
+            let valid_subject = match status.as_str() {
+                "authorized" => subject.as_deref().is_some_and(valid_model_text),
+                "pending" | "revoked" => subject.is_none(),
+                _ => false,
+            };
+            if !valid_model_text(&provider)
+                || !valid_subject
+                || created < 0
+                || updated < created
+                || version < 1
+            {
+                return Err(invalid_path(
+                    path,
+                    "SQLite authentication row violates its constraints",
+                ));
+            }
+            indexes.push((
+                "sqlite_autoindex_authentication_records_1",
+                IndexKey(vec![
+                    IndexValue::Text(id.clone()),
+                    IndexValue::Integer(rowid),
+                ]),
+            ));
+            indexes.push((
+                "authentication_records_device_order",
+                IndexKey(vec![
+                    IndexValue::Text(device_id.clone()),
+                    IndexValue::Integer(created),
+                    IndexValue::Text(id.clone()),
+                    IndexValue::Integer(rowid),
+                ]),
+            ));
+            references.push(("sqlite_autoindex_devices_1", device_id));
+            unique_id = Some(id);
+        }
+        "tasks" => {
+            require_field_count(path, &fields, 8)?;
+            let id = required_id(path, &fields[0])?;
+            let session_id = required_id(path, &fields[1])?;
+            let kind = required_text(path, &fields[2], MAX_RAW_TEXT_FIELD_BYTES)?;
+            let _payload = required_text(path, &fields[3], MAX_RAW_APPLICATION_ROW_BYTES)?;
+            let status = required_text(path, &fields[4], 16)?;
+            let created = required_integer(path, &fields[5])?;
+            let updated = required_integer(path, &fields[6])?;
+            let version = required_integer(path, &fields[7])?;
+            if !valid_model_text(&kind)
+                || !matches!(
+                    status.as_str(),
+                    "pending" | "running" | "succeeded" | "failed" | "cancelled"
+                )
+                || created < 0
+                || updated < created
+                || version < 1
+            {
+                return Err(invalid_path(
+                    path,
+                    "SQLite task row violates its constraints",
+                ));
+            }
+            indexes.push((
+                "sqlite_autoindex_tasks_1",
+                IndexKey(vec![
+                    IndexValue::Text(id.clone()),
+                    IndexValue::Integer(rowid),
+                ]),
+            ));
+            indexes.push((
+                "tasks_session_order",
+                IndexKey(vec![
+                    IndexValue::Text(session_id.clone()),
+                    IndexValue::Integer(created),
+                    IndexValue::Text(id.clone()),
+                    IndexValue::Integer(rowid),
+                ]),
+            ));
+            references.push(("sqlite_autoindex_sessions_1", session_id));
+            unique_id = Some(id);
+        }
+        "claw_writer_lock" => {
+            require_field_count(path, &fields, 3)?;
+            require_rowid_alias(path, &fields[0])?;
+            let owner = required_text(path, &fields[1], MAX_RAW_TEXT_FIELD_BYTES)?;
+            let acquired = required_integer(path, &fields[2])?;
+            if rowid != 1 || owner.is_empty() || acquired < 0 {
+                return Err(invalid_path(
+                    path,
+                    "SQLite application writer row violates its constraints",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid_path(
+                path,
+                "SQLite application table is outside the accepted schema",
+            ));
+        }
+    }
+    Ok(LogicalRecord {
+        indexes,
+        references,
+        unique_id,
+        migration,
+    })
+}
+
+fn valid_model_text(value: &str) -> bool {
+    !value.contains('\0') && !value.trim().is_empty()
+}
+
+fn require_field_count(
+    path: &Path,
+    fields: &[RecordField<'_>],
+    expected: usize,
+) -> Result<(), StateError> {
+    if fields.len() != expected {
+        return Err(invalid_path(
+            path,
+            "SQLite application record has the wrong field count",
+        ));
+    }
+    Ok(())
+}
+
+fn require_rowid_alias(path: &Path, field: &RecordField<'_>) -> Result<(), StateError> {
+    if field.serial != 0 {
+        return Err(invalid_path(
+            path,
+            "SQLite INTEGER PRIMARY KEY record field is not null",
+        ));
+    }
+    Ok(())
+}
+
+fn required_integer(path: &Path, field: &RecordField<'_>) -> Result<i64, StateError> {
+    decode_sqlite_integer(path, field.serial, field.bytes)?
+        .ok_or_else(|| invalid_path(path, "SQLite application integer field is null"))
+}
+
+fn required_id(path: &Path, field: &RecordField<'_>) -> Result<Vec<u8>, StateError> {
+    let id = required_text(path, field, MAX_RAW_ID_BYTES)?;
+    if id.trim() != id || id.is_empty() || id.chars().any(char::is_control) {
+        return Err(invalid_path(
+            path,
+            "SQLite application identifier is not canonical",
+        ));
+    }
+    Ok(id.into_bytes())
+}
+
+fn required_text(
+    path: &Path,
+    field: &RecordField<'_>,
+    maximum: usize,
+) -> Result<String, StateError> {
+    let bytes = decode_sqlite_text_bytes(path, field, "SQLite application text")?;
+    if bytes.len() > maximum {
+        return Err(invalid_path(
+            path,
+            "SQLite application text exceeds its offline verification bound",
+        ));
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| invalid_path(path, "SQLite application text is not valid UTF-8"))
+}
+
+fn optional_text(
+    path: &Path,
+    field: &RecordField<'_>,
+    maximum: usize,
+) -> Result<Option<String>, StateError> {
+    if field.serial == 0 {
+        Ok(None)
+    } else {
+        required_text(path, field, maximum).map(Some)
+    }
+}
+
+fn migration_checksum(sql: &str) -> String {
+    let normalized = sql.replace("\r\n", "\n").replace('\r', "\n");
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn read_index_search_page(
+    image: &DatabaseImage<'_>,
+    page_number: u32,
+    columns: &'static [IndexColumn],
+    claimed: &mut HashSet<u32>,
+) -> Result<(u8, Vec<IndexKey>, Vec<u32>), StateError> {
+    let mut page = read_btree_page(image, claimed, page_number)?;
+    if !matches!(page.page_type, 0x02 | 0x0a) {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite index search reached a non-index page",
+        ));
+    }
+    let mut keys = Vec::with_capacity(page.cell_count);
+    let mut children = Vec::with_capacity(page.cell_count + 1);
+    for index in 0..page.cell_count {
+        let offset = btree_cell_offset(image, &page, index)?;
+        let payload_offset = if page.page_type == 0x02 {
+            let child = read_be_u32(&page.bytes, offset);
+            validate_page_reference(image, child)?;
+            children.push(child);
+            offset + 4
+        } else {
+            offset
+        };
+        let (payload_size, payload_varint) =
+            read_sqlite_varint(&page.bytes, payload_offset, image.usable_size)?;
+        let payload = validate_cell_payload(
+            image,
+            &page.bytes,
+            payload_offset + payload_varint,
+            payload_size,
+            false,
+            claimed,
+            Some(MAX_RAW_INDEX_KEY_BYTES),
+        )?;
+        let key = parse_index_key(
+            &image.database.path,
+            payload
+                .1
+                .as_deref()
+                .expect("index search requests bounded payload collection"),
+            columns,
+        )?;
+        page.occupied.push((offset, payload.0));
+        keys.push(key);
+    }
+    if page.page_type == 0x02 {
+        let right = read_be_u32(&page.bytes, page.header_offset + 8);
+        validate_page_reference(image, right)?;
+        children.push(right);
+    }
+    finish_btree_page(image, page.occupied)?;
+    Ok((page.page_type, keys, children))
+}
+
+fn index_contains_key(
+    image: &DatabaseImage<'_>,
+    root: u32,
+    columns: &'static [IndexColumn],
+    target: &IndexKey,
+) -> Result<bool, StateError> {
+    let mut page = root;
+    let mut claimed = HashSet::new();
+    loop {
+        let (page_type, keys, children) =
+            read_index_search_page(image, page, columns, &mut claimed)?;
+        match keys.binary_search(target) {
+            Ok(_) => return Ok(true),
+            Err(_) if page_type == 0x0a => return Ok(false),
+            Err(child) => page = children[child],
+        }
+    }
+}
+
+fn index_contains_text_prefix(
+    image: &DatabaseImage<'_>,
+    root: u32,
+    columns: &'static [IndexColumn],
+    target: &[u8],
+) -> Result<bool, StateError> {
+    let mut page = root;
+    let mut claimed = HashSet::new();
+    loop {
+        let (page_type, keys, children) =
+            read_index_search_page(image, page, columns, &mut claimed)?;
+        let mut child = keys.len();
+        for (index, key) in keys.iter().enumerate() {
+            let Some(IndexValue::Text(value)) = key.0.first() else {
+                return Err(invalid_path(
+                    &image.database.path,
+                    "SQLite reference index does not begin with text",
+                ));
+            };
+            match value.as_slice().cmp(target) {
+                std::cmp::Ordering::Equal => return Ok(true),
+                std::cmp::Ordering::Greater => {
+                    child = index;
+                    break;
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        if page_type == 0x0a {
+            return Ok(false);
+        }
+        page = children[child];
+    }
+}
+
+fn parse_sqlite_record<'payload>(
+    path: &Path,
+    payload: &'payload [u8],
+    maximum_fields: usize,
+) -> Result<Vec<RecordField<'payload>>, StateError> {
+    let (header_size, header_varint) = read_sqlite_varint(payload, 0, payload.len())?;
+    let header_size = usize::try_from(header_size)
+        .map_err(|_| invalid_path(path, "SQLite record header is too large"))?;
+    if header_size < header_varint || header_size > payload.len() {
+        return Err(invalid_path(path, "SQLite record header is invalid"));
+    }
+    let mut serials = Vec::with_capacity(maximum_fields);
+    let mut cursor = header_varint;
+    while cursor < header_size {
+        if serials.len() == maximum_fields {
+            return Err(invalid_path(
+                path,
+                "SQLite record has more fields than its accepted schema",
+            ));
+        }
+        let (serial, length) = read_sqlite_varint(payload, cursor, header_size)?;
+        serials.push(serial);
+        cursor += length;
+    }
+    if cursor != header_size {
+        return Err(invalid_path(path, "SQLite record header is malformed"));
+    }
+    let mut data = header_size;
+    let mut fields = Vec::with_capacity(serials.len());
+    for serial in serials {
+        let length = sqlite_serial_length(path, serial)?;
+        ensure_slice(path, payload, data, length)?;
+        fields.push(RecordField {
+            serial,
+            bytes: &payload[data..data + length],
+        });
+        data += length;
+    }
+    if data != payload.len() {
+        return Err(invalid_path(
+            path,
+            "SQLite record payload length is invalid",
+        ));
+    }
+    Ok(fields)
+}
+
+fn decode_sqlite_text(
+    path: &Path,
+    field: &RecordField<'_>,
+    field_name: &'static str,
+) -> Result<String, StateError> {
+    let bytes = decode_sqlite_text_bytes(path, field, field_name)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| invalid_path(path, "SQLite schema text is not valid UTF-8"))
+}
+
+fn decode_sqlite_text_bytes<'field>(
+    path: &Path,
+    field: &'field RecordField<'_>,
+    _field_name: &'static str,
+) -> Result<&'field [u8], StateError> {
+    if field.serial < 13 || field.serial.is_multiple_of(2) {
+        return Err(invalid_path(
+            path,
+            "SQLite text field does not use a text serial type",
+        ));
+    }
+    Ok(field.bytes)
+}
+
+fn sqlite_serial_length(path: &Path, serial: u64) -> Result<usize, StateError> {
+    match serial {
+        0 | 8 | 9 => Ok(0),
+        1 => Ok(1),
+        2 => Ok(2),
+        3 => Ok(3),
+        4 => Ok(4),
+        5 => Ok(6),
+        6 | 7 => Ok(8),
+        10 | 11 => Err(invalid_path(
+            path,
+            "SQLite record uses a reserved serial type",
+        )),
+        value if value >= 12 => usize::try_from((value - 12) / 2)
+            .map_err(|_| invalid_path(path, "SQLite record serial length exceeds platform bounds")),
+        _ => unreachable!("all SQLite serial types are covered"),
+    }
+}
+
+fn decode_sqlite_integer(
+    path: &Path,
+    serial: u64,
+    bytes: &[u8],
+) -> Result<Option<i64>, StateError> {
+    match serial {
+        0 => Ok(None),
+        8 => Ok(Some(0)),
+        9 => Ok(Some(1)),
+        1..=6 => {
+            let mut value = if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+                -1_i64
+            } else {
+                0_i64
+            };
+            for byte in bytes {
+                value = (value << 8) | i64::from(*byte);
+            }
+            Ok(Some(value))
+        }
+        _ => Err(invalid_path(path, "SQLite record field is not an integer")),
+    }
+}
+
+fn read_sqlite_varint(
+    bytes: &[u8],
+    offset: usize,
+    limit: usize,
+) -> Result<(u64, usize), StateError> {
+    if offset >= limit || limit > bytes.len() {
+        return Err(invalid_path(
+            Path::new("state.sqlite"),
+            "SQLite varint starts outside its field",
+        ));
+    }
+    let mut value = 0_u64;
+    for index in 0..9 {
+        let position = offset + index;
+        if position >= limit {
+            return Err(invalid_path(
+                Path::new("state.sqlite"),
+                "SQLite varint is truncated",
+            ));
+        }
+        let byte = bytes[position];
+        if index == 8 {
+            return Ok(((value << 8) | u64::from(byte), 9));
+        }
+        value = (value << 7) | u64::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+    }
+    unreachable!("nine-byte SQLite varint returns")
+}
+
+fn validate_page_reference(image: &DatabaseImage<'_>, page: u32) -> Result<(), StateError> {
+    if page == 0 || page > image.logical_pages {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite b-tree child page is out of bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_range(
+    image: &DatabaseImage<'_>,
+    offset: usize,
+    length: usize,
+    limit: usize,
+) -> Result<(), StateError> {
+    if offset.checked_add(length).is_none_or(|end| end > limit) {
+        return Err(invalid_path(
+            &image.database.path,
+            "SQLite page field exceeds its usable bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_slice(path: &Path, bytes: &[u8], offset: usize, length: usize) -> Result<(), StateError> {
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > bytes.len())
+    {
+        return Err(invalid_path(
+            path,
+            "SQLite record field exceeds its payload",
+        ));
+    }
+    Ok(())
+}
+
+fn read_be_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("validated SQLite u16 field is in bounds"),
+    )
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("validated SQLite u32 field is in bounds"),
+    )
 }
 
 fn validate_offline_wal(
@@ -927,31 +3095,23 @@ fn validate_offline_wal(
     database_page_size: u64,
     cutoff: Instant,
     timeout_ms: u64,
-) -> Result<(), StateError> {
+) -> Result<WalObservation, StateError> {
     let length = wal
         .file
         .metadata()
         .map_err(|error| file_error("inspect initialized LinuxProtected WAL", &wal.path, error))?
         .len();
-    if length == 0 {
-        return Ok(());
-    }
-    if length < 32 {
-        return Err(invalid_path(
-            &wal.path,
-            "initialized LinuxProtected WAL header is truncated",
-        ));
+    if length <= 32 {
+        return Ok(WalObservation {
+            committed_pages: None,
+            page_one: None,
+            frames: BTreeMap::new(),
+        });
     }
     let frame_size = 24_u64
         .checked_add(database_page_size)
         .ok_or_else(|| invalid_path(&wal.path, "LinuxProtected WAL frame size overflowed"))?;
     let payload = length - 32;
-    if payload == 0 || payload % frame_size != 0 {
-        return Err(invalid_path(
-            &wal.path,
-            "initialized LinuxProtected WAL has a partial frame",
-        ));
-    }
 
     let mut header = [0_u8; 32];
     read_exact_at(
@@ -998,6 +3158,10 @@ fn validate_offline_wal(
     let page_size =
         usize::try_from(database_page_size).expect("validated SQLite page size fits this platform");
     let mut page = vec![0_u8; page_size];
+    let mut latest_commit = None;
+    let mut committed_frames = BTreeMap::new();
+    let mut pending_frames = BTreeMap::new();
+    let mut transaction_max_page = 0_u32;
     for frame_index in 0..frame_count {
         check_cutoff(&wal.path, Some(cutoff), None, timeout_ms)?;
         let offset = 32_u64
@@ -1030,18 +3194,34 @@ fn validate_offline_wal(
                 .expect("fixed WAL frame page number is in bounds"),
         );
         if !(1..=0xffff_fffe).contains(&page_number) || &frame_header[8..16] != salts {
-            return Err(invalid_path(
-                &wal.path,
-                "initialized LinuxProtected WAL frame identity is invalid",
-            ));
+            break;
         }
-        checksum = wal_checksum(&frame_header[..8], big_endian_checksum, checksum);
-        checksum = wal_checksum(&page, big_endian_checksum, checksum);
-        if checksum != stored_wal_checksum(&frame_header[16..24]) {
-            return Err(invalid_path(
-                &wal.path,
-                "initialized LinuxProtected WAL frame checksum is invalid",
-            ));
+        let mut next_checksum = wal_checksum(&frame_header[..8], big_endian_checksum, checksum);
+        next_checksum = wal_checksum(&page, big_endian_checksum, next_checksum);
+        if next_checksum != stored_wal_checksum(&frame_header[16..24]) {
+            break;
+        }
+        checksum = next_checksum;
+        transaction_max_page = transaction_max_page.max(page_number);
+        pending_frames.insert(page_number, offset + 24);
+        let database_pages = u32::from_be_bytes(
+            frame_header[4..8]
+                .try_into()
+                .expect("fixed WAL commit size is in bounds"),
+        );
+        if database_pages != 0 {
+            if database_pages < transaction_max_page {
+                return Err(invalid_path(
+                    &wal.path,
+                    "initialized LinuxProtected WAL commit size omits a transaction page",
+                ));
+            }
+            latest_commit = Some(database_pages);
+            for (page_number, frame_offset) in std::mem::take(&mut pending_frames) {
+                committed_frames.insert(page_number, frame_offset);
+            }
+            committed_frames.retain(|page_number, _| *page_number <= database_pages);
+            transaction_max_page = 0;
         }
     }
     if wal
@@ -1056,7 +3236,27 @@ fn validate_offline_wal(
             "initialized LinuxProtected WAL length changed during verification",
         ));
     }
-    Ok(())
+    let committed_page_one = committed_frames
+        .get(&1)
+        .map(|offset| {
+            let mut bytes = vec![0_u8; page_size];
+            read_exact_at(
+                &wal.file,
+                &mut bytes,
+                *offset,
+                &wal.path,
+                Some(cutoff),
+                None,
+                timeout_ms,
+            )?;
+            Ok::<_, StateError>(bytes)
+        })
+        .transpose()?;
+    Ok(WalObservation {
+        committed_pages: latest_commit,
+        page_one: committed_page_one,
+        frames: committed_frames,
+    })
 }
 
 fn wal_checksum(bytes: &[u8], big_endian: bool, mut checksum: [u32; 2]) -> [u32; 2] {
@@ -1124,9 +3324,19 @@ pub(crate) fn initialize_offline(
     let timeout_ms = u64::try_from(OFFLINE_INITIALIZE_TIMEOUT.as_millis())
         .expect("fixed offline timeout fits u64");
     let spec = LinuxProtectedSpec::new(directory.to_owned(), service_uid, service_gid);
+    let preflight = OfflineNamespacePreflight::open(&spec)?;
+    let _writer_lock = crate::store::acquire_linux_protected_offline_lock(&preflight)?;
     let namespace = ProtectedNamespace::open_for_offline_initialization(&spec)?;
+    preflight.verify_locked_namespace(&namespace)?;
     let state = namespace.offline_state(work_cutoff, timeout_ms)?;
     let identities = namespace.captured_identities();
+    if state == OfflineNamespaceState::Initialized {
+        namespace.verify_captured_identities(identities)?;
+        check_initializer_deadline(deadline, timeout_ms)?;
+        namespace.validate_runtime_layout(deadline, timeout_ms)?;
+        check_initializer_deadline(deadline, timeout_ms)?;
+        return Ok(LinuxProtectedInitialization::AlreadyInitialized);
+    }
     if Instant::now() >= work_cutoff {
         return Err(StateError::OperationTimedOut {
             operation: "initialize LinuxProtected state offline",
@@ -1148,7 +3358,6 @@ pub(crate) fn initialize_offline(
                 })?;
             let result = runtime.block_on(run_offline_sqlite(
                 &worker_namespace,
-                state,
                 work_cutoff,
                 deadline,
                 timeout_ms,
@@ -1170,23 +3379,14 @@ pub(crate) fn initialize_offline(
     })??;
     namespace.verify_captured_identities(identities)?;
     check_initializer_deadline(deadline, timeout_ms)?;
-
-    match state {
-        OfflineNamespaceState::Fresh => {
-            namespace.initialize_empty_selector()?;
-            check_initializer_deadline(deadline, timeout_ms)?;
-            namespace.verify_captured_identities(identities)?;
-            check_initializer_deadline(deadline, timeout_ms)?;
-            namespace.validate_runtime_layout(deadline, timeout_ms)?;
-            check_initializer_deadline(deadline, timeout_ms)?;
-            Ok(LinuxProtectedInitialization::Initialized)
-        }
-        OfflineNamespaceState::Initialized => {
-            namespace.validate_runtime_layout(deadline, timeout_ms)?;
-            check_initializer_deadline(deadline, timeout_ms)?;
-            Ok(LinuxProtectedInitialization::AlreadyInitialized)
-        }
-    }
+    namespace.validate_fresh_sqlite_handoff(deadline, timeout_ms)?;
+    namespace.initialize_empty_selector()?;
+    check_initializer_deadline(deadline, timeout_ms)?;
+    namespace.verify_captured_identities(identities)?;
+    check_initializer_deadline(deadline, timeout_ms)?;
+    namespace.validate_runtime_layout(deadline, timeout_ms)?;
+    check_initializer_deadline(deadline, timeout_ms)?;
+    Ok(LinuxProtectedInitialization::Initialized)
 }
 
 fn check_initializer_deadline(deadline: Instant, timeout_ms: u64) -> Result<(), StateError> {
@@ -1201,13 +3401,14 @@ fn check_initializer_deadline(deadline: Instant, timeout_ms: u64) -> Result<(), 
 
 async fn run_offline_sqlite(
     namespace: &ProtectedNamespace,
-    state: OfflineNamespaceState,
     work_cutoff: Instant,
     deadline: Instant,
     timeout_ms: u64,
 ) -> Result<(), StateError> {
+    namespace.verify()?;
+    let held_database_path = namespace.held_offline_database_path();
     let options = SqliteConnectOptions::new()
-        .filename(namespace.database_path())
+        .filename(&held_database_path)
         .create_if_missing(false)
         .vfs("unix-excl")
         .locking_mode(SqliteLockingMode::Exclusive)
@@ -1217,8 +3418,10 @@ async fn run_offline_sqlite(
         .await
         .map_err(|error| database("open LinuxProtected database offline", error))?;
 
-    let mut result =
-        verify_offline_connection(namespace, &mut connection, state, work_cutoff).await;
+    let mut result = verify_offline_live_identity(namespace, &mut connection).await;
+    if result.is_ok() {
+        result = verify_offline_connection(namespace, &mut connection, work_cutoff).await;
+    }
     if result.is_err() && Instant::now() >= work_cutoff {
         result = Err(StateError::OperationTimedOut {
             operation: "initialize LinuxProtected state offline",
@@ -1275,7 +3478,6 @@ async fn clear_offline_progress_handler(
 async fn verify_offline_connection(
     namespace: &ProtectedNamespace,
     connection: &mut SqliteConnection,
-    state: OfflineNamespaceState,
     work_cutoff: Instant,
 ) -> Result<(), StateError> {
     claw_sqlite_file_control::enable_persistent_wal(connection)
@@ -1291,6 +3493,7 @@ async fn verify_offline_connection(
         .map_err(|error| {
             file_control_error("disable LinuxProtected offline checkpoint-on-close", error)
         })?;
+    verify_offline_live_identity(namespace, connection).await?;
     {
         let mut handle = connection
             .lock_handle()
@@ -1319,6 +3522,18 @@ async fn verify_offline_connection(
             "LinuxProtected offline initializer requires exclusive locking mode",
         ));
     }
+    verify_offline_live_identity(namespace, connection).await?;
+    let memory_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = MEMORY")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| database("prepare in-memory SQLite journal handoff", error))?;
+    if memory_mode != "memory" {
+        return Err(invalid_path(
+            namespace.database_path(),
+            "LinuxProtected offline initializer requires an in-memory transition journal",
+        ));
+    }
+    verify_offline_live_identity(namespace, connection).await?;
     let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
         .fetch_one(&mut *connection)
         .await
@@ -1329,54 +3544,28 @@ async fn verify_offline_connection(
             "LinuxProtected offline initializer requires WAL journal mode",
         ));
     }
+    verify_offline_live_identity(namespace, connection).await?;
 
-    if state == OfflineNamespaceState::Fresh {
-        sqlx::raw_sql(
-            "CREATE TABLE gta_claw_offline_initialization_probe(value INTEGER);
-             DROP TABLE gta_claw_offline_initialization_probe;",
-        )
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| database("materialize offline SQLite WAL handoff", error))?;
-        let checkpoint = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(|error| database("checkpoint offline SQLite WAL handoff", error))?;
-        let busy = checkpoint
-            .try_get::<i64, _>(0)
-            .map_err(|error| database("read offline checkpoint busy result", error))?;
-        if busy != 0 || namespace.wal_length()? != 0 {
-            return Err(invalid_path(
-                namespace.database_path(),
-                "fresh LinuxProtected WAL handoff did not checkpoint cleanly",
-            ));
-        }
-        let application_objects = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_schema
-             WHERE name NOT LIKE 'sqlite_%'",
-        )
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|error| database("verify empty offline SQLite schema", error))?;
-        if application_objects != 0 {
-            return Err(invalid_path(
-                namespace.database_path(),
-                "offline initialization left application schema objects",
-            ));
-        }
-    }
+    Ok(())
+}
 
-    let integrity = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
-        .fetch_all(&mut *connection)
+async fn verify_offline_live_identity(
+    namespace: &ProtectedNamespace,
+    connection: &mut SqliteConnection,
+) -> Result<(), StateError> {
+    namespace.verify()?;
+    if claw_sqlite_file_control::main_database_has_moved(connection)
         .await
-        .map_err(|error| database("verify offline SQLite integrity", error))?;
-    if integrity.as_slice() != ["ok"] {
+        .map_err(|error| {
+            file_control_error("verify LinuxProtected offline database identity", error)
+        })?
+    {
         return Err(invalid_path(
             namespace.database_path(),
-            "LinuxProtected database failed offline SQLite integrity verification",
+            "SQLite offline connection no longer names the held LinuxProtected database",
         ));
     }
-    Ok(())
+    namespace.verify()
 }
 
 fn file_control_error(

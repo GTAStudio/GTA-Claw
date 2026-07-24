@@ -19,7 +19,7 @@ use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 
 use crate::error::{database, database_code};
 #[cfg(target_os = "linux")]
-use crate::linux_protected::{LinuxProtectedSpec, ProtectedNamespace};
+use crate::linux_protected::{LinuxProtectedSpec, OfflineNamespacePreflight, ProtectedNamespace};
 #[cfg(target_os = "linux")]
 use crate::protected_catalog::{
     self, RecoveredSnapshot, SelectorCell, SlotObservation, SnapshotMetadata,
@@ -29,10 +29,10 @@ use crate::{
     AuthenticationRepository, DeviceRepository, SessionRepository, StateError, TaskRepository,
 };
 
-const APPLICATION_ID: i64 = 0x4754_4143;
+pub(crate) const APPLICATION_ID: i64 = 0x4754_4143;
 type PoolTransactionConnection =
     claw_sqlite_file_control::ManualTransaction<sqlx::pool::PoolConnection<sqlx::Sqlite>>;
-const LATEST_SCHEMA_VERSION: i64 = 2;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 2;
 const SNAPSHOT_PROVENANCE_OWNER: &str = "gta-claw-standalone-snapshot-v1";
 #[cfg(unix)]
 const UNIX_LOCK_IDENTITY_XATTR: &str = "user.gta-claw.writer-lock-path";
@@ -1725,7 +1725,7 @@ enum FinalConnectionCloseFailure {
     Error,
     Timeout,
 }
-const MIGRATION_TABLE_SQL: &str = "
+pub(crate) const MIGRATION_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS claw_schema_migrations (
     version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
     name TEXT NOT NULL,
@@ -11521,6 +11521,54 @@ fn acquire_writer_lock(path: &Path) -> Result<File, StateError> {
 
 #[cfg(target_os = "linux")]
 fn acquire_linux_protected_store_lock(
+    namespace: &Arc<ProtectedNamespace>,
+) -> Result<(PathBuf, File, ProcessIdentityGuard), StateError> {
+    acquire_linux_protected_store_lock_inner(namespace)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxProtectedOfflineLock {
+    _lock_file: File,
+    _process_identity: ProcessIdentityGuard,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_linux_protected_offline_lock(
+    preflight: &OfflineNamespacePreflight,
+) -> Result<LinuxProtectedOfflineLock, StateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let database_file = preflight.clone_database()?;
+    let metadata = database_file.metadata().map_err(|error| {
+        file_error(
+            "inspect offline LinuxProtected process identity",
+            preflight.database_path(),
+            error,
+        )
+    })?;
+    let identity = (metadata.dev(), metadata.ino());
+    if !PROCESS_IDENTITIES
+        .lock()
+        .expect("process identity registry lock poisoned")
+        .insert(identity)
+    {
+        return Err(StateError::StoreLocked {
+            path: preflight.writer_lock_path().to_owned(),
+        });
+    }
+    let process_identity = ProcessIdentityGuard {
+        identity: Some(identity),
+    };
+    let lock_file = preflight.clone_writer_lock()?;
+    acquire_private_lock(preflight.writer_lock_path(), &lock_file)?;
+    Ok(LinuxProtectedOfflineLock {
+        _lock_file: lock_file,
+        _process_identity: process_identity,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_protected_store_lock_inner(
     namespace: &Arc<ProtectedNamespace>,
 ) -> Result<(PathBuf, File, ProcessIdentityGuard), StateError> {
     use std::os::unix::fs::MetadataExt as _;

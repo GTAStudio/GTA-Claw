@@ -6,10 +6,456 @@ use std::fmt::{self, Display, Formatter};
 use std::ptr::NonNull;
 #[cfg(test)]
 use std::sync::atomic::AtomicI32;
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
+
+static PROCESS_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_LIFECYCLE: AtomicU8 = AtomicU8::new(PROCESS_STARTING);
+static PROCESS_SIGNAL_WAKE_FAILED: AtomicBool = AtomicBool::new(false);
+static PROCESS_SIGNAL_INSTALLED: AtomicBool = AtomicBool::new(false);
+const PROCESS_STARTING: u8 = 0;
+const PROCESS_READY: u8 = 1;
+const PROCESS_STOPPING: u8 = 2;
+const PROCESS_CLEAN_EXIT: usize = 1 << (usize::BITS - 1);
+const PROCESS_SIGNAL_COUNT_MASK: usize = !PROCESS_CLEAN_EXIT;
+const SECOND_SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Monotonic native process-signal observer for daemon shutdown coordination.
+///
+/// The platform handler performs only lock-free atomic lifecycle updates and one
+/// nonblocking native wakeup. Consumers can drain every observed delivery
+/// without depending on Tokio's coalescing signal streams.
+pub struct ProcessSignalCounter {
+    observed: usize,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl ProcessSignalCounter {
+    /// Installs the process-lifetime native handler and captures its current count.
+    pub fn install() -> std::io::Result<Self> {
+        if PROCESS_SIGNAL_INSTALLED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "native process-signal handling is already installed",
+            ));
+        }
+        PROCESS_LIFECYCLE.store(PROCESS_STARTING, Ordering::Release);
+        PROCESS_SIGNAL_WAKE_FAILED.store(false, Ordering::Release);
+        let observed = PROCESS_SIGNAL_COUNT.load(Ordering::Acquire) & PROCESS_SIGNAL_COUNT_MASK;
+        let wake = Arc::new(tokio::sync::Notify::new());
+        install_process_signal_wakeup(&wake)?;
+        install_process_signal_handler()?;
+        Ok(Self { observed, wake })
+    }
+
+    /// Returns whether one additional native signal delivery was observed.
+    #[must_use]
+    pub fn take_next(&mut self) -> bool {
+        let current = PROCESS_SIGNAL_COUNT.load(Ordering::Acquire) & PROCESS_SIGNAL_COUNT_MASK;
+        if current == self.observed {
+            false
+        } else {
+            self.observed = self.observed.wrapping_add(1);
+            true
+        }
+    }
+
+    /// Atomically publishes readiness unless shutdown already won the lifecycle race.
+    #[must_use]
+    pub fn mark_ready(&self) -> bool {
+        PROCESS_LIFECYCLE
+            .compare_exchange(
+                PROCESS_STARTING,
+                PROCESS_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Atomically commits a clean exit after graceful ownership cleanup.
+    ///
+    /// A concurrent second delivery wins this race and returns `false`. Any
+    /// later delivery after the clean-exit commit terminates nonzero directly
+    /// from the native handler rather than racing the process's successful exit.
+    #[must_use]
+    pub fn commit_clean_exit(&self) -> bool {
+        let mut observed = PROCESS_SIGNAL_COUNT.load(Ordering::Acquire);
+        loop {
+            if observed & PROCESS_SIGNAL_COUNT_MASK >= 2 {
+                return false;
+            }
+            if observed & PROCESS_CLEAN_EXIT != 0 {
+                return true;
+            }
+            match PROCESS_SIGNAL_COUNT.compare_exchange_weak(
+                observed,
+                observed | PROCESS_CLEAN_EXIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    /// Waits without polling until at least one native delivery can be drained.
+    pub async fn wait_next(&mut self) -> std::io::Result<()> {
+        loop {
+            if self.take_next() {
+                return Ok(());
+            }
+            if PROCESS_SIGNAL_WAKE_FAILED.load(Ordering::Acquire) {
+                return Err(std::io::Error::other(
+                    "native process-signal wakeup stopped",
+                ));
+            }
+            let wake = Arc::clone(&self.wake);
+            let notified = wake.notified();
+            if self.take_next() {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
+    fn write(fd: i32, buffer: *const core::ffi::c_void, count: usize) -> isize;
+    fn _exit(status: i32) -> !;
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+unsafe extern "C" {
+    fn sigset(signal: i32, handler: usize) -> usize;
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "redox",
+    target_os = "hurd",
+    target_os = "fuchsia",
+    target_os = "emscripten",
+    target_os = "l4re",
+    target_os = "teeos"
+))]
+unsafe extern "C" {
+    fn __errno_location() -> *mut i32;
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "cygwin",
+    target_os = "nuttx"
+))]
+unsafe extern "C" {
+    fn __errno() -> *mut i32;
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+unsafe extern "C" {
+    fn __error() -> *mut i32;
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+unsafe extern "C" {
+    fn ___errno() -> *mut i32;
+}
+
+#[cfg(target_os = "aix")]
+unsafe extern "C" {
+    fn _Errno() -> *mut i32;
+}
+
+#[cfg(target_os = "haiku")]
+unsafe extern "C" {
+    fn _errnop() -> *mut i32;
+}
+
+#[cfg(target_os = "nto")]
+unsafe extern "C" {
+    fn __get_errno_ptr() -> *mut i32;
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "redox",
+    target_os = "hurd",
+    target_os = "fuchsia",
+    target_os = "emscripten",
+    target_os = "l4re",
+    target_os = "teeos"
+))]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: libc exposes the calling thread's process-lifetime errno slot.
+    unsafe { __errno_location() }
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "cygwin",
+    target_os = "nuttx"
+))]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: these libcs expose the calling thread's errno slot through `__errno`.
+    unsafe { __errno() }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: these libcs expose the calling thread's errno slot through `__error`.
+    unsafe { __error() }
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: Solaris-family libc exposes the calling thread's errno slot.
+    unsafe { ___errno() }
+}
+
+#[cfg(target_os = "aix")]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: AIX libc exposes the calling thread's errno slot.
+    unsafe { _Errno() }
+}
+
+#[cfg(target_os = "haiku")]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: Haiku libc exposes the calling thread's errno slot.
+    unsafe { _errnop() }
+}
+
+#[cfg(target_os = "nto")]
+unsafe fn errno_pointer() -> *mut i32 {
+    // SAFETY: QNX libc exposes the calling thread's errno slot.
+    unsafe { __get_errno_ptr() }
+}
+
+#[cfg(unix)]
+static PROCESS_SIGNAL_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn process_signal_handler(_signal: i32) {
+    // SAFETY: the platform errno slot is valid for this interrupted thread.
+    let errno = unsafe { *errno_pointer() };
+    PROCESS_LIFECYCLE.store(PROCESS_STOPPING, Ordering::Release);
+    let previous = PROCESS_SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
+    if previous & PROCESS_CLEAN_EXIT != 0 {
+        // SAFETY: graceful cleanup already committed to returning success, so
+        // this later delivery must own the final nonzero process boundary.
+        unsafe { _exit(2) };
+    }
+    let fd = PROCESS_SIGNAL_WAKE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = 1_u8;
+        // SAFETY: `fd` is a leaked process-lifetime nonblocking socket and the
+        // one-byte stack buffer remains live for this async-signal-safe call.
+        let _ = unsafe { write(fd, (&raw const byte).cast(), 1) };
+    }
+    // SAFETY: restore the exact errno value observed on handler entry.
+    unsafe { *errno_pointer() = errno };
+}
+
+#[cfg(unix)]
+fn install_process_signal_wakeup(wake: &Arc<tokio::sync::Notify>) -> std::io::Result<()> {
+    use std::io::Read as _;
+    use std::os::fd::IntoRawFd as _;
+    use std::os::unix::net::UnixStream;
+
+    let (mut reader, writer) = UnixStream::pair()?;
+    writer.set_nonblocking(true)?;
+    PROCESS_SIGNAL_WAKE_FD.store(writer.into_raw_fd(), Ordering::Release);
+    let wake = Arc::clone(wake);
+    std::thread::Builder::new()
+        .name("claw-signal-wakeup".to_owned())
+        .spawn(move || {
+            let mut bytes = [0_u8; 64];
+            loop {
+                match reader.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        wake.notify_waiters();
+                        if PROCESS_SIGNAL_COUNT.load(Ordering::Acquire) & PROCESS_SIGNAL_COUNT_MASK
+                            >= 2
+                        {
+                            std::thread::sleep(SECOND_SIGNAL_GRACE);
+                            // SAFETY: the watchdog is the final ownership boundary.
+                            unsafe { _exit(2) };
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            PROCESS_SIGNAL_WAKE_FAILED.store(true, Ordering::Release);
+            wake.notify_waiters();
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_process_signal_handler() -> std::io::Result<()> {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SIG_ERR: usize = usize::MAX;
+    for signal_number in [SIGINT, SIGTERM] {
+        // SAFETY: the handler has the C signal ABI, remains live for the
+        // process lifetime, and performs only lock-free atomics plus one
+        // nonblocking async-signal-safe write.
+        if unsafe {
+            install_native_signal_handler(
+                signal_number,
+                process_signal_handler as *const () as usize,
+            )
+        } == SIG_ERR
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+unsafe fn install_native_signal_handler(signal_number: i32, handler: usize) -> usize {
+    // SAFETY: `sigset` provides persistent Solaris signal disposition semantics.
+    unsafe { sigset(signal_number, handler) }
+}
+
+#[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+unsafe fn install_native_signal_handler(signal_number: i32, handler: usize) -> usize {
+    // SAFETY: the caller supplies a process-lifetime C signal handler.
+    unsafe { signal(signal_number, handler) }
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+static PROCESS_SIGNAL_WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
+
+#[cfg(windows)]
+unsafe extern "system" fn process_console_handler(control: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    if matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        PROCESS_LIFECYCLE.store(PROCESS_STOPPING, Ordering::Release);
+        let previous = PROCESS_SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
+        if previous & PROCESS_CLEAN_EXIT != 0 {
+            // SAFETY: graceful cleanup already committed to returning success.
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    2,
+                );
+            }
+            return 1;
+        }
+        let event = PROCESS_SIGNAL_WAKE_EVENT.load(Ordering::Relaxed);
+        if event != 0 {
+            // SAFETY: the event handle is leaked for the process lifetime.
+            let _ = unsafe { windows_sys::Win32::System::Threading::SetEvent(event as _) };
+        }
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn install_process_signal_wakeup(wake: &Arc<tokio::sync::Notify>) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
+    // SAFETY: null security/name pointers request a private auto-reset event.
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    PROCESS_SIGNAL_WAKE_EVENT.store(event as isize, Ordering::Release);
+    let event_value = event as isize;
+    let wake = Arc::clone(wake);
+    std::thread::Builder::new()
+        .name("claw-signal-wakeup".to_owned())
+        .spawn(move || {
+            loop {
+                let event = event_value as _;
+                // SAFETY: the process-lifetime event handle remains valid.
+                match unsafe { WaitForSingleObject(event, INFINITE) } {
+                    WAIT_OBJECT_0 => {
+                        wake.notify_waiters();
+                        if PROCESS_SIGNAL_COUNT.load(Ordering::Acquire) & PROCESS_SIGNAL_COUNT_MASK
+                            >= 2
+                        {
+                            std::thread::sleep(SECOND_SIGNAL_GRACE);
+                            // SAFETY: terminate the current process after the
+                            // fixed native escalation deadline.
+                            unsafe {
+                                windows_sys::Win32::System::Threading::TerminateProcess(
+                                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                    2,
+                                );
+                            }
+                            break;
+                        }
+                    }
+                    _ => {
+                        PROCESS_SIGNAL_WAKE_FAILED.store(true, Ordering::Release);
+                        wake.notify_waiters();
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_process_signal_handler() -> std::io::Result<()> {
+    // SAFETY: the callback has the required system ABI and process lifetime.
+    if unsafe { SetConsoleCtrlHandler(Some(process_console_handler), 1) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_process_signal_handler() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native process signals are unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_process_signal_wakeup(_wake: &Arc<tokio::sync::Notify>) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native process-signal wakeups are unsupported on this platform",
+    ))
+}
 
 /// Typed reason recorded by the installed identity commit hook for one COMMIT attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]

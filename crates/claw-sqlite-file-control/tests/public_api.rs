@@ -24,6 +24,15 @@ fn native_wal_and_vfs_controls_are_public() {
 }
 
 #[test]
+fn native_process_signal_counter_is_public() {
+    let _install = claw_sqlite_file_control::ProcessSignalCounter::install;
+    let _take_next = claw_sqlite_file_control::ProcessSignalCounter::take_next;
+    let _mark_ready = claw_sqlite_file_control::ProcessSignalCounter::mark_ready;
+    let _commit_clean_exit = claw_sqlite_file_control::ProcessSignalCounter::commit_clean_exit;
+    let _wait_next = claw_sqlite_file_control::ProcessSignalCounter::wait_next;
+}
+
+#[test]
 fn terminal_abort_commit_control_is_public() {
     let _api = terminal_abort_commit_method_is_public::<sqlx::pool::PoolConnection<sqlx::Sqlite>>;
 }

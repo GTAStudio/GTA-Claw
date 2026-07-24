@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use claw_application::Application;
 use claw_platform::NativeSystemProbe;
-use claw_state::{StateStore, StoreConfig, initialize_linux_protected_offline};
+use claw_state::{
+    ProcessSignalCounter, StateStore, StoreConfig, initialize_linux_protected_offline,
+};
 
 const LEGACY_USAGE: &str = "usage: gta-claw-daemon [--probe]";
 const HELP: &str = "\
@@ -296,106 +298,240 @@ fn probe_with_state(selection: &StateSelection, mut output: impl Write) -> io::R
 
 fn serve_with_state(selection: &StateSelection, mut output: impl Write) -> io::Result<()> {
     let runtime = state_runtime()?;
-    let shutdown = runtime.block_on(async { ShutdownSignals::new() })?;
-    let store = runtime
-        .block_on(StateStore::open(selection.config()))
-        .map_err(|error| state_failure("state open", error))?;
-    let health = runtime.block_on(store.health());
+    let mut signals = runtime.block_on(async { ShutdownSignals::new() })?;
+    let mut shutdown = ShutdownState::default();
+    let opened = runtime.block_on(run_state_phase(
+        &mut signals,
+        &mut shutdown,
+        StateStore::open(selection.config()),
+    ));
+    let store = opened.map_err(|error| {
+        let primary = state_failure("state open", error);
+        shutdown.combine(primary)
+    })?;
+    if shutdown.requested() {
+        return close_state_store(&runtime, &mut signals, &mut shutdown, store);
+    }
+    let health = runtime.block_on(run_state_phase(&mut signals, &mut shutdown, store.health()));
     let report = match health {
         Ok(report) => report,
-        Err(error) => return Err(close_after_failure(&runtime, store, "state health", error)),
+        Err(error) => {
+            return Err(close_state_store_after_failure(
+                &runtime,
+                &mut signals,
+                &mut shutdown,
+                store,
+                "state health",
+                error,
+            ));
+        }
     };
     if !report.is_healthy() {
-        return Err(close_after_failure(
+        return Err(close_state_store_after_failure(
             &runtime,
+            &mut signals,
+            &mut shutdown,
             store,
             "state health",
             "database is not ready",
         ));
     }
-    if let Err(error) = announce_ready(&mut output) {
-        return Err(close_after_failure(
-            &runtime,
-            store,
-            "announce daemon readiness",
-            error,
-        ));
+    if shutdown.requested() {
+        return close_state_store(&runtime, &mut signals, &mut shutdown, store);
     }
-    if let Err(error) = runtime.block_on(shutdown.wait()) {
-        return Err(close_after_failure(
-            &runtime,
-            store,
-            "wait for shutdown signal",
-            error,
-        ));
+    match runtime.block_on(announce_readiness_or_shutdown(
+        &mut signals,
+        &mut shutdown,
+        &mut output,
+    )) {
+        Ok(true) => {}
+        Ok(false) => {
+            return close_state_store(&runtime, &mut signals, &mut shutdown, store);
+        }
+        Err(error) => {
+            return Err(close_state_store_after_failure(
+                &runtime,
+                &mut signals,
+                &mut shutdown,
+                store,
+                "announce daemon readiness",
+                error,
+            ));
+        }
     }
-    runtime
-        .block_on(store.close())
-        .map_err(|error| state_failure("state close", error))?;
-    Ok(())
+    observe_shutdown(&mut shutdown, runtime.block_on(signals.wait()));
+    close_state_store(&runtime, &mut signals, &mut shutdown, store)
 }
 
-#[cfg(unix)]
-struct ShutdownSignals {
-    interrupt: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
+async fn announce_readiness_or_shutdown(
+    signals: &mut ShutdownSignals,
+    shutdown: &mut ShutdownState,
+    output: &mut impl Write,
+) -> io::Result<bool> {
+    if shutdown.requested() {
+        return Ok(false);
+    }
+    signals.drain(shutdown);
+    if shutdown.requested() || !signals.mark_ready(shutdown) {
+        Ok(false)
+    } else {
+        announce_ready(output)?;
+        Ok(true)
+    }
 }
 
-#[cfg(unix)]
-impl ShutdownSignals {
-    fn new() -> io::Result<Self> {
-        Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-        })
+#[derive(Default)]
+struct ShutdownState {
+    signals: u8,
+    listener_error: Option<String>,
+}
+
+impl ShutdownState {
+    fn observe(&mut self, result: io::Result<()>) -> bool {
+        let first = !self.requested();
+        match result {
+            Ok(()) => {
+                self.signals = self.signals.saturating_add(1);
+            }
+            Err(error) => self.listener_error = Some(error.to_string()),
+        }
+        first && self.requested()
     }
 
-    async fn wait(mut self) -> io::Result<()> {
+    const fn requested(&self) -> bool {
+        self.signals > 0 || self.listener_error.is_some()
+    }
+
+    fn terminal_error(&self) -> Option<io::Error> {
+        if let Some(error) = &self.listener_error {
+            Some(io::Error::other(format!(
+                "shutdown signal listener failed: {error}"
+            )))
+        } else if self.signals >= 2 {
+            Some(io::Error::other("shutdown escalated after a second signal"))
+        } else {
+            None
+        }
+    }
+
+    fn combine(&self, primary: io::Error) -> io::Error {
+        match self.terminal_error() {
+            Some(shutdown) => io::Error::other(format!("{primary}; {shutdown}")),
+            None => primary,
+        }
+    }
+}
+
+fn observe_shutdown(shutdown: &mut ShutdownState, result: io::Result<()>) {
+    if shutdown.observe(result) {
+        let _ = std::thread::Builder::new()
+            .name("claw-shutdown-diagnostic".to_owned())
+            .spawn(|| {
+                let _ = writeln!(io::stderr().lock(), "shutdown requested");
+            });
+    }
+}
+
+async fn run_state_phase<F: std::future::Future>(
+    signals: &mut ShutdownSignals,
+    shutdown: &mut ShutdownState,
+    future: F,
+) -> F::Output {
+    tokio::pin!(future);
+    loop {
+        if shutdown.listener_error.is_some() {
+            return future.as_mut().await;
+        }
         tokio::select! {
-            signal = self.interrupt.recv() => match signal {
-                Some(()) => Ok(()),
-                None => Err(io::Error::other("SIGINT listener stopped")),
-            },
-            signal = self.terminate.recv() => match signal {
-                Some(()) => Ok(()),
-                None => Err(io::Error::other("SIGTERM listener stopped")),
+            biased;
+            signal = signals.wait() => observe_shutdown(shutdown, signal),
+            output = future.as_mut() => {
+                signals.drain(shutdown);
+                return output;
             },
         }
     }
 }
 
-#[cfg(windows)]
-struct ShutdownSignals {
-    ctrl_c: tokio::signal::windows::CtrlC,
+fn close_state_store(
+    runtime: &tokio::runtime::Runtime,
+    signals: &mut ShutdownSignals,
+    shutdown: &mut ShutdownState,
+    store: StateStore,
+) -> io::Result<()> {
+    let close = runtime.block_on(run_state_phase(signals, shutdown, store.close()));
+    signals.drain(shutdown);
+    match (close, shutdown.terminal_error()) {
+        (Ok(_), None) if signals.commit_clean_exit() => Ok(()),
+        (Ok(_), None) => {
+            signals.drain(shutdown);
+            Err(shutdown
+                .terminal_error()
+                .unwrap_or_else(|| io::Error::other("shutdown escalation won the clean-exit race")))
+        }
+        (Ok(_), Some(shutdown)) => Err(shutdown),
+        (Err(close), None) => Err(state_failure("state close", close)),
+        (Err(close), Some(shutdown)) => Err(io::Error::other(format!(
+            "state close failed: {close}; {shutdown}"
+        ))),
+    }
 }
 
-#[cfg(windows)]
+fn close_state_store_after_failure(
+    runtime: &tokio::runtime::Runtime,
+    signals: &mut ShutdownSignals,
+    shutdown: &mut ShutdownState,
+    store: StateStore,
+    operation: &'static str,
+    primary: impl std::fmt::Display,
+) -> io::Error {
+    let primary = state_failure(operation, primary);
+    match close_state_store(runtime, signals, shutdown, store) {
+        Ok(()) => primary,
+        Err(close) => io::Error::other(format!("{primary}; {close}")),
+    }
+}
+
+struct ShutdownSignals {
+    counter: ProcessSignalCounter,
+}
+
 impl ShutdownSignals {
     fn new() -> io::Result<Self> {
         Ok(Self {
-            ctrl_c: tokio::signal::windows::ctrl_c()?,
+            counter: ProcessSignalCounter::install()?,
         })
     }
 
-    async fn wait(mut self) -> io::Result<()> {
-        match self.ctrl_c.recv().await {
-            Some(()) => Ok(()),
-            None => Err(io::Error::other("Ctrl-C listener stopped")),
+    async fn wait(&mut self) -> io::Result<()> {
+        self.counter.wait_next().await
+    }
+
+    fn drain(&mut self, shutdown: &mut ShutdownState) {
+        while self.counter.take_next() {
+            observe_shutdown(shutdown, Ok(()));
         }
     }
-}
 
-#[cfg(not(any(unix, windows)))]
-struct ShutdownSignals;
-
-#[cfg(not(any(unix, windows)))]
-impl ShutdownSignals {
-    fn new() -> io::Result<Self> {
-        Ok(Self)
+    fn mark_ready(&mut self, shutdown: &mut ShutdownState) -> bool {
+        self.drain(shutdown);
+        if shutdown.requested() {
+            return false;
+        }
+        if self.counter.mark_ready() {
+            true
+        } else {
+            while !self.counter.take_next() {
+                std::hint::spin_loop();
+            }
+            observe_shutdown(shutdown, Ok(()));
+            self.drain(shutdown);
+            false
+        }
     }
 
-    async fn wait(self) -> io::Result<()> {
-        tokio::signal::ctrl_c().await
+    fn commit_clean_exit(&self) -> bool {
+        self.counter.commit_clean_exit()
     }
 }
 

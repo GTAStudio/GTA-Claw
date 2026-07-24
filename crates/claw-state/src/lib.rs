@@ -14,6 +14,8 @@ mod provision;
 mod repository;
 mod store;
 
+#[doc(hidden)]
+pub use claw_sqlite_file_control::ProcessSignalCounter;
 pub use error::{DatabaseFailure, StateError, StateErrorKind, WriteOutcome};
 pub use model::{
     AuthenticationId, AuthenticationRecord, AuthenticationStatus, DeviceId, DeviceRecord, Page,
