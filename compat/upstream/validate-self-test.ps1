@@ -63,8 +63,9 @@ function New-SyntheticRepositoryRoot {
         "crates/synthetic/data/fixture.json" = "{}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
     foreach ($relative in $files.Keys) {
-        $absolute = Join-Path $Root ($relative -replace "/", "\")
+        $absolute = Join-Path $Root ($relative.Replace("/", $separator))
         $directory = Split-Path -Parent $absolute
         if (-not (Test-Path -LiteralPath $directory)) {
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -77,7 +78,9 @@ New-SyntheticRepositoryRoot $SyntheticRoot
 
 function Read-Json {
     param([string]$Path)
-    return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    # ReadAllText rather than Get-Content -Raw: Windows PowerShell 5.1 decodes a
+    # BOM-less file with the system ANSI codepage, PowerShell Core as UTF-8.
+    return (ConvertFrom-Json ([System.IO.File]::ReadAllText($Path)))
 }
 
 function Write-Json {
@@ -85,7 +88,11 @@ function Write-Json {
         [string]$Path,
         [object]$Value
     )
-    $Value | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $Path -Encoding UTF8
+    # Set-Content -Encoding UTF8 emits a BOM on Windows PowerShell and none on
+    # PowerShell Core; write the bytes directly so both hosts produce the same
+    # file for the same case.
+    $text = ($Value | ConvertTo-Json -Depth 50)
+    [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Test-OrdinalStringEqual {
@@ -863,10 +870,15 @@ $cases = @(
             param($caseRoot)
             $path = Join-Path $caseRoot "ledger-digests.sha256"
             $lines = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n").TrimEnd("`n").Split("`n")
-            $reordered = @($lines | Where-Object { $_.StartsWith("#") }) + @(
-                $lines | Where-Object { -not $_.StartsWith("#") } | Sort-Object -Descending
+            $comments = @($lines | Where-Object { $_.StartsWith("#", [System.StringComparison]::Ordinal) })
+            [string[]]$entries = @(
+                $lines | Where-Object { -not $_.StartsWith("#", [System.StringComparison]::Ordinal) }
             )
-            [System.IO.File]::WriteAllText($path, (($reordered -join "`n") + "`n"))
+            [Array]::Sort($entries, [StringComparer]::Ordinal)
+            [Array]::Reverse($entries)
+            $reordered = $comments + $entries
+            [System.IO.File]::WriteAllText($path, (($reordered -join "`n") + "`n"),
+                (New-Object System.Text.UTF8Encoding($false)))
         }
     },
     [ordered]@{
@@ -875,6 +887,66 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Remove-Item -LiteralPath (Join-Path $caseRoot "ledger-digests.sha256") -Force
+        }
+    },
+    # --- Cross-platform determinism -------------------------------------------
+    # These three pin the defect that made a byte-identical validate.ps1 pass
+    # under Windows PowerShell 5.1 and fail under PowerShell Core on Linux.
+    [ordered]@{
+        # .gitattributes is frozen and has no rule for *.sha256, so this file
+        # checks out CRLF on Windows and LF on Linux. Reading it must not care.
+        name = "ledger-digest-file-with-crlf-line-endings"
+        expect_success = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "ledger-digests.sha256"
+            $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n").Replace("`n", "`r`n")
+            [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    },
+    [ordered]@{
+        # Every digest is structural, taken over parsed JSON re-encoded
+        # canonically, so no digest may depend on how git checked the file out.
+        # Rewriting every digest-bearing class of file with CRLF must still pass.
+        name = "contract-digests-ignore-crlf-checkout"
+        expect_success = $true
+        mutate = {
+            param($caseRoot)
+            $encoding = New-Object System.Text.UTF8Encoding($false)
+            $targets = @(
+                "ledgers/gateway-core.json",
+                "ledgers/official-integration.json",
+                "ledgers/official-client-interop.json",
+                "inventories/clients.json",
+                "feature-ledger.schema.json",
+                "baseline.json",
+                "manifest.json"
+            )
+            foreach ($target in $targets) {
+                $path = Join-Path $caseRoot $target
+                $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n").Replace("`n", "`r`n")
+                [System.IO.File]::WriteAllText($path, $text, $encoding)
+            }
+        }
+    },
+    [ordered]@{
+        # Simulates the regression itself rather than the assertion about it: the
+        # canonical encoder is downgraded to a culture-sensitive key sort, which
+        # is what makes ICU on Linux and NLS on Windows disagree. The pinned
+        # vectors must catch it before any contract file is read.
+        name = "culture-sensitive-key-sort-is-rejected"
+        expected_message = "host portability invariant violated (object members are ordered ordinally)"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "validate.ps1"
+            $text = [System.IO.File]::ReadAllText($path)
+            $original = '[Array]::Sort($names, [StringComparer]::Ordinal)'
+            $downgraded = '[Array]::Sort($names, [StringComparer]::InvariantCulture)'
+            if (-not $text.Contains($original)) {
+                throw "culture-sensitive-key-sort-is-rejected could not find the ordinal key sort to downgrade."
+            }
+            $text = $text.Replace($original, $downgraded)
+            [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
         }
     },
     [ordered]@{
@@ -1360,6 +1432,7 @@ $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
 
 $passed = New-Object System.Collections.Generic.List[string]
+$failures = New-Object System.Collections.Generic.List[string]
 $negativeCases = 0
 $positiveCases = 1
 try {
@@ -1378,26 +1451,34 @@ try {
         }
 
         $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
+        # Every case is evaluated even after one fails, so a single regression
+        # cannot hide the status of the cases behind it.
+        $failure = ""
         if ($case.Contains("expect_success") -and $case.expect_success) {
             $positiveCases += 1
             if ($result.exit_code -ne 0) {
-                throw "positive case '$($case.name)' unexpectedly failed: $($result.output)"
+                $failure = "positive case unexpectedly failed: $($result.output)"
             }
+        } else {
+            $negativeCases += 1
+            if ($result.exit_code -eq 0) {
+                $failure = "negative tamper case unexpectedly passed"
+            } else {
+                $normalizedOutput = [regex]::Replace($result.output, "\s+", " ")
+                $normalizedExpected = [regex]::Replace([string]$case.expected_message, "\s+", " ")
+                if ($normalizedOutput.IndexOf($normalizedExpected, [StringComparison]::Ordinal) -lt 0) {
+                    $failure = ("failed for the wrong reason; expected '{0}' in: {1}" -f
+                        $normalizedExpected, $normalizedOutput)
+                }
+            }
+        }
+        if ($failure.Length -eq 0) {
             $passed.Add([string]$case.name)
-            continue
+            [Console]::Error.WriteLine("  ok   $($case.name)")
+        } else {
+            $failures.Add(("{0}: {1}" -f $case.name, $failure))
+            [Console]::Error.WriteLine("  FAIL $($case.name)")
         }
-
-        $negativeCases += 1
-        if ($result.exit_code -eq 0) {
-            throw "negative tamper case '$($case.name)' unexpectedly passed"
-        }
-        $normalizedOutput = [regex]::Replace($result.output, "\s+", " ")
-        $normalizedExpected = [regex]::Replace([string]$case.expected_message, "\s+", " ")
-        if ($normalizedOutput.IndexOf($normalizedExpected, [StringComparison]::Ordinal) -lt 0) {
-            throw ("negative tamper case '{0}' failed for the wrong reason; expected '{1}' in: {2}" -f
-                $case.name, $normalizedExpected, $normalizedOutput)
-        }
-        $passed.Add([string]$case.name)
     }
 } finally {
     if (Test-Path -LiteralPath $temporaryRoot) {
@@ -1406,6 +1487,11 @@ try {
     if (Test-Path -LiteralPath $SyntheticRoot) {
         Remove-Item -LiteralPath $SyntheticRoot -Recurse -Force
     }
+}
+
+if ($failures.Count -gt 0) {
+    throw ("validator self-test: {0} of {1} cases failed:{2}{3}" -f
+        $failures.Count, $cases.Count, [Environment]::NewLine, ($failures -join [Environment]::NewLine))
 }
 
 [ordered]@{

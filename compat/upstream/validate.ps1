@@ -35,7 +35,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
-$ExpectedSchemaDigest = "6a23b6d6579d30a52b90a0b4bd62772c58a0a27f6bab31b4102e2cdeb73490fc"
+$ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f441e8de396"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -256,7 +256,11 @@ function Fail {
 function Read-Json {
     param([string]$Path)
     try {
-        return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        # Deliberately not Get-Content -Raw: Windows PowerShell 5.1 decodes a
+        # BOM-less file with the system ANSI codepage while PowerShell Core
+        # decodes it as UTF-8, so the same bytes would parse differently on the
+        # two platforms. ReadAllText is UTF-8 with BOM detection everywhere.
+        return (ConvertFrom-Json ([System.IO.File]::ReadAllText($Path)))
     } catch {
         Fail "invalid JSON in $Path`: $($_.Exception.Message)"
     }
@@ -377,8 +381,103 @@ function Get-Sha256Text {
 
 function Get-ObjectDigest {
     param([object]$Value)
-    $json = ConvertTo-Json -InputObject $Value -Compress -Depth 50
-    return Get-Sha256Text $json
+    return Get-Sha256Text (ConvertTo-CanonicalJson $Value)
+}
+
+# --- Cross-platform determinism -------------------------------------------
+#
+# Windows PowerShell 5.1 and PowerShell Core disagree about JSON in two ways
+# that silently corrupt a trust root:
+#
+#   1. ConvertFrom-Json in PowerShell Core coerces ISO-8601-looking strings into
+#      [datetime], and [string] then renders them with the current culture. The
+#      same document therefore yields "2026-07-13T03:29:58Z" on Windows and
+#      "07/13/2026 03:29:58" on Linux.
+#   2. ConvertTo-Json in Windows PowerShell escapes < > & ' as \uXXXX because it
+#      uses JavaScriptSerializer; PowerShell Core emits them raw. Any digest
+#      taken over its output is therefore platform dependent.
+#
+# Everything canonical below is hand-encoded so neither difference can reach a
+# digest or a comparison. Assert-PortabilityInvariants pins the behaviour.
+
+$ContractTimestampFormat = "yyyy-MM-ddTHH:mm:ssZ"
+
+function ConvertTo-ContractString {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) {
+        return ""
+    }
+    if ($Value -is [datetime]) {
+        return ([datetime]$Value).ToUniversalTime().ToString(
+            $ContractTimestampFormat, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.DateTimeOffset]) {
+        return ([System.DateTimeOffset]$Value).ToUniversalTime().ToString(
+            $ContractTimestampFormat, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.IFormattable]) {
+        return ([System.IFormattable]$Value).ToString(
+            $null, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+
+function ConvertTo-CanonicalJsonString {
+    param([string]$Value)
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int]$character
+        if ($character -eq '"') {
+            [void]$builder.Append('\"')
+        } elseif ($character -eq '\') {
+            [void]$builder.Append('\\')
+        } elseif ($code -eq 8) {
+            [void]$builder.Append('\b')
+        } elseif ($code -eq 9) {
+            [void]$builder.Append('\t')
+        } elseif ($code -eq 10) {
+            [void]$builder.Append('\n')
+        } elseif ($code -eq 12) {
+            [void]$builder.Append('\f')
+        } elseif ($code -eq 13) {
+            [void]$builder.Append('\r')
+        } elseif ($code -lt 32) {
+            [void]$builder.Append('\u' + $code.ToString(
+                "x4", [System.Globalization.CultureInfo]::InvariantCulture))
+        } else {
+            [void]$builder.Append($character)
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-CanonicalJsonScalar {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) {
+        return "null"
+    }
+    if ($Value -is [bool]) {
+        if ($Value) { return "true" }
+        return "false"
+    }
+    if ($Value -is [datetime] -or $Value -is [System.DateTimeOffset]) {
+        return ConvertTo-CanonicalJsonString (ConvertTo-ContractString $Value)
+    }
+    if ($Value -is [string] -or $Value -is [char]) {
+        return ConvertTo-CanonicalJsonString ([string]$Value)
+    }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int] -or $Value -is [uint32] -or
+        $Value -is [long] -or $Value -is [uint64] -or $Value -is [bigint]) {
+        return ConvertTo-ContractString $Value
+    }
+    if ($Value -is [decimal] -or $Value -is [double] -or $Value -is [single]) {
+        return ([System.IFormattable]$Value).ToString(
+            "R", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    Fail "canonical JSON encountered an unsupported scalar of type $($Value.GetType().FullName)"
 }
 
 function ConvertTo-CanonicalJson {
@@ -398,14 +497,14 @@ function ConvertTo-CanonicalJson {
         [Array]::Sort($names, [StringComparer]::Ordinal)
         [string[]]$members = @(
             $names | ForEach-Object {
-                $encodedName = ConvertTo-Json -InputObject $_ -Compress
+                $encodedName = ConvertTo-CanonicalJsonString $_
                 $encodedValue = ConvertTo-CanonicalJson (Get-PropertyValue $Value $_)
                 "${encodedName}:${encodedValue}"
             }
         )
         return "{" + ($members -join ",") + "}"
     }
-    return ConvertTo-Json -InputObject $Value -Compress
+    return ConvertTo-CanonicalJsonScalar $Value
 }
 
 function Get-CanonicalArrayDigest {
@@ -413,6 +512,80 @@ function Get-CanonicalArrayDigest {
     [string[]]$elements = @($Items | ForEach-Object { ConvertTo-CanonicalJson $_ })
     [Array]::Sort($elements, [StringComparer]::Ordinal)
     return Get-Sha256Text ("[" + ($elements -join ",") + "]")
+}
+
+# Pins every behaviour that has to be identical under Windows PowerShell 5.1 and
+# PowerShell Core on Linux and macOS. This runs on every invocation, in both
+# verify and write mode, before any contract file is read, so a host whose
+# globalisation or JSON behaviour differs fails loudly here instead of silently
+# computing a different digest. Each vector below corresponds to a real observed
+# divergence between the two engines.
+function Assert-PortabilityInvariants {
+    $expectations = @(
+        # JSON string escaping. Windows PowerShell's ConvertTo-Json emits
+        # \u003c \u003e \u0026 \u0027 for these; PowerShell Core emits them raw.
+        @{ actual = (ConvertTo-CanonicalJsonString "a<b"); expected = '"a<b"'; case = "less-than is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a>b"); expected = '"a>b"'; case = "greater-than is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a&b"); expected = '"a&b"'; case = "ampersand is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a'b"); expected = '"a''b"'; case = "apostrophe is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a/b"); expected = '"a/b"'; case = "solidus is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString ("caf" + [char]0x00E9)); expected = ('"caf' + [char]0x00E9 + '"'); case = "non-ASCII is emitted literally" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a`"b\c"); expected = '"a\"b\\c"'; case = "quote and backslash are escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a`tb`nc`rd"); expected = '"a\tb\nc\rd"'; case = "control characters use short escapes" },
+        @{ actual = (ConvertTo-CanonicalJsonString ([string][char]1)); expected = '"\u0001"'; case = "other control characters use \u escapes" },
+        # Scalar rendering must never pick up the ambient culture.
+        @{ actual = (ConvertTo-CanonicalJsonScalar $true); expected = "true"; case = "booleans render as JSON literals" },
+        @{ actual = (ConvertTo-CanonicalJsonScalar 47); expected = "47"; case = "integers render invariantly" },
+        @{ actual = (ConvertTo-CanonicalJsonScalar $null); expected = "null"; case = "null renders as null" },
+        # Windows PowerShell parses JSON integers as Int32, PowerShell Core as
+        # Int64, so integer recognition must not be tied to one concrete type.
+        @{
+            actual = [string](Test-JsonInteger ((ConvertFrom-Json '{"n":47}').n))
+            expected = "True"
+            case = "parsed JSON integers are recognised regardless of width"
+        },
+        @{
+            actual = (ConvertTo-CanonicalJsonScalar ((ConvertFrom-Json '{"n":47}').n))
+            expected = "47"
+            case = "parsed JSON integers canonicalise identically"
+        },
+        # PowerShell Core's ConvertFrom-Json turns this string into [datetime];
+        # Windows PowerShell leaves it a [string]. Both must canonicalise the same.
+        @{
+            actual = (ConvertTo-CanonicalJson (ConvertFrom-Json '{"b":"2026-07-13T03:29:58Z","a":1}'))
+            expected = '{"a":1,"b":"2026-07-13T03:29:58Z"}'
+            case = "ISO-8601 strings survive JSON round-tripping unchanged"
+        },
+        @{
+            actual = (ConvertTo-ContractString ((ConvertFrom-Json '{"t":"2026-07-13T03:29:58Z"}').t))
+            expected = "2026-07-13T03:29:58Z"
+            case = "ISO-8601 strings compare as their original text"
+        },
+        # Object member order is ordinal, not linguistic; ICU and NLS disagree
+        # about culture-sensitive ordering of punctuation and case.
+        @{
+            actual = (ConvertTo-CanonicalJson (ConvertFrom-Json '{"b":1,"C":2,"a_b":3,"aD":4,"_a":5}'))
+            expected = '{"C":2,"_a":5,"aD":4,"a_b":3,"b":1}'
+            case = "object members are ordered ordinally"
+        },
+        # Digests must not depend on how git checked the file out.
+        @{
+            actual = (Get-Sha256Text ("x`r`ny`r`n".Replace("`r`n", "`n")))
+            expected = (Get-Sha256Text "x`ny`n")
+            case = "CRLF and LF hash identically after normalisation"
+        },
+        # The comparison primitives the whole validator is built on.
+        @{ actual = [string](Test-OrdinalStringEqual "abc" "ABC"); expected = "False"; case = "ordinal equality is case sensitive" },
+        @{ actual = [string](Test-OrdinalStringEqual "abc" ("abc" + [char]0x00AD)); expected = "False"; case = "ordinal equality is not linguistic" },
+        @{ actual = [string](Test-OrdinalContains @("abc") "ABC"); expected = "False"; case = "ordinal membership is case sensitive" },
+        @{ actual = [string]("a`r`nb".IndexOf("`n", [System.StringComparison]::Ordinal)); expected = "2"; case = "ordinal IndexOf finds a lone newline inside CRLF" }
+    )
+    foreach ($expectation in $expectations) {
+        if (-not (Test-OrdinalStringEqual ([string]$expectation.actual) ([string]$expectation.expected))) {
+            Fail ("host portability invariant violated ({0}): expected '{1}', got '{2}'; this host does not compute contract digests the same way as a conforming host, refusing to validate" -f
+                $expectation.case, $expectation.expected, $expectation.actual)
+        }
+    }
 }
 
 function Get-InventoryDigest {
@@ -454,6 +627,18 @@ function Test-JsonObject {
         -not ($Value -is [string]) -and
         -not ($Value -is [System.Array]) -and
         ($Value -is [pscustomobject] -or $Value -is [System.Collections.IDictionary])
+}
+
+# Windows PowerShell parses JSON integers as Int32 and PowerShell Core as Int64,
+# so no caller may test against one concrete numeric type.
+function Test-JsonInteger {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value -or $Value -is [bool]) {
+        return $false
+    }
+    return ($Value -is [byte]) -or ($Value -is [sbyte]) -or ($Value -is [int16]) -or
+        ($Value -is [uint16]) -or ($Value -is [int32]) -or ($Value -is [uint32]) -or
+        ($Value -is [int64]) -or ($Value -is [uint64])
 }
 
 function Resolve-LocalSchemaReference {
@@ -1361,13 +1546,20 @@ function Assert-ManifestDeclarations {
     Assert-ExactPropertySet $Manifest.evidence_policy.status_totals $AllowedFeatureStatuses "manifest.evidence_policy.status_totals"
     foreach ($status in $AllowedFeatureStatuses) {
         $declaredTotal = Get-PropertyValue $Manifest.evidence_policy.status_totals $status
-        if (-not ($declaredTotal -is [int]) -or [int]$declaredTotal -lt 0) {
+        # PowerShell Core parses JSON integers as Int64 while Windows PowerShell
+        # produces Int32, so never test against a single concrete numeric type.
+        if (-not (Test-JsonInteger $declaredTotal) -or [long]$declaredTotal -lt 0) {
             Fail "manifest.evidence_policy.status_totals.$status must be a non-negative integer"
         }
     }
 }
 
 $script:RepositoryRootFull = Resolve-RepositoryRoot $RepositoryRoot
+
+# Runs before any contract file is read, in both verify and write mode, so a host
+# whose globalisation or JSON behaviour differs from a conforming host fails
+# loudly instead of silently computing a different digest.
+Assert-PortabilityInvariants
 
 $actualFilePaths = @(
     Get-ChildItem -LiteralPath $Root -Recurse -File -Force | ForEach-Object {
@@ -1421,7 +1613,7 @@ if ($baseline.schema_version -ne 1 -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_sha) $ExpectedSha) -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.tree_sha) "ba3177d3dd666b702d59c4daab74f62a9f7a84fb") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.parent_sha) "a674ce5e0d1ab0774546086fa7b2730516eca176") -or
-    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_timestamp) "2026-07-13T03:29:58Z") -or
+    -not (Test-OrdinalStringEqual (ConvertTo-ContractString $baseline.upstream.commit_timestamp) "2026-07-13T03:29:58Z") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_url) "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85") -or
     $baseline.upstream.commit_signature_verified -ne $true -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.package_name) "openclaw") -or
@@ -1436,7 +1628,7 @@ if (-not (Test-OrdinalStringEqual ([string]$baseline.stable_release.tag) "v2026.
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.name) "openclaw 2026.6.11") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.tag_object_sha) "08d1bbad1bd6ee5700082e1c0f65f63f07600d1f") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.commit_sha) "e085fa1a3ffd32d0ea6917e1e6fb4ecbffbb77d2") -or
-    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.published_at) "2026-06-30T16:06:39Z") -or
+    -not (Test-OrdinalStringEqual (ConvertTo-ContractString $baseline.stable_release.published_at) "2026-06-30T16:06:39Z") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.release_url) "https://github.com/openclaw/openclaw/releases/tag/v2026.6.11")) {
     Fail "stable release provenance mismatch"
 }
@@ -1473,7 +1665,8 @@ $schema = $documents["feature-ledger.schema.json"]
 if (-not (Test-OrdinalStringEqual ([string]$schema.'$schema') "https://json-schema.org/draft/2020-12/schema") -or
     -not (Test-OrdinalStringEqual ([string]$schema.'$id') "https://github.com/GTAStudio/GTA-Claw/compat/upstream/feature-ledger.schema.json") -or
     -not (Test-OrdinalStringEqual (Get-ObjectDigest $schema) $ExpectedSchemaDigest)) {
-    Fail "feature ledger schema is not the frozen Draft 2020-12 contract"
+    Fail ("feature ledger schema is not the frozen Draft 2020-12 contract (expected digest {0}, computed {1})" -f
+        $ExpectedSchemaDigest, (Get-ObjectDigest $schema))
 }
 
 $manifest = $documents["manifest.json"]
@@ -1540,7 +1733,7 @@ $missingEvidenceCount = $statusTotals["unimplemented"]
 
 $globalRecordIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $inventoryRowCount = 0
-$derivedByInventory = @{}
+$derivedByInventory = [ordered]@{}
 foreach ($inventoryId in $InventorySpecs.Keys) {
     $spec = $InventorySpecs[$inventoryId]
     $inventory = $documents[$spec.path]

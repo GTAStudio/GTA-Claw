@@ -17,13 +17,53 @@ and records, per feature row, whether GTA-Claw actually implements it.
 ## Validation
 
 ```text
-powershell -NoProfile -File compat/upstream/validate.ps1
-powershell -NoProfile -File compat/upstream/validate-self-test.ps1
+powershell -NoProfile -File compat/upstream/validate.ps1        # Windows PowerShell 5.1
+pwsh       -NoProfile -File compat/upstream/validate.ps1        # PowerShell 7+, any OS
+pwsh       -NoProfile -File compat/upstream/validate-self-test.ps1
 ```
 
 `validate.ps1` resolves acceptance-evidence paths against the repository working
 tree. It defaults to the parent of `compat/`; pass `-RepositoryRoot` only when the
 contract is being validated from a copy (the self-test does this).
+
+### Portability
+
+Both scripts are supported on Windows PowerShell 5.1 and on PowerShell 7+ under
+Linux and macOS, and must produce identical digests and identical accept/reject
+decisions on every host. A validator that gates Linux CI cannot be pinned to
+`windows-latest`.
+
+The two hosts disagree by default in ways that silently corrupt a trust root, so
+`validate.ps1` never relies on host defaults. `Assert-PortabilityInvariants` runs
+before any contract file is read and checks the following against pinned vectors,
+failing loudly rather than drifting:
+
+| Divergence | Host default | What the validator does instead |
+| --- | --- | --- |
+| `ConvertFrom-Json` coerces ISO-8601 strings to `[datetime]` on 7+, leaves them `[string]` on 5.1; `[string]` then renders per current culture | culture-dependent text | `ConvertTo-ContractString` renders `[datetime]`/`[DateTimeOffset]` as invariant `yyyy-MM-ddTHH:mm:ssZ` |
+| `ConvertTo-Json` escapes `<` `>` `&` `'` as `\uXXXX` on 5.1 and emits them raw on 7+ | different bytes, different digest | `ConvertTo-CanonicalJson` is a hand-written encoder that escapes only `"`, `\` and control characters |
+| JSON integers parse as `Int32` on 5.1 and `Int64` on 7+ | `-is [int]` is false on 7+ | `Test-JsonInteger` accepts any integral width |
+| `Get-Content -Raw` decodes BOM-less files as system ANSI on 5.1, UTF-8 on 7+ | mojibake on non-ASCII | `[System.IO.File]::ReadAllText` (UTF-8 detection on both) |
+| `Set-Content -Encoding UTF8` writes a BOM on 5.1, none on 7+ | digest changes with the writer | `UTF8Encoding($false)` explicitly |
+| `String.StartsWith/EndsWith/IndexOf(String)` and `Sort-Object` are culture-sensitive | locale-dependent ordering and matching | `[StringComparison]::Ordinal` and `[StringComparer]::Ordinal` everywhere |
+| Git checks files out CRLF on Windows and LF on Linux | digest changes with the checkout | digests are structural, so line endings never reach a hash; `ledger-digests.sha256` is normalised to LF on read |
+
+Digests are **structural**: every digest is taken over the parsed JSON
+re-encoded by `ConvertTo-CanonicalJson` (ordinally sorted keys, invariant scalar
+rendering) and hashed as UTF-8 without a BOM. Insignificant whitespace, indent
+style and line endings are therefore discarded before hashing, so a digest is a
+property of the contract content and never of the checkout, the locale or the
+host. `ledger-digests.sha256` is itself read with `\r\n` normalised to `\n`,
+because `.gitattributes` is frozen and carries no rule for `*.sha256`, so that
+file checks out CRLF on Windows and LF on Linux. The self-test asserts this end
+to end; see `culture-sensitive-key-sort-is-rejected`,
+`ledger-digest-file-with-crlf-line-endings` and
+`contract-digests-ignore-crlf-checkout`.
+
+The only thing that legitimately differs between hosts is `repository_root` in
+the JSON report, plus the whitespace of the report itself, because each host
+pretty-prints with its own `ConvertTo-Json`. No digest and no decision depends
+on either.
 
 ## Feature lifecycle
 
