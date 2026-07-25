@@ -1,4 +1,4 @@
-//! Opt-in live contract check against the exactly pinned official OpenClaw Gateway.
+//! Opt-in live contract check against an operator-supplied OpenClaw Gateway.
 
 use std::env;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ fn live_config(url: &Url, token: &str, seed: u8) -> GatewayClientConfig {
 }
 
 #[tokio::test]
-#[ignore = "requires the isolated pinned-upstream reference workflow"]
+#[ignore = "requires an explicitly provisioned external OpenClaw Gateway"]
 async fn pinned_official_gateway_live_contract() {
     let url = Url::parse(
         &env::var("OPENCLAW_REFERENCE_URL").expect("OPENCLAW_REFERENCE_URL is required"),
