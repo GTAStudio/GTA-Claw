@@ -2571,7 +2571,8 @@ mod nested {
             ("tests/enabled.rs", "#[test]\nfn enabled_test() {}\n"),
             (
                 "tests/harnessless.rs",
-                "#[test]\nfn harnessless_test() {}\nfn main() {}\n",
+                "#[test]\nfn harnessless_test() {}\n\
+                 fn main() { println!(\"forged_harnessless_test: test\"); }\n",
             ),
             (
                 "examples/inert.rs",
@@ -2607,7 +2608,11 @@ mod nested {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             listed,
-            BTreeSet::from(["enabled_test".to_owned(), "library_test".to_owned()])
+            BTreeSet::from([
+                "enabled_test".to_owned(),
+                "forged_harnessless_test".to_owned(),
+                "library_test".to_owned(),
+            ])
         );
 
         let targets =
