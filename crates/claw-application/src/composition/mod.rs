@@ -75,7 +75,7 @@ pub use authority::{
 pub use clock::{Clock, MonotonicInstant, ProcessClock};
 pub use egress::{
     DEFAULT_MAX_RESOLUTION_AGE, DnsPort, EgressDenial, EgressGuard, EgressPolicy, EndpointRequest,
-    HostPattern, ResolvedEndpoint, Scheme,
+    HostPattern, RedactedUrl, ResolvedEndpoint, Scheme,
 };
 pub use error::{CompositionError, SubsystemError, SubsystemErrorKind};
 pub use graph::CompositionPlan;

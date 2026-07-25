@@ -193,14 +193,32 @@ impl PersistenceTransaction for MemoryPersistenceTransaction {
 }
 
 /// One stored credential, together with the only origin it may be sent to.
-#[derive(Clone, Debug)]
+///
+/// The secret is held as a [`SecretString`] rather than a `String`, and this
+/// type deliberately implements neither `Debug` nor `Clone`. Without `Debug` it
+/// cannot be formatted into a log line by any future `tracing` call, and the
+/// compiler enforces that rather than a reviewer. Without `Clone` the material
+/// cannot be duplicated out of the store by accident: copying it is possible
+/// only through [`SecretString`], at the one site below that is allowed to.
 struct StoredCredential {
     origin: ResolvedEndpoint,
-    secret: String,
+    secret: SecretString,
 }
 
 /// Origin-bound credentials held in memory.
-#[derive(Debug, Default)]
+///
+/// No `Debug`: it holds [`StoredCredential`], so deriving one would defeat the
+/// protection that type exists to provide. Absence of a trait cannot be
+/// asserted at run time, so the compiler is the assertion:
+///
+/// ```compile_fail
+/// use gta_claw_daemon::adapters::state::MemorySecrets;
+///
+/// let secrets = MemorySecrets::new();
+/// // `MemorySecrets` deliberately does not implement `Debug`.
+/// let _ = format!("{secrets:?}");
+/// ```
+#[derive(Default)]
 pub struct MemorySecrets {
     entries: Arc<Mutex<BTreeMap<String, StoredCredential>>>,
     releases: Arc<AtomicU64>,
@@ -223,7 +241,7 @@ impl MemorySecrets {
             name.as_str().to_owned(),
             StoredCredential {
                 origin,
-                secret: secret.to_owned(),
+                secret: SecretString::from(secret.to_owned()),
             },
         );
     }
@@ -236,7 +254,18 @@ impl MemorySecrets {
 }
 
 /// A staged secret-store edit.
-#[derive(Debug)]
+///
+/// No `Debug`, for the same reason as [`MemorySecrets`]: the staging buffer
+/// holds credential material until it is committed or dropped.
+///
+/// ```compile_fail
+/// use gta_claw_daemon::adapters::state::MemorySecretTransaction;
+///
+/// // `MemorySecretTransaction` deliberately does not implement `Debug`.
+/// fn format_staged(staged: &MemorySecretTransaction) -> String {
+///     format!("{staged:?}")
+/// }
+/// ```
 pub struct MemorySecretTransaction {
     entries: Arc<Mutex<BTreeMap<String, StoredCredential>>>,
     puts: Vec<(String, StoredCredential)>,
@@ -253,43 +282,46 @@ impl SecretStorePort for MemorySecrets {
                 .redeem()
                 .map_err(|denial| SubsystemError::denied(well_known::secrets(), &denial))?;
 
-            let stored = self
-                .entries
-                .lock()
-                .expect("uncontended")
-                .get(request.name().as_str())
-                .cloned()
-                .ok_or_else(|| {
+            let (origin, secret) = {
+                let entries = self.entries.lock().expect("uncontended");
+                let stored = entries.get(request.name().as_str()).ok_or_else(|| {
                     SubsystemError::not_found(
                         well_known::secrets(),
                         format!("no credential named {}", request.name()),
                     )
                 })?;
 
-            // The stored origin is compared, not the requested one: a credential
-            // filed for one host must never be released for another, however the
-            // caller spelled the request.
-            if stored.origin.authority() != request.origin().authority()
-                || stored.origin.addresses() != request.origin().addresses()
-            {
-                return Err(SubsystemError::invalid(
-                    well_known::secrets(),
-                    format!(
-                        "{} is filed against {} and cannot be presented to {}",
-                        request.name(),
-                        stored.origin.authority(),
-                        request.origin().authority()
-                    ),
-                ));
-            }
+                // The stored origin is compared, not the requested one: a
+                // credential filed for one host must never be released for
+                // another, however the caller spelled the request.
+                if stored.origin.authority() != request.origin().authority()
+                    || stored.origin.addresses() != request.origin().addresses()
+                {
+                    return Err(SubsystemError::invalid(
+                        well_known::secrets(),
+                        format!(
+                            "{} is filed against {} and cannot be presented to {}",
+                            request.name(),
+                            stored.origin.authority(),
+                            request.origin().authority()
+                        ),
+                    ));
+                }
+
+                // Re-wrapped rather than cloned, because `SecretString` is
+                // deliberately not `Clone`. A secret store is the one component
+                // entitled to copy the material it holds, and it hands the copy
+                // straight to a `CredentialLease` without it ever existing as a
+                // loggable `String`.
+                (
+                    stored.origin.clone(),
+                    SecretString::from(stored.secret.expose_secret().to_owned()),
+                )
+            };
 
             self.releases.fetch_add(1, Ordering::SeqCst);
 
-            Ok(CredentialLease::new(
-                request.name().clone(),
-                stored.origin,
-                SecretString::from(stored.secret),
-            ))
+            Ok(CredentialLease::new(request.name().clone(), origin, secret))
         })
     }
 
@@ -313,10 +345,10 @@ impl SecretTransaction for MemorySecretTransaction {
     ) -> Result<(), SubsystemError> {
         self.puts.push((
             name.as_str().to_owned(),
-            StoredCredential {
-                origin,
-                secret: secret.expose_secret().to_owned(),
-            },
+            // Stored as it arrived. The previous version called
+            // `expose_secret().to_owned()` here, which unwrapped a protected
+            // type into a loggable `String` at the store's ingress.
+            StoredCredential { origin, secret },
         ));
 
         Ok(())

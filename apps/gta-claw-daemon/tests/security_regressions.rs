@@ -12,11 +12,11 @@ use std::time::Duration;
 use claw_application::composition::{
     Action, ActionRequest, AuthorityPort, Capability, CapabilitySet, Clock, CredentialName,
     CredentialRequest, DnsPort, EgressDenial, EgressGuard, EgressPolicy, GrantIssuer, HostPattern,
-    Lifecycle, LifecyclePhase, Principal, ProviderReply, ResolvedEndpoint, SecretStorePort,
-    SubsystemErrorKind, ToolName, TurnEvent, TurnEventSink, well_known,
+    Lifecycle, LifecyclePhase, ModelName, Principal, ProviderName, ProviderReply, ResolvedEndpoint,
+    SecretStorePort, SubsystemErrorKind, ToolName, TurnEvent, TurnEventSink, well_known,
 };
 use claw_domain::SessionId;
-use gta_claw_daemon::adapters::model::request_tool;
+use gta_claw_daemon::adapters::model::{ProviderConfig, request_tool};
 use gta_claw_daemon::adapters::state::MemorySecrets;
 use gta_claw_daemon::adapters::support::{LivePolicy, PolicyStance, SteppedClock, TableDns};
 use gta_claw_daemon::compose::Daemon;
@@ -522,4 +522,112 @@ async fn a_plugin_instance_holds_only_the_capabilities_decided_for_it() {
         .expect_err("an instance cannot be torn down twice");
     assert_eq!(error.kind(), SubsystemErrorKind::NotFound);
     assert_eq!(host.activations(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Credential-bearing `Debug`.
+//
+// A field is credential-bearing if it *can* carry a secret, not if it is named
+// like one: a URL routinely carries `user:password@` and does not read like a
+// credential.
+//
+// These assert the complete formatted value rather than searching it for a
+// substring. A `contains("[REDACTED]")` check would still pass if someone added
+// an unredacted `api_key` field tomorrow; an exact match cannot.
+//
+// The expected strings are written by hand from each struct's field list, not
+// produced by formatting the value under test, which would only prove the
+// formatter agrees with itself.
+//
+// The absence of `Debug` on `ScriptedTransport`, `MemorySecrets` and
+// `MemorySecretTransaction` cannot be asserted at run time; it is covered by
+// `compile_fail` doctests on the types themselves.
+// ---------------------------------------------------------------------------
+
+/// The transport records which credential was presented so tests can check it,
+/// which means the record holds live secret material.
+#[tokio::test]
+async fn a_recorded_call_never_formats_the_credential_it_captured() {
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()) as Arc<dyn Clock>)
+        .build()
+        .expect("the default topology composes");
+    daemon.start().await.expect("every subsystem starts");
+
+    daemon
+        .run_turn(&operator(), &session("debug-redaction"), "hello", &Ignore)
+        .await
+        .expect("the turn completes");
+
+    let calls = daemon.transport().calls();
+
+    assert!(
+        calls[0].presented_secret_is("token-for-primary"),
+        "the fixture credential really was presented, so there is something to leak"
+    );
+    assert!(
+        !calls[0].presented_secret_is("token-for-secondary"),
+        "the comparison distinguishes credentials rather than always succeeding"
+    );
+
+    // context_items is 3 by construction, not by observation: `NoteContext`
+    // assembles one session header, then the builder's single default note,
+    // then the prompt.
+    assert_eq!(
+        format!("{:?}", calls[0]),
+        "RecordedCall { authority: \"models.example.test:443\", \
+         addresses: [203.0.113.10], \
+         prompt: \"hello\", \
+         context_items: 3, \
+         secret: \"[REDACTED]\" }"
+    );
+
+    daemon.stop().await.expect("the daemon stops");
+}
+
+/// `ProviderConfig` holds a caller-supplied URL before [`EgressGuard`] has had
+/// any chance to reject the userinfo in it, so this window is real rather than
+/// hypothetical.
+#[test]
+fn a_provider_config_never_formats_the_url_it_has_not_checked_yet() {
+    let config = ProviderConfig::new(
+        ProviderName::new("primary").expect("the literal satisfies the grammar"),
+        "https://operator:hunter2@models.example.test/v1",
+        CredentialName::new("primary-token").expect("the literal satisfies the grammar"),
+        vec![ModelName::new("test-model").expect("the literal satisfies the grammar")],
+    );
+
+    assert_eq!(
+        config.url(),
+        "https://operator:hunter2@models.example.test/v1",
+        "the accessor still returns the configured value; only formatting is redacted"
+    );
+
+    assert_eq!(
+        format!("{config:?}"),
+        "ProviderConfig { name: ProviderName(\"primary\"), \
+         url: \"[REDACTED]\", \
+         credential: CredentialName(\"primary-token\"), \
+         models: [ModelName(\"test-model\")] }"
+    );
+}
+
+/// The builder's `provider_url` cannot be set by a caller today, so this is
+/// pre-emptive rather than a live leak. It is here because the field is a
+/// `String` holding a URL, and the moment a setter is added the leak is real
+/// and nobody will remember to redact it then.
+#[test]
+fn a_builder_never_formats_the_provider_url_before_the_guard_has_seen_it() {
+    let builder = Daemon::builder();
+
+    assert_eq!(
+        format!("{builder:?}"),
+        "DaemonBuilder { listen: [127.0.0.1:0], \
+         provider_host: \"models.example.test\", \
+         provider_url: \"[REDACTED]\", \
+         provider_addresses: [203.0.113.10], \
+         authorization_ttl: 5s, \
+         context_budget: 4096, \
+         notes: [\"the operator prefers concise answers\"], .. }"
+    );
 }

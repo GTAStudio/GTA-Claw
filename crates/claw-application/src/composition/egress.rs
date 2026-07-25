@@ -88,7 +88,7 @@ impl EndpointRequest {
     /// than `http` or `https`, carries userinfo, or has no host.
     pub fn parse(url: &str) -> Result<Self, EgressDenial> {
         let parsed = Url::parse(url).map_err(|error| EgressDenial::InvalidUrl {
-            url: url.to_owned(),
+            url: RedactedUrl::new(url),
             reason: error.to_string(),
         })?;
 
@@ -104,20 +104,20 @@ impl EndpointRequest {
 
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(EgressDenial::CredentialsInUrl {
-                url: url.to_owned(),
+                url: RedactedUrl::new(url),
             });
         }
 
         let host = parsed
             .host_str()
             .ok_or_else(|| EgressDenial::MissingHost {
-                url: url.to_owned(),
+                url: RedactedUrl::new(url),
             })?
             .to_ascii_lowercase();
 
         if host.is_empty() {
             return Err(EgressDenial::MissingHost {
-                url: url.to_owned(),
+                url: RedactedUrl::new(url),
             });
         }
 
@@ -135,7 +135,9 @@ impl EndpointRequest {
     /// Returns [`EgressDenial::MissingHost`] when `host` is empty.
     pub fn new(scheme: Scheme, host: &str, port: u16) -> Result<Self, EgressDenial> {
         if host.is_empty() {
-            return Err(EgressDenial::MissingHost { url: String::new() });
+            return Err(EgressDenial::MissingHost {
+                url: RedactedUrl::new(""),
+            });
         }
 
         Ok(Self {
@@ -278,14 +280,79 @@ impl EgressPolicy {
     }
 }
 
+/// Stands in for a destination that would not parse at all.
+///
+/// Nothing of the input survives: without a parse there is no way to locate the
+/// userinfo, so there is no way to remove it.
+const UNPARSEABLE_DESTINATION: &str = "<unparseable>";
+
+/// Stands in for a destination that parsed but named no host.
+const HOSTLESS_DESTINATION: &str = "<no host>";
+
+/// A destination reduced to the parts that cannot carry a credential.
+///
+/// [`EgressDenial`] has to name the destination it refused, or an operator
+/// cannot find the configuration that produced it. It must not name it *as
+/// supplied*. [`EgressDenial::CredentialsInUrl`] is raised precisely when the
+/// URL contains `user:password@`, so every instance of that variant carries a
+/// password by definition — and `EgressDenial` implements [`Display`] and
+/// [`std::error::Error`], which is to say it is a type built to be logged.
+/// Quoting the input would put the password into the log line that reports the
+/// refusal.
+///
+/// This keeps only scheme, host and port: the same three parts
+/// [`EndpointRequest`] keeps, for the same reason given in this module's
+/// header. Path, query, fragment and userinfo are discarded rather than masked.
+///
+/// The guarantee is structural. [`RedactedUrl::new`] is the only way to build
+/// one, it reduces whatever it is given, and there is no accessor that returns
+/// the original text. So a `RedactedUrl` cannot be made to hold a secret, by
+/// this crate or by a caller. Deriving `Debug` is therefore safe here — unlike
+/// on a type that holds unredacted state, there is nothing for a formatter to
+/// reach.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RedactedUrl(String);
+
+impl RedactedUrl {
+    /// Reduces `raw` to `scheme://host[:port]`, discarding everything else.
+    ///
+    /// A URL that does not parse reduces to [`UNPARSEABLE_DESTINATION`], because
+    /// the userinfo cannot be located in a string the parser rejected.
+    #[must_use]
+    pub fn new(raw: &str) -> Self {
+        let Ok(parsed) = Url::parse(raw) else {
+            return Self(UNPARSEABLE_DESTINATION.to_owned());
+        };
+
+        let scheme = parsed.scheme();
+        let Some(host) = parsed.host_str() else {
+            return Self(format!("{scheme}://{HOSTLESS_DESTINATION}"));
+        };
+
+        match parsed.port() {
+            Some(port) => Self(format!("{scheme}://{host}:{port}")),
+            None => Self(format!("{scheme}://{host}")),
+        }
+    }
+}
+
+impl Display for RedactedUrl {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Why an outbound destination was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EgressDenial {
     /// The URL would not parse.
     InvalidUrl {
-        /// The URL as supplied.
-        url: String,
+        /// The destination, reduced to what is safe to print.
+        url: RedactedUrl,
         /// The parser's explanation.
+        ///
+        /// [`url::ParseError`] renders a fixed message per variant and never
+        /// echoes the input, so this cannot reintroduce what `url` removed.
         reason: String,
     },
     /// The URL used a scheme other than `http` or `https`.
@@ -295,13 +362,16 @@ pub enum EgressDenial {
     },
     /// The URL carried a username or password.
     CredentialsInUrl {
-        /// The URL as supplied.
-        url: String,
+        /// The destination, reduced to what is safe to print.
+        ///
+        /// Every instance of this variant was built from a URL containing a
+        /// credential, so this field in particular must never hold the input.
+        url: RedactedUrl,
     },
     /// The URL had no host component.
     MissingHost {
-        /// The URL as supplied.
-        url: String,
+        /// The destination, reduced to what is safe to print.
+        url: RedactedUrl,
     },
     /// Cleartext was requested but the policy requires TLS.
     PlainHttpRefused {
@@ -353,18 +423,15 @@ impl Display for EgressDenial {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl { url, reason } => {
-                write!(formatter, "cannot parse destination {url:?}: {reason}")
+                write!(formatter, "cannot parse destination {url}: {reason}")
             }
             Self::UnsupportedScheme { scheme } => {
                 write!(formatter, "unsupported destination scheme: {scheme}")
             }
             Self::CredentialsInUrl { url } => {
-                write!(
-                    formatter,
-                    "destination {url:?} carries embedded credentials"
-                )
+                write!(formatter, "destination {url} carries embedded credentials")
             }
-            Self::MissingHost { url } => write!(formatter, "destination {url:?} has no host"),
+            Self::MissingHost { url } => write!(formatter, "destination {url} has no host"),
             Self::PlainHttpRefused { host } => {
                 write!(formatter, "cleartext http to {host} is not permitted")
             }
@@ -677,7 +744,7 @@ mod tests {
 
     use super::{
         BoxFuture, Clock, DnsPort, EgressDenial, EgressGuard, EgressPolicy, EndpointRequest,
-        HostPattern, MonotonicInstant, Scheme, SubsystemError, classify,
+        HostPattern, MonotonicInstant, RedactedUrl, Scheme, SubsystemError, classify,
     };
     use crate::composition::id::SubsystemId;
 
@@ -784,10 +851,13 @@ mod tests {
         let denial = EndpointRequest::parse("https://user:secret@api.example.com/v1")
             .expect_err("userinfo is refused");
 
+        // The expectation is a literal, not `RedactedUrl::new(..)`: building it
+        // with the function under test would only prove that function agrees
+        // with itself.
         assert_eq!(
             denial,
             EgressDenial::CredentialsInUrl {
-                url: "https://user:secret@api.example.com/v1".to_owned(),
+                url: RedactedUrl("https://api.example.com".to_owned()),
             }
         );
     }
@@ -811,7 +881,7 @@ mod tests {
 
         match denial {
             EgressDenial::InvalidUrl { url, reason } => {
-                assert_eq!(url, "not a url");
+                assert_eq!(url, RedactedUrl("<unparseable>".to_owned()));
                 assert_eq!(reason, "relative URL without a base");
             }
             other => panic!("expected an invalid url denial, got {other}"),
@@ -1166,7 +1236,130 @@ mod tests {
         assert_eq!(request.port(), 8443);
         assert_eq!(
             EndpointRequest::new(Scheme::Https, "", 443).expect_err("empty host is refused"),
-            EgressDenial::MissingHost { url: String::new() }
+            EgressDenial::MissingHost {
+                url: RedactedUrl("<unparseable>".to_owned())
+            }
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Denials must not quote the credential they were raised to complain about.
+    //
+    // `EgressDenial` implements `Display` and `std::error::Error`, so it is a
+    // type built to be logged, and `CredentialsInUrl` is raised only for URLs
+    // that contain a password. Every expectation below is a hand-written
+    // literal: producing one with `RedactedUrl::new` or with the formatter
+    // under test would only prove the code agrees with itself.
+    // ---------------------------------------------------------------------
+
+    /// The password used throughout the redaction tests.
+    ///
+    /// Split so that the assembled URL never appears as one literal, and any
+    /// test that leaks it leaks a value that is greppable on its own.
+    const FIXTURE_PASSWORD: &str = "hunter2-do-not-log";
+
+    fn credentialed_url() -> String {
+        format!("https://operator:{FIXTURE_PASSWORD}@api.example.com:8443/v1/chat?key=abc#frag")
+    }
+
+    #[test]
+    fn a_credentials_denial_neither_displays_nor_debugs_the_password() {
+        let denial = EndpointRequest::parse(&credentialed_url()).expect_err("userinfo is refused");
+
+        assert_eq!(
+            denial.to_string(),
+            "destination https://api.example.com:8443 carries embedded credentials"
+        );
+        assert_eq!(
+            format!("{denial:?}"),
+            "CredentialsInUrl { url: RedactedUrl(\"https://api.example.com:8443\") }"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_destination_is_dropped_entirely_rather_than_masked() {
+        // The userinfo cannot be located in a string the parser rejected, so
+        // nothing of it may survive. `\u{1}` is a control character the URL
+        // parser refuses outright.
+        let raw = format!("ht\u{1}tp://operator:{FIXTURE_PASSWORD}@api.example.com/v1");
+        let denial = EndpointRequest::parse(&raw).expect_err("control characters are refused");
+
+        assert_eq!(
+            denial.to_string(),
+            "cannot parse destination <unparseable>: relative URL without a base"
+        );
+        assert_eq!(
+            format!("{denial:?}"),
+            "InvalidUrl { url: RedactedUrl(\"<unparseable>\"), \
+             reason: \"relative URL without a base\" }"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_the_destination_and_drops_everything_that_could_carry_a_secret() {
+        // Each case pairs an input with the literal it must reduce to. A port
+        // is kept only when it was given, so the rendering matches what the
+        // operator wrote.
+        let cases = [
+            ("https://api.example.com/v1", "https://api.example.com"),
+            (
+                "https://api.example.com:8443/v1",
+                "https://api.example.com:8443",
+            ),
+            ("http://10.0.0.5:8080/x", "http://10.0.0.5:8080"),
+            (
+                "https://api.example.com/?token=abc",
+                "https://api.example.com",
+            ),
+            ("https://api.example.com/#tok", "https://api.example.com"),
+            (
+                "https://api.example.com/keys/sk-live",
+                "https://api.example.com",
+            ),
+            ("mailto:someone@example.com", "mailto://<no host>"),
+            ("", "<unparseable>"),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                RedactedUrl::new(raw).to_string(),
+                expected,
+                "redaction of {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_denial_variant_can_reach_the_password_no_matter_which_check_refused_it() {
+        // Ordering-independence: the userinfo check runs before the host check
+        // today, but the guarantee must not depend on that. Every destination
+        // here carries the fixture password, and no rendering of any resulting
+        // denial may contain it.
+        let inputs = [
+            credentialed_url(),
+            format!("https://operator:{FIXTURE_PASSWORD}@"),
+            format!("ftp://operator:{FIXTURE_PASSWORD}@api.example.com"),
+            format!("ht\u{1}tp://operator:{FIXTURE_PASSWORD}@api.example.com"),
+            format!("https://operator:{FIXTURE_PASSWORD}@blocked.example.com"),
+        ];
+
+        for raw in inputs {
+            let denial = EndpointRequest::parse(&raw).expect_err("every input is refused");
+
+            let displayed = denial.to_string();
+            let debugged = format!("{denial:?}");
+            assert!(
+                !displayed.contains(FIXTURE_PASSWORD),
+                "Display leaked the password for {raw:?}: {displayed}"
+            );
+            assert!(
+                !debugged.contains(FIXTURE_PASSWORD),
+                "Debug leaked the password for {raw:?}: {debugged}"
+            );
+            assert!(
+                !displayed.contains("operator") && !debugged.contains("operator"),
+                "the username survived for {raw:?}"
+            );
+        }
     }
 }

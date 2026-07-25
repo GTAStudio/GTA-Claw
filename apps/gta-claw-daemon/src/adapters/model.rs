@@ -7,8 +7,11 @@
 //! hostname it could look up again.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+use secrecy::{ExposeSecret, SecretString};
 
 use claw_application::composition::{
     AssembledContext, BoxFuture, Capability, CapabilitySet, ContextAssemblyPort, CredentialName,
@@ -18,12 +21,29 @@ use claw_application::composition::{
 };
 
 /// How a provider is configured before it has been resolved.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written because `url` is credential-bearing: an HTTP URL may
+/// carry `user:password@` in its userinfo, and this value is held *before*
+/// [`EgressGuard`] has had the chance to reject it. A derived `Debug` would
+/// print those credentials in the window between configuration and resolution.
+#[derive(Clone)]
 pub struct ProviderConfig {
     name: ProviderName,
     url: String,
     credential: CredentialName,
     models: Vec<ModelName>,
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderConfig")
+            .field("name", &self.name)
+            .field("url", &"[REDACTED]")
+            .field("credential", &self.credential)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 impl ProviderConfig {
@@ -149,7 +169,18 @@ impl ProviderRegistryPort for GuardedProviderRegistry {
 }
 
 /// What one provider call did.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Every field is inspectable except the credential, which is held as a
+/// [`SecretString`] and can only be *compared*, never read back out. Tests
+/// assert the right credential was presented with
+/// [`presented_secret_is`](Self::presented_secret_is), which proves exactly what
+/// an equality check on a raw `String` proved, without the value ever being
+/// available to log.
+///
+/// `Debug` is hand-written and redacting rather than derived. `Eq`/`PartialEq`
+/// were derived and unused; they are gone, because whole-struct equality on a
+/// type carrying credential material invites a comparison against a literal.
+#[derive(Clone)]
 pub struct RecordedCall {
     /// The authority the call was sent to, taken from the resolved endpoint.
     pub authority: String,
@@ -157,17 +188,54 @@ pub struct RecordedCall {
     pub addresses: Vec<std::net::IpAddr>,
     /// The prompt that was sent.
     pub prompt: String,
-    /// The credential material that was presented.
-    pub secret: String,
     /// How many context items were attached.
     pub context_items: usize,
+    /// The credential material that was presented.
+    ///
+    /// `Arc` because [`SecretString`] is deliberately not `Clone`, and this
+    /// record is handed out by value; sharing the one protected allocation is
+    /// preferable to copying the secret once per reader.
+    secret: Arc<SecretString>,
+}
+
+impl RecordedCall {
+    /// Returns whether the credential presented on this call was `expected`.
+    #[must_use]
+    pub fn presented_secret_is(&self, expected: &str) -> bool {
+        self.secret.expose_secret() == expected
+    }
+}
+
+impl fmt::Debug for RecordedCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordedCall")
+            .field("authority", &self.authority)
+            .field("addresses", &self.addresses)
+            .field("prompt", &self.prompt)
+            .field("context_items", &self.context_items)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// A transport that answers from a script and records what it was asked to do.
 ///
 /// It connects to nothing, but it records the endpoint's addresses rather than
 /// its hostname, which is what a real transport must use.
-#[derive(Debug, Default)]
+///
+/// No `Debug`: it holds every [`RecordedCall`] made, and therefore every
+/// credential presented. Absence of a trait cannot be asserted at run time, so
+/// the compiler is the assertion:
+///
+/// ```compile_fail
+/// use gta_claw_daemon::adapters::model::ScriptedTransport;
+///
+/// let transport = ScriptedTransport::new();
+/// // `ScriptedTransport` deliberately does not implement `Debug`.
+/// let _ = format!("{transport:?}");
+/// ```
+#[derive(Default)]
 pub struct ScriptedTransport {
     replies: Mutex<Vec<ProviderReply>>,
     calls: Mutex<Vec<RecordedCall>>,
@@ -207,8 +275,12 @@ impl ProviderTransportPort for ScriptedTransport {
                 authority: endpoint.authority(),
                 addresses: endpoint.addresses().to_vec(),
                 prompt: call.prompt().to_owned(),
-                secret: call.credential().expose().to_owned(),
                 context_items: call.context().items().len(),
+                // Re-wrapped, not exposed into a `String`. The previous version
+                // called `.expose()` here, which opted the value out of the
+                // protection `CredentialLease` exists to provide and then stored
+                // the result in a struct that derived `Debug`.
+                secret: Arc::new(SecretString::from(call.credential().expose().to_owned())),
             });
 
             let mut replies = self.replies.lock().expect("uncontended");

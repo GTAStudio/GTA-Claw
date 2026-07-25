@@ -16,6 +16,7 @@
 //! changes — not the plan, not the shutdown path, not the session service. That
 //! is the whole point of doing this before the crates exist.
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -364,7 +365,13 @@ impl std::fmt::Debug for Daemon {
 }
 
 /// Assembles a [`Daemon`].
-#[derive(Debug)]
+///
+/// `Debug` is hand-written because `provider_url` is credential-bearing. The
+/// builder holds it before [`EgressGuard`](claw_application::composition::EgressGuard)
+/// has rejected any userinfo it carries, so a derived `Debug` would print
+/// `user:password@` for exactly as long as the value is unvalidated. The host
+/// and addresses are printed instead, which are the useful diagnostics and
+/// cannot carry a secret.
 pub struct DaemonBuilder {
     clock: Option<Arc<dyn Clock>>,
     listen: Vec<SocketAddr>,
@@ -374,6 +381,21 @@ pub struct DaemonBuilder {
     authorization_ttl: Duration,
     context_budget: usize,
     notes: Vec<String>,
+}
+
+impl fmt::Debug for DaemonBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonBuilder")
+            .field("listen", &self.listen)
+            .field("provider_host", &self.provider_host)
+            .field("provider_url", &"[REDACTED]")
+            .field("provider_addresses", &self.provider_addresses)
+            .field("authorization_ttl", &self.authorization_ttl)
+            .field("context_budget", &self.context_budget)
+            .field("notes", &self.notes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonBuilder {

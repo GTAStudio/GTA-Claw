@@ -167,7 +167,10 @@ async fn a_turn_runs_through_every_subsystem_and_is_recorded_once() {
         vec!["203.0.113.10".parse::<std::net::IpAddr>().expect("literal")],
         "the transport is handed checked addresses, not a hostname to look up"
     );
-    assert_eq!(calls[0].secret, "token-for-primary");
+    assert!(
+        calls[0].presented_secret_is("token-for-primary"),
+        "the credential filed for the primary provider is the one that was presented"
+    );
     assert_eq!(calls[0].prompt, "what is in the workspace");
     assert_eq!(
         calls[1].prompt,
