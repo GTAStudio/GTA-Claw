@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use crate::{ConfigDomain, ConfigError, ConfigSnapshot, parse_json5};
 
@@ -59,7 +65,10 @@ impl ReloadManager {
     }
 }
 
-fn changed_domains(previous: &ConfigSnapshot, candidate: &ConfigSnapshot) -> Vec<ConfigDomain> {
+pub(crate) fn changed_domains(
+    previous: &ConfigSnapshot,
+    candidate: &ConfigSnapshot,
+) -> Vec<ConfigDomain> {
     let previous = previous.core();
     let candidate = candidate.core();
     let comparisons = [
@@ -99,4 +108,202 @@ const fn restart_required(domain: ConfigDomain) -> bool {
             | ConfigDomain::Admin
             | ConfigDomain::Network
     )
+}
+
+/// One atomically published typed configuration change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChange {
+    /// Previous immutable snapshot.
+    pub previous: Arc<ConfigSnapshot>,
+    /// Newly published immutable snapshot.
+    pub current: Arc<ConfigSnapshot>,
+    /// Domains whose values changed.
+    pub changed_domains: Vec<ConfigDomain>,
+    /// Changed domains that require process restart.
+    pub restart_required_domains: Vec<ConfigDomain>,
+}
+
+/// Receiving half of one typed configuration subscription.
+#[derive(Debug)]
+pub struct ConfigSubscription {
+    receiver: mpsc::Receiver<ConfigChange>,
+}
+
+impl ConfigSubscription {
+    /// Blocks until the next change or all publisher handles are dropped.
+    pub fn recv(&self) -> Result<ConfigChange, mpsc::RecvError> {
+        self.receiver.recv()
+    }
+
+    /// Receives a pending change without blocking.
+    pub fn try_recv(&self) -> Result<ConfigChange, mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+/// Lock and configuration failure from the concurrent reload hub.
+#[derive(Debug)]
+pub enum ConfigHubError {
+    /// Candidate parsing or file loading failed.
+    Config(ConfigError),
+    /// A thread panicked while holding an internal synchronization lock.
+    LockPoisoned(&'static str),
+}
+
+impl Display for ConfigHubError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::LockPoisoned(lock) => write!(formatter, "configuration {lock} lock is poisoned"),
+        }
+    }
+}
+
+impl Error for ConfigHubError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::LockPoisoned(_) => None,
+        }
+    }
+}
+
+impl From<ConfigError> for ConfigHubError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+/// Concurrent last-known-good owner with typed change subscriptions.
+///
+/// Readers clone one `Arc` while holding a short read lock. Publication swaps
+/// the complete `Arc` under one write lock, so readers can never observe a
+/// partially updated snapshot.
+#[derive(Clone, Debug)]
+pub struct ConfigHub {
+    current: Arc<RwLock<Arc<ConfigSnapshot>>>,
+    subscribers: Arc<Mutex<Vec<mpsc::Sender<ConfigChange>>>>,
+}
+
+impl ConfigHub {
+    /// Creates a hub from an already validated snapshot.
+    #[must_use]
+    pub fn new(initial: ConfigSnapshot) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(initial))),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Returns one complete immutable snapshot.
+    pub fn snapshot(&self) -> Result<Arc<ConfigSnapshot>, ConfigHubError> {
+        self.current
+            .read()
+            .map(|current| Arc::clone(&current))
+            .map_err(|_| ConfigHubError::LockPoisoned("snapshot"))
+    }
+
+    /// Adds an independent typed subscription.
+    pub fn subscribe(&self) -> Result<ConfigSubscription, ConfigHubError> {
+        let (sender, receiver) = mpsc::channel();
+        self.subscribers
+            .lock()
+            .map_err(|_| ConfigHubError::LockPoisoned("subscriber"))?
+            .push(sender);
+        Ok(ConfigSubscription { receiver })
+    }
+
+    /// Validates then atomically publishes a complete candidate.
+    pub fn reload_json5(
+        &self,
+        source: &str,
+        source_name: &str,
+    ) -> Result<ConfigChange, ConfigHubError> {
+        let candidate = Arc::new(parse_json5(source, source_name)?);
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .map_err(|_| ConfigHubError::LockPoisoned("subscriber"))?;
+        let change = {
+            let mut current = self
+                .current
+                .write()
+                .map_err(|_| ConfigHubError::LockPoisoned("snapshot"))?;
+            let previous = Arc::clone(&current);
+            let changed_domains = changed_domains(&previous, &candidate);
+            let restart_required_domains = changed_domains
+                .iter()
+                .copied()
+                .filter(|domain| restart_required(*domain))
+                .collect();
+            *current = Arc::clone(&candidate);
+            ConfigChange {
+                previous,
+                current: candidate,
+                changed_domains,
+                restart_required_domains,
+            }
+        };
+        subscribers.retain(|subscriber| subscriber.send(change.clone()).is_ok());
+        Ok(change)
+    }
+}
+
+/// Poll-based file change detector backed by [`ConfigHub`].
+#[derive(Clone, Debug)]
+pub struct ConfigFileWatcher {
+    path: PathBuf,
+    fingerprint: u64,
+    hub: ConfigHub,
+}
+
+impl ConfigFileWatcher {
+    /// Loads a file, publishes it as the initial snapshot, and records its bytes.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigHubError> {
+        let path = path.as_ref().to_owned();
+        let bytes = fs::read(&path).map_err(|source| ConfigError::io(&path, source))?;
+        let source = std::str::from_utf8(&bytes).map_err(|error| ConfigError::Syntax {
+            source_name: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let initial = parse_json5(source, &path.display().to_string())?;
+        Ok(Self {
+            path,
+            fingerprint: fingerprint(&bytes),
+            hub: ConfigHub::new(initial),
+        })
+    }
+
+    /// Returns a cloneable handle to the publication hub.
+    #[must_use]
+    pub fn hub(&self) -> ConfigHub {
+        self.hub.clone()
+    }
+
+    /// Detects changed bytes and publishes a valid candidate.
+    ///
+    /// A rejected candidate leaves both the last-known-good snapshot and the
+    /// successful fingerprint unchanged.
+    pub fn poll(&mut self) -> Result<Option<ConfigChange>, ConfigHubError> {
+        let bytes = fs::read(&self.path).map_err(|source| ConfigError::io(&self.path, source))?;
+        let next_fingerprint = fingerprint(&bytes);
+        if next_fingerprint == self.fingerprint {
+            return Ok(None);
+        }
+        let source = std::str::from_utf8(&bytes).map_err(|error| ConfigError::Syntax {
+            source_name: self.path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let change = self
+            .hub
+            .reload_json5(source, &self.path.display().to_string())?;
+        self.fingerprint = next_fingerprint;
+        Ok(Some(change))
+    }
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
