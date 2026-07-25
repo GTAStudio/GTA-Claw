@@ -2,6 +2,11 @@ These test-only fixtures are a self-signed P-256 certificate for DNS name
 "localhost" and its unencrypted PKCS#8 private key. They are not product
 credentials.
 
+Validity: 1975-01-01T00:00:00Z through 4096-01-01T00:00:00Z. The live HTTPS
+tests validate the certificate against the current clock. Because the fixture
+has more than two millennia of remaining validity, no near-expiry warning test
+is needed; regenerate it if that validity range changes.
+
 To regenerate outside this workspace:
 
 1. Create a throwaway Rust binary crate.
