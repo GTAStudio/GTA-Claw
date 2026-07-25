@@ -91,6 +91,23 @@
     "evidence_policy":  {
                             "initial_status":  "unimplemented",
                             "acceptance_evidence_state":  "missing",
-                            "legacy_typescript_is_not_rust_acceptance_evidence":  true
+                            "legacy_typescript_is_not_rust_acceptance_evidence":  true,
+                            "allowed_statuses":  [
+                                                     "unimplemented",
+                                                     "partial",
+                                                     "implemented"
+                                                 ],
+                            "artifact_kinds":  [
+                                                   "rust_test",
+                                                   "rust_source",
+                                                   "rust_fixture",
+                                                   "ci_check"
+                                               ],
+                            "proof_artifact_kind":  "rust_test",
+                            "status_totals":  {
+                                                  "unimplemented":  47,
+                                                  "partial":  0,
+                                                  "implemented":  0
+                                              }
                         }
 }

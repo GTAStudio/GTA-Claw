@@ -1,10 +1,63 @@
+<#
+.SYNOPSIS
+    Validates the frozen OpenClaw upstream compatibility contract under compat/upstream.
+
+.DESCRIPTION
+    Enforces the frozen baseline (upstream provenance, inventories, canonical counts)
+    and the audited feature-ledger lifecycle. A feature row may be unimplemented,
+    partial or implemented; anything other than unimplemented must cite typed
+    acceptance evidence whose paths exist in the working tree and whose named test,
+    symbol or job actually appears inside the cited file.
+
+.PARAMETER WriteLedgerDigests
+    Runs every check except the stored ledger digest comparison, then rewrites
+    compat/upstream/ledger-digests.sha256 from the current ledgers and prints the
+    digests for review. This is the ONLY supported way to change ledger digests.
+    It never touches inventory digests, the schema digest or baseline.json.
+
+.PARAMETER RepositoryRoot
+    Repository working tree used to resolve acceptance-evidence paths. Defaults to
+    the parent of compat/. The validator self-test passes the real tree explicitly
+    because it runs mutated copies of this contract from a temporary directory.
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
+#>
 [CmdletBinding()]
-param()
+param(
+    [switch]$WriteLedgerDigests,
+    [string]$RepositoryRoot
+)
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
-$ExpectedSchemaDigest = "ce2399751e5f990bcf5074435a6e3159e1a5bce2266402c3d1665da1971e9a44"
+$ExpectedSchemaDigest = "32f04a7b53fa0968cc427bc6acb2cf9755d4a92dc130a0ebb8d574682dd4b052"
+$LedgerDigestFileName = "ledger-digests.sha256"
+$LedgerDigestHeader = @(
+    "# GTA-Claw frozen upstream compatibility ledger digests.",
+    "# Only the three mutable ledgers are covered here; inventory digests, the feature",
+    "# schema digest and baseline.json stay hardcoded in validate.ps1 and are frozen.",
+    "# Regenerate ONLY through the reviewed command, never by hand:",
+    "#   powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests",
+    "# Format: <sha256>  <ledger path>"
+)
+$AllowedFeatureStatuses = @("unimplemented", "partial", "implemented")
+$BaselineKnownDifference =
+    "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+$AllowedArtifactKinds = @("rust_test", "rust_source", "rust_fixture", "ci_check")
+$LegacyScriptExtensions = @(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+$LegacyPathPrefixes = @(
+    "src/",
+    "compat/legacy/",
+    "node_modules/",
+    "_upstream/",
+    "packages/"
+)
+$SelfReferentialPathPrefixes = @("compat/upstream/")
 $AllowedClassifications = @(
     "gateway_core",
     "official_integration",
@@ -40,27 +93,31 @@ $ExpectedJsonPaths = @(
     "ledgers/official-integration.json"
 )
 
+$ExpectedNonJsonPaths = @(
+    "README.md",
+    "ledger-digests.sha256",
+    "validate-self-test.ps1",
+    "validate.ps1"
+)
+
 $LedgerSpecs = @(
     [ordered]@{
         path = "ledgers/gateway-core.json"
         ledger_id = "gateway-core"
         classification = "gateway_core"
         expected_features = 16
-        digest = "4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d"
     },
     [ordered]@{
         path = "ledgers/official-integration.json"
         ledger_id = "official-integration"
         classification = "official_integration"
         expected_features = 13
-        digest = "01ac641cdcb208343bdbafa119ac6c2089c03a6ac23064351c5dae628eba1c47"
     },
     [ordered]@{
         path = "ledgers/official-client-interop.json"
         ledger_id = "official-client-interop"
         classification = "official_client_interop"
         expected_features = 18
-        digest = "e2ba9299748d42d24f7b5d84a7a18af34a470ce260f40d5d3a20a9cddf288406"
     }
 )
 
@@ -574,6 +631,333 @@ function Assert-RelativeSourcePath {
     }
 }
 
+function Resolve-RepositoryRoot {
+    param([AllowNull()][string]$Requested)
+    if ([string]::IsNullOrWhiteSpace($Requested)) {
+        $candidate = Split-Path -Parent (Split-Path -Parent $Root)
+    } else {
+        $candidate = $Requested
+    }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        Fail "repository root '$candidate' does not exist; acceptance evidence cannot be verified"
+    }
+    $resolved = (Resolve-Path -LiteralPath $candidate).ProviderPath
+    foreach ($marker in @("Cargo.toml", "crates")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $resolved $marker))) {
+            Fail "repository root '$resolved' is not a GTA-Claw working tree (missing $marker)"
+        }
+    }
+    return $resolved
+}
+
+$script:DirectoryEntryCache = @{}
+$script:RepositoryFileTextCache = @{}
+
+function Get-DirectoryEntryNames {
+    param([string]$AbsoluteDirectory)
+    if ($script:DirectoryEntryCache.ContainsKey($AbsoluteDirectory)) {
+        return $script:DirectoryEntryCache[$AbsoluteDirectory]
+    }
+    [string[]]$names = @()
+    if (Test-Path -LiteralPath $AbsoluteDirectory -PathType Container) {
+        $names = @(Get-ChildItem -LiteralPath $AbsoluteDirectory -Force | ForEach-Object { [string]$_.Name })
+    }
+    $script:DirectoryEntryCache[$AbsoluteDirectory] = $names
+    return $names
+}
+
+function Resolve-RepositoryFilePath {
+    param([string]$RelativePath)
+    $current = $script:RepositoryRootFull
+    foreach ($segment in $RelativePath.Split("/")) {
+        if (-not (Test-OrdinalContains (Get-DirectoryEntryNames $current) $segment)) {
+            return $null
+        }
+        $current = Join-Path $current $segment
+    }
+    if (-not (Test-Path -LiteralPath $current -PathType Leaf)) {
+        return $null
+    }
+    return $current
+}
+
+function Get-RepositoryFileText {
+    param([string]$AbsolutePath)
+    if ($script:RepositoryFileTextCache.ContainsKey($AbsolutePath)) {
+        return $script:RepositoryFileTextCache[$AbsolutePath]
+    }
+    $text = [System.IO.File]::ReadAllText($AbsolutePath)
+    $script:RepositoryFileTextCache[$AbsolutePath] = $text
+    return $text
+}
+
+function Test-PathHasExtension {
+    param(
+        [string]$RelativePath,
+        [string[]]$Extensions
+    )
+    $lowered = $RelativePath.ToLowerInvariant()
+    foreach ($extension in $Extensions) {
+        if ($lowered.EndsWith($extension, [StringComparison]::Ordinal)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-PathHasPrefix {
+    param(
+        [string]$RelativePath,
+        [string[]]$Prefixes
+    )
+    foreach ($prefix in $Prefixes) {
+        if ($RelativePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Assert-EvidencePathShape {
+    param(
+        [string]$RelativePath,
+        [string]$Context
+    )
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+        -not ($RelativePath -cmatch '\A[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\z')) {
+        Fail "$Context acceptance evidence path '$RelativePath' must be a repository-relative forward-slash path"
+    }
+    foreach ($segment in $RelativePath.Split("/")) {
+        if ((Test-OrdinalStringEqual $segment ".") -or (Test-OrdinalStringEqual $segment "..")) {
+            Fail "$Context acceptance evidence path '$RelativePath' must not contain relative segments"
+        }
+    }
+    if (Test-PathHasExtension $RelativePath $LegacyScriptExtensions) {
+        Fail "$Context acceptance evidence path '$RelativePath' is a legacy TypeScript/JavaScript file and is never Rust acceptance evidence"
+    }
+    if (Test-PathHasPrefix $RelativePath $LegacyPathPrefixes) {
+        Fail "$Context acceptance evidence path '$RelativePath' lives in a legacy JavaScript/TypeScript tree and is never Rust acceptance evidence"
+    }
+    if (Test-PathHasPrefix $RelativePath $SelfReferentialPathPrefixes) {
+        Fail "$Context acceptance evidence path '$RelativePath' is self-referential compatibility contract data, not acceptance evidence"
+    }
+}
+
+function Assert-RustTestSymbol {
+    param(
+        [string]$Text,
+        [string]$Symbol,
+        [string]$RelativePath,
+        [string]$Context
+    )
+    if ($Text -cnotmatch ('\bfn\s+' + [regex]::Escape($Symbol) + '\s*[(<]')) {
+        Fail "$Context cites test '$Symbol' that does not exist in '$RelativePath'"
+    }
+}
+
+function Assert-EvidenceArtifact {
+    param(
+        [object]$Artifact,
+        [string]$Context,
+        [System.Collections.Generic.List[string]]$RustTestTexts
+    )
+    Assert-ExactPropertySet $Artifact @("kind", "path", "check") $Context
+    $kind = [string](Get-PropertyValue $Artifact "kind")
+    $relativePath = [string](Get-PropertyValue $Artifact "path")
+    $check = [string](Get-PropertyValue $Artifact "check")
+    if (-not (Test-OrdinalContains $AllowedArtifactKinds $kind)) {
+        Fail "$Context has unsupported acceptance evidence kind '$kind'"
+    }
+    Assert-EvidencePathShape $relativePath $Context
+    $absolutePath = Resolve-RepositoryFilePath $relativePath
+    if ($null -eq $absolutePath) {
+        Fail "$Context cites acceptance evidence path '$relativePath' that does not exist in the working tree"
+    }
+    $text = Get-RepositoryFileText $absolutePath
+
+    if (Test-OrdinalStringEqual $kind "rust_test") {
+        if (-not (Test-PathHasExtension $relativePath @(".rs"))) {
+            Fail "$Context rust_test acceptance evidence '$relativePath' must be a Rust source file"
+        }
+        if (-not ($check -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
+            Fail "$Context rust_test check '$check' must be a Rust test path"
+        }
+        if ($text -cnotmatch '#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test') {
+            Fail "$Context rust_test acceptance evidence '$relativePath' contains no Rust test attribute"
+        }
+        $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
+        Assert-RustTestSymbol $text $symbol $relativePath $Context
+        return
+    }
+
+    if (Test-OrdinalStringEqual $kind "rust_source") {
+        if (-not (Test-PathHasExtension $relativePath @(".rs"))) {
+            Fail "$Context rust_source acceptance evidence '$relativePath' must be a Rust source file"
+        }
+        if (-not ($check -cmatch '\A[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*\z')) {
+            Fail "$Context rust_source check '$check' must be a Rust symbol path"
+        }
+        $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
+        $declaration = '\b(?:fn|struct|enum|trait|union|type|const|static|mod|impl)[ \t]+(?:[A-Za-z0-9_:<>,&'' \t]*[ \t])?' +
+            [regex]::Escape($symbol) + '\b'
+        if ($text -cnotmatch $declaration) {
+            Fail "$Context cites symbol '$symbol' that is not declared in '$relativePath'"
+        }
+        return
+    }
+
+    if (Test-OrdinalStringEqual $kind "rust_fixture") {
+        if (Test-PathHasExtension $relativePath @(".rs")) {
+            Fail "$Context rust_fixture acceptance evidence '$relativePath' must be fixture data, not Rust source"
+        }
+        if (-not ($check -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
+            Fail "$Context rust_fixture check '$check' must name the Rust test that consumes the fixture"
+        }
+        $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
+        $consumed = $false
+        foreach ($testText in $RustTestTexts) {
+            if ($testText -cmatch ('\bfn\s+' + [regex]::Escape($symbol) + '\s*[(<]')) {
+                $consumed = $true
+                break
+            }
+        }
+        if (-not $consumed) {
+            Fail "$Context rust_fixture cites test '$symbol' that is not one of the rust_test artifacts of this row"
+        }
+        return
+    }
+
+    if (-not $relativePath.StartsWith(".github/workflows/", [StringComparison]::Ordinal) -or
+        -not (Test-PathHasExtension $relativePath @(".yml", ".yaml"))) {
+        Fail "$Context ci_check acceptance evidence '$relativePath' must be a workflow under .github/workflows"
+    }
+    if (-not ($check -cmatch '\A[A-Za-z0-9][A-Za-z0-9 ._/-]*\z')) {
+        Fail "$Context ci_check check '$check' must be a workflow job key or step name"
+    }
+    $escapedCheck = [regex]::Escape($check)
+    if ($text -cnotmatch ('(?m)^\s*(?:name:\s*["'']?' + $escapedCheck + '["'']?\s*$|' + $escapedCheck + ':\s*$)')) {
+        Fail "$Context cites workflow check '$check' that does not exist in '$relativePath'"
+    }
+}
+
+function Assert-FeatureLifecycle {
+    param(
+        [object]$Feature,
+        [string]$Context
+    )
+    $status = [string]$Feature.status
+    $evidence = $Feature.acceptance_evidence
+    $evidenceStatus = [string]$evidence.status
+    $artifacts = @($evidence.artifacts)
+    $differences = @($Feature.known_differences)
+
+    if (-not (Test-OrdinalContains $AllowedFeatureStatuses $status)) {
+        Fail "$Context has unsupported lifecycle status '$status'"
+    }
+
+    if (Test-OrdinalStringEqual $status "unimplemented") {
+        if (-not (Test-OrdinalStringEqual $evidenceStatus "missing") -or $artifacts.Count -ne 0) {
+            Fail "$Context must start unimplemented with an empty evidence placeholder"
+        }
+        if ($differences.Count -ne 1 -or
+            -not (Test-OrdinalStringEqual ([string]$differences[0]) $BaselineKnownDifference)) {
+            Fail "$Context is unimplemented and must keep the frozen baseline known_differences placeholder"
+        }
+        return
+    }
+
+    $expectedEvidenceStatus = if (Test-OrdinalStringEqual $status "implemented") { "accepted" } else { "partial" }
+    if (-not (Test-OrdinalStringEqual $evidenceStatus $expectedEvidenceStatus)) {
+        Fail "$Context status '$status' requires acceptance_evidence.status '$expectedEvidenceStatus', got '$evidenceStatus'"
+    }
+    if ($artifacts.Count -eq 0) {
+        Fail "$Context status '$status' requires at least one acceptance evidence artifact"
+    }
+    foreach ($difference in $differences) {
+        if (Test-OrdinalStringEqual ([string]$difference) $BaselineKnownDifference) {
+            Fail "$Context status '$status' must not keep the baseline no-implementation known_differences placeholder"
+        }
+    }
+
+    $identities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $rustTestTexts = New-Object System.Collections.Generic.List[string]
+    for ($index = 0; $index -lt $artifacts.Count; $index += 1) {
+        $artifact = $artifacts[$index]
+        if (-not (Test-JsonObject $artifact)) {
+            Fail "$Context acceptance evidence artifact $index must be a typed object"
+        }
+        if (-not $identities.Add((ConvertTo-CanonicalJson $artifact))) {
+            Fail "$Context repeats the same acceptance evidence artifact"
+        }
+        if (Test-OrdinalStringEqual ([string](Get-PropertyValue $artifact "kind")) "rust_test") {
+            $relativePath = [string](Get-PropertyValue $artifact "path")
+            Assert-EvidencePathShape $relativePath "$Context.acceptance_evidence.artifacts[$index]"
+            $absolutePath = Resolve-RepositoryFilePath $relativePath
+            if ($null -ne $absolutePath) {
+                $rustTestTexts.Add((Get-RepositoryFileText $absolutePath))
+            }
+        }
+    }
+    for ($index = 0; $index -lt $artifacts.Count; $index += 1) {
+        Assert-EvidenceArtifact $artifacts[$index] "$Context.acceptance_evidence.artifacts[$index]" $rustTestTexts
+    }
+    if ($rustTestTexts.Count -eq 0) {
+        Fail "$Context status '$status' requires at least one rust_test acceptance evidence artifact"
+    }
+}
+
+function Format-LedgerDigestFile {
+    param([System.Collections.IDictionary]$DigestsByPath)
+    [string[]]$lines = @($LedgerDigestHeader)
+    foreach ($spec in $LedgerSpecs) {
+        $lines += ("{0}  {1}" -f [string]$DigestsByPath[[string]$spec.path], [string]$spec.path)
+    }
+    return (($lines -join "`n") + "`n")
+}
+
+function Read-LedgerDigestFile {
+    param([string]$AbsolutePath)
+    if (-not (Test-Path -LiteralPath $AbsolutePath -PathType Leaf)) {
+        Fail "$LedgerDigestFileName is missing; regenerate it with validate.ps1 -WriteLedgerDigests"
+    }
+    $text = [System.IO.File]::ReadAllText($AbsolutePath).Replace("`r`n", "`n")
+    $digests = [ordered]@{}
+    foreach ($line in $text.Split("`n")) {
+        if ($line.Length -eq 0 -or $line.StartsWith("#", [StringComparison]::Ordinal)) {
+            continue
+        }
+        if (-not ($line -cmatch '\A([0-9a-f]{64})  ([A-Za-z0-9._/-]+)\z')) {
+            Fail "$LedgerDigestFileName contains a malformed entry; regenerate it with validate.ps1 -WriteLedgerDigests"
+        }
+        $entryPath = $Matches[2]
+        if ($digests.Contains($entryPath)) {
+            Fail "$LedgerDigestFileName declares '$entryPath' more than once"
+        }
+        $digests[$entryPath] = $Matches[1]
+    }
+    foreach ($spec in $LedgerSpecs) {
+        if (-not $digests.Contains([string]$spec.path)) {
+            Fail "$LedgerDigestFileName does not declare a digest for $($spec.path)"
+        }
+    }
+    if ($digests.Count -ne $LedgerSpecs.Count) {
+        Fail "$LedgerDigestFileName must declare exactly $($LedgerSpecs.Count) ledger digests"
+    }
+    if (-not (Test-OrdinalStringEqual $text (Format-LedgerDigestFile $digests))) {
+        Fail "$LedgerDigestFileName is not in canonical form; regenerate it with validate.ps1 -WriteLedgerDigests"
+    }
+    return $digests
+}
+
+function Write-LedgerDigestFile {
+    param(
+        [string]$AbsolutePath,
+        [System.Collections.IDictionary]$DigestsByPath
+    )
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($AbsolutePath, (Format-LedgerDigestFile $DigestsByPath), $encoding)
+}
+
 function Assert-ExactCounts {
     param(
         [object]$Declared,
@@ -884,17 +1268,35 @@ function Assert-ManifestDeclarations {
     Assert-ExactPropertySet $Manifest.evidence_policy @(
         "initial_status",
         "acceptance_evidence_state",
-        "legacy_typescript_is_not_rust_acceptance_evidence"
+        "legacy_typescript_is_not_rust_acceptance_evidence",
+        "allowed_statuses",
+        "artifact_kinds",
+        "proof_artifact_kind",
+        "status_totals"
     ) "manifest.evidence_policy"
     if (-not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.initial_status) "unimplemented") -or
         -not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.acceptance_evidence_state) "missing") -or
         $Manifest.evidence_policy.legacy_typescript_is_not_rust_acceptance_evidence -ne $true) {
         Fail "manifest evidence policy mismatch"
     }
+    if (-not (Test-JsonValueEqual $Manifest.evidence_policy.allowed_statuses $AllowedFeatureStatuses) -or
+        -not (Test-JsonValueEqual $Manifest.evidence_policy.artifact_kinds $AllowedArtifactKinds) -or
+        -not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.proof_artifact_kind) "rust_test")) {
+        Fail "manifest evidence lifecycle policy mismatch"
+    }
+    Assert-ExactPropertySet $Manifest.evidence_policy.status_totals $AllowedFeatureStatuses "manifest.evidence_policy.status_totals"
+    foreach ($status in $AllowedFeatureStatuses) {
+        $declaredTotal = Get-PropertyValue $Manifest.evidence_policy.status_totals $status
+        if (-not ($declaredTotal -is [int]) -or [int]$declaredTotal -lt 0) {
+            Fail "manifest.evidence_policy.status_totals.$status must be a non-negative integer"
+        }
+    }
 }
 
-$actualJsonPaths = @(
-    Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "*.json" | ForEach-Object {
+$script:RepositoryRootFull = Resolve-RepositoryRoot $RepositoryRoot
+
+$actualFilePaths = @(
+    Get-ChildItem -LiteralPath $Root -Recurse -File -Force | ForEach-Object {
         $relative = $_.FullName.Substring($Root.Length)
         while ($relative.StartsWith("\", [StringComparison]::Ordinal) -or
             $relative.StartsWith("/", [StringComparison]::Ordinal)) {
@@ -903,6 +1305,21 @@ $actualJsonPaths = @(
         $relative.Replace("\", "/")
     }
 )
+$actualJsonPaths = @($actualFilePaths | Where-Object { $_.EndsWith(".json", [StringComparison]::Ordinal) })
+$expectedFilePaths = @($ExpectedJsonPaths + $ExpectedNonJsonPaths)
+if ($WriteLedgerDigests -and
+    -not (Test-Path -LiteralPath (Join-Path $Root $LedgerDigestFileName) -PathType Leaf)) {
+    $expectedFilePaths = @(
+        $expectedFilePaths | Where-Object { -not (Test-OrdinalStringEqual $_ $LedgerDigestFileName) }
+    )
+}
+$missingFiles = @($expectedFilePaths | Where-Object { -not (Test-OrdinalContains $actualFilePaths $_) })
+$unexpectedFiles = @($actualFilePaths | Where-Object { -not (Test-OrdinalContains $expectedFilePaths $_) })
+if ($actualFilePaths.Count -ne $expectedFilePaths.Count -or
+    $missingFiles.Count -gt 0 -or
+    $unexpectedFiles.Count -gt 0) {
+    Fail "fixed artifact topology mismatch; missing=[$($missingFiles -join ',')], unexpected=[$($unexpectedFiles -join ',')]"
+}
 $missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
 $unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
 if ($actualJsonPaths.Count -ne 16 -or
@@ -988,9 +1405,8 @@ if (-not (Test-OrdinalStringEqual ([string]$schema.'$schema') "https://json-sche
 $manifest = $documents["manifest.json"]
 Assert-ManifestDeclarations $manifest
 
-$featureIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-$featureCount = 0
-$missingEvidenceCount = 0
+$ledgerDigestPath = Join-Path $Root $LedgerDigestFileName
+$computedLedgerDigests = [ordered]@{}
 foreach ($spec in $LedgerSpecs) {
     $ledger = $documents[$spec.path]
     Assert-JsonSchema $ledger $schema $schema '$'
@@ -1003,10 +1419,31 @@ foreach ($spec in $LedgerSpecs) {
     if ($features.Count -ne [int]$spec.expected_features) {
         Fail "$($spec.path) must contain exactly $($spec.expected_features) features"
     }
-    if (-not (Test-OrdinalStringEqual (Get-FeatureDigest $features) ([string]$spec.digest))) {
-        Fail "$($spec.path) canonical feature/source evidence fingerprint mismatch"
+    $computedLedgerDigests[[string]$spec.path] = Get-FeatureDigest $features
+}
+
+if ($WriteLedgerDigests) {
+    Write-LedgerDigestFile $ledgerDigestPath $computedLedgerDigests
+} else {
+    $storedLedgerDigests = Read-LedgerDigestFile $ledgerDigestPath
+    foreach ($spec in $LedgerSpecs) {
+        if (-not (Test-OrdinalStringEqual `
+                    ([string]$computedLedgerDigests[[string]$spec.path]) `
+                    ([string]$storedLedgerDigests[[string]$spec.path]))) {
+            Fail "$($spec.path) canonical feature/source evidence fingerprint mismatch"
+        }
     }
-    foreach ($feature in $features) {
+}
+
+$featureIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$featureCount = 0
+$statusTotals = [ordered]@{}
+foreach ($status in $AllowedFeatureStatuses) {
+    $statusTotals[$status] = 0
+}
+foreach ($spec in $LedgerSpecs) {
+    $ledger = $documents[$spec.path]
+    foreach ($feature in @($ledger.features)) {
         $featureCount += 1
         if (-not $featureIds.Add([string]$feature.feature_id)) {
             Fail "duplicate feature_id '$($feature.feature_id)'"
@@ -1014,20 +1451,18 @@ foreach ($spec in $LedgerSpecs) {
         if (-not (Test-OrdinalStringEqual ([string]$feature.classification) ([string]$ledger.classification))) {
             Fail "$($feature.feature_id) classification does not match its ledger"
         }
-        if (-not (Test-OrdinalStringEqual ([string]$feature.status) "unimplemented") -or
-            -not (Test-OrdinalStringEqual ([string]$feature.acceptance_evidence.status) "missing") -or
-            @($feature.acceptance_evidence.artifacts).Count -ne 0) {
-            Fail "$($feature.feature_id) must start unimplemented with an empty evidence placeholder"
-        }
+        Assert-FeatureLifecycle $feature ([string]$feature.feature_id)
         if (-not (Test-OrdinalStringEqual ([string]$feature.last_verified_sha) $ExpectedSha)) {
             Fail "$($feature.feature_id) last_verified_sha mismatch"
         }
-        $missingEvidenceCount += 1
+        $statusTotals[[string]$feature.status] += 1
     }
 }
-if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47 -or $missingEvidenceCount -ne 47) {
-    Fail "fixed ledger totals must be 3 ledgers, 47 features, and 47 missing evidence placeholders"
+if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47) {
+    Fail "fixed ledger totals must be 3 ledgers and 47 features"
 }
+Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
+$missingEvidenceCount = $statusTotals["unimplemented"]
 
 $globalRecordIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $inventoryRowCount = 0
@@ -1131,13 +1566,24 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
     }
 }
 
+if ($WriteLedgerDigests) {
+    Write-Host "Recorded ledger digests in $LedgerDigestFileName; review every line before committing:"
+    foreach ($spec in $LedgerSpecs) {
+        Write-Host ("  {0}  {1}" -f [string]$computedLedgerDigests[[string]$spec.path], [string]$spec.path)
+    }
+}
+
 [ordered]@{
     status = "ok"
+    mode = if ($WriteLedgerDigests) { "write-ledger-digests" } else { "verify" }
     baseline_sha = $ExpectedSha
+    repository_root = $script:RepositoryRootFull
     artifact_json_files = $actualJsonPaths.Count
     ledgers = $LedgerSpecs.Count
     feature_rows = $featureCount
+    feature_status_totals = $statusTotals
     missing_acceptance_evidence = $missingEvidenceCount
+    ledger_digests = $computedLedgerDigests
     inventory_files = $InventorySpecs.Count
     inventory_rows = $inventoryRowCount
     canonical_counts = $derivedCanonicalCounts
