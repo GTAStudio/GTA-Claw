@@ -98,7 +98,8 @@ The Final root `deny.toml` is the exact reviewed policy. Its license allow-list 
 than plain Apache-2.0 and is required by the Wasmtime/Cranelift plugin-host dependency graph.
 The policy permits only the version-pinned duplicate skips recorded there; wildcard or
 versionless skips, source widening, advisory exceptions, graph target filtering, and any other
-drift are rejected.
+drift are rejected. The discovery transition pins only the reviewed older `getrandom`, `rand`,
+`core-foundation`, `syn`, and `sha3` lines that coexist with their newer ecosystem versions.
 
 ## Legacy Node shrink-only ratchet
 
