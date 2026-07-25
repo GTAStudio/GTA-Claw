@@ -417,13 +417,13 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
     "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe",
     "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d",
-    "9d78edc9a17824bfd4cd489bbed5af52f2b8c87a53bcac0e3722afa1fc1b48c2",
-    "0d7c8789ebddd4e3d4ad204e769aace4d6e37c587333e3b4db32f0904e5e5b7a",
-    "b2b277e556c2fe0329c008f6d6a3bef9a91e8303ae9983b77a5b39c23825f941",
-    "8ea60763c2cc7b09fbe3bc2a2805fdd7c2fd999f6e4f9b6ba968fd27dcd56968",
-    "319e37b49c49ca1968a2d30a4f22d1a3e108045391d0ba7acb8f6b5b8f452d29",
-    "2035257e3908a0fb05632f71268e1fac9f6c5cb1c24169fcbb4561020f8f237f",
-    "ee45dd9d1f8d74a76c7f82b84eeb36d31441e7e8114f5fc9730a475324fed309",
+    "bb0765a3cde2b1e2ccad68918c4bc639aceedfbab4a4f53a28c8afcd600f9686",
+    "fc996a176592a7222eae3ae544c373e0a926f6d9086fed9d47307666ef745fae",
+    "0bf5edd919b09327fee1b6f45aea8a0a6432d3800990a21fe7ed40fbf4a040b5",
+    "2832f430e8b38e365b58ca1583cfe84f0975f4f3655697a2f26fa9876f88bae7",
+    "b9452f32eec46f9400af6dd0a8c6160d83580bce1f163a6587cc88ff2de56213",
+    "226007c6e9d0dcf1e48f5b2a4b083f1b5669dfb91f235e999b97e1f7fc1a00f2",
+    "4c663a6cebb27c4cb285c5587e019ae503b2ec352ba83c95dc94f48cf8fa5b18",
     "dbbf5e53488e8977958a95ab58e03ba89ee9da7503ffe0e58dd946946afb8179",
     "bb2febc949e862a6e5c0904f4041b19853e7bde3f06f17627f4c828519b856d7",
     "781a04de8ae53429a22b602b303fe9f870def0c545f7a056c7ea322677984409",
@@ -444,7 +444,7 @@ const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
-    "e361ba7bbfd4b20503de4786ed0f1590cf8f9f266bd1660bc6b774d83b972d11";
+    "75dedb874582f2f6d32890e21cca11186112d13dd51f4140ada96c69989594d0";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
     "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
 const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
@@ -2891,6 +2891,35 @@ fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
         error.contains("claw-repo-policy file inventory changed"),
         "missing self-tests failed through the wrong rule: {error}"
     );
+}
+
+#[test]
+fn repository_policy_activation_rejects_self_hosted_runners() {
+    let trusted = final_tree("repository-policy-runner-base");
+    deactivate_repository_policy(&trusted);
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open inactive policy base");
+
+    for runner in ["self-hosted", "[self-hosted, windows]"] {
+        let candidate = final_tree("repository-policy-runner-candidate");
+        deactivate_repository_policy(&candidate);
+        activate_repository_policy(&candidate);
+        replace(
+            &candidate.join(".github/workflows/upstream-gateway-reference.yml"),
+            "runs-on: windows-latest",
+            &format!("runs-on: {runner}"),
+        );
+
+        let error = validate_repository_policy_transition(
+            &trusted_root,
+            &SafeRoot::new(&candidate.path).expect("open self-hosted runner candidate"),
+        )
+        .expect_err("candidate-controlled repository-policy runner unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error, "repository-policy test job shape or execution order changed",
+            "self-hosted runner {runner:?} failed through the wrong rule"
+        );
+    }
 }
 
 #[test]
