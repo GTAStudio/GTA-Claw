@@ -249,7 +249,14 @@ impl GuidedSetup {
 pub(crate) fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, CrestodianError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
         Err(source) => Err(CrestodianError::io(path, source)),
     }
 }
@@ -271,7 +278,14 @@ pub(crate) fn restore_paths<const N: usize>(
             }
             None => match fs::remove_file(path) {
                 Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    Ok(())
+                }
                 Err(error) => Err(error.to_string()),
             },
         };
