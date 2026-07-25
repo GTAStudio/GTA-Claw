@@ -22,6 +22,7 @@ use rmcp::model::{
     UnsubscribeRequestParams,
 };
 use serde_json::{Map, Value, json};
+use tokio::sync::oneshot;
 
 #[derive(Debug, Default)]
 struct RecordingSampling {
@@ -479,6 +480,70 @@ async fn unsupported_protocol_version_fails_initialization() {
         error.to_string(),
         "MCP protocol violation: server selected unsupported version 1900-01-01"
     );
+}
+
+#[tokio::test]
+async fn panicking_client_owner_terminates_the_descendant_process_tree() {
+    let marker = std::env::temp_dir().join(format!(
+        "gta-claw-mcp-listener-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must follow epoch")
+            .as_nanos()
+    ));
+    let (panic_sender, panic_receiver) = oneshot::channel();
+    let owner = tokio::spawn({
+        let marker = marker.clone();
+        async move {
+            let _client = McpClient::connect_stdio(
+                fixture(vec![
+                    "--spawn-listener-grandchild".into(),
+                    marker.to_string_lossy().into_owned(),
+                ]),
+                Arc::new(RejectSampling),
+                Arc::new(DiscardEvents),
+            )
+            .await
+            .expect("fixture with listener grandchild must initialize");
+            panic_receiver.await.expect("panic trigger must arrive");
+            panic!("intentional client-owner panic");
+        }
+    });
+    let port = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(port) = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|port| port.parse::<u16>().ok())
+            {
+                break port;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("grandchild must publish its listener port");
+    let address = ("127.0.0.1", port);
+    tokio::net::TcpStream::connect(address)
+        .await
+        .expect("grandchild listener must be alive before panic");
+
+    panic_sender
+        .send(())
+        .expect("owner must await panic trigger");
+    let panic = owner.await.expect_err("owner task must panic");
+    assert!(panic.is_panic(), "owner must fail by panic: {panic}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if tokio::net::TcpStream::connect(address).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("panic cleanup must terminate the descendant listener");
+    std::fs::remove_file(marker).expect("listener marker must be removable");
 }
 
 #[cfg(windows)]

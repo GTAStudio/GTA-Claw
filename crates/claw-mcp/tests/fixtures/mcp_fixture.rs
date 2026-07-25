@@ -4,6 +4,7 @@
 use std::{
     fs::OpenOptions,
     io::{self, BufRead, Write},
+    net::TcpListener,
     path::Path,
     process::{Command, Stdio},
     sync::Arc,
@@ -359,6 +360,38 @@ fn spawn_locking_grandchild(path: &Path) -> io::Result<()> {
     ))
 }
 
+fn run_listener_grandchild(path: &Path) -> io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    std::fs::write(path, listener.local_addr()?.port().to_string())?;
+    loop {
+        thread::sleep(Duration::from_secs(10));
+    }
+}
+
+fn spawn_listener_grandchild(path: &Path) -> io::Result<()> {
+    Command::new(std::env::current_exe()?)
+        .arg("--listener-grandchild")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    for _ in 0..100 {
+        if std::fs::read_to_string(path)
+            .ok()
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "grandchild did not publish its listener port",
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     let arguments = std::env::args().collect::<Vec<_>>();
@@ -398,6 +431,28 @@ async fn main() {
                 return;
             };
             if let Err(error) = spawn_locking_grandchild(Path::new(path)) {
+                eprintln!("fixture failed: {error}");
+                return;
+            }
+            if let Err(error) = serve_stdio(Arc::new(FixtureBackend)).await {
+                eprintln!("fixture failed: {error}");
+            }
+        }
+        Some("--listener-grandchild") => {
+            let Some(path) = arguments.get(2) else {
+                eprintln!("fixture failed: missing listener marker path");
+                return;
+            };
+            if let Err(error) = run_listener_grandchild(Path::new(path)) {
+                eprintln!("fixture failed: {error}");
+            }
+        }
+        Some("--spawn-listener-grandchild") => {
+            let Some(path) = arguments.get(2) else {
+                eprintln!("fixture failed: missing listener marker path");
+                return;
+            };
+            if let Err(error) = spawn_listener_grandchild(Path::new(path)) {
                 eprintln!("fixture failed: {error}");
                 return;
             }

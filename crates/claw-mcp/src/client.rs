@@ -268,7 +268,29 @@ impl HttpClientConfig {
 
 struct ChildTreeTransport {
     io: BoundedIoTransport<RoleClient>,
-    child: Option<Box<dyn ChildWrapper>>,
+    child: Option<ChildTreeGuard>,
+}
+
+struct ChildTreeGuard(Box<dyn ChildWrapper>);
+
+impl std::ops::Deref for ChildTreeGuard {
+    type Target = dyn ChildWrapper;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::DerefMut for ChildTreeGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut()
+    }
+}
+
+impl Drop for ChildTreeGuard {
+    fn drop(&mut self) {
+        terminate_and_reap(self.0.as_mut());
+    }
 }
 
 impl Transport<RoleClient> for ChildTreeTransport {
@@ -296,14 +318,6 @@ impl Transport<RoleClient> for ChildTreeTransport {
             let io_result = io_close.await;
             child_result?;
             io_result
-        }
-    }
-}
-
-impl Drop for ChildTreeTransport {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            terminate_and_reap(child.as_mut());
         }
     }
 }
@@ -362,7 +376,7 @@ impl McpClient {
         command.wrap(JobObject);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
-        let mut child = command.spawn().map_err(McpError::Io)?;
+        let mut child = ChildTreeGuard(command.spawn().map_err(McpError::Io)?);
         let child_pid = child.id();
         let stdin = child
             .stdin()
