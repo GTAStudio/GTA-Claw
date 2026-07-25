@@ -435,8 +435,14 @@ fn reachable_rust_sources(
         })?;
         for reference in rust_module_references(&source) {
             let mut scope = current.module_directory.clone();
-            for segment in &reference.inline_modules {
-                scope.push(segment);
+            for (index, directory) in reference.inline_modules.iter().enumerate() {
+                match directory {
+                    InlineModuleDirectory::Default(name) => scope.push(name),
+                    InlineModuleDirectory::Path(path) if index == 0 => {
+                        scope = current.path.parent().unwrap_or(&scope).join(path);
+                    }
+                    InlineModuleDirectory::Path(path) => scope.push(path),
+                }
             }
             let candidates = if let Some(path) = &reference.path {
                 let base = if reference.inline_modules.is_empty() {
@@ -452,6 +458,7 @@ fn reachable_rust_sources(
                     child_directory.join("mod.rs"),
                 ]
             };
+            let mut resolved = Vec::new();
             for candidate in candidates {
                 let Some(path) =
                     resolve_module_file(repository_root, &candidate).map_err(|error| {
@@ -467,6 +474,25 @@ fn reachable_rust_sources(
                 else {
                     continue;
                 };
+                resolved.push(path);
+            }
+            if reference.path.is_none() && resolved.len() > 1 {
+                return Err(ConformanceError::new(
+                    code,
+                    Some(normalized_api_path(
+                        current
+                            .path
+                            .strip_prefix(repository_root)
+                            .unwrap_or(&current.path)
+                            .to_path_buf(),
+                    )),
+                    format!(
+                        "Rust module '{}' is ambiguous because both '{}.rs' and '{}/mod.rs' exist",
+                        reference.name, reference.name, reference.name
+                    ),
+                ));
+            }
+            for path in resolved {
                 if reachable.insert(path.clone()) {
                     let module_directory = module_directory_for_source(&path);
                     queue.push_back(ReachableRustSource {
@@ -1019,9 +1045,15 @@ struct RustAttribute {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RustModuleReference {
-    inline_modules: Vec<String>,
+    inline_modules: Vec<InlineModuleDirectory>,
     name: String,
     path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InlineModuleDirectory {
+    Default(String),
+    Path(String),
 }
 
 // This is the normative enabled-test decision. The transition validator ports
@@ -1142,7 +1174,7 @@ fn collect_rust_module_references(
     tokens: &[RustToken],
     start: usize,
     end: usize,
-    inline_modules: &[String],
+    inline_modules: &[InlineModuleDirectory],
     references: &mut Vec<RustModuleReference>,
 ) {
     let mut index = start;
@@ -1162,7 +1194,10 @@ fn collect_rust_module_references(
                     let open = index + 2;
                     let close = matching_delimiter(tokens, open, end).unwrap_or(end);
                     let mut nested = inline_modules.to_vec();
-                    nested.push(name.clone());
+                    nested.push(path_attribute_value(&outer_attributes).map_or_else(
+                        || InlineModuleDirectory::Default(name.clone()),
+                        InlineModuleDirectory::Path,
+                    ));
                     collect_rust_module_references(tokens, open + 1, close, &nested, references);
                     index = close.saturating_add(1);
                 } else if tokens.get(index + 2) == Some(&RustToken::Semi) {
@@ -1834,6 +1869,10 @@ mod nested {
             .expect("create nested module directory");
         fs::create_dir_all(root.join("src").join("custom"))
             .expect("create custom module directory");
+        fs::create_dir_all(root.join("src").join("actual"))
+            .expect("create redirected inline module directory");
+        fs::create_dir_all(root.join("src").join("host").join("actual"))
+            .expect("create redirected inline decoy directory");
         fs::write(
             root.join("Cargo.toml"),
             "[package]\n\
@@ -1860,6 +1899,7 @@ mod nested {
             root.join("src").join("lib.rs"),
             "#[test]\nfn root_test() {}\n\
              mod outer;\n\
+             mod host;\n\
              #[path = \"support/mod.rs\"]\nmod support;\n\
              #[path = r\"raw/raw_module.rs\"]\nmod raw;\n",
         )
@@ -1870,6 +1910,28 @@ mod nested {
              #[path = \"custom/from_outer.rs\"]\nmod from_outer;\n",
         )
         .expect("write outer module");
+        fs::write(
+            root.join("src").join("host.rs"),
+            "#[path = \"actual\"]\n\
+             mod redirected {\n\
+                 #[path = \"proof.rs\"]\n\
+                 mod proof;\n\
+             }\n",
+        )
+        .expect("write redirected inline module");
+        fs::write(
+            root.join("src").join("actual").join("proof.rs"),
+            "#[test]\nfn redirected_inline_test() {}\n",
+        )
+        .expect("write redirected inline module evidence");
+        fs::write(
+            root.join("src")
+                .join("host")
+                .join("actual")
+                .join("proof.rs"),
+            "#[test]\nfn redirected_inline_decoy_test() {}\n",
+        )
+        .expect("write redirected inline module decoy");
         fs::write(
             root.join("src")
                 .join("outer")
@@ -1956,6 +2018,7 @@ mod nested {
         assert_eq!(
             listed,
             BTreeSet::from([
+                "host::redirected::proof::redirected_inline_test".to_owned(),
                 "outer::nested::proof::deep_test".to_owned(),
                 "outer::from_outer::outer_path_test".to_owned(),
                 "raw::raw_path_test".to_owned(),
@@ -1969,6 +2032,14 @@ mod nested {
             CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
         for (path, test) in [
             ("src/lib.rs", "root_test"),
+            (
+                "src/actual/proof.rs",
+                "host::redirected::proof::redirected_inline_test",
+            ),
+            (
+                "src/host/actual/proof.rs",
+                "host::redirected::proof::redirected_inline_decoy_test",
+            ),
             (
                 "src/outer/nested/proof.rs",
                 "outer::nested::proof::deep_test",
@@ -1999,6 +2070,77 @@ mod nested {
             );
         }
         fs::remove_dir_all(root).expect("remove reachability compiler oracle");
+    }
+
+    #[test]
+    fn ambiguous_module_sources_fail_closed_like_rustc() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-ambiguous-module-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src").join("duplicate"))
+            .expect("create ambiguous module directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-ambiguous-module\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n",
+        )
+        .expect("write ambiguous manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-ambiguous-module\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write ambiguous lockfile");
+        fs::write(root.join("src").join("lib.rs"), "mod duplicate;\n")
+            .expect("write ambiguous crate root");
+        fs::write(
+            root.join("src").join("duplicate.rs"),
+            "#[test]\nfn first_forged_test() {}\n",
+        )
+        .expect("write first ambiguous module");
+        fs::write(
+            root.join("src").join("duplicate").join("mod.rs"),
+            "#[test]\nfn second_forged_test() {}\n",
+        )
+        .expect("write second ambiguous module");
+
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--lib",
+                "--no-run",
+            ])
+            .output()
+            .expect("run ambiguous compiler oracle");
+        assert!(
+            !output.status.success(),
+            "rustc must reject ambiguous modules"
+        );
+
+        let error = CargoTestTargets::load(&root, ViolationCode::ClaimEvidence)
+            .expect_err("reachability must reject ambiguous modules");
+        assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+        assert_eq!(error.subject(), Some("src/lib.rs"));
+        assert_eq!(
+            error.message(),
+            "Rust module 'duplicate' is ambiguous because both 'duplicate.rs' and \
+             'duplicate/mod.rs' exist"
+        );
+        fs::remove_dir_all(root).expect("remove ambiguous compiler oracle");
     }
 
     #[test]
