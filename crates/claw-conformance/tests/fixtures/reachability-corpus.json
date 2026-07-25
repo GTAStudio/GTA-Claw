@@ -148,6 +148,46 @@
                       "cite":  "crates/p/src/solo.rs",
                       "expect":  "accept",
                       "why":  "name.rs alone is the other legitimate form"
+                  },
+                  {
+                      "name":  "cross-package-only-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"consumer\", \"decoy\"]\nresolver = \"2\"\n",
+                                    "consumer/Cargo.toml":  "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "decoy/Cargo.toml":  "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "consumer/src/lib.rs":  "#[path = \"../../decoy/src/proof.rs\"]\nmod proof;\n",
+                                    "decoy/src/lib.rs":  "",
+                                    "decoy/src/proof.rs":  "#[test]\nfn cross_package_test() {}\n"
+                                },
+                      "cite":  "decoy/src/proof.rs",
+                      "expect":  "reject",
+                      "why":  "cargo DOES run this test, but only as part of consumer. The file is not reachable from its own package\u0027s roots, so it is not evidence for decoy. Verified: \u0027cargo test -p consumer --lib -- --list\u0027 lists proof::cross_package_test; \u0027-p decoy\u0027 lists nothing."
+                  },
+                  {
+                      "name":  "cross-package-also-own-package-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"consumer\", \"decoy\"]\nresolver = \"2\"\n",
+                                    "consumer/Cargo.toml":  "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "decoy/Cargo.toml":  "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "consumer/src/lib.rs":  "#[path = \"../../decoy/src/proof.rs\"]\nmod proof;\n",
+                                    "decoy/src/lib.rs":  "mod proof;\n",
+                                    "decoy/src/proof.rs":  "#[test]\nfn cross_package_test() {}\n"
+                                },
+                      "cite":  "decoy/src/proof.rs",
+                      "expect":  "accept",
+                      "why":  "Same cross-package pull, but the file is ALSO reachable from its own package root. Pins the false-rejection direction: a package-boundary rule must not reject a file its own package legitimately compiles. Verified: both -p consumer and -p decoy list the test."
+                  },
+                  {
+                      "name":  "compiled-file-outside-any-package",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"decoy\"]\nresolver = \"2\"\n",
+                                    "decoy/Cargo.toml":  "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "decoy/src/lib.rs":  "#[path = \"../../shared/thing.rs\"]\nmod thing;\n",
+                                    "shared/thing.rs":  "#[test]\nfn shared_test() {}\n"
+                                },
+                      "cite":  "shared/thing.rs",
+                      "expect":  "reject",
+                      "why":  "DIVERGENCE PROBE. cargo genuinely compiles and runs thing::shared_test under decoy, but shared/thing.rs has no owning Cargo package. This validator attributes a cited file to its owning package first, so it rejects. An implementation that tests membership of a global compiled-file set may accept. Verified: \u0027cargo test -p decoy --lib -- --list\u0027 lists thing::shared_test."
                   }
               ]
 }
