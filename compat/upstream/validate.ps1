@@ -36,6 +36,14 @@ $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
 $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f441e8de396"
+
+# Frozen like the inventories and the schema: the shared enabled-test corpus is a
+# contract artifact, NOT a regenerable one. -WriteLedgerDigests cannot reach this
+# constant, so weakening a case to let a forged citation through requires a
+# reviewed edit to this script.
+$ExpectedOracleCorpusDigest = "30d6163e8f84c29c60354a947c2ed6dd1974f91478c38d0f45830218e89239c0"
+$ExpectedOracleCorpusCases = 85
+$ExpectedOracleCorpusTrue = 35
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -76,6 +84,7 @@ $AllowedOperatorScopes = @(
 
 $ExpectedJsonPaths = @(
     "baseline.json",
+    "enabled-test-oracle.json",
     "feature-ledger.schema.json",
     "manifest.json",
     "inventories/channels.json",
@@ -225,7 +234,7 @@ $InventorySpecs = [ordered]@{
 }
 
 $ExpectedCanonicalCounts = [ordered]@{
-    artifact_json_files = 16
+    artifact_json_files = 17
     ledgers = 3
     feature_rows = 47
     inventory_files = 10
@@ -938,35 +947,454 @@ function Assert-EvidencePathShape {
     }
 }
 
-function Remove-RustBlockComments {
-    param([string]$Source)
-    # Byte-for-byte port of claw-conformance remove_block_comments: nesting aware,
-    # and newlines inside a stripped comment are preserved so line indices survive.
-    $output = New-Object System.Text.StringBuilder
+# ---------------------------------------------------------------------------
+# Enabled-test oracle.
+#
+# This is a FOLLOWER port of declares_enabled_test in
+# crates/claw-conformance/src/claims.rs, which is the NORMATIVE implementation.
+# When the Rust function changes, this must be re-ported in the same cycle; this
+# script has no independent authority to decide what counts as a real test.
+# Agreement is not asserted by hand: enabled-test-oracle.json is a shared,
+# frozen fixture corpus that both implementations must classify identically, and
+# Assert-EnabledTestOracle below replays every case on every run.
+#
+# The oracle is a tokenizer plus an item-tree walker, not a line matcher. It
+# operates on UTF-8 BYTES because the Rust original indexes bytes. Comments,
+# strings, byte strings, raw strings and char literals are discarded BEFORE any
+# matching, so Rust-shaped text inside a comment or a string literal can never
+# be cited as evidence. A #[test] attribute must attach to the CITED function
+# itself, and the in-file module path must match exactly.
+# ---------------------------------------------------------------------------
+
+function Get-RustBlockCommentEnd {
+    param([byte[]]$Bytes, [int]$Index)
+    # Nesting aware: /* is checked before */ so a nested comment cannot end early.
+    $length = $Bytes.Length
     $depth = 0
-    $index = 0
-    $length = $Source.Length
+    $index = $Index
     while ($index -lt $length) {
-        $character = $Source[$index]
-        $peek = if (($index + 1) -lt $length) { $Source[$index + 1] } else { [char]0 }
-        if ($character -eq '/' -and $peek -eq '*') {
+        if (($index + 2) -le $length -and $Bytes[$index] -eq 47 -and $Bytes[$index + 1] -eq 42) {
             $depth += 1
             $index += 2
-            continue
-        }
-        if ($depth -gt 0 -and $character -eq '*' -and $peek -eq '/') {
+        } elseif (($index + 2) -le $length -and $Bytes[$index] -eq 42 -and $Bytes[$index + 1] -eq 47) {
             $depth -= 1
             $index += 2
+            if ($depth -eq 0) {
+                return $index
+            }
+        } else {
+            $index += 1
+        }
+    }
+    return $index
+}
+
+function Get-RustRawStringEnd {
+    param([byte[]]$Bytes, [int]$Index)
+    # Handles r"..", r#".."#, br".." and br#".."#. Returns -1 (Rust None) when the
+    # prefix is not a raw string, and the end of input when it is unterminated.
+    $length = $Bytes.Length
+    $cursor = $Index
+    if ($cursor -lt $length -and $Bytes[$cursor] -eq 98) {
+        $cursor += 1
+    }
+    if ($cursor -ge $length -or $Bytes[$cursor] -ne 114) {
+        return -1
+    }
+    $cursor += 1
+    $hashes = 0
+    while (($cursor + $hashes) -lt $length -and $Bytes[$cursor + $hashes] -eq 35) {
+        $hashes += 1
+    }
+    $cursor += $hashes
+    if ($cursor -ge $length -or $Bytes[$cursor] -ne 34) {
+        return -1
+    }
+    $cursor += 1
+    while ($cursor -lt $length) {
+        if ($Bytes[$cursor] -eq 34) {
+            $suffixEnd = $cursor + 1 + $hashes
+            if ($suffixEnd -le $length) {
+                $allHashes = $true
+                for ($probe = $cursor + 1; $probe -lt $suffixEnd; $probe += 1) {
+                    if ($Bytes[$probe] -ne 35) {
+                        $allHashes = $false
+                        break
+                    }
+                }
+                if ($allHashes) {
+                    return $suffixEnd
+                }
+            }
+        }
+        $cursor += 1
+    }
+    return $length
+}
+
+function Get-RustQuotedEnd {
+    param([byte[]]$Bytes, [int]$Quote)
+    $length = $Bytes.Length
+    $cursor = $Quote + 1
+    while ($cursor -lt $length) {
+        if ($Bytes[$cursor] -eq 92) {
+            $cursor = [Math]::Min($cursor + 2, $length)
+        } elseif ($Bytes[$cursor] -eq 34) {
+            return $cursor + 1
+        } else {
+            $cursor += 1
+        }
+    }
+    return $cursor
+}
+
+function Get-RustCharLiteralEnd {
+    param([byte[]]$Bytes, [int]$Quote)
+    # Returns -1 (Rust None) when the quote is not a char literal, which is how a
+    # lifetime such as &'a str stays a lifetime instead of opening a literal.
+    $length = $Bytes.Length
+    $cursor = $Quote + 1
+    if ($cursor -lt $length -and $Bytes[$cursor] -eq 92) {
+        $cursor += 2
+    } else {
+        $cursor += 1
+    }
+    if ($cursor -lt $length -and $Bytes[$cursor] -eq 39) {
+        return $cursor + 1
+    }
+    return -1
+}
+
+function Get-RustTokens {
+    param([string]$Source)
+    # Token encoding: identifiers become "i:<name>", punctuation is its own text
+    # and :: becomes "::". Rust identifiers are ASCII [A-Za-z0-9_] here, so no
+    # identifier can ever collide with a punctuation marker.
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
+    $length = $bytes.Length
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $index = 0
+    while ($index -lt $length) {
+        $byte = $bytes[$index]
+        # Rust is_ascii_whitespace: space, tab, newline, form feed, carriage
+        # return. Carriage return being whitespace is what makes the oracle
+        # produce identical tokens for CRLF and LF checkouts.
+        if ($byte -eq 32 -or $byte -eq 9 -or $byte -eq 10 -or $byte -eq 12 -or $byte -eq 13) {
+            $index += 1
             continue
         }
-        if ($depth -eq 0) {
-            [void]$output.Append($character)
-        } elseif ($character -eq "`n") {
-            [void]$output.Append($character)
+        if (($index + 2) -le $length -and $byte -eq 47 -and $bytes[$index + 1] -eq 47) {
+            $index += 2
+            while ($index -lt $length -and $bytes[$index] -ne 10) {
+                $index += 1
+            }
+            continue
+        }
+        if (($index + 2) -le $length -and $byte -eq 47 -and $bytes[$index + 1] -eq 42) {
+            $index = Get-RustBlockCommentEnd $bytes $index
+            continue
+        }
+        $rawEnd = Get-RustRawStringEnd $bytes $index
+        if ($rawEnd -ge 0) {
+            $index = $rawEnd
+            continue
+        }
+        if ($byte -eq 34 -or ($byte -eq 98 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 34)) {
+            $quote = if ($byte -eq 34) { $index } else { $index + 1 }
+            $index = Get-RustQuotedEnd $bytes $quote
+            continue
+        }
+        if ($byte -eq 39) {
+            $charEnd = Get-RustCharLiteralEnd $bytes $index
+            if ($charEnd -ge 0) {
+                $index = $charEnd
+            } else {
+                $index += 1
+            }
+            continue
+        }
+        if (($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -eq 95) {
+            $start = $index
+            $index += 1
+            while ($index -lt $length) {
+                $next = $bytes[$index]
+                if (($next -ge 48 -and $next -le 57) -or ($next -ge 65 -and $next -le 90) -or
+                    ($next -ge 97 -and $next -le 122) -or $next -eq 95) {
+                    $index += 1
+                } else {
+                    break
+                }
+            }
+            [void]$tokens.Add("i:" + [System.Text.Encoding]::ASCII.GetString($bytes, $start, $index - $start))
+            continue
+        }
+        if ($byte -eq 35) { [void]$tokens.Add("#") }
+        elseif ($byte -eq 33) { [void]$tokens.Add("!") }
+        elseif ($byte -eq 91) { [void]$tokens.Add("[") }
+        elseif ($byte -eq 93) { [void]$tokens.Add("]") }
+        elseif ($byte -eq 123) { [void]$tokens.Add("{") }
+        elseif ($byte -eq 125) { [void]$tokens.Add("}") }
+        elseif ($byte -eq 40) { [void]$tokens.Add("(") }
+        elseif ($byte -eq 41) { [void]$tokens.Add(")") }
+        elseif ($byte -eq 59) { [void]$tokens.Add(";") }
+        elseif ($byte -eq 58 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 58) {
+            [void]$tokens.Add("::")
+            $index += 1
         }
         $index += 1
     }
-    return $output.ToString()
+    return ,$tokens.ToArray()
+}
+
+function Get-RustMatchingDelimiter {
+    param([string[]]$Tokens, [int]$Open, [int]$End)
+    if ($Open -lt 0 -or $Open -ge $Tokens.Length) {
+        return -1
+    }
+    $opening = $Tokens[$Open]
+    if (Test-OrdinalStringEqual $opening "[") { $closing = "]" }
+    elseif (Test-OrdinalStringEqual $opening "{") { $closing = "}" }
+    elseif (Test-OrdinalStringEqual $opening "(") { $closing = ")" }
+    else { return -1 }
+    $limit = [Math]::Min($End, $Tokens.Length)
+    $depth = 0
+    for ($index = $Open; $index -lt $limit; $index += 1) {
+        $token = $Tokens[$index]
+        if (Test-OrdinalStringEqual $token $opening) {
+            $depth += 1
+        } elseif (Test-OrdinalStringEqual $token $closing) {
+            $depth -= 1
+            if ($depth -eq 0) {
+                return $index
+            }
+        }
+    }
+    return -1
+}
+
+function Get-RustAttributes {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    $attributes = New-Object System.Collections.Generic.List[object]
+    $index = $Index
+    while ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "#")) {
+        $inner = (($index + 1) -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index + 1] "!"))
+        $bracket = $index + $(if ($inner) { 2 } else { 1 })
+        if ($bracket -ge $Tokens.Length -or -not (Test-OrdinalStringEqual $Tokens[$bracket] "[")) {
+            break
+        }
+        $close = Get-RustMatchingDelimiter $Tokens $bracket $End
+        if ($close -lt 0) {
+            $close = $End
+        }
+        $path = New-Object System.Collections.Generic.List[string]
+        $cursor = $bracket + 1
+        if ($cursor -lt $Tokens.Length -and $Tokens[$cursor].StartsWith("i:", [StringComparison]::Ordinal)) {
+            [void]$path.Add($Tokens[$cursor].Substring(2))
+            $cursor += 1
+            while ($cursor -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$cursor] "::")) {
+                if (($cursor + 1) -ge $Tokens.Length -or
+                    -not $Tokens[$cursor + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
+                    break
+                }
+                [void]$path.Add($Tokens[$cursor + 1].Substring(2))
+                $cursor += 2
+            }
+        }
+        $bodyStart = $bracket + 1
+        $bodyCount = [Math]::Max(0, [Math]::Min($close, $Tokens.Length) - $bodyStart)
+        [string[]]$body = @()
+        if ($bodyCount -gt 0) {
+            $body = $Tokens[$bodyStart..($bodyStart + $bodyCount - 1)]
+        }
+        [void]$attributes.Add([ordered]@{
+            inner = $inner
+            path = $path.ToArray()
+            tokens = $body
+        })
+        $index = $close + 1
+    }
+    return [ordered]@{ attributes = $attributes.ToArray(); next = $index }
+}
+
+function Test-RustAttributesDeclareEnabledTest {
+    param([object[]]$Attributes)
+    # has_test && !ignored && !cfg_gated. Any cfg or cfg_attr on the function
+    # disqualifies it, and the trailing path segment is matched so that both
+    # #[test] and #[tokio::test] count.
+    $hasTest = $false
+    $ignored = $false
+    $cfgGated = $false
+    foreach ($attribute in $Attributes) {
+        [string[]]$path = $attribute.path
+        if ($path.Length -eq 0) {
+            continue
+        }
+        if (Test-OrdinalStringEqual $path[$path.Length - 1] "test") {
+            $hasTest = $true
+        }
+        if (Test-OrdinalStringEqual $path[0] "ignore") {
+            $ignored = $true
+        }
+        if ((Test-OrdinalStringEqual $path[0] "cfg") -or (Test-OrdinalStringEqual $path[0] "cfg_attr")) {
+            $cfgGated = $true
+        }
+    }
+    return ($hasTest -and -not $ignored -and -not $cfgGated)
+}
+
+function Test-RustModuleAttributesEnableTests {
+    param([object[]]$Attributes)
+    # Enclosing modules and file/module inner attributes may carry no cfg at all,
+    # or exactly the token sequence cfg ( test ). Every other cfg predicate,
+    # every cfg_attr and every ignore disqualifies the whole subtree.
+    foreach ($attribute in $Attributes) {
+        [string[]]$path = $attribute.path
+        if ($path.Length -eq 0) {
+            continue
+        }
+        $first = $path[0]
+        if ((Test-OrdinalStringEqual $first "ignore") -or (Test-OrdinalStringEqual $first "cfg_attr")) {
+            return $false
+        }
+        if (-not (Test-OrdinalStringEqual $first "cfg")) {
+            continue
+        }
+        [string[]]$body = $attribute.tokens
+        if ($body.Length -ne 4) {
+            return $false
+        }
+        if (-not ((Test-OrdinalStringEqual $body[0] "i:cfg") -and
+                (Test-OrdinalStringEqual $body[1] "(") -and
+                (Test-OrdinalStringEqual $body[2] "i:test") -and
+                (Test-OrdinalStringEqual $body[3] ")"))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-RustTestIdentityMatches {
+    param([string[]]$Modules, [string]$Function, [string[]]$Target)
+    # Exact in-file module identity: a nested test must be cited with its real
+    # module path, so neither a fabricated module nor a bare name can match it.
+    if ($Target.Length -ne ($Modules.Length + 1)) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Modules.Length; $index += 1) {
+        if (-not (Test-OrdinalStringEqual $Modules[$index] $Target[$index])) {
+            return $false
+        }
+    }
+    return (Test-OrdinalStringEqual $Target[$Target.Length - 1] $Function)
+}
+
+function Get-RustSkipVisibility {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    $index = $Index
+    if ($index -ge $Tokens.Length -or -not (Test-OrdinalStringEqual $Tokens[$index] "i:pub")) {
+        return $index
+    }
+    $index += 1
+    if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "(")) {
+        $close = Get-RustMatchingDelimiter $Tokens $index $End
+        if ($close -lt 0) {
+            $close = $End
+        }
+        $index = $close + 1
+    }
+    return $index
+}
+
+function Get-RustSkipItem {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    $index = $Index
+    while ($index -lt $End) {
+        $token = $Tokens[$index]
+        if (Test-OrdinalStringEqual $token ";") {
+            return $index + 1
+        }
+        if (Test-OrdinalStringEqual $token "{") {
+            $close = Get-RustMatchingDelimiter $Tokens $index $End
+            if ($close -lt 0) {
+                $close = $End
+            }
+            return $close + 1
+        }
+        $index += 1
+    }
+    return $End
+}
+
+$RustItemModifiers = @{ "i:async" = $true; "i:const" = $true; "i:default" = $true; "i:extern" = $true; "i:unsafe" = $true }
+
+function Test-RustDeclaresInItems {
+    param(
+        [string[]]$Tokens,
+        [int]$Start,
+        [int]$End,
+        [string[]]$Modules,
+        [string[]]$Target
+    )
+    $index = $Start
+    while ($index -lt $End) {
+        $itemStart = $index
+        $parsed = Get-RustAttributes $Tokens $index $End
+        $outer = New-Object System.Collections.Generic.List[object]
+        $inner = New-Object System.Collections.Generic.List[object]
+        foreach ($attribute in $parsed.attributes) {
+            if ($attribute.inner) { [void]$inner.Add($attribute) } else { [void]$outer.Add($attribute) }
+        }
+        # An inner attribute such as #![cfg(any())] disables the entire enclosing
+        # scope, so it is checked before anything in that scope is considered.
+        if (-not (Test-RustModuleAttributesEnableTests $inner.ToArray())) {
+            return $false
+        }
+        $index = $parsed.next
+        if ($index -ge $End) {
+            break
+        }
+        $index = Get-RustSkipVisibility $Tokens $index $End
+        while ($index -lt $Tokens.Length -and $RustItemModifiers.ContainsKey($Tokens[$index])) {
+            $index += 1
+        }
+        $keyword = if ($index -lt $Tokens.Length) { $Tokens[$index] } else { $null }
+        $nameToken = if (($index + 1) -lt $Tokens.Length) { $Tokens[$index + 1] } else { $null }
+        $isIdentPair = ($null -ne $keyword -and $null -ne $nameToken -and
+            $keyword.StartsWith("i:", [StringComparison]::Ordinal) -and
+            $nameToken.StartsWith("i:", [StringComparison]::Ordinal))
+        if ($isIdentPair -and (Test-OrdinalStringEqual $keyword "i:mod")) {
+            $name = $nameToken.Substring(2)
+            if (($index + 2) -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index + 2] "{")) {
+                $open = $index + 2
+                $close = Get-RustMatchingDelimiter $Tokens $open $End
+                if ($close -lt 0) {
+                    $close = $End
+                }
+                if (Test-RustModuleAttributesEnableTests $outer.ToArray()) {
+                    [string[]]$nested = @($Modules) + @($name)
+                    if (Test-RustDeclaresInItems $Tokens ($open + 1) $close $nested $Target) {
+                        return $true
+                    }
+                }
+                $index = $close + 1
+            } else {
+                $index = Get-RustSkipItem $Tokens $index $End
+            }
+        } elseif ($isIdentPair -and (Test-OrdinalStringEqual $keyword "i:fn")) {
+            $name = $nameToken.Substring(2)
+            if ((Test-RustTestIdentityMatches $Modules $name $Target) -and
+                (Test-RustAttributesDeclareEnabledTest $outer.ToArray())) {
+                return $true
+            }
+            $index = Get-RustSkipItem $Tokens ($index + 2) $End
+        } else {
+            $index = Get-RustSkipItem $Tokens $index $End
+        }
+        if ($index -le $itemStart) {
+            $index = $itemStart + 1
+        }
+    }
+    return $false
 }
 
 function Test-DeclaresEnabledRustTest {
@@ -974,58 +1402,72 @@ function Test-DeclaresEnabledRustTest {
         [string]$Source,
         [string]$TestName
     )
-    # Port of claw-conformance declares_enabled_test. Both trust roots must agree
-    # on what counts as a real test, so a row can never pass one and fail the other.
-    # A citation is only honoured when the recorded name is an ENABLED test:
-    # commented-out code, string literals, #[ignore]d tests, cfg-gated tests and
-    # ordinary functions are all rejected.
-    $lines = (Remove-RustBlockComments $Source).Split("`n")
-    for ($index = 0; $index -lt $lines.Length; $index += 1) {
-        $lines[$index] = $lines[$index].TrimEnd("`r")
+    [string[]]$target = $TestName.Split(@("::"), [System.StringSplitOptions]::None)
+    [string[]]$tokens = Get-RustTokens $Source
+    return (Test-RustDeclaresInItems $tokens 0 $tokens.Length @() $target)
+}
+
+function Assert-EnabledTestOracle {
+    param([object]$Corpus)
+    # Replays the shared fixture corpus on every run. This is the drift detector
+    # between the two independently owned trust roots: crates/claw-conformance
+    # owns the normative rule, this script owns a port of it, and both must
+    # classify all of these cases identically. A re-port that silently changes
+    # behaviour fails here, on the auditor's machine as well as in CI, instead of
+    # quietly accepting or rejecting a parity claim the other side disagrees with.
+    Assert-ExactPropertySet $Corpus @(
+        "schema_version", "purpose", "normative_implementation",
+        "follower_implementation", "expected_is_authoritative_from", "cases"
+    ) "enabled-test-oracle"
+    if ($Corpus.schema_version -ne 1) {
+        Fail "enabled-test-oracle schema_version must be 1"
     }
-    for ($index = 0; $index -lt $lines.Length; $index += 1) {
-        $code = $lines[$index].TrimStart()
-        if ($code.StartsWith("//", [StringComparison]::Ordinal)) {
-            continue
+    Assert-ExactPropertySet $Corpus.normative_implementation @("path", "function", "ported_at_commit") "enabled-test-oracle.normative_implementation"
+    Assert-ExactPropertySet $Corpus.follower_implementation @("path", "function") "enabled-test-oracle.follower_implementation"
+    if (-not (Test-OrdinalStringEqual ([string]$Corpus.normative_implementation.path) "crates/claw-conformance/src/claims.rs") -or
+        -not (Test-OrdinalStringEqual ([string]$Corpus.normative_implementation.function) "declares_enabled_test") -or
+        -not (Test-OrdinalStringEqual ([string]$Corpus.follower_implementation.path) "compat/upstream/validate.ps1") -or
+        -not (Test-OrdinalStringEqual ([string]$Corpus.follower_implementation.function) "Test-DeclaresEnabledRustTest")) {
+        Fail "enabled-test-oracle must record claw-conformance declares_enabled_test as normative and validate.ps1 Test-DeclaresEnabledRustTest as the follower"
+    }
+    $cases = @($Corpus.cases)
+    # The case count and the true/false split are pinned so that a case cannot be
+    # deleted or flipped to hide a disagreement.
+    if ($cases.Count -ne $ExpectedOracleCorpusCases) {
+        Fail ("enabled-test-oracle must contain exactly {0} cases; found {1}" -f $ExpectedOracleCorpusCases, $cases.Count)
+    }
+    $names = @{}
+    $trueCases = 0
+    foreach ($case in $cases) {
+        Assert-ExactPropertySet $case @("name", "source", "test", "expected") "enabled-test-oracle case"
+        $name = [string]$case.name
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            Fail "enabled-test-oracle case name must not be empty"
         }
-        $tokens = [regex]::Split($code, '[^A-Za-z0-9_]')
-        $isFunction = $false
-        for ($token = 0; ($token + 1) -lt $tokens.Length; $token += 1) {
-            if ((Test-OrdinalStringEqual $tokens[$token] "fn") -and
-                (Test-OrdinalStringEqual $tokens[$token + 1] $TestName)) {
-                $isFunction = $true
-                break
-            }
+        if ($names.ContainsKey($name)) {
+            Fail "enabled-test-oracle case name '$name' is duplicated"
         }
-        if (-not $isFunction) {
-            continue
+        $names[$name] = $true
+        if ($case.expected -isnot [bool]) {
+            Fail "enabled-test-oracle case '$name' expected must be a boolean"
         }
-        $windowStart = [Math]::Max(0, $index - 6)
-        $hasTest = $false
-        $ignored = $false
-        $cfgGated = $false
-        for ($attribute = $windowStart; $attribute -le $index; $attribute += 1) {
-            $value = $lines[$attribute].Trim()
-            if ($value.StartsWith("//", [StringComparison]::Ordinal)) {
-                continue
-            }
-            if ((Test-OrdinalStringEqual $value "#[test]") -or
-                ($value.StartsWith("#[", [StringComparison]::Ordinal) -and
-                    $value.Contains("::test"))) {
-                $hasTest = $true
-            }
-            if ($value.StartsWith("#[ignore", [StringComparison]::Ordinal)) {
-                $ignored = $true
-            }
-            if ($value.StartsWith("#[cfg", [StringComparison]::Ordinal)) {
-                $cfgGated = $true
-            }
+        if ($case.expected) {
+            $trueCases += 1
         }
-        if ($hasTest -and -not $ignored -and -not $cfgGated) {
-            return $true
+        $actual = Test-DeclaresEnabledRustTest ([string]$case.source) ([string]$case.test)
+        if ($actual -ne $case.expected) {
+            Fail ("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
+                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus." -f
+                $name, $case.expected, $actual)
         }
     }
-    return $false
+    if ($trueCases -ne $ExpectedOracleCorpusTrue) {
+        Fail ("enabled-test-oracle must record exactly {0} accepting cases; found {1}" -f $ExpectedOracleCorpusTrue, $trueCases)
+    }
+    $digest = Get-ObjectDigest $Corpus
+    if (-not (Test-OrdinalStringEqual $digest $ExpectedOracleCorpusDigest)) {
+        Fail ("enabled-test-oracle digest mismatch; expected {0}, found {1}" -f $ExpectedOracleCorpusDigest, $digest)
+    }
 }
 
 function Assert-RustTestSymbol {
@@ -1066,11 +1508,12 @@ function Assert-EvidenceArtifact {
         Fail "$Context acceptance evidence test '$test' must be a Rust test path"
     }
     $text = Get-RepositoryFileText $absolutePath
-    if ($text -cnotmatch '#\[\s*test\s*\]|#\[[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*::test') {
-        Fail "$Context acceptance evidence '$relativePath' contains no Rust test attribute"
-    }
-    $symbol = @($test.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
-    Assert-RustTestSymbol $text $symbol $relativePath $Context
+    # The full module-qualified path is handed to the oracle, not just the last
+    # segment: in-file module identity is part of the citation, so a test nested
+    # in a module cannot be cited by a bare name or under a fabricated module.
+    # There is deliberately no cheaper pre-check in front of the oracle; a second,
+    # weaker rule would be a place for the two trust roots to disagree.
+    Assert-RustTestSymbol $text $test $relativePath $Context
 }
 
 function Assert-ImplementationPointer {
@@ -1588,7 +2031,7 @@ if ($actualFilePaths.Count -ne $expectedFilePaths.Count -or
 }
 $missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
 $unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
-if ($actualJsonPaths.Count -ne 16 -or
+if ($actualJsonPaths.Count -ne 17 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
     Fail "fixed JSON topology mismatch; missing=[$($missingJsonFiles -join ',')], unexpected=[$($unexpectedJsonFiles -join ',')]"
@@ -1598,6 +2041,11 @@ $documents = @{}
 foreach ($relativePath in $ExpectedJsonPaths) {
     $documents[$relativePath] = Read-Json (Join-Path $Root $relativePath)
 }
+
+# Prove the enabled-test oracle still agrees with the normative Rust rule BEFORE
+# any evidence is judged with it. A drifted oracle must never get the chance to
+# accept or reject a parity claim.
+Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
 
 $baseline = $documents["baseline.json"]
 Assert-ExactPropertySet $baseline @("schema_version", "upstream", "stable_release", "gateway_protocol", "licensing") "baseline"

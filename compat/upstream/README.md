@@ -10,6 +10,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `baseline.json` | frozen, never changes |
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
+| `enabled-test-oracle.json` (85 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence`, `implementation_pointers` and `known_differences` may change |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
@@ -103,10 +104,31 @@ also would not satisfy the Rust parity harness, which would leave rows that pass
 one trust root and fail the other.
 
 "Enabled `#[test]`" is decided by the same algorithm the Rust parity harness in
-`crates/claw-conformance` uses, ported line for line, so a row can never pass one
-trust root and fail the other. A cited name does **not** count when it is
-`#[ignore]`d, gated by a nearby `#[cfg(...)]`, inside a line or block comment,
-inside a string literal, or an ordinary function with no test attribute.
+`crates/claw-conformance` uses, so a row can never pass one trust root and fail
+the other. That algorithm is a **tokenizer plus an item-tree walker**, not a
+line matcher:
+
+- Line comments, doc comments, nested block comments, normal strings, byte
+  strings, raw strings and char literals are discarded **before** any matching,
+  so Rust-shaped text inside a comment or a string literal can never be cited.
+- A `#[test]` attribute must attach to the **cited function itself**. An
+  unrelated test attribute earlier in the file does not bless a later ordinary
+  function.
+- In-file module identity is exact. A test declared in `mod real_module` must be
+  cited as `real_module::the_test`; neither a bare name nor a fabricated module
+  path matches it.
+- Function-level `#[ignore]`, `#[cfg(...)]` and `#[cfg_attr(...)]` disqualify the
+  test.
+- An enclosing inline module, and any `#![...]` inner attribute, may carry no
+  `cfg` at all or exactly `cfg(test)`. Every other predicate — `cfg(any())`,
+  `cfg(not(test))`, `cfg(all(test))`, feature gates — plus `cfg_attr` and
+  `ignore` disqualify the entire subtree, transitively through outer modules.
+- `#[test]` and `#[tokio::test]` are both accepted; any attribute path whose last
+  segment is `test` counts, which is intentionally broad.
+
+Because carriage return is ASCII whitespace to the tokenizer, a CRLF checkout on
+Windows and an LF checkout on Linux produce identical tokens and therefore
+identical verdicts.
 
 #### Ownership of the enabled-test rule
 
@@ -124,15 +146,29 @@ binding in one direction only:
   here without a matching change in the harness creates exactly the split the
   port exists to prevent: a row that passes one trust root and fails the other.
 
-The port was verified against all eight of the harness's own unit cases, and the
-self-test re-checks the same eight behaviours (`synthetic-enabled-test-passes`,
-`synthetic-async-enabled-test-passes`, `implemented-with-ignored-test`,
-`implemented-with-cfg-gated-test`, `implemented-with-line-commented-test`,
-`implemented-with-block-commented-test`,
-`implemented-with-plain-function-not-a-test`,
-`implemented-with-test-name-in-string-literal`). Those cases are the drift
-detector: if the harness changes and the port does not, they are where it should
-be caught.
+#### The drift check is mechanical, not manual
+
+`enabled-test-oracle.json` is a **shared fixture corpus** that both
+implementations must classify identically. It holds 85 cases — the 22 cases of
+the harness's own `evidence_requires_an_enabled_test_declaration` unit test, plus
+63 lexer, attribute, item-shape, module-identity and citation-shape cases.
+
+`validate.ps1` replays every case through `Test-DeclaresEnabledRustTest` on
+**every run**, before any evidence is judged, and fails with
+`enabled-test oracle drift on case '<name>'` on the first disagreement. The
+harness replays the same file through `declares_enabled_test`. A re-port that
+silently changes behaviour therefore fails a build on both sides instead of
+quietly accepting or rejecting a claim the other side disagrees with.
+
+The `expected` values were **not written by hand**: they were produced by running
+the normative Rust implementation, so the corpus cannot encode an expectation the
+normative side does not actually hold.
+
+The corpus is frozen like the inventories. Its digest, its case count and its
+accept/reject split are pinned as constants in `validate.ps1`, and
+`-WriteLedgerDigests` is structurally incapable of regenerating any of them, so
+weakening a case to let a forged citation through requires a reviewed edit to the
+validator itself.
 
 ### Implementation pointers are not evidence
 
@@ -187,8 +223,8 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
 
    This is the only supported way to change a ledger digest. It rewrites
    `ledger-digests.sha256` and nothing else: inventory digests, the feature schema
-   digest and `baseline.json` stay hardcoded in `validate.ps1` and are unreachable
-   from this command.
+   digest, the enabled-test oracle corpus digest and `baseline.json` stay
+   hardcoded in `validate.ps1` and are unreachable from this command.
 5. Re-run `validate.ps1` and `validate-self-test.ps1`.
 
 ## Continuous integration

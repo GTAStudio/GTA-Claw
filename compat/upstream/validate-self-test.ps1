@@ -60,6 +60,29 @@ function New-SyntheticRepositoryRoot {
             "#[test]`nfn unrelated_but_real() {}`n`n`n`n`n`n`n`nfn $SyntheticTestName() {}`n"
         "crates/synthetic/tests/string_literal.rs" =
             "#[test]`nfn unrelated_but_real() {}`n`n`n`n`n`n`n`nconst CLAIM: &str = `"fn $SyntheticTestName`";`n"
+        # The cases below exercise the item-tree walker rather than the lexer.
+        # Each one is a forgery that a line-window matcher would have accepted.
+        "crates/synthetic/tests/detached_attribute.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`nfn $SyntheticTestName() {}`n"
+        "crates/synthetic/tests/nested_module.rs" =
+            "mod real_module {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        "crates/synthetic/tests/cfg_test_module.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        "crates/synthetic/tests/disabled_module.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`n#[cfg(any())]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {}`n}`n"
+        "crates/synthetic/tests/inner_disabled_module.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`nmod tests {`n    #![cfg(any())]`n    #[test]`n    fn $SyntheticTestName() {}`n}`n"
+        "crates/synthetic/tests/raw_string_literal.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`nconst CLAIM: &str = r#`"#[test] fn $SyntheticTestName() {}`"#;`n"
+        "crates/synthetic/tests/impl_block.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`nstruct Proof;`nimpl Proof {`n    #[test]`n    fn $SyntheticTestName() {}`n}`n"
+        "crates/synthetic/tests/doc_comment.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`n/// #[test]`n/// fn $SyntheticTestName() {}`nfn documented() {}`n"
+        # Written with CRLF on purpose. Carriage return is ASCII whitespace to the
+        # tokenizer, so a CRLF checkout on Windows and an LF checkout on Linux must
+        # reach the same verdict for the same file.
+        "crates/synthetic/tests/crlf_enabled.rs" =
+            "#[test]`r`nfn $SyntheticTestName() {`r`n    assert!(true);`r`n}`r`n"
         "crates/synthetic/data/fixture.json" = "{}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
@@ -399,6 +422,209 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "synthetic-nested-module-test-passes-when-cited-exactly"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/nested_module.rs" "real_module::$SyntheticTestName")
+            )
+        }
+    },
+    [ordered]@{
+        name = "synthetic-cfg-test-module-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/cfg_test_module.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },
+    [ordered]@{
+        name = "synthetic-crlf-source-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/crlf_enabled.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-detached-test-attribute"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # An unrelated #[test] earlier in the file must not bless a following
+            # ordinary function. A line-window matcher accepted this.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/detached_attribute.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-unqualified-nested-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The test exists but lives in a module; a bare citation does not
+            # identify it, so the module path is part of the proof obligation.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/nested_module.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-fabricated-module-path"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/nested_module.rs" "fabricated_module::$SyntheticTestName")
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-cfg-disabled-module-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/disabled_module.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-inner-attribute-disabled-module-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #![cfg(any())] disables the whole enclosing scope transitively.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/inner_disabled_module.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-raw-string-literal-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/raw_string_literal.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-test-inside-impl-block"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/impl_block.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-doc-comment-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/doc_comment.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "oracle-corpus-expectation-flipped"
+        expected_message = "enabled-test oracle drift on case"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # The shared corpus is the drift detector between the two trust roots.
+            # Flipping an expectation is how a re-port that silently changed
+            # behaviour would look, so it must be rejected by name.
+            $corpusPath = Join-Path $caseRoot "enabled-test-oracle.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases[0].expected = -not $corpus.cases[0].expected
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "oracle-corpus-case-deleted"
+        expected_message = "enabled-test-oracle must contain exactly"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $corpusPath = Join-Path $caseRoot "enabled-test-oracle.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases = @($corpus.cases | Select-Object -Skip 1)
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "oracle-corpus-case-renamed"
+        expected_message = "enabled-test-oracle digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Every case still classifies correctly and the counts still hold, so
+            # only the frozen digest catches this. -WriteLedgerDigests cannot
+            # regenerate it.
+            $corpusPath = Join-Path $caseRoot "enabled-test-oracle.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases[0].name = "renamed-behind-your-back"
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "oracle-corpus-normative-owner-rewritten"
+        expected_message = "must record claw-conformance declares_enabled_test as normative"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Ownership direction is part of the contract: this script may never
+            # declare itself the normative implementation.
+            $corpusPath = Join-Path $caseRoot "enabled-test-oracle.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.normative_implementation.path = "compat/upstream/validate.ps1"
+            $corpus.normative_implementation.function = "Test-DeclaresEnabledRustTest"
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "oracle-corpus-removed"
+        expected_message = "fixed artifact topology mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Remove-Item -LiteralPath (Join-Path $caseRoot "enabled-test-oracle.json") -Force
+        }
+    },
+    [ordered]@{
         name = "implemented-with-ignored-test"
         expected_message = "is not declared as an enabled #[test]"
         regenerate_digests = $true
@@ -409,8 +635,7 @@ $cases = @(
                 (New-Artifact "crates/synthetic/tests/ignored.rs" $SyntheticTestName)
             )
         }
-    },
-    [ordered]@{
+    },    [ordered]@{
         name = "implemented-with-cfg-gated-test"
         expected_message = "is not declared as an enabled #[test]"
         regenerate_digests = $true
@@ -650,7 +875,7 @@ $cases = @(
     },
     [ordered]@{
         name = "implemented-with-untested-rust-file"
-        expected_message = "contains no Rust test attribute"
+        expected_message = "is not declared as an enabled #[test]"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
