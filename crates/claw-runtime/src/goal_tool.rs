@@ -37,6 +37,7 @@ pub enum GoalAction {
     /// Close the active goal with a terminal status.
     Close {
         /// The terminal status to close with.
+        #[serde(with = "crate::wire::goal_status")]
         status: GoalStatus,
     },
 }

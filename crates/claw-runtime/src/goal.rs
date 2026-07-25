@@ -178,13 +178,7 @@ impl GoalService {
 
         let now = self.clock.now();
 
-        if let Some(mut previous) = self.active(session_id).await? {
-            previous.status = GoalStatus::Superseded;
-            previous.updated_at = now;
-            previous.closed_at = Some(now);
-            previous.revision = previous.revision.saturating_add(1);
-            self.store.save(previous).await?;
-        }
+        let previous = self.active(session_id).await?;
 
         let record = GoalRecord {
             goal_id,
@@ -198,7 +192,21 @@ impl GoalService {
             compacted_entries: 0,
             revision: 1,
         };
+
+        // The replacement is durable before the goal it replaces is closed, so neither dropping
+        // this future between the two writes nor a failure of the second write can leave the
+        // session with no active goal. `active` reads the newest active record, so the transient
+        // overlap resolves to the replacement.
         self.store.save(record.clone()).await?;
+
+        if let Some(mut previous) = previous {
+            previous.status = GoalStatus::Superseded;
+            previous.updated_at = now;
+            previous.closed_at = Some(now);
+            previous.revision = previous.revision.saturating_add(1);
+            self.store.save(previous).await?;
+        }
+
         Ok(record)
     }
 

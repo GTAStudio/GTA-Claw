@@ -46,7 +46,7 @@ use crate::session::{StateMachineError, TurnStateMachine};
 use crate::stream::{StreamAssembler, StreamError, StreamEvent, StreamPayload};
 use crate::suspend::{
     PrepareOutcome, PrepareRequest, SuspendError, SuspensionController, SuspensionStatus,
-    WorkRefused,
+    WorkPermit, WorkRefused,
 };
 use crate::tool::{ToolExecutionError, ToolExecutor, ToolExecutorConfig};
 
@@ -395,6 +395,30 @@ struct LiveTurn {
     paused: watch::Sender<bool>,
 }
 
+/// Releases a session's live-turn registration and its work permit when the turn task ends.
+///
+/// The turn task is spawned onto a [`TaskTracker`], so it normally runs to completion, but a task
+/// future can also be dropped without ever finishing. Doing the cleanup in [`Drop`] rather than
+/// after the `await` means an abandoned task cannot leave the session permanently registered as
+/// having a turn in flight, which would make every later [`Runtime::submit`] return
+/// [`RuntimeError::TurnInFlight`].
+///
+/// The permit is a field rather than a separate binding so that it is released *after* the
+/// live-turn entry is removed on every path: [`Drop::drop`] runs before a value's fields are
+/// dropped. A suspension that observes zero in-flight work therefore also observes an empty
+/// live-turn map.
+struct LiveTurnGuard {
+    inner: Arc<RuntimeInner>,
+    session_key: String,
+    _permit: WorkPermit,
+}
+
+impl Drop for LiveTurnGuard {
+    fn drop(&mut self) {
+        self.inner.live().remove(&self.session_key);
+    }
+}
+
 struct RuntimeInner {
     config: RuntimeConfig,
     ports: RuntimePorts,
@@ -627,14 +651,17 @@ impl Runtime {
             pause: pause_rx,
         };
 
+        let live_guard = LiveTurnGuard {
+            inner: Arc::clone(&self.inner),
+            session_key: session_id.as_str().to_owned(),
+            _permit: permit,
+        };
+
+        // The guard is captured by the task future itself rather than created inside it, so a task
+        // that is dropped before it is ever polled still releases the session.
         let spawned = self.tracker.spawn(async move {
-            let session_key = execution.session_id.as_str().to_owned();
-            let inner = Arc::clone(&execution.inner);
             let result = execution.run().await;
-            inner.live().remove(&session_key);
-            // The permit is released here, after the live-turn entry is gone, so a suspend that
-            // observes zero in-flight work also observes an empty live-turn map.
-            drop(permit);
+            drop(live_guard);
             let _ = completion_tx.send(result);
         });
         drop(spawned);

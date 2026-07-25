@@ -3,14 +3,12 @@
 use std::fmt::{self, Display, Formatter};
 
 use claw_domain::SessionId;
-use serde::{Deserialize, Serialize};
 
 use super::ids::GoalId;
 use super::time::Timestamp;
 
 /// The lifecycle status of a durable goal.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum GoalStatus {
     /// The goal steers the session.
     Active,
@@ -60,7 +58,7 @@ impl Display for GoalStatus {
 }
 
 /// One recorded step toward a goal.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalProgress {
     /// Monotonic index of this entry within the goal.
     pub index: u64,
@@ -73,12 +71,11 @@ pub struct GoalProgress {
 }
 
 /// A goal persisted across restarts.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalRecord {
     /// The goal identifier.
     pub goal_id: GoalId,
     /// The owning session.
-    #[serde(with = "super::session_id_serde")]
     pub session_id: SessionId,
     /// The operator-supplied objective.
     pub objective: String,
@@ -100,11 +97,7 @@ pub struct GoalRecord {
 
 #[cfg(test)]
 mod tests {
-    use claw_domain::SessionId;
-
-    use super::{GoalProgress, GoalRecord, GoalStatus};
-    use crate::model::ids::GoalId;
-    use crate::model::time::Timestamp;
+    use super::GoalStatus;
 
     #[test]
     fn goal_status_labels_are_stable() {
@@ -132,33 +125,5 @@ mod tests {
                 GoalStatus::Superseded,
             ]
         );
-    }
-
-    #[test]
-    fn goal_records_round_trip_through_json() {
-        let record = GoalRecord {
-            goal_id: GoalId::new("goal-1").expect("valid goal id"),
-            session_id: SessionId::new("session-1").expect("valid session id"),
-            objective: "ship the runtime".to_owned(),
-            status: GoalStatus::Active,
-            progress: vec![GoalProgress {
-                index: 0,
-                note: "scaffolded".to_owned(),
-                recorded_at: Timestamp::from_millis(10),
-                compacted: false,
-            }],
-            created_at: Timestamp::from_millis(5),
-            updated_at: Timestamp::from_millis(10),
-            closed_at: None,
-            compacted_entries: 0,
-            revision: 2,
-        };
-
-        let encoded = serde_json::to_string(&record).expect("goal serialises");
-        let decoded: GoalRecord = serde_json::from_str(&encoded).expect("goal deserialises");
-
-        assert_eq!(decoded, record);
-        assert_eq!(decoded.progress[0].note, "scaffolded");
-        assert_eq!(decoded.revision, 2);
     }
 }

@@ -1,7 +1,6 @@
 //! The session persistence port.
 
 use claw_domain::SessionId;
-use serde::{Deserialize, Serialize};
 
 use super::{PortError, PortFuture};
 use crate::model::ids::TurnId;
@@ -10,10 +9,9 @@ use crate::model::session::SessionState;
 use crate::model::time::Timestamp;
 
 /// The durable view of one session.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSnapshot {
     /// The session identifier.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// The current turn.
     pub turn: TurnId,
@@ -28,10 +26,9 @@ pub struct SessionSnapshot {
 }
 
 /// The durable view of one turn.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnRecord {
     /// The owning session.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// The turn identifier.
     pub turn: TurnId,

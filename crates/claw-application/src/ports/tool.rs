@@ -1,14 +1,13 @@
 //! The tool execution port.
 
 use claw_domain::SessionId;
-use serde::{Deserialize, Serialize};
 
 use super::{PortError, PortFuture};
 use crate::model::ids::{ToolCallId, TurnId};
 use crate::model::message::ToolCall;
 
 /// A tool the runtime may dispatch.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolDescriptor {
     /// The dispatch name used by providers.
     pub name: String,
@@ -21,10 +20,9 @@ pub struct ToolDescriptor {
 }
 
 /// One dispatched tool call.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolInvocation {
     /// The session that requested the call.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// The turn that requested the call.
     pub turn: TurnId,
@@ -33,8 +31,7 @@ pub struct ToolInvocation {
 }
 
 /// How a tool call ended.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ToolStatus {
     /// The tool ran and succeeded.
     Ok,
@@ -78,7 +75,7 @@ impl ToolStatus {
 }
 
 /// The result of one tool call.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolOutcome {
     /// The call this outcome answers.
     pub call_id: ToolCallId,

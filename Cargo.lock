@@ -51,8 +51,6 @@ version = "0.1.0"
 dependencies = [
  "claw-domain",
  "claw-protocol",
- "serde",
- "serde_json",
 ]
 
 [[package]]

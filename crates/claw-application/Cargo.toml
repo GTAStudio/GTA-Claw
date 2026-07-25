@@ -10,10 +10,6 @@ repository.workspace = true
 [dependencies]
 claw-domain.workspace = true
 claw-protocol.workspace = true
-serde.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

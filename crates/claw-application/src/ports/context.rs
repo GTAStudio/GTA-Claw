@@ -6,7 +6,6 @@
 //! reports budget pressure.
 
 use claw_domain::SessionId;
-use serde::{Deserialize, Serialize};
 
 use super::{PortError, PortFuture};
 use crate::model::ids::TurnId;
@@ -14,8 +13,7 @@ use crate::model::time::Timestamp;
 use crate::ports::provider::PromptMessage;
 
 /// One item offered to a context engine.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "item")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextItem {
     /// Operator-authored input.
     UserInput {
@@ -49,8 +47,7 @@ pub enum ContextItem {
 }
 
 /// Why an engine was asked to bootstrap.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BootstrapReason {
     /// The session is brand new.
     NewSession,
@@ -59,10 +56,9 @@ pub enum BootstrapReason {
 }
 
 /// The request that opens a context engine for a session.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextBootstrap {
     /// The session being opened.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// Why the engine is being opened.
     pub reason: BootstrapReason,
@@ -73,10 +69,9 @@ pub struct ContextBootstrap {
 }
 
 /// The request that offers one item to an engine.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextIngest {
     /// The session being updated.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// The turn the item belongs to.
     pub turn: TurnId,
@@ -87,10 +82,9 @@ pub struct ContextIngest {
 }
 
 /// The request that asks an engine for a prompt.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextAssembly {
     /// The session being prompted.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// The turn being executed.
     pub turn: TurnId,
@@ -99,20 +93,18 @@ pub struct ContextAssembly {
 }
 
 /// The request that asks an engine to perform between-round upkeep.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextMaintenance {
     /// The session being maintained.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// When maintenance ran.
     pub at: Timestamp,
 }
 
 /// The request that asks an engine to shed context.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextCompaction {
     /// The session being compacted.
-    #[serde(with = "crate::model::session_id_serde")]
     pub session_id: SessionId,
     /// The number of tokens the engine must free.
     pub reclaim_tokens: u32,
@@ -121,7 +113,7 @@ pub struct ContextCompaction {
 }
 
 /// The engine's self-reported state after a lifecycle call.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextState {
     /// The number of items the engine is holding.
     pub item_count: u32,
@@ -136,7 +128,7 @@ pub struct ContextState {
 }
 
 /// The prompt an engine assembled.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssembledContext {
     /// The ordered prompt.
     pub messages: Vec<PromptMessage>,
@@ -145,7 +137,7 @@ pub struct AssembledContext {
 }
 
 /// The result of a compaction pass.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactionReport {
     /// The number of items compaction removed.
     pub removed_items: u32,
@@ -183,36 +175,4 @@ pub trait ContextEnginePort: Send + Sync + 'static {
         &self,
         request: ContextCompaction,
     ) -> PortFuture<'_, Result<CompactionReport, PortError>>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BootstrapReason, ContextItem};
-
-    #[test]
-    fn context_items_serialise_with_a_tagged_representation() {
-        let encoded = serde_json::to_string(&ContextItem::ToolResult {
-            tool_name: "read_file".to_owned(),
-            output: "hi".to_owned(),
-            failed: false,
-        })
-        .expect("item serialises");
-
-        assert_eq!(
-            encoded,
-            "{\"item\":\"tool_result\",\"tool_name\":\"read_file\",\"output\":\"hi\",\"failed\":false}"
-        );
-    }
-
-    #[test]
-    fn bootstrap_reasons_serialise_as_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&BootstrapReason::NewSession).expect("reason serialises"),
-            "\"new_session\""
-        );
-        assert_eq!(
-            serde_json::to_string(&BootstrapReason::Restart).expect("reason serialises"),
-            "\"restart\""
-        );
-    }
 }

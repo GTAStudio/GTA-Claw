@@ -84,6 +84,7 @@ pub enum StreamPayload {
     /// A tool call started streaming.
     ToolCallStarted {
         /// The call identifier.
+        #[serde(with = "crate::wire::tool_call_id")]
         call_id: ToolCallId,
         /// The tool being called.
         name: String,
@@ -91,11 +92,13 @@ pub enum StreamPayload {
     /// A tool call finished streaming and is ready to dispatch.
     ToolCallCompleted {
         /// The assembled call.
+        #[serde(with = "crate::wire::tool_call")]
         call: ToolCall,
     },
     /// The assistant message is complete.
     MessageCompleted {
         /// The assembled message.
+        #[serde(with = "crate::wire::assistant_message")]
         message: AssistantMessage,
     },
 }

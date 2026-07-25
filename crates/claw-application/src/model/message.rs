@@ -1,11 +1,9 @@
 //! Assistant message values produced by streaming assembly.
 
-use serde::{Deserialize, Serialize};
-
 use super::ids::ToolCallId;
 
 /// A fully assembled tool call requested by the provider.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolCall {
     /// The provider-assigned call identifier.
     pub call_id: ToolCallId,
@@ -16,7 +14,7 @@ pub struct ToolCall {
 }
 
 /// A tool call whose arguments never finished streaming.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingToolCall {
     /// The provider-assigned call identifier.
     pub call_id: ToolCallId,
@@ -27,7 +25,7 @@ pub struct PendingToolCall {
 }
 
 /// A complete assistant message.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AssistantMessage {
     /// The visible assistant text.
     pub text: String,
@@ -38,7 +36,7 @@ pub struct AssistantMessage {
 }
 
 /// Everything recoverable from a stream that ended before the message completed.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PartialAssistantMessage {
     /// The visible assistant text received so far.
     pub text: String,
@@ -65,32 +63,8 @@ impl PartialAssistantMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssistantMessage, PartialAssistantMessage, PendingToolCall, ToolCall};
+    use super::{PartialAssistantMessage, PendingToolCall};
     use crate::model::ids::ToolCallId;
-
-    #[test]
-    fn assistant_messages_round_trip_through_json() {
-        let message = AssistantMessage {
-            text: "done".to_owned(),
-            reasoning: "because".to_owned(),
-            tool_calls: vec![ToolCall {
-                call_id: ToolCallId::new("call-1").expect("valid call id"),
-                name: "read_file".to_owned(),
-                arguments: "{\"path\":\"a.txt\"}".to_owned(),
-            }],
-        };
-
-        let encoded = serde_json::to_string(&message).expect("message serialises");
-
-        assert_eq!(
-            encoded,
-            "{\"text\":\"done\",\"reasoning\":\"because\",\"tool_calls\":[{\"call_id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]}"
-        );
-        assert_eq!(
-            serde_json::from_str::<AssistantMessage>(&encoded).expect("message deserialises"),
-            message
-        );
-    }
 
     #[test]
     fn partial_emptiness_tracks_every_content_channel() {

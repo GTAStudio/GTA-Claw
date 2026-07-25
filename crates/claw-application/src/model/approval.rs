@@ -3,14 +3,12 @@
 use std::fmt::{self, Display, Formatter};
 
 use claw_domain::SessionId;
-use serde::{Deserialize, Serialize};
 
 use super::ids::{ApprovalId, ToolCallId, TurnId};
 use super::time::Timestamp;
 
 /// How long an approval decision applies.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ApprovalScope {
     /// The decision applies to this call only.
     Once,
@@ -45,8 +43,7 @@ impl Display for ApprovalScope {
 }
 
 /// An operator's answer to an approval request.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ApprovalVerdict {
     /// Run the tool.
     Approve,
@@ -72,7 +69,7 @@ impl Display for ApprovalVerdict {
 }
 
 /// A decision, with the scope it applies to.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ApprovalDecision {
     /// Whether the tool may run.
     pub verdict: ApprovalVerdict,
@@ -119,12 +116,11 @@ impl ApprovalDecision {
 }
 
 /// An outstanding approval request.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
     /// The request identifier.
     pub approval_id: ApprovalId,
     /// The session that requested the tool.
-    #[serde(with = "super::session_id_serde")]
     pub session_id: SessionId,
     /// The turn that requested the tool.
     pub turn: TurnId,
@@ -141,8 +137,7 @@ pub struct ApprovalRequest {
 }
 
 /// Why an approval request stopped being outstanding without an operator decision.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ApprovalWithdrawal {
     /// The deadline passed.
     TimedOut,
@@ -168,8 +163,7 @@ impl Display for ApprovalWithdrawal {
 }
 
 /// The final result of an approval request.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "outcome")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ApprovalOutcome {
     /// An operator answered.
     Decided {
@@ -204,14 +198,9 @@ impl ApprovalOutcome {
 
 #[cfg(test)]
 mod tests {
-    use claw_domain::SessionId;
-
     use super::{
-        ApprovalDecision, ApprovalOutcome, ApprovalRequest, ApprovalScope, ApprovalVerdict,
-        ApprovalWithdrawal,
+        ApprovalDecision, ApprovalOutcome, ApprovalScope, ApprovalVerdict, ApprovalWithdrawal,
     };
-    use crate::model::ids::{ApprovalId, ToolCallId, TurnId};
-    use crate::model::time::Timestamp;
 
     #[test]
     fn only_session_scope_is_remembered() {
@@ -283,39 +272,5 @@ mod tests {
             }
             .is_approved()
         );
-    }
-
-    #[test]
-    fn outcomes_serialise_with_a_tagged_representation() {
-        let encoded = serde_json::to_string(&ApprovalOutcome::Withdrawn {
-            reason: ApprovalWithdrawal::TimedOut,
-        })
-        .expect("outcome serialises");
-
-        assert_eq!(
-            encoded,
-            "{\"outcome\":\"withdrawn\",\"reason\":\"timed_out\"}"
-        );
-    }
-
-    #[test]
-    fn requests_round_trip_through_json() {
-        let request = ApprovalRequest {
-            approval_id: ApprovalId::new("approval-1").expect("valid approval id"),
-            session_id: SessionId::new("session-1").expect("valid session id"),
-            turn: TurnId::new(2),
-            call_id: ToolCallId::new("call-3").expect("valid call id"),
-            tool_name: "write_file".to_owned(),
-            arguments: "{}".to_owned(),
-            requested_at: Timestamp::from_millis(100),
-            expires_at: Timestamp::from_millis(30_100),
-        };
-
-        let encoded = serde_json::to_string(&request).expect("request serialises");
-        let decoded: ApprovalRequest =
-            serde_json::from_str(&encoded).expect("request deserialises");
-
-        assert_eq!(decoded, request);
-        assert_eq!(decoded.expires_at.as_millis(), 30_100);
     }
 }

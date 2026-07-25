@@ -78,7 +78,49 @@ struct Pending {
 struct BrokerState {
     pending: HashMap<ApprovalId, Pending>,
     remembered: HashMap<(String, String), ApprovalDecision>,
+    abandoned: Vec<ApprovalId>,
     next_id: u64,
+}
+
+fn lock_state(state: &Mutex<BrokerState>) -> std::sync::MutexGuard<'_, BrokerState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Retracts a registered request when [`ApprovalBroker::request`] is dropped instead of resolved.
+///
+/// `request` inserts the pending entry before awaiting the operator, and a future may be dropped
+/// at any await point. Without this guard the entry would outlive its waiter forever: it would
+/// still be listed by [`ApprovalBroker::outstanding`], and [`ApprovalBroker::resolve`] would
+/// accept it and record an "always allow" memory for a tool call that no longer exists.
+///
+/// [`Drop`] cannot run the asynchronous [`ApprovalPort::withdraw`] notification, so the guard
+/// records the identifier in `abandoned` and [`ApprovalBroker::withdraw_all`] tells the adapter
+/// about it. `request` disarms the guard on every path that removes the entry deliberately.
+struct PendingGuard {
+    state: Arc<Mutex<BrokerState>>,
+    approval_id: ApprovalId,
+    armed: bool,
+}
+
+impl PendingGuard {
+    /// Hands ownership of the pending entry back to the caller.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = lock_state(&self.state);
+        if state.pending.remove(&self.approval_id).is_some() {
+            state.abandoned.push(self.approval_id.clone());
+        }
+    }
 }
 
 /// Brokers tool approval decisions between the runtime and its operators.
@@ -190,6 +232,10 @@ impl ApprovalBroker {
 
     /// Withdraws every outstanding request, waking each waiter with `reason`.
     ///
+    /// Requests whose waiter was dropped rather than cancelled are retracted from the broker at
+    /// drop time but cannot be reported to the adapter from a synchronous [`Drop`]; they are
+    /// notified here as well, so no presented request is left un-dismissed after a shutdown.
+    ///
     /// # Errors
     ///
     /// Returns the first [`PortError`] raised while notifying the presentation adapter. Every
@@ -197,8 +243,9 @@ impl ApprovalBroker {
     pub async fn withdraw_all(&self, reason: ApprovalWithdrawal) -> Result<(), ApprovalError> {
         let drained: Vec<ApprovalId> = {
             let mut state = self.lock();
-            let ids: Vec<ApprovalId> = state.pending.keys().cloned().collect();
+            let mut ids: Vec<ApprovalId> = state.pending.keys().cloned().collect();
             state.pending.clear();
+            ids.append(&mut state.abandoned);
             ids
         };
 
@@ -219,6 +266,9 @@ impl ApprovalBroker {
     /// Returns immediately with a remembered decision when one exists. Otherwise the request is
     /// presented through [`ApprovalPort`] and the call waits until an operator answers, the
     /// clock passes the deadline, or `cancel` fires.
+    ///
+    /// Dropping the returned future retracts the request from the broker, so an abandoned waiter
+    /// cannot leave a resolvable entry behind.
     ///
     /// # Errors
     ///
@@ -267,7 +317,15 @@ impl ApprovalBroker {
             (approval_id, receiver, request)
         };
 
+        // Armed for exactly the window in which this future owns the pending entry.
+        let mut guard = PendingGuard {
+            state: Arc::clone(&self.state),
+            approval_id: approval_id.clone(),
+            armed: true,
+        };
+
         if let Err(error) = self.approvals.present(request).await {
+            guard.disarm();
             self.discard(&approval_id);
             return Err(ApprovalError::Port(error));
         }
@@ -281,6 +339,8 @@ impl ApprovalBroker {
 
         match outcome {
             Some(decision) => {
+                // `resolve` already removed the entry when it woke this waiter.
+                guard.disarm();
                 self.approvals.settle(&approval_id).await?;
                 Ok(ApprovalOutcome::Decided {
                     decision,
@@ -288,6 +348,7 @@ impl ApprovalBroker {
                 })
             }
             None => {
+                guard.disarm();
                 let still_pending = self.discard(&approval_id);
                 let reason = if cancel.is_cancelled() {
                     ApprovalWithdrawal::Cancelled
@@ -307,9 +368,7 @@ impl ApprovalBroker {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BrokerState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_state(&self.state)
     }
 }
 

@@ -39,6 +39,18 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Polls `future` exactly once with a waker that does nothing, without resolving it.
+///
+/// Tests that drive a future to completion cannot observe what happens when it is *dropped*
+/// while parked, which is how a cancelled caller abandons it. This reaches the first await point
+/// and hands the future back so the caller can drop it there.
+pub(crate) fn poll_once<F: std::future::Future>(
+    future: &mut std::pin::Pin<Box<F>>,
+) -> std::task::Poll<F::Output> {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    future.as_mut().poll(&mut context)
+}
+
 /// A clock that only moves when a test moves it.
 pub(crate) struct FakeClock {
     millis: Mutex<i64>,

@@ -12,7 +12,9 @@ use claw_runtime::suspend::{
     SuspensionPhase, SuspensionStatus, WorkRefused,
 };
 
-use support::FakeClock;
+use std::task::Poll;
+
+use support::{FakeClock, poll_once};
 
 fn lease(name: &str) -> LeaseId {
     LeaseId::new(name).expect("the test lease id is valid")
@@ -364,4 +366,128 @@ fn every_phase_declares_whether_it_admits_work() {
 
     assert_eq!(admitting, vec![SuspensionPhase::Active]);
     assert_eq!(labels, vec!["active", "draining", "suspended"]);
+}
+
+/// Reaching the drain await without resolving it is the only way to observe a cancelled
+/// `prepare`: every other suspension test drives the future to completion, which is precisely why
+/// this hazard survived until an audit found it.
+#[tokio::test]
+async fn a_prepare_dropped_while_draining_rolls_the_runtime_back_to_active() {
+    let clock = FakeClock::new(0);
+    let controller = SuspensionController::new(Arc::clone(&clock) as Arc<_>);
+    let permit = controller.admit().expect("the runtime is active");
+
+    let mut preparing = Box::pin(controller.prepare(request(
+        "lease-abandoned",
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+    )));
+
+    // One poll commits the `Draining` transition and parks on the drain.
+    assert!(
+        poll_once(&mut preparing).is_pending(),
+        "in-flight work must keep the drain parked"
+    );
+    assert_eq!(
+        controller.status(),
+        SuspensionStatus {
+            phase: SuspensionPhase::Draining,
+            in_flight: 1,
+            lease: Some(SuspendLease {
+                lease_id: lease("lease-abandoned"),
+                reason: "host update".to_owned(),
+                granted_at: Timestamp::from_millis(0),
+                expires_at: Timestamp::from_millis(300_000),
+            }),
+            observed_at: Timestamp::from_millis(0),
+        }
+    );
+
+    // The caller is cancelled: the future is dropped instead of resolved.
+    drop(preparing);
+
+    assert_eq!(
+        controller.status(),
+        SuspensionStatus {
+            phase: SuspensionPhase::Active,
+            in_flight: 1,
+            lease: None,
+            observed_at: Timestamp::from_millis(0),
+        }
+    );
+
+    // Every escape hatch that `Draining` closed is open again.
+    let readmitted = controller.admit().expect("work is admitted again");
+    assert_eq!(controller.status().in_flight, 2);
+    assert_eq!(
+        controller.resume(&lease("lease-abandoned")).expect_err(
+            "no lease is held, so resume must still refuse rather than invent a suspension"
+        ),
+        SuspendError::NotSuspended
+    );
+
+    drop(readmitted);
+    drop(permit);
+    assert_eq!(controller.status().in_flight, 0);
+
+    let outcome = controller
+        .prepare(request(
+            "lease-after",
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        ))
+        .await
+        .expect("a fresh suspension is accepted");
+    assert_eq!(
+        outcome,
+        PrepareOutcome::Suspended(SuspendLease {
+            lease_id: lease("lease-after"),
+            reason: "host update".to_owned(),
+            granted_at: Timestamp::from_millis(0),
+            expires_at: Timestamp::from_millis(300_000),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_prepare_dropped_after_the_drain_timed_out_keeps_the_timeout_outcome() {
+    let clock = FakeClock::new(0);
+    let controller = SuspensionController::new(Arc::clone(&clock) as Arc<_>);
+    let permit = controller.admit().expect("the runtime is active");
+
+    let mut preparing = Box::pin(controller.prepare(request(
+        "lease-timeout",
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+    )));
+    assert!(
+        poll_once(&mut preparing).is_pending(),
+        "in-flight work must keep the drain parked"
+    );
+
+    clock.advance(Duration::from_secs(31));
+    let resolved = loop {
+        match poll_once(&mut preparing) {
+            Poll::Ready(resolved) => break resolved,
+            Poll::Pending => tokio::task::yield_now().await,
+        }
+    };
+
+    assert_eq!(
+        resolved.expect("a timed-out drain is not an error"),
+        PrepareOutcome::DrainTimedOut { in_flight: 1 }
+    );
+    // The guard was disarmed by the deliberate timeout rollback, so dropping the resolved future
+    // must not touch the phase a second time.
+    drop(preparing);
+    assert_eq!(
+        controller.status(),
+        SuspensionStatus {
+            phase: SuspensionPhase::Active,
+            in_flight: 1,
+            lease: None,
+            observed_at: Timestamp::from_millis(31_000),
+        }
+    );
+    drop(permit);
 }

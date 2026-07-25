@@ -3,8 +3,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use serde::{Deserialize, Serialize};
-
 /// The largest identifier accepted by any application port.
 pub const MAX_IDENTIFIER_BYTES: usize = 128;
 
@@ -65,8 +63,7 @@ fn parse_identifier(kind: &'static str, value: &str) -> Result<String, Identifie
 macro_rules! identifier {
     ($name:ident, $kind:literal, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-        #[serde(try_from = "String", into = "String")]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(String);
 
         impl $name {
@@ -127,10 +124,7 @@ identifier!(
 );
 
 /// Identifies one turn inside a session.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TurnId(u64);
 
 impl TurnId {
@@ -198,26 +192,6 @@ mod tests {
         let error = ToolCallId::new(" ").expect_err("blank ids are rejected");
 
         assert_eq!(error.to_string(), "invalid tool call id: must not be empty");
-    }
-
-    #[test]
-    fn identifiers_round_trip_through_json() {
-        let id = GoalId::new("goal-9").expect("valid goal id");
-        let encoded = serde_json::to_string(&id).expect("goal id serialises");
-
-        assert_eq!(encoded, "\"goal-9\"");
-        assert_eq!(
-            serde_json::from_str::<GoalId>(&encoded).expect("goal id deserialises"),
-            id
-        );
-    }
-
-    #[test]
-    fn identifier_deserialisation_enforces_the_invariant() {
-        let error =
-            serde_json::from_str::<GoalId>("\"\"").expect_err("blank goal ids must be rejected");
-
-        assert_eq!(error.to_string(), "invalid goal id: must not be empty");
     }
 
     #[test]

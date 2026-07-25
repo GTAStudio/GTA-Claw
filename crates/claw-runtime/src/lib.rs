@@ -20,6 +20,7 @@ pub mod session;
 pub mod stream;
 pub mod suspend;
 pub mod tool;
+mod wire;
 pub mod worker;
 
 pub use approval::{ApprovalBroker, ApprovalError};

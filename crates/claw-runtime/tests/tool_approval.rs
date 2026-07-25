@@ -597,3 +597,98 @@ async fn answering_without_the_approvals_scope_is_refused() {
 
     fixture.runtime.shutdown().await.expect("shutdown is clean");
 }
+
+/// A caller that is cancelled hard enough to drop the future has no chance to run the withdraw
+/// path inside `request`, so the broker must retract the entry itself. Otherwise the request stays
+/// answerable forever and `resolve` would record an "always allow" memory for a call that no
+/// longer exists.
+#[tokio::test]
+async fn a_dropped_request_retracts_itself_and_is_still_reported_to_the_adapter() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let cancel = CancellationToken::new();
+    let approval_id = ApprovalId::new("approval-1").expect("the test approval id is valid");
+
+    let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(
+        support::poll_once(&mut waiting).is_pending(),
+        "an unanswered request must park"
+    );
+    assert_eq!(
+        broker
+            .outstanding()
+            .into_iter()
+            .map(|request| request.approval_id)
+            .collect::<Vec<_>>(),
+        vec![approval_id.clone()]
+    );
+
+    // The waiter goes away without ever resolving the future.
+    drop(waiting);
+
+    assert!(
+        broker.outstanding().is_empty(),
+        "an abandoned request must not stay outstanding"
+    );
+    assert_eq!(
+        broker
+            .resolve(&approval_id, ApprovalDecision::approve_for_session())
+            .expect_err("an abandoned request must not be answerable"),
+        ApprovalError::Unknown(approval_id.clone())
+    );
+    assert_eq!(broker.remembered(&session("approvals"), "write_file"), None);
+
+    // `Drop` cannot run the asynchronous notification, so the adapter learns about it here.
+    broker
+        .withdraw_all(ApprovalWithdrawal::Cancelled)
+        .await
+        .expect("the adapter accepts the withdrawal");
+    assert_eq!(
+        approvals.records(),
+        vec![
+            ApprovalRecord::Presented(approval_id.clone()),
+            ApprovalRecord::Withdrawn(approval_id, ApprovalWithdrawal::Cancelled),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_answered_request_is_not_reported_twice_when_its_future_is_dropped_afterwards() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let cancel = CancellationToken::new();
+    let approval_id = ApprovalId::new("approval-1").expect("the test approval id is valid");
+
+    let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(
+        support::poll_once(&mut waiting).is_pending(),
+        "an unanswered request must park"
+    );
+
+    broker
+        .resolve(&approval_id, ApprovalDecision::approve_once())
+        .expect("the request is outstanding");
+
+    let outcome = waiting.await.expect("the decision is delivered");
+    assert_eq!(
+        outcome,
+        ApprovalOutcome::Decided {
+            decision: ApprovalDecision::approve_once(),
+            remembered: false,
+        }
+    );
+
+    broker
+        .withdraw_all(ApprovalWithdrawal::Cancelled)
+        .await
+        .expect("the adapter accepts the withdrawal");
+    assert_eq!(
+        approvals.records(),
+        vec![
+            ApprovalRecord::Presented(approval_id.clone()),
+            ApprovalRecord::Settled(approval_id),
+        ]
+    );
+}

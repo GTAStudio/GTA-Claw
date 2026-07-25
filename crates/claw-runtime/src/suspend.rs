@@ -202,6 +202,72 @@ impl Drop for WorkPermit {
     }
 }
 
+/// Rolls a committed `Draining` transition back when [`SuspensionController::prepare`] is
+/// dropped instead of resolved.
+///
+/// `prepare` commits the phase change and installs its lease, releases the lock, and then awaits
+/// the drain. A future may be dropped at any await point, and without this guard a dropped
+/// `prepare` would strand the controller in `Draining` forever: [`SuspensionController::admit`]
+/// refuses all work, another `prepare` returns [`SuspendError::AlreadyDraining`],
+/// [`SuspensionController::resume`] returns [`SuspendError::NotSuspended`], and lease expiry only
+/// fires in `Suspended`. Only a process restart would recover.
+///
+/// The guard is armed for exactly the window between committing the transition and reaching a
+/// decision about it, and `prepare` disarms it on every path that reaches a decision — including
+/// the drain-timeout path, whose rollback is a deliberate outcome rather than an unwind.
+#[derive(Debug)]
+struct DrainGuard {
+    shared: Arc<Shared>,
+    lease_id: LeaseId,
+    armed: bool,
+}
+
+impl DrainGuard {
+    /// Commits the `Draining` transition and returns the guard that owns rolling it back.
+    ///
+    /// The caller must already hold `state` and must have checked that the phase is `Active`.
+    fn arm(shared: &Arc<Shared>, state: &mut ControllerState, lease: SuspendLease) -> Self {
+        let lease_id = lease.lease_id.clone();
+        state.phase = SuspensionPhase::Draining;
+        state.lease = Some(lease);
+        Self {
+            shared: Arc::clone(shared),
+            lease_id,
+            armed: true,
+        }
+    }
+
+    /// Hands ownership of the transition back to the caller.
+    ///
+    /// Must be called before the controller mutex is taken, because [`Drop`] locks the same
+    /// non-reentrant mutex.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = Shared::lock(&self.shared.state);
+        // Roll back only the transition this guard installed. `Draining` blocks every other
+        // transition today, so nothing else can be holding the phase, but that is an invariant of
+        // the current control flow rather than of the type; checking the lease identity keeps the
+        // rollback correct if a third transition is ever added.
+        let owned = state.phase == SuspensionPhase::Draining
+            && state
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.lease_id == self.lease_id);
+        if owned {
+            state.phase = SuspensionPhase::Active;
+            state.lease = None;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Shared {
     state: Mutex<ControllerState>,
@@ -284,6 +350,9 @@ impl SuspensionController {
 
     /// Quiesces the runtime, waiting for in-flight work to drain.
     ///
+    /// Dropping the returned future rolls the `Draining` transition back to `Active` and releases
+    /// the lease, so a cancelled suspension cannot wedge the controller.
+    ///
     /// # Errors
     ///
     /// Returns [`SuspendError::AlreadyDraining`] or [`SuspendError::AlreadySuspended`] when
@@ -298,7 +367,7 @@ impl SuspensionController {
             .checked_add(request.lease_ttl)
             .ok_or(SuspendError::DeadlineOverflow)?;
 
-        {
+        let mut guard = {
             let mut state = Shared::lock(&self.shared.state);
             self.expire_locked(&mut state);
             match state.phase {
@@ -318,16 +387,25 @@ impl SuspensionController {
                 }
                 SuspensionPhase::Active => {}
             }
-            state.phase = SuspensionPhase::Draining;
-            state.lease = Some(SuspendLease {
-                lease_id: request.lease_id.clone(),
-                reason: request.reason.clone(),
-                granted_at,
-                expires_at,
-            });
-        }
+            DrainGuard::arm(
+                &self.shared,
+                &mut state,
+                SuspendLease {
+                    lease_id: request.lease_id.clone(),
+                    reason: request.reason.clone(),
+                    granted_at,
+                    expires_at,
+                },
+            )
+        };
 
         let drained = self.wait_for_drain(drain_deadline).await;
+
+        // The drain reached a decision, so ownership of the transition returns here for both
+        // outcomes: a drained runtime becomes `Suspended`, and a timed-out drain deliberately
+        // returns to `Active` without a lease. Disarming before the lock is taken keeps `Drop`
+        // from re-entering the same non-reentrant mutex.
+        guard.disarm();
 
         let mut state = Shared::lock(&self.shared.state);
         if drained {
@@ -423,5 +501,108 @@ impl SuspensionController {
             state.phase = SuspensionPhase::Active;
             state.lease = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lease_id(name: &str) -> LeaseId {
+        LeaseId::new(name).expect("the test lease id is valid")
+    }
+
+    fn lease(name: &str) -> SuspendLease {
+        SuspendLease {
+            lease_id: lease_id(name),
+            reason: "host update".to_owned(),
+            granted_at: Timestamp::from_millis(0),
+            expires_at: Timestamp::from_millis(60_000),
+        }
+    }
+
+    /// An active controller with one unit of work outstanding, so a real `prepare` would park.
+    fn active_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            state: Mutex::new(ControllerState {
+                phase: SuspensionPhase::Active,
+                in_flight: 1,
+                lease: None,
+            }),
+            drained: Notify::new(),
+        })
+    }
+
+    /// Commits the transition the way `prepare` does and hands back the guard that owns it.
+    fn arm(shared: &Arc<Shared>, held: SuspendLease) -> DrainGuard {
+        let mut state = Shared::lock(&shared.state);
+        DrainGuard::arm(shared, &mut state, held)
+    }
+
+    #[test]
+    fn arming_the_guard_commits_the_draining_transition() {
+        let shared = active_shared();
+        let mut guard = arm(&shared, lease("lease-a"));
+
+        let state = Shared::lock(&shared.state);
+        assert_eq!(state.phase, SuspensionPhase::Draining);
+        assert_eq!(state.lease, Some(lease("lease-a")));
+        assert_eq!(state.in_flight, 1);
+        drop(state);
+
+        guard.disarm();
+    }
+
+    #[test]
+    fn an_armed_guard_rolls_the_transition_it_installed_back_to_active() {
+        let shared = active_shared();
+        let guard = arm(&shared, lease("lease-b"));
+        drop(guard);
+
+        let state = Shared::lock(&shared.state);
+        assert_eq!(state.phase, SuspensionPhase::Active);
+        assert_eq!(state.lease, None);
+        // The rollback releases the phase, never the work that is still running.
+        assert_eq!(state.in_flight, 1);
+    }
+
+    #[test]
+    fn a_disarmed_guard_leaves_the_transition_in_place() {
+        let shared = active_shared();
+        let mut guard = arm(&shared, lease("lease-c"));
+        guard.disarm();
+        drop(guard);
+
+        let state = Shared::lock(&shared.state);
+        assert_eq!(state.phase, SuspensionPhase::Draining);
+        assert_eq!(state.lease, Some(lease("lease-c")));
+    }
+
+    #[test]
+    fn a_guard_whose_lease_was_replaced_leaves_the_replacement_alone() {
+        let shared = active_shared();
+        let guard = arm(&shared, lease("lease-d"));
+
+        // A hypothetical third transition parks a different lease in `Draining` before the
+        // abandoned prepare unwinds. The guard must not roll back state it does not own.
+        Shared::lock(&shared.state).lease = Some(lease("lease-e"));
+        drop(guard);
+
+        let state = Shared::lock(&shared.state);
+        assert_eq!(state.phase, SuspensionPhase::Draining);
+        assert_eq!(state.lease, Some(lease("lease-e")));
+    }
+
+    #[test]
+    fn a_guard_whose_phase_moved_on_leaves_the_new_phase_alone() {
+        let shared = active_shared();
+        let guard = arm(&shared, lease("lease-f"));
+
+        Shared::lock(&shared.state).phase = SuspensionPhase::Suspended;
+        drop(guard);
+
+        let state = Shared::lock(&shared.state);
+        assert_eq!(state.phase, SuspensionPhase::Suspended);
+        assert_eq!(state.lease, Some(lease("lease-f")));
     }
 }

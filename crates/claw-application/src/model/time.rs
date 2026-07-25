@@ -3,13 +3,8 @@
 use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 /// A wall-clock instant expressed as milliseconds since the Unix epoch.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Timestamp(i64);
 
 impl Timestamp {

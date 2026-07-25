@@ -3,11 +3,8 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use serde::{Deserialize, Serialize};
-
 /// Every user-visible state a session turn can occupy.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SessionState {
     /// Composed locally and not yet submitted to the runtime.
     Draft,
@@ -36,8 +33,7 @@ pub enum SessionState {
 }
 
 /// Every input that can drive a session state transition.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SessionEvent {
     /// Submit a draft turn to the runtime.
     Enqueue,
@@ -336,19 +332,6 @@ mod tests {
                 "fail",
             ]
         );
-    }
-
-    #[test]
-    fn states_serialise_with_their_labels() {
-        for state in SessionState::ALL {
-            let encoded = serde_json::to_string(&state).expect("state serialises");
-
-            assert_eq!(encoded, format!("\"{}\"", state.label()));
-            assert_eq!(
-                serde_json::from_str::<SessionState>(&encoded).expect("state deserialises"),
-                state
-            );
-        }
     }
 
     #[test]

@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_application::model::approval::ApprovalWithdrawal;
+use claw_application::model::ids::TurnId;
 use claw_application::model::session::SessionState;
 use claw_application::ports::tool::ToolStatus;
-use claw_runtime::runtime::{Runtime, RuntimeConfig, RuntimeError, RuntimePorts};
+use claw_runtime::runtime::{Runtime, RuntimeConfig, RuntimeError, RuntimeEventKind, RuntimePorts};
 use claw_runtime::suspend::{PrepareRequest, SuspensionPhase};
 
 use support::{
@@ -405,4 +406,75 @@ async fn a_refused_turn_releases_its_work_permit() {
 
     fixture.runtime.shutdown().await.expect("shutdown is clean");
     assert_eq!(fixture.runtime.tracked_tasks(), 0);
+}
+
+/// A turn task normally runs to completion, but a task future can also be dropped outright — for
+/// example when the executor it was spawned on is torn down. The live-turn registration and the
+/// suspension permit must therefore be released by `Drop`, not by code after the `await`:
+/// otherwise the session stays marked as busy and every later `submit` is refused with
+/// `TurnInFlight`, with no way back short of a process restart.
+#[test]
+fn a_turn_task_dropped_before_it_finishes_still_releases_the_session() {
+    let fixture = fixture(
+        vec![Round::stalling(Vec::new()), Round::stalling(Vec::new())],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("abandoned");
+
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a single-threaded test executor starts");
+    let handle = executor.block_on(async {
+        let mut handle = fixture
+            .runtime
+            .submit(&session_id, "hello")
+            .await
+            .expect("the first turn is accepted");
+        // Drive the task until it is parked inside the stalling provider round, so the drop below
+        // really abandons a running turn rather than an unstarted one.
+        let first = handle
+            .next_event()
+            .await
+            .expect("the turn reports its first state change");
+        assert_eq!(first.turn, TurnId::FIRST);
+        assert_eq!(
+            first.kind,
+            RuntimeEventKind::StateChanged {
+                from: SessionState::Draft,
+                to: SessionState::Queued,
+            }
+        );
+        handle
+    });
+    assert_eq!(fixture.runtime.suspension().status().in_flight, 1);
+    assert_eq!(fixture.runtime.tracked_tasks(), 1);
+
+    drop(handle);
+    // Dropping the executor drops the parked task future without ever resolving it.
+    drop(executor);
+
+    assert_eq!(fixture.runtime.suspension().status().in_flight, 0);
+
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a second single-threaded test executor starts");
+    executor.block_on(async {
+        let second = fixture
+            .runtime
+            .submit(&session_id, "again")
+            .await
+            .expect("the session is free again");
+        // The abandoned turn persisted its first states, so the replacement is the next turn.
+        assert_eq!(second.turn(), TurnId::FIRST.next());
+        assert_eq!(fixture.runtime.suspension().status().in_flight, 1);
+        second.cancel();
+        second
+            .join()
+            .await
+            .expect("the cancelled turn reports back");
+        fixture.runtime.shutdown().await.expect("shutdown is clean");
+    });
+
+    assert_eq!(fixture.runtime.tracked_tasks(), 0);
+    assert_eq!(fixture.runtime.suspension().status().in_flight, 0);
 }
