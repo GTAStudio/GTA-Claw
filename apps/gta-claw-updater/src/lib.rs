@@ -106,7 +106,7 @@ struct RollbackState {
     revoked_versions: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResumeBinding {
     target: String,
@@ -117,6 +117,20 @@ struct ResumeBinding {
     release_sequence: u64,
 }
 
+impl fmt::Debug for ResumeBinding {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResumeBinding")
+            .field("target", &self.target)
+            .field("url", &"<redacted>")
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .field("kind", &self.kind)
+            .field("release_sequence", &self.release_sequence)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SwapJournal {
@@ -124,14 +138,14 @@ struct SwapJournal {
 }
 
 /// One signed update artifact.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseArtifact {
     /// Signed release sequence this artifact belongs to.
     pub release_sequence: u64,
     /// Exact Rust target triple.
     pub target: String,
-    /// HTTPS URL, or loopback HTTP URL for local operation and tests.
+    /// HTTPS URL, or loopback HTTP URL for local operation and tests. Debug output redacts it.
     pub url: String,
     /// Lowercase SHA-256 hex digest.
     pub sha256: String,
@@ -139,6 +153,20 @@ pub struct ReleaseArtifact {
     pub size: u64,
     /// Installation format.
     pub kind: ArtifactKind,
+}
+
+impl fmt::Debug for ReleaseArtifact {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReleaseArtifact")
+            .field("release_sequence", &self.release_sequence)
+            .field("target", &self.target)
+            .field("url", &"<redacted>")
+            .field("sha256", &self.sha256)
+            .field("size", &self.size)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// Signed artifact format.
@@ -306,7 +334,7 @@ impl Updater {
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("gta-claw-updater/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(UpdateError::Http)?;
+            .map_err(redact_http_error)?;
         Ok(Self {
             client,
             proxy: Arc::new(ProxyMatcher::from_env()),
@@ -665,7 +693,7 @@ impl Updater {
         if let Some(offset) = range_offset {
             request = request.header(RANGE, format!("bytes={offset}-"));
         }
-        let response = request.send().await.map_err(UpdateError::Http)?;
+        let response = request.send().await.map_err(redact_http_error)?;
         let status = response.status();
         let headers = response.headers().clone();
         Ok(UpdateResponse {
@@ -1960,7 +1988,7 @@ enum ResponseBody {
 impl ResponseBody {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>, UpdateError> {
         match self {
-            Self::Reqwest(stream) => stream.next().await.transpose().map_err(UpdateError::Http),
+            Self::Reqwest(stream) => stream.next().await.transpose().map_err(redact_http_error),
             Self::Https { body, .. } => {
                 while let Some(frame) = body.frame().await {
                     let frame = frame.map_err(UpdateError::HttpsProtocol)?;
@@ -1984,6 +2012,10 @@ impl ResponseBody {
         }
         Ok(())
     }
+}
+
+fn redact_http_error(error: reqwest::Error) -> UpdateError {
+    UpdateError::Http(error.without_url())
 }
 
 impl Drop for ResponseBody {
@@ -3228,5 +3260,88 @@ mod unit_tests {
                 .to_string(),
             "updates require HTTPS or loopback HTTP"
         );
+    }
+
+    #[test]
+    fn debug_output_redacts_download_credentials() {
+        let artifact = ReleaseArtifact {
+            release_sequence: 7,
+            target: "x86_64-test-target".to_owned(),
+            url: "https://user:password@updates.invalid/release?token=secret#fragment".to_owned(),
+            sha256: "0123456789abcdef".to_owned(),
+            size: 4,
+            kind: ArtifactKind::Executable,
+        };
+        assert_eq!(
+            format!("{artifact:?}"),
+            concat!(
+                "ReleaseArtifact { release_sequence: 7, target: \"x86_64-test-target\", ",
+                "url: \"<redacted>\", sha256: \"0123456789abcdef\", size: 4, ",
+                "kind: Executable }"
+            )
+        );
+
+        let binding = ResumeBinding {
+            target: "trusted-target".to_owned(),
+            url: artifact.url.clone(),
+            size: artifact.size,
+            sha256: artifact.sha256.clone(),
+            kind: artifact.kind,
+            release_sequence: artifact.release_sequence,
+        };
+        assert_eq!(
+            format!("{binding:?}"),
+            concat!(
+                "ResumeBinding { target: \"trusted-target\", url: \"<redacted>\", size: 4, ",
+                "sha256: \"0123456789abcdef\", kind: Executable, release_sequence: 7 }"
+            )
+        );
+
+        let envelope = SignedManifest {
+            manifest: ReleaseManifest {
+                version: "2.0.0".to_owned(),
+                sequence: 7,
+                published_at_unix: 100,
+                expires_at_unix: 200,
+                revoked_versions: Vec::new(),
+                artifacts: vec![artifact],
+            },
+            signature: "public-signature".to_owned(),
+        };
+        assert_eq!(
+            format!("{envelope:?}"),
+            concat!(
+                "SignedManifest { manifest: ReleaseManifest { version: \"2.0.0\", sequence: 7, ",
+                "published_at_unix: 100, expires_at_unix: 200, revoked_versions: [], artifacts: ",
+                "[ReleaseArtifact { release_sequence: 7, target: \"x86_64-test-target\", ",
+                "url: \"<redacted>\", sha256: \"0123456789abcdef\", size: 4, ",
+                "kind: Executable }] }, signature: \"public-signature\" }"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_errors_discard_sensitive_request_urls() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind error endpoint");
+        let address = listener.local_addr().expect("error endpoint address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept error request");
+            drop(stream);
+        });
+        let error = Client::new()
+            .get(format!(
+                "http://{address}/release?authorization=secret-query-value"
+            ))
+            .send()
+            .await
+            .expect_err("closed connection produces a request error");
+        server.await.expect("error endpoint task");
+
+        let UpdateError::Http(error) = redact_http_error(error) else {
+            panic!("request error must retain its typed updater variant");
+        };
+        assert_eq!(error.url(), None);
     }
 }
