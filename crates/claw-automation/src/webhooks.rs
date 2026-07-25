@@ -617,10 +617,6 @@ impl<R: WebhookResolver> RustlsOutboundTransport<R> {
             .url
             .port_or_known_default()
             .ok_or(WebhookError::UnsafeEndpoint)?;
-        let destination_authority = match host {
-            Host::Ipv6(value) => format!("[{value}]:{port}"),
-            Host::Domain(_) | Host::Ipv4(_) => format!("{host_text}:{port}"),
-        };
         let addresses = match host {
             Host::Domain(_) => self.resolver.resolve(&host_text, port).await?,
             Host::Ipv4(value) => vec![SocketAddr::new(value.into(), port)],
@@ -637,10 +633,10 @@ impl<R: WebhookResolver> RustlsOutboundTransport<R> {
                 .parse::<Uri>()
                 .map_err(|_| WebhookError::UnsafeEndpoint)?;
             if let Some(proxy) = self.proxy.intercept(&uri) {
-                // The proxy performs DNS in its own network, where a locally resolved IP may name
-                // another machine; public proxy routing therefore uses the original authority.
+                // Public addresses are globally scoped, so the proxy can dial the exact address
+                // that passed local policy without re-resolving the destination hostname.
                 return self
-                    .send_via_proxy(proxy, &request, &host_text, &destination_authority)
+                    .send_via_proxy(proxy, &request, &host_text, &addresses)
                     .await;
             }
         }
@@ -672,7 +668,7 @@ impl<R: WebhookResolver> RustlsOutboundTransport<R> {
         proxy: Intercept,
         request: &OutboundHttpRequest,
         destination_host: &str,
-        destination_authority: &str,
+        destination_addresses: &[SocketAddr],
     ) -> Result<OutboundHttpResponse, WebhookError> {
         let proxy_uri = proxy.uri();
         let proxy_scheme = proxy_uri
@@ -711,48 +707,47 @@ impl<R: WebhookResolver> RustlsOutboundTransport<R> {
             return Err(WebhookError::ProxyConfiguration);
         }
 
-        for proxy_address in &proxy_addresses {
-            let Ok(stream) = TcpStream::connect(proxy_address).await else {
-                continue;
-            };
-            if stream.set_nodelay(true).is_err() {
-                continue;
-            }
-            if proxy_scheme == "https" {
-                let proxy_name = ServerName::try_from(proxy_host.to_owned())
-                    .map_err(|_| WebhookError::ProxyConfiguration)?;
-                let Ok(stream) = self.tls.connect(proxy_name, stream).await else {
+        for destination in destination_addresses {
+            for proxy_address in &proxy_addresses {
+                let Ok(stream) = TcpStream::connect(proxy_address).await else {
                     continue;
                 };
-                let stream = match establish_http_connect(
-                    stream,
-                    destination_authority,
-                    authorization.as_deref(),
-                )
-                .await
-                {
-                    Ok(stream) => stream,
-                    Err(WebhookError::Transport) => continue,
-                    Err(error) => return Err(error),
-                };
+                if stream.set_nodelay(true).is_err() {
+                    continue;
+                }
+                if proxy_scheme == "https" {
+                    let proxy_name = ServerName::try_from(proxy_host.to_owned())
+                        .map_err(|_| WebhookError::ProxyConfiguration)?;
+                    let Ok(stream) = self.tls.connect(proxy_name, stream).await else {
+                        continue;
+                    };
+                    let stream = match establish_http_connect(
+                        stream,
+                        *destination,
+                        authorization.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(stream) => stream,
+                        Err(WebhookError::Transport) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    return self
+                        .send_through_tunnel(stream, request, destination_host)
+                        .await;
+                }
+                let stream =
+                    match establish_http_connect(stream, *destination, authorization.as_deref())
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(WebhookError::Transport) => continue,
+                        Err(error) => return Err(error),
+                    };
                 return self
                     .send_through_tunnel(stream, request, destination_host)
                     .await;
             }
-            let stream = match establish_http_connect(
-                stream,
-                destination_authority,
-                authorization.as_deref(),
-            )
-            .await
-            {
-                Ok(stream) => stream,
-                Err(WebhookError::Transport) => continue,
-                Err(error) => return Err(error),
-            };
-            return self
-                .send_through_tunnel(stream, request, destination_host)
-                .await;
         }
         Err(WebhookError::Transport)
     }
@@ -799,21 +794,12 @@ async fn resolve_proxy_addresses<R: WebhookResolver>(
 
 async fn establish_http_connect<S>(
     mut stream: S,
-    destination: &str,
+    destination: SocketAddr,
     authorization: Option<&str>,
 ) -> Result<S, WebhookError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if destination.is_empty()
-        || destination.len() > 261
-        || !destination.is_ascii()
-        || destination
-            .chars()
-            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
-    {
-        return Err(WebhookError::UnsafeEndpoint);
-    }
     let authorization = authorization.map_or_else(String::new, |value| {
         format!("Proxy-Authorization: {value}\r\n")
     });
@@ -1964,7 +1950,7 @@ mod tests {
         assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(
             connect_request,
-            b"CONNECT hooks.example.test:443 HTTP/1.1\r\nHost: hooks.example.test:443\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+            b"CONNECT 8.8.8.8:443 HTTP/1.1\r\nHost: 8.8.8.8:443\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
         );
         assert_eq!(
             transport.resolver.calls.lock().expect("calls").as_slice(),
@@ -2040,7 +2026,7 @@ mod tests {
                 .expect("proxy rejection");
             request
         });
-        let destination = "hooks.example.test:443";
+        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 443);
 
         assert!(matches!(
             establish_http_connect(client, destination, None).await,
@@ -2048,7 +2034,7 @@ mod tests {
         ));
         assert_eq!(
             server.await.expect("proxy server"),
-            b"CONNECT hooks.example.test:443 HTTP/1.1\r\nHost: hooks.example.test:443\r\n\r\n"
+            b"CONNECT 8.8.4.4:443 HTTP/1.1\r\nHost: 8.8.4.4:443\r\n\r\n"
         );
         assert!(!WebhookError::ProxyConnect.retryable_delivery_failure());
     }
