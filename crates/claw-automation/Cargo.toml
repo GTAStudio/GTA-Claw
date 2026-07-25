@@ -12,6 +12,8 @@ publish = false
 async-trait = "=0.1.89"
 base64 = "=0.22.1"
 hmac = "=0.13.0"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["client-proxy"] }
 rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
 secrecy = "=0.10.3"
