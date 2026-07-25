@@ -1,0 +1,28 @@
+[package]
+name = "gta-claw-updater"
+description = "Standalone signed updater for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+base64 = "=0.22.1"
+ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
+futures-util = "=0.3.31"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+semver = "=1.0.28"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+url = "=2.5.8"
+
+[dev-dependencies]
+ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,528 @@
+//! Local-only adversarial updater integration coverage.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use ed25519_dalek::{Signer as _, SigningKey};
+use gta_claw_updater::{
+    ArtifactKind, InstallMode, InstallOutcome, InstallTarget, ReleaseArtifact, ReleaseManifest,
+    SignedManifest, UpdateDecision, UpdateOutcome, Updater,
+};
+use semver::Version;
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
+use url::Url;
+
+static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+struct TestDir {
+    path: PathBuf,
+}
+
+impl TestDir {
+    fn new(label: &str) -> Self {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "gta-claw-updater-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).expect("remove stale test directory");
+        }
+        std::fs::create_dir(&path).expect("create isolated test directory");
+        Self { path }
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Request {
+    path: String,
+    range: Option<String>,
+}
+
+struct ResponsePlan {
+    status: &'static str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    write_bytes: usize,
+}
+
+type Handler = Arc<dyn Fn(Request, usize) -> ResponsePlan + Send + Sync>;
+struct LocalServer {
+    url: Url,
+    requests: Arc<Mutex<Vec<Request>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LocalServer {
+    async fn spawn(handler: Handler) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback server");
+        let address = listener.local_addr().expect("loopback address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let task_requests = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            let mut index = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                let handler = Arc::clone(&handler);
+                let requests = Arc::clone(&task_requests);
+                index += 1;
+                handle_connection(stream, handler, requests, index).await;
+            }
+        });
+        Self {
+            url: Url::parse(&format!("http://{address}/")).expect("local URL"),
+            requests,
+            task,
+        }
+    }
+
+    fn url(&self, path: &str) -> Url {
+        self.url.join(path).expect("local path URL")
+    }
+}
+
+impl Drop for LocalServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    handler: Handler,
+    requests: Arc<Mutex<Vec<Request>>>,
+    index: usize,
+) {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let count = stream.read(&mut chunk).await.expect("read local request");
+        if count == 0 {
+            return;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8(bytes).expect("HTTP request is UTF-8");
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().expect("request line");
+    let path = request_line
+        .split_ascii_whitespace()
+        .nth(1)
+        .expect("request path")
+        .to_owned();
+    let range = lines.find_map(|line| {
+        line.strip_prefix("range: ")
+            .or_else(|| line.strip_prefix("Range: "))
+            .map(ToOwned::to_owned)
+    });
+    let request = Request { path, range };
+    requests
+        .lock()
+        .expect("request log lock")
+        .push(request.clone());
+    let plan = handler(request, index);
+    let mut response = format!(
+        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        plan.status,
+        plan.body.len()
+    );
+    for (name, value) in plan.headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .expect("write local response headers");
+    stream
+        .write_all(&plan.body[..plan.write_bytes.min(plan.body.len())])
+        .await
+        .expect("write local response body");
+    stream.flush().await.expect("flush local response");
+}
+
+fn handler<F>(handler: F) -> Handler
+where
+    F: Fn(Request, usize) -> ResponsePlan + Send + Sync + 'static,
+{
+    Arc::new(handler)
+}
+
+fn signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[19_u8; 32])
+}
+
+fn updater() -> Updater {
+    Updater::with_public_key(
+        signing_key().verifying_key().to_bytes(),
+        "x86_64-test-target",
+    )
+    .expect("test updater")
+}
+
+fn signed_bytes(manifest: ReleaseManifest) -> Vec<u8> {
+    let canonical = serde_json::to_vec(&manifest).expect("canonical test manifest");
+    let signature = signing_key().sign(&canonical);
+    serde_json::to_vec(&SignedManifest {
+        manifest,
+        signature: STANDARD.encode(signature.to_bytes()),
+    })
+    .expect("signed envelope")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn artifact(url: Url, bytes: &[u8], kind: ArtifactKind) -> ReleaseArtifact {
+    ReleaseArtifact {
+        target: "x86_64-test-target".to_owned(),
+        url: url.to_string(),
+        sha256: sha256_hex(bytes),
+        size: u64::try_from(bytes.len()).expect("small test artifact"),
+        kind,
+    }
+}
+
+fn executable_target(directory: &Path) -> InstallTarget {
+    InstallTarget::new(directory.join("gta-claw.exe"), InstallMode::Executable)
+        .expect("test executable target")
+}
+
+#[tokio::test]
+async fn checks_valid_signed_manifest_and_rejects_forged_or_unsigned_data() {
+    let release_bytes = b"release";
+    let manifest = ReleaseManifest {
+        version: "2.1.0".to_owned(),
+        published_at: "2026-07-25T00:00:00Z".to_owned(),
+        artifacts: vec![ReleaseArtifact {
+            target: "x86_64-test-target".to_owned(),
+            url: "https://updates.example.invalid/gta-claw.exe".to_owned(),
+            sha256: sha256_hex(release_bytes),
+            size: u64::try_from(release_bytes.len()).expect("small release"),
+            kind: ArtifactKind::Executable,
+        }],
+    };
+    let envelope = signed_bytes(manifest.clone());
+    let server_envelope = envelope.clone();
+    let server = LocalServer::spawn(handler(move |request, _| {
+        assert_eq!(
+            request,
+            Request {
+                path: "/manifest.json".to_owned(),
+                range: None,
+            }
+        );
+        ResponsePlan {
+            status: "200 OK",
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            write_bytes: server_envelope.len(),
+            body: server_envelope.clone(),
+        }
+    }))
+    .await;
+    let decision = updater()
+        .check(
+            &server.url("manifest.json"),
+            &Version::parse("2.0.0").expect("current version"),
+        )
+        .await
+        .expect("valid manifest check");
+    assert_eq!(
+        decision,
+        UpdateDecision::Available {
+            version: Version::parse("2.1.0").expect("release version"),
+            artifact: manifest.artifacts[0].clone(),
+        }
+    );
+
+    let mut forged: SignedManifest =
+        serde_json::from_slice(&envelope).expect("decode signed envelope");
+    forged.manifest.version = "9.9.9".to_owned();
+    let forged_error = updater()
+        .verify_manifest(&serde_json::to_vec(&forged).expect("encode forged envelope"))
+        .expect_err("forged signature rejected");
+    assert_eq!(
+        forged_error.to_string(),
+        "release manifest signature is invalid"
+    );
+
+    forged.signature.clear();
+    let unsigned_error = updater()
+        .verify_manifest(&serde_json::to_vec(&forged).expect("encode unsigned envelope"))
+        .expect_err("unsigned manifest rejected");
+    assert_eq!(
+        unsigned_error.to_string(),
+        "release manifest signature encoding is invalid"
+    );
+}
+
+#[tokio::test]
+async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
+    let directory = TestDir::new("tampered");
+    let trusted = b"verified update bytes".to_vec();
+    let mut tampered = trusted.clone();
+    tampered[3] ^= 0x55;
+    let server_body = tampered.clone();
+    let server = LocalServer::spawn(handler(move |request, _| {
+        assert_eq!(
+            request,
+            Request {
+                path: "/artifact".to_owned(),
+                range: None,
+            }
+        );
+        ResponsePlan {
+            status: "200 OK",
+            headers: Vec::new(),
+            write_bytes: server_body.len(),
+            body: server_body.clone(),
+        }
+    }))
+    .await;
+    let release = artifact(server.url("artifact"), &trusted, ArtifactKind::Executable);
+    let target = executable_target(&directory.path);
+    let error = updater()
+        .download(&release, &target)
+        .await
+        .expect_err("tampered artifact rejected");
+    assert_eq!(error.to_string(), "artifact SHA-256 mismatch");
+    assert_eq!(
+        std::fs::read_dir(&directory.path)
+            .expect("read test directory")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn interrupted_download_resumes_from_exact_persisted_offset() {
+    let directory = TestDir::new("resume");
+    let bytes = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+    let response_bytes = bytes.clone();
+    let server = LocalServer::spawn(handler(move |request, index| {
+        if index == 1 {
+            assert_eq!(
+                request,
+                Request {
+                    path: "/artifact".to_owned(),
+                    range: None,
+                }
+            );
+            ResponsePlan {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: response_bytes.clone(),
+                write_bytes: 8,
+            }
+        } else {
+            assert_eq!(
+                request,
+                Request {
+                    path: "/artifact".to_owned(),
+                    range: Some("bytes=8-".to_owned()),
+                }
+            );
+            ResponsePlan {
+                status: "206 Partial Content",
+                headers: vec![(
+                    "Content-Range".to_owned(),
+                    format!(
+                        "bytes 8-{}/{}",
+                        response_bytes.len() - 1,
+                        response_bytes.len()
+                    ),
+                )],
+                body: response_bytes[8..].to_vec(),
+                write_bytes: response_bytes.len() - 8,
+            }
+        }
+    }))
+    .await;
+    let release = artifact(server.url("artifact"), &bytes, ArtifactKind::Executable);
+    let target = executable_target(&directory.path);
+    let first_error = updater()
+        .download(&release, &target)
+        .await
+        .expect_err("first transfer is interrupted");
+    assert_eq!(first_error.to_string(), "update HTTP transfer failed");
+    let part = directory.path.join(".gta-claw.exe.gta-claw.part");
+    assert_eq!(std::fs::read(&part).expect("persisted partial"), bytes[..8]);
+
+    let verified = updater()
+        .download(&release, &target)
+        .await
+        .expect("resumed artifact verifies");
+    assert_eq!(
+        std::fs::read(verified.path()).expect("verified staged bytes"),
+        bytes
+    );
+    assert_eq!(
+        server.requests.lock().expect("request log lock").as_slice(),
+        [
+            Request {
+                path: "/artifact".to_owned(),
+                range: None,
+            },
+            Request {
+                path: "/artifact".to_owned(),
+                range: Some("bytes=8-".to_owned()),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn complete_partial_is_verified_without_an_invalid_range_request() {
+    let directory = TestDir::new("complete-partial");
+    let bytes = b"complete artifact bytes".to_vec();
+    let target = executable_target(&directory.path);
+    let part = directory.path.join(".gta-claw.exe.gta-claw.part");
+    std::fs::write(&part, &bytes).expect("write complete partial");
+    let release = artifact(
+        Url::parse("http://127.0.0.1:9/must-not-connect").expect("loopback URL"),
+        &bytes,
+        ArtifactKind::Executable,
+    );
+
+    let verified = updater()
+        .download(&release, &target)
+        .await
+        .expect("complete partial verifies locally");
+    assert_eq!(
+        std::fs::read(verified.path()).expect("verified complete partial"),
+        bytes
+    );
+    assert!(!part.exists());
+}
+
+#[tokio::test]
+async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
+    let directory = TestDir::new("bundle");
+    let target_path = directory.path.join("GTA Claw.app");
+    std::fs::create_dir(&target_path).expect("create old bundle");
+    std::fs::write(target_path.join("old.txt"), b"old").expect("write old bundle");
+    let bundle = serde_json::to_vec(&json!({
+        "format": "gta-claw-bundle-v1",
+        "files": [
+            {
+                "path": "Contents/MacOS/gta-claw",
+                "mode": 493,
+                "contents": STANDARD.encode(b"new executable")
+            },
+            {
+                "path": "Contents/Info.plist",
+                "mode": 420,
+                "contents": STANDARD.encode(b"plist")
+            }
+        ]
+    }))
+    .expect("bundle archive");
+    let server_bundle = bundle.clone();
+    let server = LocalServer::spawn(handler(move |_, _| ResponsePlan {
+        status: "200 OK",
+        headers: Vec::new(),
+        write_bytes: server_bundle.len(),
+        body: server_bundle.clone(),
+    }))
+    .await;
+    let release = artifact(server.url("bundle"), &bundle, ArtifactKind::MacOsBundle);
+    let target = InstallTarget::new(target_path.clone(), InstallMode::MacOsBundle)
+        .expect("macOS bundle target");
+    let verified = updater()
+        .download(&release, &target)
+        .await
+        .expect("download bundle");
+    let outcome = updater()
+        .install(verified, &target)
+        .await
+        .expect("install bundle");
+    assert_eq!(outcome, InstallOutcome::Installed);
+    assert_eq!(
+        std::fs::read(target_path.join("Contents/MacOS/gta-claw")).expect("new bundle executable"),
+        b"new executable"
+    );
+    assert_eq!(
+        std::fs::read(target_path.join("Contents/Info.plist")).expect("new bundle metadata"),
+        b"plist"
+    );
+    assert!(!target_path.join("old.txt").exists());
+
+    let unsafe_bundle = serde_json::to_vec(&json!({
+        "format": "gta-claw-bundle-v1",
+        "files": [{
+            "path": "../escaped",
+            "mode": 420,
+            "contents": STANDARD.encode(b"escape")
+        }]
+    }))
+    .expect("unsafe bundle archive");
+    let unsafe_server_body = unsafe_bundle.clone();
+    let unsafe_server = LocalServer::spawn(handler(move |_, _| ResponsePlan {
+        status: "200 OK",
+        headers: Vec::new(),
+        write_bytes: unsafe_server_body.len(),
+        body: unsafe_server_body.clone(),
+    }))
+    .await;
+    let unsafe_release = artifact(
+        unsafe_server.url("bundle"),
+        &unsafe_bundle,
+        ArtifactKind::MacOsBundle,
+    );
+    let verified = updater()
+        .download(&unsafe_release, &target)
+        .await
+        .expect("unsafe archive bytes still verify");
+    let error = updater()
+        .install(verified, &target)
+        .await
+        .expect_err("archive traversal rejected");
+    assert_eq!(error.to_string(), "macOS bundle archive is invalid");
+    assert!(!directory.path.join("escaped").exists());
+}
+
+#[tokio::test]
+async fn linux_package_mode_is_network_and_filesystem_noop() {
+    let directory = TestDir::new("linux-noop");
+    let target_path = directory.path.join("gta-claw");
+    std::fs::write(&target_path, b"unchanged").expect("write package binary");
+    let target = InstallTarget::new(target_path.clone(), InstallMode::LinuxPackage)
+        .expect("Linux package target");
+    let outcome = updater()
+        .execute(
+            &Url::parse("http://198.51.100.1/never-requested").expect("test URL"),
+            &Version::parse("1.0.0").expect("current version"),
+            &target,
+        )
+        .await
+        .expect("Linux path is a no-op");
+    assert_eq!(outcome, UpdateOutcome::SystemManaged);
+    assert_eq!(
+        std::fs::read(target_path).expect("unchanged package binary"),
+        b"unchanged"
+    );
+    assert_eq!(
+        std::fs::read_dir(&directory.path)
+            .expect("read Linux test directory")
+            .count(),
+        1
+    );
+}
