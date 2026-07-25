@@ -98,7 +98,9 @@ fn snapshot(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     let root = required(&mut options, "root")?;
     let output = required(&mut options, "output")?;
     reject_unknown(&options)?;
-    write_bootstrap_snapshot(&SafeRoot::new(root)?, &output)
+    let delta = write_bootstrap_snapshot(&SafeRoot::new(root)?, &output)?;
+    println!("{delta}");
+    Ok(())
 }
 
 fn final_dependency_fixtures(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
