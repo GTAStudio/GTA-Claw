@@ -47,14 +47,14 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 Repository CI additionally *executes* this crate's tests — not merely compiles
 them — on macOS arm64 (`macos-latest`), Linux and Windows, because the crate is
-a root workspace member and the headless matrix runs `--workspace`. All 78 pass
+a root workspace member and the headless matrix runs `--workspace`. All 84 pass
 on all three. That is the only non-Windows evidence about this code that exists,
 and it says nothing about an Apple *target* build: those runners build for the
 host, not for `aarch64-apple-ios`.
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 78 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 84 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
@@ -92,6 +92,47 @@ the wrong scope
 Incidental finding: the frozen inventories carry a UTF-8 BOM, which
 `serde_json` rejects as a leading value. Any Rust consumer of
 `compat/upstream/**` has to strip it.
+
+### The frozen inventory does not say which scopes iOS is *granted*
+
+`frozen_scope_contract.rs` proves each action asks for the right scope. It
+cannot prove iOS is ever *given* that scope, because
+`compat/upstream/inventories/clients.json` records `client:ios` only as
+`official_client_interop` with no scope grants at all.
+
+`tests/upstream_ios_grant_set.rs` closes that with `claw-clients` as its
+subject — the crate that ports the frozen client surfaces — read through the
+public `surface(SurfaceId::Ios)` contract rather than restated here, so there is
+no second copy of the grant set to drift. It records that upstream iOS requests
+
+```
+operator.admin  operator.read  operator.write  operator.approvals
+operator.talk.secrets
+```
+
+and **not** `operator.pairing`. That set is a **ceiling, not a quota**:
+`validate_gateway_profile` admits any subset of it, so the enforceable claim is
+not "pairing is missing from a list" but "a profile requesting pairing is
+refused". One test runs that real validator, with a read-only control that must
+be admitted so the refusal is not vacuous. (That framing is the Android
+session's, from #76.)
+
+Consequences, each asserted:
+
+- `IosAction::ManagePairing` can never be granted on iOS. `grants()` refuses it
+  because it consults the *observed* scopes from the server hello, so nothing
+  fabricates a permission — but any front end must treat pairing as
+  unavailable rather than as a control that will work.
+- The other four actions *are* granted, which is asserted too. Without that, a
+  `grants()` that always returned `false` would satisfy the pairing test.
+- `operator.talk.secrets` is granted but modelled by no action here, because no
+  Talk surface is built yet. That gap is asserted so it cannot change unnoticed.
+
+Mutation-checked: repointing `ManagePairing` at `operator.read` fails with the
+granted set spelled out, rather than `ScopeSet(47)`.
+
+This does **not** prove upstream's Swift client requests these scopes. That
+source is not vendored here and cannot be read from this repository.
 
 The iOS target check fails in `ring 0.17.14`, a mandatory transitive dependency
 of `claw-gateway-client`, before it reaches any code in this crate:
