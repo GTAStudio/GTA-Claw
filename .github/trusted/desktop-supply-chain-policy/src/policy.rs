@@ -79,7 +79,7 @@ const ROOT_RUSTFMT: &[u8] = b"edition = \"2024\"\nmax_width = 100\nnewline_style
 const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n/.gitattributes text eol=lf\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\n*.sh text eol=lf\nCargo.lock text eol=lf\nrust-toolchain text eol=lf\n.github/fixtures/security-tools/shadow-bin/* text eol=lf\n.github/trusted/desktop-supply-chain-policy/policy/final/.github/fixtures/security-tools/shadow-bin/* text eol=lf\n";
 
 const BOOTSTRAP_FINGERPRINT: &str =
-    "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3";
+    "4a52e1daad1fc3b3136c72585e3934dae390dbe7e8e9e330e8c60da784a15237";
 
 const BOOTSTRAP_SNAPSHOT_MAGIC: &[u8; 8] = b"GTABOOT1";
 
@@ -380,12 +380,6 @@ fn validate_profile(root_manifest: &TomlValue) -> PolicyResult<()> {
     Ok(())
 }
 
-/// Resolves a `[dependencies.<name>] path` value against its manifest directory.
-///
-/// The result describes where a dependency claims to live; it never authorises that
-/// location. Callers must check the resolved path against an independently established
-/// member set, as `validate_dependency` does. See the inventory note in
-/// `validate_manifest_and_lock_inventory`.
 fn normalize_dependency_path(base: &str, dependency: &str) -> PolicyResult<String> {
     if dependency.contains('\\') || Path::new(dependency).is_absolute() {
         return Err(PolicyError::new(format!(
@@ -1018,17 +1012,6 @@ fn validate_manifest_and_lock_inventory(
         )));
     }
 
-    // The manifest inventory is derived exclusively from `[workspace] members`. Do not
-    // widen it by scanning manifests for `path` keys: `path` is also the source field of
-    // `[dependencies.<name>]`, `[dev-dependencies]`, `[build-dependencies]` and every
-    // `[target.'cfg(...)'.*]` table, all of which are candidate-controlled. A rule that
-    // accepted any manifest `path =` would let an author bless an arbitrary orphan file
-    // into the inventory with one line of TOML. Any future manifest parsing here must be
-    // section-aware and must treat only the workspace member list as authorising.
-    // `validate_dependency` independently requires a `path` dependency to resolve to an
-    // already-declared member; this inventory check is the backstop for when it does not
-    // run. Both layers are pinned by
-    // `manifest_path_keys_cannot_bless_a_file_the_workspace_never_declared`.
     let mut expected_manifests = BTreeSet::from([
         ROOT_MANIFEST.to_owned(),
         DESKTOP_MANIFEST.to_owned(),
