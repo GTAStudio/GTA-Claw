@@ -3,7 +3,7 @@
 use claw_relay::{
     BridgeEffect, BridgeError, CdpBridge, CdpErrorObject, CdpRequest, EndpointError,
     ExtensionCommand, ExtensionId, ExtensionMessage, FrameError, PeerKind, RelayEndpoint, RelayTab,
-    RelayToken, UpgradeRequest, decode_extension_frame,
+    RelayToken, UpgradeRequest, decode_cdp_frame, decode_extension_frame,
 };
 use serde_json::json;
 
@@ -73,6 +73,27 @@ fn endpoint_authenticates_exact_extension_origin_and_token() {
 }
 
 #[test]
+fn upgrade_request_debug_redacts_credentials_at_ingress() {
+    let request = UpgradeRequest {
+        path: "/extension".to_owned(),
+        host: "127.0.0.1:18792".to_owned(),
+        origin: Some(format!("chrome-extension://{EXTENSION_ID}")),
+        subprotocols: vec![
+            "openclaw-extension-relay".to_owned(),
+            format!("openclaw-extension-token.{TOKEN}"),
+        ],
+        authorization_token: Some(TOKEN.to_owned()),
+    };
+
+    assert_eq!(
+        format!("{request:?}"),
+        format!(
+            "UpgradeRequest {{ path: \"/extension\", host: \"127.0.0.1:18792\", origin: Some(\"chrome-extension://{EXTENSION_ID}\"), subprotocols: \"[REDACTED]\", authorization_token: \"[REDACTED]\" }}"
+        )
+    );
+}
+
+#[test]
 fn endpoint_rejects_unknown_extension_id_and_forged_origins() {
     let unknown = "pppppppppppppppppppppppppppppppp";
     assert_eq!(
@@ -135,6 +156,38 @@ fn oversized_and_shape_invalid_frames_are_rejected_before_allocation_use() {
     );
     assert_eq!(
         decode_extension_frame(br#"{"type":"pong","unknown":true}"#, 128),
+        Err(FrameError::InvalidJson)
+    );
+}
+
+#[test]
+fn cdp_frames_obey_the_endpoint_configured_bound_and_strict_shape() {
+    let endpoint = endpoint(64);
+    let valid = br#"{"id":7,"method":"Browser.getVersion"}"#;
+    assert_eq!(
+        decode_cdp_frame(valid, endpoint.max_frame_bytes()),
+        Ok(CdpRequest {
+            id: 7,
+            method: "Browser.getVersion".to_owned(),
+            params: None,
+            session_id: None,
+        })
+    );
+
+    let oversized = br#"{"id":8,"method":"Browser.getVersion","params":{"padding":"xxxxxxxx"}}"#;
+    assert_eq!(
+        decode_cdp_frame(oversized, endpoint.max_frame_bytes()),
+        Err(FrameError::TooLarge {
+            actual: oversized.len(),
+            limit: 64,
+        })
+    );
+    assert_eq!(decode_cdp_frame(valid, 0), Err(FrameError::InvalidBound));
+    assert_eq!(
+        decode_cdp_frame(
+            br#"{"id":9,"method":"Browser.getVersion","unexpected":true}"#,
+            64,
+        ),
         Err(FrameError::InvalidJson)
     );
 }
@@ -410,6 +463,126 @@ fn unauthorized_commands_and_cross_connection_session_hijacks_are_denied() {
                 }),
             },
         }]
+    );
+}
+
+#[test]
+fn browser_policy_controls_and_unapproved_event_prefixes_fail_closed() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let cdp = endpoint.accept(&cdp_upgrade()).expect("CDP");
+    let mut bridge = CdpBridge::new();
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(cdp).expect("CDP");
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Hello {
+                    user_agent: "Fixture".to_owned(),
+                    browser_version: "Chrome/144".to_owned(),
+                    extension_version: "2.0.0".to_owned(),
+                    tabs: vec![tab()],
+                },
+            )
+            .expect("hello"),
+        Vec::new()
+    );
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 1,
+                    method: "Browser.setDownloadBehavior".to_owned(),
+                    params: Some(json!({ "behavior": "deny" })),
+                    session_id: None,
+                },
+            )
+            .expect("policy denial response"),
+        vec![BridgeEffect::ToCdp {
+            connection: cdp,
+            response: claw_relay::CdpResponse {
+                id: 1,
+                session_id: None,
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32601,
+                    message: "CDP method is not allowed by relay policy".to_owned(),
+                }),
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 2,
+                    method: "Security.setIgnoreCertificateErrors".to_owned(),
+                    params: Some(json!({ "ignore": true })),
+                    session_id: None,
+                },
+            )
+            .expect("browser method denial response"),
+        vec![BridgeEffect::ToCdp {
+            connection: cdp,
+            response: claw_relay::CdpResponse {
+                id: 2,
+                session_id: None,
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32601,
+                    message: "CDP method is not allowed by relay policy".to_owned(),
+                }),
+            },
+        }]
+    );
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 3,
+                    method: "Target.attachToTarget".to_owned(),
+                    params: Some(json!({ "targetId": "tab-41" })),
+                    session_id: None,
+                },
+            )
+            .expect("attach"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 1,
+            tab_id: 41,
+        })]
+    );
+    let attached = bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "target-41" })),
+            },
+        )
+        .expect("attached");
+    assert_eq!(attached.len(), 2);
+    assert_eq!(
+        bridge.receive_extension(
+            extension,
+            ExtensionMessage::CdpEvent {
+                tab_id: 41,
+                session_id: None,
+                method: "SystemInfo.processInfoChanged".to_owned(),
+                params: Some(json!({})),
+            },
+        ),
+        Err(BridgeError::ExtensionEventNotAllowed)
     );
 }
 

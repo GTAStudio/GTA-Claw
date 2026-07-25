@@ -501,9 +501,14 @@ impl CdpBridge {
                     reason: "Browser.close",
                 },
             ]),
-            "Target.setDiscoverTargets" | "Browser.setDownloadBehavior" => {
+            "Target.setDiscoverTargets" => {
                 Ok(vec![success_effect(connection, &request, json!({}))])
             }
+            "Browser.setDownloadBehavior" => Ok(vec![error_effect(
+                connection,
+                &request,
+                CdpError::MethodNotAllowed,
+            )]),
             "Target.attachToBrowserTarget" => {
                 let session_id = browser_session_name(self.next_session);
                 self.next_session = self

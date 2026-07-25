@@ -77,7 +77,7 @@ pub enum PeerKind {
 }
 
 /// Complete security metadata from one WebSocket upgrade.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct UpgradeRequest {
     /// Requested path, without a query string.
     pub path: String,
@@ -89,6 +89,19 @@ pub struct UpgradeRequest {
     pub subprotocols: Vec<String>,
     /// Bearer or Basic-password token already extracted by the HTTP adapter.
     pub authorization_token: Option<String>,
+}
+
+impl Debug for UpgradeRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpgradeRequest")
+            .field("path", &self.path)
+            .field("host", &self.host)
+            .field("origin", &self.origin)
+            .field("subprotocols", &"[REDACTED]")
+            .field("authorization_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Authenticated relay connection identity.
