@@ -100,7 +100,7 @@ fn control_the_frozen_inventory_is_present_and_populated() {
     assert!(
         !scopes.is_empty(),
         "the frozen inventory yielded no scope records, so the scope assertions below would \
-         compare against nothing"
+         compare against nothing; the parsed scope set was {scopes:?}"
     );
 
     let sample = record_of_kind("method", "sessions.list");
