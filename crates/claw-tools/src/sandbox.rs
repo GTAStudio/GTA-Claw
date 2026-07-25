@@ -324,7 +324,7 @@ impl Sandbox {
         // Scanned before the existence check so that a case-insensitive
         // filesystem cannot silently redirect the write onto a differently
         // cased file, and so the refusal is identical on every platform.
-        self.reject_case_collision(pin.path(), leaf)?;
+        self.reject_case_collision(&pin, leaf)?;
         let existed = match std::fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
                 if is_link_like(&metadata) {
@@ -429,27 +429,22 @@ impl Sandbox {
 
     /// Enumerates one directory without following links.
     pub fn read_directory(&self, path: &RelativePath) -> Result<Vec<DirectoryEntry>, SandboxError> {
-        // The directory itself is pinned, so the listing cannot be redirected
-        // to another directory after the components were validated.
+        // The directory is enumerated through its own pinned handle, so the
+        // listing cannot be redirected to another directory after the
+        // components were validated.
         let pin = self.pin_ancestors(&path.components)?;
+        let handle = pin.handle()?;
+        let names = list_pinned_names(handle, pin.path(), self.limits.max_directory_entries)?;
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(pin.path()).map_err(map_io)? {
-            let entry = entry.map_err(map_io)?;
-            if entries.len() >= self.limits.max_directory_entries {
-                return Err(SandboxError::DirectoryTooLarge);
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
+        for name in names {
             let Ok(child) = self.child_of(path, &name) else {
                 continue;
             };
-            let metadata = entry.metadata().map_err(map_io)?;
-            let kind = classify(&metadata);
+            let (kind, size) = stat_pinned_child(handle, pin.path(), &name)?;
             entries.push(DirectoryEntry {
                 path: child,
                 kind,
-                size_bytes: (kind == EntryKind::File).then_some(metadata.len()),
+                size_bytes: (kind == EntryKind::File).then_some(size),
             });
         }
         pin.verify()?;
@@ -591,17 +586,13 @@ impl Sandbox {
         }
     }
 
-    fn reject_case_collision(&self, parent: &Path, leaf: &str) -> Result<(), SandboxError> {
-        let mut scanned = 0_usize;
-        for entry in std::fs::read_dir(parent).map_err(map_io)? {
-            let entry = entry.map_err(map_io)?;
-            scanned += 1;
-            if scanned > self.limits.max_directory_entries {
-                return Err(SandboxError::DirectoryTooLarge);
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
+    fn reject_case_collision(&self, pin: &DirectoryPin, leaf: &str) -> Result<(), SandboxError> {
+        // Enumerated through the pinned handle for the same reason as
+        // `read_directory`: a scan redirected to another directory would miss a
+        // real collision, or invent one.
+        let names =
+            list_pinned_names(pin.handle()?, pin.path(), self.limits.max_directory_entries)?;
+        for name in names {
             if name != leaf && name.eq_ignore_ascii_case(leaf) {
                 return Err(SandboxError::CaseCollision);
             }
@@ -610,6 +601,11 @@ impl Sandbox {
     }
 }
 
+/// Classifies an entry from its metadata.
+///
+/// Only the path-based enumeration needs this; on Unix entries are classified
+/// from a `statat` taken relative to the pinned descriptor instead.
+#[cfg(not(unix))]
 fn classify(metadata: &std::fs::Metadata) -> EntryKind {
     if is_link_like(metadata) {
         EntryKind::Link
@@ -683,6 +679,17 @@ impl DirectoryPin {
         self.levels
             .last()
             .map_or_else(|| Path::new(""), |level| level.path.as_path())
+    }
+
+    /// Borrows the open handle of the deepest pinned directory.
+    ///
+    /// Enumeration acts on this handle rather than on [`Self::path`], so a
+    /// listing cannot be redirected by an ancestor swapped after validation.
+    fn handle(&self) -> Result<&File, SandboxError> {
+        self.levels
+            .last()
+            .map(|level| &level.handle)
+            .ok_or(SandboxError::NotADirectory)
     }
 
     /// Re-checks that every pinned directory is still the same directory.
@@ -965,6 +972,107 @@ fn is_reserved_device_name(component: &str) -> bool {
             (characters.next(), characters.next()),
             (Some(digit), None) if SUPERSCRIPT_DEVICE_DIGITS.contains(&digit)
         )
+}
+
+/// Lists the child names of a pinned directory.
+///
+/// On Unix this reads through the pinned descriptor with `rustix::fs::Dir`,
+/// which wraps `fdopendir`. The enumeration is therefore bound to the open
+/// description that was validated, not to a pathname that can be re-resolved,
+/// which closes the same check-then-use gap that `verify_handle_matches_path`
+/// closes for files. Reopening the directory through its path — or through
+/// `/dev/fd/N` — would re-enter the path namespace and discard exactly the
+/// protection the descriptor provides.
+#[cfg(unix)]
+fn list_pinned_names(
+    handle: &File,
+    _path: &Path,
+    limit: usize,
+) -> Result<Vec<String>, SandboxError> {
+    let mut dir = rustix::fs::Dir::read_from(handle).map_err(map_errno)?;
+    // The descriptor is freshly opened, but rewinding removes any dependence on
+    // its current offset.
+    dir.rewind();
+    let mut names = Vec::new();
+    for entry in dir {
+        let entry = entry.map_err(map_errno)?;
+        let raw = entry.file_name();
+        if raw == c"." || raw == c".." {
+            continue;
+        }
+        if names.len() >= limit {
+            return Err(SandboxError::DirectoryTooLarge);
+        }
+        // A non-UTF-8 name cannot be a legal sandbox component, so it is
+        // skipped rather than treated as an error.
+        let Ok(name) = std::str::from_utf8(raw.to_bytes()) else {
+            continue;
+        };
+        names.push(name.to_owned());
+    }
+    Ok(names)
+}
+
+/// Windows and other platforms enumerate by path.
+///
+/// This is safe here for the reason the identity comparison is unnecessary
+/// there: pinned ancestors are held without `FILE_SHARE_DELETE`, so the kernel
+/// refuses to rename or delete them while the pin lives.
+#[cfg(not(unix))]
+fn list_pinned_names(
+    _handle: &File,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<String>, SandboxError> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(path).map_err(map_io)? {
+        let entry = entry.map_err(map_io)?;
+        if names.len() >= limit {
+            return Err(SandboxError::DirectoryTooLarge);
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Classifies one child of a pinned directory without following a link.
+#[cfg(unix)]
+fn stat_pinned_child(
+    handle: &File,
+    _path: &Path,
+    name: &str,
+) -> Result<(EntryKind, u64), SandboxError> {
+    use rustix::fs::{AtFlags, FileType};
+
+    // Relative to the pinned descriptor, so the child is resolved from the
+    // directory that was validated rather than from a name walked again.
+    let stat = rustix::fs::statat(handle, name, AtFlags::SYMLINK_NOFOLLOW).map_err(map_errno)?;
+    let kind = match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Directory => EntryKind::Directory,
+        FileType::RegularFile => EntryKind::File,
+        FileType::Symlink => EntryKind::Link,
+        _ => EntryKind::Other,
+    };
+    Ok((kind, u64::try_from(stat.st_size).unwrap_or(0)))
+}
+
+#[cfg(not(unix))]
+fn stat_pinned_child(
+    _handle: &File,
+    path: &Path,
+    name: &str,
+) -> Result<(EntryKind, u64), SandboxError> {
+    let metadata = std::fs::symlink_metadata(path.join(name)).map_err(map_io)?;
+    Ok((classify(&metadata), metadata.len()))
+}
+
+/// Maps a `rustix` error onto the sandbox error type through `std::io`.
+#[cfg(unix)]
+fn map_errno(error: rustix::io::Errno) -> SandboxError {
+    map_io(io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
 fn map_io(error: io::Error) -> SandboxError {
@@ -1262,6 +1370,54 @@ mod tests {
         // A name that no longer resolves at all is equally not the open handle.
         std::fs::remove_file(&other).expect("remove the other file");
         assert!(verify_handle_matches_path(&file, &other).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Proves the listing is bound to the open descriptor rather than the name.
+    ///
+    /// The directory is swapped for a different one *after* the handle is open,
+    /// which is the swap-and-restore shape that device/inode comparison cannot
+    /// see. Path-based enumeration returns the impostor's contents here; a
+    /// descriptor-based one cannot, because the descriptor still refers to the
+    /// inode that was validated.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_listing_follows_the_descriptor_not_the_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("claw-pinned-listing-{nanos}"));
+        let honest = root.join("honest");
+        let impostor = root.join("impostor");
+        let moved = root.join("moved-aside");
+        std::fs::create_dir_all(&honest).expect("create the honest directory");
+        std::fs::create_dir_all(&impostor).expect("create the impostor directory");
+        std::fs::write(honest.join("inside.txt"), b"inside").expect("write the honest entry");
+        std::fs::write(impostor.join("secret.txt"), b"secret").expect("write the impostor entry");
+
+        let handle = open_directory_no_follow(&honest).expect("pin the honest directory");
+        // The swap a validated-name check cannot detect.
+        std::fs::rename(&honest, &moved).expect("move the honest directory aside");
+        std::fs::rename(&impostor, &honest).expect("put the impostor in its place");
+
+        let names = list_pinned_names(&handle, &honest, 64).expect("the pinned listing succeeds");
+        assert_eq!(
+            names,
+            vec!["inside.txt".to_owned()],
+            "the listing followed the path to the impostor instead of the pinned descriptor"
+        );
+
+        // The same descriptor must also classify children relative to itself.
+        let (kind, size) =
+            stat_pinned_child(&handle, &honest, "inside.txt").expect("stat through the descriptor");
+        assert_eq!(kind, EntryKind::File);
+        assert_eq!(size, 6);
+        assert_eq!(
+            stat_pinned_child(&handle, &honest, "secret.txt")
+                .expect_err("the impostor's entry is not reachable through the pinned descriptor"),
+            SandboxError::NotFound
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
