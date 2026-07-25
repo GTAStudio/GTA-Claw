@@ -18,7 +18,8 @@ highlight = "all"
 name = "rand_core"
 version = "=0.6.4"
 
-# fastwebsockets 0.10 retains getrandom 0.2 while russh and hickory-resolver use 0.4.
+# fastwebsockets 0.10 and ring 0.17 remain on getrandom 0.2 while Hickory 0.26
+# and russh 0.62 require the current getrandom 0.4 line.
 [[bans.skip]]
 name = "getrandom"
 version = "=0.2.17"
