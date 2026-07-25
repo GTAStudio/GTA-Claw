@@ -178,8 +178,10 @@ restore_remove_state() {
   if ! systemctl daemon-reload >/dev/null; then
     fence_failed_remove_restore
   fi
-  if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
-    fence_failed_remove_restore
+  if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
+    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+      fence_failed_remove_restore
+    fi
   fi
   if [ -e "$remove_was_enabled" ]; then
     if ! systemctl enable gta-claw-daemon.service >/dev/null; then
@@ -229,8 +231,10 @@ case "$1" in
         if ! systemctl --system daemon-reload >/dev/null; then
           fence_failed_runtime
         fi
-        if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
-          fence_failed_runtime
+        if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
+          if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+            fence_failed_runtime
+          fi
         fi
         if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&
           [ ! -e "$was_active" ]; then
