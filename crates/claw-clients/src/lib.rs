@@ -214,20 +214,42 @@ pub enum ExerciseStatus {
     ContractOnlyThirdPartyClient,
 }
 
-const OPERATOR_SCOPES: &[OperatorScope] = &[
+const ANDROID_OPERATOR_SCOPES: &[OperatorScope] = &[
     OperatorScope::Admin,
     OperatorScope::Approvals,
     OperatorScope::Read,
     OperatorScope::TalkSecrets,
     OperatorScope::Write,
 ];
-const CONTROL_UI_SCOPES: &[OperatorScope] = &[
+const IOS_OPERATOR_SCOPES: &[OperatorScope] = &[
+    OperatorScope::Read,
+    OperatorScope::Write,
+    OperatorScope::TalkSecrets,
     OperatorScope::Admin,
     OperatorScope::Approvals,
-    OperatorScope::Pairing,
+];
+const MACOS_OPERATOR_SCOPES: &[OperatorScope] = &[
+    OperatorScope::Admin,
     OperatorScope::Read,
-    OperatorScope::TalkSecrets,
     OperatorScope::Write,
+    OperatorScope::Approvals,
+    OperatorScope::Pairing,
+];
+const CLI_OPERATOR_SCOPES: &[OperatorScope] = &[
+    OperatorScope::Admin,
+    OperatorScope::Read,
+    OperatorScope::Write,
+    OperatorScope::Approvals,
+    OperatorScope::Pairing,
+    OperatorScope::TalkSecrets,
+];
+const TUI_OPERATOR_SCOPES: &[OperatorScope] = &[OperatorScope::Admin];
+const CONTROL_UI_SCOPES: &[OperatorScope] = &[
+    OperatorScope::Admin,
+    OperatorScope::Read,
+    OperatorScope::Write,
+    OperatorScope::Approvals,
+    OperatorScope::Pairing,
 ];
 const READ_WRITE_CAPABILITIES: &[ClientCapability] = &[
     ClientCapability::SessionRead,
@@ -255,7 +277,7 @@ const MOBILE_PROFILES_ANDROID: &[GatewayProfile] = &[
         client_id: ClientId::Android,
         mode: ClientMode::Ui,
         role: Role::Operator,
-        scopes: OPERATOR_SCOPES,
+        scopes: ANDROID_OPERATOR_SCOPES,
         requires_device_identity: true,
     },
     GatewayProfile {
@@ -271,7 +293,7 @@ const MOBILE_PROFILES_IOS: &[GatewayProfile] = &[
         client_id: ClientId::Ios,
         mode: ClientMode::Ui,
         role: Role::Operator,
-        scopes: OPERATOR_SCOPES,
+        scopes: IOS_OPERATOR_SCOPES,
         requires_device_identity: true,
     },
     GatewayProfile {
@@ -287,7 +309,7 @@ const MACOS_PROFILES: &[GatewayProfile] = &[
         client_id: ClientId::MacOs,
         mode: ClientMode::Ui,
         role: Role::Operator,
-        scopes: OPERATOR_SCOPES,
+        scopes: MACOS_OPERATOR_SCOPES,
         requires_device_identity: true,
     },
     GatewayProfile {
@@ -302,14 +324,14 @@ const CLI_PROFILE: &[GatewayProfile] = &[GatewayProfile {
     client_id: ClientId::Cli,
     mode: ClientMode::Cli,
     role: Role::Operator,
-    scopes: OPERATOR_SCOPES,
+    scopes: CLI_OPERATOR_SCOPES,
     requires_device_identity: true,
 }];
 const TUI_PROFILE: &[GatewayProfile] = &[GatewayProfile {
     client_id: ClientId::Tui,
     mode: ClientMode::Ui,
     role: Role::Operator,
-    scopes: OPERATOR_SCOPES,
+    scopes: TUI_OPERATOR_SCOPES,
     requires_device_identity: true,
 }];
 const CONTROL_UI_PROFILE: &[GatewayProfile] = &[GatewayProfile {
@@ -824,7 +846,14 @@ mod tests {
     }
 
     #[test]
-    fn gateway_surface_profiles_match_independent_frozen_candidates() {
+    fn gateway_surface_profiles_match_pinned_upstream_defaults() {
+        // Sources are openclaw/openclaw@b43e832fcc8000ed7287c7accc54e381db607f85:
+        // Android: apps/android/app/src/main/java/ai/openclaw/app/node/ConnectionManager.kt
+        // iOS: apps/ios/Sources/Model/NodeAppModel.swift makeOperatorConnectOptions
+        // macOS: apps/macos/Sources/OpenClawMacCLI/GatewayScopes.swift
+        // CLI: src/gateway/method-scopes.ts CLI_DEFAULT_OPERATOR_SCOPES
+        // TUI: src/tui/gateway-chat.ts plus packages/gateway-client/src/client.ts fallback
+        // Control UI: ui/src/api/gateway.ts CONTROL_UI_OPERATOR_SCOPES
         let expected: &[(SurfaceId, &[GatewayProfile])] = &[
             (
                 SurfaceId::Cli,
@@ -834,10 +863,11 @@ mod tests {
                     role: Role::Operator,
                     scopes: &[
                         OperatorScope::Admin,
-                        OperatorScope::Approvals,
                         OperatorScope::Read,
-                        OperatorScope::TalkSecrets,
                         OperatorScope::Write,
+                        OperatorScope::Approvals,
+                        OperatorScope::Pairing,
+                        OperatorScope::TalkSecrets,
                     ],
                     requires_device_identity: true,
                 }],
@@ -848,13 +878,7 @@ mod tests {
                     client_id: ClientId::Tui,
                     mode: ClientMode::Ui,
                     role: Role::Operator,
-                    scopes: &[
-                        OperatorScope::Admin,
-                        OperatorScope::Approvals,
-                        OperatorScope::Read,
-                        OperatorScope::TalkSecrets,
-                        OperatorScope::Write,
-                    ],
+                    scopes: &[OperatorScope::Admin],
                     requires_device_identity: true,
                 }],
             ),
@@ -866,11 +890,10 @@ mod tests {
                     role: Role::Operator,
                     scopes: &[
                         OperatorScope::Admin,
+                        OperatorScope::Read,
+                        OperatorScope::Write,
                         OperatorScope::Approvals,
                         OperatorScope::Pairing,
-                        OperatorScope::Read,
-                        OperatorScope::TalkSecrets,
-                        OperatorScope::Write,
                     ],
                     requires_device_identity: true,
                 }],
@@ -908,11 +931,11 @@ mod tests {
                         mode: ClientMode::Ui,
                         role: Role::Operator,
                         scopes: &[
+                            OperatorScope::Read,
+                            OperatorScope::Write,
+                            OperatorScope::TalkSecrets,
                             OperatorScope::Admin,
                             OperatorScope::Approvals,
-                            OperatorScope::Read,
-                            OperatorScope::TalkSecrets,
-                            OperatorScope::Write,
                         ],
                         requires_device_identity: true,
                     },
@@ -934,10 +957,10 @@ mod tests {
                         role: Role::Operator,
                         scopes: &[
                             OperatorScope::Admin,
-                            OperatorScope::Approvals,
                             OperatorScope::Read,
-                            OperatorScope::TalkSecrets,
                             OperatorScope::Write,
+                            OperatorScope::Approvals,
+                            OperatorScope::Pairing,
                         ],
                         requires_device_identity: true,
                     },
@@ -973,21 +996,72 @@ mod tests {
                     Ok(()),
                     "surface {surface_id:?}"
                 );
-                if profile.role == Role::Operator {
-                    let reordered_minimum = GatewayProfile {
-                        client_id: profile.client_id,
-                        mode: profile.mode,
-                        role: profile.role,
-                        scopes: &[OperatorScope::Write, OperatorScope::Read],
-                        requires_device_identity: profile.requires_device_identity,
-                    };
-                    assert_eq!(
-                        validate_gateway_profile(surface_id, reordered_minimum, 4),
-                        Ok(()),
-                        "surface {surface_id:?}"
-                    );
-                }
             }
+        }
+    }
+
+    #[test]
+    fn gateway_scope_profiles_reject_cross_surface_overgrants() {
+        let cases = [
+            (
+                SurfaceId::Android,
+                ClientId::Android,
+                ClientMode::Ui,
+                &[OperatorScope::Pairing][..],
+                Err(ConnectionError::ProfileNotAllowed),
+            ),
+            (
+                SurfaceId::Ios,
+                ClientId::Ios,
+                ClientMode::Ui,
+                &[OperatorScope::Pairing][..],
+                Err(ConnectionError::ProfileNotAllowed),
+            ),
+            (
+                SurfaceId::MacOs,
+                ClientId::MacOs,
+                ClientMode::Ui,
+                &[OperatorScope::TalkSecrets][..],
+                Err(ConnectionError::ProfileNotAllowed),
+            ),
+            (
+                SurfaceId::ControlUi,
+                ClientId::ControlUi,
+                ClientMode::Webchat,
+                &[OperatorScope::TalkSecrets][..],
+                Err(ConnectionError::ProfileNotAllowed),
+            ),
+            (
+                SurfaceId::Tui,
+                ClientId::Tui,
+                ClientMode::Ui,
+                &[OperatorScope::Write][..],
+                Err(ConnectionError::ProfileNotAllowed),
+            ),
+            (
+                SurfaceId::Cli,
+                ClientId::Cli,
+                ClientMode::Cli,
+                &[OperatorScope::Pairing, OperatorScope::TalkSecrets][..],
+                Ok(()),
+            ),
+        ];
+        for (surface_id, client_id, mode, scopes, expected) in cases {
+            assert_eq!(
+                validate_gateway_profile(
+                    surface_id,
+                    GatewayProfile {
+                        client_id,
+                        mode,
+                        role: Role::Operator,
+                        scopes,
+                        requires_device_identity: true,
+                    },
+                    4,
+                ),
+                expected,
+                "surface {surface_id:?}"
+            );
         }
     }
 
