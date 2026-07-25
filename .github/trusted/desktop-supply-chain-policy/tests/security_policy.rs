@@ -668,7 +668,6 @@ fn final_tree(label: &str) -> TempTree {
     ] {
         write_from_policy(&tree, source, destination);
     }
-    write_active_repository_policy_workflow(&tree);
     tree
 }
 
@@ -769,6 +768,7 @@ workspace = true
 "#;
 
 const REPOSITORY_POLICY_MEMBER: &str = "crates/claw-repo-policy";
+const REPOSITORY_POLICY_PACKAGE: &str = "claw-repo-policy";
 
 const REPOSITORY_POLICY_TEST_FIXTURE: &str = r#"const FORBIDDEN_FILE_NAMES: &[&str] = &[
     "package.json",
@@ -862,14 +862,6 @@ jobs:
         run: cargo test --locked --package claw-repo-policy --test repository_policy
 "#;
 
-fn write_active_repository_policy_workflow(tree: &TempTree) {
-    fs::write(
-        tree.join(".github/workflows/upstream-gateway-reference.yml"),
-        ACTIVE_REPOSITORY_POLICY_WORKFLOW,
-    )
-    .expect("write active repository policy workflow");
-}
-
 fn deactivate_repository_policy(tree: &TempTree) {
     let root_manifest_path = tree.join("Cargo.toml");
     let mut root_manifest: toml::Value = toml::from_str(
@@ -881,6 +873,7 @@ fn deactivate_repository_policy(tree: &TempTree) {
         .and_then(|workspace| workspace.get_mut("members"))
         .and_then(toml::Value::as_array_mut)
         .expect("active policy root workspace members");
+    assert_unique_sorted_root_members(members);
     let position = members
         .binary_search_by(|candidate| {
             candidate
@@ -897,8 +890,13 @@ fn deactivate_repository_policy(tree: &TempTree) {
     )
     .expect("write inactive policy root manifest");
 
-    fs::remove_dir_all(tree.join(REPOSITORY_POLICY_MEMBER))
-        .expect("remove active repository policy crate");
+    let policy_root = tree.join(REPOSITORY_POLICY_MEMBER);
+    for path in ["Cargo.toml", "src/lib.rs", "tests/repository_policy.rs"] {
+        fs::remove_file(policy_root.join(path)).expect("remove active repository policy file");
+    }
+    fs::remove_dir(policy_root.join("src")).expect("remove empty repository policy source");
+    fs::remove_dir(policy_root.join("tests")).expect("remove empty repository policy tests");
+    fs::remove_dir(policy_root).expect("remove empty repository policy crate");
 
     let root_lock_path = tree.join("Cargo.lock");
     let mut root_lock: toml::Value =
@@ -910,7 +908,7 @@ fn deactivate_repository_policy(tree: &TempTree) {
         .expect("active policy root lock packages");
     let package_count = packages.len();
     packages.retain(|package| {
-        package.get("name").and_then(toml::Value::as_str) != Some("claw-repo-policy")
+        package.get("name").and_then(toml::Value::as_str) != Some(REPOSITORY_POLICY_PACKAGE)
     });
     assert_eq!(
         package_count,
@@ -939,7 +937,11 @@ fn activate_repository_policy(tree: &TempTree) {
         REPOSITORY_POLICY_TEST_FIXTURE,
     )
     .expect("write repository policy test fixture");
-    write_active_repository_policy_workflow(tree);
+    fs::write(
+        tree.join(".github/workflows/upstream-gateway-reference.yml"),
+        ACTIVE_REPOSITORY_POLICY_WORKFLOW,
+    )
+    .expect("write active repository policy workflow");
 }
 
 fn write_release_workspace(
