@@ -8,6 +8,8 @@
 //! it cannot prove that the test is semantically sufficient for the claim.
 //! Automated citation integrity therefore composes with independent review:
 //! the harness rejects fabricated evidence, while reviewers judge sufficiency.
+//! The verifier recognizes literal test declarations only; macro-generated
+//! tests are conservatively rejected because their expanded items are unavailable.
 
 mod claims;
 mod error;
