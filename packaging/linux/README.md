@@ -92,8 +92,11 @@ rejected before service disruption; final removal stops/disables before
 executable unlink. Ordinary removal and Debian purge preserve protected state
 and the stable service identity. LP4 intentionally ships no automated state
 purge action. No hook executes network or dynamic code.
-The root wrapper creates `/run/gta-claw-initialization-failed` before every
-handoff, so failed direct, Debian, RPM, or manual initialization remains fenced.
+The root wrapper creates
+`/run/gta-claw-state-init/initialization-failed` before every handoff. The
+root-owned mode-0755 runtime directory is preserved by the initializer oneshot;
+only root can change the marker while the runtime can read it. Failed direct,
+Debian, RPM, or manual initialization therefore remains fenced.
 RPM may report `%post` failures as warnings, but the runtime unit still refuses
 startup until a later successful root initialization clears the marker.
 

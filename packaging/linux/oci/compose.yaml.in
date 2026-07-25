@@ -1,6 +1,6 @@
 services:
   gta-claw-init:
-    image: gta-claw:0.1.0
+    image: gta-claw@sha256:@OCI_MANIFEST_DIGEST@
     user: "0:0"
     entrypoint: ["/usr/libexec/gta-claw/gta-claw-daemon"]
     command:
@@ -19,7 +19,7 @@ services:
       - gta-claw-state:/var/lib
 
   gta-claw:
-    image: gta-claw:0.1.0
+    image: gta-claw@sha256:@OCI_MANIFEST_DIGEST@
     user: "65532:65532"
     depends_on:
       gta-claw-init:

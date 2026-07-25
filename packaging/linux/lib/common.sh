@@ -801,7 +801,7 @@ validate_service_contract() {
     'Requires=gta-claw-state-init.service' \
     'After=local-fs.target gta-claw-state-init.service' \
     'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
-    'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-initialization-failed' \
+    'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-state-init/initialization-failed' \
     'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'Type=notify' \
@@ -849,7 +849,10 @@ validate_initializer_service_contract() {
     'Group=root' \
     'ExecStart=/usr/libexec/gta-claw/gta-claw-state-init' \
     'RemainAfterExit=yes' \
-    'ReadWritePaths=/var/lib' \
+    'RuntimeDirectory=gta-claw-state-init' \
+    'RuntimeDirectoryMode=0755' \
+    'RuntimeDirectoryPreserve=yes' \
+    'ReadWritePaths=/var/lib /run/gta-claw-state-init' \
     'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER' \
     'NoNewPrivileges=yes' \
     'ProtectSystem=strict' \
@@ -879,7 +882,8 @@ validate_initializer_wrapper_contract() {
   local required
   for required in \
     'namespace=/var/lib/gta-claw-protected' \
-    'failure_marker=/run/gta-claw-initialization-failed' \
+    'runtime_directory=/run/gta-claw-state-init' \
+    'failure_marker=$runtime_directory/initialization-failed' \
     'service_gid="$(getent group gta-claw | cut -d: -f3)"' \
     'if [ "$primary_gid" != "$service_gid" ]; then' \
     'touch "$failure_marker"' \
@@ -923,7 +927,13 @@ validate_direct_lifecycle_contract() {
   for required in \
     'refusing gta-claw downgrade' \
     'validate_regular_or_absent /etc/gta-claw/gta-claw.env' \
-    'systemctl stop gta-claw-daemon.service' \
+    'ensure_failure_fence' \
+    'stop_runtime_for_replacement' \
+    'verify_runtime_stopped' \
+    'active | activating | reloading | deactivating)' \
+    'main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"' \
+    'lock_pid="$(lock_holder_pid)"' \
+    'fail_restarted_runtime' \
     '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
     '/usr/libexec/gta-claw/gta-claw-state-init' \
     '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
@@ -951,16 +961,51 @@ validate_direct_lifecycle_contract() {
   fi
 }
 
+validate_oci_manifest_digest() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]] ||
+    die "OCI manifest digest must be exactly 64 lowercase hexadecimal characters"
+}
+
+validate_oci_orchestration_templates() {
+  local compose="$1"
+  local kubernetes="$2"
+  local template
+  for template in "$compose" "$kubernetes"; do
+    assert_regular_file "$template" "OCI orchestration template"
+    [[ "$(grep -Fo '@OCI_MANIFEST_DIGEST@' "$template" | wc -l)" -eq 2 ]] ||
+      die "OCI orchestration template must bind exactly two image references"
+    if grep -Eq '^[[:space:]]*image:[[:space:]]+.*(:[^/@[:space:]]+|@sha256:[0-9a-f]{64})$' \
+      "$template"; then
+      die "OCI orchestration template contains a mutable or pre-resolved image reference"
+    fi
+  done
+}
+
+render_oci_orchestration() {
+  local template="$1"
+  local output="$2"
+  local digest="$3"
+  validate_oci_manifest_digest "$digest"
+  open_output_file "$output" 0644
+  sed "s/@OCI_MANIFEST_DIGEST@/$digest/g" "$template" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
+}
+
 validate_oci_orchestration_contract() {
   local compose="$1"
   local kubernetes="$2"
+  local digest="$3"
   local required
-  [[ "$(sha256_file "$compose")" == \
-    "ccc36a0d038e6d90b8666b0cd39ed92422674aca239a050301f415bf9dc7d3fe" ]] ||
-    die "Compose orchestration differs from the exact reviewed two-phase contract"
-  [[ "$(sha256_file "$kubernetes")" == \
-    "4f74c28b28ee2a978dc07f7e7800de29237f2d361a4ed15f3ddd9b5e631f0e58" ]] ||
-    die "Kubernetes orchestration differs from the exact reviewed two-phase contract"
+  local image="gta-claw@sha256:$digest"
+  validate_oci_manifest_digest "$digest"
+  [[ "$(grep -Fxc "    image: $image" "$compose")" -eq 2 ]] ||
+    die "Compose init and runtime must use one packaged OCI manifest digest"
+  [[ "$(grep -Fxc "          image: $image" "$kubernetes")" -eq 2 ]] ||
+    die "Kubernetes init and runtime must use one packaged OCI manifest digest"
+  if grep -F '@OCI_MANIFEST_DIGEST@' "$compose" "$kubernetes" >/dev/null ||
+    grep -Eq '^[[:space:]]*image:.*:[^/@[:space:]]+$' "$compose" "$kubernetes"; then
+    die "rendered OCI orchestration contains a placeholder or mutable image tag"
+  fi
   for required in \
     'user: "0:0"' \
     'user: "65532:65532"' \

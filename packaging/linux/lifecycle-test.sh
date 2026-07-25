@@ -66,6 +66,12 @@ cleanup() {
     sudo rpm -e --nodeps gta-claw >/dev/null 2>&1 || true
   fi
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
+  if getent passwd gta-claw >/dev/null 2>&1; then
+    sudo userdel gta-claw >/dev/null 2>&1 || true
+  fi
+  if getent group gta-claw >/dev/null 2>&1; then
+    sudo groupdel gta-claw >/dev/null 2>&1 || true
+  fi
   rm -rf "$direct_root"
 }
 trap cleanup EXIT INT TERM
@@ -155,6 +161,27 @@ reset_test_namespace() {
     die "test fixture namespace purge failed"
 }
 
+assert_identity_absent() {
+  ! getent passwd gta-claw >/dev/null 2>&1 ||
+    die "lifecycle phase inherited a gta-claw user"
+  ! getent group gta-claw >/dev/null 2>&1 ||
+    die "lifecycle phase inherited a gta-claw group"
+}
+
+reset_test_identity() {
+  [[ ! -e "$namespace" && ! -L "$namespace" ]] ||
+    die "refusing identity reset while protected state exists"
+  ! systemctl is-active --quiet gta-claw-daemon.service ||
+    die "refusing identity reset while daemon is active"
+  if getent passwd gta-claw >/dev/null 2>&1; then
+    sudo userdel gta-claw
+  fi
+  if getent group gta-claw >/dev/null 2>&1; then
+    sudo groupdel gta-claw
+  fi
+  assert_identity_absent
+}
+
 assert_active_restart() {
   local old_pid="$1"
   local new_pid
@@ -216,6 +243,7 @@ tar -xzf "$tar1" -C "$direct_root/release1"
 tar -xzf "$tar2" -C "$direct_root/release2"
 direct1="$(find "$direct_root/release1" -mindepth 1 -maxdepth 1 -type d)"
 direct2="$(find "$direct_root/release2" -mindepth 1 -maxdepth 1 -type d)"
+assert_identity_absent
 sudo "$direct1/install.sh"
 assert_disabled_and_inactive
 assert_protected_contract
@@ -223,6 +251,7 @@ static_identity="$(id -u gta-claw):$(id -g gta-claw)"
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+direct_reinstall_snapshot="$(state_snapshot)"
 sudo mv /etc/gta-claw/gta-claw.env /etc/gta-claw/gta-claw.env.saved
 sudo ln -s /nonexistent/gta-claw.env /etc/gta-claw/gta-claw.env
 if sudo "$direct1/install.sh"; then
@@ -236,9 +265,12 @@ sudo rm /etc/gta-claw/gta-claw.env
 sudo mv /etc/gta-claw/gta-claw.env.saved /etc/gta-claw/gta-claw.env
 sudo "$direct1/install.sh"
 assert_active_restart "$direct_pid"
+assert_preserved "$direct_reinstall_snapshot"
 direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+direct_upgrade_snapshot="$(state_snapshot)"
 sudo "$direct2/install.sh"
 assert_active_restart "$direct_pid"
+assert_preserved "$direct_upgrade_snapshot"
 if sudo "$direct1/install.sh"; then
   die "direct deployment accepted a downgrade"
 fi
@@ -287,13 +319,17 @@ reset_test_namespace
 
 sudo "$direct1/install.sh"
 assert_disabled_and_inactive
+direct_inactive_upgrade_snapshot="$(state_snapshot)"
 sudo "$direct2/install.sh"
 assert_disabled_and_inactive
+assert_preserved "$direct_inactive_upgrade_snapshot"
 direct_inactive_snapshot="$(state_snapshot)"
 sudo "$direct2/uninstall.sh"
 assert_preserved "$direct_inactive_snapshot"
 reset_test_namespace
+reset_test_identity
 
+assert_identity_absent
 sudo dpkg -i "$deb1"
 assert_disabled_and_inactive
 assert_protected_contract
@@ -302,11 +338,15 @@ assert_protected_contract
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+deb_reinstall_snapshot="$(state_snapshot)"
 sudo dpkg -i "$deb1"
 assert_active_restart "$deb_pid"
+assert_preserved "$deb_reinstall_snapshot"
 deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+deb_upgrade_snapshot="$(state_snapshot)"
 sudo dpkg -i "$deb2"
 assert_active_restart "$deb_pid"
+assert_preserved "$deb_upgrade_snapshot"
 if sudo dpkg -i --force-downgrade "$deb1"; then
   die "Debian package accepted a downgrade"
 fi
@@ -367,15 +407,19 @@ reset_test_namespace
 
 sudo dpkg -i "$deb1"
 assert_disabled_and_inactive
+deb_inactive_upgrade_snapshot="$(state_snapshot)"
 sudo dpkg -i "$deb2"
 assert_disabled_and_inactive
+assert_preserved "$deb_inactive_upgrade_snapshot"
 deb_inactive_snapshot="$(state_snapshot)"
 sudo dpkg --remove gta-claw
 assert_preserved "$deb_inactive_snapshot"
 sudo dpkg --purge gta-claw
 assert_preserved "$deb_inactive_snapshot"
 reset_test_namespace
+reset_test_identity
 
+assert_identity_absent
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
 assert_protected_contract
@@ -384,11 +428,15 @@ assert_protected_contract
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+rpm_reinstall_snapshot="$(state_snapshot)"
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm1"
 assert_active_restart "$rpm_pid"
+assert_preserved "$rpm_reinstall_snapshot"
 rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+rpm_upgrade_snapshot="$(state_snapshot)"
 sudo rpm -Uvh --nodeps "$rpm2"
 assert_active_restart "$rpm_pid"
+assert_preserved "$rpm_upgrade_snapshot"
 if sudo rpm -Uvh --nodeps --oldpackage "$rpm1"; then
   die "RPM package accepted a downgrade"
 fi
@@ -451,12 +499,15 @@ reset_test_namespace
 
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
+rpm_inactive_upgrade_snapshot="$(state_snapshot)"
 sudo rpm -Uvh --nodeps "$rpm2"
 assert_disabled_and_inactive
+assert_preserved "$rpm_inactive_upgrade_snapshot"
 rpm_inactive_snapshot="$(state_snapshot)"
 sudo rpm -e --nodeps gta-claw
 assert_preserved "$rpm_inactive_snapshot"
 reset_test_namespace
+reset_test_identity
 
 trap - EXIT INT TERM
 rm -rf "$direct_root"

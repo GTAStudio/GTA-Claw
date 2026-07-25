@@ -1,0 +1,88 @@
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+replacement=/run/gta-claw-daemon.replacement
+ready=/run/gta-claw-daemon.ready-for-replacement
+was_active=/run/gta-claw-daemon.was-active
+remove_was_active=/run/gta-claw-daemon.remove-was-active
+remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
+lock=/var/lib/gta-claw-protected/state.writer.lock
+prepared=0
+
+lock_holder_pid() {
+  locks="$(lslocks --noheadings --notruncate --output PID,PATH)"
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+verify_runtime_stopped() {
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid" in
+    inactive:0 | failed:0) ;;
+    *) return 1 ;;
+  esac
+  [ -z "$(lock_holder_pid)" ]
+}
+
+restore_on_failure() {
+  status=$?
+  trap - 0 HUP INT TERM
+  if [ "$prepared" -eq 0 ]; then
+    systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
+    if [ -e "$remove_was_enabled" ]; then
+      systemctl enable gta-claw-daemon.service >/dev/null 2>&1 || status=1
+    fi
+    if [ -e "$remove_was_active" ]; then
+      systemctl start gta-claw-daemon.service >/dev/null 2>&1 || status=1
+      /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 || status=1
+    fi
+  fi
+  exit "$status"
+}
+
+if [ -d /run/systemd/system ]; then
+  if [ "$1" -eq 0 ]; then
+    rm -f "$remove_was_active" "$remove_was_enabled"
+    enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
+    case "$enabled_state" in
+      enabled | enabled-runtime) touch "$remove_was_enabled" ;;
+      disabled | indirect | static | generated | transient | masked | not-found | '') ;;
+      *) {
+        echo "unexpected gta-claw enablement state before RPM removal: $enabled_state" >&2
+        exit 1
+      } ;;
+    esac
+    active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+    case "$active_state" in
+      inactive | failed) ;;
+      active | activating | reloading | deactivating)
+        touch "$remove_was_active"
+        ;;
+      *) {
+        echo "unexpected gta-claw active state before RPM removal: $active_state" >&2
+        exit 1
+      } ;;
+    esac
+    trap restore_on_failure 0 HUP INT TERM
+    systemctl mask --runtime gta-claw-daemon.service
+    systemctl stop gta-claw-daemon.service
+    verify_runtime_stopped
+    systemctl disable gta-claw-daemon.service
+    systemctl stop gta-claw-state-init.service
+    prepared=1
+    trap - 0 HUP INT TERM
+  elif [ -e "$replacement" ] && [ -e "$was_active" ]; then
+    test -e "$ready"
+    systemctl is-active --quiet gta-claw-daemon.service
+    main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+    case "$main_pid" in
+      '' | 0 | *[!0-9]*) exit 1 ;;
+    esac
+    test "$(lock_holder_pid)" = "$main_pid"
+  fi
+fi
+
+exit 0

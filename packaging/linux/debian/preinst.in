@@ -2,7 +2,53 @@
 
 set -eu
 
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
 new_version='@PACKAGE_VERSION@'
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+lock=/var/lib/gta-claw-protected/state.writer.lock
+was_active=/run/gta-claw-daemon.was-active
+
+ensure_failure_fence() {
+  if [ -L "$runtime_directory" ] ||
+    { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+    echo "gta-claw initialization runtime path is not a physical directory" >&2
+    exit 1
+  fi
+  if [ ! -e "$runtime_directory" ]; then
+    mkdir -m 0755 -- "$runtime_directory"
+  fi
+  if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+    exit 1
+  fi
+  touch "$failure_marker"
+}
+
+lock_holder_pid() {
+  locks="$(lslocks --noheadings --notruncate --output PID,PATH)"
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+verify_runtime_stopped() {
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid" in
+    inactive:0 | failed:0) ;;
+    *) {
+      echo "gta-claw daemon remains $active_state with MainPID $main_pid" >&2
+      exit 1
+    } ;;
+  esac
+  lock_pid="$(lock_holder_pid)"
+  if [ -n "$lock_pid" ]; then
+    echo "gta-claw writer lock remains held by PID $lock_pid" >&2
+    exit 1
+  fi
+}
 
 case "$1" in
   install | upgrade)
@@ -13,9 +59,34 @@ case "$1" in
       exit 1
     fi
     if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
-      if systemctl is-active --quiet gta-claw-daemon.service; then
-        touch /run/gta-claw-daemon.was-active
+      ensure_failure_fence
+      rm -f /run/gta-claw-daemon.ready-for-replacement
+      load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+      case "$load_state" in
+        not-found) rm -f "$was_active" ;;
+        loaded)
+          rm -f "$was_active"
+          active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+          case "$active_state" in
+            inactive | failed) ;;
+            active | activating | reloading | deactivating)
+              touch "$was_active"
+              ;;
+            *) {
+              echo "unexpected gta-claw daemon state before package replacement: $active_state" >&2
+              exit 1
+            } ;;
+          esac
+          ;;
+        *) {
+          echo "unexpected gta-claw daemon load state before replacement: $load_state" >&2
+          exit 1
+        } ;;
+      esac
+      systemctl mask --runtime gta-claw-daemon.service
+      if [ "$load_state" = "loaded" ]; then
         systemctl stop gta-claw-daemon.service
+        verify_runtime_stopped
       fi
     fi
     ;;

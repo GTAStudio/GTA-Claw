@@ -1,52 +1,124 @@
 #!/bin/sh
 
-set -e
+set -eu
 
-if [ "$1" = "configure" ]; then
-  if [ -z "${DPKG_ROOT:-}" ]; then
-    if [ -d /run/systemd/system ]; then
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+was_active=/run/gta-claw-daemon.was-active
+remove_was_active=/run/gta-claw-daemon.remove-was-active
+remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
+lock=/var/lib/gta-claw-protected/state.writer.lock
+
+lock_holder_pid() {
+  locks="$(lslocks --noheadings --notruncate --output PID,PATH)"
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+verify_runtime_stopped() {
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid" in
+    inactive:0 | failed:0) ;;
+    *) {
+      echo "gta-claw daemon remains $active_state with MainPID $main_pid" >&2
+      exit 1
+    } ;;
+  esac
+  lock_pid="$(lock_holder_pid)"
+  if [ -n "$lock_pid" ]; then
+    echo "gta-claw writer lock remains held by PID $lock_pid" >&2
+    exit 1
+  fi
+}
+
+fence_failed_runtime() {
+  mkdir -p -- "$runtime_directory"
+  touch "$failure_marker"
+  systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 || true
+  systemctl stop gta-claw-daemon.service >/dev/null 2>&1 || true
+  verify_runtime_stopped
+  exit 1
+}
+
+stop_for_idempotent_configure() {
+  load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+  case "$load_state" in
+    masked) return ;;
+    loaded)
       active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
       case "$active_state" in
         inactive | failed) ;;
         active | activating | reloading | deactivating)
-          touch /run/gta-claw-daemon.was-active
-          systemctl stop gta-claw-daemon.service
-          active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
-          case "$active_state" in
-            inactive | failed) ;;
-            *) {
-              echo "gta-claw daemon remains $active_state before initialization" >&2
-              exit 1
-            } ;;
-          esac
+          touch "$was_active"
           ;;
         *) {
           echo "unexpected gta-claw daemon state before initialization: $active_state" >&2
           exit 1
         } ;;
       esac
-    fi
-    systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
-    /usr/libexec/gta-claw/gta-claw-state-init
-  fi
-fi
+      systemctl mask --runtime gta-claw-daemon.service
+      systemctl stop gta-claw-daemon.service
+      verify_runtime_stopped
+      ;;
+    not-found) ;;
+    *) {
+      echo "unexpected gta-claw daemon load state before initialization: $load_state" >&2
+      exit 1
+    } ;;
+  esac
+}
 
-if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] ||
-  [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
-  if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
-    systemctl --system daemon-reload >/dev/null
-    if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&
-      [ ! -e /run/gta-claw-daemon.was-active ]; then
-      systemctl preset gta-claw-daemon.service >/dev/null
-    fi
-    if [ -e /run/gta-claw-daemon.was-active ]; then
-      deb-systemd-invoke restart gta-claw-daemon.service >/dev/null
-      /usr/libexec/gta-claw/gta-claw-runtime-ready
-      rm -f \
-        /run/gta-claw-daemon.ready-for-replacement \
-        /run/gta-claw-daemon.was-active
-    fi
+restore_remove_state() {
+  systemctl unmask --runtime gta-claw-daemon.service
+  if [ -e "$remove_was_enabled" ]; then
+    systemctl enable gta-claw-daemon.service >/dev/null
   fi
-fi
+  if [ -e "$remove_was_active" ]; then
+    systemctl start gta-claw-daemon.service
+    /usr/libexec/gta-claw/gta-claw-runtime-ready
+  fi
+  rm -f "$remove_was_active" "$remove_was_enabled"
+}
+
+case "$1" in
+  configure | abort-upgrade | abort-deconfigure)
+    if [ -z "${DPKG_ROOT:-}" ]; then
+      if [ -d /run/systemd/system ]; then
+        stop_for_idempotent_configure
+      fi
+      systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
+      /usr/libexec/gta-claw/gta-claw-state-init
+      if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null
+        systemctl unmask --runtime gta-claw-daemon.service
+        if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&
+          [ ! -e "$was_active" ]; then
+          systemctl preset gta-claw-daemon.service >/dev/null
+        fi
+        if [ -e "$was_active" ]; then
+          if ! systemctl restart gta-claw-daemon.service >/dev/null; then
+            fence_failed_runtime
+          fi
+          if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+            fence_failed_runtime
+          fi
+          rm -f \
+            /run/gta-claw-daemon.ready-for-replacement \
+            "$was_active"
+        fi
+      fi
+    fi
+    ;;
+  abort-remove)
+    if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+      systemctl --system daemon-reload >/dev/null
+      restore_remove_state
+    fi
+    ;;
+esac
 
 exit 0

@@ -1,0 +1,111 @@
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+new_version='@PACKAGE_VERSION@'
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+lock=/var/lib/gta-claw-protected/state.writer.lock
+replacement=/run/gta-claw-daemon.replacement
+ready=/run/gta-claw-daemon.ready-for-replacement
+was_active=/run/gta-claw-daemon.was-active
+fresh_install=/run/gta-claw-daemon.fresh-install
+installed=0
+
+ensure_failure_fence() {
+  if [ -L "$runtime_directory" ] ||
+    { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+    echo "gta-claw initialization runtime path is not a physical directory" >&2
+    exit 1
+  fi
+  if [ ! -e "$runtime_directory" ]; then
+    mkdir -m 0755 -- "$runtime_directory"
+  fi
+  if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+    exit 1
+  fi
+  touch "$failure_marker"
+}
+
+lock_holder_pid() {
+  locks="$(lslocks --noheadings --notruncate --output PID,PATH)"
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+verify_runtime_stopped() {
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid" in
+    inactive:0 | failed:0) ;;
+    *) {
+      echo "gta-claw daemon remains $active_state with MainPID $main_pid" >&2
+      exit 1
+    } ;;
+  esac
+  lock_pid="$(lock_holder_pid)"
+  if [ -n "$lock_pid" ]; then
+    echo "gta-claw writer lock remains held by PID $lock_pid" >&2
+    exit 1
+  fi
+}
+
+if rpm -q gta-claw >/dev/null 2>&1; then
+  installed_versions="$(rpm -q --qf '%%{VERSION}-%%{RELEASE}\n' gta-claw)"
+  while IFS= read -r installed_version; do
+    [ -n "$installed_version" ] || continue
+    newest_version="$(
+      printf '%s\n' "$installed_version" "$new_version" | sort -V | tail -n 1
+    )"
+    if [ "$installed_version" != "$new_version" ] &&
+      [ "$newest_version" = "$installed_version" ]; then
+      echo "refusing gta-claw downgrade from $installed_version to $new_version" >&2
+      exit 1
+    fi
+  done <<GTA_CLAW_INSTALLED_VERSIONS
+$installed_versions
+GTA_CLAW_INSTALLED_VERSIONS
+  installed=1
+fi
+
+ensure_failure_fence
+if [ "$installed" -eq 1 ]; then
+  rm -f "$ready" "$replacement" "$fresh_install" "$was_active"
+  touch "$replacement"
+else
+  rm -f "$ready" "$replacement" "$was_active"
+  touch "$fresh_install"
+fi
+
+if [ -d /run/systemd/system ]; then
+  load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+  case "$load_state" in
+    not-found) ;;
+    loaded)
+      active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+      case "$active_state" in
+        inactive | failed) ;;
+        active | activating | reloading | deactivating)
+          touch "$was_active"
+          ;;
+        *) {
+          echo "unexpected gta-claw daemon state before RPM replacement: $active_state" >&2
+          exit 1
+        } ;;
+      esac
+      ;;
+    *) {
+      echo "unexpected gta-claw daemon load state before RPM replacement: $load_state" >&2
+      exit 1
+    } ;;
+  esac
+  systemctl mask --runtime gta-claw-daemon.service
+  if [ "$load_state" = "loaded" ]; then
+    systemctl stop gta-claw-daemon.service
+    verify_runtime_stopped
+  fi
+fi
+
+exit 0

@@ -437,10 +437,13 @@ validate_workflow() {
 
   expected="$(printf '%s\n' \
     '.github/workflows/linux-packaging.yml' \
+    '.github/workflows/macos-packaging.yml' \
+    '.github/workflows/windows-packaging.yml' \
     'packaging/linux/**' \
     'apps/**' \
     'crates/**' \
     'compat/**' \
+    'desktop/**' \
     'Cargo.lock' \
     'Cargo.toml' \
     'deny.toml' \
@@ -1053,29 +1056,52 @@ expect_actionlint_valid_validation_failure \
   "extra path entry" \
   "$tmp_dir/extra-path.yml"
 
-python3 "$SCRIPT_DIR/tests/reject-javascript-commands.py" "$SCRIPT_DIR"
-printf '%s\n' \
-  '#!/bin/sh' \
-  'exec "/usr/bin/npm" install' \
-  'env NODE_ENV=production /usr/bin/node daemon.js' \
-  "/usr/bin/no\\" \
-  'de daemon.js' \
-  >"$tmp_dir/javascript-shell-fixture.sh"
-if python3 \
-  "$SCRIPT_DIR/tests/reject-javascript-commands.py" \
-  "$tmp_dir/javascript-shell-fixture.sh" \
+source_policy="$SCRIPT_DIR/tests/validate-source-surfaces.py"
+python3 "$source_policy" "$SCRIPT_DIR"
+mkdir -p "$tmp_dir/source-type-fixture"
+ln -s /bin/true "$tmp_dir/source-type-fixture/validator.sh"
+if python3 "$source_policy" --types-only "$tmp_dir/source-type-fixture" \
   >/dev/null 2>&1; then
-  echo "shell JavaScript-command policy accepted quoted, wrapped, or split commands" >&2
+  echo "Linux source policy accepted a /bin/true validator symlink" >&2
   exit 1
 fi
-mkdir -p "$tmp_dir/recursive-policy/nested"
-printf '%s\n' '#!/bin/sh' '/usr/bin/node daemon.js' \
-  >"$tmp_dir/recursive-policy/nested/omitted-surface.sh"
-if python3 \
-  "$SCRIPT_DIR/tests/reject-javascript-commands.py" \
-  "$tmp_dir/recursive-policy" \
+rm "$tmp_dir/source-type-fixture/validator.sh"
+mkfifo "$tmp_dir/source-type-fixture/special"
+if python3 "$source_policy" --types-only "$tmp_dir/source-type-fixture" \
   >/dev/null 2>&1; then
-  echo "shell JavaScript-command policy omitted a recursively discovered script" >&2
+  echo "Linux source policy accepted a special file" >&2
+  exit 1
+fi
+
+command_policy="$SCRIPT_DIR/tests/reject-javascript-commands.py"
+python3 "$command_policy" "$SCRIPT_DIR" "$workflow"
+mkdir -p "$tmp_dir/recursive-policy/nested"
+ln -s /bin/true "$tmp_dir/recursive-policy/nested/validator.sh"
+if python3 "$command_policy" "$tmp_dir/recursive-policy" >/dev/null 2>&1; then
+  echo "command policy skipped a /bin/true command-surface symlink" >&2
+  exit 1
+fi
+rm "$tmp_dir/recursive-policy/nested/validator.sh"
+while IFS='|' read -r name command; do
+  fixture="$tmp_dir/javascript-$name.sh"
+  printf '%s\n' '#!/bin/sh' "$command" >"$fixture"
+  if python3 "$command_policy" "$fixture" >/dev/null 2>&1; then
+    echo "JavaScript command policy accepted bypass fixture: $name" >&2
+    exit 1
+  fi
+done <<'EOF'
+shell-c|sh -c 'npm install'
+redirection|2>/dev/null node daemon.js
+env-unset|env -u NODE_ENV node daemon.js
+brace-group|{ pnpm install; }
+eval|eval 'npx tool'
+quoted-concatenation|"/usr/bin/no""de" daemon.js
+EOF
+printf '%s\n' '#!/bin/sh' "/usr/bin/no\\" 'de daemon.js' \
+  >"$tmp_dir/javascript-continuation.sh"
+if python3 "$command_policy" "$tmp_dir/javascript-continuation.sh" \
+  >/dev/null 2>&1; then
+  echo "JavaScript command policy accepted bypass fixture: continuation" >&2
   exit 1
 fi
 yaml_command_pattern='(^|[^[:alnum:]_.-])(npm|npx|node|nodejs|bun|pnpm)([^[:alnum:]_.-]|$)'

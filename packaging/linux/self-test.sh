@@ -253,10 +253,22 @@ expect_success runtime-readiness-wrapper \
   bash -c "source '$common'; validate_runtime_ready_contract '$SCRIPT_DIR/libexec/gta-claw-runtime-ready'"
 expect_success direct-lifecycle \
   bash -c "source '$common'; validate_direct_lifecycle_contract '$SCRIPT_DIR/direct/install.sh' '$SCRIPT_DIR/direct/uninstall.sh'"
+oci_test_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+validate_oci_orchestration_templates \
+  "$SCRIPT_DIR/oci/compose.yaml.in" \
+  "$SCRIPT_DIR/oci/kubernetes.yaml.in"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/compose.yaml.in" \
+  "$work/compose.yaml" \
+  "$oci_test_digest"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/kubernetes.yaml.in" \
+  "$work/kubernetes.yaml" \
+  "$oci_test_digest"
 expect_success oci-two-phase-orchestration \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 python3 - \
-  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/compose.yaml" \
   "$work/compose-root-runtime.yaml" <<'PY'
 from pathlib import Path
 import sys
@@ -267,9 +279,9 @@ assert source.count(needle) == 1
 Path(sys.argv[2]).write_text(source.replace(needle, '    user: "0:0"\n'), encoding="utf-8")
 PY
 expect_failure oci-compose-root-runtime \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-root-runtime.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-root-runtime.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 python3 - \
-  "$SCRIPT_DIR/oci/compose.yaml" \
+  "$work/compose.yaml" \
   "$work/compose-unshared-state.yaml" <<'PY'
 from pathlib import Path
 import sys
@@ -281,9 +293,9 @@ assert index >= 0
 Path(sys.argv[2]).write_text(source[:index] + source[index + len(needle):], encoding="utf-8")
 PY
 expect_failure oci-compose-unshared-state \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-unshared-state.yaml' '$SCRIPT_DIR/oci/kubernetes.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-unshared-state.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 python3 - \
-  "$SCRIPT_DIR/oci/kubernetes.yaml" \
+  "$work/kubernetes.yaml" \
   "$work/kubernetes-root-runtime.yaml" <<'PY'
 from pathlib import Path
 import sys
@@ -294,7 +306,13 @@ assert source.count(needle) == 1
 Path(sys.argv[2]).write_text(source.replace(needle, "            runAsUser: 0\n"), encoding="utf-8")
 PY
 expect_failure oci-kubernetes-root-runtime \
-  bash -c "source '$common'; validate_oci_orchestration_contract '$SCRIPT_DIR/oci/compose.yaml' '$work/kubernetes-root-runtime.yaml'"
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes-root-runtime.yaml' '$oci_test_digest'"
+sed \
+  "0,/gta-claw@sha256:$oci_test_digest/s//gta-claw@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/" \
+  "$work/compose.yaml" \
+  >"$work/compose-split-digest.yaml"
+expect_failure oci-compose-split-digest \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-split-digest.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish

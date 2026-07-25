@@ -1,0 +1,39 @@
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+replacement=/run/gta-claw-daemon.replacement
+ready=/run/gta-claw-daemon.ready-for-replacement
+was_active=/run/gta-claw-daemon.was-active
+remove_was_active=/run/gta-claw-daemon.remove-was-active
+remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
+
+installed_count="$(
+  rpm -q --qf '%%{NAME}\n' gta-claw 2>/dev/null | wc -l | tr -d ' '
+)"
+if [ "$installed_count" -gt 0 ] &&
+  { [ -e "$remove_was_active" ] || [ -e "$remove_was_enabled" ]; }; then
+  systemctl unmask --runtime gta-claw-daemon.service
+  if [ -e "$remove_was_enabled" ]; then
+    systemctl enable gta-claw-daemon.service >/dev/null
+  fi
+  if [ -e "$remove_was_active" ]; then
+    systemctl start gta-claw-daemon.service
+    /usr/libexec/gta-claw/gta-claw-runtime-ready
+  fi
+  rm -f "$remove_was_active" "$remove_was_enabled"
+fi
+
+if [ "$installed_count" -eq 1 ]; then
+  if [ -e "$ready" ]; then
+    if [ ! -e "$was_active" ] ||
+      systemctl is-active --quiet gta-claw-daemon.service; then
+      rm -f "$ready" "$replacement" "$was_active"
+    fi
+  elif [ ! -e "$was_active" ]; then
+    rm -f "$replacement"
+  fi
+fi
+
+exit 0

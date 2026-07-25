@@ -6,10 +6,13 @@ on:
       - main
     paths:
       - ".github/workflows/linux-packaging.yml"
+      - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/windows-packaging.yml"
       - "packaging/linux/**"
       - "apps/**"
       - "crates/**"
       - "compat/**"
+      - "desktop/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "deny.toml"
@@ -18,10 +21,13 @@ on:
   pull_request:
     paths:
       - ".github/workflows/linux-packaging.yml"
+      - ".github/workflows/macos-packaging.yml"
+      - ".github/workflows/windows-packaging.yml"
       - "packaging/linux/**"
       - "apps/**"
       - "crates/**"
       - "compat/**"
+      - "desktop/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "deny.toml"
@@ -71,6 +77,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unsafe_source="$(
+            find packaging/linux -mindepth 1 \
+              ! -type d ! -type f -print -quit
+          )"
+          test -z "$unsafe_source" || {
+            echo "Linux packaging contains a symlink or special source: $unsafe_source" >&2
+            exit 1
+          }
+          source_policy=packaging/linux/tests/validate-source-surfaces.py
+          test -f "$source_policy" && test ! -L "$source_policy"
+          test "$(git ls-files --stage -- "$source_policy" | awk '{ print $1 }')" = 100755
+          python3 "$source_policy" packaging/linux
           find packaging/linux -type f -name '*.sh' -print0 |
             while IFS= read -r -d '' script; do
               bash -n "$script"
@@ -84,7 +102,12 @@ jobs:
             packaging/linux/debian/preinst.in \
             packaging/linux/debian/prerm \
             packaging/linux/libexec/gta-claw-runtime-ready \
-            packaging/linux/libexec/gta-claw-state-init; do
+            packaging/linux/libexec/gta-claw-state-init \
+            packaging/linux/rpm/post \
+            packaging/linux/rpm/posttrans \
+            packaging/linux/rpm/postun \
+            packaging/linux/rpm/pre.in \
+            packaging/linux/rpm/preun; do
             sh -n "$script"
             shellcheck -x "$script"
           done

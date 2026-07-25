@@ -4665,6 +4665,20 @@ fn verify_and_sync_provisioned_namespace(
     let namespace = ProtectedNamespace::open_for_offline_initialization(spec)?;
     preflight.verify_locked_namespace(&namespace)?;
     let identities = namespace.captured_identities();
+    let deadline = Instant::now()
+        .checked_add(OFFLINE_INITIALIZE_TIMEOUT)
+        .ok_or(StateError::InvalidValue {
+            field: "LinuxProtected provisioning verification timeout",
+            reason: "is too large for the monotonic clock",
+        })?;
+    let timeout_ms = u64::try_from(OFFLINE_INITIALIZE_TIMEOUT.as_millis())
+        .expect("fixed provisioning timeout fits u64");
+    let state = namespace.offline_state(deadline, timeout_ms)?;
+    namespace.verify_captured_identities(identities)?;
+    if state == OfflineNamespaceState::Initialized {
+        namespace.validate_runtime_layout(deadline, timeout_ms)?;
+        namespace.verify_captured_identities(identities)?;
+    }
 
     for entry in &namespace.entries {
         entry.file.sync_all().map_err(|error| {
@@ -5567,19 +5581,20 @@ fn validate_credentials(
 }
 
 fn validate_service_credentials(spec: &LinuxProtectedSpec) -> Result<(), StateError> {
+    let supplementary_groups = rustix::process::getgroups().map_err(|error| {
+        file_error(
+            "inspect LinuxProtected supplementary groups",
+            &spec.directory,
+            error.into(),
+        )
+    })?;
     if rustix::process::getuid().as_raw() != spec.expected_uid
         || rustix::process::geteuid().as_raw() != spec.expected_uid
         || rustix::process::getgid().as_raw() != spec.expected_gid
         || rustix::process::getegid().as_raw() != spec.expected_gid
-        || !rustix::process::getgroups()
-            .map_err(|error| {
-                file_error(
-                    "inspect LinuxProtected supplementary groups",
-                    &spec.directory,
-                    error.into(),
-                )
-            })?
-            .is_empty()
+        || supplementary_groups
+            .iter()
+            .any(|group| group.as_raw() != spec.expected_gid)
     {
         return Err(invalid_path(
             &spec.directory,
@@ -6088,6 +6103,7 @@ mod tests {
     const LOCK_PROBE_CHILD: &str = "lock-probe";
     const RECOVERY_CHILD: &str = "recovery";
     const RUNTIME_DROP_CHILD: &str = "runtime-drop";
+    const REDUNDANT_GROUP_CHILD: &str = "redundant-group";
     const GROUP_MISMATCH_CHILD: &str = "group-mismatch";
     const DEADLINE_CHILD: &str = "deadline";
     const REPOSITORY_OUTCOME_CHILD: &str = "repository-outcome";
@@ -6304,8 +6320,8 @@ mod tests {
         assert!(
             rustix::process::getgroups()
                 .expect("read service supplementary groups")
-                .is_empty(),
-            "LinuxProtected service child must have no supplementary groups"
+                .iter()
+                .all(|group| group.as_raw() == SERVICE_GID)
         );
     }
 
@@ -7129,6 +7145,8 @@ mod tests {
             .arg(format!("--regid={SERVICE_GID}"));
         if mode == GROUP_MISMATCH_CHILD {
             command.arg("--groups=0");
+        } else if mode == REDUNDANT_GROUP_CHILD {
+            command.arg(format!("--groups={SERVICE_GID}"));
         } else {
             command.arg("--clear-groups");
         }
@@ -9147,6 +9165,7 @@ mod tests {
                 LOCK_PROBE_CHILD => run_lock_probe_service(&namespace).await,
                 RECOVERY_CHILD => run_recovery_service(&namespace).await,
                 RUNTIME_DROP_CHILD => run_runtime_drop_service(&namespace),
+                REDUNDANT_GROUP_CHILD => exercise_service_store(&namespace).await,
                 GROUP_MISMATCH_CHILD => run_group_mismatch_service(&namespace).await,
                 DEADLINE_CHILD => run_deadline_service(&namespace).await,
                 REPOSITORY_OUTCOME_CHILD => {
@@ -9213,6 +9232,17 @@ mod tests {
             wal_before
         );
         let original_identities = entry_identities(&fixture.namespace);
+        assert_child_success(
+            service_child_command(
+                &fixture.namespace,
+                &fixture.ready,
+                &fixture.control,
+                REDUNDANT_GROUP_CHILD,
+            )
+            .output()
+            .expect("run redundant supplementary-group child"),
+            "LinuxProtected redundant supplementary primary-group acceptance",
+        );
         assert_child_success(
             service_child_command(
                 &fixture.namespace,

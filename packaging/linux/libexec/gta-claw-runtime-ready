@@ -7,18 +7,43 @@ export PATH
 
 lock=/var/lib/gta-claw-protected/state.writer.lock
 ready_marker=/run/gta-claw-daemon.ready-for-replacement
+failure_marker=/run/gta-claw-state-init/initialization-failed
+
+lock_holder_pid() {
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    return 2
+  fi
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
 
 fail_readiness() {
   reason="$1"
+  if ! touch "$failure_marker"; then
+    echo "gta-claw initialization failure fence could not be retained" >&2
+  fi
   if ! rm -f "$ready_marker"; then
     echo "gta-claw readiness marker could not be removed" >&2
   fi
   echo "$reason" >&2
+  if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon could not be runtime-masked after readiness failure" >&2
+  fi
   if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
     echo "gta-claw daemon stop failed after readiness failure" >&2
   fi
-  if systemctl is-active --quiet gta-claw-daemon.service; then
-    echo "gta-claw daemon remains active after readiness failure" >&2
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null || true)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service 2>/dev/null || true)"
+  case "$active_state:$main_pid" in
+    inactive:0 | failed:0) ;;
+    *) echo "gta-claw daemon remains $active_state with MainPID $main_pid after readiness failure" >&2 ;;
+  esac
+  if lock_pid="$(lock_holder_pid)"; then
+    if [ -n "$lock_pid" ]; then
+      echo "gta-claw writer lock remains held by PID $lock_pid after readiness failure" >&2
+    fi
+  else
+    echo "gta-claw writer-lock release could not be inspected after readiness failure" >&2
   fi
   exit 1
 }
@@ -39,13 +64,9 @@ while [ "$attempt" -lt 150 ]; do
       fail_readiness "gta-claw daemon has no valid MainPID"
       ;;
   esac
-  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+  if ! lock_pid="$(lock_holder_pid)"; then
     fail_readiness "gta-claw writer-lock ownership could not be inspected"
   fi
-  lock_pid="$(
-    printf '%s\n' "$locks" |
-      awk -v path="$lock" '$2 == path { print $1; exit }'
-  )"
   if [ "$lock_pid" = "$main_pid" ]; then
     if ! touch "$ready_marker"; then
       fail_readiness "gta-claw readiness marker could not be created"
