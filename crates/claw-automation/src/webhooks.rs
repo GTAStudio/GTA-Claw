@@ -623,7 +623,10 @@ impl<R: WebhookResolver> RustlsOutboundTransport<R> {
             Host::Ipv6(value) => vec![SocketAddr::new(value.into(), port)],
         };
         validate_resolved_addresses(&request.url, &addresses, port, self.allow_private_https)?;
-        if request.url.scheme() == "https" {
+        // NO_PROXY is opt-in; never disclose a validated non-public destination to a proxy.
+        if request.url.scheme() == "https"
+            && addresses.iter().all(|address| is_public_ip(address.ip()))
+        {
             let uri = request
                 .url
                 .as_str()
@@ -1939,6 +1942,59 @@ mod tests {
             transport.resolver.calls.lock().expect("calls").as_slice(),
             &[("hooks.example.test".to_owned(), 443)]
         );
+    }
+
+    #[tokio::test]
+    async fn outbound_transport_never_proxies_validated_private_addresses() {
+        let direct_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("direct listener");
+        let direct_address = direct_listener.local_addr().expect("direct address");
+        let proxy_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("proxy listener");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        let direct_server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), direct_listener.accept())
+                .await
+                .expect("direct connection timeout")
+                .expect("direct connection")
+                .1
+        });
+        let proxy_server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), proxy_listener.accept()).await
+        });
+        let resolver = FixedResolver {
+            addresses: vec![direct_address],
+            calls: Mutex::new(Vec::new()),
+        };
+        let matcher = Matcher::builder()
+            .https(format!("http://{proxy_address}"))
+            .build();
+        let mut transport = RustlsOutboundTransport::new_with_resolver_and_proxy(
+            Duration::from_secs(1),
+            resolver,
+            matcher,
+        )
+        .expect("transport");
+        transport.allow_private_https = true;
+        let request = outbound_request(
+            Url::parse(&format!(
+                "https://localhost:{}/taskflow",
+                direct_address.port()
+            ))
+            .expect("URL"),
+        );
+
+        assert!(matches!(
+            transport.send(request).await,
+            Err(WebhookError::Transport)
+        ));
+        assert_eq!(
+            direct_server.await.expect("direct server").ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert!(proxy_server.await.expect("proxy server").is_err());
     }
 
     #[tokio::test]
