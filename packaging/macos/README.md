@@ -7,44 +7,45 @@ dependency graph.
 
 ## Architecture and artifact matrix
 
-The workflow executes arm64 binaries on `macos-15` and x86_64 binaries on an
-Intel macOS 15 runner before assembling a universal2 application. Release
-outputs are:
+The workflow ships arm64 binaries built on `macos-15`. Its Intel macOS row is
+retained as host-native workspace test coverage, not as a release producer.
+Release outputs are:
 
-- a universal2 `GTA Claw.app` preserved in an `.app.zip`;
+- an arm64 `GTA Claw.app` preserved in an `.app.zip`;
 - a Developer ID signed and Apple-notarized DMG;
 - a Developer ID Installer signed and Apple-notarized PKG;
-- separate CLI and daemon archives for arm64 and x86_64;
+- arm64 CLI and daemon archives;
 - an SPDX 2.3 SBOM and SLSA/in-toto provenance statement for every artifact;
 - one complete `SHA256SUMS-macos` manifest over the exact publication bytes.
 
 The GUI app has bundle identifier `com.gtastudio.gta-claw`, minimum system
 version 14.0, a source-generated icon, the committed empty entitlement set, and
-the hardened runtime. Universal assembly compares dependencies, rpaths, and
-deployment targets between slices before `lipo`.
+the hardened runtime.
 
 ```sh
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+rustup target add aarch64-apple-darwin
 cargo fetch --manifest-path Cargo.toml --locked
 cargo fetch --manifest-path desktop/Cargo.toml --locked
 
-GTA_CLAW_OFFLINE=1 ./packaging/macos/build.sh universal2
+GTA_CLAW_OFFLINE=1 ./packaging/macos/build.sh native
 ./packaging/macos/package.sh prototype \
-  "target/macos-package/apps/universal2/GTA Claw.app"
+  "target/macos-package/apps/arm64/GTA Claw.app"
 ```
 
-`package.sh` also accepts optional app-archive-label and expected-architecture
-arguments. Omitting them preserves the current `universal2` archive label and
-`arm64 x86_64` validation/SBOM profile. The published-byte validator accepts
-the same optional profile after its checksum-manifest argument, so a producer
-and validator can move to a single-architecture profile together.
+`package.sh` and `validate-artifacts.sh` share one fail-closed distribution
+profile. Omitting their optional archive-label and expected-architecture
+arguments selects `arm64`; any retired universal2 or Intel distribution profile
+is rejected.
 
 `GTA_CLAW_OFFLINE=1` requires all Rust targets and locked dependencies to be
-present and then forbids Cargo network access. Paths, tar ownership, gzip
-headers, source paths, and staged timestamps are normalized. Signed timestamps,
-notarization tickets, DMG filesystem metadata, and PKG metadata are issued by
-Apple tools and are therefore checksum-recorded rather than falsely claimed to
-be byte-identical across signing times or Xcode versions.
+present and then forbids Cargo network access. Run the locked `cargo fetch`
+commands above before invoking `build.sh` offline on a clean machine. Without
+offline mode, `build.sh` acquires both complete locked workspaces before its
+offline graph proof. Paths, tar ownership, gzip headers, source paths, and
+staged timestamps are normalized. Signed timestamps, notarization tickets, DMG
+filesystem metadata, and PKG metadata are issued by Apple tools and are
+therefore checksum-recorded rather than falsely claimed to be byte-identical
+across signing times or Xcode versions.
 
 ## Published-byte validation
 

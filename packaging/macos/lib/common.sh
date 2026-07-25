@@ -320,6 +320,13 @@ validate_headless_archive() {
   rm -f -- "$listing"
 }
 
+acquire_locked_dependencies() {
+  cargo fetch --manifest-path "$REPO_ROOT/Cargo.toml" --locked ||
+    die "failed to acquire locked root workspace dependencies"
+  cargo fetch --manifest-path "$REPO_ROOT/desktop/Cargo.toml" --locked ||
+    die "failed to acquire locked desktop workspace dependencies"
+}
+
 assert_headless_cargo_tree() {
   local target="$1"
   local tree
@@ -329,7 +336,8 @@ assert_headless_cargo_tree() {
     --locked \
     --offline \
     --prefix none \
-    --format '{p}')" || die "cargo tree failed for the headless workspace target $target"
+    --format '{p}')" ||
+    die "cargo tree failed for $target; acquire locked dependencies with cargo fetch before running build.sh"
   if grep -E '^(slint|slint-build|i-slint[-A-Za-z0-9]*) v' <<<"$tree" >/dev/null; then
     die "headless Cargo graph contains Slint for target $target"
   fi
@@ -576,14 +584,15 @@ expected_lipo_arch() {
   case "$1" in
     aarch64-apple-darwin | arm64) printf 'arm64\n' ;;
     x86_64-apple-darwin | x86_64) printf 'x86_64\n' ;;
-    universal2) printf 'arm64 x86_64\n' ;;
     *) die "unsupported macOS architecture or target: $1" ;;
   esac
 }
 
 distribution_app_archive_label() {
-  local label="${1:-universal2}"
+  local label="${1:-arm64}"
   validate_safe_component "$label" APP_ARCHIVE_LABEL
+  [[ "$label" == "arm64" ]] ||
+    die "unsupported macOS distribution archive label: $label"
   printf '%s\n' "$label"
 }
 
@@ -599,14 +608,11 @@ distribution_app_archive_name() {
 }
 
 distribution_expected_arches() {
-  local arches="${1:-arm64 x86_64}"
+  local arches="${1:-arm64}"
   arches="${arches//,/ }"
   arches="$(awk '{$1=$1; print}' <<<"$arches")"
-  case "$arches" in
-    arm64 | x86_64) ;;
-    "arm64 x86_64" | "x86_64 arm64") arches="arm64 x86_64" ;;
-    *) die "unsupported macOS distribution architecture set: $arches" ;;
-  esac
+  [[ "$arches" == "arm64" ]] ||
+    die "unsupported macOS distribution architecture set: $arches"
   printf '%s\n' "$arches"
 }
 

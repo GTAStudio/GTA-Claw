@@ -55,7 +55,7 @@ assert_sentinel() {
 }
 
 default_profile="$work/default-distribution-profile"
-legacy_profile="$work/legacy-distribution-profile"
+contract_profile="$work/contract-distribution-profile"
 explicit_profile="$work/explicit-distribution-profile"
 {
   distribution_app_archive_label
@@ -64,21 +64,21 @@ explicit_profile="$work/explicit-distribution-profile"
   distribution_app_archive_name signed-notarized
 } >"$default_profile"
 {
-  distribution_app_archive_label universal2
-  distribution_expected_arches "arm64 x86_64"
-  distribution_app_archive_name unsigned-non-release universal2
-  distribution_app_archive_name signed-notarized universal2
+  distribution_app_archive_label arm64
+  distribution_expected_arches arm64
+  distribution_app_archive_name unsigned-non-release arm64
+  distribution_app_archive_name signed-notarized arm64
 } >"$explicit_profile"
 printf '%s\n' \
-  universal2 \
-  "arm64 x86_64" \
-  "gta-claw-$VERSION-macos-universal2-unsigned-non-release.app.zip" \
-  "gta-claw-$VERSION-macos-universal2-signed-notarized.app.zip" \
-  >"$legacy_profile"
+  arm64 \
+  arm64 \
+  "gta-claw-$VERSION-macos-arm64-unsigned-non-release.app.zip" \
+  "gta-claw-$VERSION-macos-arm64-signed-notarized.app.zip" \
+  >"$contract_profile"
 cmp -s "$default_profile" "$explicit_profile" ||
-  die "omitted distribution arguments differ from explicit legacy values"
-cmp -s "$default_profile" "$legacy_profile" ||
-  die "default distribution profile bytes changed from the legacy contract"
+  die "omitted distribution arguments differ from explicit arm64 values"
+cmp -s "$default_profile" "$contract_profile" ||
+  die "default distribution profile bytes differ from the arm64 contract"
 tests=$((tests + 1))
 [[ "$(distribution_app_archive_label arm64)" == "arm64" ]] ||
   die "arm64 app archive label override failed"
@@ -87,13 +87,50 @@ tests=$((tests + 1))
 [[ "$(distribution_app_archive_name signed-notarized arm64)" == \
   "gta-claw-$VERSION-macos-arm64-signed-notarized.app.zip" ]] ||
   die "arm64 app archive name override failed"
-[[ "$(distribution_expected_arches x86_64,arm64)" == "arm64 x86_64" ]] ||
-  die "distribution architecture normalization failed"
 tests=$((tests + 1))
+expect_failure retired-universal-archive-label \
+  bash -c "source '$common'; distribution_app_archive_label universal2"
+expect_failure retired-dual-architecture-distribution \
+  bash -c "source '$common'; distribution_expected_arches 'arm64 x86_64'"
 expect_failure invalid-app-archive-label \
   bash -c "source '$common'; distribution_app_archive_label '../escape'"
 expect_failure invalid-distribution-architectures \
   bash -c "source '$common'; distribution_expected_arches 'arm64 riscv64'"
+
+mkdir -p "$work/mock-cargo"
+cat >"$work/mock-cargo/cargo" <<'EOF'
+#!/bin/sh
+printf '%s' "$1" >>"$MOCK_CARGO_LOG"
+shift
+for argument in "$@"; do
+  printf '|%s' "$argument" >>"$MOCK_CARGO_LOG"
+done
+printf '\n' >>"$MOCK_CARGO_LOG"
+EOF
+chmod +x "$work/mock-cargo/cargo"
+mock_cargo_log="$work/mock-cargo.log"
+expect_success complete-dependency-acquisition \
+  env PATH="$work/mock-cargo:$PATH" MOCK_CARGO_LOG="$mock_cargo_log" \
+  bash -c "source '$common'; acquire_locked_dependencies"
+printf 'fetch|--manifest-path|%s/Cargo.toml|--locked\nfetch|--manifest-path|%s/desktop/Cargo.toml|--locked\n' \
+  "$REPO_ROOT" "$REPO_ROOT" >"$work/expected-mock-cargo.log"
+cmp -s "$mock_cargo_log" "$work/expected-mock-cargo.log" ||
+  die "locked dependency acquisition did not cover both complete workspaces"
+tests=$((tests + 1))
+
+mkdir -p "$work/failing-cargo"
+cat >"$work/failing-cargo/cargo" <<'EOF'
+#!/bin/sh
+exit 99
+EOF
+chmod +x "$work/failing-cargo/cargo"
+expect_failure offline-graph-cache-precondition \
+  env PATH="$work/failing-cargo:$PATH" \
+  bash -c "source '$common'; assert_headless_cargo_tree aarch64-apple-darwin"
+grep -F 'acquire locked dependencies with cargo fetch before running build.sh' \
+  "$work/offline-graph-cache-precondition.stderr" >/dev/null ||
+  die "offline graph failure omitted its dependency acquisition precondition"
+tests=$((tests + 1))
 
 package_inventory="$(write_spdx_package_inventory $'alpha 1.0.0\nbeta 2.0.0\nalpha 1.0.0')"
 [[ "$(grep -c '^PackageName:' <<<"$package_inventory")" -eq 2 ]] ||
@@ -245,9 +282,11 @@ expect_failure hash-mismatch bash -c "source '$common'; verify_sha256_manifest '
 cat >"$work/hello.c" <<'EOF'
 int main(void) { return 0; }
 EOF
-xcrun clang -target arm64-apple-macos"$MINIMUM_MACOS_VERSION" "$work/hello.c" -o "$work/hello-arm64"
-xcrun clang -target x86_64-apple-macos"$MINIMUM_MACOS_VERSION" "$work/hello.c" -o "$work/hello-x86_64"
 host_arch="$(expected_lipo_arch "$(host_target)")"
+xcrun clang \
+  -target "$host_arch-apple-macos$MINIMUM_MACOS_VERSION" \
+  "$work/hello.c" \
+  -o "$work/hello-$host_arch"
 
 mkdir -p "$outside/archive-existing"
 printf 'outside sentinel\n' >"$outside/archive-existing/sentinel"
@@ -279,15 +318,6 @@ expect_failure assemble-app-name-traversal \
   env APP_NAME=../escape "$MACOS_DIR/assemble-app.sh" "$work/hello-$host_arch" "$host_arch" "$host_arch"
 expect_failure assemble-executable-name-traversal \
   env EXECUTABLE_NAME=../escape "$MACOS_DIR/assemble-app.sh" "$work/hello-$host_arch" "$host_arch" "$host_arch"
-expect_success universal-merge \
-  "$MACOS_DIR/merge-universal.sh" "$work/hello-arm64" "$work/hello-x86_64" "$work/hello-universal"
-expect_failure wrong-slice \
-  "$MACOS_DIR/merge-universal.sh" "$work/hello-arm64" "$work/hello-arm64" "$work/wrong-universal"
-expect_failure missing-slice \
-  "$MACOS_DIR/merge-universal.sh" "$work/hello-arm64" "$work/missing-x86_64" "$work/missing-universal"
-assert_binary_arches "$work/hello-universal" "arm64 x86_64"
-assert_binary_arches "$work/hello-universal" "x86_64 arm64"
-tests=$((tests + 1))
 
 expect_success archive-first \
   "$MACOS_DIR/archive-headless.sh" "$work/hello-$host_arch" gta-claw-cli "$host_arch" "$host_arch"

@@ -22,13 +22,14 @@ case "$mode" in
   x86_64)
     targets=("x86_64-apple-darwin")
     ;;
-  universal2)
-    targets=("aarch64-apple-darwin" "x86_64-apple-darwin")
-    ;;
   *)
-    die "usage: build.sh [native|arm64|x86_64|universal2]"
+    die "usage: build.sh [native|arm64|x86_64]"
     ;;
 esac
+
+if [[ "${GTA_CLAW_OFFLINE:-0}" != "1" ]]; then
+  acquire_locked_dependencies
+fi
 
 for target in "${targets[@]}"; do
   assert_headless_cargo_tree "$target"
@@ -111,15 +112,5 @@ build_target() {
 for target in "${targets[@]}"; do
   build_target "$target"
 done
-
-if [[ "$mode" == "universal2" ]]; then
-  universal_dir="$OUTPUT_ROOT/build/universal2"
-  safe_reset_dir "$universal_dir"
-  "$MACOS_DIR/merge-universal.sh" \
-    "$OUTPUT_ROOT/build/aarch64-apple-darwin/desktop/aarch64-apple-darwin/release/gta-claw-desktop" \
-    "$OUTPUT_ROOT/build/x86_64-apple-darwin/desktop/x86_64-apple-darwin/release/gta-claw-desktop" \
-    "$universal_dir/gta-claw-desktop"
-  "$MACOS_DIR/assemble-app.sh" "$universal_dir/gta-claw-desktop" universal2 "arm64 x86_64"
-fi
 
 note "macOS $mode build complete under $OUTPUT_ROOT"
