@@ -131,6 +131,32 @@ function New-SyntheticRepositoryRoot {
         "crates/decoy/src/lib.rs" = "`n"
         "crates/decoy/src/blessed.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # bench and example targets default to test = false, so cargo test
+        # compiles them but never runs a #[test] inside one. Measured against
+        # cargo metadata rather than recalled.
+        "crates/synthetic/benches/bench.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/examples/demo.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # The accepting direction for the same rule: a bin target under src/bin
+        # does run its tests, so it must stay citable.
+        "crates/synthetic/src/bin/cli.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A crate that switches off every route by which cargo test would reach
+        # its files: auto-discovery of tests/, an explicit bin with test = false,
+        # and an explicit test target whose own main() replaces the libtest
+        # harness so its #[test] items are inert.
+        "crates/nonrunning/Cargo.toml" =
+            ("[package]`nname = `"nonrunning`"`nautotests = false`n`n" +
+             "[[bin]]`nname = `"notest`"`npath = `"src/bin/notest.rs`"`ntest = false`n`n" +
+             "[[test]]`nname = `"noharness`"`npath = `"tests/noharness.rs`"`nharness = false`n")
+        "crates/nonrunning/src/lib.rs" = "`n"
+        "crates/nonrunning/src/bin/notest.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/noharness.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/autodiscovered.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $separator = [string][System.IO.Path]::DirectorySeparatorChar
@@ -823,6 +849,90 @@ $cases = @(
             # orphan without wiring it into the crate.
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/decoy/src/blessed.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-bench-target-test"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A bench target defaults to test = false. cargo test compiles the
+            # file and never runs the #[test] inside it, so citing one is a claim
+            # backed by code that never executes -- and it needs no manifest edit
+            # at all, only a file in benches/.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/benches/bench.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-example-target-test"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Same rule as benches/: example targets default to test = false.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/examples/demo.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-src-bin-target-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The accepting direction: a bin target under src/bin DOES run its
+            # tests. Dropping benches/ and examples/ from the root set must not
+            # take src/bin/ with them.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/bin/cli.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-test-false-bin-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # An explicit [[bin]] with test = false, whose path also sits under
+            # src/bin/. Auto-discovery must not resurrect the target the manifest
+            # disabled: this is the fix for the fix, and it fails without the
+            # explicit-path precedence rule.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/src/bin/notest.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-harness-false-test-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # harness = false replaces libtest with the target's own main(), so
+            # every #[test] item in the file is inert. cargo metadata cannot
+            # express this -- it still reports test = true -- so this rule is
+            # deliberately stricter than a metadata-only root set.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/noharness.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-autotests-disabled-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # autotests = false switches off discovery of tests/*.rs entirely, so
+            # the file is never built into a target.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/autodiscovered.rs" $SyntheticTestName)
             )
         }
     },    [ordered]@{

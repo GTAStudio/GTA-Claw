@@ -193,27 +193,46 @@ never runs. Adding `crates/foo/src/orphan.rs`, never referencing it from any
 by code that is compiled into nothing.
 
 `validate.ps1` therefore also requires the cited path to be reached by a target
-that `cargo test` builds. The reachable set of the owning crate — the nearest
-ancestor directory whose `Cargo.toml` declares a `[package]` — is:
+that `cargo test` builds **and runs tests in**. The reachable set of the owning
+crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package]`
+— is:
 
 - `src/lib.rs` and `src/main.rs`;
-- every `*.rs` directly under `tests/`, `benches/`, `examples/` and `src/bin/`,
-  plus `<dir>/main.rs` for a subdirectory of those;
-- any target file named by an explicit `path = "..."` in the crate manifest;
+- every `*.rs` directly under `tests/` and `src/bin/`, plus `<dir>/main.rs` for a
+  subdirectory of those;
+- any target file named by an explicit `path = "..."` in a `[lib]`, `[[bin]]` or
+  `[[test]]` section of the crate manifest;
 - everything reached transitively from those roots by a `mod name;` declaration,
   resolving to `<scope>/name.rs` or `<scope>/name/mod.rs`, honouring
   `#[path = "..."]`, and descending into inline `mod name { ... }` blocks.
 
-`build.rs` is deliberately **not** a root: `cargo test` does not run tests in a
-build script, so a `#[test]` there never executes either.
+Four kinds of target are deliberately **excluded**, because `cargo test` does not
+run `#[test]` items in any of them. Each was measured against `cargo metadata`
+rather than recalled:
+
+- `build.rs`. `cargo test` does not run tests in a build script.
+- `benches/` and `examples/`. Bench and example targets default to
+  `test = false`. The file is compiled, and the `#[test]` inside it never runs.
+  This needs no manifest edit — a file dropped in `examples/` is enough.
+- Any target with an explicit `test = false`.
+- Any target with `harness = false`, whose own `main()` replaces the libtest
+  harness and makes every `#[test]` item in the file inert.
+
+Auto-discovery is suppressed by `autotests = false` and `autobins = false`, and a
+file named by an explicit target section is governed by that section alone —
+auto-discovery must not resurrect a target the manifest disabled.
 
 Three limits, stated plainly rather than left to be discovered:
 
-- The rule catches files that **nothing references**. It does not evaluate `cfg`
-  predicates, so a module behind `#[cfg(feature = "off-by-default")]` still
-  counts as referenced even though `cargo test` would not run it by default.
-  Evaluating predicates would reject honest evidence, and the disclosed vector is
-  the unreferenced file.
+- The rule catches files that **nothing references**, and targets that
+  `cargo test` does not run. It does not evaluate `cfg` predicates, so a module
+  behind `#[cfg(feature = "off-by-default")]` still counts as referenced even
+  though `cargo test` would not run it by default. Nor does it resolve
+  `required-features`: a target gated on a non-default feature is still treated
+  as a root. `cargo metadata` does not filter on `required-features` either — it
+  reports such targets with `test = true` — so both implementations are
+  permissive here by the same rule. Evaluating either would reject honest
+  evidence, and the disclosed vector is the unreferenced file.
 - Reachability is computed within the owning crate. A file pulled in only by a
   `#[path = "..."]` from a *different* crate is not recognised; cite a test in
   the crate that compiles it. No file in this repository is in that position —
@@ -233,15 +252,28 @@ The two implementations are therefore intended to be **identical**, not merely
 ordered. A divergence in *either* direction is a defect and must be reported
 rather than managed: if this validator were the looser side, a row it blesses
 could be rejected by the parity report. The specification above is deliberately
-complete enough to be mirrored; the seven `implemented-citing-*` cases in
-`validate-self-test.ps1` are its executable form — four that must be rejected and
-three that must be accepted.
+complete enough to be mirrored; the thirteen `implemented-citing-*` cases in
+`validate-self-test.ps1` are its executable form — nine that must be rejected and
+four that must be accepted.
+
+The root set is derived here by reading the manifest rather than by shelling out
+to `cargo metadata`, which keeps this trust root hermetic: it reads files and
+executes nothing. That is a deliberate trade. It costs exactness at the margins
+of cargo's auto-discovery rules, and it means the per-kind defaults above are a
+model of cargo rather than cargo's own answer — a model that was **wrong** once
+already, when `benches/` and `examples/` were treated as roots. Where the two
+differ today, this validator is the stricter side: `harness = false` cannot be
+expressed in `cargo metadata` at all, which still reports such a target as
+`test = true`.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. The three accepting cases — a `mod`-wired module, a
-`#[path]`-relocated module, and a transitive `lib.rs` → `nested/mod.rs` →
-`nested/deep.rs` chain — exist so that a later "improvement" to this rule cannot
-quietly turn it into a false-rejection engine without turning the self-test red.
+true-positive ones. The four accepting cases — a `mod`-wired module, a
+`#[path]`-relocated module, a transitive `lib.rs` → `nested/mod.rs` →
+`nested/deep.rs` chain, and a `src/bin/` target — exist so that a later
+"improvement" to this rule cannot quietly turn it into a false-rejection engine
+without turning the self-test red. The `src/bin/` case is there specifically
+because dropping `benches/` and `examples/` from the root set must not take
+`src/bin/` with them.
 
 #### A row may not rewrite its own acceptance bar
 

@@ -1827,17 +1827,94 @@ function Get-CrateDirectoryForPath {
     return $null
 }
 
+function Get-CargoManifestTargetSections {
+    param([string]$ManifestText)
+    # Every [lib] / [[bin]] / [[test]] / [[bench]] / [[example]] block, with the
+    # only three keys that decide whether `cargo test` runs #[test] items in the
+    # named file. Keys are read per block: a bare `path = "..."` also appears
+    # under [dependencies.<name>], and honouring that would let an author bless
+    # an orphan file by adding one line to a manifest instead of wiring the file
+    # into the crate.
+    $sections = New-Object System.Collections.Generic.List[object]
+    $current = $null
+    $packageFlags = @{}
+    $inPackage = $false
+    foreach ($line in ($ManifestText -split "`n")) {
+        $trimmed = $line.Trim()
+        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
+        if ($header.Success) {
+            $kind = $header.Groups[1].Value
+            $inPackage = (Test-OrdinalStringEqual $kind "package")
+            if (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $kind) {
+                $current = [ordered]@{ kind = $kind; path = $null; test = $null; harness = $null }
+                [void]$sections.Add($current)
+            } else {
+                $current = $null
+            }
+            continue
+        }
+        if ($inPackage) {
+            $auto = [regex]::Match($trimmed, '\A(autobins|autotests|autobenches|autoexamples)\s*=\s*(true|false)\z')
+            if ($auto.Success) { $packageFlags[$auto.Groups[1].Value] = (Test-OrdinalStringEqual $auto.Groups[2].Value "true") }
+            continue
+        }
+        if ($null -eq $current) { continue }
+        $declared = [regex]::Match($trimmed, '\Apath\s*=\s*"([^"]+)"\z')
+        if ($declared.Success) { $current.path = $declared.Groups[1].Value; continue }
+        $flag = [regex]::Match($trimmed, '\A(test|harness)\s*=\s*(true|false)\z')
+        if ($flag.Success) { $current[$flag.Groups[1].Value] = (Test-OrdinalStringEqual $flag.Groups[2].Value "true") }
+    }
+    return [ordered]@{ sections = $sections.ToArray(); package = $packageFlags }
+}
+
+function Test-CargoSectionRunsTests {
+    param([object]$Section)
+    # cargo's per-kind defaults, measured against `cargo metadata` rather than
+    # recalled: lib, bin and test targets are run by `cargo test`; bench and
+    # example targets are NOT (they report test = false), so a #[test] inside
+    # one never executes. An explicit `test = ...` overrides the default.
+    # `harness = false` replaces the libtest harness with the target's own
+    # main(), which makes every #[test] item in it inert, so it can never be
+    # acceptance evidence whatever `test` says.
+    if ($Section.harness -eq $false) { return $false }
+    if ($null -ne $Section.test) { return [bool]$Section.test }
+    return (Test-OrdinalContains @("lib", "bin", "test") ([string]$Section.kind))
+}
+
 function Get-CrateTargetRootFiles {
     param([string]$CrateDirectory, [string]$ManifestText)
     $roots = New-Object System.Collections.Generic.List[object]
+    $manifest = Get-CargoManifestTargetSections $ManifestText
+    # A file named by an explicit target section is governed by that section
+    # alone. cargo matches an explicit target to the auto-discovered file it
+    # replaces, so re-adding it through auto-discovery would resurrect exactly
+    # the target the manifest disabled -- an explicit `test = false` bin whose
+    # path sits under src/bin/ would otherwise still be treated as a root.
+    $explicitPaths = @{}
+    $explicitKinds = @{}
+    foreach ($section in $manifest.sections) {
+        if ($null -eq $section.path) { continue }
+        $explicitKinds[[string]$section.kind] = $true
+        $declared = Join-RepositoryRelativePath $CrateDirectory ([string]$section.path)
+        if ($null -ne $declared) { $explicitPaths[$declared] = $true }
+    }
+    # An explicit [lib] path replaces src/lib.rs rather than adding to it: cargo
+    # builds the named file and never looks at src/lib.rs.
     foreach ($entry in @("src/lib.rs", "src/main.rs")) {
+        if ($entry -eq "src/lib.rs" -and $explicitKinds.ContainsKey("lib")) { continue }
         $candidate = Join-RepositoryRelativePath $CrateDirectory $entry
+        if ($explicitPaths.ContainsKey($candidate)) { continue }
         if ($null -ne (Resolve-RepositoryFilePath $candidate)) {
             [void]$roots.Add([ordered]@{ file = $candidate; directory = (Join-RepositoryRelativePath $CrateDirectory "src") })
         }
     }
-    # Auto-discovered target directories. cargo test compiles and runs these.
-    foreach ($directory in @("tests", "benches", "examples", "src/bin")) {
+    # Auto-discovered target directories that `cargo test` actually runs.
+    # benches/ and examples/ are deliberately absent: their targets default to
+    # test = false, so a #[test] in one is compiled but never run, and treating
+    # them as roots would accept evidence that can never execute.
+    $autoDirectories = [ordered]@{ "tests" = "autotests"; "src/bin" = "autobins" }
+    foreach ($directory in $autoDirectories.Keys) {
+        if ($manifest.package[$autoDirectories[$directory]] -eq $false) { continue }
         $relative = Join-RepositoryRelativePath $CrateDirectory $directory
         $absolute = $script:RepositoryRootFull
         foreach ($segment in $relative.Split("/")) {
@@ -1846,35 +1923,23 @@ function Get-CrateTargetRootFiles {
         foreach ($name in (Get-DirectoryEntryNames $absolute)) {
             $child = Join-RepositoryRelativePath $relative $name
             if ($name.EndsWith(".rs", [StringComparison]::Ordinal)) {
+                if ($explicitPaths.ContainsKey($child)) { continue }
                 if ($null -ne (Resolve-RepositoryFilePath $child)) {
                     [void]$roots.Add([ordered]@{ file = $child; directory = $relative })
                 }
                 continue
             }
             $nested = Join-RepositoryRelativePath $child "main.rs"
+            if ($explicitPaths.ContainsKey($nested)) { continue }
             if ($null -ne (Resolve-RepositoryFilePath $nested)) {
                 [void]$roots.Add([ordered]@{ file = $nested; directory = $child })
             }
         }
     }
-    # Explicitly declared target paths. Only a target section may name one: a
-    # bare `path = "..."` also appears under [dependencies.<name>], and honouring
-    # that would let an author bless an orphan file by adding one line to a
-    # manifest instead of wiring the file into the crate.
-    $section = ""
-    foreach ($line in ($ManifestText -split "`n")) {
-        $trimmed = $line.Trim()
-        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
-        if ($header.Success) {
-            $section = $header.Groups[1].Value
-            continue
-        }
-        if (-not (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $section)) {
-            continue
-        }
-        $declared = [regex]::Match($trimmed, '\Apath\s*=\s*"([^"]+)"\z')
-        if (-not $declared.Success) { continue }
-        $candidate = Join-RepositoryRelativePath $CrateDirectory $declared.Groups[1].Value
+    foreach ($section in $manifest.sections) {
+        if ($null -eq $section.path) { continue }
+        if (-not (Test-CargoSectionRunsTests $section)) { continue }
+        $candidate = Join-RepositoryRelativePath $CrateDirectory ([string]$section.path)
         if ($null -ne $candidate -and $null -ne (Resolve-RepositoryFilePath $candidate)) {
             [void]$roots.Add([ordered]@{ file = $candidate; directory = ($candidate -replace '/[^/]+\z', '') })
         }
@@ -1944,9 +2009,10 @@ function Assert-EvidenceFileIsCompiled {
     if (-not $reachable.ContainsKey($RelativePath)) {
         $crateLabel = $(if ([string]::IsNullOrEmpty([string]$crate.directory)) { "the repository root crate" } else { [string]$crate.directory })
         Fail ("$Context acceptance evidence '$RelativePath' is not reached by any cargo test target of $crateLabel. " +
-            "It is not an auto-discovered target under tests/, benches/, examples/ or src/bin/, and no mod chain from " +
-            "that crate's roots declares it, so the cited test is never compiled or run. Wire the file into the crate, " +
-            "or cite a test in a file that is.")
+            "It is not an auto-discovered target under tests/ or src/bin/, is not a manifest target that cargo test " +
+            "runs, and no mod chain from that crate's roots declares it, so the cited test is never compiled or run. " +
+            "Note that benches/ and examples/ targets default to test = false and never run #[test] items. " +
+            "Wire the file into the crate, or cite a test in a file that is.")
     }
 }
 
