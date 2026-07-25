@@ -756,16 +756,20 @@ impl StreamableHttpClient for HttpClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{Router, extract::State, response::Redirect, routing::get};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rustls::{
         ServerConfig,
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        client::{WebPkiServerVerifier, danger::ServerCertVerifier},
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime},
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
@@ -787,6 +791,41 @@ mod tests {
             CertificateDer::from(certificate),
             PrivateKeyDer::from(PrivatePkcs8KeyDer::from(private_key)),
         )
+    }
+
+    #[test]
+    fn tls_fixture_remains_valid_for_at_least_thirty_days() {
+        let (certificate, _) = tls_fixture();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(certificate.clone())
+            .expect("add fixture trust anchor");
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .expect("build fixture certificate verifier");
+        let verification_time = SystemTime::now()
+            .checked_add(Duration::from_secs(30 * 24 * 60 * 60))
+            .expect("fixture warning horizon must fit in system time")
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must follow the Unix epoch");
+        let server_name = ServerName::try_from("localhost").expect("valid fixture DNS name");
+
+        verifier
+            .verify_server_cert(
+                &certificate,
+                &[],
+                &server_name,
+                &[],
+                UnixTime::since_unix_epoch(verification_time),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "TLS fixtures expire within 30 days or are otherwise invalid; regenerate crates/claw-mcp/tests/fixtures/tls: {error}"
+                )
+            });
     }
 
     #[tokio::test]
