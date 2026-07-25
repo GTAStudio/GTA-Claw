@@ -617,6 +617,58 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "frozen-acceptance-bar-weakened"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # The claimant rewrites the row's own statement of what parity means,
+            # then re-blesses the ledger digest through the documented command.
+            # acceptance_evidence.required is contract text, not a mutable field:
+            # a party that could edit it would be setting the bar it is judged
+            # against. Only the frozen projection digest catches this, and
+            # -WriteLedgerDigests cannot reach that constant.
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].acceptance_evidence.required = "Any test at all exists."
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "frozen-feature-title-rewritten"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].title = "Something easier to claim"
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "frozen-upstream-source-narrowed"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Shrinking the upstream surface a row is measured against is the same
+            # forgery as weakening its required text, one level down.
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].upstream_source.paths = @("docs")
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "frozen-feature-tier-downgraded"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].tier = "tier_3"
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
         name = "oracle-corpus-case-renamed"
         expected_message = "enabled-test-oracle digest mismatch"
         regenerate_digests = $true
