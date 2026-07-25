@@ -79,7 +79,7 @@ const ROOT_RUSTFMT: &[u8] = b"edition = \"2024\"\nmax_width = 100\nnewline_style
 const ROOT_GITATTRIBUTES: &[u8] = b"# Keep Rust workspace inputs deterministic on Windows checkouts.\n/.gitattributes text eol=lf\n*.rs text eol=lf\n*.slint text eol=lf\n*.toml text eol=lf\n*.yml text eol=lf\n*.yaml text eol=lf\n*.sh text eol=lf\nCargo.lock text eol=lf\nrust-toolchain text eol=lf\n.github/fixtures/security-tools/shadow-bin/* text eol=lf\n.github/trusted/desktop-supply-chain-policy/policy/final/.github/fixtures/security-tools/shadow-bin/* text eol=lf\n";
 
 const BOOTSTRAP_FINGERPRINT: &str =
-    "4a52e1daad1fc3b3136c72585e3934dae390dbe7e8e9e330e8c60da784a15237";
+    "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3";
 
 const BOOTSTRAP_SNAPSHOT_MAGIC: &[u8; 8] = b"GTABOOT1";
 

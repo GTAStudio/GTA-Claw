@@ -10,6 +10,7 @@ pub mod metadata;
 pub mod ownership;
 pub mod policy;
 pub mod process;
+pub mod repository_policy;
 pub mod validation;
 pub mod workflows;
 

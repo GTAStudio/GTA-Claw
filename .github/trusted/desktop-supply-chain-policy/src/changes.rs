@@ -23,6 +23,8 @@ pub const MAX_PULL_REQUEST_COMMITS: usize = 10_000;
 pub const MAX_GIT_PACK_FILES: usize = 64;
 /// Maximum aggregate bytes accepted in one checkout's Git pack directory.
 pub const MAX_GIT_PACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Maximum bytes accepted from one complete Git tree inventory.
+pub const MAX_GIT_TREE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One direct base-to-head path status.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -162,6 +164,7 @@ pub fn verify_checkout(
             String::from_utf8_lossy(&head.stderr)
         )));
     }
+
     require_clean_stderr(&head.stderr, "git rev-parse")?;
     let actual = std::str::from_utf8(&head.stdout)
         .map_err(|cause| error("decode checkout OID", cause))?
@@ -194,6 +197,78 @@ pub fn verify_checkout(
             String::from_utf8_lossy(&config.stderr)
         ))),
     }
+}
+
+/// Rejects symbolic links, gitlinks, and non-regular modes in one complete Git tree listing.
+pub fn validate_tree_entries(bytes: &[u8], label: &str) -> PolicyResult<()> {
+    for entry in bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let mut fields = entry.splitn(2, |byte| *byte == b'\t');
+        let metadata = fields
+            .next()
+            .ok_or_else(|| PolicyError::new(format!("{label} Git tree entry is empty")))?;
+        let path = fields
+            .next()
+            .ok_or_else(|| PolicyError::new(format!("{label} Git tree entry has no path")))?;
+        let metadata = std::str::from_utf8(metadata)
+            .map_err(|cause| error(&format!("decode {label} Git tree metadata"), cause))?;
+        let parts = metadata.split_ascii_whitespace().collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err(PolicyError::new(format!(
+                "{label} Git tree metadata is malformed: {metadata:?}"
+            )));
+        }
+        validate_oid(parts[2], &format!("{label} Git tree object"))?;
+        let path = std::str::from_utf8(path)
+            .map_err(|cause| error(&format!("decode {label} Git tree path"), cause))?;
+        validate_changed_path(path)?;
+        match (parts[0], parts[1]) {
+            ("100644" | "100755", "blob") => {}
+            ("120000", "blob") => {
+                return Err(PolicyError::new(format!(
+                    "{label} Git tree contains a tracked symbolic link: {path}"
+                )));
+            }
+            ("160000", "commit") => {
+                return Err(PolicyError::new(format!(
+                    "{label} Git tree contains a tracked gitlink: {path}"
+                )));
+            }
+            (mode, kind) => {
+                return Err(PolicyError::new(format!(
+                    "{label} Git tree contains unsupported mode/type {mode} {kind}: {path}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_tree_entries(
+    git: &Path,
+    checkout: &Path,
+    isolated_home: &Path,
+    oid: &str,
+    label: &str,
+) -> PolicyResult<()> {
+    let output = run(&git_spec(
+        git,
+        checkout,
+        isolated_home,
+        ["ls-tree", "-r", "-z", "--full-tree", oid],
+    )?
+    .output_limits(MAX_GIT_TREE_BYTES, 512 * 1024))?;
+    if !output.status.success() {
+        return Err(PolicyError::new(format!(
+            "{label} git ls-tree failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    require_clean_stderr(&output.stderr, &format!("{label} git ls-tree"))?;
+    validate_tree_entries(&output.stdout, label)
 }
 
 fn alternate_objects(candidate_repo: &Path) -> PolicyResult<OsString> {
@@ -399,6 +474,8 @@ pub fn compute_manifest(
 ) -> PolicyResult<ChangeManifest> {
     verify_checkout(git, trusted_repo, isolated_home, base)?;
     verify_checkout(git, candidate_repo, isolated_home, head)?;
+    verify_tree_entries(git, trusted_repo, isolated_home, base, "trusted base")?;
+    verify_tree_entries(git, candidate_repo, isolated_home, head, "candidate")?;
     verify_up_to_date(git, trusted_repo, candidate_repo, isolated_home, base, head)?;
     verify_commit_count(git, trusted_repo, candidate_repo, isolated_home, base, head)?;
     let [git_dir_flag, git_dir] = repository_args(trusted_repo);
