@@ -170,6 +170,49 @@ accept/reject split are pinned as constants in `validate.ps1`, and
 weakening a case to let a forged citation through requires a reviewed edit to the
 validator itself.
 
+#### The cited file must actually be compiled
+
+A structurally perfect, enabled `#[test]` in a file that no Cargo target builds
+never runs. Adding `crates/foo/src/orphan.rs`, never referencing it from any
+`mod`, and citing a test inside it would otherwise produce a parity claim backed
+by code that is compiled into nothing.
+
+`validate.ps1` therefore also requires the cited path to be reached by a target
+that `cargo test` builds. The reachable set of the owning crate — the nearest
+ancestor directory whose `Cargo.toml` declares a `[package]` — is:
+
+- `src/lib.rs` and `src/main.rs`;
+- every `*.rs` directly under `tests/`, `benches/`, `examples/` and `src/bin/`,
+  plus `<dir>/main.rs` for a subdirectory of those;
+- any target file named by an explicit `path = "..."` in the crate manifest;
+- everything reached transitively from those roots by a `mod name;` declaration,
+  resolving to `<scope>/name.rs` or `<scope>/name/mod.rs`, honouring
+  `#[path = "..."]`, and descending into inline `mod name { ... }` blocks.
+
+`build.rs` is deliberately **not** a root: `cargo test` does not run tests in a
+build script, so a `#[test]` there never executes either.
+
+Two limits, stated plainly rather than left to be discovered:
+
+- The rule catches files that **nothing references**. It does not evaluate `cfg`
+  predicates, so a module behind `#[cfg(feature = "off-by-default")]` still
+  counts as referenced even though `cargo test` would not run it by default.
+  Evaluating predicates would reject honest evidence, and the disclosed vector is
+  the unreferenced file.
+- Reachability is computed within the owning crate. A file pulled in only by a
+  `#[path = "..."]` from a *different* crate is not recognised; cite a test in
+  the crate that compiles it. No file in this repository is in that position —
+  the three real `#[path]` uses all resolve within their own crate.
+- It proves a file is compiled and a test is enabled. It does not prove the test
+  passes; that is `cargo test`'s job.
+
+This rule is **locally owned**, not ported. `crates/claw-conformance` does not
+implement it yet, so this validator is currently the stricter of the two. That
+asymmetry is safe in this direction: it can only reject a citation the harness
+would have accepted, and an unreferenced file is never legitimate evidence. The
+specification above is deliberately complete enough to be mirrored; the six
+`implemented-citing-*` cases in `validate-self-test.ps1` are its executable form.
+
 ### Implementation pointers are not evidence
 
 A row may optionally carry `implementation_pointers`, a list of
@@ -207,7 +250,9 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
 
 ## Recording a transition
 
-1. Land the Rust implementation and its tests.
+1. Land the Rust implementation and its tests. Every test you intend to cite must
+   live in a file some `cargo test` target compiles — an integration test under
+   `tests/`, or a `src/` module wired in through a `mod` chain.
 2. Edit only the affected rows in `ledgers/*.json`: set `status`,
    `acceptance_evidence.status`, the `artifacts`, optionally
    `implementation_pointers`, and replace the baseline `known_differences`

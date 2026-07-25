@@ -846,6 +846,7 @@ function Resolve-RepositoryRoot {
 
 $script:DirectoryEntryCache = @{}
 $script:RepositoryFileTextCache = @{}
+$script:CrateReachabilityCache = @{}
 
 function Get-DirectoryEntryNames {
     param([string]$AbsoluteDirectory)
@@ -1066,10 +1067,17 @@ function Get-RustCharLiteralEnd {
 }
 
 function Get-RustTokens {
-    param([string]$Source)
+    param([string]$Source, [switch]$WithStrings)
     # Token encoding: identifiers become "i:<name>", punctuation is its own text
     # and :: becomes "::". Rust identifiers are ASCII [A-Za-z0-9_] here, so no
     # identifier can ever collide with a punctuation marker.
+    #
+    # -WithStrings is a LOCAL extension with no counterpart in the normative Rust
+    # tokenizer. It additionally emits "s:<value>" for quoted strings and "=", so
+    # the locally owned Cargo reachability rule below can read a #[path = "..."]
+    # attribute value. The oracle never passes it, so the token stream the oracle
+    # sees stays byte-identical to the Rust original; the 1269-case differential
+    # is run against the default path to keep that honest.
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $length = $bytes.Length
     $tokens = New-Object System.Collections.Generic.List[string]
@@ -1101,7 +1109,14 @@ function Get-RustTokens {
         }
         if ($byte -eq 34 -or ($byte -eq 98 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 34)) {
             $quote = if ($byte -eq 34) { $index } else { $index + 1 }
-            $index = Get-RustQuotedEnd $bytes $quote
+            $quotedEnd = Get-RustQuotedEnd $bytes $quote
+            if ($WithStrings) {
+                $inner = $quotedEnd - $quote - 2
+                if ($inner -ge 0) {
+                    [void]$tokens.Add("s:" + [System.Text.Encoding]::UTF8.GetString($bytes, $quote + 1, $inner))
+                }
+            }
+            $index = $quotedEnd
             continue
         }
         if ($byte -eq 39) {
@@ -1137,6 +1152,7 @@ function Get-RustTokens {
         elseif ($byte -eq 40) { [void]$tokens.Add("(") }
         elseif ($byte -eq 41) { [void]$tokens.Add(")") }
         elseif ($byte -eq 59) { [void]$tokens.Add(";") }
+        elseif ($byte -eq 61 -and $WithStrings) { [void]$tokens.Add("=") }
         elseif ($byte -eq 58 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 58) {
             [void]$tokens.Add("::")
             $index += 1
@@ -1482,6 +1498,250 @@ function Assert-RustTestSymbol {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Cargo target reachability.
+#
+# LOCALLY OWNED rule. This is NOT part of the ported enabled-test oracle and has
+# no counterpart in crates/claw-conformance yet; see README.md.
+#
+# A structurally perfect, enabled #[test] in a .rs file that no Cargo target
+# compiles never runs. An author could add crates/foo/src/orphan.rs, never
+# reference it from any mod, and cite a test inside it: the oracle would accept
+# it, cargo test would never execute it, and the parity claim would be pure
+# fiction. This rule closes that by requiring the cited file to be part of some
+# target that cargo test actually builds.
+#
+# The reachable set is built from the auto-discovered target roots of the owning
+# crate and then followed through mod declarations, honouring #[path = "..."].
+# build.rs is deliberately NOT a root: cargo test does not run tests in a build
+# script, so a #[test] there never executes either.
+#
+# Scope, stated honestly: this catches files that nothing references. It does
+# not evaluate cfg predicates, so a module behind #[cfg(never)] still counts as
+# referenced. Reachability is deliberately permissive wherever a false rejection
+# would block honest evidence, because the disclosed vector is the unreferenced
+# file, not the unreachable-under-all-configurations one.
+# ---------------------------------------------------------------------------
+
+function Join-RepositoryRelativePath {
+    param([string]$Base, [string]$Relative)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrEmpty($Base)) {
+        foreach ($part in $Base.Split("/")) {
+            if (-not [string]::IsNullOrEmpty($part)) { [void]$parts.Add($part) }
+        }
+    }
+    foreach ($part in $Relative.Split("/")) {
+        if ([string]::IsNullOrEmpty($part) -or (Test-OrdinalStringEqual $part ".")) { continue }
+        if (Test-OrdinalStringEqual $part "..") {
+            if ($parts.Count -eq 0) { return $null }
+            $parts.RemoveAt($parts.Count - 1)
+            continue
+        }
+        [void]$parts.Add($part)
+    }
+    return ($parts -join "/")
+}
+
+function Get-RustModReferencesInRange {
+    param([string[]]$Tokens, [int]$Start, [int]$End, [string[]]$Segments, [object]$Sink)
+    $index = $Start
+    while ($index -lt $End) {
+        $attributeResult = Get-RustAttributes $Tokens $index $End
+        $outer = @($attributeResult.attributes | Where-Object { -not $_.inner })
+        $index = [int]$attributeResult.next
+        if ($index -ge $End) { break }
+        $itemStart = $index
+        $index = Get-RustSkipVisibility $Tokens $index
+        while ($index -lt $Tokens.Length -and $RustItemModifiers.ContainsKey($Tokens[$index])) {
+            $index += 1
+        }
+        $matched = $false
+        if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "i:mod") -and
+            ($index + 1) -lt $Tokens.Length -and $Tokens[$index + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
+            $name = $Tokens[$index + 1].Substring(2)
+            $after = $index + 2
+            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
+                $close = Get-RustMatchingDelimiter $Tokens $after $End
+                if ($close -lt 0) { $close = $End }
+                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($name)) $Sink
+                $index = $close + 1
+                $matched = $true
+            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
+                $pathAttribute = $null
+                foreach ($attribute in $outer) {
+                    if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
+                        foreach ($token in $attribute.tokens) {
+                            if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
+                                $pathAttribute = $token.Substring(2)
+                                break
+                            }
+                        }
+                    }
+                }
+                [void]$Sink.Add([ordered]@{ segments = $Segments; name = $name; path = $pathAttribute })
+                $index = $after + 1
+                $matched = $true
+            }
+        }
+        if (-not $matched) {
+            $index = Get-RustSkipItem $Tokens $index $End
+        }
+        if ($index -le $itemStart) { $index = $itemStart + 1 }
+    }
+}
+
+function Get-RustModuleReferences {
+    param([string]$Source)
+    $tokens = Get-RustTokens $Source -WithStrings
+    $sink = New-Object System.Collections.Generic.List[object]
+    Get-RustModReferencesInRange $tokens 0 $tokens.Length @() $sink
+    return ,$sink.ToArray()
+}
+
+function Get-CrateDirectoryForPath {
+    param([string]$RelativePath)
+    # Nearest ancestor holding a Cargo.toml that declares a [package]. A virtual
+    # workspace manifest owns no sources and must not be treated as a crate.
+    $segments = @($RelativePath.Split("/"))
+    for ($i = $segments.Length - 1; $i -ge 0; $i -= 1) {
+        $candidate = ($segments[0..([Math]::Max(0, $i - 1))] -join "/")
+        if ($i -eq 0) { $candidate = "" }
+        $manifest = Join-RepositoryRelativePath $candidate "Cargo.toml"
+        $absolute = Resolve-RepositoryFilePath $manifest
+        if ($null -ne $absolute) {
+            $text = Get-RepositoryFileText $absolute
+            if ($text -cmatch '(?m)^\s*\[package\]\s*$') {
+                return [ordered]@{ directory = $candidate; manifest = $manifest; text = $text }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-CrateTargetRootFiles {
+    param([string]$CrateDirectory, [string]$ManifestText)
+    $roots = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @("src/lib.rs", "src/main.rs")) {
+        $candidate = Join-RepositoryRelativePath $CrateDirectory $entry
+        if ($null -ne (Resolve-RepositoryFilePath $candidate)) {
+            [void]$roots.Add([ordered]@{ file = $candidate; directory = (Join-RepositoryRelativePath $CrateDirectory "src") })
+        }
+    }
+    # Auto-discovered target directories. cargo test compiles and runs these.
+    foreach ($directory in @("tests", "benches", "examples", "src/bin")) {
+        $relative = Join-RepositoryRelativePath $CrateDirectory $directory
+        $absolute = $script:RepositoryRootFull
+        foreach ($segment in $relative.Split("/")) {
+            if (-not [string]::IsNullOrEmpty($segment)) { $absolute = Join-Path $absolute $segment }
+        }
+        foreach ($name in (Get-DirectoryEntryNames $absolute)) {
+            $child = Join-RepositoryRelativePath $relative $name
+            if ($name.EndsWith(".rs", [StringComparison]::Ordinal)) {
+                if ($null -ne (Resolve-RepositoryFilePath $child)) {
+                    [void]$roots.Add([ordered]@{ file = $child; directory = $relative })
+                }
+                continue
+            }
+            $nested = Join-RepositoryRelativePath $child "main.rs"
+            if ($null -ne (Resolve-RepositoryFilePath $nested)) {
+                [void]$roots.Add([ordered]@{ file = $nested; directory = $child })
+            }
+        }
+    }
+    # Explicitly declared target paths. Only a target section may name one: a
+    # bare `path = "..."` also appears under [dependencies.<name>], and honouring
+    # that would let an author bless an orphan file by adding one line to a
+    # manifest instead of wiring the file into the crate.
+    $section = ""
+    foreach ($line in ($ManifestText -split "`n")) {
+        $trimmed = $line.Trim()
+        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
+        if ($header.Success) {
+            $section = $header.Groups[1].Value
+            continue
+        }
+        if (-not (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $section)) {
+            continue
+        }
+        $declared = [regex]::Match($trimmed, '\Apath\s*=\s*"([^"]+)"\z')
+        if (-not $declared.Success) { continue }
+        $candidate = Join-RepositoryRelativePath $CrateDirectory $declared.Groups[1].Value
+        if ($null -ne $candidate -and $null -ne (Resolve-RepositoryFilePath $candidate)) {
+            [void]$roots.Add([ordered]@{ file = $candidate; directory = ($candidate -replace '/[^/]+\z', '') })
+        }
+    }
+    return ,$roots.ToArray()
+}
+
+function Get-CrateCompiledFileSet {
+    param([string]$CrateDirectory, [string]$ManifestText)
+    if ($script:CrateReachabilityCache.ContainsKey($CrateDirectory)) {
+        return $script:CrateReachabilityCache[$CrateDirectory]
+    }
+    $reachable = @{}
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    foreach ($root in (Get-CrateTargetRootFiles $CrateDirectory $ManifestText)) {
+        if (-not $reachable.ContainsKey($root.file)) {
+            $reachable[$root.file] = $true
+            $queue.Enqueue($root)
+        }
+    }
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        $absolute = Resolve-RepositoryFilePath $current.file
+        if ($null -eq $absolute) { continue }
+        foreach ($reference in (Get-RustModuleReferences (Get-RepositoryFileText $absolute))) {
+            $scope = $current.directory
+            foreach ($segment in $reference.segments) {
+                $scope = Join-RepositoryRelativePath $scope $segment
+                if ($null -eq $scope) { break }
+            }
+            if ($null -eq $scope) { continue }
+            $candidates = @()
+            $childDirectory = $null
+            if ($null -ne $reference.path) {
+                $target = Join-RepositoryRelativePath $scope $reference.path
+                if ($null -ne $target) {
+                    $candidates = @($target)
+                    $childDirectory = ($target -replace '\.rs\z', '')
+                }
+            } else {
+                $candidates = @(
+                    (Join-RepositoryRelativePath $scope ($reference.name + ".rs")),
+                    (Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs"))
+                )
+                $childDirectory = Join-RepositoryRelativePath $scope $reference.name
+            }
+            foreach ($candidate in $candidates) {
+                if ($null -eq $candidate -or $reachable.ContainsKey($candidate)) { continue }
+                if ($null -eq (Resolve-RepositoryFilePath $candidate)) { continue }
+                $reachable[$candidate] = $true
+                $queue.Enqueue([ordered]@{ file = $candidate; directory = $childDirectory })
+            }
+        }
+    }
+    $script:CrateReachabilityCache[$CrateDirectory] = $reachable
+    return $reachable
+}
+
+function Assert-EvidenceFileIsCompiled {
+    param([string]$RelativePath, [string]$Context)
+    $crate = Get-CrateDirectoryForPath $RelativePath
+    if ($null -eq $crate) {
+        Fail ("$Context acceptance evidence '$RelativePath' is not inside a Cargo package, " +
+            "so no cargo test target compiles it and the cited test can never run")
+    }
+    $reachable = Get-CrateCompiledFileSet ([string]$crate.directory) ([string]$crate.text)
+    if (-not $reachable.ContainsKey($RelativePath)) {
+        $crateLabel = $(if ([string]::IsNullOrEmpty([string]$crate.directory)) { "the repository root crate" } else { [string]$crate.directory })
+        Fail ("$Context acceptance evidence '$RelativePath' is not reached by any cargo test target of $crateLabel. " +
+            "It is not an auto-discovered target under tests/, benches/, examples/ or src/bin/, and no mod chain from " +
+            "that crate's roots declares it, so the cited test is never compiled or run. Wire the file into the crate, " +
+            "or cite a test in a file that is.")
+    }
+}
+
 function Assert-EvidenceArtifact {
     param(
         [object]$Artifact,
@@ -1514,6 +1774,8 @@ function Assert-EvidenceArtifact {
     # There is deliberately no cheaper pre-check in front of the oracle; a second,
     # weaker rule would be a place for the two trust roots to disagree.
     Assert-RustTestSymbol $text $test $relativePath $Context
+    # A structurally enabled test in a file no cargo target compiles never runs.
+    Assert-EvidenceFileIsCompiled $relativePath $Context
 }
 
 function Assert-ImplementationPointer {

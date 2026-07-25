@@ -83,7 +83,38 @@ function New-SyntheticRepositoryRoot {
         # reach the same verdict for the same file.
         "crates/synthetic/tests/crlf_enabled.rs" =
             "#[test]`r`nfn $SyntheticTestName() {`r`n    assert!(true);`r`n}`r`n"
+        # The files below all contain a genuinely enabled #[test] that the oracle
+        # accepts. What separates them is whether any cargo test target actually
+        # compiles the file, which is the only thing that decides whether the test
+        # can ever run.
+        "crates/synthetic/src/lib.rs" =
+            "mod wired;`nmod nested;`n#[path = `"relocated.rs`"]`nmod aliased;`n"
+        "crates/synthetic/src/wired.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/relocated.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/nested/mod.rs" =
+            "mod deep;`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/nested/deep.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # Never named by any mod declaration anywhere in the crate. cargo builds
+        # nothing from it, so the test inside it never runs.
+        "crates/synthetic/src/orphan.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A build script is compiled, but cargo test does not run its tests.
+        "crates/synthetic/build.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # Outside every Cargo package.
+        "loose/outside.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/data/fixture.json" = "{}`n"
+        # A second crate whose manifest names an orphan under a dependency table
+        # rather than a target section. cargo builds nothing from it.
+        "crates/decoy/Cargo.toml" =
+            "[package]`nname = `"decoy`"`n`n[dependencies.other]`npath = `"src/blessed.rs`"`n"
+        "crates/decoy/src/lib.rs" = "`n"
+        "crates/decoy/src/blessed.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $separator = [string][System.IO.Path]::DirectorySeparatorChar
@@ -633,6 +664,97 @@ $cases = @(
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/synthetic/tests/ignored.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-orphan-source-file"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The cited test is real and enabled; the oracle accepts it. Nothing
+            # in the crate declares mod orphan, so cargo compiles the file into
+            # nothing and the test never runs. This is the disclosed vector.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/orphan.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-build-script-test"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # cargo test does not run tests declared in a build script.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/build.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-file-outside-any-crate"
+        expected_message = "is not inside a Cargo package"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "loose/outside.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-mod-wired-source-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Reachability must not reject honest evidence. A unit test in a
+            # src/ module that lib.rs declares is legitimate and common.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/wired.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-path-attribute-module-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Reached only through #[path = "relocated.rs"]. A resolver that
+            # ignored the attribute would reject this honest citation.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/relocated.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-transitive-mod-chain-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # lib.rs -> nested/mod.rs -> nested/deep.rs. Both the mod.rs form and
+            # the transitive hop must resolve.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/nested/deep.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-manifest-dependency-path-orphan"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # crates/decoy/Cargo.toml names src/blessed.rs, but under
+            # [dependencies.other], not a target section. Treating any path= in a
+            # manifest as a target root would let one manifest line bless an
+            # orphan without wiring it into the crate.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/decoy/src/blessed.rs" $SyntheticTestName)
             )
         }
     },    [ordered]@{
