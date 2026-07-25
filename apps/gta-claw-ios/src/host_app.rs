@@ -19,17 +19,44 @@
 //! receiving UDP multicast additionally requires the
 //! `com.apple.developer.networking.multicast` entitlement, which is not a key
 //! a developer may simply add: Apple grants it case by case on written
-//! request. See [`HostAppEntitlement`].
+//! request. See [`HostAppEntitlement`], whose state is tracked by its own
+//! [`EntitlementStatus`] rather than by [`DeclarationStatus`], because a
+//! capability a third party grants is a different kind of thing from text a
+//! developer writes.
 //!
 //! Whether that entitlement is required depends on *how* discovery is
-//! implemented, which is why [`DiscoveryMechanism`] exists. Per TN3179's own
-//! tables, registering, browsing and resolving a **specific, declared** Bonjour
-//! service type through the system's DNS-SD APIs does not require it — the
-//! system daemon performs the multicast outside the application's process.
-//! Only "working with arbitrary Bonjour service types" and "browsing for all
-//! advertised service types" do. An in-process mDNS implementation that binds
-//! its own multicast sockets is squarely the entitlement-requiring case,
-//! whatever service types it browses.
+//! implemented, which is why there are two gates returning two **different
+//! witness types**:
+//!
+//! | Backend | Gate | Requires |
+//! | --- | --- | --- |
+//! | system DNS-SD | [`HostAppDeclarations::system_dns_sd_precondition`] | both plist keys, and the requested service type among the declared entries |
+//! | in-process mDNS | [`HostAppDeclarations::raw_multicast_precondition`] | the above, **and** a confirmed multicast entitlement |
+//!
+//! Per TN3179's own tables, registering, browsing and resolving a **specific,
+//! declared** Bonjour service type through the system's DNS-SD APIs does not
+//! require the entitlement — the system daemon performs the multicast outside
+//! the application's process. Only "working with arbitrary Bonjour service
+//! types" and "browsing for all advertised service types" do. An in-process
+//! mDNS implementation that binds its own multicast sockets is squarely the
+//! entitlement-requiring case, whatever service types it browses.
+//!
+//! The two witnesses are separate types rather than one type carrying a mode
+//! field so that a raw-socket backend is *unable* to accept the weaker
+//! permission. A runtime field would leave that to a reviewer to notice.
+//!
+//! # This crate does not own the service type
+//!
+//! Both gates take the required [`BonjourServiceType`] as an argument. The
+//! Gateway's DNS-SD service type belongs to the discovery contract and is
+//! owned by the discovery backend, not by an iOS application crate. Declaring
+//! it here would create a second copy that can drift from the first silently,
+//! and this crate would have no way to notice.
+//!
+//! Note also that the plist entry and the browsed type are not the same
+//! string: `NSBonjourServices` carries the application-label form such as
+//! `_example._tcp`, while the fully qualified `_example._tcp.local.` belongs
+//! inside the discovery implementation.
 //!
 //! # Two conditions this module deliberately does not gate
 //!
@@ -60,8 +87,12 @@ const MAX_DECLARED_SERVICE_TYPES: usize = 16;
 
 /// An `Info.plist` declaration the host application must carry.
 ///
-/// This is a closed set of the declarations features in *this* crate's scope
-/// depend on. It is deliberately not a general model of iOS entitlements.
+/// This is a closed set of the `Info.plist` keys features in *this* crate's
+/// scope depend on. It is deliberately not a general model of iOS bundle
+/// configuration. Entitlements are **not** members of this set — they are
+/// modelled separately by [`HostAppEntitlement`], because
+/// `com.apple.developer.networking.multicast` is not a plist key and a caller
+/// that treats it as one will look for it in the wrong file.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HostAppDeclaration {
     /// The user-facing reason the application uses the local network.
@@ -170,9 +201,12 @@ impl Display for HostAppEntitlement {
 
 /// How local-network discovery would be implemented.
 ///
-/// The choice decides which preconditions apply, so it is an input to
-/// [`HostAppDeclarations::discovery_precondition`] rather than an
-/// implementation detail hidden behind it.
+/// Each variant has its own gate returning its own witness type —
+/// [`HostAppDeclarations::system_dns_sd_precondition`] and
+/// [`HostAppDeclarations::raw_multicast_precondition`]. This enum is the
+/// descriptor those gates report against; it is not itself the gate, because a
+/// mode passed as an argument can be passed wrongly whereas two types cannot be
+/// confused by a caller.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DiscoveryMechanism {
     /// The system's DNS-SD service, browsing only declared service types.
@@ -256,6 +290,58 @@ impl DeclarationStatus {
 }
 
 impl Display for DeclarationStatus {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// What the embedder was able to say about a restricted entitlement.
+///
+/// Deliberately a separate type from [`DeclarationStatus`]. An `Info.plist`
+/// key is text a developer adds; a restricted entitlement is a capability a
+/// third party grants for a specific application identifier, and conflating
+/// the two invites a caller to think a build can be fixed locally when it
+/// cannot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EntitlementStatus {
+    /// The embedder confirmed the shipped build is signed with the entitlement.
+    Granted,
+    /// The embedder confirmed the shipped build is not signed with it.
+    ///
+    /// This covers a refused request and a pending one alike, because the two
+    /// are operationally identical: the capability is absent either way, and a
+    /// build that behaves as though a pending request were a grant is the
+    /// defect this type exists to prevent.
+    NotGranted,
+    /// Nobody has told this crate either way.
+    ///
+    /// This is the default, and it is treated exactly as strictly as
+    /// [`EntitlementStatus::NotGranted`]. It is kept distinct from it because
+    /// the remedies differ: one is answered by checking the signing profile,
+    /// the other by asking Apple.
+    #[default]
+    Unknown,
+}
+
+impl EntitlementStatus {
+    /// Returns whether the embedder positively confirmed the grant.
+    #[must_use]
+    pub const fn is_granted(self) -> bool {
+        matches!(self, Self::Granted)
+    }
+
+    /// Returns text safe to render beside the entitlement key.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::NotGranted => "not granted or still pending",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl Display for EntitlementStatus {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -429,7 +515,7 @@ impl Error for ServiceTypeError {}
 pub struct HostAppDeclarations {
     local_network_usage: DeclarationStatus,
     bonjour_services: DeclarationStatus,
-    multicast_entitlement: DeclarationStatus,
+    multicast_entitlement: EntitlementStatus,
     service_types: Vec<BonjourServiceType>,
 }
 
@@ -440,7 +526,7 @@ impl HostAppDeclarations {
         Self {
             local_network_usage: DeclarationStatus::Unknown,
             bonjour_services: DeclarationStatus::Unknown,
-            multicast_entitlement: DeclarationStatus::Unknown,
+            multicast_entitlement: EntitlementStatus::Unknown,
             service_types: Vec::new(),
         }
     }
@@ -471,18 +557,18 @@ impl HostAppDeclarations {
         self
     }
 
-    /// Records what the embedder knows about an entitlement.
+    /// Records what the embedder knows about a restricted entitlement.
     ///
-    /// [`DeclarationStatus::Declared`] here asserts that the shipping build is
+    /// [`EntitlementStatus::Granted`] here asserts that the shipped build is
     /// *signed* with the entitlement, which for
     /// [`HostAppEntitlement::MulticastNetworking`] means Apple granted it for
     /// this application identifier. A build made from source by someone who has
-    /// not been granted it must report [`DeclarationStatus::Absent`].
+    /// not been granted it must report [`EntitlementStatus::NotGranted`].
     #[must_use]
     pub const fn with_entitlement(
         mut self,
         entitlement: HostAppEntitlement,
-        status: DeclarationStatus,
+        status: EntitlementStatus,
     ) -> Self {
         match entitlement {
             HostAppEntitlement::MulticastNetworking => self.multicast_entitlement = status,
@@ -493,7 +579,8 @@ impl HostAppDeclarations {
     /// Returns the recorded status of a declaration.
     ///
     /// A user interface must render from this method, because it is the same
-    /// record [`HostAppDeclarations::discovery_precondition`] decides from.
+    /// record the two gates decide from — see
+    /// [`HostAppDeclarations::system_dns_sd_precondition`].
     #[must_use]
     pub const fn status(&self, declaration: HostAppDeclaration) -> DeclarationStatus {
         match declaration {
@@ -507,7 +594,7 @@ impl HostAppDeclarations {
     /// A user interface must render from this method, for the same reason as
     /// [`HostAppDeclarations::status`].
     #[must_use]
-    pub const fn entitlement_status(&self, entitlement: HostAppEntitlement) -> DeclarationStatus {
+    pub const fn entitlement_status(&self, entitlement: HostAppEntitlement) -> EntitlementStatus {
         match entitlement {
             HostAppEntitlement::MulticastNetworking => self.multicast_entitlement,
         }
@@ -519,22 +606,82 @@ impl HostAppDeclarations {
         &self.service_types
     }
 
-    /// Decides whether local-network discovery may even be attempted.
+    /// Decides whether the **system DNS-SD** backend may browse a service type.
     ///
-    /// The mechanism matters: an in-process mDNS stack needs an entitlement
-    /// that the system DNS-SD path does not, so passing the wrong one produces
-    /// the wrong answer. See [`DiscoveryMechanism`].
+    /// This is the weaker of the two gates. Per Apple's TN3179 the system
+    /// DNS-SD path needs the two `Info.plist` keys and no entitlement, because
+    /// the multicast happens in the platform daemon rather than in this
+    /// process. It must not be used to authorise a backend that binds its own
+    /// sockets — see [`HostAppDeclarations::raw_multicast_precondition`], which
+    /// returns a different type for exactly that reason.
+    ///
+    /// `required` is supplied by the caller rather than held here, because the
+    /// service type belongs to the discovery contract and this crate is not its
+    /// owner. Hardcoding it here would let the two drift apart silently.
     ///
     /// # Errors
     ///
     /// Returns [`DiscoveryUnavailable`] naming the exact `Info.plist` key or
-    /// entitlement at fault. Callers must surface that text instead of
+    /// the service type at fault. Callers must surface that text instead of
     /// reporting that no Gateway was found, because the two look identical
     /// from the outside.
-    pub fn discovery_precondition(
+    pub fn system_dns_sd_precondition<'a>(
+        &'a self,
+        required: &BonjourServiceType,
+    ) -> Result<SystemDnsSdDiscoveryPermitted<'a>, DiscoveryUnavailable> {
+        let matched = self.declaration_precondition(required)?;
+        Ok(SystemDnsSdDiscoveryPermitted {
+            service_type: matched,
+        })
+    }
+
+    /// Decides whether a **raw-multicast** backend may browse a service type.
+    ///
+    /// This is the stricter gate, and the one that must be consulted before
+    /// starting any in-process mDNS implementation — every pure-Rust mDNS crate
+    /// is one. It requires both `Info.plist` keys, the requested service type
+    /// among the declared entries, **and** a confirmed
+    /// `com.apple.developer.networking.multicast` grant in the shipped signing
+    /// profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscoveryUnavailable`] naming the exact key, service type or
+    /// entitlement at fault. When the entitlement is the cause,
+    /// [`DiscoveryUnavailable::awaits_apple_approval`] is `true`, because that
+    /// is not a condition the person reading the message can fix.
+    pub fn raw_multicast_precondition<'a>(
+        &'a self,
+        required: &BonjourServiceType,
+    ) -> Result<RawMulticastDiscoveryPermitted<'a>, DiscoveryUnavailable> {
+        let matched = self.declaration_precondition(required)?;
+        for entitlement in DiscoveryMechanism::InProcessMulticast.required_entitlements() {
+            match self.entitlement_status(*entitlement) {
+                EntitlementStatus::Granted => {}
+                EntitlementStatus::NotGranted => {
+                    return Err(DiscoveryUnavailable::EntitlementNotGranted {
+                        entitlement: *entitlement,
+                        mechanism: DiscoveryMechanism::InProcessMulticast,
+                    });
+                }
+                EntitlementStatus::Unknown => {
+                    return Err(DiscoveryUnavailable::EntitlementUndetermined {
+                        entitlement: *entitlement,
+                        mechanism: DiscoveryMechanism::InProcessMulticast,
+                    });
+                }
+            }
+        }
+        Ok(RawMulticastDiscoveryPermitted {
+            service_type: matched,
+        })
+    }
+
+    /// Checks the declarations both backends need, returning the matched entry.
+    fn declaration_precondition(
         &self,
-        mechanism: DiscoveryMechanism,
-    ) -> Result<DiscoveryPermitted<'_>, DiscoveryUnavailable> {
+        required: &BonjourServiceType,
+    ) -> Result<&BonjourServiceType, DiscoveryUnavailable> {
         for declaration in HostAppDeclaration::ALL {
             match self.status(declaration) {
                 DeclarationStatus::Declared => {}
@@ -546,62 +693,59 @@ impl HostAppDeclarations {
                 }
             }
         }
-        for entitlement in mechanism.required_entitlements() {
-            match self.entitlement_status(*entitlement) {
-                DeclarationStatus::Declared => {}
-                DeclarationStatus::Absent => {
-                    return Err(DiscoveryUnavailable::EntitlementNotGranted {
-                        entitlement: *entitlement,
-                        mechanism,
-                    });
-                }
-                DeclarationStatus::Unknown => {
-                    return Err(DiscoveryUnavailable::EntitlementUndetermined {
-                        entitlement: *entitlement,
-                        mechanism,
-                    });
-                }
-            }
-        }
         if self.service_types.is_empty() {
             return Err(DiscoveryUnavailable::NoDeclaredServiceTypes);
         }
-        Ok(DiscoveryPermitted {
-            service_types: &self.service_types,
-            mechanism,
-        })
-    }
-}
-
-/// Proof that [`HostAppDeclarations::discovery_precondition`] was consulted.
-///
-/// Discovery code takes this witness rather than a bare service-type list, so
-/// that the check cannot be skipped by a caller that forgot it exists. The
-/// witness also carries the mechanism it was granted for, so it cannot be
-/// obtained for the system DNS-SD path and then spent on an in-process
-/// multicast implementation that needs a stricter gate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DiscoveryPermitted<'a> {
-    service_types: &'a [BonjourServiceType],
-    mechanism: DiscoveryMechanism,
-}
-
-impl DiscoveryPermitted<'_> {
-    /// Returns the service types discovery is permitted to browse.
-    #[must_use]
-    pub const fn service_types(&self) -> &[BonjourServiceType] {
         self.service_types
+            .iter()
+            .find(|declared| *declared == required)
+            .ok_or_else(|| DiscoveryUnavailable::ServiceTypeNotDeclared {
+                requested: required.clone(),
+            })
     }
+}
 
-    /// Returns the mechanism this permission was granted for.
+/// Proof that the **system DNS-SD** gate was consulted and passed.
+///
+/// Discovery code takes a witness rather than a bare service type, so the check
+/// cannot be skipped by a caller that forgot it exists. This witness and
+/// [`RawMulticastDiscoveryPermitted`] are deliberately **different types**
+/// rather than one type carrying a mode field: a backend that binds its own
+/// multicast sockets must be unable to accept this one, and a runtime field
+/// would leave that to a reviewer to notice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SystemDnsSdDiscoveryPermitted<'a> {
+    service_type: &'a BonjourServiceType,
+}
+
+impl SystemDnsSdDiscoveryPermitted<'_> {
+    /// Returns the exact declared entry that matched the request.
     #[must_use]
-    pub const fn mechanism(&self) -> DiscoveryMechanism {
-        self.mechanism
+    pub const fn service_type(&self) -> &BonjourServiceType {
+        self.service_type
+    }
+}
+
+/// Proof that the **raw-multicast** gate was consulted and passed.
+///
+/// Obtaining this requires both `Info.plist` keys, the requested service type
+/// among the declared entries, and a confirmed multicast entitlement. It is the
+/// witness an in-process mDNS browser must be handed before it starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawMulticastDiscoveryPermitted<'a> {
+    service_type: &'a BonjourServiceType,
+}
+
+impl RawMulticastDiscoveryPermitted<'_> {
+    /// Returns the exact declared entry that matched the request.
+    #[must_use]
+    pub const fn service_type(&self) -> &BonjourServiceType {
+        self.service_type
     }
 }
 
 /// Why local-network discovery must not be attempted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiscoveryUnavailable {
     /// The embedder confirmed the declaration is missing from the bundle.
     NotDeclared(HostAppDeclaration),
@@ -623,6 +767,16 @@ pub enum DiscoveryUnavailable {
     },
     /// `NSBonjourServices` is present but lists nothing to browse.
     NoDeclaredServiceTypes,
+    /// `NSBonjourServices` lists entries, but not the one asked for.
+    ///
+    /// iOS browses only the declared types, so asking for an undeclared one
+    /// returns nothing rather than failing. A bundle declaring some *other*
+    /// service is the case most likely to be mistaken for an empty network,
+    /// because the key is present and looks correct.
+    ServiceTypeNotDeclared {
+        /// The service type the caller asked to browse.
+        requested: BonjourServiceType,
+    },
 }
 
 impl DiscoveryUnavailable {
@@ -637,7 +791,10 @@ impl DiscoveryUnavailable {
             | Self::EntitlementUndetermined { entitlement, .. } => {
                 entitlement.requires_apple_approval()
             }
-            Self::NotDeclared(_) | Self::Undetermined(_) | Self::NoDeclaredServiceTypes => false,
+            Self::NotDeclared(_)
+            | Self::Undetermined(_)
+            | Self::NoDeclaredServiceTypes
+            | Self::ServiceTypeNotDeclared { .. } => false,
         }
     }
 }
@@ -685,6 +842,12 @@ impl Display for DiscoveryUnavailable {
                 "local network discovery is unavailable: NSBonjourServices is present but lists \
                  no service types, so iOS will browse nothing",
             ),
+            Self::ServiceTypeNotDeclared { requested } => write!(
+                formatter,
+                "local network discovery is unavailable: NSBonjourServices does not list \
+                 {requested}, and iOS browses only the service types a bundle declares, so a \
+                 browse for it returns nothing rather than failing"
+            ),
         }
     }
 }
@@ -695,7 +858,8 @@ impl Error for DiscoveryUnavailable {}
 mod tests {
     use super::{
         BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryUnavailable,
-        HostAppDeclaration, HostAppDeclarations, HostAppEntitlement, ServiceTypeError,
+        EntitlementStatus, HostAppDeclaration, HostAppDeclarations, HostAppEntitlement,
+        ServiceTypeError,
     };
 
     fn service_type(text: &str) -> BonjourServiceType {
@@ -703,10 +867,14 @@ mod tests {
             .unwrap_or_else(|error| panic!("{text:?} should parse, but failed with {error}"))
     }
 
+    fn gateway_service() -> BonjourServiceType {
+        service_type("_gtaclaw._tcp")
+    }
+
     fn fully_declared() -> HostAppDeclarations {
         HostAppDeclarations::new()
             .with_local_network_usage(DeclarationStatus::Declared)
-            .with_bonjour_services(DeclarationStatus::Declared, [service_type("_gtaclaw._tcp")])
+            .with_bonjour_services(DeclarationStatus::Declared, [gateway_service()])
     }
 
     #[test]
@@ -714,7 +882,7 @@ mod tests {
         let declarations = HostAppDeclarations::new();
 
         let error = declarations
-            .discovery_precondition(DiscoveryMechanism::SystemDnsSd)
+            .system_dns_sd_precondition(&gateway_service())
             .expect_err("an undeclared bundle must not permit discovery");
 
         assert_eq!(
@@ -751,7 +919,7 @@ mod tests {
         let declarations = fully_declared().with_local_network_usage(DeclarationStatus::Absent);
 
         let error = declarations
-            .discovery_precondition(DiscoveryMechanism::SystemDnsSd)
+            .system_dns_sd_precondition(&gateway_service())
             .expect_err("an absent declaration must not permit discovery");
 
         assert_eq!(
@@ -773,7 +941,7 @@ mod tests {
             .with_bonjour_services(DeclarationStatus::Declared, []);
 
         let error = declarations
-            .discovery_precondition(DiscoveryMechanism::SystemDnsSd)
+            .system_dns_sd_precondition(&gateway_service())
             .expect_err("an empty service type list must not permit discovery");
 
         assert_eq!(
@@ -784,35 +952,56 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_declared_bundle_permits_exactly_the_declared_service_types() {
-        let declarations = fully_declared();
+    fn declaring_only_some_other_service_type_blocks_the_one_that_was_asked_for() {
+        let declarations = HostAppDeclarations::new()
+            .with_local_network_usage(DeclarationStatus::Declared)
+            .with_bonjour_services(DeclarationStatus::Declared, [service_type("_printer._tcp")]);
+        let wanted = gateway_service();
 
-        let permitted = declarations
-            .discovery_precondition(DiscoveryMechanism::SystemDnsSd)
-            .expect("a fully declared bundle must permit discovery");
+        let error = declarations
+            .system_dns_sd_precondition(&wanted)
+            .expect_err("a non-empty list of the wrong types must not permit discovery");
 
-        let browsed: Vec<&str> = permitted
-            .service_types()
-            .iter()
-            .map(BonjourServiceType::as_str)
-            .collect();
         assert_eq!(
-            browsed,
-            vec!["_gtaclaw._tcp"],
-            "discovery must browse exactly what the bundle declares"
+            error,
+            DiscoveryUnavailable::ServiceTypeNotDeclared {
+                requested: wanted.clone(),
+            },
+            "a declared-but-different service list must name the type that was requested"
         );
-        assert_eq!(
-            permitted.mechanism(),
-            DiscoveryMechanism::SystemDnsSd,
-            "the witness must carry the mechanism it was granted for"
+        let text = error.to_string();
+        assert!(
+            text.contains(wanted.as_str()),
+            "the reason must name the requested service type {wanted}, but read {text}"
         );
     }
 
     #[test]
-    fn a_plist_complete_bundle_still_blocks_in_process_multicast_without_the_entitlement() {
-        let declarations = fully_declared();
+    fn a_witness_carries_the_exact_declared_entry_that_matched() {
+        let declarations = HostAppDeclarations::new()
+            .with_local_network_usage(DeclarationStatus::Declared)
+            .with_bonjour_services(
+                DeclarationStatus::Declared,
+                [service_type("_printer._tcp"), gateway_service()],
+            );
 
-        let permitted = declarations.discovery_precondition(DiscoveryMechanism::SystemDnsSd);
+        let permitted = declarations
+            .system_dns_sd_precondition(&gateway_service())
+            .expect("a bundle declaring the requested type must permit discovery");
+
+        assert_eq!(
+            permitted.service_type().as_str(),
+            "_gtaclaw._tcp",
+            "the witness must carry the matched entry, not the whole declared list"
+        );
+    }
+
+    #[test]
+    fn a_plist_complete_bundle_still_blocks_raw_multicast_without_the_entitlement() {
+        let declarations = fully_declared();
+        let wanted = gateway_service();
+
+        let permitted = declarations.system_dns_sd_precondition(&wanted);
         assert!(
             permitted.is_ok(),
             "the system DNS-SD path needs no entitlement, but was refused with {:?}",
@@ -820,8 +1009,8 @@ mod tests {
         );
 
         let error = declarations
-            .discovery_precondition(DiscoveryMechanism::InProcessMulticast)
-            .expect_err("an in-process mDNS stack must not run without the multicast entitlement");
+            .raw_multicast_precondition(&wanted)
+            .expect_err("a raw-socket mDNS backend must not run without the entitlement");
 
         assert_eq!(
             error,
@@ -837,12 +1026,12 @@ mod tests {
     fn a_missing_multicast_entitlement_explains_that_apple_must_grant_it() {
         let declarations = fully_declared().with_entitlement(
             HostAppEntitlement::MulticastNetworking,
-            DeclarationStatus::Absent,
+            EntitlementStatus::NotGranted,
         );
 
         let error = declarations
-            .discovery_precondition(DiscoveryMechanism::InProcessMulticast)
-            .expect_err("an ungranted entitlement must not permit in-process multicast");
+            .raw_multicast_precondition(&gateway_service())
+            .expect_err("an ungranted entitlement must not permit raw multicast");
 
         let text = error.to_string();
         assert!(
@@ -866,20 +1055,46 @@ mod tests {
     }
 
     #[test]
-    fn a_granted_entitlement_permits_in_process_multicast() {
+    fn not_granted_and_unknown_are_reported_as_different_conditions() {
+        let wanted = gateway_service();
+        let not_granted = fully_declared()
+            .with_entitlement(
+                HostAppEntitlement::MulticastNetworking,
+                EntitlementStatus::NotGranted,
+            )
+            .raw_multicast_precondition(&wanted)
+            .expect_err("NotGranted must block");
+        let unknown = fully_declared()
+            .raw_multicast_precondition(&wanted)
+            .expect_err("Unknown must block");
+
+        assert_ne!(
+            not_granted, unknown,
+            "a refused or pending grant must be told apart from an unverified one, but both \
+             reported {not_granted:?}"
+        );
+        assert!(
+            not_granted.awaits_apple_approval() && unknown.awaits_apple_approval(),
+            "both must be attributed to Apple rather than to the developer, but got \
+             {not_granted:?} and {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn a_granted_entitlement_permits_raw_multicast() {
         let declarations = fully_declared().with_entitlement(
             HostAppEntitlement::MulticastNetworking,
-            DeclarationStatus::Declared,
+            EntitlementStatus::Granted,
         );
 
         let permitted = declarations
-            .discovery_precondition(DiscoveryMechanism::InProcessMulticast)
+            .raw_multicast_precondition(&gateway_service())
             .expect("a granted entitlement plus complete declarations must permit discovery");
 
         assert_eq!(
-            permitted.mechanism(),
-            DiscoveryMechanism::InProcessMulticast,
-            "the witness must record that the stricter gate was the one that passed"
+            permitted.service_type().as_str(),
+            "_gtaclaw._tcp",
+            "the raw-multicast witness must carry the matched entry"
         );
     }
 
@@ -891,8 +1106,12 @@ mod tests {
             let status = declarations.entitlement_status(entitlement);
             assert_eq!(
                 status,
-                DeclarationStatus::Unknown,
+                EntitlementStatus::Unknown,
                 "{entitlement} defaulted to {status} instead of unknown"
+            );
+            assert!(
+                !status.is_granted(),
+                "{entitlement} reported itself granted while its status was {status}"
             );
         }
     }
@@ -915,6 +1134,31 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn a_fully_qualified_service_type_is_refused_so_it_cannot_reach_a_plist_entry() {
+        let error = BonjourServiceType::parse("_gtaclaw._tcp.local.")
+            .expect_err("the fully qualified browse form must not be accepted as a plist entry");
+
+        assert_eq!(
+            error,
+            ServiceTypeError::MissingTransportSuffix,
+            "NSBonjourServices carries the application-label form, so the .local. form must be \
+             refused, but parsing reported {error}"
+        );
+    }
+
+    #[test]
+    fn a_subtype_form_is_refused_until_a_frozen_descriptor_requires_one() {
+        let error = BonjourServiceType::parse("_gtaclaw._sub._tcp")
+            .expect_err("no frozen descriptor uses a subtype, so the form must be refused");
+
+        assert_eq!(
+            error,
+            ServiceTypeError::DisallowedCharacter { character: '.' },
+            "the subtype form must be refused by the grammar, but parsing reported {error}"
+        );
     }
 
     #[test]

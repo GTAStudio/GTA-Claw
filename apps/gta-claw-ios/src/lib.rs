@@ -94,9 +94,9 @@ pub use credential::{CredentialError, IosCredential, IosCredentialKind};
 pub use device::{DeclaredDeviceProbe, IosDeviceProbe, UnobservedDeviceProbe};
 pub use endpoint::{EndpointError, EndpointSummary, GatewayEndpoint};
 pub use host_app::{
-    BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryPermitted,
-    DiscoveryUnavailable, HostAppDeclaration, HostAppDeclarations, HostAppEntitlement,
-    ServiceTypeError,
+    BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryUnavailable,
+    EntitlementStatus, HostAppDeclaration, HostAppDeclarations, HostAppEntitlement,
+    RawMulticastDiscoveryPermitted, ServiceTypeError, SystemDnsSdDiscoveryPermitted,
 };
 pub use identity::{IdentityError, IosClientIdentity};
 pub use profile::{IosClientCore, IosGatewayProfile};

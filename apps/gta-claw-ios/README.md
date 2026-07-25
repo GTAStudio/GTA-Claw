@@ -47,7 +47,7 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 59 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 63 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
@@ -119,8 +119,23 @@ iOS does not fail loudly when `NSLocalNetworkUsageDescription` or
 `NSBonjourServices` is missing from the host bundle: it simply returns nothing,
 which is indistinguishable from a network with no Gateway on it. `HostAppDeclarations`
 therefore refuses to permit discovery unless an embedder positively confirms
-both keys and a non-empty service-type list, and returns a `DiscoveryUnavailable`
-naming the exact plist key when it will not.
+both keys **and the specific service type being browsed is among the declared
+entries**, and returns a `DiscoveryUnavailable` naming the exact plist key or
+service type when it will not.
+
+Declaring `NSBonjourServices` with some *other* service is the case most likely
+to be mistaken for an empty network, because the key is present and looks
+correct, so `ServiceTypeNotDeclared` names the type that was requested.
+
+**This crate does not own the service type.** Both gates take it as an argument.
+The Gateway's DNS-SD service type belongs to the discovery contract and its
+owning crate; declaring a copy here would let the two drift apart with nothing
+able to notice. Note also that the plist entry and the browsed name are
+different strings — `NSBonjourServices` carries the application-label form
+(`_example._tcp`), while the fully qualified `_example._tcp.local.` belongs
+inside the discovery implementation. Tests assert that the fully qualified form
+and the subtype form are both **rejected** by `BonjourServiceType`, so neither
+can reach a plist entry by accident.
 
 An *unconfirmed* declaration is treated exactly as strictly as a missing one:
 `DeclarationStatus::Unknown` is the default and does not permit anything. This
@@ -152,13 +167,24 @@ decision by a third party for a specific application identifier, so **a build
 made from source does not have it**, and its failure mode is the worst one
 available: the sockets bind, the calls report success, and no packet moves.
 
-The requirement depends on **how** discovery is implemented, which is why
-`DiscoveryMechanism` exists rather than a single flag:
+The requirement depends on **how** discovery is implemented, which is why there
+are two gates returning two **different witness types** rather than one type
+carrying a mode field — a raw-socket backend must be *unable* to accept the
+weaker permission, and a runtime field would leave that to a reviewer to notice:
 
-| Mechanism | Multicast entitlement | Why |
+| Backend | Gate | Requires |
 | --- | --- | --- |
-| `SystemDnsSd` — system DNS-SD, declared service types only | not required | the platform daemon performs the multicast outside this process |
-| `InProcessMulticast` — any pure-Rust mDNS stack, `mdns-sd` included | **required** | it binds its own sockets and sends UDP multicast directly |
+| system DNS-SD, declared service types only | `system_dns_sd_precondition` | both plist keys, and the requested service type among the declared entries |
+| any pure-Rust mDNS stack, `mdns-sd` included | `raw_multicast_precondition` | the above, **and** a confirmed multicast entitlement |
+
+Entitlement state is tracked by its own `EntitlementStatus` (`Granted` /
+`NotGranted` / `Unknown`, fail-closed on `Unknown`) rather than by
+`DeclarationStatus`, because a capability a third party grants is a different
+kind of thing from text a developer writes, and a caller told to "add the
+declaration" would look in the wrong file. `NotGranted` covers a refused request
+and a pending one alike — operationally identical — but stays distinct from
+`Unknown`, because one is answered by checking the signing profile and the other
+by asking Apple.
 
 Per TN3179's own tables, only *"working with arbitrary Bonjour service types"*
 and *"browsing for all advertised service types"* pull the entitlement into the
