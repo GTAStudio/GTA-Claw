@@ -789,9 +789,12 @@ impl Tool for ProcessExecTool {
         let child = command
             .spawn()
             .map_err(|_| ToolError::Execution(ExecutionError::SpawnFailed))?;
+        // Armed before anything else can fail: from here every exit path,
+        // including an unwind, terminates the whole tree.
+        let guard = ChildGuard::new(child);
         drop(pinned);
         let cancellation = self.cancellation.as_ref().map(|handle| handle.0.clone());
-        let outcome = supervise(child, timeout, self.policy.max_output_bytes, cancellation)?;
+        let outcome = supervise(guard, timeout, self.policy.max_output_bytes, cancellation)?;
 
         let rendered = if outcome.stderr.is_empty() {
             outcome.stdout.clone()
@@ -833,21 +836,20 @@ fn place_in_own_process_group(_command: &mut Command) {}
 /// immediately would otherwise leave that payload running past the deadline
 /// and past any revocation of the grant that started it.
 fn supervise(
-    mut child: Child,
+    mut guard: ChildGuard,
     timeout: Duration,
     max_output_bytes: usize,
     cancellation: Option<CancellationToken>,
 ) -> Result<ProcessOutcome, ToolError> {
-    let pid = child.id();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = guard.child_mut().stdout.take();
+    let stderr = guard.child_mut().stderr.take();
     let stdout_reader = spawn_reader(stdout, max_output_bytes);
     let stderr_reader = spawn_reader(stderr, max_output_bytes);
 
     let deadline = Instant::now() + timeout;
     let mut expiry: Option<ExecutionError> = None;
     let status = loop {
-        match child.try_wait() {
+        match guard.child_mut().try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(_) => {
@@ -872,16 +874,12 @@ fn supervise(
     // Terminate before the child handle is dropped: while it is held the
     // operating system cannot reuse the identifier, so the sweep still finds
     // descendants of an already-exited child.
-    terminate_tree(pid);
-    if expiry.is_some() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    guard.terminate(expiry.is_some());
     // Bounded: a descendant that inherited the pipes and never closes them must
     // not stall the supervisor forever.
     let (stdout, stdout_truncated) = drain(stdout_reader);
     let (stderr, stderr_truncated) = drain(stderr_reader);
-    drop(child);
+    drop(guard);
 
     if let Some(reason) = expiry {
         return Err(ToolError::Execution(reason));
@@ -892,6 +890,70 @@ fn supervise(
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         truncated: stdout_truncated || stderr_truncated,
     })
+}
+
+/// Owns a spawned child and guarantees its whole tree is terminated even when
+/// the supervising thread unwinds.
+///
+/// `std::process::Child` deliberately does not kill on drop, so a panic between
+/// the spawn and the ordinary termination point would otherwise leave the tree
+/// running past its deadline and past any revocation of the grant that
+/// authorised it. Since the child is placed in its own process group, it would
+/// not even be caught by a signal aimed at the supervisor's group.
+///
+/// The guard owns the child handle rather than only its identifier, so the
+/// operating system cannot recycle that identifier before the sweep runs: the
+/// guard can only ever terminate the tree it started.
+#[derive(Debug)]
+struct ChildGuard {
+    child: Child,
+    pid: u32,
+    armed: bool,
+}
+
+impl ChildGuard {
+    /// Arms a guard over a freshly spawned child.
+    fn new(child: Child) -> Self {
+        let pid = child.id();
+        Self {
+            child,
+            pid,
+            armed: true,
+        }
+    }
+
+    /// Borrows the supervised child.
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// Terminates the tree and disarms the guard.
+    ///
+    /// This is the single termination implementation: the ordinary path calls
+    /// it explicitly and the unwinding path reaches it through `Drop`, so the
+    /// two can never diverge. `force` additionally reaps the direct child,
+    /// which the ordinary path only wants when it is ending the child early.
+    fn terminate(&mut self, force: bool) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        // Terminate while the handle is still held, so the sweep still finds
+        // descendants of an already-exited child.
+        terminate_tree(self.pid);
+        if force {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // Only does work when the ordinary path never ran, which is precisely
+        // the unwinding case. A completed supervision has already disarmed.
+        self.terminate(true);
+    }
 }
 
 /// Buffer shared between a pipe reader thread and the supervisor.
@@ -1314,5 +1376,86 @@ mod tests {
         assert!(!clone.is_cancelled());
         token.cancel();
         assert!(clone.is_cancelled());
+    }
+
+    /// Names the directory the re-executed helper writes its markers into.
+    const GUARD_MARKER_DIR: &str = "CLAW_TOOLS_GUARD_MARKER_DIR";
+
+    /// How long the helper stays alive after announcing itself.
+    const GUARD_CHILD_LIFETIME: Duration = Duration::from_secs(4);
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    /// Re-executed as a long-running child by the guard test below.
+    ///
+    /// This carries no assertions of its own; without the marker directory in
+    /// its environment it is not being used as a child and returns at once.
+    #[test]
+    #[ignore = "re-executed as a child process by child_guard_terminates_the_tree_when_the_supervisor_unwinds"]
+    fn child_guard_sleeper_helper() {
+        let Ok(directory) = std::env::var(GUARD_MARKER_DIR) else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        std::fs::write(directory.join("started"), b"1").expect("write the started marker");
+        std::thread::sleep(GUARD_CHILD_LIFETIME);
+        // Reached only by a process that was never terminated.
+        std::fs::write(directory.join("survived"), b"1").expect("write the survived marker");
+    }
+
+    #[test]
+    fn child_guard_terminates_the_tree_when_the_supervisor_unwinds() {
+        let directory = unique_temp_dir("claw-tools-child-guard");
+        std::fs::create_dir_all(&directory).expect("create the marker directory");
+        let executable = std::env::current_exe().expect("locate the test binary");
+        let child = Command::new(executable)
+            .args([
+                "--exact",
+                "--ignored",
+                "exec::tests::child_guard_sleeper_helper",
+            ])
+            .env(GUARD_MARKER_DIR, &directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the sleeper child");
+
+        // The child must genuinely be running before the unwind. Without this
+        // the survival assertion below would hold for a child that never ran,
+        // and the test would report green while proving nothing.
+        let started = directory.join("started");
+        let ready_by = Instant::now() + Duration::from_secs(30);
+        while !started.exists() && Instant::now() < ready_by {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        assert!(
+            started.exists(),
+            "the child never reached its sleep, so this run would be vacuous"
+        );
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = ChildGuard::new(child);
+            panic!("the supervising thread unwinds while the child is still running");
+        }));
+        assert!(unwound.is_err(), "the supervisor did not actually unwind");
+
+        // Well past the child's own lifetime: a process the guard failed to
+        // terminate writes its second marker inside this window.
+        std::thread::sleep(GUARD_CHILD_LIFETIME + Duration::from_secs(3));
+        let survived = directory.join("survived");
+        let leaked = survived.exists();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            !leaked,
+            "the child tree outlived the unwinding supervisor: {} exists",
+            survived.display()
+        );
     }
 }
