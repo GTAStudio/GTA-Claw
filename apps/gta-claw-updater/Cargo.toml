@@ -10,14 +10,22 @@ publish = false
 
 [dependencies]
 base64 = "=0.22.1"
+bytes = "=1.12.1"
 ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
-futures-util = "=0.3.31"
-reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+futures-util = "=0.3.32"
+http-body-util = "=0.1.4"
+httparse = "=1.10.1"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["client-proxy", "tokio"] }
+reqwest = { version = "=0.13.2", default-features = false, features = ["stream"] }
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
 semver = "=1.0.28"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 url = "=2.5.8"
 
 [dev-dependencies]

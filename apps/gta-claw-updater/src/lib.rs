@@ -5,22 +5,40 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use bytes::Bytes;
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use futures_util::StreamExt as _;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
-use reqwest::{Client, StatusCode};
+use futures_util::stream::BoxStream;
+use http_body_util::{BodyExt as _, Empty};
+use hyper::body::Incoming;
+use hyper::client::conn::http1;
+use hyper::header::{CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, HOST, RANGE, USER_AGENT};
+use hyper::{HeaderMap, Request, StatusCode};
+use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
+use hyper_util::rt::TokioIo;
+use reqwest::Client;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use url::{Host, Url};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use url::{Host, Position, Url};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_PROXY_RESPONSE_HEAD_BYTES: usize = 32 * 1024;
 const BUNDLE_MAGIC: &str = "gta-claw-bundle-v1";
+
+trait UpdateIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> UpdateIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 /// Compiled maintainer-controlled Ed25519 release key.
 pub const PRODUCTION_PUBLIC_KEY: [u8; 32] = [
@@ -160,6 +178,8 @@ pub enum UpdateOutcome {
 #[derive(Clone)]
 pub struct Updater {
     client: Client,
+    proxy: Arc<ProxyMatcher>,
+    tls_config: Arc<ClientConfig>,
     verifying_key: VerifyingKey,
     target_triple: String,
 }
@@ -186,6 +206,8 @@ impl Updater {
             .map_err(UpdateError::Http)?;
         Ok(Self {
             client,
+            proxy: Arc::new(ProxyMatcher::from_env()),
+            tls_config: Arc::new(native_root_tls_config()?),
             verifying_key,
             target_triple: target_triple.into(),
         })
@@ -198,14 +220,14 @@ impl Updater {
         current: &Version,
     ) -> Result<UpdateDecision, UpdateError> {
         validate_network_url(manifest_url)?;
-        let response = self
-            .client
-            .get(manifest_url.clone())
-            .send()
-            .await
-            .map_err(UpdateError::Http)?;
+        let response = self.get(manifest_url, None).await?;
         ensure_success(response.status())?;
-        let bytes = read_response_limited(response, MAX_MANIFEST_BYTES).await?;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(300),
+            read_response_limited(response, MAX_MANIFEST_BYTES),
+        )
+        .await
+        .map_err(|_| UpdateError::HttpTimeout)??;
         let manifest = self.verify_manifest(&bytes)?;
         let available =
             Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
@@ -273,11 +295,7 @@ impl Updater {
         };
         let mut downloaded = offset;
         if offset < artifact.size {
-            let mut request = self.client.get(url);
-            if offset > 0 {
-                request = request.header(RANGE, format!("bytes={offset}-"));
-            }
-            let response = request.send().await.map_err(UpdateError::Http)?;
+            let mut response = self.get(&url, (offset > 0).then_some(offset)).await?;
             if offset > 0 {
                 if response.status() == StatusCode::PARTIAL_CONTENT {
                     validate_content_range(&response, offset, artifact.size)?;
@@ -299,19 +317,24 @@ impl Updater {
                 options.append(true);
             }
             let mut file = options.open(&part_path).await.map_err(UpdateError::Io)?;
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(UpdateError::Http)?;
-                downloaded = downloaded
-                    .checked_add(
-                        u64::try_from(chunk.len()).map_err(|_| UpdateError::ArtifactTooLarge)?,
-                    )
-                    .ok_or(UpdateError::ArtifactTooLarge)?;
-                if downloaded > artifact.size {
-                    return Err(UpdateError::ArtifactTooLarge);
+            downloaded = tokio::time::timeout(Duration::from_secs(300), async {
+                while let Some(chunk) = response.next_chunk().await? {
+                    downloaded = downloaded
+                        .checked_add(
+                            u64::try_from(chunk.len())
+                                .map_err(|_| UpdateError::ArtifactTooLarge)?,
+                        )
+                        .ok_or(UpdateError::ArtifactTooLarge)?;
+                    if downloaded > artifact.size {
+                        return Err(UpdateError::ArtifactTooLarge);
+                    }
+                    file.write_all(&chunk).await.map_err(UpdateError::Io)?;
                 }
-                file.write_all(&chunk).await.map_err(UpdateError::Io)?;
-            }
+                response.finish().await?;
+                Ok(downloaded)
+            })
+            .await
+            .map_err(|_| UpdateError::HttpTimeout)??;
             file.flush().await.map_err(UpdateError::Io)?;
             file.sync_all().await.map_err(UpdateError::Io)?;
         }
@@ -385,6 +408,144 @@ impl Updater {
             }
         }
     }
+
+    async fn get(
+        &self,
+        url: &Url,
+        range_offset: Option<u64>,
+    ) -> Result<UpdateResponse, UpdateError> {
+        if url.scheme() == "https" {
+            return self.https_get(url, range_offset).await;
+        }
+        let mut request = self.client.get(url.clone());
+        if let Some(offset) = range_offset {
+            request = request.header(RANGE, format!("bytes={offset}-"));
+        }
+        let response = request.send().await.map_err(UpdateError::Http)?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        Ok(UpdateResponse {
+            status,
+            headers,
+            body: ResponseBody::Reqwest(response.bytes_stream().boxed()),
+        })
+    }
+
+    async fn https_get(
+        &self,
+        url: &Url,
+        range_offset: Option<u64>,
+    ) -> Result<UpdateResponse, UpdateError> {
+        let host = url.host_str().ok_or(UpdateError::InvalidArtifactUrl)?;
+        let stream = self.connect_https_stream(url).await?;
+        let server_name =
+            ServerName::try_from(host.to_owned()).map_err(|_| UpdateError::InvalidArtifactUrl)?;
+        let tls = tokio::time::timeout(
+            Duration::from_secs(15),
+            TlsConnector::from(Arc::clone(&self.tls_config)).connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| UpdateError::HttpTimeout)?
+        .map_err(UpdateError::HttpsIo)?;
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(&url[Position::BeforePath..Position::AfterQuery])
+            .header(HOST, url_authority(url)?)
+            .header(CONNECTION, "close")
+            .header(
+                USER_AGENT,
+                concat!("gta-claw-updater/", env!("CARGO_PKG_VERSION")),
+            );
+        if let Some(offset) = range_offset {
+            request = request.header(RANGE, format!("bytes={offset}-"));
+        }
+        let request = request
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| UpdateError::InvalidHttpRequest)?;
+        let (mut sender, connection) = http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(UpdateError::HttpsProtocol)?;
+        let connection = tokio::spawn(connection);
+        let response = match tokio::time::timeout(
+            Duration::from_secs(300),
+            sender.send_request(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                connection.abort();
+                return Err(UpdateError::HttpsProtocol(error));
+            }
+            Err(_) => {
+                connection.abort();
+                return Err(UpdateError::HttpTimeout);
+            }
+        };
+        let status = response.status();
+        let headers = response.headers().clone();
+        Ok(UpdateResponse {
+            status,
+            headers,
+            body: ResponseBody::Https {
+                body: response.into_body(),
+                connection: Some(connection),
+            },
+        })
+    }
+
+    async fn connect_https_stream(&self, url: &Url) -> Result<Box<dyn UpdateIo>, UpdateError> {
+        let destination_host = url.host_str().ok_or(UpdateError::InvalidArtifactUrl)?;
+        let destination_port = url
+            .port_or_known_default()
+            .ok_or(UpdateError::InvalidArtifactUrl)?;
+        let uri = url
+            .as_str()
+            .parse::<hyper::Uri>()
+            .map_err(|_| UpdateError::InvalidArtifactUrl)?;
+        let Some(proxy) = self.proxy.intercept(&uri) else {
+            return connect_tcp(destination_host, destination_port)
+                .await
+                .map(|stream| Box::new(stream) as Box<dyn UpdateIo>);
+        };
+        let proxy_host = proxy.uri().host().ok_or(UpdateError::UnsupportedProxy)?;
+        let proxy_scheme = proxy
+            .uri()
+            .scheme_str()
+            .ok_or(UpdateError::UnsupportedProxy)?;
+        let proxy_port = proxy
+            .uri()
+            .port_u16()
+            .unwrap_or(if proxy_scheme == "https" { 443 } else { 80 });
+        let tcp = connect_tcp(proxy_host, proxy_port).await?;
+        let mut stream: Box<dyn UpdateIo> = match proxy_scheme {
+            "http" => Box::new(tcp),
+            "https" => {
+                let server_name = ServerName::try_from(proxy_host.to_owned())
+                    .map_err(|_| UpdateError::UnsupportedProxy)?;
+                let tls = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    TlsConnector::from(Arc::clone(&self.tls_config)).connect(server_name, tcp),
+                )
+                .await
+                .map_err(|_| UpdateError::HttpTimeout)?
+                .map_err(UpdateError::HttpsIo)?;
+                Box::new(tls)
+            }
+            _ => return Err(UpdateError::UnsupportedProxy),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            establish_http_tunnel(
+                stream.as_mut(),
+                &connect_authority(url)?,
+                proxy.basic_auth(),
+            ),
+        )
+        .await
+        .map_err(|_| UpdateError::HttpTimeout)??;
+        Ok(stream)
+    }
 }
 
 /// Opaque proof that one staged artifact passed signature, size, and hash checks.
@@ -445,6 +606,24 @@ pub enum UpdateError {
     InvalidArtifactSize,
     /// HTTP request failed.
     Http(reqwest::Error),
+    /// HTTPS socket or TLS I/O failed.
+    HttpsIo(io::Error),
+    /// HTTPS HTTP/1 framing failed.
+    HttpsProtocol(hyper::Error),
+    /// HTTPS connection driver failed.
+    HttpTask(tokio::task::JoinError),
+    /// A validated URL could not be represented as an HTTP request.
+    InvalidHttpRequest,
+    /// An HTTP connection or transfer exceeded its fixed timeout.
+    HttpTimeout,
+    /// Configured proxy transport is not a supported HTTP CONNECT proxy.
+    UnsupportedProxy,
+    /// An HTTP CONNECT proxy returned an invalid or unsuccessful response.
+    InvalidProxyResponse,
+    /// No usable platform root certificates were available.
+    NativeRootsUnavailable,
+    /// The pinned TLS provider could not construct a safe client configuration.
+    TlsConfiguration,
     /// Server returned a non-success status.
     HttpStatus(u16),
     /// Resume response did not exactly match the requested range.
@@ -500,7 +679,18 @@ impl Display for UpdateError {
             Self::InvalidArtifactUrl => formatter.write_str("artifact URL is invalid"),
             Self::InvalidArtifactHash => formatter.write_str("artifact SHA-256 is invalid"),
             Self::InvalidArtifactSize => formatter.write_str("artifact size is invalid"),
-            Self::Http(_) => formatter.write_str("update HTTP transfer failed"),
+            Self::Http(_)
+            | Self::HttpsIo(_)
+            | Self::HttpsProtocol(_)
+            | Self::HttpTask(_)
+            | Self::InvalidHttpRequest => formatter.write_str("update HTTP transfer failed"),
+            Self::HttpTimeout => formatter.write_str("update HTTP transfer timed out"),
+            Self::UnsupportedProxy => formatter.write_str("configured update proxy is unsupported"),
+            Self::InvalidProxyResponse => formatter.write_str("update proxy connection failed"),
+            Self::NativeRootsUnavailable => {
+                formatter.write_str("no usable platform root certificates are available")
+            }
+            Self::TlsConfiguration => formatter.write_str("update TLS configuration failed"),
             Self::HttpStatus(status) => write!(formatter, "update server returned HTTP {status}"),
             Self::InvalidContentRange => formatter.write_str("resume response range is invalid"),
             Self::ArtifactTooLarge => formatter.write_str("artifact exceeded its signed size"),
@@ -535,6 +725,9 @@ impl Error for UpdateError {
         match self {
             Self::ManifestJson(error) => Some(error),
             Self::Http(error) => Some(error),
+            Self::HttpsIo(error) => Some(error),
+            Self::HttpsProtocol(error) => Some(error),
+            Self::HttpTask(error) => Some(error),
             Self::Io(error) | Self::InstallRolledBack(error) => Some(error),
             Self::RollbackFailed { install, .. } => Some(install),
             _ => None,
@@ -542,8 +735,191 @@ impl Error for UpdateError {
     }
 }
 
+struct UpdateResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: ResponseBody,
+}
+
+impl UpdateResponse {
+    const fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, UpdateError> {
+        self.body.next_chunk().await
+    }
+
+    async fn finish(&mut self) -> Result<(), UpdateError> {
+        self.body.finish().await
+    }
+}
+
+enum ResponseBody {
+    Reqwest(BoxStream<'static, Result<Bytes, reqwest::Error>>),
+    Https {
+        body: Incoming,
+        connection: Option<tokio::task::JoinHandle<Result<(), hyper::Error>>>,
+    },
+}
+
+impl ResponseBody {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, UpdateError> {
+        match self {
+            Self::Reqwest(stream) => stream.next().await.transpose().map_err(UpdateError::Http),
+            Self::Https { body, .. } => {
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.map_err(UpdateError::HttpsProtocol)?;
+                    if let Ok(bytes) = frame.into_data() {
+                        return Ok(Some(bytes));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    async fn finish(&mut self) -> Result<(), UpdateError> {
+        if let Self::Https { connection, .. } = self
+            && let Some(connection) = connection.take()
+        {
+            connection
+                .await
+                .map_err(UpdateError::HttpTask)?
+                .map_err(UpdateError::HttpsProtocol)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ResponseBody {
+    fn drop(&mut self) {
+        if let Self::Https {
+            connection: Some(connection),
+            ..
+        } = self
+        {
+            connection.abort();
+        }
+    }
+}
+
+fn native_root_tls_config() -> Result<ClientConfig, UpdateError> {
+    let loaded = rustls_native_certs::load_native_certs();
+    if loaded.certs.is_empty() {
+        return Err(UpdateError::NativeRootsUnavailable);
+    }
+    let mut roots = RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(loaded.certs);
+    if added == 0 {
+        return Err(UpdateError::NativeRootsUnavailable);
+    }
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| UpdateError::TlsConfiguration)
+        .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+fn url_authority(url: &Url) -> Result<String, UpdateError> {
+    let host = match url.host().ok_or(UpdateError::InvalidArtifactUrl)? {
+        Host::Domain(domain) => domain.to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
+    };
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+fn connect_authority(url: &Url) -> Result<String, UpdateError> {
+    let host = match url.host().ok_or(UpdateError::InvalidArtifactUrl)? {
+        Host::Domain(domain) => domain.to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or(UpdateError::InvalidArtifactUrl)?;
+    Ok(format!("{host}:{port}"))
+}
+
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, UpdateError> {
+    tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| UpdateError::HttpTimeout)?
+        .map_err(UpdateError::HttpsIo)
+}
+
+async fn establish_http_tunnel<S>(
+    stream: &mut S,
+    authority: &str,
+    basic_auth: Option<&hyper::header::HeaderValue>,
+) -> Result<(), UpdateError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(value) = basic_auth {
+        let value = value.to_str().map_err(|_| UpdateError::UnsupportedProxy)?;
+        request.push_str("Proxy-Authorization: ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(UpdateError::HttpsIo)?;
+    stream.flush().await.map_err(UpdateError::HttpsIo)?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if response.len() >= MAX_PROXY_RESPONSE_HEAD_BYTES {
+            return Err(UpdateError::InvalidProxyResponse);
+        }
+        let remaining = MAX_PROXY_RESPONSE_HEAD_BYTES - response.len();
+        let read_limit = remaining.min(buffer.len());
+        let count = stream
+            .read(&mut buffer[..read_limit])
+            .await
+            .map_err(UpdateError::HttpsIo)?;
+        if count == 0 {
+            return Err(UpdateError::InvalidProxyResponse);
+        }
+        response.extend_from_slice(&buffer[..count]);
+        if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            if index + 4 != response.len() {
+                return Err(UpdateError::InvalidProxyResponse);
+            }
+            break;
+        }
+    }
+
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut parsed = httparse::Response::new(&mut headers);
+    match parsed
+        .parse(&response)
+        .map_err(|_| UpdateError::InvalidProxyResponse)?
+    {
+        httparse::Status::Complete(length)
+            if length == response.len() && parsed.version.is_some() && parsed.code == Some(200) =>
+        {
+            Ok(())
+        }
+        httparse::Status::Complete(_) | httparse::Status::Partial => {
+            Err(UpdateError::InvalidProxyResponse)
+        }
+    }
+}
+
 async fn read_response_limited(
-    response: reqwest::Response,
+    mut response: UpdateResponse,
     limit: u64,
 ) -> Result<Vec<u8>, UpdateError> {
     if response
@@ -556,9 +932,7 @@ async fn read_response_limited(
         return Err(UpdateError::ManifestTooLarge);
     }
     let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(UpdateError::Http)?;
+    while let Some(chunk) = response.next_chunk().await? {
         if u64::try_from(bytes.len())
             .ok()
             .and_then(|length| length.checked_add(u64::try_from(chunk.len()).ok()?))
@@ -568,6 +942,7 @@ async fn read_response_limited(
         }
         bytes.extend_from_slice(&chunk);
     }
+    response.finish().await?;
     Ok(bytes)
 }
 
@@ -611,7 +986,7 @@ fn ensure_success(status: StatusCode) -> Result<(), UpdateError> {
 }
 
 fn validate_content_range(
-    response: &reqwest::Response,
+    response: &UpdateResponse,
     offset: u64,
     size: u64,
 ) -> Result<(), UpdateError> {
@@ -865,7 +1240,16 @@ mod unit_tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use rustls::ServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
     use super::*;
+
+    const TEST_CERTIFICATE: &str = "MIIBQTCB9KADAgECAgECMAUGAytlcDApMScwJQYDVQQDDB5HVEEgQ2xhdyB1cGRhdGVyIGxvb3BiYWNrIHRlc3QwHhcNMjAwMTAxMDAwMDAwWhcNNDAwMTAxMDAwMDAwWjApMScwJQYDVQQDDB5HVEEgQ2xhdyB1cGRhdGVyIGxvb3BiYWNrIHRlc3QwKjAFBgMrZXADIQARrhPTfditsU9TEgEUTTgu9MLOxHQTU2Ozj2StvH5tJKNBMD8wGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwBQYDK2VwA0EAzE79rkVmUtNws2e50/SurA89Cb9F0vAGlWc0l8wlh15Tbm09gbrqeW1IH+47zJP8ZT/5yW8XvphiG+ZJ704ACQ==";
+    const TEST_PRIVATE_KEY: &str =
+        "MC4CAQAwBQYDK2VwBCIEICA2Blt/M1Zjk7maaA54FIXAlRGZAI9sCYJcTQx1ptxh";
 
     #[derive(Default)]
     struct MockOps {
@@ -917,6 +1301,194 @@ mod unit_tests {
             self.existing.lock().expect("existing lock").remove(path);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn https_uses_pinned_native_root_transport_and_exact_request_target() {
+        let certificate = CertificateDer::from(
+            STANDARD
+                .decode(TEST_CERTIFICATE)
+                .expect("decode test certificate"),
+        );
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            STANDARD
+                .decode(TEST_PRIVATE_KEY)
+                .expect("decode test private key"),
+        ));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("test server protocols")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], private_key)
+            .expect("test server certificate");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TLS test server");
+        let address = listener.local_addr().expect("TLS test address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept TLS test client");
+            let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                .accept(stream)
+                .await
+                .expect("accept TLS handshake");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.expect("read TLS request");
+                assert_ne!(count, 0, "request headers must be complete");
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .expect("write TLS response");
+            stream.flush().await.expect("flush TLS response");
+            String::from_utf8(request).expect("request is ASCII")
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).expect("trust test certificate");
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("test client protocols")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let updater = Updater {
+            client: Client::builder().build().expect("loopback HTTP client"),
+            proxy: Arc::new(ProxyMatcher::builder().build()),
+            tls_config: Arc::new(client_config),
+            verifying_key: VerifyingKey::from_bytes(&PRODUCTION_PUBLIC_KEY)
+                .expect("production key is canonical"),
+            target_triple: "test-target".to_owned(),
+        };
+        let url = Url::parse(&format!(
+            "https://127.0.0.1:{}/release?channel=stable",
+            address.port()
+        ))
+        .expect("TLS test URL");
+        let response = updater.get(&url, None).await.expect("HTTPS GET");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            read_response_limited(response, 5)
+                .await
+                .expect("read HTTPS response"),
+            b"hello"
+        );
+
+        let request = server.await.expect("TLS server task");
+        let mut sections = request.split("\r\n\r\n");
+        let head = sections.next().expect("request head");
+        assert_eq!(sections.next(), Some(""));
+        assert_eq!(sections.next(), None);
+        let mut lines = head.split("\r\n");
+        assert_eq!(lines.next(), Some("GET /release?channel=stable HTTP/1.1"));
+        let headers = lines
+            .map(|line| {
+                let (name, value) = line.split_once(": ").expect("valid request header");
+                (name.to_ascii_lowercase(), value.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            headers,
+            BTreeSet::from([
+                ("connection".to_owned(), "close".to_owned()),
+                ("host".to_owned(), format!("127.0.0.1:{}", address.port())),
+                (
+                    "user-agent".to_owned(),
+                    concat!("gta-claw-updater/", env!("CARGO_PKG_VERSION")).to_owned()
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn https_proxy_uses_exact_authenticated_connect_tunnel() {
+        let certificate = CertificateDer::from(
+            STANDARD
+                .decode(TEST_CERTIFICATE)
+                .expect("decode test certificate"),
+        );
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            STANDARD
+                .decode(TEST_PRIVATE_KEY)
+                .expect("decode test private key"),
+        ));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("proxy server protocols")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], private_key)
+            .expect("proxy server certificate");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy test server");
+        let address = listener.local_addr().expect("proxy test address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept proxy client");
+            let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                .accept(stream)
+                .await
+                .expect("accept proxy TLS handshake");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.expect("read CONNECT");
+                assert_ne!(count, 0, "CONNECT headers must be complete");
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write CONNECT response");
+            stream.flush().await.expect("flush CONNECT response");
+            String::from_utf8(request).expect("CONNECT request is ASCII")
+        });
+        let proxy = ProxyMatcher::builder()
+            .https(format!(
+                "https://Aladdin:opensesame@127.0.0.1:{}",
+                address.port()
+            ))
+            .build();
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).expect("trust proxy certificate");
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("proxy client protocols")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let updater = Updater {
+            client: Client::builder().build().expect("loopback HTTP client"),
+            proxy: Arc::new(proxy),
+            tls_config: Arc::new(client_config),
+            verifying_key: VerifyingKey::from_bytes(&PRODUCTION_PUBLIC_KEY)
+                .expect("production key is canonical"),
+            target_triple: "test-target".to_owned(),
+        };
+        let url = Url::parse("https://updates.example.invalid/release").expect("proxy target URL");
+        let stream = updater
+            .connect_https_stream(&url)
+            .await
+            .expect("CONNECT tunnel");
+        drop(stream);
+        assert_eq!(
+            server.await.expect("proxy server task"),
+            concat!(
+                "CONNECT updates.example.invalid:443 HTTP/1.1\r\n",
+                "Host: updates.example.invalid:443\r\n",
+                "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuc2VzYW1l\r\n",
+                "\r\n"
+            )
+        );
     }
 
     #[test]
