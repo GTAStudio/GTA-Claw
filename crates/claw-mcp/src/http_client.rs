@@ -762,10 +762,10 @@ mod tests {
     };
 
     use axum::{Router, extract::State, response::Redirect, routing::get};
-    use rcgen::generate_simple_self_signed;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rustls::{
         ServerConfig,
-        pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
@@ -776,14 +776,22 @@ mod tests {
 
     use super::*;
 
+    fn tls_fixture() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let certificate = STANDARD
+            .decode(include_str!("../tests/fixtures/tls/localhost-cert.der.b64").trim())
+            .expect("decode fixture certificate");
+        let private_key = STANDARD
+            .decode(include_str!("../tests/fixtures/tls/localhost-key.der.b64").trim())
+            .expect("decode fixture private key");
+        (
+            CertificateDer::from(certificate),
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(private_key)),
+        )
+    }
+
     #[tokio::test]
     async fn custom_ring_connector_completes_a_local_https_exchange() {
-        let certified =
-            generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test certificate");
-        let certificate = certified.cert.der().clone();
-        let private_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
-            certified.signing_key.serialize_der(),
-        ));
+        let (certificate, private_key) = tls_fixture();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let server_config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -846,12 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_http_proxy_tunnels_https_with_connect() {
-        let certified =
-            generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test certificate");
-        let certificate = certified.cert.der().clone();
-        let private_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
-            certified.signing_key.serialize_der(),
-        ));
+        let (certificate, private_key) = tls_fixture();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let server_config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
