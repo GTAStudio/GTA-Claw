@@ -46,8 +46,8 @@ struct EndpointInventoryItem {
     path: String,
 }
 
-#[test]
-fn registered_endpoint_set_exactly_matches_frozen_inventory() {
+#[tokio::test]
+async fn registered_endpoint_set_exactly_matches_frozen_inventory() {
     let inventory_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -62,8 +62,8 @@ fn registered_endpoint_set_exactly_matches_frozen_inventory() {
 
     let frozen = inventory
         .items
-        .into_iter()
-        .map(|endpoint| (endpoint.method, endpoint.path))
+        .iter()
+        .map(|endpoint| (endpoint.method.clone(), endpoint.path.clone()))
         .collect::<BTreeSet<_>>();
     let registered = HTTP_ENDPOINTS
         .iter()
@@ -75,6 +75,51 @@ fn registered_endpoint_set_exactly_matches_frozen_inventory() {
     assert_eq!(HTTP_ENDPOINTS.len(), 18);
     assert_eq!(registered.len(), 18);
     assert_eq!(registered, frozen);
+
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime).await;
+    for endpoint in &inventory.items {
+        let path = endpoint
+            .path
+            .replace("{id}", "inventory-probe")
+            .replace("{routeId}", "inventory-probe");
+        let wrong_method = match endpoint.method.as_str() {
+            "GET" => "POST",
+            "POST" => "GET",
+            method => panic!("unsupported frozen HTTP method {method}"),
+        };
+        let (address, token) = if endpoint.path == "/mcp" {
+            (server.mcp_address, "mcp-owner")
+        } else {
+            (server.address, "operator-token")
+        };
+        let response = request_at(address, wrong_method, &path, Some(token), &[], b"").await;
+        assert_eq!(
+            response.status, 405,
+            "{} {} was not bound to the expected method",
+            endpoint.method, endpoint.path
+        );
+        let allowed = response
+            .headers
+            .get("allow")
+            .unwrap_or_else(|| panic!("{} {} omitted Allow", endpoint.method, endpoint.path));
+        assert!(
+            allowed
+                .split(',')
+                .any(|method| method.trim() == endpoint.method),
+            "{} {} returned Allow: {allowed}",
+            endpoint.method,
+            endpoint.path
+        );
+        assert!(
+            allowed
+                .split(',')
+                .all(|method| method.trim() != wrong_method),
+            "{} {} unexpectedly accepted {wrong_method}",
+            endpoint.method,
+            endpoint.path
+        );
+    }
 }
 
 impl Drop for Server {
@@ -433,6 +478,9 @@ async fn probes_reflect_real_dependency_state_and_hide_details_without_auth() {
         live.headers.get("cache-control").map(String::as_str),
         Some("no-store")
     );
+    let live_alias = request(&server, "GET", "/healthz", None, &[], b"").await;
+    assert_eq!(live_alias.status, 200);
+    assert_eq!(live_alias.json(), json!({"ok":true,"status":"live"}));
 
     runtime.set_ready(false);
     let hidden = request(&server, "GET", "/readyz", None, &[], b"").await;
