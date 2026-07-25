@@ -204,7 +204,31 @@ crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package
   `[[test]]` section of the crate manifest;
 - everything reached transitively from those roots by a `mod name;` declaration,
   resolving to `<scope>/name.rs` or `<scope>/name/mod.rs`, honouring
-  `#[path = "..."]`, and descending into inline `mod name { ... }` blocks.
+  `#[path = "..."]`, and descending into inline `mod name { ... }` blocks. A
+  restricted visibility (`pub(crate) mod name;`, `pub(super)`, `pub(in ...)`) is
+  a declaration like any other.
+
+`#[path = "..."]` resolves the way `rustc` resolves it, which is **not** simply
+"relative to the module directory":
+
+- Outside an inline `mod { }` block, the path is relative to the directory
+  **holding the source file**. For `src/a/b.rs`, `#[path = "foo.rs"] mod c;`
+  names `src/a/foo.rs`, not `src/a/b/foo.rs`. The two coincide for *mod-rs*
+  files — crate roots and `mod.rs` — and differ for every other file.
+- Inside an inline `mod { }` block, the path is relative to the module directory
+  plus the inline components.
+- A path naming a `mod.rs` makes that module mod-rs, so **its** children resolve
+  beside it: `#[path = "sub/mod.rs"] mod two;` puts `two`'s children in `sub/`,
+  not in `sub/mod/`.
+- The value may be a raw string (`#[path = r"foo.rs"]`).
+- A `path` attribute whose value this reader cannot resolve resolves to
+  **nothing**. It must never fall back to resolving by module name, or an
+  attribute pointing at one file blesses another.
+
+Getting any of these wrong is a forgery vector and not merely a false rejection,
+because each wrong answer names a *specific* other file — one that nothing
+compiles — and blesses it. Each has a decoy planted at the wrong location in
+`validate-self-test.ps1`.
 
 Four kinds of target are deliberately **excluded**, because `cargo test` does not
 run `#[test]` items in any of them. Each was measured against `cargo metadata`
@@ -233,10 +257,14 @@ Three limits, stated plainly rather than left to be discovered:
   reports such targets with `test = true` — so both implementations are
   permissive here by the same rule. Evaluating either would reject honest
   evidence, and the disclosed vector is the unreferenced file.
-- Reachability is computed within the owning crate. A file pulled in only by a
+- Reachability is computed within the owning crate: the crate that owns the
+  *cited* file must itself reach it. A file pulled in only by a
   `#[path = "..."]` from a *different* crate is not recognised; cite a test in
-  the crate that compiles it. No file in this repository is in that position —
-  the three real `#[path]` uses all resolve within their own crate.
+  the crate that compiles it. One real cross-crate `#[path]` exists —
+  `apps/gta-claw-cli/tests/gateway_health.rs` reaches into
+  `crates/claw-gateway-client/tests/support/mod.rs` — and nothing is lost by it,
+  because a `mod support;` in that crate's own `tests/gateway_client.rs` reaches
+  the same file.
 - It proves a file is compiled and a test is enabled. It does not prove the test
   passes; that is `cargo test`'s job.
 
@@ -252,9 +280,9 @@ The two implementations are therefore intended to be **identical**, not merely
 ordered. A divergence in *either* direction is a defect and must be reported
 rather than managed: if this validator were the looser side, a row it blesses
 could be rejected by the parity report. The specification above is deliberately
-complete enough to be mirrored; the thirteen `implemented-citing-*` cases in
-`validate-self-test.ps1` are its executable form — nine that must be rejected and
-four that must be accepted.
+complete enough to be mirrored; the twenty-three `implemented-citing-*` cases in
+`validate-self-test.ps1` are its executable form — thirteen that must be rejected
+and ten that must be accepted.
 
 The root set is derived here by reading the manifest rather than by shelling out
 to `cargo metadata`, which keeps this trust root hermetic: it reads files and
@@ -267,13 +295,28 @@ expressed in `cargo metadata` at all, which still reports such a target as
 `test = true`.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. The four accepting cases — a `mod`-wired module, a
-`#[path]`-relocated module, a transitive `lib.rs` → `nested/mod.rs` →
-`nested/deep.rs` chain, and a `src/bin/` target — exist so that a later
-"improvement" to this rule cannot quietly turn it into a false-rejection engine
-without turning the self-test red. The `src/bin/` case is there specifically
-because dropping `benches/` and `examples/` from the root set must not take
-`src/bin/` with them.
+true-positive ones. Eight of the ten accepting cases pin reachability — a
+`mod`-wired module, a `#[path]`-relocated module, a transitive `lib.rs` →
+`nested/mod.rs` → `nested/deep.rs` chain, a `src/bin/` target, a top-level
+`#[path]` sibling, the child of a `#[path]`-named `mod.rs`, a raw-string
+`#[path]`, and a `pub(crate) mod` — so that a later "improvement" to this rule
+cannot quietly turn it into a false-rejection engine without turning the
+self-test red. The other two pin the enabled-test oracle. The `src/bin/` case is
+there specifically because dropping `benches/` and `examples/` from the root set
+must not take `src/bin/` with them.
+
+Four of those accepting cases were added after a peer implementation's
+adversarial review found the corresponding bugs here, each proved by execution
+against a planted tree rather than argued: a six-line file with three top-level
+`#[path]` declarations produced **two false acceptances and four false
+rejections**. A fifth, `pub(crate) mod`, was found by sweeping the real tree
+after a merge: `Get-RustSkipVisibility` takes three parameters and the module
+walk was calling it with two, so PowerShell supplied `0` for the end bound and
+the walk could not step over the visibility group. The enabled-test oracle called
+the same function correctly. **A rule verified only against a corpus cannot find
+a divergence the corpus does not exercise** — which is why the whole-tree sweep
+runs on every change and why its result is reported as a per-file verdict list
+rather than as a count.
 
 #### A row may not rewrite its own acceptance bar
 
