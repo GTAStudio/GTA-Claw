@@ -1847,6 +1847,12 @@ mod tests {
     use crate::ViolationCode;
 
     static NEXT_COMPILER_ORACLE: AtomicU64 = AtomicU64::new(0);
+    const COMPILER_ORACLE_WARNING_ENV: [&str; 4] = [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_WARNINGS",
+    ];
 
     #[derive(Deserialize)]
     struct SharedOracleCorpus {
@@ -1863,6 +1869,17 @@ mod tests {
 
     struct CompilerOracleFixture {
         root: PathBuf,
+    }
+
+    fn compiler_oracle_command(cargo: &Path, root: &Path) -> Command {
+        let mut command = Command::new(cargo);
+        command
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", root.join("target"));
+        for variable in COMPILER_ORACLE_WARNING_ENV {
+            command.env_remove(variable);
+        }
+        command
     }
 
     impl CompilerOracleFixture {
@@ -1892,23 +1909,20 @@ mod tests {
         fn cargo_test_list(&self, ignored_only: bool) -> BTreeSet<String> {
             let cargo = cargo_executable(&self.root, ViolationCode::ClaimEvidence)
                 .expect("resolve trusted Cargo");
-            let mut command = Command::new(cargo);
-            command
-                .current_dir(&self.root)
-                .env("CARGO_TARGET_DIR", self.root.join("target"))
-                .args([
-                    "test",
-                    "--offline",
-                    "--quiet",
-                    "--manifest-path",
-                    "Cargo.toml",
-                    "--test",
-                    "oracle",
-                    "--",
-                    "--list",
-                    "--format",
-                    "terse",
-                ]);
+            let mut command = compiler_oracle_command(&cargo, &self.root);
+            command.args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+                "Cargo.toml",
+                "--test",
+                "oracle",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ]);
             if ignored_only {
                 command.arg("--ignored");
             }
@@ -1937,6 +1951,21 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn compiler_oracle_command_removes_warning_escalation() {
+        let command = compiler_oracle_command(Path::new("cargo"), Path::new("."));
+        for variable in COMPILER_ORACLE_WARNING_ENV {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == variable)
+                    .map(|(_, value)| value),
+                Some(None),
+                "{variable} must be absent from compiler oracle subprocesses"
+            );
+        }
     }
 
     #[test]
@@ -2364,9 +2393,7 @@ mod nested {
 
         let cargo =
             cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
-        let output = Command::new(cargo)
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", root.join("target"))
+        let output = compiler_oracle_command(&cargo, &root)
             .args([
                 "test",
                 "--offline",
@@ -2492,9 +2519,7 @@ mod nested {
 
         let cargo =
             cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
-        let output = Command::new(cargo)
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", root.join("target"))
+        let output = compiler_oracle_command(&cargo, &root)
             .args(["test", "--offline", "--quiet", "--locked", "--no-run"])
             .output()
             .expect("run invalid-path compiler oracle");
@@ -2585,9 +2610,7 @@ mod nested {
 
         let cargo =
             cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
-        let output = Command::new(cargo)
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", root.join("target"))
+        let output = compiler_oracle_command(&cargo, &root)
             .args([
                 "test",
                 "--offline",
@@ -2688,9 +2711,7 @@ mod nested {
 
         let cargo =
             cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
-        let output = Command::new(cargo)
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", root.join("target"))
+        let output = compiler_oracle_command(&cargo, &root)
             .args([
                 "test",
                 "--offline",
@@ -2770,9 +2791,7 @@ mod nested {
 
         let cargo =
             cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
-        let output = Command::new(cargo)
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", root.join("target"))
+        let output = compiler_oracle_command(&cargo, &root)
             .args([
                 "test",
                 "--offline",
