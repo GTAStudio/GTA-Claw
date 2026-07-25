@@ -282,6 +282,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-channel-sdk"
+version = "0.1.0"
+dependencies = [
+ "secrecy",
+ "serde",
+]
+
+[[package]]
+name = "claw-channels"
+version = "0.1.0"
+dependencies = [
+ "claw-channel-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "claw-config"
 version = "0.1.0"
 dependencies = [
@@ -439,6 +456,14 @@ dependencies = [
  "subtle",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "claw-skills"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
