@@ -5,6 +5,7 @@
 //! [`crate::store::GatewayStore`] port.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use claw_protocol::gateway::{CompatibilityMode, OperatorScope, Role};
@@ -48,10 +49,21 @@ pub struct ConnectionInfo {
     pub commands: Vec<String>,
 }
 
+/// One directory entry together with the registration that placed it.
+///
+/// The serial is what lets a [`ConnectionRegistration`] prove it is unwinding
+/// its *own* entry rather than evicting whatever happens to occupy its id.
+#[derive(Clone, Debug)]
+struct Registered {
+    serial: u64,
+    info: ConnectionInfo,
+}
+
 /// Shared registry of authenticated connections.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionDirectory {
-    entries: Arc<Mutex<BTreeMap<u64, ConnectionInfo>>>,
+    entries: Arc<Mutex<BTreeMap<u64, Registered>>>,
+    next_serial: Arc<AtomicU64>,
 }
 
 impl ConnectionDirectory {
@@ -61,24 +73,63 @@ impl ConnectionDirectory {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, ConnectionInfo>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Registered>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn next_serial(&self) -> u64 {
+        self.next_serial.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Records an authenticated connection, replacing any entry with the same id.
     pub fn insert(&self, info: ConnectionInfo) {
-        self.lock().insert(info.id.get(), info);
+        let serial = self.next_serial();
+        self.lock()
+            .insert(info.id.get(), Registered { serial, info });
+    }
+
+    /// Records an authenticated connection and returns its lifetime guard.
+    ///
+    /// Prefer this to [`Self::insert`] whenever the caller is an async task.
+    /// A future can be dropped at any await point — the accept loop aborts
+    /// connections that outlive the graceful-drain window — and a dropped
+    /// future never runs the code after its await. Tying removal to `Drop` is
+    /// the only way the directory cannot retain a connection that has ceased
+    /// to exist, because `Drop` runs on the cancellation path too.
+    #[must_use = "dropping the guard immediately deregisters the connection"]
+    pub fn register(&self, info: ConnectionInfo) -> ConnectionRegistration {
+        let id = info.id;
+        let serial = self.next_serial();
+        self.lock().insert(id.get(), Registered { serial, info });
+        ConnectionRegistration {
+            directory: self.clone(),
+            id,
+            serial,
+        }
+    }
+
+    /// Removes an entry only while `serial` still owns it.
+    fn remove_registered(&self, id: ConnectionId, serial: u64) -> bool {
+        let mut entries = self.lock();
+        if entries
+            .get(&id.get())
+            .is_some_and(|held| held.serial == serial)
+        {
+            entries.remove(&id.get());
+            return true;
+        }
+        false
     }
 
     /// Removes one connection, returning the entry when it was present.
     pub fn remove(&self, id: ConnectionId) -> Option<ConnectionInfo> {
-        self.lock().remove(&id.get())
+        self.lock().remove(&id.get()).map(|held| held.info)
     }
 
     /// Returns every authenticated connection ordered by connection id.
     #[must_use]
     pub fn all(&self) -> Vec<ConnectionInfo> {
-        self.lock().values().cloned().collect()
+        self.lock().values().map(|held| held.info.clone()).collect()
     }
 
     /// Returns every authenticated connection whose role is `node`.
@@ -86,6 +137,7 @@ impl ConnectionDirectory {
     pub fn nodes(&self) -> Vec<ConnectionInfo> {
         self.lock()
             .values()
+            .map(|held| &held.info)
             .filter(|info| info.role == Role::Node)
             .cloned()
             .collect()
@@ -96,6 +148,7 @@ impl ConnectionDirectory {
     pub fn node(&self, device_id: &str) -> Option<ConnectionInfo> {
         self.lock()
             .values()
+            .map(|held| &held.info)
             .find(|info| info.role == Role::Node && info.device_id == device_id)
             .cloned()
     }
@@ -110,6 +163,41 @@ impl ConnectionDirectory {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+}
+
+/// Keeps one connection in the directory for exactly as long as it is served.
+///
+/// This exists because the compensating write for "mark this connection live"
+/// used to sit *after* an await, so a cancelled connection future left a
+/// permanent phantom entry: connection ids are allocated monotonically and
+/// never reused, the directory has no expiry sweep, and shutdown does not
+/// clear it, so no later code path could evict the stale row.
+///
+/// The guard removes its entry unconditionally on drop — there is no
+/// success path on which a served connection should outlive its own future —
+/// and it removes *only* the entry it placed, verified by serial. Relying on
+/// "no two connections share an id" would be an invariant of today's accept
+/// loop rather than of this type, and [`ConnectionDirectory::insert`] is
+/// public and takes a caller-supplied id.
+#[derive(Debug)]
+pub struct ConnectionRegistration {
+    directory: ConnectionDirectory,
+    id: ConnectionId,
+    serial: u64,
+}
+
+impl ConnectionRegistration {
+    /// Returns the connection identity this registration owns.
+    #[must_use]
+    pub const fn id(&self) -> ConnectionId {
+        self.id
+    }
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        self.directory.remove_registered(self.id, self.serial);
     }
 }
 
@@ -192,5 +280,77 @@ mod tests {
             compatibility_identity(CompatibilityMode::LegacyNode),
             "legacy-node"
         );
+    }
+
+    #[test]
+    fn a_dropped_registration_removes_its_own_entry() {
+        let directory = ConnectionDirectory::new();
+        {
+            let registration = directory.register(info(1, Role::Operator, "dev-op"));
+            assert_eq!(registration.id(), ConnectionId::new(1));
+            assert_eq!(directory.len(), 1);
+            assert_eq!(
+                directory.all().first().map(|entry| entry.device_id.clone()),
+                Some("dev-op".to_owned())
+            );
+        }
+        assert!(
+            directory.is_empty(),
+            "a dropped registration must not leave the connection behind"
+        );
+    }
+
+    #[test]
+    fn a_registration_never_evicts_an_entry_that_replaced_it() {
+        let directory = ConnectionDirectory::new();
+        let first = directory.register(info(1, Role::Operator, "first"));
+        // A second registration takes the same id. Monotonic ids make this
+        // impossible in today's accept loop, but `insert`/`register` are
+        // public and take a caller-supplied id, so the guard must not rely
+        // on that being true.
+        let second = directory.register(info(1, Role::Operator, "second"));
+        assert_eq!(directory.len(), 1);
+
+        drop(first);
+        assert_eq!(
+            directory.all().first().map(|entry| entry.device_id.clone()),
+            Some("second".to_owned()),
+            "the stale guard evicted a live connection it never registered"
+        );
+
+        drop(second);
+        assert!(directory.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_removal_leaves_the_guard_with_nothing_to_undo() {
+        let directory = ConnectionDirectory::new();
+        let registration = directory.register(info(1, Role::Node, "dev-node"));
+        assert_eq!(
+            directory
+                .remove(ConnectionId::new(1))
+                .map(|entry| entry.device_id),
+            Some("dev-node".to_owned())
+        );
+        assert!(directory.is_empty());
+
+        directory.insert(info(1, Role::Operator, "later"));
+        drop(registration);
+        assert_eq!(
+            directory.all().first().map(|entry| entry.device_id.clone()),
+            Some("later".to_owned()),
+            "the guard clobbered an unrelated entry after its own was removed"
+        );
+    }
+
+    #[test]
+    fn registration_serials_are_distinct_across_reused_identities() {
+        let directory = ConnectionDirectory::new();
+        let first = directory.register(info(1, Role::Operator, "a"));
+        drop(first);
+        let second = directory.register(info(1, Role::Operator, "b"));
+        assert_eq!(directory.len(), 1);
+        drop(second);
+        assert!(directory.is_empty());
     }
 }

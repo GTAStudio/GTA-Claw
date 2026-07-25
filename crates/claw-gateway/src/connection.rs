@@ -35,7 +35,9 @@ use crate::auth::issue_challenge;
 use crate::authority::AuthorizationSource;
 use crate::clock::Clock;
 use crate::config::ValidatedConfig;
-use crate::directory::{ConnectionDirectory, ConnectionInfo, compatibility_identity};
+use crate::directory::{
+    ConnectionDirectory, ConnectionInfo, ConnectionRegistration, compatibility_identity,
+};
 use crate::dispatch::{MethodContext, MethodRegistry};
 use crate::error::{
     ConnectionClose, DispatchError, EncodeError, HandshakeError, StoreError, WireError,
@@ -120,18 +122,20 @@ pub async fn serve(
     let outcome = match negotiated {
         Err(_) => ConnectionClose::HandshakeTimeout,
         Ok(Err(close)) => close,
-        Ok(Ok(session)) => {
+        Ok(Ok((session, registration))) => {
             let (sender, mut inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
             let reader = tokio::spawn(read_loop(read, sender));
             let outcome =
                 dispatch_loop(id, &services, &mut write, &mut inbound, session, shutdown).await;
             inbound.close();
             reader.abort();
+            // Held across the await above on purpose: if this future is
+            // dropped there, `Drop` is what deregisters the connection.
+            drop(registration);
             outcome
         }
     };
 
-    services.directory.remove(id);
     services.events.unsubscribe(id);
     let _ = timeout(
         timeouts.close,
@@ -576,7 +580,7 @@ async fn negotiate(
     services: &ConnectionServices,
     read: &mut ServerRead,
     write: &mut ServerWrite,
-) -> Result<Session, ConnectionClose> {
+) -> Result<(Session, ConnectionRegistration), ConnectionClose> {
     let preauth = Codec::preauthentication();
     let Ok(challenge) = issue_challenge(services.clock.as_ref()) else {
         return Err(ConnectionClose::HandshakeRejected(
@@ -679,7 +683,7 @@ async fn negotiate(
         .and_then(|()| negotiation.mark_ready())
         .map_err(|error| ConnectionClose::HandshakeRejected(error.to_string()))?;
 
-    services.directory.insert(ConnectionInfo {
+    let registration = services.directory.register(ConnectionInfo {
         id,
         role,
         scopes: scopes.clone(),
@@ -694,13 +698,16 @@ async fn negotiate(
         commands: command_claims(&params, role),
     });
 
-    Ok(Session {
-        role,
-        scopes,
-        device_id,
-        filter: Arc::new(Mutex::new(TopicFilter::default())),
-        authorized_at,
-    })
+    Ok((
+        Session {
+            role,
+            scopes,
+            device_id,
+            filter: Arc::new(Mutex::new(TopicFilter::default())),
+            authorized_at,
+        },
+        registration,
+    ))
 }
 
 fn handshake_failure(error: EncodeError) -> ConnectionClose {
@@ -1254,5 +1261,127 @@ mod tests {
             subscription.try_recv().is_none(),
             "an admin-scoped event reached a connection whose admin scope was withdrawn"
         );
+    }
+
+    /// Builds services over a real clock, so a live client's signed handshake
+    /// passes the signature-age check that [`services_over`]'s frozen clock
+    /// would reject.
+    fn live_services(devices: &crate::authority::DeviceDirectory) -> ConnectionServices {
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::SystemClock);
+        let config = crate::config::GatewayServerConfig::default()
+            .validate()
+            .expect("the default configuration is valid");
+        ConnectionServices {
+            config: Arc::new(config),
+            registry: Arc::new(crate::methods::registry().expect("every handler installs")),
+            store: Arc::new(crate::store::InMemoryGatewayStore::new(8, 8)),
+            events: EventBus::new(8, 8192),
+            clock: Arc::clone(&clock),
+            directory: ConnectionDirectory::new(),
+            authenticator: Arc::new(crate::auth::StaticAuthenticator::with_devices(
+                crate::auth::CredentialPolicy::None,
+                clock,
+                devices.clone(),
+            )),
+            authorization: Arc::new(devices.clone()),
+        }
+    }
+
+    /// Proves the directory registration survives future cancellation.
+    ///
+    /// The accept loop aborts connection tasks that outlive the graceful-drain
+    /// window, which drops the `serve` future at its `dispatch_loop` await.
+    /// Nothing after that await runs, so only a `Drop` impl can deregister the
+    /// connection — and connection ids are never reused, the directory has no
+    /// expiry sweep and shutdown does not clear it, so a leaked entry would be
+    /// permanent for anyone holding a clone of the directory.
+    ///
+    /// Every other test in this crate polls its connection future to
+    /// completion, which is exactly why this defect class is invisible to
+    /// them. This test drops the future instead.
+    #[tokio::test]
+    async fn aborting_a_served_connection_deregisters_it_from_the_directory() {
+        use claw_gateway_client::{GatewayClient, GatewayClientConfig, ReconnectPolicy};
+        use claw_security::authorization::{Role as SecurityRole, Scope, ScopeSet};
+        use claw_security::identity::DeviceIdentity;
+        use rand_chacha::ChaCha20Rng;
+        use rand_chacha::rand_core::SeedableRng;
+        use tokio::net::TcpListener;
+
+        let mut rng = ChaCha20Rng::from_seed([91_u8; 32]);
+        let identity = Arc::new(DeviceIdentity::generate(&mut rng));
+        let wire_id = identity.device_id().gateway_wire_id();
+
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            &wire_id,
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Read]),
+        );
+        let services = live_services(&devices);
+        let directory = services.directory.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port is available");
+        let port = listener
+            .local_addr()
+            .expect("the listener reports its address")
+            .port();
+
+        let mut client_config = GatewayClientConfig::new(
+            url::Url::parse(&format!("ws://127.0.0.1:{port}/"))
+                .expect("the loopback endpoint parses"),
+            identity,
+        );
+        client_config.role = SecurityRole::Operator;
+        client_config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
+        client_config.reconnect = ReconnectPolicy::Never;
+        let (client, _events) =
+            GatewayClient::start(client_config).expect("the client configuration is valid");
+
+        let (stream, _peer) = listener.accept().await.expect("the client dials in");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let connection = ConnectionId::new(1);
+        let task = tokio::spawn(serve(stream, connection, services, shutdown_rx));
+
+        client
+            .wait_ready()
+            .await
+            .expect("the operator handshake completes");
+
+        // The hello frame is written before the registration, so readiness on
+        // the client can legitimately precede it by a few microseconds.
+        for _ in 0..1_000 {
+            if directory.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            directory.all().len(),
+            1,
+            "the authenticated connection registered"
+        );
+        assert_eq!(
+            directory.all()[0].device_id,
+            wire_id,
+            "the registered entry is this connection"
+        );
+
+        task.abort();
+        let joined = task.await;
+        assert!(
+            joined.expect_err("the task was aborted").is_cancelled(),
+            "the future must really have been dropped at its await, not run to completion"
+        );
+
+        assert_eq!(
+            directory.all(),
+            Vec::new(),
+            "a cancelled connection future left a phantom entry in the directory"
+        );
+        assert!(directory.node(&wire_id).is_none());
+
+        client.shutdown().await.ok();
     }
 }
