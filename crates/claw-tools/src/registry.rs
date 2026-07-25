@@ -4,6 +4,7 @@
 //! other way to obtain the [`crate::permission::Authorization`] a tool needs,
 //! so an unauthorized invocation cannot reach an implementation.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
@@ -11,8 +12,8 @@ use serde_json::{Value, json};
 use crate::audit::{AuditOutcome, AuditPhase, AuditReason, ToolAuditRecord, ToolAuditSink, redact};
 use crate::error::ToolError;
 use crate::permission::{
-    Authorization, Capability, DenialReason, PermissionBroker, PermissionDecision, PermissionError,
-    PermissionRequest, Resource,
+    Authorization, Capability, DenialReason, GrantId, PermissionBroker, PermissionDecision,
+    PermissionError, PermissionRequest, Resource, ResourceGate,
 };
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolOutput};
 
@@ -171,9 +172,7 @@ impl ToolRegistry {
             }
         };
 
-        // The authorization record is committed before any side effect so a
-        // crash during execution still leaves the decision on record.
-        audit.persist(&ToolAuditRecord {
+        let authorization_record = ToolAuditRecord {
             tool: descriptor.name.to_owned(),
             phase: AuditPhase::Authorized,
             capability: Some(capability),
@@ -184,10 +183,27 @@ impl ToolRegistry {
             denial: None,
             arguments: redacted.clone(),
             unix_millis: context.unix_millis,
-        })?;
+        };
+        // The authorization record is committed before any side effect so a
+        // crash during execution still leaves the decision on record.
+        audit.persist(&authorization_record)?;
 
-        let authorization = Authorization::new(grant, capability);
-        let result = tool.invoke(&validated, context, &authorization);
+        // The broker and the audit sink are lent to the gate for exactly the
+        // duration of the call, so a tool that reaches a second resource has to
+        // ask the same broker again instead of riding the first decision.
+        let result = {
+            let gate = BrokerGate {
+                broker: RefCell::new(&mut *broker),
+                audit: RefCell::new(&mut *audit),
+                tool: descriptor.name,
+                capability,
+                requires_approval: descriptor.permission.requires_approval,
+                unix_millis: context.unix_millis,
+                arguments: redacted.clone(),
+            };
+            let authorization = Authorization::new(grant, capability, &gate);
+            tool.invoke(&validated, context, &authorization)
+        };
         let (outcome, reason) = match &result {
             Ok(_) => (AuditOutcome::Allowed, AuditReason::PolicySatisfied),
             Err(error) => (AuditOutcome::Failed, error.audit_reason()),
@@ -231,6 +247,78 @@ impl ToolRegistry {
             unix_millis,
         };
         audit.persist(&record).map_err(ToolError::Audit)
+    }
+}
+
+/// Re-authorization gate handed to a tool for the duration of one invocation.
+///
+/// It re-asks the same broker that authorized the invocation, and durably
+/// records every answer, so a tool that widens its resource set mid-flight is
+/// both re-checked and accounted for.
+struct BrokerGate<'a, B: PermissionBroker, S: ToolAuditSink> {
+    broker: RefCell<&'a mut B>,
+    audit: RefCell<&'a mut S>,
+    tool: &'static str,
+    capability: Capability,
+    requires_approval: bool,
+    unix_millis: u64,
+    arguments: Value,
+}
+
+impl<B: PermissionBroker, S: ToolAuditSink> BrokerGate<'_, B, S> {
+    fn refusal(&self, reason: DenialReason) -> PermissionError {
+        PermissionError {
+            tool: self.tool,
+            capability: self.capability,
+            reason,
+        }
+    }
+}
+
+impl<B: PermissionBroker, S: ToolAuditSink> ResourceGate for BrokerGate<'_, B, S> {
+    fn authorize(&self, resource: &Resource) -> Result<GrantId, PermissionError> {
+        let request = PermissionRequest {
+            tool: self.tool,
+            capability: self.capability,
+            resource: resource.clone(),
+            requires_approval: self.requires_approval,
+            unix_millis: self.unix_millis,
+        };
+        let decision = self.broker.borrow_mut().evaluate(&request);
+        let (grant, outcome, reason, denial) = match decision {
+            PermissionDecision::Granted(grant) => (
+                Some(grant),
+                AuditOutcome::Allowed,
+                AuditReason::PolicySatisfied,
+                None,
+            ),
+            PermissionDecision::Denied(denial) => (
+                None,
+                AuditOutcome::Denied,
+                AuditReason::PolicyRejected,
+                Some(denial),
+            ),
+        };
+        let record = ToolAuditRecord {
+            tool: self.tool.to_owned(),
+            phase: AuditPhase::Authorized,
+            capability: Some(self.capability),
+            resource: Some(resource.clone()),
+            grant,
+            outcome,
+            reason,
+            denial,
+            arguments: self.arguments.clone(),
+            unix_millis: self.unix_millis,
+        };
+        // An unrecorded authorization is treated as no authorization.
+        if self.audit.borrow_mut().persist(&record).is_err() {
+            return Err(self.refusal(DenialReason::AuditUnavailable));
+        }
+        match decision {
+            PermissionDecision::Granted(grant) => Ok(grant),
+            PermissionDecision::Denied(denial) => Err(self.refusal(denial)),
+        }
     }
 }
 

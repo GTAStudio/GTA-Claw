@@ -11,7 +11,10 @@
 //! 2. **Deny by default.** A tool cannot run without an
 //!    [`permission::Authorization`], and only [`registry::ToolRegistry`] can
 //!    mint one, after a [`permission::PermissionBroker`] granted the exact
-//!    capability and resource. Absent configuration means refusal.
+//!    capability and resource. Absent configuration means refusal. A tool that
+//!    reaches a second resource mid-invocation, such as a redirect onto another
+//!    host, must ask the same broker again through
+//!    [`permission::Authorization::authorize`].
 //! 3. **Confinement.** [`sandbox::Sandbox`] resolves every path against a
 //!    workspace root and refuses traversal, symlinks, reparse points, UNC
 //!    paths, alternate data streams, reserved device names and case-only
@@ -59,7 +62,7 @@ pub use fs::{
 pub use permission::{
     Approval, Authorization, Capability, DenialReason, DenyAllBroker, Grant, GrantId, GrantLedger,
     GrantRequest, GrantScope, PermissionBroker, PermissionDecision, PermissionDescriptor,
-    PermissionError, PermissionRequest, Resource, RiskLevel,
+    PermissionError, PermissionRequest, Resource, ResourceGate, RiskLevel,
 };
 pub use registry::{ToolRegistry, declared_capabilities};
 pub use sandbox::{

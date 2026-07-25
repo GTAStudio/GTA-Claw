@@ -459,9 +459,19 @@ impl<T: HttpTransport> NetFetchTool<T> {
     }
 
     /// Runs the validated request loop, revalidating every hop.
-    fn run(&self, destination: Destination, method: &str) -> Result<FetchOutcome, NetworkError> {
+    ///
+    /// Each hop that leaves the authorized host is re-submitted to the
+    /// permission broker through `authorization`, so a host-scoped grant cannot
+    /// be widened by an open redirect on the granted host.
+    fn run(
+        &self,
+        destination: Destination,
+        method: &str,
+        authorization: &Authorization<'_>,
+    ) -> Result<FetchOutcome, ToolError> {
         let mut transport = self.transport.borrow_mut();
         let mut hops: Vec<String> = vec![destination.url().to_owned()];
+        let mut authorized_host = destination.host();
         let mut current = destination;
         let mut redirects = 0_u8;
         loop {
@@ -490,7 +500,7 @@ impl<T: HttpTransport> NetFetchTool<T> {
             }
             let location = response.location.ok_or(NetworkError::MalformedRedirect)?;
             if redirects >= self.policy.max_redirects {
-                return Err(NetworkError::TooManyRedirects);
+                return Err(NetworkError::TooManyRedirects.into());
             }
             redirects += 1;
             let next = match &current {
@@ -501,6 +511,11 @@ impl<T: HttpTransport> NetFetchTool<T> {
                 // redirect is revalidated from scratch against the policy.
                 Destination::PrivateException { .. } => self.policy.validate(&location)?,
             };
+            let next_host = next.host();
+            if next_host != authorized_host {
+                authorization.authorize(&Resource::Host(next_host.clone()))?;
+                authorized_host = next_host;
+            }
             hops.push(next.url().to_owned());
             current = next;
         }
@@ -546,12 +561,12 @@ impl<T: HttpTransport> Tool for NetFetchTool<T> {
         &self,
         arguments: &Arguments,
         _context: &ToolContext<'_>,
-        _authorization: &Authorization<'_>,
+        authorization: &Authorization<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let url = arguments.required_text("url")?;
         let method = arguments.text("method").unwrap_or("GET");
         let destination = self.policy.validate(url)?;
-        let outcome = self.run(destination, method)?;
+        let outcome = self.run(destination, method, authorization)?;
         let truncated = outcome.body.len() >= self.policy.max_body_bytes;
         let body = String::from_utf8_lossy(&outcome.body).into_owned();
         Ok(ToolOutput::new(

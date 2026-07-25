@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::marker::PhantomData;
 
 use serde::Serialize;
 
@@ -257,6 +256,8 @@ pub enum DenialReason {
     BrokerDeniesAll,
     /// The tool requires an approval-backed grant and none was found.
     ApprovalRequired,
+    /// The decision could not be durably audited, so it was withdrawn.
+    AuditUnavailable,
 }
 
 impl Display for DenialReason {
@@ -267,6 +268,7 @@ impl Display for DenialReason {
             Self::GrantExhausted => "the matching grant has no remaining uses",
             Self::BrokerDeniesAll => "the permission broker denies all requests",
             Self::ApprovalRequired => "explicit approval is required",
+            Self::AuditUnavailable => "the authorization could not be audited",
         };
         formatter.write_str(message)
     }
@@ -403,23 +405,39 @@ impl PermissionBroker for GrantLedger {
     }
 }
 
+/// Re-authorization port for a tool whose reachable resource set can widen
+/// after the initial decision, such as an HTTP redirect onto a second host.
+///
+/// Implementations must consult the same broker that authorized the invocation
+/// and must fail closed.
+pub trait ResourceGate {
+    /// Asks whether the authorized capability also covers `resource`.
+    ///
+    /// This consumes grant budget exactly as the initial request did, so a
+    /// use-bounded grant cannot be stretched across extra resources.
+    fn authorize(&self, resource: &Resource) -> Result<GrantId, PermissionError>;
+}
+
 /// Unforgeable proof that a broker authorized exactly one tool invocation.
 ///
-/// The private field prevents construction outside this crate, so a tool
+/// The private fields prevent construction outside this crate, so a tool
 /// implementation cannot be driven without passing the authorization gate.
-#[derive(Debug)]
 pub struct Authorization<'a> {
     grant: GrantId,
     capability: Capability,
-    _lifetime: PhantomData<&'a ()>,
+    gate: &'a dyn ResourceGate,
 }
 
-impl Authorization<'_> {
-    pub(crate) const fn new(grant: GrantId, capability: Capability) -> Self {
+impl<'a> Authorization<'a> {
+    pub(crate) const fn new(
+        grant: GrantId,
+        capability: Capability,
+        gate: &'a dyn ResourceGate,
+    ) -> Self {
         Self {
             grant,
             capability,
-            _lifetime: PhantomData,
+            gate,
         }
     }
 
@@ -433,6 +451,25 @@ impl Authorization<'_> {
     #[must_use]
     pub const fn capability(&self) -> Capability {
         self.capability
+    }
+
+    /// Extends the authorization to a second resource reached mid-invocation.
+    ///
+    /// A tool must call this before touching any resource other than the one
+    /// its [`crate::tool::Tool::resource`] derived, because only that first
+    /// resource was authorized before execution began.
+    pub fn authorize(&self, resource: &Resource) -> Result<GrantId, PermissionError> {
+        self.gate.authorize(resource)
+    }
+}
+
+impl fmt::Debug for Authorization<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Authorization")
+            .field("grant", &self.grant)
+            .field("capability", &self.capability)
+            .finish_non_exhaustive()
     }
 }
 

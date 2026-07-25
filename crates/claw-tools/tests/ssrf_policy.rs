@@ -5,18 +5,24 @@
 //! should have refused, and the deny-all transport proves the tool cannot fall
 //! back to real I/O.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::rc::Rc;
 
 use claw_security::ssrf::{ResolutionError, TargetError};
-use claw_tools::audit::InMemoryAuditSink;
+use claw_tools::audit::{
+    AuditError, AuditOutcome, AuditPhase, AuditReason, InMemoryAuditSink, ToolAuditRecord,
+    ToolAuditSink,
+};
 use claw_tools::net::{
     DenyAllSearchProvider, DenyAllTransport, HttpRequest, HttpResponse, HttpTransport,
     NetFetchTool, NetworkError, PrivateOriginExceptions, SearchHit, SearchProvider, UrlPolicy,
     WebSearchTool,
 };
 use claw_tools::permission::{
-    Approval, Capability, GrantLedger, GrantRequest, GrantScope, Resource,
+    Approval, Capability, DenialReason, GrantLedger, GrantRequest, GrantScope, PermissionError,
+    Resource,
 };
 use claw_tools::registry::ToolRegistry;
 use claw_tools::sandbox::{Sandbox, SandboxLimits};
@@ -53,11 +59,22 @@ const FORBIDDEN_TARGETS: [&str; 24] = [
     "http://db.internal/",
 ];
 
+/// Shared record of every URL the transport was actually asked to fetch.
+#[derive(Clone, Default)]
+struct RequestLog(Rc<RefCell<Vec<String>>>);
+
+impl RequestLog {
+    fn urls(&self) -> Vec<String> {
+        self.0.borrow().clone()
+    }
+}
+
 /// A transport that replays scripted responses and never performs I/O.
 #[derive(Default)]
 struct RecordingTransport {
     resolutions: BTreeMap<String, Vec<IpAddr>>,
     responses: Vec<HttpResponse>,
+    log: RequestLog,
 }
 
 impl RecordingTransport {
@@ -77,6 +94,11 @@ impl RecordingTransport {
         self.responses.reverse();
         self
     }
+
+    fn logging(mut self, log: &RequestLog) -> Self {
+        self.log = log.clone();
+        self
+    }
 }
 
 impl HttpTransport for RecordingTransport {
@@ -87,8 +109,26 @@ impl HttpTransport for RecordingTransport {
             .ok_or(NetworkError::TransportFailed)
     }
 
-    fn fetch(&mut self, _request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
+    fn fetch(&mut self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
+        self.log.0.borrow_mut().push(request.url.clone());
         self.responses.pop().ok_or(NetworkError::TransportFailed)
+    }
+}
+
+/// A sink that refuses to record one specific host, proving an authorization
+/// that cannot be committed is withdrawn instead of assumed.
+struct SelectiveAuditSink {
+    reject_host: &'static str,
+    records: Vec<ToolAuditRecord>,
+}
+
+impl ToolAuditSink for SelectiveAuditSink {
+    fn persist(&mut self, record: &ToolAuditRecord) -> Result<(), AuditError> {
+        if record.resource == Some(Resource::Host(self.reject_host.to_owned())) {
+            return Err(AuditError::new("sink refused the record"));
+        }
+        self.records.push(record.clone());
+        Ok(())
     }
 }
 
@@ -370,6 +410,300 @@ fn a_public_fetch_revalidates_dns_on_every_hop() {
         audit.records()[0].resource,
         Some(Resource::Host("example.com".to_owned()))
     );
+    // The second host was reached, so it had to be authorized in its own right
+    // and recorded before the request left the host.
+    assert_eq!(audit.records().len(), 3);
+    assert_eq!(audit.records()[1].phase, AuditPhase::Authorized);
+    assert_eq!(audit.records()[1].outcome, AuditOutcome::Allowed);
+    assert_eq!(
+        audit.records()[1].resource,
+        Some(Resource::Host("cdn.example.net".to_owned()))
+    );
+}
+
+#[test]
+fn a_host_scoped_grant_does_not_survive_a_cross_host_redirect() {
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        unix_millis: NOW,
+    };
+    let log = RequestLog::default();
+    let transport = RecordingTransport::default()
+        .logging(&log)
+        .with_resolution("docs.example.com", &["93.184.216.34"])
+        .with_resolution("attacker.test", &["93.184.216.36"])
+        .returning(vec![
+            HttpResponse {
+                status: 302,
+                location: Some("https://attacker.test/collect?d=context".to_owned()),
+                body: Vec::new(),
+            },
+            HttpResponse {
+                status: 200,
+                location: None,
+                body: b"exfiltrated".to_vec(),
+            },
+        ]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+    let mut ledger = GrantLedger::new();
+    ledger.grant(GrantRequest {
+        capability: Capability::NetworkFetch,
+        scope: GrantScope::Host("docs.example.com".to_owned()),
+        expires_unix_millis: None,
+        max_uses: None,
+        approval: Approval::Explicit,
+    });
+    let mut audit = InMemoryAuditSink::new();
+
+    let error = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "https://docs.example.com/start" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect_err("an open redirect widened a host-scoped grant");
+    assert_eq!(
+        error.permission(),
+        Some(PermissionError {
+            tool: "net_fetch",
+            capability: Capability::NetworkFetch,
+            reason: DenialReason::NoMatchingGrant,
+        })
+    );
+    // The attacker host was never contacted: the refusal happened before the
+    // redirect was followed, so nothing was exfiltrated.
+    assert_eq!(
+        log.urls(),
+        vec!["https://docs.example.com/start".to_owned()]
+    );
+    assert_eq!(audit.records().len(), 3);
+    assert_eq!(audit.records()[1].phase, AuditPhase::Authorized);
+    assert_eq!(audit.records()[1].outcome, AuditOutcome::Denied);
+    assert_eq!(audit.records()[1].reason, AuditReason::PolicyRejected);
+    assert_eq!(
+        audit.records()[1].denial,
+        Some(DenialReason::NoMatchingGrant)
+    );
+    assert_eq!(
+        audit.records()[1].resource,
+        Some(Resource::Host("attacker.test".to_owned()))
+    );
+    assert_eq!(audit.records()[1].grant, None);
+    assert_eq!(audit.records()[2].phase, AuditPhase::Completed);
+    assert_eq!(audit.records()[2].outcome, AuditOutcome::Failed);
+}
+
+#[test]
+fn a_same_host_redirect_spends_no_additional_grant_budget() {
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        unix_millis: NOW,
+    };
+    let log = RequestLog::default();
+    let transport = RecordingTransport::default()
+        .logging(&log)
+        .with_resolution("docs.example.com", &["93.184.216.34"])
+        .returning(vec![
+            HttpResponse {
+                status: 301,
+                location: Some("https://docs.example.com/guide/v2".to_owned()),
+                body: Vec::new(),
+            },
+            HttpResponse {
+                status: 200,
+                location: None,
+                body: b"guide".to_vec(),
+            },
+        ]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+    let mut ledger = GrantLedger::new();
+    // A single-use grant proves the same-host hop asked the broker no second
+    // time: a second question would have found the grant exhausted.
+    ledger.grant(GrantRequest {
+        capability: Capability::NetworkFetch,
+        scope: GrantScope::Host("docs.example.com".to_owned()),
+        expires_unix_millis: None,
+        max_uses: Some(1),
+        approval: Approval::Explicit,
+    });
+    let mut audit = InMemoryAuditSink::new();
+
+    let output = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "https://docs.example.com/guide" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect("a same-host redirect stays inside the granted scope");
+    assert_eq!(output.content, "guide");
+    assert_eq!(
+        log.urls(),
+        vec![
+            "https://docs.example.com/guide".to_owned(),
+            "https://docs.example.com/guide/v2".to_owned(),
+        ]
+    );
+    assert_eq!(audit.records().len(), 2);
+    assert_eq!(audit.records()[0].phase, AuditPhase::Authorized);
+    assert_eq!(audit.records()[1].phase, AuditPhase::Completed);
+    assert_eq!(audit.records()[1].outcome, AuditOutcome::Allowed);
+}
+
+#[test]
+fn every_cross_host_redirect_is_re_authorized_in_order() {
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        unix_millis: NOW,
+    };
+    let log = RequestLog::default();
+    let transport = RecordingTransport::default()
+        .logging(&log)
+        .with_resolution("first.example.com", &["93.184.216.34"])
+        .with_resolution("second.example.net", &["93.184.216.35"])
+        .with_resolution("third.example.org", &["93.184.216.36"])
+        .returning(vec![
+            HttpResponse {
+                status: 302,
+                location: Some("https://second.example.net/b".to_owned()),
+                body: Vec::new(),
+            },
+            HttpResponse {
+                status: 302,
+                location: Some("https://third.example.org/c".to_owned()),
+                body: Vec::new(),
+            },
+            HttpResponse {
+                status: 200,
+                location: None,
+                body: b"final".to_vec(),
+            },
+        ]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+    let mut ledger = ledger();
+    let mut audit = InMemoryAuditSink::new();
+
+    let output = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "https://first.example.com/a" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect("an unrestricted grant covers every hop");
+    assert_eq!(output.content, "final");
+    assert_eq!(
+        log.urls(),
+        vec![
+            "https://first.example.com/a".to_owned(),
+            "https://second.example.net/b".to_owned(),
+            "https://third.example.org/c".to_owned(),
+        ]
+    );
+    let authorized: Vec<Option<Resource>> = audit
+        .records()
+        .iter()
+        .filter(|record| record.phase == AuditPhase::Authorized)
+        .map(|record| record.resource.clone())
+        .collect();
+    assert_eq!(
+        authorized,
+        vec![
+            Some(Resource::Host("first.example.com".to_owned())),
+            Some(Resource::Host("second.example.net".to_owned())),
+            Some(Resource::Host("third.example.org".to_owned())),
+        ]
+    );
+}
+
+#[test]
+fn an_unrecordable_redirect_authorization_is_withdrawn() {
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        unix_millis: NOW,
+    };
+    let log = RequestLog::default();
+    let transport = RecordingTransport::default()
+        .logging(&log)
+        .with_resolution("docs.example.com", &["93.184.216.34"])
+        .with_resolution("attacker.test", &["93.184.216.36"])
+        .returning(vec![
+            HttpResponse {
+                status: 302,
+                location: Some("https://attacker.test/collect".to_owned()),
+                body: Vec::new(),
+            },
+            HttpResponse {
+                status: 200,
+                location: None,
+                body: b"exfiltrated".to_vec(),
+            },
+        ]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+    // The grant itself is unrestricted, so only the audit failure can refuse
+    // the hop.
+    let mut ledger = ledger();
+    let mut audit = SelectiveAuditSink {
+        reject_host: "attacker.test",
+        records: Vec::new(),
+    };
+
+    let error = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "https://docs.example.com/start" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect_err("an unrecordable hop was allowed");
+    assert_eq!(
+        error.permission(),
+        Some(PermissionError {
+            tool: "net_fetch",
+            capability: Capability::NetworkFetch,
+            reason: DenialReason::AuditUnavailable,
+        })
+    );
+    assert_eq!(
+        log.urls(),
+        vec!["https://docs.example.com/start".to_owned()]
+    );
+    assert_eq!(audit.records.len(), 2);
+    assert_eq!(audit.records[1].phase, AuditPhase::Completed);
+    assert_eq!(audit.records[1].outcome, AuditOutcome::Failed);
 }
 
 #[test]
