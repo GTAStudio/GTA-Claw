@@ -152,6 +152,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Acquire locked Cargo dependencies
+        shell: pwsh
+        run: |
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop\Cargo.toml --locked
+
       - name: Download x64 and arm64 MSIX packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -268,10 +274,8 @@ jobs:
           $wix = (Get-ChildItem $admin -File -Recurse -Filter wix.exe | Select-Object -First 1).FullName
           & $wix --version
           "GTA_CLAW_WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
-            cargo fetch --manifest-path Cargo.toml --locked --target $target
-            cargo fetch --manifest-path desktop\Cargo.toml --locked --target $target
-          }
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop\Cargo.toml --locked
 
       - name: Import protected signing identity
         id: signing

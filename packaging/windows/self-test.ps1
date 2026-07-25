@@ -132,8 +132,12 @@ try {
         'cargo fetch --manifest-path Cargo.toml --locked',
         'cargo fetch --manifest-path desktop\Cargo.toml --locked'
     )) {
-        if ($workflow -notmatch "(?m)^\s*$([regex]::Escape($fetch))\s*$") {
-            throw "Windows packaging workflow lacks complete locked dependency acquisition: $fetch"
+        $matches = [regex]::Matches(
+            $workflow,
+            "(?m)^\s*$([regex]::Escape($fetch))\s*$"
+        )
+        if ($matches.Count -ne 3) {
+            throw "Expected complete locked dependency acquisition in package, bundle, and release jobs: $fetch"
         }
     }
     $passed++
