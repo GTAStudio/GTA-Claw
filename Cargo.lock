@@ -492,6 +492,7 @@ dependencies = [
  "claw-security",
  "rand_chacha 0.10.0",
  "secrecy",
+ "serde_json",
  "tokio",
  "url",
 ]

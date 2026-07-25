@@ -47,11 +47,44 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 71 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 75 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
+| `cargo deny check bans` | `bans ok` |
 | `cargo check -p gta-claw-ios --target aarch64-apple-ios` | **fails** |
+
+### Most of these tests compare this crate against itself
+
+That is appropriate for the logic they cover, but it cannot catch the case where
+this crate and `claw-security` agree with each other and both differ from
+upstream. A suite can be entirely green while the client asks the Gateway for
+the wrong scope.
+
+`tests/frozen_scope_contract.rs` therefore takes
+`compat/upstream/inventories/gateway-protocol.json` as its subject — read from
+the repository, not reconstructed in Rust, and byte-frozen so nothing in this
+crate contributes to it. It asserts that the scope registry this build can name
+is exactly the frozen six, and that each `IosAction`'s required scope equals the
+scope upstream records for a method that performs it (`sessions.list`,
+`talk.client.create`, `exec.approval.resolve`, `device.pair.approve`,
+`config.set`).
+
+The file opens with a control test, because every other assertion there is a
+lookup and a lookup against an empty or mis-parsed document passes vacuously.
+Without the control, three green tests would be evidence of nothing. The
+mapping was also mutation-checked: pointing `Administer` at `config.get`
+(`operator.read`) makes the test fail with
+
+```
+action administer the Gateway requires operator.admin but the frozen inventory
+records operator.read for config.get, so this client would ask the Gateway for
+the wrong scope
+```
+
+Incidental finding: the frozen inventories carry a UTF-8 BOM, which
+`serde_json` rejects as a leading value. Any Rust consumer of
+`compat/upstream/**` has to strip it.
 
 The iOS target check fails in `ring 0.17.14`, a mandatory transitive dependency
 of `claw-gateway-client`, before it reaches any code in this crate:
