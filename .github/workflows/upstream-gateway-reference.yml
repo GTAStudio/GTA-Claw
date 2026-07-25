@@ -22,12 +22,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Reject JavaScript toolchain artifacts
+        run: cargo test --locked --package claw-repo-policy --test repository_policy
+
       - name: Verify frozen compatibility snapshot
         shell: powershell
         run: ./compat/upstream/validate.ps1
-
-      - name: Reject JavaScript toolchain artifacts
-        run: cargo test --locked --package claw-repo-policy --test repository_policy
 
       - name: Test protocol and Gateway client against frozen contracts
         run: >-
