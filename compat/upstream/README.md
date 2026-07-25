@@ -11,7 +11,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
-| `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence` and `known_differences` may change |
+| `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence`, `implementation_pointers` and `known_differences` may change |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
 
 ## Validation
@@ -34,35 +34,59 @@ claim parity outcomes without evidence.
 | `status` | required `acceptance_evidence.status` | artifacts |
 | --- | --- | --- |
 | `unimplemented` | `missing` | none, and `known_differences` must stay the frozen baseline placeholder |
-| `partial` | `partial` | at least one, including at least one `rust_test` |
-| `implemented` | `accepted` | at least one, including at least one `rust_test` |
+| `partial` | `partial` | at least one, and every one names an enabled Rust test |
+| `implemented` | `accepted` | at least one, and every one names an enabled Rust test |
 
 `last_verified_sha` stays pinned to the frozen upstream SHA in every state.
 
 ### Acceptance evidence artifacts
 
-`acceptance_evidence.artifacts` is a list of typed objects, never bare strings:
+`acceptance_evidence.artifacts` is a list of objects with exactly two fields,
+never bare strings and never a `path#test` string:
 
 ```json
 {
-  "kind": "rust_test",
   "path": "crates/claw-migrate/tests/claude.rs",
-  "check": "migrates_every_frozen_claude_fixture"
+  "test": "migrates_every_frozen_claude_fixture"
 }
 ```
 
-| `kind` | `path` must be | `check` names | verified by |
-| --- | --- | --- | --- |
-| `rust_test` | a `.rs` file that contains a Rust test attribute | the test function | that name is declared as an **enabled** `#[test]` in that file |
-| `rust_source` | a `.rs` file | an implementation symbol | the symbol is declared in that file |
-| `rust_fixture` | a non-Rust fixture file | the test that consumes it | that test is an enabled `#[test]` in one of this row's own `rust_test` artifacts |
-| `ci_check` | a workflow under `.github/workflows` | a job key or step name | that key or `name:` value exists in the workflow |
+There is deliberately only one artifact shape, because there is only one thing
+that proves behaviour: an existing Rust file plus the name of an **enabled**
+`#[test]` inside it. `path` must be a repository-relative forward-slash `.rs`
+path that exists in the working tree, and `test` must be a Rust test path such
+as `codex_home_override_is_injected` or `providers::rollback_is_reversible`.
+
+A source file with no test name, a test file with no test name, a fixture and a
+workflow job all prove nothing on their own, so none of them is evidence. They
+also would not satisfy the Rust parity harness, which would leave rows that pass
+one trust root and fail the other.
 
 "Enabled `#[test]`" is decided by the same algorithm the Rust parity harness in
 `crates/claw-conformance` uses, ported line for line, so a row can never pass one
 trust root and fail the other. A cited name does **not** count when it is
 `#[ignore]`d, gated by a nearby `#[cfg(...)]`, inside a line or block comment,
 inside a string literal, or an ordinary function with no test attribute.
+
+### Implementation pointers are not evidence
+
+A row may optionally carry `implementation_pointers`, a list of
+`{ "path": ..., "note": ... }` objects, to record where the implementation
+lives:
+
+```json
+"implementation_pointers": [
+  { "path": "crates/claw-migrate/src/providers.rs", "note": "provider implementations" }
+]
+```
+
+This field is explicitly **non-evidential**. It never counts toward the
+"at least one artifact" requirement, and a row whose only content is pointers is
+rejected with `requires at least one acceptance evidence artifact naming an
+enabled Rust test`. Pointers are still validated — the path must exist and the
+same legacy-JavaScript bans apply — so a pointer cannot be used to smuggle a
+fabricated or TypeScript path into a ledger. An `unimplemented` row must not
+carry pointers at all.
 
 `partial` is a first-class state with exactly the same evidence burden as
 `implemented`; the two differ only in `acceptance_evidence.status`. A subsystem
@@ -83,8 +107,9 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
 
 1. Land the Rust implementation and its tests.
 2. Edit only the affected rows in `ledgers/*.json`: set `status`,
-   `acceptance_evidence.status`, the typed `artifacts`, and replace the baseline
-   `known_differences` placeholder with the real remaining differences.
+   `acceptance_evidence.status`, the `artifacts`, optionally
+   `implementation_pointers`, and replace the baseline `known_differences`
+   placeholder with the real remaining differences.
 3. Update `manifest.json` `evidence_policy.status_totals` so the three counts
    still sum to 47 and match reality. The validator cross-checks them.
 4. Regenerate the ledger digests through the reviewed command and review the

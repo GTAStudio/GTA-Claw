@@ -53,25 +53,36 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "kind",
         "path",
-        "check"
+        "test"
       ],
       "properties": {
-        "kind": {
-          "enum": [
-            "rust_test",
-            "rust_source",
-            "rust_fixture",
-            "ci_check"
-          ]
-        },
         "path": {
           "type": "string",
           "minLength": 1,
           "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
         },
-        "check": {
+        "test": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*$"
+        }
+      }
+    },
+    "implementation_pointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "note"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+        },
+        "note": {
           "type": "string",
           "minLength": 1
         }
@@ -191,6 +202,13 @@
           "items": {
             "type": "string",
             "minLength": 1
+          }
+        },
+        "implementation_pointers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/implementation_pointer"
           }
         }
       }

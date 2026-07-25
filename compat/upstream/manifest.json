@@ -97,13 +97,12 @@
                                                      "partial",
                                                      "implemented"
                                                  ],
-                            "artifact_kinds":  [
-                                                   "rust_test",
-                                                   "rust_source",
-                                                   "rust_fixture",
-                                                   "ci_check"
+                            "artifact_fields":  [
+                                                   "path",
+                                                   "test"
                                                ],
-                            "proof_artifact_kind":  "rust_test",
+                            "every_artifact_names_an_enabled_rust_test":  true,
+                            "implementation_pointers_are_not_acceptance_evidence":  true,
                             "status_totals":  {
                                                   "unimplemented":  47,
                                                   "partial":  0,

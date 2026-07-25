@@ -35,7 +35,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
-$ExpectedSchemaDigest = "32f04a7b53fa0968cc427bc6acb2cf9755d4a92dc130a0ebb8d574682dd4b052"
+$ExpectedSchemaDigest = "6a23b6d6579d30a52b90a0b4bd62772c58a0a27f6bab31b4102e2cdeb73490fc"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -48,7 +48,7 @@ $LedgerDigestHeader = @(
 $AllowedFeatureStatuses = @("unimplemented", "partial", "implemented")
 $BaselineKnownDifference =
     "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-$AllowedArtifactKinds = @("rust_test", "rust_source", "rust_fixture", "ci_check")
+$ArtifactFields = @("path", "test")
 $LegacyScriptExtensions = @(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 $LegacyPathPrefixes = @(
     "src/",
@@ -858,85 +858,52 @@ function Assert-RustTestSymbol {
 function Assert-EvidenceArtifact {
     param(
         [object]$Artifact,
-        [string]$Context,
-        [System.Collections.Generic.List[string]]$RustTestTexts
+        [string]$Context
     )
-    Assert-ExactPropertySet $Artifact @("kind", "path", "check") $Context
-    $kind = [string](Get-PropertyValue $Artifact "kind")
+    # Every acceptance evidence artifact is a proof obligation: an existing file
+    # plus the name of an ENABLED #[test] inside it. There is deliberately no
+    # weaker artifact shape. A source file, a fixture, a workflow or a test file
+    # with no test name proves nothing on its own and would not satisfy the Rust
+    # parity harness either, so such pointers belong in the separate,
+    # explicitly non-evidential implementation_pointers field.
+    Assert-ExactPropertySet $Artifact @("path", "test") $Context
     $relativePath = [string](Get-PropertyValue $Artifact "path")
-    $check = [string](Get-PropertyValue $Artifact "check")
-    if (-not (Test-OrdinalContains $AllowedArtifactKinds $kind)) {
-        Fail "$Context has unsupported acceptance evidence kind '$kind'"
-    }
+    $test = [string](Get-PropertyValue $Artifact "test")
     Assert-EvidencePathShape $relativePath $Context
     $absolutePath = Resolve-RepositoryFilePath $relativePath
     if ($null -eq $absolutePath) {
         Fail "$Context cites acceptance evidence path '$relativePath' that does not exist in the working tree"
     }
+    if (-not (Test-PathHasExtension $relativePath @(".rs"))) {
+        Fail "$Context acceptance evidence '$relativePath' must be a Rust source file containing the cited test"
+    }
+    if (-not ($test -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
+        Fail "$Context acceptance evidence test '$test' must be a Rust test path"
+    }
     $text = Get-RepositoryFileText $absolutePath
+    if ($text -cnotmatch '#\[\s*test\s*\]|#\[[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*::test') {
+        Fail "$Context acceptance evidence '$relativePath' contains no Rust test attribute"
+    }
+    $symbol = @($test.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
+    Assert-RustTestSymbol $text $symbol $relativePath $Context
+}
 
-    if (Test-OrdinalStringEqual $kind "rust_test") {
-        if (-not (Test-PathHasExtension $relativePath @(".rs"))) {
-            Fail "$Context rust_test acceptance evidence '$relativePath' must be a Rust source file"
-        }
-        if (-not ($check -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
-            Fail "$Context rust_test check '$check' must be a Rust test path"
-        }
-        if ($text -cnotmatch '#\[\s*test\s*\]|#\[[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*::test') {
-            Fail "$Context rust_test acceptance evidence '$relativePath' contains no Rust test attribute"
-        }
-        $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
-        Assert-RustTestSymbol $text $symbol $relativePath $Context
-        return
+function Assert-ImplementationPointer {
+    param(
+        [object]$Pointer,
+        [string]$Context
+    )
+    # Never acceptance evidence. Still validated, so a pointer cannot be used to
+    # smuggle a fabricated or legacy-JavaScript path into the ledger.
+    Assert-ExactPropertySet $Pointer @("path", "note") $Context
+    $relativePath = [string](Get-PropertyValue $Pointer "path")
+    $note = [string](Get-PropertyValue $Pointer "note")
+    Assert-EvidencePathShape $relativePath $Context
+    if ($null -eq (Resolve-RepositoryFilePath $relativePath)) {
+        Fail "$Context cites implementation pointer path '$relativePath' that does not exist in the working tree"
     }
-
-    if (Test-OrdinalStringEqual $kind "rust_source") {
-        if (-not (Test-PathHasExtension $relativePath @(".rs"))) {
-            Fail "$Context rust_source acceptance evidence '$relativePath' must be a Rust source file"
-        }
-        if (-not ($check -cmatch '\A[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*\z')) {
-            Fail "$Context rust_source check '$check' must be a Rust symbol path"
-        }
-        $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
-        $declaration = '\b(?:fn|struct|enum|trait|union|type|const|static|mod|impl)[ \t]+(?:[A-Za-z0-9_:<>,&'' \t]*[ \t])?' +
-            [regex]::Escape($symbol) + '\b'
-        if ($text -cnotmatch $declaration) {
-            Fail "$Context cites symbol '$symbol' that is not declared in '$relativePath'"
-        }
-        return
-    }
-
-    if (Test-OrdinalStringEqual $kind "rust_fixture") {
-        if (Test-PathHasExtension $relativePath @(".rs")) {
-            Fail "$Context rust_fixture acceptance evidence '$relativePath' must be fixture data, not Rust source"
-        }
-        if (-not ($check -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
-            Fail "$Context rust_fixture check '$check' must name the Rust test that consumes the fixture"
-        }
-        $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
-        $consumed = $false
-        foreach ($testText in $RustTestTexts) {
-            if (Test-DeclaresEnabledRustTest $testText $symbol) {
-                $consumed = $true
-                break
-            }
-        }
-        if (-not $consumed) {
-            Fail "$Context rust_fixture cites test '$symbol' that is not one of the rust_test artifacts of this row"
-        }
-        return
-    }
-
-    if (-not $relativePath.StartsWith(".github/workflows/", [StringComparison]::Ordinal) -or
-        -not (Test-PathHasExtension $relativePath @(".yml", ".yaml"))) {
-        Fail "$Context ci_check acceptance evidence '$relativePath' must be a workflow under .github/workflows"
-    }
-    if (-not ($check -cmatch '\A[A-Za-z0-9][A-Za-z0-9 ._/-]*\z')) {
-        Fail "$Context ci_check check '$check' must be a workflow job key or step name"
-    }
-    $escapedCheck = [regex]::Escape($check)
-    if ($text -cnotmatch ('(?m)^\s*(?:name:\s*["'']?' + $escapedCheck + '["'']?\s*$|' + $escapedCheck + ':\s*$)')) {
-        Fail "$Context cites workflow check '$check' that does not exist in '$relativePath'"
+    if ([string]::IsNullOrWhiteSpace($note)) {
+        Fail "$Context implementation pointer must explain what the path contributes"
     }
 }
 
@@ -950,6 +917,10 @@ function Assert-FeatureLifecycle {
     $evidenceStatus = [string]$evidence.status
     $artifacts = @($evidence.artifacts)
     $differences = @($Feature.known_differences)
+    $pointers = @()
+    if (Has-Property $Feature "implementation_pointers") {
+        $pointers = @($Feature.implementation_pointers)
+    }
 
     if (-not (Test-OrdinalContains $AllowedFeatureStatuses $status)) {
         Fail "$Context has unsupported lifecycle status '$status'"
@@ -958,6 +929,9 @@ function Assert-FeatureLifecycle {
     if (Test-OrdinalStringEqual $status "unimplemented") {
         if (-not (Test-OrdinalStringEqual $evidenceStatus "missing") -or $artifacts.Count -ne 0) {
             Fail "$Context must start unimplemented with an empty evidence placeholder"
+        }
+        if ($pointers.Count -ne 0) {
+            Fail "$Context is unimplemented and must not record implementation pointers"
         }
         if ($differences.Count -ne 1 -or
             -not (Test-OrdinalStringEqual ([string]$differences[0]) $BaselineKnownDifference)) {
@@ -971,7 +945,7 @@ function Assert-FeatureLifecycle {
         Fail "$Context status '$status' requires acceptance_evidence.status '$expectedEvidenceStatus', got '$evidenceStatus'"
     }
     if ($artifacts.Count -eq 0) {
-        Fail "$Context status '$status' requires at least one acceptance evidence artifact"
+        Fail "$Context status '$status' requires at least one acceptance evidence artifact naming an enabled Rust test"
     }
     foreach ($difference in $differences) {
         if (Test-OrdinalStringEqual ([string]$difference) $BaselineKnownDifference) {
@@ -980,7 +954,6 @@ function Assert-FeatureLifecycle {
     }
 
     $identities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $rustTestTexts = New-Object System.Collections.Generic.List[string]
     for ($index = 0; $index -lt $artifacts.Count; $index += 1) {
         $artifact = $artifacts[$index]
         if (-not (Test-JsonObject $artifact)) {
@@ -989,20 +962,19 @@ function Assert-FeatureLifecycle {
         if (-not $identities.Add((ConvertTo-CanonicalJson $artifact))) {
             Fail "$Context repeats the same acceptance evidence artifact"
         }
-        if (Test-OrdinalStringEqual ([string](Get-PropertyValue $artifact "kind")) "rust_test") {
-            $relativePath = [string](Get-PropertyValue $artifact "path")
-            Assert-EvidencePathShape $relativePath "$Context.acceptance_evidence.artifacts[$index]"
-            $absolutePath = Resolve-RepositoryFilePath $relativePath
-            if ($null -ne $absolutePath) {
-                $rustTestTexts.Add((Get-RepositoryFileText $absolutePath))
-            }
+        Assert-EvidenceArtifact $artifact "$Context.acceptance_evidence.artifacts[$index]"
+    }
+
+    $pointerIdentities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $pointers.Count; $index += 1) {
+        $pointer = $pointers[$index]
+        if (-not (Test-JsonObject $pointer)) {
+            Fail "$Context implementation pointer $index must be a typed object"
         }
-    }
-    for ($index = 0; $index -lt $artifacts.Count; $index += 1) {
-        Assert-EvidenceArtifact $artifacts[$index] "$Context.acceptance_evidence.artifacts[$index]" $rustTestTexts
-    }
-    if ($rustTestTexts.Count -eq 0) {
-        Fail "$Context status '$status' requires at least one rust_test acceptance evidence artifact"
+        if (-not $pointerIdentities.Add((ConvertTo-CanonicalJson $pointer))) {
+            Fail "$Context repeats the same implementation pointer"
+        }
+        Assert-ImplementationPointer $pointer "$Context.implementation_pointers[$index]"
     }
 }
 
@@ -1370,8 +1342,9 @@ function Assert-ManifestDeclarations {
         "acceptance_evidence_state",
         "legacy_typescript_is_not_rust_acceptance_evidence",
         "allowed_statuses",
-        "artifact_kinds",
-        "proof_artifact_kind",
+        "artifact_fields",
+        "every_artifact_names_an_enabled_rust_test",
+        "implementation_pointers_are_not_acceptance_evidence",
         "status_totals"
     ) "manifest.evidence_policy"
     if (-not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.initial_status) "unimplemented") -or
@@ -1380,8 +1353,9 @@ function Assert-ManifestDeclarations {
         Fail "manifest evidence policy mismatch"
     }
     if (-not (Test-JsonValueEqual $Manifest.evidence_policy.allowed_statuses $AllowedFeatureStatuses) -or
-        -not (Test-JsonValueEqual $Manifest.evidence_policy.artifact_kinds $AllowedArtifactKinds) -or
-        -not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.proof_artifact_kind) "rust_test")) {
+        -not (Test-JsonValueEqual $Manifest.evidence_policy.artifact_fields $ArtifactFields) -or
+        $Manifest.evidence_policy.every_artifact_names_an_enabled_rust_test -ne $true -or
+        $Manifest.evidence_policy.implementation_pointers_are_not_acceptance_evidence -ne $true) {
         Fail "manifest evidence lifecycle policy mismatch"
     }
     Assert-ExactPropertySet $Manifest.evidence_policy.status_totals $AllowedFeatureStatuses "manifest.evidence_policy.status_totals"

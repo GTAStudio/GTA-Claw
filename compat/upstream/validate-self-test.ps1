@@ -185,14 +185,23 @@ function Save-FirstLedger {
 
 function New-Artifact {
     param(
-        [string]$Kind,
         [string]$Path,
-        [string]$Check
+        [string]$Test
     )
     return [pscustomobject][ordered]@{
-        kind = $Kind
         path = $Path
-        check = $Check
+        test = $Test
+    }
+}
+
+function New-Pointer {
+    param(
+        [string]$Path,
+        [string]$Note
+    )
+    return [pscustomobject][ordered]@{
+        path = $Path
+        note = $Note
     }
 }
 
@@ -202,11 +211,15 @@ function Set-FeatureTransition {
         [string]$Status,
         [string]$EvidenceStatus,
         [object[]]$Artifacts,
+        [object[]]$Pointers,
         [switch]$KeepBaselineDifference
     )
     $Feature.status = $Status
     $Feature.acceptance_evidence.status = $EvidenceStatus
     $Feature.acceptance_evidence.artifacts = @($Artifacts)
+    if ($null -ne $Pointers -and $Pointers.Count -gt 0) {
+        $Feature | Add-Member -NotePropertyName "implementation_pointers" -NotePropertyValue @($Pointers) -Force
+    }
     if (-not $KeepBaselineDifference) {
         $Feature.known_differences = @("Rust parity proven by the cited acceptance evidence.")
     }
@@ -233,6 +246,7 @@ function Set-ForgedTransition {
     param(
         [string]$CaseRoot,
         [object[]]$Artifacts,
+        [object[]]$Pointers,
         [string]$EvidenceStatus = "accepted",
         [switch]$KeepBaselineDifference
     )
@@ -242,6 +256,7 @@ function Set-ForgedTransition {
         -Status "implemented" `
         -EvidenceStatus $EvidenceStatus `
         -Artifacts $Artifacts `
+        -Pointers $Pointers `
         -KeepBaselineDifference:$KeepBaselineDifference
     Save-FirstLedger $CaseRoot $ledger
     Set-ManifestStatusTotals $CaseRoot 46 0 1
@@ -259,11 +274,11 @@ $cases = @(
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
-            Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_source" $RealSourcePath $RealSourceSymbol),
-                (New-Artifact "rust_fixture" $RealFixturePath $RealTestName),
-                (New-Artifact "ci_check" $RealWorkflowPath $RealWorkflowCheck)
+            Set-ForgedTransition $caseRoot -Artifacts @(
+                (New-Artifact $RealTestPath $RealTestName)
+            ) -Pointers @(
+                (New-Pointer $RealSourcePath "Rust implementation of the protocol version constant."),
+                (New-Pointer $RealWorkflowPath "Workflow that runs the cited test.")
             )
         }
     },
@@ -279,8 +294,10 @@ $cases = @(
                 -Status "partial" `
                 -EvidenceStatus "partial" `
                 -Artifacts @(
-                    (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                    (New-Artifact "rust_source" $RealSourcePath $RealSourceSymbol)
+                    (New-Artifact $RealTestPath $RealTestName)
+                ) `
+                -Pointers @(
+                    (New-Pointer $RealSourcePath "Registration is done; behaviour is not.")
                 )
             Save-FirstLedger $caseRoot $ledger
             Set-ManifestStatusTotals $caseRoot 46 1 0
@@ -313,7 +330,7 @@ $cases = @(
                 -Feature $ledger.features[0] `
                 -Status "partial" `
                 -EvidenceStatus "accepted" `
-                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName))
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName))
             Save-FirstLedger $caseRoot $ledger
             Set-ManifestStatusTotals $caseRoot 46 1 0
         }
@@ -329,7 +346,7 @@ $cases = @(
                 -Feature $ledger.features[0] `
                 -Status "partial" `
                 -EvidenceStatus "partial" `
-                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName)) `
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName)) `
                 -KeepBaselineDifference
             Save-FirstLedger $caseRoot $ledger
             Set-ManifestStatusTotals $caseRoot 46 1 0
@@ -346,7 +363,7 @@ $cases = @(
                 -Feature $ledger.features[0] `
                 -Status "partial" `
                 -EvidenceStatus "partial" `
-                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName))
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName))
             Save-FirstLedger $caseRoot $ledger
         }
     },
@@ -358,7 +375,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/enabled.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/enabled.rs" $SyntheticTestName)
             )
         }
     },
@@ -370,7 +387,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/async_enabled.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/async_enabled.rs" $SyntheticTestName)
             )
         }
     },
@@ -382,7 +399,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/ignored.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/ignored.rs" $SyntheticTestName)
             )
         }
     },
@@ -394,7 +411,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/cfg_gated.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/cfg_gated.rs" $SyntheticTestName)
             )
         }
     },
@@ -406,7 +423,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/line_commented.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/line_commented.rs" $SyntheticTestName)
             )
         }
     },
@@ -418,7 +435,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/block_commented.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/block_commented.rs" $SyntheticTestName)
             )
         }
     },
@@ -430,7 +447,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/plain_fn.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/plain_fn.rs" $SyntheticTestName)
             )
         }
     },
@@ -442,20 +459,72 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/string_literal.rs" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/string_literal.rs" $SyntheticTestName)
             )
         }
     },
     [ordered]@{
-        name = "fixture-consumed-by-a-plain-function"
-        expected_message = "rust_fixture cites test '$SyntheticTestName' that is not one of the rust_test artifacts of this row"
+        name = "non-rust-file-cited-as-evidence"
+        expected_message = "must be a Rust source file containing the cited test"
         regenerate_digests = $true
         repository_root = $SyntheticRoot
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/synthetic/tests/plain_fn.rs" "unrelated_but_real"),
-                (New-Artifact "rust_fixture" "crates/synthetic/data/fixture.json" $SyntheticTestName)
+                (New-Artifact "crates/synthetic/tests/enabled.rs" $SyntheticTestName),
+                (New-Artifact "crates/synthetic/data/fixture.json" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "pointer-with-nonexistent-path"
+        expected_message = "cites implementation pointer path 'crates/synthetic/src/imaginary.rs' that does not exist in the working tree"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot -Artifacts @(
+                (New-Artifact "crates/synthetic/tests/enabled.rs" $SyntheticTestName)
+            ) -Pointers @(
+                (New-Pointer "crates/synthetic/src/imaginary.rs" "Claimed implementation.")
+            )
+        }
+    },
+    [ordered]@{
+        name = "pointer-with-typescript-path"
+        expected_message = "is a legacy TypeScript/JavaScript file and is never Rust acceptance evidence"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot -Artifacts @(
+                (New-Artifact $RealTestPath $RealTestName)
+            ) -Pointers @(
+                (New-Pointer "src/server.ts" "Legacy implementation.")
+            )
+        }
+    },
+    [ordered]@{
+        name = "unimplemented-with-implementation-pointer"
+        expected_message = "is unimplemented and must not record implementation pointers"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0] | Add-Member -NotePropertyName "implementation_pointers" -NotePropertyValue @(
+                (New-Pointer $RealSourcePath "Started work.")
+            ) -Force
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "implementation-pointers-are-not-acceptance-evidence"
+        expected_message = "requires at least one acceptance evidence artifact naming an enabled Rust test"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot -Artifacts @() -Pointers @(
+                (New-Pointer $RealSourcePath "The whole implementation lives here, honest."),
+                (New-Pointer $RealWorkflowPath "And CI runs it.")
             )
         }
     },
@@ -475,7 +544,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "crates/claw-security/tests/fabricated_parity.rs" $RealTestName)
+                (New-Artifact "crates/claw-security/tests/fabricated_parity.rs" $RealTestName)
             )
         }
     },
@@ -486,7 +555,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "Crates/claw-security/tests/frozen_gateway_registry.rs" $RealTestName)
+                (New-Artifact "Crates/claw-security/tests/frozen_gateway_registry.rs" $RealTestName)
             )
         }
     },
@@ -497,7 +566,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" "src/server.ts" $RealTestName)
+                (New-Artifact "src/server.ts" $RealTestName)
             )
         }
     },
@@ -508,8 +577,8 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_fixture" "compat/legacy/scripts/verify.mjs" $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact "compat/legacy/scripts/verify.mjs" $RealTestName)
             )
         }
     },
@@ -520,8 +589,8 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_fixture" "compat/legacy/contract.json" $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact "compat/legacy/contract.json" $RealTestName)
             )
         }
     },
@@ -532,8 +601,8 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_fixture" "compat/upstream/inventories/gateway-protocol.json" $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact "compat/upstream/inventories/gateway-protocol.json" $RealTestName)
             )
         }
     },
@@ -544,19 +613,31 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath "proves_total_parity")
+                (New-Artifact $RealTestPath "proves_total_parity")
             )
         }
     },
     [ordered]@{
-        name = "implemented-with-fabricated-source-symbol"
-        expected_message = "cites symbol 'FabricatedParityMarker' that is not declared in"
+        name = "implemented-with-source-symbol-instead-of-test"
+        expected_message = "does not match JSON Schema pattern"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_source" $RealSourcePath "FabricatedParityMarker")
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact $RealSourcePath $RealSourceSymbol)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-source-file-and-lowercase-symbol"
+        expected_message = "cites test 'current_protocol_version' that is not declared as an enabled #[test] in"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact $RealSourcePath "current_protocol_version")
             )
         }
     },
@@ -567,44 +648,51 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RustFileWithoutTests $RealTestName)
+                (New-Artifact $RustFileWithoutTests $RealTestName)
             )
         }
     },
     [ordered]@{
-        name = "implemented-without-any-rust-test"
-        expected_message = "requires at least one rust_test acceptance evidence artifact"
+        name = "implemented-with-fixture-as-evidence"
+        expected_message = "must be a Rust source file containing the cited test"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_source" $RealSourcePath $RealSourceSymbol),
-                (New-Artifact "ci_check" $RealWorkflowPath $RealWorkflowCheck)
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact $RealFixturePath "never_run_anywhere")
             )
         }
     },
     [ordered]@{
-        name = "implemented-with-unconsumed-fixture"
-        expected_message = "rust_fixture cites test 'never_run_anywhere' that is not one of the rust_test artifacts of this row"
+        name = "implemented-with-workflow-as-evidence"
+        expected_message = "must be a Rust source file containing the cited test"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_fixture" $RealFixturePath "never_run_anywhere")
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact $RealWorkflowPath $RealWorkflowCheck)
             )
         }
     },
     [ordered]@{
-        name = "implemented-with-fabricated-ci-check"
-        expected_message = "cites workflow check 'parity-proof' that does not exist in"
+        name = "artifact-missing-test-field"
+        expected_message = "missing required properties [test]"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
-            Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "ci_check" $RealWorkflowPath "parity-proof")
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                -Feature $ledger.features[0] `
+                -Status "implemented" `
+                -EvidenceStatus "accepted" `
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName))
+            $ledger.features[0].acceptance_evidence.artifacts = @(
+                [pscustomobject][ordered]@{ path = $RealTestPath }
             )
+            Save-FirstLedger $caseRoot $ledger
+            Set-ManifestStatusTotals $caseRoot 46 0 1
         }
     },
     [ordered]@{
@@ -630,7 +718,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName)
             ) -EvidenceStatus "partial"
         }
     },
@@ -641,7 +729,7 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName)
             ) -KeepBaselineDifference
         }
     },
@@ -651,8 +739,8 @@ $cases = @(
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName),
-                (New-Artifact "rust_test" $RealTestPath $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName),
+                (New-Artifact $RealTestPath $RealTestName)
             )
         }
     },
@@ -664,7 +752,7 @@ $cases = @(
             param($caseRoot)
             $ledger = Get-FirstLedger $caseRoot
             $ledger.features[0].acceptance_evidence.artifacts = @(
-                (New-Artifact "rust_test" $RealTestPath $RealTestName)
+                (New-Artifact $RealTestPath $RealTestName)
             )
             Save-FirstLedger $caseRoot $ledger
         }
@@ -701,7 +789,7 @@ $cases = @(
                 -Feature $ledger.features[0] `
                 -Status "implemented" `
                 -EvidenceStatus "accepted" `
-                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName))
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName))
             Save-FirstLedger $caseRoot $ledger
         }
     },
@@ -875,15 +963,35 @@ $cases = @(
         }
     },
     [ordered]@{
-        name = "manifest-artifact-kind-widening"
+        name = "manifest-artifact-field-widening"
         expected_message = "manifest evidence lifecycle policy mismatch"
         mutate = {
             param($caseRoot)
             $path = Join-Path $caseRoot "manifest.json"
             $manifest = Read-Json $path
-            $manifest.evidence_policy.artifact_kinds = @(
-                "rust_test", "rust_source", "rust_fixture", "ci_check", "typescript_test"
-            )
+            $manifest.evidence_policy.artifact_fields = @("path", "test", "kind")
+            Write-Json $path $manifest
+        }
+    },
+    [ordered]@{
+        name = "manifest-test-requirement-downgrade"
+        expected_message = "manifest evidence lifecycle policy mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "manifest.json"
+            $manifest = Read-Json $path
+            $manifest.evidence_policy.every_artifact_names_an_enabled_rust_test = $false
+            Write-Json $path $manifest
+        }
+    },
+    [ordered]@{
+        name = "manifest-pointer-promotion-to-evidence"
+        expected_message = "manifest evidence lifecycle policy mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "manifest.json"
+            $manifest = Read-Json $path
+            $manifest.evidence_policy.implementation_pointers_are_not_acceptance_evidence = $false
             Write-Json $path $manifest
         }
     },
@@ -1034,9 +1142,35 @@ $cases = @(
         expected_message = "contains JSON Schema additional properties [waiver]"
         mutate = {
             param($caseRoot)
-            $artifact = New-Artifact "rust_test" $RealTestPath $RealTestName
+            $artifact = New-Artifact $RealTestPath $RealTestName
             $artifact | Add-Member -NotePropertyName "waiver" -NotePropertyValue "approved"
             Set-ForgedTransition $caseRoot @($artifact)
+        }
+    },
+    [ordered]@{
+        name = "pointer-additional-properties"
+        expected_message = "contains JSON Schema additional properties [test]"
+        mutate = {
+            param($caseRoot)
+            $pointer = New-Pointer $RealSourcePath "Implementation."
+            $pointer | Add-Member -NotePropertyName "test" -NotePropertyValue $RealTestName
+            Set-ForgedTransition $caseRoot `
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName)) `
+                -Pointers @($pointer)
+        }
+    },
+    [ordered]@{
+        name = "duplicated-implementation-pointer"
+        expected_message = "violates JSON Schema uniqueItems"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot `
+                -Artifacts @((New-Artifact $RealTestPath $RealTestName)) `
+                -Pointers @(
+                    (New-Pointer $RealSourcePath "Implementation."),
+                    (New-Pointer $RealSourcePath "Implementation.")
+                )
         }
     },
     [ordered]@{
