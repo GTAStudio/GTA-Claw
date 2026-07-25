@@ -8,6 +8,7 @@ use std::{
 
 use rmcp::{
     RoleClient, RoleServer,
+    model::{InitializeResult, ProtocolVersion},
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
 };
@@ -55,6 +56,28 @@ impl BoundedIoDiagnostics {
             .expect("bounded stdio diagnostics lock poisoned");
         if failure.is_none() {
             *failure = Some(format!("stdio JSON-RPC message is invalid: {error}"));
+        }
+    }
+
+    fn record_initialize_result(&self, value: &Value) {
+        let Some(result) = value.get("result") else {
+            return;
+        };
+        let Ok(initialize) = serde_json::from_value::<InitializeResult>(result.clone()) else {
+            return;
+        };
+        if ProtocolVersion::KNOWN_VERSIONS.contains(&initialize.protocol_version) {
+            return;
+        }
+        let mut failure = self
+            .protocol_failure
+            .lock()
+            .expect("bounded stdio diagnostics lock poisoned");
+        if failure.is_none() {
+            *failure = Some(format!(
+                "server selected unsupported version {}",
+                initialize.protocol_version
+            ));
         }
     }
 
@@ -216,6 +239,9 @@ where
                         return Err(protocol_io_error(error));
                     }
                 };
+                for value in &values {
+                    reader_diagnostics.record_initialize_result(value);
+                }
                 if reader_disconnected.is_cancelled() {
                     return Ok(());
                 }
@@ -369,7 +395,7 @@ fn join_io_error(error: tokio::task::JoinError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use rmcp::{
-        RoleServer,
+        RoleClient, RoleServer,
         service::{RxJsonRpcMessage, TxJsonRpcMessage},
         transport::Transport,
     };
@@ -554,6 +580,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "MCP protocol violation: stdio frame contains invalid JSON: key must be a string at line 1 column 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_initialize_version_wins_over_writer_failure() {
+        let (mut peer_input, transport_input) = duplex(1024);
+        let (transport_output, peer_output) = duplex(1024);
+        drop(peer_output);
+        let mut transport =
+            BoundedIoTransport::<RoleClient>::new(transport_input, transport_output);
+        let diagnostics = transport.diagnostics();
+        peer_input
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"1900-01-01\",\"capabilities\":{},\"serverInfo\":{\"name\":\"bad-version\",\"version\":\"1.0.0\"}}}\n",
+            )
+            .await
+            .expect("write unsupported initialize result");
+        let received: Option<RxJsonRpcMessage<RoleClient>> = transport.receive().await;
+        assert!(
+            received.is_some(),
+            "unsupported initialize result must reach the service"
+        );
+        let initialized: TxJsonRpcMessage<RoleClient> = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .expect("valid initialized notification");
+        let writer_error = transport
+            .send(initialized)
+            .await
+            .expect_err("closed peer read half must fail the writer");
+
+        let error = diagnostics
+            .promote_after_disconnect(McpError::Io(writer_error))
+            .await;
+
+        assert_eq!(
+            error.to_string(),
+            "MCP protocol violation: server selected unsupported version 1900-01-01"
         );
     }
 
