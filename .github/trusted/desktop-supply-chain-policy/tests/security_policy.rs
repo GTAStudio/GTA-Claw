@@ -2788,8 +2788,8 @@ fn base_owned_repository_ratchet_rejects_node_in_future_mobile_workflows() {
         ),
         ("android-packaging.yml", "      - run: npm ci\n"),
     ] {
-        let trusted = final_tree(&format!("repository-{workflow}-ratchet-base"));
-        let candidate = final_tree(&format!("repository-{workflow}-ratchet-candidate"));
+        let trusted = bootstrap_tree(&format!("repository-{workflow}-ratchet-base"));
+        let candidate = bootstrap_tree(&format!("repository-{workflow}-ratchet-candidate"));
         let path = format!(".github/workflows/{workflow}");
         fs::write(
             candidate.join(&path),
