@@ -730,6 +730,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gta-claw-ios"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-gateway-client",
+ "claw-platform",
+ "claw-protocol",
+ "claw-security",
+ "rand_chacha 0.10.0",
+ "secrecy",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

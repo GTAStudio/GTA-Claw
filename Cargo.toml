@@ -3,6 +3,7 @@ members = [
   "apps/gta-claw-android",
   "apps/gta-claw-cli",
   "apps/gta-claw-daemon",
+  "apps/gta-claw-ios",
   "crates/claw-application",
   "crates/claw-config",
   "crates/claw-conformance",
