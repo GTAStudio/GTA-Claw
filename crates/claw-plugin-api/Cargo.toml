@@ -1,0 +1,18 @@
+[package]
+name = "claw-plugin-api"
+description = "WebAssembly plugin ABI contract, manifest schema, capability model and frozen plugin registry for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ed25519-dalek = "=3.0.0"
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
