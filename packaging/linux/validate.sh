@@ -70,6 +70,7 @@ native_rootfs_files() {
     usr/lib/sysusers.d/gta-claw.conf \
     usr/libexec/gta-claw/gta-claw-daemon \
     usr/libexec/gta-claw/gta-claw-runtime-ready \
+    usr/libexec/gta-claw/gta-claw-start-authorized \
     usr/libexec/gta-claw/gta-claw-state-init \
     usr/share/doc/gta-claw/LICENSE.txt \
     usr/share/doc/gta-claw/NOTICE.txt \
@@ -96,6 +97,7 @@ native_tar_files() {
     lib/systemd/system/gta-claw-state-init.service \
     lib/sysusers.d/gta-claw.conf \
     libexec/gta-claw-runtime-ready \
+    libexec/gta-claw-start-authorized \
     libexec/gta-claw-direct-config \
     libexec/gta-claw-state-init \
     package-version \
@@ -200,6 +202,7 @@ compare_native_sources() {
     "systemd/80-gta-claw.preset|usr/lib/systemd/system-preset/80-gta-claw.preset" \
     "sysusers/gta-claw.conf|usr/lib/sysusers.d/gta-claw.conf" \
     "libexec/gta-claw-runtime-ready|usr/libexec/gta-claw/gta-claw-runtime-ready" \
+    "libexec/gta-claw-start-authorized|usr/libexec/gta-claw/gta-claw-start-authorized" \
     "libexec/gta-claw-state-init|usr/libexec/gta-claw/gta-claw-state-init" \
     "LICENSE.txt|usr/share/doc/gta-claw/LICENSE.txt" \
     "NOTICE.txt|usr/share/doc/gta-claw/NOTICE.txt" \
@@ -240,6 +243,7 @@ validate_published_native_root() {
     usr/bin/gta-claw-cli \
     usr/libexec/gta-claw/gta-claw-daemon \
     usr/libexec/gta-claw/gta-claw-runtime-ready \
+    usr/libexec/gta-claw/gta-claw-start-authorized \
     usr/libexec/gta-claw/gta-claw-state-init; do
     assert_mode "$root" "$executable" 755
   done
@@ -264,6 +268,8 @@ validate_published_native_root() {
     "$root/usr/libexec/gta-claw/gta-claw-state-init"
   validate_runtime_ready_contract \
     "$root/usr/libexec/gta-claw/gta-claw-runtime-ready"
+  validate_start_authorization_contract \
+    "$root/usr/libexec/gta-claw/gta-claw-start-authorized"
   reject_forbidden_runtime_content "$root"
   verify_sha256_manifest "$root" "$root/usr/share/doc/gta-claw/SHA256SUMS"
 }
@@ -339,6 +345,7 @@ for source_target in \
   "systemd/80-gta-claw.preset|lib/systemd/system-preset/80-gta-claw.preset" \
   "sysusers/gta-claw.conf|lib/sysusers.d/gta-claw.conf" \
   "libexec/gta-claw-runtime-ready|libexec/gta-claw-runtime-ready" \
+  "libexec/gta-claw-start-authorized|libexec/gta-claw-start-authorized" \
   "direct/config-safeio.py|libexec/gta-claw-direct-config" \
   "libexec/gta-claw-state-init|libexec/gta-claw-state-init" \
   "systemd/gta-claw.env|etc/gta-claw/gta-claw.env" \
@@ -375,6 +382,7 @@ for executable in \
   install.sh \
   uninstall.sh \
   libexec/gta-claw-runtime-ready \
+  libexec/gta-claw-start-authorized \
   libexec/gta-claw-direct-config \
   libexec/gta-claw-state-init; do
   assert_mode "$archive_root" "$executable" 755
@@ -427,6 +435,8 @@ validate_initializer_service_contract \
 validate_sysusers_contract "$archive_root/lib/sysusers.d/gta-claw.conf"
 validate_initializer_wrapper_contract "$archive_root/libexec/gta-claw-state-init"
 validate_runtime_ready_contract "$archive_root/libexec/gta-claw-runtime-ready"
+validate_start_authorization_contract \
+  "$archive_root/libexec/gta-claw-start-authorized"
 [[ "$(stat -c '%a' "$archive_root/install.sh")" == "755" &&
   "$(stat -c '%a' "$archive_root/uninstall.sh")" == "755" ]] ||
   die "direct lifecycle scripts are not executable"
@@ -731,10 +741,14 @@ validate_initializer_wrapper_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
 validate_runtime_ready_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
+validate_start_authorization_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 [[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-state-init")" == "755" ]] ||
   die "initializer wrapper mode is not 0755"
 [[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready")" == "755" ]] ||
   die "runtime readiness wrapper mode is not 0755"
+[[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized")" == "755" ]] ||
+  die "start authorization wrapper mode is not 0755"
 [[ ! -e "$rootfs/usr/lib/systemd/system/gta-claw-daemon.socket" ]] ||
   die "unsupported socket unit was installed"
 [[ "$(cat "$rootfs/usr/lib/systemd/system-preset/80-gta-claw.preset")" == \

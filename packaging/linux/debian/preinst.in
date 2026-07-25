@@ -14,6 +14,7 @@ replacement_fence=$runtime_directory/replacement-fenced
 lock=/var/lib/gta-claw-protected/state.writer.lock
 was_active=/run/gta-claw-daemon.was-active
 ready=/run/gta-claw-daemon.ready-for-replacement
+rollback_complete=/run/gta-claw-daemon.preinst-rollback-complete
 prepared=0
 runtime_touched=0
 created_runtime_mask=0
@@ -192,9 +193,11 @@ restore_preinst_failure() {
       systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
         fence_rollback_failure
       systemctl daemon-reload >/dev/null 2>&1 || fence_rollback_failure
-      if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-        systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
+      if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+        if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+          [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
           fence_rollback_failure
+        fi
       fi
       if [ "$old_initializer_active" -eq 1 ]; then
         systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
@@ -214,6 +217,13 @@ restore_preinst_failure() {
     if [ "$had_runtime_directory" -eq 0 ]; then
       rmdir "$runtime_directory" >/dev/null 2>&1 || fence_rollback_failure
     fi
+    if [ -L "$rollback_complete" ] ||
+      { [ -e "$rollback_complete" ] && [ ! -f "$rollback_complete" ]; }; then
+      fence_rollback_failure
+    fi
+    touch "$rollback_complete" || fence_rollback_failure
+    chown 0:0 "$rollback_complete" || fence_rollback_failure
+    chmod 0600 "$rollback_complete" || fence_rollback_failure
   fi
   exit "$status"
 }
@@ -248,7 +258,7 @@ stop_runtime_for_replacement() {
   load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
   case "$load_state" in
     masked)
-      if [ "$had_replacement_fence" -ne 1 ] || [ "$had_failure_marker" -ne 1 ]; then
+      if [ "$had_replacement_fence" -ne 1 ]; then
         echo "refusing externally masked gta-claw daemon" >&2
         return 1
       fi
@@ -291,10 +301,10 @@ stop_runtime_for_replacement() {
       return 1
     } ;;
   esac
+  verify_writer_lock_released
   if [ "$package_fenced" -eq 0 ]; then
     stop_initializer_for_replacement
   fi
-  verify_writer_lock_released
 }
 
 case "$1" in
@@ -306,6 +316,7 @@ case "$1" in
       exit 1
     fi
     if [ -z "${DPKG_ROOT:-}" ]; then
+      rm -f "$rollback_complete"
       had_failure_marker="$(marker_state "$failure_marker")"
       had_complete_marker="$(marker_state "$complete_marker")"
       had_replacement_fence="$(marker_state "$replacement_fence")"

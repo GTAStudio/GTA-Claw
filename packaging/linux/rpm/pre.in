@@ -196,9 +196,11 @@ restore_pre_failure() {
       elif [ "$created_runtime_mask" -eq 1 ]; then
         systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
           fence_failed_rollback
-        if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-          systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
+        if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+          if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+            [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
             fence_failed_rollback
+          fi
         fi
         if [ "$old_initializer_active" -eq 1 ]; then
           systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
@@ -263,7 +265,7 @@ if [ -d /run/systemd/system ]; then
   load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
   case "$load_state" in
     masked)
-      if [ "$had_replacement_fence" -ne 1 ] || [ "$had_failure_marker" -ne 1 ]; then
+      if [ "$had_replacement_fence" -ne 1 ]; then
         echo "refusing externally masked gta-claw daemon" >&2
         exit 1
       fi
@@ -308,10 +310,10 @@ if [ -d /run/systemd/system ]; then
       exit 1
     } ;;
   esac
+  verify_writer_lock_released
   if [ "$package_fenced" -eq 0 ]; then
     stop_initializer_for_replacement
   fi
-  verify_writer_lock_released
 else
   touch "$replacement_fence"
   verify_writer_lock_released

@@ -10,6 +10,7 @@ runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 complete_marker=$runtime_directory/initialization-complete
 replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
 ready_marker=/run/gta-claw-daemon.ready-for-replacement
 was_active_marker=/run/gta-claw-daemon.was-active
 persistent_runtime_directory=/var/lib/gta-claw-install
@@ -27,6 +28,10 @@ lock_held=0
 
 if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
   echo "gta-claw direct removal requires real and effective UID 0" >&2
+  exit 1
+fi
+if [ -e "$authorization_marker" ] || [ -L "$authorization_marker" ]; then
+  echo "gta-claw direct removal refuses an outstanding start authorization" >&2
   exit 1
 fi
 
@@ -375,6 +380,16 @@ if [ -d /run/systemd/system ]; then
   systemctl mask --runtime gta-claw-daemon.service
   systemctl stop gta-claw-daemon.service
   verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+fi
+
+acquire_writer_lock
+verify_held_writer_lock ||
+  {
+    echo "gta-claw writer-lock ownership could not be held for removal" >&2
+    exit 1
+  }
+
+if [ -d /run/systemd/system ]; then
   initializer_load_state="$(systemctl show -P LoadState gta-claw-state-init.service)"
   case "$initializer_load_state" in
     loaded | masked)
@@ -389,7 +404,6 @@ if [ -d /run/systemd/system ]; then
   esac
 fi
 
-acquire_writer_lock
 verify_held_writer_lock ||
   {
     echo "gta-claw writer-lock ownership could not be held for removal" >&2
@@ -410,6 +424,7 @@ rm -f -- \
   /usr/bin/gta-claw-cli \
   /usr/libexec/gta-claw/gta-claw-daemon \
   /usr/libexec/gta-claw/gta-claw-runtime-ready \
+  /usr/libexec/gta-claw/gta-claw-start-authorized \
   /usr/libexec/gta-claw/gta-claw-state-init \
   /usr/lib/systemd/system/gta-claw-daemon.service \
   /usr/lib/systemd/system/gta-claw-state-init.service \

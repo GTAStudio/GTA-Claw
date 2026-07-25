@@ -12,6 +12,8 @@ runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 complete_marker=$runtime_directory/initialization-complete
 replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
+authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized
 lock=/var/lib/gta-claw-protected/state.writer.lock
 was_active_marker=/run/gta-claw-daemon.was-active
 persistent_runtime_directory=/var/lib/gta-claw-install
@@ -245,6 +247,10 @@ interrupt_install_after() {
 fail_install_runtime() {
   trap - 0 HUP INT TERM
   failure=0
+  if ! rm -f "$authorization_marker"; then
+    echo "gta-claw start authorization could not be cancelled" >&2
+    failure=1
+  fi
   if ! ensure_persistent_failure_fence; then
     echo "gta-claw persistent install failure marker could not be retained" >&2
     failure=1
@@ -320,6 +326,7 @@ if [ "$resuming_persistent_transaction" -eq 0 ]; then
   rm -f "$persistent_was_active_marker"
 fi
 ensure_failure_fence || fail_install_runtime
+rm -f "$authorization_marker" || fail_install_runtime
 trap cancel_incomplete_install 0 HUP INT TERM
 was_active=0
 if [ -d /run/systemd/system ]; then
@@ -339,6 +346,8 @@ install -D -m 0755 "$source_root/libexec/gta-claw-state-init" \
   /usr/libexec/gta-claw/gta-claw-state-init
 install -D -m 0755 "$source_root/libexec/gta-claw-runtime-ready" \
   /usr/libexec/gta-claw/gta-claw-runtime-ready
+install -D -m 0755 "$source_root/libexec/gta-claw-start-authorized" \
+  "$authorization_helper"
 install -D -m 0644 "$source_root/lib/systemd/system/gta-claw-daemon.service" \
   /usr/lib/systemd/system/gta-claw-daemon.service
 install -D -m 0644 "$source_root/lib/systemd/system/gta-claw-state-init.service" \
@@ -399,8 +408,9 @@ if [ -d /run/systemd/system ]; then
   if ! systemctl daemon-reload; then
     fail_install_runtime
   fi
-  if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+  if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+      [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
       fail_install_runtime
     fi
   fi
@@ -410,10 +420,17 @@ if [ -d /run/systemd/system ]; then
     fi
   fi
   if [ "$was_active" -eq 1 ]; then
+    if ! "$authorization_helper" arm "$$"; then
+      fail_install_runtime
+    fi
+    interrupt_install_after authorization
     if ! systemctl restart gta-claw-daemon.service; then
       fail_install_runtime
     fi
     if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+      fail_install_runtime
+    fi
+    if ! "$authorization_helper" clear; then
       fail_install_runtime
     fi
     rm -f \
@@ -421,6 +438,7 @@ if [ -d /run/systemd/system ]; then
       "$was_active_marker"
   fi
 fi
+rm -f "$authorization_marker"
 rm -f "$failure_marker" "$complete_marker" "$replacement_fence"
 rm -f "$persistent_failure_marker" "$persistent_was_active_marker"
 rmdir "$persistent_runtime_directory" >/dev/null 2>&1 || true

@@ -16,6 +16,7 @@ if [ -d /run/systemd/system ]; then
       /run/gta-claw-state-init/remove-was-active \
       /run/gta-claw-state-init/remove-prepared \
       /run/gta-claw-state-init/remove-was-package-fenced \
+      /run/gta-claw-state-init/start-authorized \
       /run/gta-claw-state-init/initialization-failed \
       /run/gta-claw-state-init/replacement-fenced
   fi

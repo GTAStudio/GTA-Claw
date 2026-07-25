@@ -9,8 +9,7 @@ ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon
 Type=notify
 NotifyAccess=main
 TimeoutStartSec=60s
-ExecStartPre=/usr/bin/test ! -e /run/gta-claw-state-init/initialization-failed
-ExecStartPre=/usr/bin/test ! -e /var/lib/gta-claw-install/transaction-failed
+ExecCondition=+/usr/libexec/gta-claw/gta-claw-start-authorized check
 ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected
 ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected
 User=gta-claw

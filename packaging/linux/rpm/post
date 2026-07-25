@@ -8,6 +8,8 @@ runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 complete_marker=$runtime_directory/initialization-complete
 replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
+authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized
 fresh_install=/run/gta-claw-daemon.fresh-install
 was_active=/run/gta-claw-daemon.was-active
 lock=/var/lib/gta-claw-protected/state.writer.lock
@@ -154,6 +156,10 @@ stop_for_idempotent_configure() {
 fence_failed_runtime() {
   trap - 0 HUP INT TERM
   failure=0
+  if ! rm -f "$authorization_marker"; then
+    echo "gta-claw RPM start authorization could not be cancelled" >&2
+    failure=1
+  fi
   ensure_failure_fence ||
     {
       echo "gta-claw RPM configure failure marker could not be retained" >&2
@@ -221,6 +227,7 @@ fail_configure_after() {
 
 trap cancel_incomplete_configure 0 HUP INT TERM
 ensure_failure_fence
+rm -f "$authorization_marker"
 if [ -d /run/systemd/system ]; then
   stop_for_idempotent_configure
 else
@@ -240,8 +247,9 @@ if [ -d /run/systemd/system ]; then
     fence_failed_runtime
   fi
   fail_configure_after daemon-reload
-  if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+  if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+      [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
       fence_failed_runtime
     fi
   fi
@@ -253,6 +261,9 @@ if [ -d /run/systemd/system ]; then
     rm -f "$fresh_install"
   fi
   if [ -e "$was_active" ]; then
+    if ! "$authorization_helper" arm "$$"; then
+      fence_failed_runtime
+    fi
     if ! systemctl restart gta-claw-daemon.service >/dev/null; then
       fence_failed_runtime
     fi
@@ -260,11 +271,15 @@ if [ -d /run/systemd/system ]; then
     if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
       fence_failed_runtime
     fi
+    if ! "$authorization_helper" clear; then
+      fence_failed_runtime
+    fi
     fail_configure_after readiness
   fi
 else
   rm -f "$replacement_fence"
 fi
+rm -f "$authorization_marker"
 rm -f "$failure_marker" "$complete_marker"
 configure_complete=1
 trap - 0 HUP INT TERM

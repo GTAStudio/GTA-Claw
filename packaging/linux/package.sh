@@ -415,6 +415,10 @@ copy_regular_input \
   "$archive_stage/libexec/gta-claw-runtime-ready" \
   0755
 copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-start-authorized" \
+  "$archive_stage/libexec/gta-claw-start-authorized" \
+  0755
+copy_regular_input \
   "$LINUX_DIR/systemd/gta-claw-daemon.service" \
   "$archive_stage/lib/systemd/system/gta-claw-daemon.service" \
   0644
@@ -453,7 +457,8 @@ chmod 0755 \
   "$archive_stage/install.sh" \
   "$archive_stage/uninstall.sh" \
   "$archive_stage/libexec/gta-claw-state-init" \
-  "$archive_stage/libexec/gta-claw-runtime-ready"
+  "$archive_stage/libexec/gta-claw-runtime-ready" \
+  "$archive_stage/libexec/gta-claw-start-authorized"
 chmod 0640 "$archive_stage/etc/gta-claw/gta-claw.env"
 chmod 0600 "$archive_stage/etc/gta-claw/credentials/daemon.conf"
 validate_service_contract \
@@ -463,6 +468,8 @@ validate_initializer_service_contract \
 validate_sysusers_contract "$archive_stage/lib/sysusers.d/gta-claw.conf"
 validate_initializer_wrapper_contract "$archive_stage/libexec/gta-claw-state-init"
 validate_runtime_ready_contract "$archive_stage/libexec/gta-claw-runtime-ready"
+validate_start_authorization_contract \
+  "$archive_stage/libexec/gta-claw-start-authorized"
 validate_direct_lifecycle_contract \
   "$archive_stage/install.sh" \
   "$archive_stage/uninstall.sh"
@@ -507,6 +514,10 @@ copy_regular_input \
   "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready" \
   0755
 copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-start-authorized" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized" \
+  0755
+copy_regular_input \
   "$LINUX_DIR/systemd/gta-claw.env" \
   "$rootfs/etc/gta-claw/gta-claw.env" \
   0640
@@ -532,6 +543,7 @@ chmod 0755 "$rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 chmod 0640 "$rootfs/etc/gta-claw/gta-claw.env"
 chmod 0600 "$rootfs/etc/gta-claw/credentials/daemon.conf"
 validate_service_contract "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service"
@@ -542,6 +554,8 @@ validate_initializer_wrapper_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
 validate_runtime_ready_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
+validate_start_authorization_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 reject_forbidden_runtime_content "$rootfs"
 
 deb_root="$WORK_DIR/deb-root"
@@ -704,6 +718,7 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 /usr/bin/gta-claw-cli
 /usr/libexec/gta-claw/gta-claw-daemon
 /usr/libexec/gta-claw/gta-claw-runtime-ready
+/usr/libexec/gta-claw/gta-claw-start-authorized
 /usr/libexec/gta-claw/gta-claw-state-init
 /usr/lib/systemd/system/gta-claw-daemon.service
 /usr/lib/systemd/system/gta-claw-state-init.service

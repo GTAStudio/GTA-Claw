@@ -82,8 +82,9 @@ if [ "$installed_count" -gt 0 ] && [ -e "$remove_prepared" ]; then
   if ! systemctl daemon-reload >/dev/null; then
     fence_failed_restore
   fi
-  if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1; then
+  if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+      [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
       fence_failed_restore
     fi
   fi

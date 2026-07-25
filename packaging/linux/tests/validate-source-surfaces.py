@@ -28,6 +28,7 @@ EXECUTABLE_SURFACES = frozenset(
         "lib/oci-validation.sh",
         "lib/worktree-git.sh",
         "libexec/gta-claw-runtime-ready",
+        "libexec/gta-claw-start-authorized",
         "libexec/gta-claw-state-init",
         "lifecycle-test.sh",
         "oci/cri-probe.sh",

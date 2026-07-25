@@ -808,8 +808,7 @@ validate_service_contract() {
     'Requires=gta-claw-state-init.service' \
     'After=local-fs.target gta-claw-state-init.service' \
     'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
-    'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-state-init/initialization-failed' \
-    'ExecStartPre=/usr/bin/test ! -e /var/lib/gta-claw-install/transaction-failed' \
+    'ExecCondition=+/usr/libexec/gta-claw/gta-claw-start-authorized check' \
     'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'Type=notify' \
@@ -939,6 +938,26 @@ validate_runtime_ready_contract() {
   done
 }
 
+validate_start_authorization_contract() {
+  local wrapper="$1"
+  local required
+  for required in \
+    'failure_marker=$runtime_directory/initialization-failed' \
+    'replacement_fence=$runtime_directory/replacement-fenced' \
+    'authorization_marker=$runtime_directory/start-authorized' \
+    'persistent_failure_marker=/var/lib/gta-claw-install/transaction-failed' \
+    'process_start_time()' \
+    'authorization_valid()' \
+    'arm_authorization()' \
+    'clear_authorization()' \
+    '[ "$authorized_pid" = "$PPID" ]' \
+    '0:0:600:1' \
+    'case "${1:-check}" in'; do
+    grep -F -- "$required" "$wrapper" >/dev/null ||
+      die "start authorization contract missing: $required"
+  done
+}
+
 validate_direct_lifecycle_contract() {
   local installer="$1"
   local uninstaller="$2"
@@ -952,6 +971,7 @@ validate_direct_lifecycle_contract() {
     'gta-claw-direct-config' \
     'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
     'persistent_was_active_marker=$persistent_runtime_directory/was-active' \
+    'authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized' \
     'ensure_failure_fence' \
     'ensure_persistent_failure_fence' \
     'trap cancel_incomplete_install 0 HUP INT TERM' \
@@ -970,6 +990,8 @@ validate_direct_lifecycle_contract() {
     '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
     '/usr/libexec/gta-claw/gta-claw-state-init' \
     '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
+    '"$authorization_helper" arm "$$"' \
+    '"$authorization_helper" clear' \
     'systemctl restart gta-claw-daemon.service'; do
     grep -F -- "$required" "$installer" >/dev/null ||
       die "direct installer lifecycle contract missing: $required"

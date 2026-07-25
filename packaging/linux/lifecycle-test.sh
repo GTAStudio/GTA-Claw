@@ -222,6 +222,22 @@ assert_active_restart() {
     die "active service was not restarted during replacement"
 }
 
+assert_start_fenced() {
+  local label="$1"
+  local active_state
+  local main_pid
+  local control_pid
+  sudo systemctl start gta-claw-daemon.service >/dev/null 2>&1 || true
+  sleep 0.2
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid:$control_pid" in
+    inactive:0:0 | failed:0:0) ;;
+    *) die "$label allowed a process or automatic retry: $active_state:$main_pid:$control_pid" ;;
+  esac
+}
+
 wait_for_writer_lock() {
   local deadline=$((SECONDS + 15))
   local status
@@ -334,9 +350,7 @@ simulate_direct_reboot() {
   [[ -e /var/lib/gta-claw-install/transaction-failed &&
     -e /var/lib/gta-claw-install/was-active ]] ||
     die "direct hard interruption lost its persistent transaction journal"
-  if sudo systemctl start gta-claw-daemon.service; then
-    die "direct hard interruption allowed a start after simulated reboot"
-  fi
+  assert_start_fenced "direct hard interruption after simulated reboot"
   ! systemctl is-active --quiet gta-claw-daemon.service ||
     die "direct hard interruption left the daemon active after simulated reboot"
 }
@@ -388,12 +402,17 @@ direct_upgrade_snapshot="$(state_identity_snapshot)"
 sudo "$direct2/install.sh"
 assert_active_restart "$direct_pid"
 assert_identity_preserved "$direct_upgrade_snapshot"
-for direct_boundary in unit daemon; do
+for direct_boundary in unit daemon authorization; do
   direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
   if sudo env \
     GTA_CLAW_DIRECT_TEST_INTERRUPT_AFTER="$direct_boundary" \
     "$direct2/install.sh"; then
     die "direct install ignored a hard interruption at $direct_boundary"
+  fi
+  if [[ "$direct_boundary" == "authorization" ]]; then
+    [[ -e /run/gta-claw-state-init/start-authorized ]] ||
+      die "direct authorization interruption left no transaction capability"
+    assert_start_fenced "dead direct start authorization"
   fi
   simulate_direct_reboot
   sudo "$direct2/install.sh"
@@ -432,9 +451,7 @@ fi
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "direct restart failure left the service active"
 remove_failure_dropin
-if sudo systemctl start gta-claw-daemon.service; then
-  die "direct restart failure did not retain the runtime start fence"
-fi
+assert_start_fenced "direct restart failure"
 sudo "$direct2/install.sh"
 systemctl is-active --quiet gta-claw-daemon.service ||
   die "direct restart retry did not resume the previously active service"
@@ -445,9 +462,7 @@ if sudo "$direct2/install.sh"; then
 fi
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "direct failed initialization left the service active"
-if sudo systemctl start gta-claw-daemon.service; then
-  die "direct initialization failure did not retain the runtime start fence"
-fi
+assert_start_fenced "direct initialization failure"
 sudo rm "$namespace/state.sqlite-shm"
 sudo "$direct2/install.sh"
 systemctl is-active --quiet gta-claw-daemon.service ||
@@ -483,8 +498,9 @@ fi
   die "direct lock rejection unlinked the daemon"
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "direct lock rejection changed the inactive runtime state"
-[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
-  die "direct lock rejection changed persistent enablement"
+direct_lock_enable_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
+[[ "$direct_lock_enable_state" == "enabled" ]] ||
+  die "direct lock rejection changed persistent enablement: $direct_lock_enable_state"
 stop_manual_writer_lock
 sudo systemctl start gta-claw-daemon.service
 
@@ -638,9 +654,7 @@ fi
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "policy-denied Debian restart left the service active"
 remove_policy_denial
-if sudo systemctl start gta-claw-daemon.service; then
-  die "Debian restart failure did not retain the runtime start fence"
-fi
+assert_start_fenced "Debian restart failure"
 sudo dpkg --configure gta-claw
 systemctl is-active --quiet gta-claw-daemon.service ||
   die "Debian restart recovery did not resume the service"
@@ -651,9 +665,7 @@ if sudo dpkg -i "$deb2"; then
 fi
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "Debian failed initialization restarted the service"
-if sudo systemctl start gta-claw-daemon.service; then
-  die "Debian initialization failure did not retain the runtime start fence"
-fi
+assert_start_fenced "Debian initialization failure"
 sudo rm "$namespace/state.sqlite-shm"
 sudo dpkg -i "$deb2"
 systemctl is-active --quiet gta-claw-daemon.service ||
@@ -872,9 +884,7 @@ if sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"; then
 fi
 ! systemctl is-active --quiet gta-claw-daemon.service ||
   die "RPM restart failure left the service active"
-if sudo systemctl start gta-claw-daemon.service; then
-  die "RPM restart failure did not retain the runtime start fence"
-fi
+assert_start_fenced "RPM restart failure"
 [[ "$(rpm -q gta-claw | wc -l)" -gt 1 ]] ||
   die "RPM restart failure did not exercise the multi-instance guard"
 if sudo rpm -Uvh --nodeps --oldpackage "$rpm1"; then
@@ -901,9 +911,7 @@ set -e
 [[ "$(sudo stat -c '%u:%g:%a' /run/gta-claw-state-init/initialization-failed)" == \
   "0:0:644" ]] ||
   die "RPM failure marker is not root-owned mode 0644"
-if sudo systemctl start gta-claw-daemon.service; then
-  die "RPM initialization failure did not retain the runtime start fence"
-fi
+assert_start_fenced "RPM initialization failure"
 if [[ "$rpm_init_status" -eq 0 ]]; then
   echo "RPM reported failed %post as a warning; runtime remained fenced" >&2
 fi

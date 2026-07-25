@@ -9,9 +9,12 @@ export PATH
 remove_was_active=/run/gta-claw-daemon.remove-was-active
 remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
 remove_was_enabled_runtime=/run/gta-claw-daemon.remove-was-enabled-runtime
+persistent_enable_link=/etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service
+runtime_enable_link=/run/systemd/system/multi-user.target.wants/gta-claw-daemon.service
 runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
 remove_initializer_was_active=$runtime_directory/remove-was-active
 remove_prepared=$runtime_directory/remove-prepared
 remove_was_package_fenced=$runtime_directory/remove-was-package-fenced
@@ -102,6 +105,23 @@ restore_enablement() {
   fi
 }
 
+remove_enablement() {
+  link=
+  if [ -e "$remove_was_enabled" ]; then
+    link="$persistent_enable_link"
+  elif [ -e "$remove_was_enabled_runtime" ]; then
+    link="$runtime_enable_link"
+  else
+    return 0
+  fi
+  if [ ! -L "$link" ] ||
+    [ "$(readlink "$link")" != "/usr/lib/systemd/system/gta-claw-daemon.service" ]; then
+    echo "gta-claw enablement link changed during removal: $link" >&2
+    return 1
+  fi
+  rm -f -- "$link"
+}
+
 retire_remove_journal() {
   rm -f \
     "$remove_was_active" \
@@ -132,9 +152,11 @@ restore_on_failure() {
       systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
         fence_failed_restore
       systemctl daemon-reload >/dev/null 2>&1 || fence_failed_restore
-      if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-        systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
+      if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+        if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+          [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
           fence_failed_restore
+        fi
       fi
       restore_enablement >/dev/null 2>&1 || fence_failed_restore
       if [ -e "$remove_initializer_was_active" ]; then
@@ -155,6 +177,10 @@ restore_on_failure() {
 
 if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   [ -d /run/systemd/system ]; then
+  if [ -e "$authorization_marker" ] || [ -L "$authorization_marker" ]; then
+    echo "refusing removal during a gta-claw start authorization transaction" >&2
+    exit 1
+  fi
   ensure_runtime_directory
   rm -f \
     "$remove_was_active" \
@@ -222,13 +248,9 @@ if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   systemctl mask --runtime gta-claw-daemon.service
   deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
   verify_unit_stopped gta-claw-daemon.service
-  if [ -e "$remove_was_enabled" ]; then
-    systemctl disable gta-claw-daemon.service >/dev/null
-  elif [ -e "$remove_was_enabled_runtime" ]; then
-    systemctl disable --runtime gta-claw-daemon.service >/dev/null
-  fi
-  stop_initializer
   verify_writer_lock_released
+  remove_enablement
+  stop_initializer
   prepared=1
   trap - 0 HUP INT TERM
 fi
