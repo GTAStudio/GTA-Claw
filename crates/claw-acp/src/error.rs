@@ -8,7 +8,7 @@ use std::time::Duration;
 pub enum AcpInteropError {
     /// An ACP protocol operation failed.
     #[error("ACP protocol failed: {0}")]
-    Protocol(#[from] agent_client_protocol::Error),
+    Protocol(#[from] crate::Error),
     /// An operating-system operation failed.
     #[error("ACP I/O failed: {0}")]
     Io(#[from] std::io::Error),

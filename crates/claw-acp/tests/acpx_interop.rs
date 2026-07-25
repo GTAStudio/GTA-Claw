@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::schema::{ContentBlock, TextContent};
 use claw_acp::{
     acpx::{
         AcpxRuntime, AcpxSessionStore, AcpxTurn, HarnessConfig, LeaseState, MemoryAcpxSessionStore,
@@ -19,6 +18,7 @@ use claw_acp::{
     },
     debug_client::DebugClientConfig,
     error::{AcpInteropError, Result as AcpResult},
+    schema::{ContentBlock, TextContent},
 };
 use claw_mcp::registry::{ServerConfig, ServerTransportConfig};
 use serde_json::json;

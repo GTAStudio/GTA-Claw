@@ -13,7 +13,8 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::{
+use claw_acp::bridge::{AcpBackend, AcpBridge, AcpFuture, AcpSessionContext};
+use claw_acp::{
     Error,
     schema::{
         AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
@@ -28,7 +29,6 @@ use agent_client_protocol::{
         SetSessionModeResponse, StopReason, TextContent, ToolCall, ToolCallId,
     },
 };
-use claw_acp::bridge::{AcpBackend, AcpBridge, AcpFuture, AcpSessionContext};
 use serde_json::{Value, json};
 
 #[derive(Debug, Default)]
@@ -150,12 +150,14 @@ impl AcpBackend for FixtureBackend {
                         .data("fixture expected the client to deny permission"));
                 }
             }
-            context.notify(
-                request.session_id.clone(),
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    TextContent::new("fixture response"),
-                ))),
-            )?;
+            context
+                .notify(
+                    request.session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("fixture response"),
+                    ))),
+                )
+                .await?;
             if std::env::var_os("WAIT_FOR_CANCEL").is_some() {
                 while !self.cancelled.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(10)).await;

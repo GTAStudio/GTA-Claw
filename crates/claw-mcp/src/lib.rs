@@ -22,9 +22,30 @@ pub(crate) fn endpoint_allows_credentials(url: &url::Url) -> bool {
     url.scheme() == "https"
         || (url.scheme() == "http"
             && url.host_str().is_some_and(|host| {
-                host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
             }))
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::endpoint_allows_credentials;
+
+    #[test]
+    fn credential_endpoints_require_https_or_literal_loopback_addresses() {
+        let https = Url::parse("https://mcp.example/rpc").expect("HTTPS endpoint");
+        let ipv4 = Url::parse("http://127.0.0.1:8080/rpc").expect("IPv4 endpoint");
+        let ipv6 = Url::parse("http://[::1]:8080/rpc").expect("IPv6 endpoint");
+        let localhost = Url::parse("http://localhost:8080/rpc").expect("localhost endpoint");
+        let remote_http = Url::parse("http://mcp.example/rpc").expect("remote HTTP endpoint");
+
+        assert!(endpoint_allows_credentials(&https));
+        assert!(endpoint_allows_credentials(&ipv4));
+        assert!(endpoint_allows_credentials(&ipv6));
+        assert!(!endpoint_allows_credentials(&localhost));
+        assert!(!endpoint_allows_credentials(&remote_http));
+    }
 }

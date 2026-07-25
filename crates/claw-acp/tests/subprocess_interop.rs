@@ -1,14 +1,229 @@
 //! ACP subprocess interoperability tests.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
-use agent_client_protocol::schema::{
-    ContentBlock, ContentChunk, ProtocolVersion, SessionConfigId, SessionConfigValueId, SessionId,
-    SessionModeId, SessionUpdate, StopReason, TextContent,
-};
 use claw_acp::debug_client::{DebugClient, DebugClientConfig, DebugRunRequest, DenyPermissions};
 use claw_acp::error::AcpInteropError;
+use claw_acp::schema::{
+    ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest, NewSessionRequest,
+    PromptRequest, ProtocolVersion, SessionConfigId, SessionConfigValueId, SessionId,
+    SessionModeId, SessionUpdate, StopReason, TextContent,
+};
 use serde_json::json;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+};
+
+async fn raw_fixture_exchange(
+    request: &[u8],
+) -> (Vec<serde_json::Value>, std::process::ExitStatus) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claw-acp-fixture"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ACP fixture");
+    let mut stdin = child.stdin.take().expect("fixture stdin");
+    stdin.write_all(request).await.expect("write raw request");
+    stdin.shutdown().await.expect("close fixture stdin");
+    drop(stdin);
+    let mut lines = BufReader::new(child.stdout.take().expect("fixture stdout")).lines();
+    let mut responses = Vec::new();
+    while let Some(line) = lines.next_line().await.expect("read fixture response") {
+        responses.push(serde_json::from_str(&line).expect("fixture response JSON"));
+    }
+    let status = child.wait().await.expect("wait for fixture");
+    (responses, status)
+}
+
+#[tokio::test]
+async fn bridge_flushes_an_accepted_request_after_input_eof() {
+    let params =
+        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(ClientCapabilities::new());
+    let request = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "initialize",
+        "params": params,
+    }))
+    .expect("serialize initialize");
+    let mut framed = request;
+    framed.push(b'\n');
+
+    let (responses, status) = raw_fixture_exchange(&framed).await;
+
+    assert!(status.success());
+    assert_eq!(responses.len(), 1);
+    let response = &responses[0];
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["result"]["protocolVersion"], 1);
+    assert_eq!(response["result"]["agentInfo"]["name"], "gta-claw");
+}
+
+#[tokio::test]
+async fn bridge_rejects_invalid_request_ids_with_a_null_id() {
+    let (responses, status) = raw_fixture_exchange(
+        b"{\"jsonrpc\":\"2.0\",\"id\":false,\"method\":\"initialize\",\"params\":{}}\n",
+    )
+    .await;
+
+    assert!(status.success());
+    assert_eq!(responses.len(), 1);
+    assert_eq!(
+        responses[0],
+        json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request"
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn bridge_drains_notifications_and_responses_after_input_eof() {
+    let cwd = std::env::current_dir().expect("fixture cwd");
+    let frames = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": InitializeRequest::new(ProtocolVersion::V1),
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": NewSessionRequest::new(cwd),
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": PromptRequest::new(
+                SessionId::new("fixture-session"),
+                vec![ContentBlock::Text(TextContent::new("drain fixture"))],
+            ),
+        }),
+    ];
+    let mut wire = Vec::new();
+    for frame in frames {
+        serde_json::to_writer(&mut wire, &frame).expect("serialize ACP frame");
+        wire.push(b'\n');
+    }
+
+    let (messages, status) = raw_fixture_exchange(&wire).await;
+
+    assert!(status.success());
+    assert_eq!(messages.len(), 4);
+    assert!(messages.iter().any(|message| {
+        message["method"] == "session/update" && message["params"]["sessionId"] == "fixture-session"
+    }));
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message["id"] == 3 && message["result"]["stopReason"] == "end_turn" })
+    );
+}
+
+#[tokio::test]
+async fn bridge_answers_methodless_invalid_envelopes() {
+    let (responses, status) = raw_fixture_exchange(b"{}\n").await;
+
+    assert!(status.success());
+    assert_eq!(
+        responses,
+        vec![json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32600,
+                "message": "Invalid Request"
+            }
+        })]
+    );
+}
+
+#[tokio::test]
+async fn bridge_does_not_answer_unmatched_error_responses() {
+    let (responses, status) = raw_fixture_exchange(
+        b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}\n",
+    )
+    .await;
+
+    assert!(status.success());
+    assert_eq!(responses, Vec::<serde_json::Value>::new());
+}
+
+#[tokio::test]
+async fn bridge_preserves_partial_frames_while_dispatch_tasks_complete() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claw-acp-fixture"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ACP fixture");
+    let mut stdin = child.stdin.take().expect("fixture stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("fixture stdout")).lines();
+    let initialize = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": InitializeRequest::new(ProtocolVersion::V1),
+    }))
+    .expect("serialize initialize");
+    let session = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": NewSessionRequest::new(std::env::current_dir().expect("fixture cwd")),
+    }))
+    .expect("serialize new session");
+    let split = session.len() / 2;
+    stdin
+        .write_all(&initialize)
+        .await
+        .expect("write initialize");
+    stdin.write_all(b"\n").await.expect("frame initialize");
+    stdin
+        .write_all(&session[..split])
+        .await
+        .expect("write partial session request");
+    stdin.flush().await.expect("flush partial frame");
+    let initialize_response: serde_json::Value = serde_json::from_str(
+        &stdout
+            .next_line()
+            .await
+            .expect("read initialize response")
+            .expect("initialize response line"),
+    )
+    .expect("initialize response JSON");
+    stdin
+        .write_all(&session[split..])
+        .await
+        .expect("write session suffix");
+    stdin.write_all(b"\n").await.expect("frame session request");
+    stdin.shutdown().await.expect("close fixture stdin");
+    drop(stdin);
+    let session_response: serde_json::Value = serde_json::from_str(
+        &stdout
+            .next_line()
+            .await
+            .expect("read session response")
+            .expect("session response line"),
+    )
+    .expect("session response JSON");
+    let status = child.wait().await.expect("wait for fixture");
+
+    assert!(status.success());
+    assert_eq!(initialize_response["id"], 1);
+    assert_eq!(session_response["id"], 2);
+    assert_eq!(session_response["result"]["sessionId"], "fixture-session");
+}
 
 #[tokio::test]
 async fn debug_client_exercises_bridge_lifecycle_and_streaming() {

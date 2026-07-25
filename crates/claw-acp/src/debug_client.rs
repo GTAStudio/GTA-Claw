@@ -11,45 +11,36 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::{
-    Agent, Client, ConnectTo, ConnectionTo, Lines,
-    schema::{
-        CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
-        InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-        LoadSessionRequest, McpServer, NewSessionRequest, PromptRequest, PromptResponse,
-        ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-        RequestPermissionResponse, ResumeSessionRequest, SessionConfigId, SessionConfigValueId,
-        SessionId, SessionModeId, SessionNotification, SetSessionConfigOptionRequest,
-        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    },
-};
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use tokio::time::{sleep, timeout};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-};
+use tokio::{io::BufReader, process::Command};
 
 use crate::{
+    Error,
     error::{AcpInteropError, Result},
+    protocol::{RpcPeer, decode, is_response_message, message_parts, read_message, response_id},
     schema,
+    schema::{
+        CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
+        InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+        LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse,
+        PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+        ResumeSessionResponse, SessionConfigId, SessionConfigValueId, SessionId, SessionModeId,
+        SessionNotification, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+        SetSessionModeRequest, SetSessionModeResponse,
+    },
 };
+
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Future returned by an ACP permission policy.
 pub type PermissionFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = std::result::Result<
-                    RequestPermissionResponse,
-                    agent_client_protocol::Error,
-                >,
-            > + Send
-            + 'a,
-    >,
+    Box<dyn Future<Output = std::result::Result<RequestPermissionResponse, Error>> + Send + 'a>,
 >;
 
 /// Policy for permission requests made by an ACP agent.
@@ -121,6 +112,13 @@ struct ProcessTreeAcpAgent {
 #[derive(Debug)]
 struct ProcessTreeGuard(Box<dyn ChildWrapper>);
 
+struct SpawnedAgent {
+    child: ProcessTreeGuard,
+    peer: RpcPeer,
+    reader: tokio::task::JoinHandle<std::result::Result<(), Error>>,
+    stderr_drain: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
 impl std::ops::Deref for ProcessTreeGuard {
     type Target = dyn ChildWrapper;
 
@@ -147,11 +145,12 @@ impl Drop for ProcessTreeGuard {
     }
 }
 
-impl ConnectTo<Client> for ProcessTreeAcpAgent {
-    async fn connect_to(
+impl ProcessTreeAcpAgent {
+    fn spawn(
         self,
-        client: impl ConnectTo<Agent>,
-    ) -> std::result::Result<(), agent_client_protocol::Error> {
+        notifications: Arc<Mutex<Vec<SessionNotification>>>,
+        permissions: Arc<dyn PermissionPolicy>,
+    ) -> std::result::Result<SpawnedAgent, Error> {
         let mut command = Command::new(&self.command);
         command
             .args(&self.arguments)
@@ -185,52 +184,100 @@ impl ConnectTo<Client> for ProcessTreeAcpAgent {
                 .await
                 .map(|_| ())
         });
-        let incoming =
-            futures_util::stream::unfold(BufReader::new(stdout).lines(), |mut lines| async move {
-                match lines.next_line().await {
-                    Ok(Some(line)) => Some((Ok(line), lines)),
-                    Ok(None) => None,
-                    Err(error) => Some((Err(error), lines)),
-                }
-            });
-        let outgoing = futures_util::sink::unfold(stdin, |mut stdin, line: String| async move {
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await?;
-            Ok::<_, std::io::Error>(stdin)
-        });
-        let protocol = ConnectTo::<Client>::connect_to(Lines::new(outgoing, incoming), client);
-        tokio::pin!(protocol);
-
-        let outcome = tokio::select! {
-            result = &mut protocol => result,
-            status = child.wait() => match status {
-                Ok(status) if status.success() => Ok(()),
-                Ok(status) => Err(acp_internal_error(format!(
-                    "ACP child exited with status {status}"
-                ))),
-                Err(error) => Err(acp_internal_error(error)),
-            },
-        };
-        let cleanup = Box::into_pin(child.kill()).await;
-        let drain = stderr_drain
+        let peer = RpcPeer::new(stdin);
+        let reader_peer = peer.clone();
+        let reader = tokio::spawn(async move {
+            read_client_messages(
+                BufReader::new(stdout),
+                reader_peer,
+                notifications,
+                permissions,
+            )
             .await
-            .map_err(acp_internal_error)
-            .and_then(|result| result.map_err(acp_internal_error));
-
-        match outcome {
-            Err(error) => Err(error),
-            Ok(()) => {
-                cleanup.map_err(acp_internal_error)?;
-                drain?;
-                Ok(())
-            }
-        }
+        });
+        Ok(SpawnedAgent {
+            child,
+            peer,
+            reader,
+            stderr_drain,
+        })
     }
 }
 
-fn acp_internal_error(error: impl fmt::Display) -> agent_client_protocol::Error {
-    agent_client_protocol::Error::internal_error().data(error.to_string())
+async fn read_client_messages(
+    mut reader: BufReader<tokio::process::ChildStdout>,
+    peer: RpcPeer,
+    notifications: Arc<Mutex<Vec<SessionNotification>>>,
+    permissions: Arc<dyn PermissionPolicy>,
+) -> std::result::Result<(), Error> {
+    let result = async {
+        let mut frame = Vec::new();
+        loop {
+            let message = match read_message(&mut reader, &mut frame).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = peer
+                        .respond::<serde_json::Value>(serde_json::Value::Null, Err(error.clone()))
+                        .await;
+                    return Err(error);
+                }
+            };
+            if message.get("method").is_none() {
+                if is_response_message(&message) {
+                    let _ = peer.resolve_response(&message);
+                } else {
+                    peer.respond::<serde_json::Value>(
+                        response_id(&message),
+                        Err(Error::invalid_request()),
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            let (method, params, id) = match message_parts(&message) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    peer.respond::<serde_json::Value>(response_id(&message), Err(error))
+                        .await?;
+                    continue;
+                }
+            };
+            match (method, id) {
+                ("session/update", None) => {
+                    notifications
+                        .lock()
+                        .map_err(|_| {
+                            Error::internal_error().data("debug notification lock poisoned")
+                        })?
+                        .push(decode(params)?);
+                }
+                ("session/request_permission", Some(id)) => {
+                    let result = decode(params).map(|request| permissions.decide(request));
+                    match result {
+                        Ok(future) => peer.respond(id, future.await).await?,
+                        Err(error) => {
+                            peer.respond::<RequestPermissionResponse>(id, Err(error))
+                                .await?;
+                        }
+                    }
+                }
+                (_, Some(id)) => {
+                    peer.respond::<serde_json::Value>(id, Err(Error::method_not_found()))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    .await;
+    peer.mark_disconnected();
+    result
+}
+
+fn acp_internal_error(error: impl fmt::Display) -> Error {
+    Error::internal_error().data(error.to_string())
 }
 
 /// Script executed by the ACP debug client.
@@ -329,171 +376,174 @@ impl DebugClient {
             current_dir: request.cwd.clone(),
         };
         let notifications = Arc::new(Mutex::new(Vec::new()));
-        let notification_sink = notifications.clone();
-        let permissions = self.permissions.clone();
         let timeout_duration = self.config.timeout;
-
-        let interaction = Client
-            .builder()
-            .name("gta-claw-acp-debug")
-            .on_receive_notification(
-                async move |notification: SessionNotification, _connection| {
-                    notification_sink
-                        .lock()
-                        .map_err(|_| {
-                            agent_client_protocol::Error::internal_error()
-                                .data("debug notification lock poisoned")
-                        })?
-                        .push(notification);
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_notification!(),
-            )
-            .on_receive_request(
-                async move |request: RequestPermissionRequest, responder, _connection| {
-                    responder.respond_with_result(permissions.decide(request).await)
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
-                let initialize = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
+        let SpawnedAgent {
+            mut child,
+            peer: connection,
+            reader,
+            stderr_drain,
+        } = agent.spawn(Arc::clone(&notifications), Arc::clone(&self.permissions))?;
+        let interaction = async move {
+            let initialize: InitializeResponse = connection
+                .request(
+                    "initialize",
+                    InitializeRequest::new(ProtocolVersion::V1).client_info(
                         schema::Implementation::new(
                             "gta-claw-acp-debug",
                             env!("CARGO_PKG_VERSION"),
                         ),
-                    ))
-                    .block_task()
-                    .await?;
-                if initialize.protocol_version != ProtocolVersion::V1 {
-                    return Err(agent_client_protocol::Error::invalid_request()
-                        .data("ACP agent selected an unsupported protocol version"));
+                    ),
+                )
+                .await?;
+            if initialize.protocol_version != ProtocolVersion::V1 {
+                return Err(Error::invalid_request()
+                    .data("ACP agent selected an unsupported protocol version"));
+            }
+
+            let session_id = match (request.load_session, request.resume_session) {
+                (Some(_), Some(_)) => {
+                    return Err(Error::invalid_request()
+                        .data("load_session and resume_session are mutually exclusive"));
                 }
+                (Some(session_id), None) => {
+                    let _: LoadSessionResponse = connection
+                        .request(
+                            "session/load",
+                            LoadSessionRequest::new(session_id.clone(), request.cwd.clone())
+                                .mcp_servers(request.mcp_servers.clone()),
+                        )
+                        .await?;
+                    session_id
+                }
+                (None, Some(session_id)) => {
+                    let _: ResumeSessionResponse = connection
+                        .request(
+                            "session/resume",
+                            ResumeSessionRequest::new(session_id.clone(), request.cwd.clone())
+                                .mcp_servers(request.mcp_servers.clone()),
+                        )
+                        .await?;
+                    session_id
+                }
+                (None, None) => {
+                    let response: NewSessionResponse = connection
+                        .request(
+                            "session/new",
+                            NewSessionRequest::new(request.cwd.clone())
+                                .mcp_servers(request.mcp_servers.clone()),
+                        )
+                        .await?;
+                    response.session_id
+                }
+            };
 
-                let session_id = match (request.load_session, request.resume_session) {
-                    (Some(_), Some(_)) => {
-                        return Err(agent_client_protocol::Error::invalid_request()
-                            .data("load_session and resume_session are mutually exclusive"));
-                    }
-                    (Some(session_id), None) => {
-                        connection
-                            .send_request(
-                                LoadSessionRequest::new(session_id.clone(), request.cwd.clone())
-                                    .mcp_servers(request.mcp_servers.clone()),
-                            )
-                            .block_task()
-                            .await?;
-                        session_id
-                    }
-                    (None, Some(session_id)) => {
-                        connection
-                            .send_request(
-                                ResumeSessionRequest::new(session_id.clone(), request.cwd.clone())
-                                    .mcp_servers(request.mcp_servers.clone()),
-                            )
-                            .block_task()
-                            .await?;
-                        session_id
-                    }
-                    (None, None) => {
-                        connection
-                            .send_request(
-                                NewSessionRequest::new(request.cwd.clone())
-                                    .mcp_servers(request.mcp_servers.clone()),
-                            )
-                            .block_task()
-                            .await?
-                            .session_id
-                    }
-                };
-
-                let sessions = if initialize
-                    .agent_capabilities
-                    .session_capabilities
-                    .list
-                    .is_some()
-                {
-                    Some(
-                        connection
-                            .send_request(ListSessionsRequest::new())
-                            .block_task()
-                            .await?,
-                    )
-                } else {
-                    None
-                };
-                let mode = if let Some(mode) = request.mode {
-                    Some(
-                        connection
-                            .send_request(SetSessionModeRequest::new(session_id.clone(), mode))
-                            .block_task()
-                            .await?,
-                    )
-                } else {
-                    None
-                };
-                let mut config_options = Vec::with_capacity(request.config_options.len());
-                for (config_id, value) in request.config_options {
-                    config_options.push(
-                        connection
-                            .send_request(SetSessionConfigOptionRequest::new(
+            let sessions = if initialize
+                .agent_capabilities
+                .session_capabilities
+                .list
+                .is_some()
+            {
+                Some(
+                    connection
+                        .request("session/list", ListSessionsRequest::new())
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let mode = if let Some(mode) = request.mode {
+                Some(
+                    connection
+                        .request(
+                            "session/set_mode",
+                            SetSessionModeRequest::new(session_id.clone(), mode),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let mut config_options = Vec::with_capacity(request.config_options.len());
+            for (config_id, value) in request.config_options {
+                config_options.push(
+                    connection
+                        .request(
+                            "session/set_config_option",
+                            SetSessionConfigOptionRequest::new(
                                 session_id.clone(),
                                 config_id,
                                 value,
-                            ))
-                            .block_task()
-                            .await?,
-                    );
-                }
+                            ),
+                        )
+                        .await?,
+                );
+            }
 
-                let cancellation = request.cancel_after.map(|delay| {
-                    let connection = connection.clone();
-                    let session_id = session_id.clone();
-                    tokio::spawn(async move {
-                        sleep(delay).await;
-                        connection.send_notification(CancelNotification::new(session_id))
-                    })
-                });
-                let prompt = connection
-                    .send_request(PromptRequest::new(session_id.clone(), request.prompt))
-                    .block_task()
-                    .await?;
-                if let Some(cancellation) = cancellation {
-                    cancellation.abort();
-                }
-
-                let close = if request.close_session
-                    && initialize
-                        .agent_capabilities
-                        .session_capabilities
-                        .close
-                        .is_some()
-                {
-                    Some(
+            let prompt_request = connection.request(
+                "session/prompt",
+                PromptRequest::new(session_id.clone(), request.prompt),
+            );
+            tokio::pin!(prompt_request);
+            let prompt: PromptResponse = if let Some(delay) = request.cancel_after {
+                tokio::select! {
+                    result = &mut prompt_request => result?,
+                    () = sleep(delay) => {
                         connection
-                            .send_request(CloseSessionRequest::new(session_id.clone()))
-                            .block_task()
-                            .await?,
-                    )
-                } else {
-                    None
-                };
+                            .notify(
+                                "session/cancel",
+                                CancelNotification::new(session_id.clone()),
+                            )
+                            .await?;
+                        prompt_request.await?
+                    }
+                }
+            } else {
+                prompt_request.await?
+            };
 
-                Ok((
-                    initialize,
-                    session_id,
-                    sessions,
-                    mode,
-                    config_options,
-                    prompt,
-                    close,
-                ))
-            });
+            let close = if request.close_session
+                && initialize
+                    .agent_capabilities
+                    .session_capabilities
+                    .close
+                    .is_some()
+            {
+                Some(
+                    connection
+                        .request(
+                            "session/close",
+                            CloseSessionRequest::new(session_id.clone()),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            };
 
-        let (initialize, session_id, sessions, mode, config_options, prompt, close) =
-            timeout(timeout_duration, interaction)
-                .await
-                .map_err(|_| AcpInteropError::Timeout(timeout_duration))??;
+            Ok((
+                initialize,
+                session_id,
+                sessions,
+                mode,
+                config_options,
+                prompt,
+                close,
+            ))
+        };
+
+        let outcome = timeout(timeout_duration, interaction)
+            .await
+            .map_err(|_| AcpInteropError::Timeout(timeout_duration))
+            .and_then(|result| result.map_err(AcpInteropError::from));
+        let cleanup = timeout(PROCESS_CLEANUP_TIMEOUT, Box::into_pin(child.kill())).await;
+        reader.abort();
+        let _ = reader.await;
+        stderr_drain.abort();
+        let _ = stderr_drain.await;
+        let (initialize, session_id, sessions, mode, config_options, prompt, close) = outcome?;
+        cleanup.map_err(|_| {
+            AcpInteropError::Lifecycle("ACP process cleanup exceeded its deadline".into())
+        })??;
         let notifications = notifications
             .lock()
             .map_err(|_| AcpInteropError::Lifecycle("debug notification lock poisoned".into()))?

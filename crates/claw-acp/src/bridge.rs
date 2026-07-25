@@ -1,30 +1,44 @@
 //! ACP stdio server bridge backed by GTA-Claw application ports.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use agent_client_protocol::{
-    Agent, Client, ConnectionTo, Stdio,
+use serde::Serialize;
+use serde_json::Value;
+use tokio::{
+    io::BufReader,
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+    time::timeout,
+};
+
+use crate::{
+    Error, Result,
+    protocol::{RpcPeer, decode, is_response_message, message_parts, read_message, response_id},
     schema::{
         AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-        InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-        LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-        PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionRequest,
-        RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse,
-        SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+        Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+        ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
+        RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+        ResumeSessionResponse, SessionId, SessionNotification, SessionUpdate,
+        SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+        SetSessionModeResponse,
     },
 };
 
-use crate::Result;
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const MAX_IN_FLIGHT_CANCELLATIONS: usize = 8;
+const INCOMING_QUEUE_CAPACITY: usize = 64;
+const DISCONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Future returned by an ACP backend operation.
 pub type AcpFuture<'a, T> =
-    Pin<Box<dyn Future<Output = std::result::Result<T, agent_client_protocol::Error>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = std::result::Result<T, Error>> + Send + 'a>>;
 
 /// Request context used for streaming and permission callbacks.
 #[derive(Clone)]
 pub struct AcpSessionContext {
-    connection: ConnectionTo<Client>,
+    connection: RpcPeer,
 }
 
 impl std::fmt::Debug for AcpSessionContext {
@@ -37,21 +51,27 @@ impl std::fmt::Debug for AcpSessionContext {
 
 impl AcpSessionContext {
     /// Streams one session update to the connected ACP client.
-    pub fn notify(
+    pub async fn notify(
         &self,
-        session_id: impl Into<agent_client_protocol::schema::SessionId>,
+        session_id: impl Into<SessionId>,
         update: SessionUpdate,
-    ) -> std::result::Result<(), agent_client_protocol::Error> {
+    ) -> std::result::Result<(), Error> {
         self.connection
-            .send_notification(SessionNotification::new(session_id, update))
+            .notify(
+                "session/update",
+                SessionNotification::new(session_id, update),
+            )
+            .await
     }
 
     /// Requests an explicit permission decision from the ACP client.
     pub async fn request_permission(
         &self,
         request: RequestPermissionRequest,
-    ) -> std::result::Result<RequestPermissionResponse, agent_client_protocol::Error> {
-        self.connection.send_request(request).block_task().await
+    ) -> std::result::Result<RequestPermissionResponse, Error> {
+        self.connection
+            .request("session/request_permission", request)
+            .await
     }
 }
 
@@ -132,118 +152,232 @@ impl AcpBridge {
 
     /// Serves the ACP bridge over process stdio until the client disconnects.
     pub async fn serve_stdio(self) -> Result<()> {
-        let initialize_capabilities = self.capabilities;
-        let new_session_backend = self.backend.clone();
-        let load_session_backend = self.backend.clone();
-        let resume_session_backend = self.backend.clone();
-        let list_sessions_backend = self.backend.clone();
-        let close_session_backend = self.backend.clone();
-        let prompt_backend = self.backend.clone();
-        let set_mode_backend = self.backend.clone();
-        let set_config_backend = self.backend.clone();
-        let cancel_backend = self.backend;
+        let peer = RpcPeer::new(tokio::io::stdout());
+        let (incoming_sender, mut incoming) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
+        let reader = tokio::spawn(async move {
+            let mut reader = BufReader::new(tokio::io::stdin());
+            let mut frame = Vec::new();
+            loop {
+                match read_message(&mut reader, &mut frame).await {
+                    Ok(Some(message)) => {
+                        if incoming_sender.send(Ok(message)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = incoming_sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        let request_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+        let cancellation_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_CANCELLATIONS));
+        let mut tasks = JoinSet::new();
+        let terminal_error = loop {
+            let message = tokio::select! {
+                message = incoming.recv() => message,
+                completed = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        break Some(Error::internal_error().data(error.to_string()));
+                    }
+                    continue;
+                }
+            };
+            let message = match message {
+                Some(Ok(message)) => message,
+                None => break None,
+                Some(Err(error)) => {
+                    let _ = peer.respond::<Value>(Value::Null, Err(error.clone())).await;
+                    break Some(error);
+                }
+            };
+            if message.get("method").is_none() {
+                if is_response_message(&message) {
+                    let _ = peer.resolve_response(&message);
+                } else {
+                    let _ = peer
+                        .respond::<Value>(response_id(&message), Err(Error::invalid_request()))
+                        .await;
+                }
+                continue;
+            }
+            let (method, params, id) = match message_parts(&message) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    let _ = peer
+                        .respond::<Value>(response_id(&message), Err(error))
+                        .await;
+                    continue;
+                }
+            };
+            if let Some(id) = id {
+                let Ok(permit) = Arc::clone(&request_slots).try_acquire_owned() else {
+                    let _ = peer
+                        .respond::<Value>(
+                            id,
+                            Err(Error::server_error(
+                                -32099,
+                                "Too many in-flight ACP requests",
+                            )),
+                        )
+                        .await;
+                    continue;
+                };
+                let backend = Arc::clone(&self.backend);
+                let capabilities = self.capabilities.clone();
+                let peer = peer.clone();
+                let method = method.to_owned();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    dispatch_request(backend, capabilities, peer, method, params, id).await;
+                });
+            } else if method == "session/cancel" {
+                let notification = match decode(params) {
+                    Ok(notification) => notification,
+                    Err(_) => continue,
+                };
+                let Ok(permit) = Arc::clone(&cancellation_slots).try_acquire_owned() else {
+                    continue;
+                };
+                let backend = Arc::clone(&self.backend);
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let _ = backend.cancel(notification).await;
+                });
+            }
+        };
+        peer.mark_disconnected();
+        if !reader.is_finished() {
+            reader.abort();
+        }
+        let _ = reader.await;
+        if timeout(DISCONNECT_DRAIN_TIMEOUT, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+        match terminal_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+}
 
-        Agent
-            .builder()
-            .name("gta-claw-acp")
-            .on_receive_request(
-                async move |request: InitializeRequest, responder, _connection| {
-                    let response = InitializeResponse::new(
-                        if request.protocol_version == ProtocolVersion::V1 {
-                            request.protocol_version
-                        } else {
-                            ProtocolVersion::V1
-                        },
-                    )
-                    .agent_capabilities(initialize_capabilities.clone())
-                    .agent_info(
-                        agent_client_protocol::schema::Implementation::new(
-                            "gta-claw",
-                            env!("CARGO_PKG_VERSION"),
-                        ),
-                    );
-                    responder.respond(response)
-                },
-                agent_client_protocol::on_receive_request!(),
+async fn dispatch_request(
+    backend: Arc<dyn AcpBackend>,
+    capabilities: AgentCapabilities,
+    peer: RpcPeer,
+    method: String,
+    params: Value,
+    id: Value,
+) {
+    match method.as_str() {
+        "initialize" => {
+            let result = decode::<InitializeRequest>(params).map(|request| {
+                InitializeResponse::new(if request.protocol_version == ProtocolVersion::V1 {
+                    request.protocol_version
+                } else {
+                    ProtocolVersion::V1
+                })
+                .agent_capabilities(capabilities)
+                .agent_info(Implementation::new("gta-claw", env!("CARGO_PKG_VERSION")))
+            });
+            let _ = peer.respond(id, result).await;
+        }
+        "session/new" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.new_session(request, context(&peer))),
             )
-            .on_receive_request(
-                async move |request: NewSessionRequest, responder, connection| {
-                    responder.respond_with_result(
-                        new_session_backend
-                            .new_session(request, AcpSessionContext { connection })
-                            .await,
-                    )
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/load" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.load_session(request, context(&peer))),
             )
-            .on_receive_request(
-                async move |request: LoadSessionRequest, responder, connection| {
-                    responder.respond_with_result(
-                        load_session_backend
-                            .load_session(request, AcpSessionContext { connection })
-                            .await,
-                    )
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/resume" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.resume_session(request, context(&peer))),
             )
-            .on_receive_request(
-                async move |request: ResumeSessionRequest, responder, connection| {
-                    responder.respond_with_result(
-                        resume_session_backend
-                            .resume_session(request, AcpSessionContext { connection })
-                            .await,
-                    )
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/list" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.list_sessions(request)),
             )
-            .on_receive_request(
-                async move |request: ListSessionsRequest, responder, _connection| {
-                    responder
-                        .respond_with_result(list_sessions_backend.list_sessions(request).await)
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/close" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.close_session(request)),
             )
-            .on_receive_request(
-                async move |request: CloseSessionRequest, responder, _connection| {
-                    responder
-                        .respond_with_result(close_session_backend.close_session(request).await)
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/prompt" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.prompt(request, context(&peer))),
             )
-            .on_receive_request(
-                async move |request: PromptRequest, responder, connection| {
-                    let prompt_backend = prompt_backend.clone();
-                    tokio::spawn(async move {
-                        let result = prompt_backend
-                            .prompt(request, AcpSessionContext { connection })
-                            .await;
-                        let _ = responder.respond_with_result(result);
-                    });
-                    Ok(())
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/set_mode" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.set_mode(request)),
             )
-            .on_receive_request(
-                async move |request: SetSessionModeRequest, responder, _connection| {
-                    responder.respond_with_result(set_mode_backend.set_mode(request).await)
-                },
-                agent_client_protocol::on_receive_request!(),
+            .await;
+        }
+        "session/set_config_option" => {
+            respond(
+                &peer,
+                id,
+                decode(params).map(|request| backend.set_config_option(request)),
             )
-            .on_receive_request(
-                async move |request: SetSessionConfigOptionRequest, responder, _connection| {
-                    responder
-                        .respond_with_result(set_config_backend.set_config_option(request).await)
-                },
-                agent_client_protocol::on_receive_request!(),
-            )
-            .on_receive_notification(
-                async move |notification: CancelNotification, _connection| {
-                    cancel_backend.cancel(notification).await
-                },
-                agent_client_protocol::on_receive_notification!(),
-            )
-            .connect_to(Stdio::new())
-            .await?;
-        Ok(())
+            .await;
+        }
+        _ => {
+            let _ = peer
+                .respond::<Value>(id, Err(Error::method_not_found()))
+                .await;
+        }
+    }
+}
+
+fn context(peer: &RpcPeer) -> AcpSessionContext {
+    AcpSessionContext {
+        connection: peer.clone(),
+    }
+}
+
+async fn respond<T>(peer: &RpcPeer, id: Value, future: std::result::Result<AcpFuture<'_, T>, Error>)
+where
+    T: Serialize,
+{
+    match future {
+        Ok(future) => {
+            let _ = peer.respond(id, future.await).await;
+        }
+        Err(error) => {
+            let _ = peer.respond::<T>(id, Err(error)).await;
+        }
     }
 }
