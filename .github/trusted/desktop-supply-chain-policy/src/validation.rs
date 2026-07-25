@@ -7,6 +7,7 @@ use crate::input::SafeRoot;
 use crate::metadata::{MetadataTools, validate_desktop_metadata, validate_root_metadata};
 use crate::ownership::validate_codeowners;
 use crate::policy::{is_bootstrap_state, validate_final_static};
+use crate::repository_policy::validate_repository_policy_transition;
 use crate::workflows::{
     ActionlintTool, run_actionlint, validate_final_workflows, validate_inventory,
     validate_protected_files,
@@ -146,6 +147,9 @@ pub fn validate_request(request: &ValidationRequest) -> PolicyResult<ValidationE
         )?;
         BaseState::Final
     };
+    if matches!(base_state, BaseState::Final) {
+        validate_repository_policy_transition(&trusted, &candidate)?;
+    }
 
     let candidate_final = if candidate_requires_final(base_state, relevant_change) {
         validate_final(
