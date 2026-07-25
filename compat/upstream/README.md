@@ -12,7 +12,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (85 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
-| `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence`, `implementation_pointers` and `known_differences` may change |
+| `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
 
 ## Validation
@@ -220,6 +220,43 @@ true-positive ones. The three accepting cases — a `mod`-wired module, a
 `nested/deep.rs` chain — exist so that a later "improvement" to this rule cannot
 quietly turn it into a false-rejection engine without turning the self-test red.
 
+#### A row may not rewrite its own acceptance bar
+
+Each row carries `acceptance_evidence.required` — a sentence stating what parity
+means for that feature, written when the baseline was frozen and nothing was
+implemented. It is contract text, not a working field.
+
+Making the ledger digests regenerable is what transitions require, but it also
+removed the only thing that had been holding every *descriptive* field in place.
+Without a second freeze, a session recording a transition could rewrite
+`required` from "A Rust protocol constant test proves v4 negotiation and rejects
+unsupported general-client versions" to "A test exists", re-bless the digest
+through the documented command, and pass — having set the bar it was judged
+against. The same edit works on `title`, `tier`, `domain`, `profile` and
+`upstream_source.paths`, which is the surface the row is measured over.
+
+`validate.ps1` therefore pins a second digest per ledger, over the **frozen
+projection** of its rows: every field except `status`,
+`acceptance_evidence.status`, `acceptance_evidence.artifacts`,
+`implementation_pointers` and `known_differences`. Those five are the entire
+mutable surface; everything else must hash to `frozen_digest` in `$LedgerSpecs`.
+
+Two properties make this hold:
+
+- the constant lives in `validate.ps1`, so `-WriteLedgerDigests` cannot reach it,
+  exactly like the inventory, schema and corpus digests;
+- it is checked in **both** modes, so `-WriteLedgerDigests` also exits non-zero on
+  a ledger whose frozen text moved, rather than reporting success.
+
+The barrier is the constant, not the command. `ledger-digests.sha256` is an
+ordinary file that anyone can recompute and write by hand, so the self-test
+assumes an attacker has already re-blessed it — every frozen-text case runs
+`-WriteLedgerDigests` first and must still be rejected. What stops the forgery is
+that no sidecar contents can satisfy a digest hardcoded in the script.
+
+An honest transition changes only the five mutable fields, so the projection does
+not move and the command works normally.
+
 ### Implementation pointers are not evidence
 
 A row may optionally carry `implementation_pointers`, a list of
@@ -326,9 +363,9 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 185 child
+The adversarial self-test is a separate, slower step. It spawns 193 child
 validator processes — one baseline run against the real tree, one per each of the
-117 cases, and a re-blessing pre-run for the 67 cases that model an attacker who
+121 cases, and a re-blessing pre-run for the 71 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:
