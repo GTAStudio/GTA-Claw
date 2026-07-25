@@ -679,6 +679,12 @@ async fn a_dropped_request_retracts_itself_and_is_still_reported_to_the_adapter(
 /// `request` registers nothing until it is first polled, so a future that is created and dropped
 /// without ever being polled must leave no trace at all — not even a dismissal for a request the
 /// adapter was never shown.
+///
+/// The first half of this test asserts an *absence*, which is the weakest shape a test can have: it
+/// also passes when the fixture is incapable of recording anything, and it would keep passing if the
+/// drop stopped being a real drop. The second half is therefore a positive control on the very same
+/// broker and adapter — it polls a request, drops it, and requires the two records to appear. An
+/// inert fixture or a drop that does nothing now fails the test instead of satisfying it.
 #[tokio::test]
 async fn a_request_dropped_before_its_first_poll_leaves_no_trace() {
     let clock = FakeClock::new(0);
@@ -695,6 +701,28 @@ async fn a_request_dropped_before_its_first_poll_leaves_no_trace() {
         "a never-polled request was never presented, so it must not be dismissed"
     );
     assert!(broker.outstanding().is_empty());
+
+    // Positive control: the same fixture, one poll further on, must produce records.
+    let mut polled = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(
+        support::poll_once(&mut polled).is_pending(),
+        "an unanswered request must park"
+    );
+    let approval_id = ApprovalId::new("approval-1").expect("the test approval id is valid");
+    assert_eq!(
+        approvals.records(),
+        vec![ApprovalRecord::Presented(approval_id.clone())],
+        "polling must present, or the absence asserted above proves nothing"
+    );
+    drop(polled);
+    assert_eq!(
+        approvals.records(),
+        vec![
+            ApprovalRecord::Presented(approval_id.clone()),
+            ApprovalRecord::Abandoned(approval_id),
+        ],
+        "dropping a polled request must dismiss it, or the drop above was not a real drop"
+    );
 }
 
 /// An adapter that calls straight back into the broker from `abandon`.
