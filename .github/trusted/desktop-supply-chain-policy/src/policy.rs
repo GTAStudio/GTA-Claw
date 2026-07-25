@@ -380,6 +380,12 @@ fn validate_profile(root_manifest: &TomlValue) -> PolicyResult<()> {
     Ok(())
 }
 
+/// Resolves a `[dependencies.<name>] path` value against its manifest directory.
+///
+/// The result describes where a dependency claims to live; it never authorises that
+/// location. Callers must check the resolved path against an independently established
+/// member set, as `validate_dependency` does. See the inventory note in
+/// `validate_manifest_and_lock_inventory`.
 fn normalize_dependency_path(base: &str, dependency: &str) -> PolicyResult<String> {
     if dependency.contains('\\') || Path::new(dependency).is_absolute() {
         return Err(PolicyError::new(format!(
@@ -1012,6 +1018,17 @@ fn validate_manifest_and_lock_inventory(
         )));
     }
 
+    // The manifest inventory is derived exclusively from `[workspace] members`. Do not
+    // widen it by scanning manifests for `path` keys: `path` is also the source field of
+    // `[dependencies.<name>]`, `[dev-dependencies]`, `[build-dependencies]` and every
+    // `[target.'cfg(...)'.*]` table, all of which are candidate-controlled. A rule that
+    // accepted any manifest `path =` would let an author bless an arbitrary orphan file
+    // into the inventory with one line of TOML. Any future manifest parsing here must be
+    // section-aware and must treat only the workspace member list as authorising.
+    // `validate_dependency` independently requires a `path` dependency to resolve to an
+    // already-declared member; this inventory check is the backstop for when it does not
+    // run. Both layers are pinned by
+    // `manifest_path_keys_cannot_bless_a_file_the_workspace_never_declared`.
     let mut expected_manifests = BTreeSet::from([
         ROOT_MANIFEST.to_owned(),
         DESKTOP_MANIFEST.to_owned(),
