@@ -161,8 +161,14 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
 
-    use claw_gateway_client::{AuthorizationExpectation, GatewayCredential};
-    use claw_protocol::gateway::{ClientId, ClientMode};
+    use claw_clients::{
+        ConnectionContract, ConnectionError, GatewayProfile, SurfaceId, surface,
+        validate_gateway_profile,
+    };
+    use claw_gateway_client::{AuthorizationExpectation, GatewayClientConfig, GatewayCredential};
+    use claw_protocol::gateway::{
+        ClientId, ClientMode, GATEWAY_PROTOCOL_VERSION, OperatorScope, Role as WireRole,
+    };
     use claw_security::authorization::{Role, Scope, ScopeSet};
     use claw_security::identity::DeviceIdentity;
 
@@ -173,6 +179,60 @@ mod tests {
 
     fn test_identity() -> Arc<DeviceIdentity> {
         Arc::new(generate_session_identity().expect("host randomness available"))
+    }
+
+    fn test_config() -> GatewayClientConfig {
+        let request = ConnectRequest::prepare("wss://gateway.example.com", "", false)
+            .expect("a valid request");
+        build_client_config(request, test_identity())
+    }
+
+    /// Translates the scopes the transport will actually request into the frozen
+    /// protocol registry, using the same wire identities `claw-gateway-client`
+    /// puts on the socket rather than a mapping written for the test.
+    fn requested_operator_scopes(config: &GatewayClientConfig) -> Vec<OperatorScope> {
+        config
+            .scopes
+            .iter()
+            .map(|scope| {
+                OperatorScope::from_identity(scope.as_str()).unwrap_or_else(|| {
+                    panic!("requested scope {:?} has no frozen wire identity", scope)
+                })
+            })
+            .collect()
+    }
+
+    /// Reads the operator scope ceiling for the Android UI profile out of the
+    /// frozen surface contract, so this test cannot drift from it by retyping.
+    fn android_ui_contract_scopes() -> &'static [OperatorScope] {
+        let ConnectionContract::GatewayV4(profiles) = surface(SurfaceId::Android).connection else {
+            panic!("the Android surface must use the Gateway v4 transport");
+        };
+        profiles
+            .iter()
+            .find(|profile| profile.role == WireRole::Operator && profile.mode == ClientMode::Ui)
+            .map(|profile| profile.scopes)
+            .expect("the Android surface must define an operator UI profile")
+    }
+
+    /// Builds the profile the Gateway would see, taking identity, mode and role
+    /// from the real configuration so the test cannot drift from the client.
+    fn profile_for(
+        config: &GatewayClientConfig,
+        scopes: &'static [OperatorScope],
+    ) -> GatewayProfile {
+        GatewayProfile {
+            client_id: config.client.id,
+            mode: config.client.mode,
+            role: WireRole::from_identity(config.role.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "requested role {:?} has no frozen wire identity",
+                    config.role
+                )
+            }),
+            scopes,
+            requires_device_identity: true,
+        }
     }
 
     /// Mirrors the controller's shape: commit the slot, then suspend.
@@ -400,6 +460,69 @@ mod tests {
         assert!(
             !rendered.contains("super-secret-token"),
             "the transport configuration Debug leaked the token: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_frozen_client_contract_admits_the_scopes_this_client_requests() {
+        let config = test_config();
+        let requested = requested_operator_scopes(&config);
+        let pinned: &'static [OperatorScope] = Box::leak(requested.clone().into_boxed_slice());
+
+        let outcome = validate_gateway_profile(
+            SurfaceId::Android,
+            profile_for(&config, pinned),
+            GATEWAY_PROTOCOL_VERSION.get(),
+        );
+
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "the frozen Android contract must admit the scopes this client requests \
+             ({requested:?}), got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_frozen_client_contract_refuses_pairing_for_android() {
+        const READ_PLUS_PAIRING: &[OperatorScope] = &[OperatorScope::Read, OperatorScope::Pairing];
+        let config = test_config();
+
+        let outcome = validate_gateway_profile(
+            SurfaceId::Android,
+            profile_for(&config, READ_PLUS_PAIRING),
+            GATEWAY_PROTOCOL_VERSION.get(),
+        );
+
+        assert_eq!(
+            outcome,
+            Err(ConnectionError::ProfileNotAllowed),
+            "the Android contract grants no pairing authority, so {READ_PLUS_PAIRING:?} \
+             must be refused, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn this_client_requests_strictly_less_than_the_android_contract_allows() {
+        let config = test_config();
+        let requested = requested_operator_scopes(&config);
+        let ceiling = android_ui_contract_scopes();
+
+        let unrequested: Vec<OperatorScope> = ceiling
+            .iter()
+            .copied()
+            .filter(|scope| !requested.contains(scope))
+            .collect();
+
+        assert!(
+            requested.iter().all(|scope| ceiling.contains(scope)),
+            "every requested scope must lie inside the Android contract {ceiling:?}, \
+             requested {requested:?}"
+        );
+        assert!(
+            !unrequested.is_empty(),
+            "this client deliberately requests less than the contract allows; if it now \
+             requests all of {ceiling:?} that is an over-grant to justify, requested {requested:?}"
         );
     }
 }
