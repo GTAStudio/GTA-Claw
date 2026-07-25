@@ -444,7 +444,7 @@ const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
-    "57f6b07a72e9ef2fe90a14f1d4262b73221429ecac49b82e37d4925558343ce3";
+    "e361ba7bbfd4b20503de4786ed0f1590cf8f9f266bd1660bc6b774d83b972d11";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
     "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
 const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
