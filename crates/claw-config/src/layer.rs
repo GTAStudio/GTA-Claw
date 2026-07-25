@@ -235,7 +235,7 @@ fn read_layer(path: &Path, layer: ConfigLayerKind) -> Result<String, LayeredConf
     })
 }
 
-fn merge_layer(
+pub(crate) fn merge_layer(
     merged: &mut Value,
     source: &str,
     layer: ConfigLayerKind,
@@ -261,12 +261,26 @@ fn merge_layer(
     Ok(())
 }
 
-fn merge_value(base: &mut Value, overlay: Value) {
+pub(crate) fn merge_value(base: &mut Value, overlay: Value) {
+    merge_value_at(base, overlay, &mut Vec::new());
+}
+
+fn merge_value_at(base: &mut Value, overlay: Value, path: &mut Vec<String>) {
+    if let (Some(base_object), Some(overlay_object)) = (base.as_object(), overlay.as_object())
+        && replace_discriminated_object(path, base_object, overlay_object)
+    {
+        *base = overlay;
+        return;
+    }
     match (base, overlay) {
         (Value::Object(base), Value::Object(overlay)) => {
             for (key, value) in overlay {
                 match base.get_mut(&key) {
-                    Some(existing) => merge_value(existing, value),
+                    Some(existing) => {
+                        path.push(key);
+                        merge_value_at(existing, value, path);
+                        path.pop();
+                    }
                     None => {
                         base.insert(key, value);
                     }
@@ -275,4 +289,44 @@ fn merge_value(base: &mut Value, overlay: Value) {
         }
         (base, overlay) => *base = overlay,
     }
+}
+
+fn replace_discriminated_object(
+    path: &[String],
+    base: &serde_json::Map<String, Value>,
+    overlay: &serde_json::Map<String, Value>,
+) -> bool {
+    let mode_discriminated = (path.len() == 4
+        && path[0] == "marketplaces"
+        && path[1] == "feeds"
+        && path[3] == "verification")
+        || (path.len() == 5
+            && path[0] == "models"
+            && path[1] == "providers"
+            && path[3] == "request"
+            && matches!(path[4].as_str(), "auth" | "proxy"));
+    let discriminator = if path.len() == 2 && path[0] == "accessGroups" {
+        Some("type")
+    } else if path.len() == 3 && path[0] == "secrets" && path[1] == "providers" {
+        Some("source")
+    } else if path.len() == 3 && path[0] == "marketplaces" && path[1] == "sources" {
+        Some("type")
+    } else if mode_discriminated {
+        Some("mode")
+    } else {
+        None
+    };
+
+    if let Some(discriminator) = discriminator
+        && let Some(overlay_value) = overlay.get(discriminator)
+        && base.get(discriminator) != Some(overlay_value)
+    {
+        return true;
+    }
+
+    path.len() == 3
+        && path[0] == "secrets"
+        && path[1] == "providers"
+        && ((base.contains_key("command") && overlay.contains_key("pluginIntegration"))
+            || (base.contains_key("pluginIntegration") && overlay.contains_key("command")))
 }

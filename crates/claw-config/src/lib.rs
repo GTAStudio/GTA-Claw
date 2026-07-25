@@ -5,7 +5,8 @@
 //! source surface. The original [`ConfigSnapshot`] API remains the strict,
 //! validated GTA legacy runtime envelope used by existing callers.
 
-mod domains;
+/// Strongly typed source configuration for the frozen 47-domain contract.
+pub mod domains;
 mod error;
 mod io;
 mod layer;
@@ -25,12 +26,13 @@ pub use domains::{
     DiscoveryDomain, EnvironmentConfig, GatewayDomain, HooksDomain, InstallPolicyConfig,
     InstallPolicyExec, InstallPolicyExecSource, InstallTarget, LoggingDomain, MarketplacesDomain,
     McpDomain, MediaConfig, MemoryDomain, MessagesDomain, MetaConfig, ModelsDomain, NodeHostDomain,
-    OpenClawConfig, PluginsDomain, ProxyDomain, RescueAuto, RescueEnabled, SecretsDomain,
-    SecurityAuditConfig, SecurityAuditSuppression, SecurityConfig, SessionDomain,
-    ShellEnvironmentConfig, SkillsDomain, SurfaceConfigEntry, TalkDomain, ToolsDomain,
-    TranscriptsDomain, TuiConfig, TuiFooterConfig, UiConfig, UpdateChannel, UpdateConfig,
-    WebDomain, WizardConfig, WizardMode, openclaw_schema_json, openclaw_to_json5,
-    parse_openclaw_json5,
+    OpenClawConfig, OpenClawConfigChange, OpenClawConfigFileWatcher, OpenClawConfigHub,
+    OpenClawConfigLayers, OpenClawConfigSubscription, OpenClawDomain, PluginsDomain, ProxyDomain,
+    RescueAuto, RescueEnabled, ResolvedOpenClawConfig, SecretsDomain, SecurityAuditConfig,
+    SecurityAuditSuppression, SecurityConfig, SessionDomain, ShellEnvironmentConfig, SkillsDomain,
+    SurfaceConfigEntry, TalkDomain, ToolsDomain, TranscriptsDomain, TuiConfig, TuiFooterConfig,
+    UiConfig, UpdateChannel, UpdateConfig, WebDomain, WizardConfig, WizardMode,
+    openclaw_schema_json, openclaw_to_json5, parse_openclaw_json5,
 };
 pub use error::ConfigError;
 pub use io::{WriteOutcome, WriteWarning, load_file, write_bytes_atomically, write_file};

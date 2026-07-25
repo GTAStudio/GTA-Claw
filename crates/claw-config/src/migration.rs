@@ -395,24 +395,7 @@ fn parse_u64(
     minimum: u64,
     maximum: Option<u64>,
 ) -> Result<u64, MigrationError> {
-    let parsed = match parse_integer_prefix(value) {
-        IntegerPrefix::Parsed(value) => value,
-        IntegerPrefix::Missing => {
-            return Err(invalid(mapping, "must start with a base-10 integer"));
-        }
-        IntegerPrefix::Overflow => {
-            return Err(invalid(mapping, "integer prefix is too large to represent"));
-        }
-    };
-    let parsed = u64::try_from(parsed).map_err(|_| invalid(mapping, "must not be negative"))?;
-    if parsed < minimum || maximum.is_some_and(|maximum| parsed > maximum) {
-        let requirement = maximum.map_or_else(
-            || format!("must be at least {minimum}"),
-            |maximum| format!("must be from {minimum} through {maximum}"),
-        );
-        return Err(invalid(mapping, requirement));
-    }
-    Ok(parsed)
+    parse_legacy_integer(value, minimum, maximum).map_err(|message| invalid(mapping, message))
 }
 
 enum IntegerPrefix {
@@ -436,6 +419,28 @@ fn parse_integer_prefix(value: &str) -> IntegerPrefix {
         Ok(value) => IntegerPrefix::Parsed(value),
         Err(_) => IntegerPrefix::Overflow,
     }
+}
+
+pub(crate) fn parse_legacy_integer(
+    value: &str,
+    minimum: u64,
+    maximum: Option<u64>,
+) -> Result<u64, String> {
+    let parsed = match parse_integer_prefix(value) {
+        IntegerPrefix::Parsed(value) => value,
+        IntegerPrefix::Missing => return Err("must start with a base-10 integer".to_owned()),
+        IntegerPrefix::Overflow => {
+            return Err("integer prefix is too large to represent".to_owned());
+        }
+    };
+    let parsed = u64::try_from(parsed).map_err(|_| "must not be negative".to_owned())?;
+    if parsed < minimum || maximum.is_some_and(|maximum| parsed > maximum) {
+        return Err(maximum.map_or_else(
+            || format!("must be at least {minimum}"),
+            |maximum| format!("must be from {minimum} through {maximum}"),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_log_level(
