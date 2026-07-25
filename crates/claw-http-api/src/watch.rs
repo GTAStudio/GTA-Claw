@@ -82,7 +82,7 @@ impl WatchRuntime {
 
     fn issue_challenge(&self, client_ip: IpAddr) -> Result<(String, u64), ApiError> {
         let mut bytes = [0_u8; 32];
-        getrandom::getrandom(&mut bytes).map_err(|_| internal_error())?;
+        getrandom::fill(&mut bytes).map_err(|_| internal_error())?;
         let nonce = URL_SAFE_NO_PAD.encode(bytes);
         let now = Instant::now();
         let mut challenges = self.inner.challenges.lock().map_err(|_| internal_error())?;
@@ -588,7 +588,7 @@ fn validate_watch_connect(connect: &ConnectParams) -> Result<(), ApiError> {
 
 fn random_token() -> Result<String, ApiError> {
     let mut bytes = [0_u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|_| internal_error())?;
+    getrandom::fill(&mut bytes).map_err(|_| internal_error())?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
