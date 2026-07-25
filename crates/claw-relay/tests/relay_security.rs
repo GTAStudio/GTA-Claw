@@ -392,6 +392,16 @@ fn child_sessions_route_real_ids_enforce_ownership_and_reap_descendants() {
         )
         .expect("hello");
     assert_eq!(
+        bridge.receive_extension(
+            extension,
+            ExtensionMessage::Detached {
+                tab_id: 999,
+                reason: "unknown".to_owned(),
+            },
+        ),
+        Err(BridgeError::UnknownTab)
+    );
+    assert_eq!(
         bridge
             .receive_cdp(
                 first,
@@ -721,17 +731,14 @@ fn child_sessions_reject_reserved_ids_and_contain_untracked_traffic() {
                     tab_id: 41,
                     session_id: None,
                     method: "Target.attachedToTarget".to_owned(),
-                    params: Some(overflow_params.clone()),
+                    params: Some(overflow_params),
                 },
             )
-            .expect("overflow is contained to the untracked child"),
-        vec![BridgeEffect::EventToCdp {
+            .expect("overflow closes only the owning CDP connection"),
+        vec![BridgeEffect::CloseCdp {
             connection: cdp,
-            event: claw_relay::CdpEvent {
-                session_id: Some("gta-claw-tab-1".to_owned()),
-                method: "Target.attachedToTarget".to_owned(),
-                params: overflow_params,
-            },
+            code: 1013,
+            reason: "relay child session limit reached",
         }]
     );
     assert_eq!(
@@ -772,6 +779,150 @@ fn child_sessions_reject_reserved_ids_and_contain_untracked_traffic() {
                 }),
             },
         }]
+    );
+}
+
+#[test]
+fn child_session_capacity_is_partitioned_and_overflow_is_never_announced() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(first).expect("first client");
+    bridge.connect_cdp(second).expect("second client");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![
+                    tab(),
+                    RelayTab {
+                        tab_id: 42,
+                        url: "https://second.example.test/".to_owned(),
+                        title: "Second".to_owned(),
+                        active: false,
+                    },
+                ],
+            },
+        )
+        .expect("hello");
+    bridge
+        .receive_cdp(
+            first,
+            CdpRequest {
+                id: 1,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-41" })),
+                session_id: None,
+            },
+        )
+        .expect("first root attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("first root attached");
+    bridge
+        .receive_cdp(
+            second,
+            CdpRequest {
+                id: 2,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-42" })),
+                session_id: None,
+            },
+        )
+        .expect("second root attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 2,
+                result: Some(json!({ "targetId": "chrome-target-42" })),
+            },
+        )
+        .expect("second root attached");
+
+    let child_event = |tab_id, session_id: &str, target_id: &str| ExtensionMessage::CdpEvent {
+        tab_id,
+        session_id: None,
+        method: "Target.attachedToTarget".to_owned(),
+        params: Some(json!({
+            "sessionId": session_id,
+            "targetInfo": { "targetId": target_id, "type": "worker" }
+        })),
+    };
+    bridge
+        .receive_extension(
+            extension,
+            child_event(41, "chrome-first-child", "first-worker"),
+        )
+        .expect("first owner child");
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                child_event(41, "chrome-first-overflow", "overflow-worker"),
+            )
+            .expect("overflow closes only the first owner"),
+        vec![BridgeEffect::CloseCdp {
+            connection: first,
+            code: 1013,
+            reason: "relay child session limit reached",
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                child_event(42, "chrome-second-child", "second-worker"),
+            )
+            .expect("second owner keeps its child partition"),
+        vec![BridgeEffect::EventToCdp {
+            connection: second,
+            event: claw_relay::CdpEvent {
+                session_id: Some("gta-claw-tab-2".to_owned()),
+                method: "Target.attachedToTarget".to_owned(),
+                params: json!({
+                    "sessionId": "chrome-second-child",
+                    "targetInfo": { "targetId": "second-worker", "type": "worker" }
+                }),
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 3,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "1" })),
+                    session_id: Some("chrome-second-child".to_owned()),
+                },
+            )
+            .expect("second owner child command"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
+            seq: 3,
+            tab_id: 42,
+            session_id: Some("chrome-second-child".to_owned()),
+            method: "Runtime.evaluate".to_owned(),
+            params: Some(json!({ "expression": "1" })),
+        })]
     );
 }
 
@@ -1555,6 +1706,371 @@ fn playwright_browser_session_and_auto_attach_sequence_is_supported() {
 }
 
 #[test]
+fn pending_capacity_is_partitioned_per_authenticated_connection() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(first).expect("first client");
+    bridge.connect_cdp(second).expect("second client");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![
+                    tab(),
+                    RelayTab {
+                        tab_id: 42,
+                        url: "https://second.example.test/".to_owned(),
+                        title: "Second".to_owned(),
+                        active: false,
+                    },
+                ],
+            },
+        )
+        .expect("hello");
+    bridge
+        .receive_cdp(
+            first,
+            CdpRequest {
+                id: 1,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-41" })),
+                session_id: None,
+            },
+        )
+        .expect("first root attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("first root attached");
+    bridge
+        .receive_cdp(
+            second,
+            CdpRequest {
+                id: 2,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-42" })),
+                session_id: None,
+            },
+        )
+        .expect("second root attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 2,
+                result: Some(json!({ "targetId": "chrome-target-42" })),
+            },
+        )
+        .expect("second root attached");
+
+    let screenshot = |id, session_id: &str| CdpRequest {
+        id,
+        method: "Page.captureScreenshot".to_owned(),
+        params: Some(json!({ "format": "png" })),
+        session_id: Some(session_id.to_owned()),
+    };
+    assert_eq!(
+        bridge
+            .receive_cdp(first, screenshot(3, "gta-claw-tab-1"))
+            .expect("first owner uses its slot"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
+            seq: 3,
+            tab_id: 41,
+            session_id: None,
+            method: "Page.captureScreenshot".to_owned(),
+            params: Some(json!({ "format": "png" })),
+        })]
+    );
+    assert_eq!(
+        bridge.receive_cdp(first, screenshot(4, "gta-claw-tab-1")),
+        Err(BridgeError::PendingLimit)
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(second, screenshot(5, "gta-claw-tab-2"))
+            .expect("second owner has an independent slot"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
+            seq: 4,
+            tab_id: 42,
+            session_id: None,
+            method: "Page.captureScreenshot".to_owned(),
+            params: Some(json!({ "format": "png" })),
+        })]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq: 3,
+                    result: Some(json!({ "data": "first" })),
+                },
+            )
+            .expect("first screenshot completed"),
+        vec![BridgeEffect::ToCdp {
+            connection: first,
+            response: claw_relay::CdpResponse {
+                id: 3,
+                session_id: Some("gta-claw-tab-1".to_owned()),
+                result: Some(json!({ "data": "first" })),
+                error: None,
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(first, screenshot(6, "gta-claw-tab-1"))
+            .expect("first owner reacquires only its own slot"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
+            seq: 5,
+            tab_id: 41,
+            session_id: None,
+            method: "Page.captureScreenshot".to_owned(),
+            params: Some(json!({ "format": "png" })),
+        })]
+    );
+}
+
+#[test]
+fn bridge_caps_authenticated_cdp_connections_and_global_limit_arithmetic() {
+    let mut endpoint = RelayEndpoint::new(
+        RelayToken::from_hex(TOKEN).expect("valid fixture token"),
+        [ExtensionId::new(EXTENSION_ID).expect("valid fixture extension ID")],
+        4096,
+        9,
+    )
+    .expect("endpoint above the bridge-level cap");
+    let connections = (0..9)
+        .map(|_| endpoint.accept(&cdp_upgrade()).expect("CDP"))
+        .collect::<Vec<_>>();
+    let mut bridge = CdpBridge::new();
+    for connection in connections.iter().take(8) {
+        bridge
+            .connect_cdp(*connection)
+            .expect("connection within the bridge cap");
+    }
+    assert_eq!(
+        bridge.connect_cdp(connections[8]),
+        Err(BridgeError::CdpConnectionLimit)
+    );
+    assert!(matches!(
+        CdpBridge::with_pending_limit(usize::MAX),
+        Err(BridgeError::InvalidPendingLimit)
+    ));
+}
+
+#[test]
+fn root_session_capacity_is_partitioned_per_authenticated_connection() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(first).expect("first CDP");
+    bridge.connect_cdp(second).expect("second CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![
+                    tab(),
+                    RelayTab {
+                        tab_id: 42,
+                        url: "https://second.example.test/".to_owned(),
+                        title: "Second".to_owned(),
+                        active: false,
+                    },
+                    RelayTab {
+                        tab_id: 43,
+                        url: "https://third.example.test/".to_owned(),
+                        title: "Third".to_owned(),
+                        active: false,
+                    },
+                ],
+            },
+        )
+        .expect("hello");
+    let attach = |id, target_id| CdpRequest {
+        id,
+        method: "Target.attachToTarget".to_owned(),
+        params: Some(json!({ "targetId": target_id })),
+        session_id: None,
+    };
+
+    bridge
+        .receive_cdp(first, attach(1, "tab-41"))
+        .expect("first owner attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({})),
+            },
+        )
+        .expect("first owner attached");
+    assert_eq!(
+        bridge.receive_cdp(first, attach(2, "tab-43")),
+        Err(BridgeError::SessionLimit)
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(second, attach(3, "tab-42"))
+            .expect("first owner cannot consume the second owner's root partition"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 2,
+            tab_id: 42,
+        })]
+    );
+}
+
+#[test]
+fn cleanup_quarantine_capacity_is_partitioned_per_authenticated_connection() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let second_tab = RelayTab {
+        tab_id: 42,
+        url: "https://second.example.test/".to_owned(),
+        title: "Second".to_owned(),
+        active: false,
+    };
+    let connect = |bridge: &mut CdpBridge| {
+        assert_eq!(bridge.connect_extension(extension), Vec::new());
+        bridge.connect_cdp(first).expect("first CDP");
+        bridge.connect_cdp(second).expect("second CDP");
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Hello {
+                    user_agent: "Fixture".to_owned(),
+                    browser_version: "Chrome/144".to_owned(),
+                    extension_version: "2.0.0".to_owned(),
+                    tabs: vec![tab(), second_tab.clone()],
+                },
+            )
+            .expect("hello");
+    };
+    let attach = |id, target_id| CdpRequest {
+        id,
+        method: "Target.attachToTarget".to_owned(),
+        params: Some(json!({ "targetId": target_id })),
+        session_id: None,
+    };
+
+    let mut abandoned = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    connect(&mut abandoned);
+    abandoned
+        .receive_cdp(first, attach(1, "tab-41"))
+        .expect("first pending attach");
+    abandoned
+        .receive_cdp(second, attach(2, "tab-42"))
+        .expect("second pending attach");
+    assert_eq!(abandoned.disconnect_cdp(first), Vec::new());
+    assert_eq!(abandoned.disconnect_cdp(second), Vec::new());
+    for seq in [1, 2] {
+        assert_eq!(
+            abandoned
+                .receive_extension(
+                    extension,
+                    ExtensionMessage::Error {
+                        seq,
+                        message: "attach cancelled".to_owned(),
+                    },
+                )
+                .expect("each owner has an independent abandoned-attach partition"),
+            Vec::new()
+        );
+    }
+    assert_eq!(
+        abandoned
+            .receive_extension(extension, ExtensionMessage::Pong)
+            .expect("one owner's quarantine cannot close the shared extension"),
+        Vec::new()
+    );
+
+    let mut cleanup = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    connect(&mut cleanup);
+    cleanup
+        .receive_cdp(first, attach(3, "tab-41"))
+        .expect("first attach");
+    cleanup
+        .receive_cdp(second, attach(4, "tab-42"))
+        .expect("second attach");
+    for seq in [1, 2] {
+        cleanup
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq,
+                    result: Some(json!({})),
+                },
+            )
+            .expect("attach completion");
+    }
+    assert_eq!(
+        cleanup.disconnect_cdp(first),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Detach {
+            seq: 3,
+            tab_id: 41,
+        })]
+    );
+    assert_eq!(
+        cleanup.disconnect_cdp(second),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Detach {
+            seq: 4,
+            tab_id: 42,
+        })]
+    );
+    for seq in [3, 4] {
+        assert_eq!(
+            cleanup
+                .receive_extension(
+                    extension,
+                    ExtensionMessage::Result {
+                        seq,
+                        result: Some(json!({})),
+                    },
+                )
+                .expect("each owner has an independent cleanup-detach partition"),
+            Vec::new()
+        );
+    }
+}
+
+#[test]
 fn pending_work_is_bounded_expires_and_disconnect_cleanup_cannot_leak_ownership() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint
@@ -1826,7 +2342,7 @@ fn playwright_page_bootstrap_commands_are_explicitly_policy_allowed() {
 }
 
 #[test]
-fn auto_attach_reservation_is_atomic_and_internal_failures_emit_no_fake_response() {
+fn auto_attach_capacity_is_bounded_without_blocking_tab_synchronization() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint
         .accept(&extension_upgrade(
@@ -1856,20 +2372,29 @@ fn auto_attach_reservation_is_atomic_and_internal_failures_emit_no_fake_response
         )
         .expect("hello");
     assert_eq!(
-        bridge.receive_cdp(
-            cdp,
-            CdpRequest {
-                id: 1,
-                method: "Target.setAutoAttach".to_owned(),
-                params: Some(json!({ "autoAttach": true })),
-                session_id: None,
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 1,
+                    method: "Target.setAutoAttach".to_owned(),
+                    params: Some(json!({ "autoAttach": true })),
+                    session_id: None,
+                },
+            )
+            .expect("auto attach admits work within the connection partition"),
+        vec![
+            BridgeEffect::ToCdp {
+                connection: cdp,
+                response: claw_relay::CdpResponse {
+                    id: 1,
+                    session_id: None,
+                    result: Some(json!({})),
+                    error: None,
+                },
             },
-        ),
-        Err(BridgeError::PendingLimit)
-    );
-    assert_eq!(
-        bridge.expire_command(1),
-        Err(BridgeError::UnknownCommandSequence)
+            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 1, tab_id: 41 }),
+        ]
     );
     let third_tab = RelayTab {
         tab_id: 43,
@@ -1882,17 +2407,260 @@ fn auto_attach_reservation_is_atomic_and_internal_failures_emit_no_fake_response
             .receive_extension(
                 extension,
                 ExtensionMessage::Tabs {
+                    tabs: vec![tab(), third_tab.clone()],
+                },
+            )
+            .expect("the full auto-attach partition does not block tab synchronization"),
+        Vec::new()
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Error {
+                    seq: 1,
+                    message: "attach cancelled".to_owned(),
+                },
+            )
+            .expect("internal attach cancellation"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 2,
+            tab_id: 43,
+        })]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Error {
+                    seq: 2,
+                    message: "second attach cancelled".to_owned(),
+                },
+            )
+            .expect("the second failure suppresses the whole failed wave"),
+        Vec::new()
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Tabs {
                     tabs: vec![tab(), third_tab],
                 },
             )
-            .expect("failed auto-attach did not remain enabled"),
-        Vec::new()
+            .expect("a fresh snapshot begins a controlled retry wave"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 3,
+            tab_id: 41,
+        })]
     );
+    assert_eq!(bridge.disconnect_extension(), Vec::new());
+}
 
-    let mut single = CdpBridge::with_pending_limit(1).expect("positive pending bound");
-    single.connect_extension(extension);
-    single.connect_cdp(cdp).expect("CDP");
-    single
+#[test]
+fn browser_detach_pumps_auto_attach_without_retrying_the_detached_tab() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let cdp = endpoint.accept(&cdp_upgrade()).expect("CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    bridge.connect_extension(extension);
+    bridge.connect_cdp(cdp).expect("CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![
+                    tab(),
+                    RelayTab {
+                        tab_id: 42,
+                        url: "https://second.example.test/".to_owned(),
+                        title: "Second".to_owned(),
+                        active: false,
+                    },
+                ],
+            },
+        )
+        .expect("hello");
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 1,
+                    method: "Target.setAutoAttach".to_owned(),
+                    params: Some(json!({ "autoAttach": true })),
+                    session_id: None,
+                },
+            )
+            .expect("auto attach"),
+        vec![
+            BridgeEffect::ToCdp {
+                connection: cdp,
+                response: claw_relay::CdpResponse {
+                    id: 1,
+                    session_id: None,
+                    result: Some(json!({})),
+                    error: None,
+                },
+            },
+            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 1, tab_id: 41 }),
+        ]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "target-41" })),
+            },
+        )
+        .expect("first tab attached");
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Detached {
+                    tab_id: 41,
+                    reason: "target_closed".to_owned(),
+                },
+            )
+            .expect("browser detach releases lifecycle capacity"),
+        vec![
+            BridgeEffect::EventToCdp {
+                connection: cdp,
+                event: claw_relay::CdpEvent {
+                    session_id: None,
+                    method: "Target.detachedFromTarget".to_owned(),
+                    params: json!({
+                        "sessionId": "gta-claw-tab-1",
+                        "targetId": "target-41"
+                    }),
+                },
+            },
+            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 2, tab_id: 42 }),
+        ]
+    );
+}
+
+#[test]
+fn auto_attach_capacity_advances_across_enabled_connections() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    bridge.connect_extension(extension);
+    bridge.connect_cdp(first).expect("first CDP");
+    bridge.connect_cdp(second).expect("second CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![
+                    tab(),
+                    RelayTab {
+                        tab_id: 42,
+                        url: "https://second.example.test/".to_owned(),
+                        title: "Second".to_owned(),
+                        active: false,
+                    },
+                ],
+            },
+        )
+        .expect("hello");
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 1,
+                    method: "Target.setAutoAttach".to_owned(),
+                    params: Some(json!({ "autoAttach": true })),
+                    session_id: None,
+                },
+            )
+            .expect("first auto-attach owner"),
+        vec![
+            BridgeEffect::ToCdp {
+                connection: first,
+                response: claw_relay::CdpResponse {
+                    id: 1,
+                    session_id: None,
+                    result: Some(json!({})),
+                    error: None,
+                },
+            },
+            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 1, tab_id: 41 }),
+        ]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({})),
+            },
+        )
+        .expect("first owner reaches its root limit");
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 2,
+                    method: "Target.setAutoAttach".to_owned(),
+                    params: Some(json!({ "autoAttach": true })),
+                    session_id: None,
+                },
+            )
+            .expect("scheduler advances past the full first partition"),
+        vec![
+            BridgeEffect::ToCdp {
+                connection: second,
+                response: claw_relay::CdpResponse {
+                    id: 2,
+                    session_id: None,
+                    result: Some(json!({})),
+                    error: None,
+                },
+            },
+            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 2, tab_id: 42 }),
+        ]
+    );
+}
+
+#[test]
+fn failed_auto_attach_is_handed_to_another_enabled_owner() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    bridge.connect_extension(extension);
+    bridge.connect_cdp(first).expect("first CDP");
+    bridge.connect_cdp(second).expect("second CDP");
+    bridge
         .receive_extension(
             extension,
             ExtensionMessage::Hello {
@@ -1903,59 +2671,175 @@ fn auto_attach_reservation_is_atomic_and_internal_failures_emit_no_fake_response
             },
         )
         .expect("hello");
-    single
+    bridge
         .receive_cdp(
-            cdp,
+            first,
             CdpRequest {
-                id: 2,
+                id: 1,
                 method: "Target.setAutoAttach".to_owned(),
                 params: Some(json!({ "autoAttach": true })),
                 session_id: None,
             },
         )
-        .expect("auto attach");
-    let new_tab = RelayTab {
-        tab_id: 42,
-        url: "https://new.example.test/".to_owned(),
-        title: "New".to_owned(),
-        active: false,
-    };
+        .expect("first owner reserves the tab");
     assert_eq!(
-        single.receive_extension(
-            extension,
-            ExtensionMessage::Tabs {
-                tabs: vec![tab(), new_tab.clone()],
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 2,
+                    method: "Target.setAutoAttach".to_owned(),
+                    params: Some(json!({ "autoAttach": true })),
+                    session_id: None,
+                },
+            )
+            .expect("second owner waits on the reservation"),
+        vec![BridgeEffect::ToCdp {
+            connection: second,
+            response: claw_relay::CdpResponse {
+                id: 2,
+                session_id: None,
+                result: Some(json!({})),
+                error: None,
             },
-        ),
-        Err(BridgeError::PendingLimit)
+        }]
     );
     assert_eq!(
-        single
+        bridge
             .receive_extension(
                 extension,
                 ExtensionMessage::Error {
                     seq: 1,
-                    message: "attach cancelled".to_owned(),
+                    message: "first owner attach failed".to_owned(),
                 },
             )
-            .expect("internal attach cancellation"),
-        Vec::new()
-    );
-    assert_eq!(
-        single
-            .receive_extension(
-                extension,
-                ExtensionMessage::Tabs {
-                    tabs: vec![tab(), new_tab],
-                },
-            )
-            .expect("retry sees the tab as new"),
+            .expect("failure suppression is scoped to the failed owner"),
         vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
             seq: 2,
-            tab_id: 42,
+            tab_id: 41,
         })]
     );
-    assert_eq!(single.disconnect_extension(), Vec::new());
+}
+
+#[test]
+fn auto_attach_pumps_when_an_ordinary_command_releases_capacity() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let cdp = endpoint.accept(&cdp_upgrade()).expect("CDP");
+    let mut bridge = CdpBridge::with_pending_limit(2).expect("positive per-client bound");
+    bridge.connect_extension(extension);
+    bridge.connect_cdp(cdp).expect("CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![
+                    tab(),
+                    RelayTab {
+                        tab_id: 42,
+                        url: "https://second.example.test/".to_owned(),
+                        title: "Second".to_owned(),
+                        active: false,
+                    },
+                ],
+            },
+        )
+        .expect("hello");
+    bridge
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 1,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-41" })),
+                session_id: None,
+            },
+        )
+        .expect("root attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({})),
+            },
+        )
+        .expect("root attached");
+    for (id, seq) in [(2, 2), (3, 3)] {
+        assert_eq!(
+            bridge
+                .receive_cdp(
+                    cdp,
+                    CdpRequest {
+                        id,
+                        method: "Page.captureScreenshot".to_owned(),
+                        params: Some(json!({ "format": "png" })),
+                        session_id: Some("gta-claw-tab-1".to_owned()),
+                    },
+                )
+                .expect("ordinary command fills pending capacity"),
+            vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
+                seq,
+                tab_id: 41,
+                session_id: None,
+                method: "Page.captureScreenshot".to_owned(),
+                params: Some(json!({ "format": "png" })),
+            })]
+        );
+    }
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 4,
+                    method: "Target.setAutoAttach".to_owned(),
+                    params: Some(json!({ "autoAttach": true })),
+                    session_id: None,
+                },
+            )
+            .expect("auto attach waits for pending capacity"),
+        vec![BridgeEffect::ToCdp {
+            connection: cdp,
+            response: claw_relay::CdpResponse {
+                id: 4,
+                session_id: None,
+                result: Some(json!({})),
+                error: None,
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq: 2,
+                    result: Some(json!({ "data": "first" })),
+                },
+            )
+            .expect("ordinary completion pumps queued auto-attach work"),
+        vec![
+            BridgeEffect::ToCdp {
+                connection: cdp,
+                response: claw_relay::CdpResponse {
+                    id: 2,
+                    session_id: Some("gta-claw-tab-1".to_owned()),
+                    result: Some(json!({ "data": "first" })),
+                    error: None,
+                },
+            },
+            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 4, tab_id: 42 }),
+        ]
+    );
 }
 
 #[test]
@@ -2289,7 +3173,7 @@ fn attach_reservations_release_into_bounded_timeout_and_disconnect_quarantine() 
 }
 
 #[test]
-fn abandoned_tombstones_are_bounded_without_consuming_pending_capacity() {
+fn abandoned_tombstones_release_pending_but_hold_lifecycle_capacity() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint
         .accept(&extension_upgrade(
@@ -2344,18 +3228,13 @@ fn abandoned_tombstones_are_bounded_without_consuming_pending_capacity() {
         }]
     );
     assert_eq!(
-        bridge
-            .receive_cdp(cdp, attach(2, "tab-42"))
-            .expect("tombstone does not consume pending capacity"),
-        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
-            seq: 2,
-            tab_id: 42,
-        })]
+        bridge.receive_cdp(cdp, attach(2, "tab-42")),
+        Err(BridgeError::SessionLimit)
     );
     assert_eq!(
         bridge.expire_command(1).expect("first tombstone grace"),
         vec![BridgeEffect::ToExtension(ExtensionCommand::Detach {
-            seq: 3,
+            seq: 2,
             tab_id: 41,
         })]
     );
@@ -2364,7 +3243,7 @@ fn abandoned_tombstones_are_bounded_without_consuming_pending_capacity() {
             .receive_extension(
                 extension,
                 ExtensionMessage::Result {
-                    seq: 3,
+                    seq: 2,
                     result: Some(json!({})),
                 },
             )
@@ -2372,7 +3251,16 @@ fn abandoned_tombstones_are_bounded_without_consuming_pending_capacity() {
         Vec::new()
     );
     assert_eq!(
-        bridge.expire_command(2).expect("second timeout"),
+        bridge
+            .receive_cdp(cdp, attach(2, "tab-42"))
+            .expect("cleanup completion releases lifecycle capacity"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 3,
+            tab_id: 42,
+        })]
+    );
+    assert_eq!(
+        bridge.expire_command(3).expect("second timeout"),
         vec![BridgeEffect::ToCdp {
             connection: cdp,
             response: claw_relay::CdpResponse {
@@ -2389,7 +3277,7 @@ fn abandoned_tombstones_are_bounded_without_consuming_pending_capacity() {
 }
 
 #[test]
-fn cleanup_failure_and_quarantine_exhaustion_close_the_extension_fail_closed() {
+fn cleanup_failure_is_fail_closed_but_capacity_exhaustion_is_owner_local() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint
         .accept(&extension_upgrade(
@@ -2488,8 +3376,8 @@ fn cleanup_failure_and_quarantine_exhaustion_close_the_extension_fail_closed() {
         )
         .expect("first attach");
     exhausted.expire_command(1).expect("first attach timeout");
-    exhausted
-        .receive_cdp(
+    assert_eq!(
+        exhausted.receive_cdp(
             cdp,
             CdpRequest {
                 id: 3,
@@ -2497,34 +3385,19 @@ fn cleanup_failure_and_quarantine_exhaustion_close_the_extension_fail_closed() {
                 params: Some(json!({ "targetId": "tab-42" })),
                 session_id: None,
             },
-        )
-        .expect("pending capacity remains available");
+        ),
+        Err(BridgeError::SessionLimit)
+    );
     assert_eq!(
-        exhausted.expire_command(2).expect("quarantine overflow"),
-        vec![
-            BridgeEffect::CloseExtension {
-                connection: extension,
-                code: 1011,
-                reason: "relay cleanup quarantine limit reached",
-            },
-            BridgeEffect::ToCdp {
-                connection: cdp,
-                response: claw_relay::CdpResponse {
-                    id: 3,
-                    session_id: None,
-                    result: None,
-                    error: Some(CdpErrorObject {
-                        code: -32000,
-                        message: "extension relay command timed out".to_owned(),
-                    }),
-                },
-            },
-        ]
+        exhausted
+            .receive_extension(extension, ExtensionMessage::Pong)
+            .expect("one owner's lifecycle exhaustion preserves the shared extension"),
+        Vec::new()
     );
 }
 
 #[test]
-fn cleanup_timeout_and_disconnect_cleanup_overflow_fail_closed() {
+fn cleanup_timeout_is_fail_closed_but_root_admission_prevents_disconnect_overflow() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint
         .accept(&extension_upgrade(
@@ -2599,35 +3472,62 @@ fn cleanup_timeout_and_disconnect_cleanup_overflow_fail_closed() {
             },
         )
         .expect("hello");
-    for (request_id, sequence, target_id) in [(2, 1, "tab-41"), (3, 2, "tab-42")] {
-        overflow
-            .receive_cdp(
-                cdp,
-                CdpRequest {
-                    id: request_id,
-                    method: "Target.attachToTarget".to_owned(),
-                    params: Some(json!({ "targetId": target_id })),
-                    session_id: None,
-                },
-            )
-            .expect("attach");
+    overflow
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 2,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-41" })),
+                session_id: None,
+            },
+        )
+        .expect("first attach");
+    overflow
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "tab-41" })),
+            },
+        )
+        .expect("first attached");
+    assert_eq!(
+        overflow.receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 3,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-42" })),
+                session_id: None,
+            },
+        ),
+        Err(BridgeError::SessionLimit)
+    );
+    assert_eq!(
+        overflow.disconnect_cdp(cdp),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Detach {
+            seq: 2,
+            tab_id: 41,
+        })]
+    );
+    assert_eq!(
         overflow
             .receive_extension(
                 extension,
                 ExtensionMessage::Result {
-                    seq: sequence,
-                    result: Some(json!({ "targetId": target_id })),
+                    seq: 2,
+                    result: Some(json!({})),
                 },
             )
-            .expect("attached");
-    }
+            .expect("bounded disconnect cleanup"),
+        Vec::new()
+    );
     assert_eq!(
-        overflow.disconnect_cdp(cdp),
-        vec![BridgeEffect::CloseExtension {
-            connection: extension,
-            code: 1011,
-            reason: "relay cleanup quarantine limit reached",
-        }]
+        overflow
+            .receive_extension(extension, ExtensionMessage::Pong)
+            .expect("one owner's root limit preserves the shared extension"),
+        Vec::new()
     );
 }
 
@@ -3178,8 +4078,8 @@ fn ordinary_cdp_detach_and_mixed_quarantine_timeouts_are_distinct() {
         )
         .expect("detach second");
     mixed.expire_command(3).expect("tracked cleanup");
-    mixed
-        .receive_cdp(
+    assert_eq!(
+        mixed.receive_cdp(
             cdp,
             CdpRequest {
                 id: 9,
@@ -3187,29 +4087,14 @@ fn ordinary_cdp_detach_and_mixed_quarantine_timeouts_are_distinct() {
                 params: Some(json!({ "targetId": "tab-43" })),
                 session_id: None,
             },
-        )
-        .expect("third attach");
+        ),
+        Err(BridgeError::SessionLimit)
+    );
     assert_eq!(
-        mixed.expire_command(4).expect("mixed quarantine overflow"),
-        vec![
-            BridgeEffect::CloseExtension {
-                connection: extension,
-                code: 1011,
-                reason: "relay cleanup quarantine limit reached",
-            },
-            BridgeEffect::ToCdp {
-                connection: cdp,
-                response: claw_relay::CdpResponse {
-                    id: 9,
-                    session_id: None,
-                    result: None,
-                    error: Some(CdpErrorObject {
-                        code: -32000,
-                        message: "extension relay command timed out".to_owned(),
-                    }),
-                },
-            },
-        ]
+        mixed
+            .receive_extension(extension, ExtensionMessage::Pong)
+            .expect("mixed quarantine exhaustion remains owner-local"),
+        Vec::new()
     );
 }
 
@@ -3336,18 +4221,15 @@ fn tab_death_clears_quarantine_without_poisoning_auto_attach() {
                 },
             )
             .expect("auto attach third tab"),
-        vec![
-            BridgeEffect::ToCdp {
-                connection: cdp,
-                response: claw_relay::CdpResponse {
-                    id: 5,
-                    session_id: None,
-                    result: Some(json!({})),
-                    error: None,
-                },
+        vec![BridgeEffect::ToCdp {
+            connection: cdp,
+            response: claw_relay::CdpResponse {
+                id: 5,
+                session_id: None,
+                result: Some(json!({})),
+                error: None,
             },
-            BridgeEffect::ToExtension(ExtensionCommand::Attach { seq: 3, tab_id: 43 }),
-        ]
+        }]
     );
     let fourth_tab = RelayTab {
         tab_id: 44,
@@ -3360,12 +4242,12 @@ fn tab_death_clears_quarantine_without_poisoning_auto_attach() {
             .receive_extension(
                 extension,
                 ExtensionMessage::Tabs {
-                    tabs: vec![tabs[0].clone(), tabs[1].clone(), fourth_tab],
+                    tabs: vec![tabs[1].clone(), fourth_tab],
                 },
             )
-            .expect("authoritative tab death needs no late-response quarantine"),
+            .expect("authoritative death releases one quarantined lifecycle slot"),
         vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
-            seq: 4,
+            seq: 3,
             tab_id: 44,
         })]
     );

@@ -395,8 +395,8 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "69d4dd13274184df81e40850af72b43a61616d39053756e4b9af048c6258d300",
     "9753cc1eadca7a09df356d08dafec088e646c94c0ce2868f84710df1943a2441",
     "3467fde87a6a406cc94335bd2bd63f0b8e3522c134e063976328a630de1dcaa7",
-    "75cb7f837f26e830939ba4367817b0de70c2e3d9adc3b84e7e65fa9064d020ab",
-    "579a3c2a71181662079aaf327014ea83086ad3f2ba820b90f49888aaa4cc2f83",
+    "1da40175a7d23d22a337c66d4142ff085d3ab600132af3a9b542e3c84db2ca9d",
+    "a6203dbf4d210e5e11ba68275ed600aac157a4d45adc3bea2a45027deebe6884",
     "167036eb447029f002f216247434daa4bb2e4134c0d5bc93267aaed0cc069327",
     "a8bbfc6d471d39ed81ad4676e57f477b5b50afd82129068eb6bc6d6f57733342",
     "a20a835fd001a0eca4eb665cf735848ff18c5fa311de33e905d6306f31bc3140",
@@ -404,26 +404,26 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "ec82eef948d01d5cab301b32086204cb966db73dd01644070f6c6777a4b45924",
     "0bdd763bd89d491d9b8b35421b4ad3654a4679c86f1822bbf1c909c87374e00e",
     "5aee908db7a976b943b26425e848cfa90931ee626f804e39cb252486cf047383",
-    "3f051c251bafdf3a6b0f14c37e21ffdb1ef92c7e3bea0d303341544e7e0e0374",
-    "b5c925fa778bb9e0199b48b60eb8cfdc39c414c91cf9d9f02ce1cbadb511e1ff",
-    "98067986b73b2e60c3e49c54db9c255c041bcf40710f3a993f1eeedc98f84685",
-    "fa4fd6982b510690dc10aec44125af48bd4365a76be708650f5759b7598ea274",
-    "347bf30ac68502a5bc0f76186f59be0c4aab3ca708581e6ebd46e2062b326393",
-    "fe56db78495e1ae5104940a929f0178466c7c350c78b129e24594a578e2051c8",
-    "420e9159c23eae96a5b7c8fbdd1e84fead0e99e83b88a90b42bad93872947e4b",
+    "ccb878d811465ad1005d7bf4792506cde121e17cbeee566b244eeb05265800cc",
+    "4ae7bed67b0afe8d76e1fb6503497b1563d4b256b715e78d71029c875409a032",
+    "1b7b2da40c6655a218b0c7e20d844280df99d2cb9b09f7c20d689d5ff1183d08",
+    "14275c8e0e44b039a72082688afc2a6411eba71a96390d28247bf5802509c8ef",
+    "20a72617566a38befd9e48ae5ef899e8e41de2e15b4ad2b9b4a4c22549c8ee92",
+    "9492af801047bb872e00cbf2f458da57103af236b9f1e18ea2e3ef52284eb942",
+    "24e97bd0ff76612445f7ed60adefa4d5f22154c77c1c54602e8caeec8302f957",
     "6323a7af697145771d2c7347e8d58b7473a03aebdd9f4f454373265cd878b109",
     "6f9e9832a4b82fb713d312da5003f65c5c95324fc10a1ec64f5f59cc28bafcb0",
     "d25d49c53c9c183dd0686e25d714c17a8658992615b1c51b5154af2d5795eec7",
     "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
     "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe",
     "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d",
-    "9d78edc9a17824bfd4cd489bbed5af52f2b8c87a53bcac0e3722afa1fc1b48c2",
-    "0d7c8789ebddd4e3d4ad204e769aace4d6e37c587333e3b4db32f0904e5e5b7a",
-    "b2b277e556c2fe0329c008f6d6a3bef9a91e8303ae9983b77a5b39c23825f941",
-    "8ea60763c2cc7b09fbe3bc2a2805fdd7c2fd999f6e4f9b6ba968fd27dcd56968",
-    "319e37b49c49ca1968a2d30a4f22d1a3e108045391d0ba7acb8f6b5b8f452d29",
-    "2035257e3908a0fb05632f71268e1fac9f6c5cb1c24169fcbb4561020f8f237f",
-    "ee45dd9d1f8d74a76c7f82b84eeb36d31441e7e8114f5fc9730a475324fed309",
+    "bb0765a3cde2b1e2ccad68918c4bc639aceedfbab4a4f53a28c8afcd600f9686",
+    "fc996a176592a7222eae3ae544c373e0a926f6d9086fed9d47307666ef745fae",
+    "0bf5edd919b09327fee1b6f45aea8a0a6432d3800990a21fe7ed40fbf4a040b5",
+    "2832f430e8b38e365b58ca1583cfe84f0975f4f3655697a2f26fa9876f88bae7",
+    "b9452f32eec46f9400af6dd0a8c6160d83580bce1f163a6587cc88ff2de56213",
+    "226007c6e9d0dcf1e48f5b2a4b083f1b5669dfb91f235e999b97e1f7fc1a00f2",
+    "4c663a6cebb27c4cb285c5587e019ae503b2ec352ba83c95dc94f48cf8fa5b18",
     "dbbf5e53488e8977958a95ab58e03ba89ee9da7503ffe0e58dd946946afb8179",
     "bb2febc949e862a6e5c0904f4041b19853e7bde3f06f17627f4c828519b856d7",
     "781a04de8ae53429a22b602b303fe9f870def0c545f7a056c7ea322677984409",
@@ -444,7 +444,7 @@ const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
-    "e361ba7bbfd4b20503de4786ed0f1590cf8f9f266bd1660bc6b774d83b972d11";
+    "75dedb874582f2f6d32890e21cca11186112d13dd51f4140ada96c69989594d0";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
     "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
 const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
@@ -1368,6 +1368,125 @@ fn dynamic_and_matrix_workflow_identities_cannot_spoof_reserved_checks() {
     );
 }
 
+fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
+    format!(
+        "name: \"{name}\"\n\
+         \n\
+         on:\n\
+         \x20 pull_request:\n\
+         \x20   branches:\n\
+         \x20     - main\n\
+         \n\
+         permissions:\n\
+         \x20 contents: read\n\
+         \n\
+         jobs:\n\
+         \x20 {job_id}:\n\
+         \x20   name: \"{job_name}\"\n\
+         \x20   runs-on: ubuntu-latest\n\
+         \x20   steps:\n\
+         \x20     - name: Placeholder\n\
+         \x20       run: echo packaging\n"
+    )
+}
+
+#[test]
+fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
+    let base = copy_repo("mobile-inventory-baseline");
+    let identities = validate_inventory(&SafeRoot::new(&base.path).expect("open baseline tree"))
+        .expect("the eight required workflows are a valid inventory");
+    assert_eq!(identities.len(), 8);
+
+    for (label, added) in [
+        ("ios", &[".github/workflows/ios-packaging.yml"][..]),
+        ("android", &[".github/workflows/android-packaging.yml"][..]),
+        (
+            "both",
+            &[
+                ".github/workflows/android-packaging.yml",
+                ".github/workflows/ios-packaging.yml",
+            ][..],
+        ),
+    ] {
+        let tree = copy_repo(&format!("mobile-inventory-{label}"));
+        for (index, path) in added.iter().enumerate() {
+            fs::write(
+                tree.join(path),
+                mobile_workflow_stub(
+                    &format!("mobile packaging {index}"),
+                    &format!("package{index}"),
+                    &format!("Mobile package {index}"),
+                ),
+            )
+            .expect("write admitted mobile workflow");
+        }
+        let identities =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open admitted mobile tree"))
+                .expect("admitted mobile workflows pass the inventory");
+        assert_eq!(identities.len(), 8 + added.len(), "{label}");
+    }
+
+    for (label, path) in [
+        ("unknown-name", ".github/workflows/linux-mobile.yml"),
+        (
+            "near-miss-extension",
+            ".github/workflows/ios-packaging.yaml",
+        ),
+        ("nested", ".github/workflows/mobile/ios-packaging.yml"),
+    ] {
+        let tree = copy_repo(&format!("mobile-inventory-{label}"));
+        let destination = tree.join(path);
+        fs::create_dir_all(destination.parent().expect("workflow parent"))
+            .expect("create workflow parent");
+        fs::write(
+            &destination,
+            mobile_workflow_stub("unadmitted packaging", "package", "Unadmitted package"),
+        )
+        .expect("write unadmitted workflow");
+        let error =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open unadmitted mobile tree"))
+                .expect_err("unadmitted workflow unexpectedly passed the inventory");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow directory inventory changed"),
+            "{label} failed for the wrong reason: {error}"
+        );
+    }
+
+    let removed = copy_repo("mobile-inventory-missing-required");
+    fs::write(
+        removed.join(".github/workflows/ios-packaging.yml"),
+        mobile_workflow_stub("ios packaging", "package", "iOS package"),
+    )
+    .expect("write admitted iOS workflow");
+    fs::remove_file(removed.join(".github/workflows/windows-packaging.yml"))
+        .expect("remove required workflow");
+    let error = validate_inventory(&SafeRoot::new(&removed.path).expect("open reduced tree"))
+        .expect_err("missing required workflow unexpectedly passed the inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("workflow directory inventory changed"),
+        "removed required workflow failed for the wrong reason: {error}"
+    );
+
+    let spoof = copy_repo("mobile-inventory-spoof");
+    fs::write(
+        spoof.join(".github/workflows/android-packaging.yml"),
+        mobile_workflow_stub("android packaging", "package", AUTHORITATIVE_JOB_NAME),
+    )
+    .expect("write spoofing admitted workflow");
+    let error = validate_inventory(&SafeRoot::new(&spoof.path).expect("open spoofing tree"))
+        .expect_err("admitted workflow spoofed the authoritative identity");
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative workflow identity is spoofed"),
+        "admitted spoof failed for the wrong reason: {error}"
+    );
+}
+
 #[test]
 fn authoritative_workflow_checkout_and_event_controls_are_exact() {
     let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
@@ -1801,6 +1920,52 @@ fn alternate_codeowners_locations_fail_final_inventory() {
             "alternate CODEOWNERS unexpectedly passed: {alternate}"
         );
     }
+}
+
+#[test]
+fn manifest_path_keys_cannot_bless_a_file_the_workspace_never_declared() {
+    // The manifest inventory is derived from `[workspace] members` only. `path` is also
+    // the source field of a dependency table, which is candidate-controlled, so a rule
+    // that treated any manifest `path =` as authorising would let one line of TOML admit
+    // an orphan crate. This pins both halves of that being closed.
+    let orphan_manifest = "[package]\nname = \"claw-orphan\"\nversion = \"0.1.0\"\n\
+         edition = \"2024\"\n\n[lints]\nworkspace = true\n";
+
+    let tree = final_tree("manifest-path-orphan-undeclared");
+    fs::create_dir_all(tree.join("crates/claw-orphan/src")).expect("create orphan crate");
+    fs::write(tree.join("crates/claw-orphan/Cargo.toml"), orphan_manifest)
+        .expect("write orphan manifest");
+    fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open orphan tree"))
+        .expect_err("an undeclared crate manifest must not enter the inventory");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Cargo.toml inventory does not match declared root members"),
+        "orphan manifest was rejected by an unrelated rule: {error}"
+    );
+
+    // Now point a workspace dependency at it, which is the "bless it with one line of
+    // TOML" move. Measured: this is caught earlier still, by the dependency rule, because
+    // a `path` dependency must resolve to an already-declared member. The inventory check
+    // above is the independent backstop, so both halves are closed by separate rules.
+    let tree = final_tree("manifest-path-orphan-blessed");
+    fs::create_dir_all(tree.join("crates/claw-orphan/src")).expect("create orphan crate");
+    fs::write(tree.join("crates/claw-orphan/Cargo.toml"), orphan_manifest)
+        .expect("write orphan manifest");
+    fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
+    replace(
+        &tree.join("Cargo.toml"),
+        "[workspace.dependencies]\n",
+        "[workspace.dependencies]\n\
+         claw-orphan = { path = \"crates/claw-orphan\", version = \"0.1.0\" }\n",
+    );
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open blessed tree"))
+        .expect_err("a dependency path must not admit an undeclared crate");
+    assert_eq!(
+        error.to_string(),
+        "path dependency is not a declared root member: claw-orphan -> crates/claw-orphan"
+    );
 }
 
 #[test]
@@ -2891,6 +3056,35 @@ fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
         error.contains("claw-repo-policy file inventory changed"),
         "missing self-tests failed through the wrong rule: {error}"
     );
+}
+
+#[test]
+fn repository_policy_activation_rejects_self_hosted_runners() {
+    let trusted = final_tree("repository-policy-runner-base");
+    deactivate_repository_policy(&trusted);
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open inactive policy base");
+
+    for runner in ["self-hosted", "[self-hosted, windows]"] {
+        let candidate = final_tree("repository-policy-runner-candidate");
+        deactivate_repository_policy(&candidate);
+        activate_repository_policy(&candidate);
+        replace(
+            &candidate.join(".github/workflows/upstream-gateway-reference.yml"),
+            "runs-on: windows-latest",
+            &format!("runs-on: {runner}"),
+        );
+
+        let error = validate_repository_policy_transition(
+            &trusted_root,
+            &SafeRoot::new(&candidate.path).expect("open self-hosted runner candidate"),
+        )
+        .expect_err("candidate-controlled repository-policy runner unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error, "repository-policy test job shape or execution order changed",
+            "self-hosted runner {runner:?} failed through the wrong rule"
+        );
+    }
 }
 
 #[test]

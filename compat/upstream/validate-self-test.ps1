@@ -42,7 +42,12 @@ $SyntheticTestName = "parity_is_proven_here"
 function New-SyntheticRepositoryRoot {
     param([string]$Root)
     $files = [ordered]@{
-        "Cargo.toml" = "[workspace]`nmembers = [`"crates/synthetic`"]`n"
+        "Cargo.toml" = ("[workspace]`nmembers = [`n" +
+            "  `"crates/synthetic`",`n" +
+            "  `"crates/decoy`",`n" +
+            "  `"crates/nonrunning`",`n" +
+            "  `"globbed/*`",`n" +
+            "]`nexclude = [`"vendored`"]`n")
         "crates/synthetic/Cargo.toml" = "[package]`nname = `"synthetic`"`n"
         "crates/synthetic/tests/enabled.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
@@ -88,7 +93,8 @@ function New-SyntheticRepositoryRoot {
         # compiles the file, which is the only thing that decides whether the test
         # can ever run.
         "crates/synthetic/src/lib.rs" =
-            "mod wired;`nmod nested;`n#[path = `"relocated.rs`"]`nmod aliased;`n"
+            ("mod wired;`nmod nested;`n#[path = `"relocated.rs`"]`nmod aliased;`nmod carrier;`n" +
+             "pub(crate) mod restricted;`n")
         "crates/synthetic/src/wired.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/src/relocated.rs" =
@@ -96,6 +102,42 @@ function New-SyntheticRepositoryRoot {
         "crates/synthetic/src/nested/mod.rs" =
             "mod deep;`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/src/nested/deep.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # carrier.rs is a non-mod-rs file, so its module directory
+        # (src/carrier/) and the directory holding it (src/) are different. Every
+        # #[path] below sits at the top level of the file, where Rust resolves it
+        # against the directory holding the file. Each real target has a decoy
+        # planted where a resolver using the module directory instead would look,
+        # so a rule that gets this wrong both rejects the real file and blesses a
+        # file cargo never compiles.
+        "crates/synthetic/src/carrier.rs" =
+            ("#[path = `"sibling.rs`"]`nmod one;`n" +
+             "#[path = `"modular/mod.rs`"]`nmod two;`n" +
+             "#[path = r`"rawsib.rs`"]`nmod three;`n")
+        "crates/synthetic/src/sibling.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/carrier/sibling.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A #[path] naming a mod.rs makes that module mod-rs, so its children
+        # resolve beside it. modular/mod/child.rs is where a resolver that
+        # stripped only the .rs would look, and nothing compiles it.
+        "crates/synthetic/src/modular/mod.rs" =
+            "mod child;`n"
+        "crates/synthetic/src/modular/child.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/modular/mod/child.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # #[path = r"..."] is a raw string. A reader that tokenises raw strings as
+        # opaque literals cannot see the attribute at all and resolves the
+        # declaration by module name instead, which lands on carrier/three.rs.
+        "crates/synthetic/src/rawsib.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/carrier/three.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # Declared with a restricted visibility. The token walk has to step over
+        # the whole (crate) group before it can see the mod keyword; stopping
+        # short leaves an ordinary module looking like an orphan.
+        "crates/synthetic/src/restricted.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         # Never named by any mod declaration anywhere in the crate. cargo builds
         # nothing from it, so the test inside it never runs.
@@ -157,6 +199,31 @@ function New-SyntheticRepositoryRoot {
             "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/tests/autodiscovered.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # Workspace membership. Reachability proves cargo would compile a file
+        # within its package; it says nothing about whether anything builds the
+        # package. Each of these four is a real cargo outcome, measured against
+        # cargo itself rather than recalled.
+        # Not listed in members and not excluded: cargo test --workspace never
+        # touches it, so its #[test] items never run.
+        "crates/orphanpkg/Cargo.toml" = "[package]`nname = `"orphanpkg`"`n"
+        "crates/orphanpkg/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # Named in the workspace exclude list -- a deliberate, reviewed statement
+        # that this directory is not part of the build.
+        "vendored/Cargo.toml" = "[package]`nname = `"vendored`"`n"
+        "vendored/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # The accepting direction, twice, because a membership rule that only
+        # pins its rejections becomes a false-rejection engine on the next edit.
+        # A glob member must expand.
+        "globbed/member/Cargo.toml" = "[package]`nname = `"globbed-member`"`n"
+        "globbed/member/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # A manifest carrying its own [workspace] table is a separate build root
+        # and cargo builds it on its own terms. The real tree has two.
+        "standalone/Cargo.toml" = "[package]`nname = `"standalone`"`n`n[workspace]`n"
+        "standalone/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $separator = [string][System.IO.Path]::DirectorySeparatorChar
@@ -837,6 +904,101 @@ $cases = @(
             )
         }
     },    [ordered]@{
+        name = "implemented-citing-path-attribute-sibling-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # src/carrier.rs is non-mod-rs and carries #[path = "sibling.rs"] at
+            # its top level, which Rust resolves against src/, not src/carrier/.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/sibling.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-path-attribute-module-directory-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The decoy sits at src/carrier/sibling.rs, where a resolver that
+            # based a top-level #[path] on the module directory would look. No
+            # mod declaration names it, so cargo never compiles it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/carrier/sibling.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-path-attribute-mod-rs-child-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[path = "modular/mod.rs"] makes that module mod-rs, so its own
+            # mod child; resolves to modular/child.rs beside it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/modular/child.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-path-attribute-mod-rs-child-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # modular/mod/child.rs is where a resolver that turned the path target
+            # into a directory by stripping .rs would look for that module's
+            # children. Nothing compiles it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/modular/mod/child.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-raw-string-path-attribute-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[path = r"rawsib.rs"] is a raw string literal and names a real file.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/rawsib.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-unreadable-path-attribute-fallback-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # carrier/three.rs is what mod three; would resolve to if the raw
+            # string in its #[path] were invisible. A path attribute the reader
+            # cannot resolve must resolve to nothing rather than fall back to the
+            # module name, or an unreadable attribute becomes a blessing.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/carrier/three.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-restricted-visibility-module-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # pub(crate) mod restricted; is an ordinary module declaration. A walk
+            # that cannot step over the visibility group never sees the mod
+            # keyword and rejects a file cargo plainly compiles.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/restricted.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
         name = "implemented-citing-manifest-dependency-path-orphan"
         expected_message = "is not reached by any cargo test target"
         regenerate_digests = $true
@@ -933,6 +1095,69 @@ $cases = @(
             # the file is never built into a target.
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/nonrunning/tests/autodiscovered.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-non-member-package"
+        expected_message = "belongs to a Cargo package that nothing builds"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # crates/orphanpkg is a well-formed package whose src/lib.rs is a
+            # target root and whose test is a genuine enabled #[test]. Every
+            # file-level rule passes. It is simply not in the workspace members
+            # list, so cargo test at the repository root never builds it and the
+            # test never runs. Two new files and no unusual construct anywhere:
+            # the cheapest forgery in the pipeline until membership is checked.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/orphanpkg/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-workspace-excluded-package"
+        expected_message = "exclude list"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Sharper than merely unlisted: the workspace manifest names this
+            # directory in exclude, which is an explicit reviewed statement that
+            # it is not part of the build.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "vendored/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-glob-member-package-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The accepting direction. members entries may be globs, and a rule
+            # that compared them literally would reject every crate in a
+            # repository that uses `crates/*` -- a false-rejection engine with a
+            # green self-test.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "globbed/member/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-self-rooted-workspace-package-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A manifest carrying its own [workspace] table is a separate build
+            # root that cargo builds on its own terms, and this repository has
+            # two of them. Pinned in the accepting direction because it is the
+            # documented residual of this rule: a static check cannot tell which
+            # workspaces CI invokes, so tightening here would be a guess that
+            # falsely rejects real evidence.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "standalone/src/lib.rs" "tests::$SyntheticTestName")
             )
         }
     },    [ordered]@{
