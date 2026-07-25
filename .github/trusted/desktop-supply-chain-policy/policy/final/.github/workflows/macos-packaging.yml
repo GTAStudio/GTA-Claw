@@ -101,9 +101,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # x86_64 is no longer a shipped target, but this row is the only job in the
+        # repository that runs `cargo test --workspace --all-targets` on an Intel macOS
+        # host: rust.yml runs the full workspace only on macos-latest (arm64), ubuntu and
+        # windows, and its macos-15-intel job runs two named claw-gateway-client tests.
+        # Do not prune this row when pruning shipped targets; it is test coverage, not
+        # packaging.
         include:
           - runner: macos-15
             arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
