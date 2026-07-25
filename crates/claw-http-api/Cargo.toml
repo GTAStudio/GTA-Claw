@@ -9,12 +9,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-axum = { version = "=0.8.8", features = ["json", "tokio"] }
+axum = { version = "=0.8.9", features = ["json", "tokio"] }
 base64 = "=0.22.1"
 claw-protocol.workspace = true
 claw-security.workspace = true
 futures-core = "=0.3.32"
-getrandom = "=0.2.17"
+getrandom = "=0.4.3"
 http = "=1.4.0"
 serde.workspace = true
 serde_json.workspace = true
