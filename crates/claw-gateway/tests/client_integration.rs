@@ -229,6 +229,75 @@ async fn a_probe_is_admitted_on_the_protocol_v3_compatibility_window() {
 }
 
 #[tokio::test]
+async fn a_general_client_is_refused_the_node_window_version() {
+    let identity = device(25);
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                identity.device_id().gateway_wire_id(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+    )
+    .await;
+
+    let mut config = client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    );
+    config.min_protocol = ProtocolVersion::new(3).unwrap();
+    config.max_protocol = ProtocolVersion::new(3).unwrap();
+
+    let (client, _events) = GatewayClient::start(config).expect("the configuration is valid");
+    let error = client
+        .wait_ready()
+        .await
+        .expect_err("v3 is reserved for authenticated node and probe clients");
+    match error {
+        GatewayClientError::Protocol(ProtocolFailure::WebSocketProtocol(category)) => {
+            assert_eq!(category, "handshake rejected");
+        }
+        other => panic!("expected a rejected handshake, got {other}"),
+    }
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn claiming_the_node_role_without_node_client_mode_cannot_enter_the_v3_window() {
+    let identity = device(26);
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                identity.device_id().gateway_wire_id(),
+                Grant::new(Role::Node, []),
+            ),
+    )
+    .await;
+
+    let mut config = client_config(&handle, Arc::clone(&identity), SecurityRole::Node, &[]);
+    config.client.id = ClientId::Test;
+    config.client.mode = ClientMode::Test;
+    config.min_protocol = ProtocolVersion::new(3).unwrap();
+    config.max_protocol = ProtocolVersion::new(3).unwrap();
+
+    let (client, _events) = GatewayClient::start(config).expect("the configuration is valid");
+    let error = client
+        .wait_ready()
+        .await
+        .expect_err("the v3 window requires genuine node client mode, not just the node role");
+    match error {
+        GatewayClientError::Protocol(ProtocolFailure::WebSocketProtocol(category)) => {
+            assert_eq!(category, "handshake rejected");
+        }
+        other => panic!("expected a rejected handshake, got {other}"),
+    }
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_client_below_the_window_is_rejected_as_a_protocol_mismatch() {
     let identity = device(14);
     let handle = start(
