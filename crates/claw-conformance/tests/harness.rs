@@ -989,6 +989,44 @@ fn cross_package_path_module_cannot_supply_acceptance_evidence() {
 }
 
 #[test]
+fn unreadable_path_attribute_cannot_bless_a_fallback_module() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let crate_root = fixture.root.join("crates").join("demo");
+    fs::write(
+        crate_root.join("src").join("lib.rs"),
+        "#[path = b\"real.rs\"]\nmod forged;\n",
+    )
+    .expect("write invalid path attribute");
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("src")
+        .join("forged.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[test]\nfn forged_fallback_test() {}\n",
+    )
+    .expect("write fallback decoy");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "forged_fallback_test")],
+        ))
+        .expect("register fallback claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("unreadable path attribute must suppress fallback resolution");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence path 'crates/demo/src/forged.rs' is not reachable from a test-enabled Cargo target"
+    );
+}
+
+#[test]
 fn fabricated_module_qualification_is_rejected() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
     let fixture = Fixture::empty();

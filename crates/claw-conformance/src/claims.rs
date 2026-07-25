@@ -1233,6 +1233,7 @@ enum RustToken {
     CloseParen,
     ColonColon,
     Semi,
+    Equals,
     Literal,
     StringLiteral(String),
     Other,
@@ -1250,6 +1251,13 @@ struct RustModuleReference {
     inline_modules: Vec<InlineModuleDirectory>,
     name: String,
     path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathAttribute {
+    Absent,
+    Value(String),
+    Invalid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1396,18 +1404,44 @@ fn collect_rust_module_references(
                     let open = index + 2;
                     let close = matching_delimiter(tokens, open, end).unwrap_or(end);
                     let mut nested = inline_modules.to_vec();
-                    nested.push(path_attribute_value(&outer_attributes).map_or_else(
-                        || InlineModuleDirectory::Default(name.clone()),
-                        InlineModuleDirectory::Path,
-                    ));
-                    collect_rust_module_references(tokens, open + 1, close, &nested, references);
+                    match path_attribute(&outer_attributes) {
+                        PathAttribute::Absent => {
+                            nested.push(InlineModuleDirectory::Default(name.clone()));
+                            collect_rust_module_references(
+                                tokens,
+                                open + 1,
+                                close,
+                                &nested,
+                                references,
+                            );
+                        }
+                        PathAttribute::Value(path) => {
+                            nested.push(InlineModuleDirectory::Path(path));
+                            collect_rust_module_references(
+                                tokens,
+                                open + 1,
+                                close,
+                                &nested,
+                                references,
+                            );
+                        }
+                        PathAttribute::Invalid => {}
+                    }
                     index = close.saturating_add(1);
                 } else if tokens.get(index + 2) == Some(&RustToken::Semi) {
-                    references.push(RustModuleReference {
-                        inline_modules: inline_modules.to_vec(),
-                        name: name.clone(),
-                        path: path_attribute_value(&outer_attributes),
-                    });
+                    match path_attribute(&outer_attributes) {
+                        PathAttribute::Absent => references.push(RustModuleReference {
+                            inline_modules: inline_modules.to_vec(),
+                            name: name.clone(),
+                            path: None,
+                        }),
+                        PathAttribute::Value(path) => references.push(RustModuleReference {
+                            inline_modules: inline_modules.to_vec(),
+                            name: name.clone(),
+                            path: Some(path),
+                        }),
+                        PathAttribute::Invalid => {}
+                    }
                     index += 3;
                 } else {
                     index = skip_item(tokens, index, end);
@@ -1421,15 +1455,24 @@ fn collect_rust_module_references(
     }
 }
 
-fn path_attribute_value(attributes: &[RustAttribute]) -> Option<String> {
-    attributes.iter().find_map(|attribute| {
-        (attribute.path.as_slice() == ["path"]).then(|| {
-            attribute.tokens.iter().find_map(|token| match token {
-                RustToken::StringLiteral(value) => Some(value.clone()),
-                _ => None,
-            })
-        })?
-    })
+fn path_attribute(attributes: &[RustAttribute]) -> PathAttribute {
+    let mut paths = attributes
+        .iter()
+        .filter(|attribute| attribute.path.as_slice() == ["path"]);
+    let Some(attribute) = paths.next() else {
+        return PathAttribute::Absent;
+    };
+    if paths.next().is_some() {
+        return PathAttribute::Invalid;
+    }
+    match attribute.tokens.as_slice() {
+        [
+            RustToken::Ident(name),
+            RustToken::Equals,
+            RustToken::StringLiteral(value),
+        ] if name == "path" => PathAttribute::Value(value.clone()),
+        _ => PathAttribute::Invalid,
+    }
 }
 
 fn attributes_declare_enabled_test(attributes: &[RustAttribute]) -> bool {
@@ -1678,6 +1721,7 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
                 b'(' => tokens.push(RustToken::OpenParen),
                 b')' => tokens.push(RustToken::CloseParen),
                 b';' => tokens.push(RustToken::Semi),
+                b'=' => tokens.push(RustToken::Equals),
                 b':' if bytes.get(index + 1) == Some(&b':') => {
                     tokens.push(RustToken::ColonColon);
                     index += 1;
@@ -2220,6 +2264,7 @@ mod nested {
             "#[test]\nfn root_test() {}\n\
              mod outer;\n\
              mod host;\n\
+             pub(crate) mod restricted;\n\
              #[path = \"support/mod.rs\"]\nmod support;\n\
              #[path = r\"raw/raw_module.rs\"]\nmod raw;\n",
         )
@@ -2307,6 +2352,11 @@ mod nested {
         )
         .expect("write orphan module");
         fs::write(
+            root.join("src").join("restricted.rs"),
+            "#[test]\nfn restricted_visibility_test() {}\n",
+        )
+        .expect("write restricted-visibility module");
+        fs::write(
             root.join("src").join("disabled.rs"),
             "#[test]\nfn disabled_test() {}\nfn main() {}\n",
         )
@@ -2343,6 +2393,7 @@ mod nested {
                 "outer::nested::proof::deep_test".to_owned(),
                 "outer::from_outer::outer_path_test".to_owned(),
                 "raw::raw_path_test".to_owned(),
+                "restricted::restricted_visibility_test".to_owned(),
                 "root_test".to_owned(),
                 "support::child::mod_rs_child_test".to_owned(),
                 "support::mod_rs_root_test".to_owned(),
@@ -2380,6 +2431,10 @@ mod nested {
                 "support::child::mod_rs_child_decoy_test",
             ),
             ("src/raw/raw_module.rs", "raw::raw_path_test"),
+            (
+                "src/restricted.rs",
+                "restricted::restricted_visibility_test",
+            ),
             ("src/orphan.rs", "orphan_test"),
             ("src/disabled.rs", "disabled_test"),
         ] {
@@ -2391,6 +2446,75 @@ mod nested {
             );
         }
         fs::remove_dir_all(root).expect("remove reachability compiler oracle");
+    }
+
+    #[test]
+    fn unreadable_path_attribute_never_falls_back_to_module_name() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-invalid-path-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).expect("create invalid-path oracle directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-invalid-path-oracle\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n",
+        )
+        .expect("write invalid-path oracle manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-invalid-path-oracle\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write invalid-path oracle lockfile");
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "#[path = b\"real.rs\"]\nmod forged;\n",
+        )
+        .expect("write invalid path attribute");
+        fs::write(
+            root.join("src").join("forged.rs"),
+            "#[test]\nfn forged_fallback_test() {}\n",
+        )
+        .expect("write fallback decoy");
+        fs::write(
+            root.join("src").join("real.rs"),
+            "#[test]\nfn forged_path_value_test() {}\n",
+        )
+        .expect("write apparent path target");
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = Command::new(cargo)
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args(["test", "--offline", "--quiet", "--locked", "--no-run"])
+            .output()
+            .expect("run invalid-path compiler oracle");
+        assert!(
+            !output.status.success(),
+            "rustc must reject a non-string path attribute"
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        let decoy = root
+            .join("src")
+            .join("forged.rs")
+            .canonicalize()
+            .expect("canonical fallback decoy");
+        assert!(
+            !targets.contains(&decoy),
+            "an unreadable path attribute must not fall back to the module name"
+        );
+        fs::remove_dir_all(root).expect("remove invalid-path oracle");
     }
 
     #[test]
