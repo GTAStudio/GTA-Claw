@@ -42,6 +42,26 @@
 //! * [`IosSessionModel`] — the connection lifecycle rendered as an
 //!   [`IosViewSnapshot`] a UI can bind to, with authorization reported *only*
 //!   from what the server actually confirmed.
+//! * [`HostAppDeclarations`] — the `Info.plist` declarations local-network
+//!   discovery depends on, so that a missing declaration is a reported
+//!   condition rather than an empty result set.
+//! * [`ClientTransport`] — a written record of which Gateway transports iOS can
+//!   carry and, for those it cannot, why.
+//!
+//! # Recorded platform gaps
+//!
+//! Three surfaces in the frozen upstream contract have no working iOS form in
+//! this crate, and each is recorded rather than substituted:
+//!
+//! * **Bonjour and DNS-SD discovery** needs `NSLocalNetworkUsageDescription`
+//!   and `NSBonjourServices` in the host application bundle. This crate cannot
+//!   read the bundle, so [`HostAppDeclarations`] treats an unconfirmed
+//!   declaration exactly as strictly as a missing one.
+//! * **Tailscale** needs an app-accessible LocalAPI Unix socket or a loopback
+//!   proxy, which a stock sandboxed iOS deployment may expose neither of. No
+//!   alternative transport is offered in its place.
+//! * **SSH** needs caller-provisioned sandbox paths for key material and
+//!   `known_hosts`. There is no Keychain or Secure Enclave integration here.
 //!
 //! # Composition
 //!
@@ -64,16 +84,23 @@
 mod credential;
 mod device;
 mod endpoint;
+mod host_app;
 mod identity;
 mod profile;
 mod session;
+mod transport;
 
 pub use credential::{CredentialError, IosCredential, IosCredentialKind};
 pub use device::{DeclaredDeviceProbe, IosDeviceProbe, UnobservedDeviceProbe};
 pub use endpoint::{EndpointError, EndpointSummary, GatewayEndpoint};
+pub use host_app::{
+    BonjourServiceType, DeclarationStatus, DiscoveryPermitted, DiscoveryUnavailable,
+    HostAppDeclaration, HostAppDeclarations, ServiceTypeError,
+};
 pub use identity::{IdentityError, IosClientIdentity};
 pub use profile::{IosClientCore, IosGatewayProfile};
 pub use session::{
     AttemptRejected, AuthorizationDenied, AuthorizedAction, ConnectionAttempt, IosAction,
     IosSessionModel, IosStatusKind, IosViewSnapshot, ObservedAuthorization,
 };
+pub use transport::{ClientTransport, IosTransportRecord, IosTransportStatus};

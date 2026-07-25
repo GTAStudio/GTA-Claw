@@ -47,7 +47,7 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 42 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 54 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
@@ -72,8 +72,12 @@ Finished `dev` profile
 ```
 
 That narrows the remaining unknown to the `ring`/`rustls`/`tokio` layer, but it
-is not a proof that this crate compiles for iOS. Someone on a macOS runner with
-Xcode must run the iOS target check before any iOS claim is made.
+is **not** a proof that this crate compiles for iOS, and it must not be reported
+as one. It is a `rustc`-only check performed with no Apple toolchain present at
+all: no `xcrun`, no iOS SDK, no target `clang`, no linker. Any crate in the
+graph that compiles C, assembly or Objective-C is untested by it, and linking is
+untested entirely. Someone on a macOS runner with Xcode must run the iOS target
+check before any iOS build claim is made.
 
 ## Known limitations
 
@@ -96,6 +100,73 @@ Xcode must run the iOS target check before any iOS claim is made.
   `Ready` value. Everything downstream of that conversion is tested.
 * No push notifications, no background refresh, no Keychain persistence, no
   device-token storage. `claw-security` provides no persistence either.
+
+## Platform surfaces recorded as gaps rather than substituted
+
+Three surfaces in the frozen upstream contract have no working iOS form here.
+Each is written down, with its reason, in code rather than only in prose, so
+that its absence cannot be mistaken for an oversight. See `src/transport.rs`
+(`ClientTransport::ios_record`) and `src/host_app.rs`.
+
+**None of these positions has been confirmed on an Apple device.** Every
+transport record reports `confirmed_on_ios() == false`, and a test asserts it.
+
+### Bonjour and DNS-SD discovery — needs host-application declarations
+
+`integration.discovery.dns-sd` in `compat/upstream/ledgers/official-integration.json`.
+
+iOS does not fail loudly when `NSLocalNetworkUsageDescription` or
+`NSBonjourServices` is missing from the host bundle: it simply returns nothing,
+which is indistinguishable from a network with no Gateway on it. `HostAppDeclarations`
+therefore refuses to permit discovery unless an embedder positively confirms
+both keys and a non-empty service-type list, and returns a `DiscoveryUnavailable`
+naming the exact plist key when it will not.
+
+An *unconfirmed* declaration is treated exactly as strictly as a missing one:
+`DeclarationStatus::Unknown` is the default and does not permit anything. This
+crate cannot read `Info.plist` — that needs Foundation interop and the workspace
+forbids `unsafe_code` — so every status here is declared by the embedder, and
+the type names say so.
+
+`BonjourServiceType` is validated down to the RFC 6763 grammar (at most fifteen
+characters of `[A-Za-z0-9-]`, no dots, colons, slashes, at-signs or whitespace)
+specifically so that it cannot hold credential-shaped text. Narrowing the domain
+was preferred to redacting a `Debug`.
+
+Discovery itself is not implemented in this crate and is not this crate's to
+implement; only the precondition is.
+
+### Tailscale — believed structurally unavailable on iOS
+
+`integration.discovery.tailscale` in the same ledger. The Gateway handshake
+already reserves `AUTH_TAILSCALE_IDENTITY_MISSING`, `AUTH_TAILSCALE_PROXY_MISSING`,
+`AUTH_TAILSCALE_WHOIS_FAILED` and `AUTH_TAILSCALE_IDENTITY_MISMATCH` in
+`crates/claw-protocol/src/gateway/handshake.rs`.
+
+Reaching that path needs an app-accessible Tailscale LocalAPI Unix socket or an
+explicit loopback proxy. A stock sandboxed iOS deployment may expose neither.
+This is recorded as `IosTransportStatus::BelievedUnavailable` — believed, not
+proven, because confirming it requires a device.
+
+**No substitute transport is offered in its place**, deliberately. A documented
+gap can be planned around; an invented analogue cannot afterwards be told apart
+from the real thing.
+
+### SSH — no Keychain integration, and that is a known regression
+
+`integration.discovery.ssh` in the same ledger. An SSH tunnel needs
+caller-provisioned sandbox paths for the private key and `known_hosts`.
+
+**Keychain and Secure Enclave integration is explicitly out of scope for this
+crate**, for a stated reason rather than by omission: the Keychain API is
+Objective-C/C and reaching it needs FFI, which `unsafe_code = "forbid"` rules
+out for a root workspace member. Without it, key material would sit in ordinary
+application-container files on a platform that provides a hardware-backed store.
+That is a regression against the platform's own norm, and it is why the SSH
+transport is recorded as unusable rather than shipped in a weakened form.
+
+The same reasoning applies to `IosCredential`, which holds a secret in memory
+for the lifetime of a process and persists nothing.
 
 ## Cross-crate observation, not fixed here
 
