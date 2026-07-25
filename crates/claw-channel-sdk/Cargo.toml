@@ -1,0 +1,15 @@
+[package]
+name = "claw-channel-sdk"
+description = "Transport-neutral channel contracts for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+secrecy = "=0.10.3"
+serde.workspace = true
+
+[lints]
+workspace = true
