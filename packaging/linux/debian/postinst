@@ -141,6 +141,7 @@ stop_for_idempotent_configure() {
       return
       ;;
     loaded)
+      ensure_failure_fence
       if [ ! -e "$replacement_fence" ]; then
         rm -f "$was_active"
         active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
@@ -161,6 +162,7 @@ stop_for_idempotent_configure() {
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;
     not-found)
+      ensure_failure_fence
       if [ ! -e "$replacement_fence" ]; then
         rm -f "$was_active"
       fi
