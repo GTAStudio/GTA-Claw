@@ -978,16 +978,15 @@ fn terminate_tree(pid: u32) {
     {
         // The child leads its own process group, so signalling the group
         // reaches descendants that were reparented when it exited.
-        for group in [format!("-{pid}")] {
-            let mut command = Command::new("kill");
-            command
-                .args(["-KILL", "--", &group])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if let Ok(mut killer) = command.spawn() {
-                let _ = killer.wait();
-            }
+        let group = format!("-{pid}");
+        let mut command = Command::new("kill");
+        command
+            .args(["-KILL", "--", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut killer) = command.spawn() {
+            let _ = killer.wait();
         }
         let table = process_table();
         let mut targets = descendants(&table, pid);
