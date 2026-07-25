@@ -1414,7 +1414,8 @@ mod tests {
         let directory = unique_temp_dir("claw-tools-child-guard");
         std::fs::create_dir_all(&directory).expect("create the marker directory");
         let executable = std::env::current_exe().expect("locate the test binary");
-        let child = Command::new(executable)
+        let mut builder = Command::new(executable);
+        builder
             .args([
                 "--exact",
                 "--ignored",
@@ -1423,9 +1424,11 @@ mod tests {
             .env(GUARD_MARKER_DIR, &directory)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the sleeper child");
+            .stderr(Stdio::null());
+        // Mirror the production spawn, so the unix group signal that
+        // `terminate_tree` relies on is the mechanism actually under test.
+        place_in_own_process_group(&mut builder);
+        let child = builder.spawn().expect("spawn the sleeper child");
 
         // The child must genuinely be running before the unwind. Without this
         // the survival assertion below would hold for a child that never ran,
