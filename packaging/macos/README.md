@@ -16,7 +16,7 @@ Release outputs are:
 - a Developer ID Installer signed and Apple-notarized PKG;
 - arm64 CLI and daemon archives;
 - an SPDX 2.3 SBOM and SLSA/in-toto provenance statement for every artifact;
-- one complete `SHA256SUMS-macos` manifest over the exact publication bytes.
+- one complete `SHA256SUMS` manifest over the exact publication bytes.
 
 The GUI app has bundle identifier `com.gtastudio.gta-claw`, minimum system
 version 14.0, a source-generated icon, the committed empty entitlement set, and
@@ -62,7 +62,7 @@ across signing times or Xcode versions.
   runtime, Installer identity, accepted notarization staples, and Gatekeeper
   assessment. Prototype mode rejects claims of release signatures.
 - Every SBOM and provenance statement must hash its exact artifact, and
-  `SHA256SUMS-macos` must verify the complete publication directory.
+  `SHA256SUMS` must verify the complete publication directory.
 
 ## Signing and notarization
 

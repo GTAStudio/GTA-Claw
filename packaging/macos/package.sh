@@ -40,6 +40,7 @@ else
 fi
 
 distribution="$OUTPUT_ROOT/distribution"
+checksum_name=SHA256SUMS
 archive_stage_root="$OUTPUT_ROOT/staging/app-archive"
 archive_stage="$archive_stage_root/$APP_NAME.app"
 dmg_stage="$OUTPUT_ROOT/staging/dmg"
@@ -127,11 +128,11 @@ fi
 write_artifact_supply_chain "$app_archive" desktop "$expected_arches"
 write_artifact_supply_chain "$dmg" desktop "$expected_arches"
 write_artifact_supply_chain "$pkg" desktop "$expected_arches"
-write_artifact_set_checksums "$distribution" SHA256SUMS-macos
+write_artifact_set_checksums "$distribution" "$checksum_name"
 "$MACOS_DIR/validate-artifacts.sh" \
   "$distribution" \
   "$mode" \
-  SHA256SUMS-macos \
+  "$checksum_name" \
   "$app_archive_label" \
   "$expected_arches"
 note "created validated $mode distribution artifacts under $distribution"
