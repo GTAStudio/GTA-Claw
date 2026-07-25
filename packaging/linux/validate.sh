@@ -662,6 +662,7 @@ expected_rpm_requires="$(
     find "$rpm_payload_root" -type f -print0 |
       xargs -0 /usr/lib/rpm/rpmdeps --requires
     printf '%s\n' \
+      "config($LINUX_PACKAGE_NAME) = $VERSION-$LINUX_PACKAGE_RELEASE" \
       "glibc >= $BUILD_GLIBC_REQUIREMENT" \
       libgcc \
       "systemd >= 249" \
