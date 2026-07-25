@@ -10,14 +10,15 @@ require_macos
 for tool in codesign ditto hdiutil lipo pkgbuild pkgutil productbuild security xcrun zipinfo; do
   require_tool "$tool"
 done
-[[ "$#" -eq 2 ]] || die "usage: package.sh prototype|release APP"
+[[ "$#" -ge 2 && "$#" -le 4 ]] ||
+  die "usage: package.sh prototype|release APP [APP_ARCHIVE_LABEL] [EXPECTED_ARCHES]"
 mode="$1"
 app="$2"
+app_archive_label="$(distribution_app_archive_label "${3:-}")"
+expected_arches="$(distribution_expected_arches "${4:-}")"
 [[ -d "$app" && "$app" == *.app && ! -L "$app" ]] || die "invalid app bundle: $app"
 reject_symlinks "$app"
 
-binary="$app/Contents/MacOS/$EXECUTABLE_NAME"
-expected_arches="$(lipo -archs "$binary")"
 if [[ "$mode" == "release" ]]; then
   "$MACOS_DIR/validate.sh" "$app" "$expected_arches" release
   xcrun stapler validate "$app"
@@ -60,7 +61,7 @@ archive_qualifier="unsigned-non-release"
 if [[ "$mode" == "release" ]]; then
   archive_qualifier="signed-notarized"
 fi
-app_archive="$distribution/gta-claw-$VERSION-macos-universal2-$archive_qualifier.app.zip"
+app_archive="$distribution/$(distribution_app_archive_name "$archive_qualifier" "$app_archive_label")"
 assert_output_file_slot "$app_archive"
 ditto "$app" "$archive_stage"
 find "$archive_stage_root" -exec touch -t "$NORMALIZED_MTIME" {} +
@@ -123,9 +124,14 @@ if [[ "$mode" == "release" ]]; then
   "$MACOS_DIR/notarize.sh" "$pkg"
 fi
 
-write_artifact_supply_chain "$app_archive" desktop "arm64 x86_64"
-write_artifact_supply_chain "$dmg" desktop "arm64 x86_64"
-write_artifact_supply_chain "$pkg" desktop "arm64 x86_64"
+write_artifact_supply_chain "$app_archive" desktop "$expected_arches"
+write_artifact_supply_chain "$dmg" desktop "$expected_arches"
+write_artifact_supply_chain "$pkg" desktop "$expected_arches"
 write_artifact_set_checksums "$distribution" SHA256SUMS-macos
-"$MACOS_DIR/validate-artifacts.sh" "$distribution" "$mode" SHA256SUMS-macos
+"$MACOS_DIR/validate-artifacts.sh" \
+  "$distribution" \
+  "$mode" \
+  SHA256SUMS-macos \
+  "$app_archive_label" \
+  "$expected_arches"
 note "created validated $mode distribution artifacts under $distribution"

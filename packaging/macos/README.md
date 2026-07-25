@@ -33,6 +33,12 @@ GTA_CLAW_OFFLINE=1 ./packaging/macos/build.sh universal2
   "target/macos-package/apps/universal2/GTA Claw.app"
 ```
 
+`package.sh` also accepts optional app-archive-label and expected-architecture
+arguments. Omitting them preserves the current `universal2` archive label and
+`arm64 x86_64` validation/SBOM profile. The published-byte validator accepts
+the same optional profile after its checksum-manifest argument, so a producer
+and validator can move to a single-architecture profile together.
+
 `GTA_CLAW_OFFLINE=1` requires all Rust targets and locked dependencies to be
 present and then forbids Cargo network access. Paths, tar ownership, gzip
 headers, source paths, and staged timestamps are normalized. Signed timestamps,

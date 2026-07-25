@@ -573,6 +573,35 @@ expected_lipo_arch() {
   esac
 }
 
+distribution_app_archive_label() {
+  local label="${1:-universal2}"
+  validate_safe_component "$label" APP_ARCHIVE_LABEL
+  printf '%s\n' "$label"
+}
+
+distribution_app_archive_name() {
+  local qualifier="$1"
+  local label
+  case "$qualifier" in
+    unsigned-non-release | signed-notarized) ;;
+    *) die "unsupported app archive qualifier: $qualifier" ;;
+  esac
+  label="$(distribution_app_archive_label "${2:-}")"
+  printf 'gta-claw-%s-macos-%s-%s.app.zip\n' "$VERSION" "$label" "$qualifier"
+}
+
+distribution_expected_arches() {
+  local arches="${1:-arm64 x86_64}"
+  arches="${arches//,/ }"
+  arches="$(awk '{$1=$1; print}' <<<"$arches")"
+  case "$arches" in
+    arm64 | x86_64) ;;
+    "arm64 x86_64" | "x86_64 arm64") arches="arm64 x86_64" ;;
+    *) die "unsupported macOS distribution architecture set: $arches" ;;
+  esac
+  printf '%s\n' "$arches"
+}
+
 host_target() {
   rustc -vV | awk '/^host:/ { print $2 }'
 }

@@ -10,11 +10,13 @@ require_macos
 for tool in codesign ditto hdiutil pkgutil spctl tar xcrun zipinfo; do
   require_tool "$tool"
 done
-[[ "$#" -ge 2 && "$#" -le 3 ]] ||
-  die "usage: validate-artifacts.sh ARTIFACT_DIRECTORY prototype|release [CHECKSUM_NAME]"
+[[ "$#" -ge 2 && "$#" -le 5 ]] ||
+  die "usage: validate-artifacts.sh ARTIFACT_DIRECTORY prototype|release [CHECKSUM_NAME] [APP_ARCHIVE_LABEL] [EXPECTED_ARCHES]"
 artifact_root="$(cd "$1" && pwd -P)"
 mode="$2"
 checksum_name="${3:-SHA256SUMS}"
+app_archive_label="$(distribution_app_archive_label "${4:-}")"
+expected_arches="$(distribution_expected_arches "${5:-}")"
 [[ "$checksum_name" =~ ^SHA256SUMS(-[a-z]+)?$ ]] ||
   die "invalid artifact checksum manifest name: $checksum_name"
 case "$mode" in
@@ -40,7 +42,7 @@ trap cleanup EXIT INT TERM
 
 validate_published_app() {
   local app="$1"
-  "$MACOS_DIR/validate.sh" "$app" "arm64 x86_64" "$app_signature"
+  "$MACOS_DIR/validate.sh" "$app" "$expected_arches" "$app_signature"
   assert_no_javascript_payload "$app"
   if [[ "$mode" == "release" ]]; then
     xcrun stapler validate "$app"
@@ -60,14 +62,14 @@ expected_artifacts=""
 if grep -E '\.(app\.zip|dmg|pkg)$' <<<"$actual_artifacts" >/dev/null; then
   app_qualifier="unsigned-non-release"
   [[ "$mode" != "release" ]] || app_qualifier="signed-notarized"
-  expected_artifacts+="gta-claw-$VERSION-macos-universal2-$app_qualifier.app.zip"$'\n'
+  expected_artifacts+="$(distribution_app_archive_name "$app_qualifier" "$app_archive_label")"$'\n'
   expected_artifacts+="gta-claw-$VERSION-macos.dmg"$'\n'
   expected_artifacts+="gta-claw-$VERSION-macos.pkg"$'\n'
   if grep -E '\.tar\.gz$' <<<"$actual_artifacts" >/dev/null; then
-    for arch in arm64 x86_64; do
+    while IFS= read -r arch; do
       expected_artifacts+="gta-claw-cli-$VERSION-macos-$arch.tar.gz"$'\n'
       expected_artifacts+="gta-claw-daemon-$VERSION-macos-$arch.tar.gz"$'\n'
-    done
+    done < <(tr ' ' '\n' <<<"$expected_arches")
   fi
 else
   case "$actual_artifacts" in

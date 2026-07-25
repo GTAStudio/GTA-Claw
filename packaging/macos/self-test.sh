@@ -54,6 +54,29 @@ assert_sentinel() {
   [[ "$(cat "$1")" == "outside sentinel" ]] || die "self-test modified outside bytes: $1"
 }
 
+[[ "$(distribution_app_archive_label)" == "universal2" ]] ||
+  die "default app archive label changed"
+[[ "$(distribution_expected_arches)" == "arm64 x86_64" ]] ||
+  die "default distribution architecture set changed"
+[[ "$(distribution_app_archive_name unsigned-non-release)" == \
+  "gta-claw-$VERSION-macos-universal2-unsigned-non-release.app.zip" ]] ||
+  die "default app archive name changed"
+tests=$((tests + 1))
+[[ "$(distribution_app_archive_label arm64)" == "arm64" ]] ||
+  die "arm64 app archive label override failed"
+[[ "$(distribution_expected_arches arm64)" == "arm64" ]] ||
+  die "arm64 distribution architecture override failed"
+[[ "$(distribution_app_archive_name signed-notarized arm64)" == \
+  "gta-claw-$VERSION-macos-arm64-signed-notarized.app.zip" ]] ||
+  die "arm64 app archive name override failed"
+[[ "$(distribution_expected_arches x86_64,arm64)" == "arm64 x86_64" ]] ||
+  die "distribution architecture normalization failed"
+tests=$((tests + 1))
+expect_failure invalid-app-archive-label \
+  bash -c "source '$common'; distribution_app_archive_label '../escape'"
+expect_failure invalid-distribution-architectures \
+  bash -c "source '$common'; distribution_expected_arches 'arm64 riscv64'"
+
 expect_failure invalid-bundle-id env BUNDLE_ID=invalid bash -c "source '$common'"
 expect_failure invalid-version env VERSION=1.2-beta bash -c "source '$common'"
 expect_failure invalid-build-version env BUILD_VERSION=1.beta bash -c "source '$common'"
