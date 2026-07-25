@@ -1,12 +1,10 @@
 node_modules
 dist
-target
-desktop/target
-packaging/*/.work
-packaging/*/out
 .env
 .env.*
 !.env.example
 .git
 .gitignore
+*.md
+docs/
 .vscode/

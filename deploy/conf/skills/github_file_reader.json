@@ -10,7 +10,7 @@
       },
       "path": {
         "type": "string",
-        "description": "File or directory path within the repo (e.g. 'crates/claw-protocol/src/lib.rs' or 'crates/'). Leave empty for root listing."
+        "description": "File or directory path within the repo (e.g. 'src/index.ts' or 'src/'). Leave empty for root listing."
       },
       "ref": {
         "type": "string",

@@ -1,4 +1,4 @@
-//! Repository-wide policy that keeps the product free of JavaScript toolchains.
+//! Repository-wide policy that prevents the legacy JavaScript surface from growing.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -24,6 +24,35 @@ const FORBIDDEN_EXTENSIONS: &[&str] =
 const FORBIDDEN_WORKFLOW_COMMANDS: &[&str] = &[
     "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "corepack",
 ];
+// No dist path is listed because the audited repository tracks no generated output.
+const LEGACY_RUNTIME_INVENTORY: &[&str] = &[
+    "Dockerfile",
+    "package-lock.json",
+    "package.json",
+    "src/auth/deviceFlow.ts",
+    "src/bot/teamsBot.ts",
+    "src/channels/discordGateway.ts",
+    "src/channels/messageProcessor.ts",
+    "src/channels/telegramPolling.ts",
+    "src/channels/whatsappWebhook.ts",
+    "src/config.ts",
+    "src/engine/copilotEngine.ts",
+    "src/engine/sessionManager.ts",
+    "src/engine/toolExecutor.ts",
+    "src/index.ts",
+    "src/loader/roleLoader.ts",
+    "src/loader/skillLoader.ts",
+    "src/server.ts",
+    "src/state/contentScanner.ts",
+    "src/state/fileState.ts",
+    "src/state/memoryStore.ts",
+    "src/state/transcriptStore.ts",
+    "src/updater/sdkUpdater.ts",
+    "src/utils/logger.ts",
+    "src/utils/proxy.ts",
+    "src/utils/splitMessage.ts",
+    "tsconfig.json",
+];
 const ALLOWED_INERT_WORKFLOW_LINES: &[(&str, &str)] = &[
     (
         ".github/workflows/macos-packaging.yml",
@@ -46,8 +75,41 @@ const ALLOWED_ADVERSARIAL_SHELL_FIXTURES: &[&str] =
 const ALLOWED_COMPAT_FIXTURES: &[&str] = &[];
 
 #[test]
-fn repository_contains_no_javascript_toolchain_artifacts() {
+fn repository_legacy_javascript_surface_does_not_grow() {
     let root = workspace_root();
+    let mut sorted_inventory = LEGACY_RUNTIME_INVENTORY.to_vec();
+    sorted_inventory.sort_unstable();
+    sorted_inventory.dedup();
+    assert_eq!(
+        sorted_inventory.len(),
+        LEGACY_RUNTIME_INVENTORY.len(),
+        "legacy runtime inventory contains duplicate paths"
+    );
+    assert_eq!(
+        LEGACY_RUNTIME_INVENTORY
+            .iter()
+            .filter(|path| path.ends_with(".ts") || path.ends_with(".tsx"))
+            .count(),
+        22,
+        "the binding legacy TypeScript ceiling changed without an explicit ratchet update"
+    );
+    for required_root in [
+        "Dockerfile",
+        "package-lock.json",
+        "package.json",
+        "tsconfig.json",
+    ] {
+        assert!(
+            LEGACY_RUNTIME_INVENTORY.contains(&required_root),
+            "legacy build root is missing from the explicit inventory: {required_root}"
+        );
+    }
+    for allowed in LEGACY_RUNTIME_INVENTORY {
+        assert!(
+            !allowed.starts_with('/') && !allowed.contains('\\') && !allowed.contains("/../"),
+            "legacy runtime inventory path is not repository-relative and normalized: {allowed}"
+        );
+    }
     for allowed in ALLOWED_COMPAT_FIXTURES {
         assert!(
             allowed.starts_with("compat/legacy/") || allowed.starts_with("compat/upstream/"),
@@ -70,8 +132,10 @@ fn repository_contains_no_javascript_toolchain_artifacts() {
             "allowlisted adversarial shell fixture is missing: {allowed}"
         );
     }
+    let mut allowed_artifacts = LEGACY_RUNTIME_INVENTORY.to_vec();
+    allowed_artifacts.extend_from_slice(ALLOWED_COMPAT_FIXTURES);
     let mut violations =
-        scan_tree(&root, ALLOWED_COMPAT_FIXTURES).expect("scan repository policy surface");
+        scan_tree(&root, &allowed_artifacts).expect("scan repository policy surface");
     violations.extend(scan_git_index(&root).expect("scan tracked repository entry modes"));
     violations.extend(scan_workflows(&root).expect("scan workflow command policy"));
     violations.extend(scan_local_actions(&root).expect("scan repository-owned action runtimes"));
@@ -79,13 +143,47 @@ fn repository_contains_no_javascript_toolchain_artifacts() {
 
     assert!(
         violations.is_empty(),
-        "JavaScript/Node artifacts are forbidden outside the exact compat fixture allowlist:\n{}",
+        "the legacy JavaScript/Node surface may only shrink; unlisted artifacts are forbidden:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn planted_violations_are_detected() {
+fn new_typescript_path_outside_legacy_inventory_is_rejected() {
+    let fixture = TemporaryTree::new("new-typescript");
+    fixture.write("src/index.ts", b"grandfathered");
+    fixture.write("src/newFeature.ts", b"new");
+
+    let violations =
+        scan_tree(fixture.path(), &["src/index.ts"]).expect("scan ratchet addition fixture");
+
+    assert_eq!(violations, ["src/newFeature.ts"]);
+}
+
+#[test]
+fn removing_allowlisted_legacy_entry_keeps_ratchet_green() {
+    let fixture = TemporaryTree::new("legacy-removal");
+    fixture.write("package.json", b"grandfathered");
+    fixture.write("src/index.ts", b"grandfathered");
+    let allowlist = ["package.json", "src/index.ts"];
+    assert!(
+        scan_tree(fixture.path(), &allowlist)
+            .expect("scan complete legacy fixture")
+            .is_empty()
+    );
+
+    fs::remove_file(fixture.path().join("src/index.ts")).expect("remove grandfathered entry");
+
+    assert!(
+        scan_tree(fixture.path(), &allowlist)
+            .expect("scan reduced legacy fixture")
+            .is_empty(),
+        "deleting an allowlisted legacy entry must not require a replacement"
+    );
+}
+
+#[test]
+fn other_planted_violations_are_detected() {
     let fixture = TemporaryTree::new("planted");
     let planted_files = [
         "package.json",

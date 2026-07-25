@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
-import fnmatch
+import glob
 import json
 import re
 import subprocess
@@ -195,33 +195,6 @@ def run_git(*args: str, check: bool = True):
     return result
 
 
-def revision_paths(revision: str):
-    result = run_git("ls-tree", "-r", "--name-only", revision)
-    return {line for line in result.stdout.splitlines() if line}
-
-
-def source_text(revision: str, path: str):
-    result = run_git("show", f"{revision}:{path}", check=False)
-    ensure(
-        result.returncode == 0,
-        f"missing source file at {revision}: {path}",
-    )
-    return result.stdout
-
-
-def source_json(revision: str, path: str):
-    try:
-        return json.loads(source_text(revision, path))
-    except json.JSONDecodeError as exc:
-        raise ContractError(f"{path} at {revision}: {exc}") from exc
-
-
-def matches_discovery_pattern(path: str, pattern: str):
-    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(
-        path, pattern.replace("**/", "")
-    )
-
-
 def schema_registry():
     schemas = {}
     resources = []
@@ -293,10 +266,12 @@ def validate_revision(contract, *documents):
         )
 
 
-def validate_source_reference(reference, covered_paths, revision):
+def validate_source_reference(reference, covered_paths):
     path_text = reference["path"]
     ensure(path_text in covered_paths, f"uncovered source reference: {path_text}")
-    lines = source_text(revision, path_text).splitlines()
+    path = REPO / path_text
+    ensure(path.is_file(), f"missing source file: {path_text}")
+    lines = path.read_text(encoding="utf-8").splitlines()
     line_count = len(lines)
     start = reference["line_start"]
     end = reference["line_end"]
@@ -341,15 +316,12 @@ def validate_coverage_definition(coverage):
         f"expected={AUDITED_SOURCE_CATEGORY_TOTALS}, actual={dict(category_totals)}",
     )
 
-    revision = coverage["source_revision"]
-    revision_source_paths = revision_paths(revision)
     discovered = set()
     for pattern in DISCOVERY_PATTERNS:
-        discovered.update(
-            path
-            for path in revision_source_paths
-            if matches_discovery_pattern(path, pattern)
-        )
+        for match in glob.glob(str(REPO / pattern), recursive=True):
+            path = Path(match)
+            if path.is_file():
+                discovered.add(path.relative_to(REPO).as_posix())
     covered_paths = {entry["path"] for entry in audited}
     ensure(
         discovered == covered_paths,
@@ -375,13 +347,17 @@ def validate_ledger(contract, ledger, behaviors, coverage):
         ensure(entry["feature_ids"], f"no feature classification for {entry['path']}")
         unknown = set(entry["feature_ids"]) - feature_set
         ensure(not unknown, f"{entry['path']} references unknown features {sorted(unknown)}")
-        source_text(revision, entry["path"])
+        ensure(
+            run_git("diff", "--quiet", revision, "--", entry["path"], check=False).returncode
+            == 0,
+            f"audited source changed since {revision}: {entry['path']}",
+        )
 
     feature_source_paths = set()
     for feature in features:
         ensure(feature["status"] != "unclassified", f"unclassified feature {feature['feature_id']}")
         for reference in feature["source"]:
-            validate_source_reference(reference, covered_paths, revision)
+            validate_source_reference(reference, covered_paths)
             feature_source_paths.add(reference["path"])
         for fixture in feature["acceptance_fixture"]:
             ensure((BASE / fixture).is_file(), f"missing acceptance fixture: {fixture}")
@@ -405,7 +381,7 @@ def validate_ledger(contract, ledger, behaviors, coverage):
             f"{behavior['behavior_id']} references unknown feature",
         )
         behavior_features.add(behavior["feature_id"])
-        validate_source_reference(behavior["source"], covered_paths, revision)
+        validate_source_reference(behavior["source"], covered_paths)
     ensure(
         behavior_features == feature_set,
         f"features without behavior records: {sorted(feature_set - behavior_features)}",
@@ -413,17 +389,15 @@ def validate_ledger(contract, ledger, behaviors, coverage):
     return len(features), len(inventory), len(audited)
 
 
-def extract_runtime_env(revision):
+def extract_runtime_env():
     names = set()
     direct = re.compile(r'process\.env\["([^"]+)"\]')
     helper = re.compile(
         r'(?:parseBooleanEnv|parseIntegerEnv|parseOptionalNonEmptyEnv|'
         r'parseDomainList|requireEnv)\(\s*"([^"]+)"'
     )
-    for path in sorted(revision_paths(revision)):
-        if not path.startswith("src/") or not path.endswith(".ts"):
-            continue
-        text = source_text(revision, path)
+    for path in (REPO / "src").rglob("*.ts"):
+        text = path.read_text(encoding="utf-8")
         names.update(direct.findall(text))
         names.update(helper.findall(text))
     return names
@@ -441,7 +415,7 @@ def validate_config(mapping):
             runtime_names.extend(entry.get("aliases", []))
     unique(runtime_names, "runtime environment name or alias")
     runtime_declared = set(runtime_names)
-    runtime_actual = extract_runtime_env(mapping["source_revision"])
+    runtime_actual = extract_runtime_env()
     ensure(
         runtime_actual == runtime_declared,
         "runtime environment coverage mismatch: "
@@ -558,15 +532,14 @@ def validate_http(http_examples):
     pairs = [(endpoint["method"], endpoint["path"]) for endpoint in endpoints]
     unique(pairs, "HTTP method/path")
 
-    revision = http_examples["source_revision"]
-    server_text = source_text(revision, "src/server.ts")
+    server_text = (REPO / "src" / "server.ts").read_text(encoding="utf-8")
     literal_routes = {
         (method.upper(), path)
         for method, path in re.findall(
             r'server\.(get|post)\("([^"]+)"', server_text
         )
     }
-    config_text = source_text(revision, "src/config.ts")
+    config_text = (REPO / "src" / "config.ts").read_text(encoding="utf-8")
     webhook_match = re.search(
         r'WHATSAPP_WEBHOOK_PATH\s*=\s*.*?\|\|\s*"([^"]+)"',
         config_text,
@@ -642,11 +615,9 @@ def validate_skills(schemas, registry, inventory):
     unique(source_paths, "bundled skill source")
     unique((skill["name"] for skill in skills), "bundled skill name")
 
-    revision = inventory["source_revision"]
     actual_paths = {
-        path
-        for path in revision_paths(revision)
-        if fnmatch.fnmatch(path, "deploy/conf/skills/*.json")
+        path.relative_to(REPO).as_posix()
+        for path in (REPO / "deploy" / "conf" / "skills").glob("*.json")
     }
     ensure(
         set(source_paths) == actual_paths,
@@ -659,7 +630,7 @@ def validate_skills(schemas, registry, inventory):
     validator = validator_for(schema)(schema, registry=registry)
     bridge_order = ["httpGet", "httpPost", "log"]
     for item in skills:
-        source = source_json(revision, item["source_path"])
+        source = load_json(REPO / item["source_path"])
         errors = list(validator.iter_errors(source))
         ensure(not errors, f"bundled skill is invalid: {item['source_path']}")
         ensure(source["name"] == item["name"], f"skill name mismatch: {item['source_path']}")
@@ -796,8 +767,9 @@ def validate_migration(contract):
     for result in positive_results:
         validate_migration_result_semantics(result)
         if result["input"]["kind"] == "legacy_skill":
-            source_path = result["input"]["source"]
-            source = source_json(contract["source_revision"], source_path)
+            source_path = REPO / result["input"]["source"]
+            ensure(source_path.is_file(), f"missing legacy skill input: {source_path}")
+            source = load_json(source_path)
             ensure(
                 isinstance(source.get("executeCode"), str),
                 f"legacy skill input lacks executeCode: {source_path}",
@@ -1084,7 +1056,6 @@ def run_regression_self_tests(mapping, coverage, http_examples, schemas, registr
         lambda: validate_source_reference(
             {"path": "package-lock.json", "line_start": 1, "line_end": 1},
             {"package-lock.json"},
-            coverage["source_revision"],
         ),
     )
 

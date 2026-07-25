@@ -3,8 +3,6 @@ node_modules/
 
 # Build output
 dist/
-coverage/
-*.tsbuildinfo
 /target/
 /desktop/target/
 
@@ -13,6 +11,11 @@ coverage/
 .env.*
 !.env.example
 deploy/conf/gta-claw.conf
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # OS / editor
 .DS_Store
