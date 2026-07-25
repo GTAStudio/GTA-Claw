@@ -485,6 +485,12 @@ pub enum ServiceTypeError {
     EdgeHyphen,
     /// The service name held no letter.
     NoLetter,
+    /// The browsed type was not exactly one `.local.`-qualified service type.
+    ///
+    /// Produced only when deriving an `NSBonjourServices` entry from a
+    /// [`LocalDiscoveryBackend::DNS_SD_SERVICE_TYPE`], never by
+    /// [`BonjourServiceType::parse`], whose input is already a plist form.
+    NotFullyQualifiedLocal,
 }
 
 impl Display for ServiceTypeError {
@@ -516,6 +522,10 @@ impl Display for ServiceTypeError {
                 formatter.write_str("service name must not start or end with a hyphen")
             }
             Self::NoLetter => formatter.write_str("service name must contain at least one letter"),
+            Self::NotFullyQualifiedLocal => formatter.write_str(
+                "browsed service type must be a single .local.-qualified type, such as \
+                 _example._tcp.local.",
+            ),
         }
     }
 }
@@ -709,12 +719,13 @@ impl HostAppDeclarations {
 /// A local-discovery backend, described at the type level.
 ///
 /// This mirrors the backend contract agreed with the `claw-nodes` owner. It is
-/// **not** yet present in that crate: as of PR #57 head `237b386e`,
-/// `crates/claw-nodes/src/dns_sd.rs` exports `GATEWAY_SERVICE_TYPE` and
-/// `MdnsBrowser` but no descriptor trait. This is therefore a deliberate
-/// private mirror rather than a re-export, kept here so that iOS does not
-/// create a cross-PR dependency, and shaped so that replacing it with the real
-/// trait is mechanical.
+/// **not** yet present in that crate: `crates/claw-nodes/src/dns_sd.rs` exports
+/// `GATEWAY_SERVICE_TYPE` and a desktop-only `MdnsBrowser`, but no descriptor
+/// trait. This is therefore a deliberate private mirror rather than a
+/// re-export, kept here so that iOS does not create a cross-PR dependency, and
+/// shaped so that replacing it with the real trait is mechanical. It cites no
+/// head or line number of the owning branch on purpose; those move, the names
+/// do not.
 ///
 /// Both associated items are `const`, so a caller cannot override them for a
 /// backend it is about to construct. That is the whole point: the mechanism
@@ -745,26 +756,61 @@ pub trait LocalDiscoveryBackend {
     /// # Errors
     ///
     /// Returns [`ServiceTypeError`] if the declared type has no representable
-    /// `NSBonjourServices` form.
+    /// `NSBonjourServices` form. The transformation is deliberately strict:
+    /// the browsed type must carry exactly one terminal `.local.`, because a
+    /// descriptor that forgot to qualify its type, applied the domain twice, or
+    /// consists of nothing but the domain is a mistake, and accepting any of
+    /// them would mint a permit naming an entry the backend never browses.
     fn bonjour_service_type() -> Result<BonjourServiceType, ServiceTypeError> {
-        let trimmed = Self::DNS_SD_SERVICE_TYPE
-            .strip_suffix('.')
-            .unwrap_or(Self::DNS_SD_SERVICE_TYPE);
-        let trimmed = trimmed.strip_suffix(".local").unwrap_or(trimmed);
-        BonjourServiceType::parse(trimmed)
+        const DOMAIN: &str = ".local.";
+
+        let Some(remainder) = Self::DNS_SD_SERVICE_TYPE.strip_suffix(DOMAIN) else {
+            return Err(ServiceTypeError::NotFullyQualifiedLocal);
+        };
+        if remainder.is_empty() || remainder.ends_with(".local") {
+            return Err(ServiceTypeError::NotFullyQualifiedLocal);
+        }
+        BonjourServiceType::parse(remainder)
     }
 }
 
-/// The pure-Rust mDNS backend `claw-nodes` browses the Gateway with.
+/// Descriptor for the raw-multicast Gateway browser — **not shipped on iOS**.
 ///
 /// Uninhabited: it exists only as a type-level descriptor, and there is no
 /// reason to hold a value of it.
 ///
-/// `DNS_SD_SERVICE_TYPE` mirrors `claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE`
-/// (PR #57 head `237b386e`), which is documented there as the frozen local
-/// Gateway service type. `MECHANISM` is [`DiscoveryMechanism::InProcessMulticast`]
-/// because that browser is built on `mdns-sd`, which binds its own UDP
-/// multicast sockets in this process.
+/// **This type is not evidence that an iOS build can browse the local network.**
+/// In `claw-nodes`, `mdns-sd`, `hickory-resolver` and `flume` are declared under
+/// `[target.'cfg(any(target_os = "windows", target_os = "macos", target_os =
+/// "linux"))'.dependencies]`, and `MdnsBrowser` and the surrounding runtime
+/// carry the matching `cfg`. On `aarch64-apple-ios` that browser therefore does
+/// not exist at all — it is compiled out rather than merely ungranted. Mobile
+/// keeps only signed DNS-SD record parsing and verification.
+///
+/// So the descriptor states a *requirement*, not a *capability*: it records
+/// what an in-process multicast backend would have to satisfy before it could
+/// run here. Until a separately audited platform adapter establishes that
+/// capability, no iOS code path can construct the backend this describes, and
+/// a permit issued for it grants nothing that exists.
+///
+/// `DNS_SD_SERVICE_TYPE` mirrors `claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE`,
+/// documented there as the frozen local Gateway service type. It is deliberately
+/// a copy of the *value* rather than a citation of a line, because the value is
+/// the stable part — the constant has been read at four different heads of the
+/// owning branch and moved line twice while never changing. That constant is
+/// **not** `cfg`-gated, so once `claw-nodes` lands the mirror can be replaced by
+/// a direct import even on iOS; only the backend itself is unavailable here.
+///
+/// `MECHANISM` is [`DiscoveryMechanism::InProcessMulticast`] because that
+/// browser is built on `mdns-sd`, which binds its own UDP multicast sockets in
+/// this process.
+///
+/// Scope limit worth knowing: `claw-nodes` also exposes a zone-parameterised
+/// browser over `_openclaw-gw._tcp.{zone}`. That form has no
+/// `NSBonjourServices` representation derivable from a service type alone, so
+/// [`HostAppDeclarations::discovery_precondition`] refuses it rather than
+/// truncating it to something that looks right. This descriptor covers the
+/// `.local.` browser only.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum GatewayMdnsBackend {}
 
@@ -1087,6 +1133,7 @@ mod tests {
         HostAppDeclaration, HostAppDeclarations, HostAppEntitlement, LocalDiscoveryBackend,
         LocalNetworkPrivacy, ServiceTypeError, diagnose_empty_result,
     };
+    use crate::transport::ClientTransport;
 
     /// Stands in for the `claw-nodes` browser: raw sockets, test service type.
     enum TestMdnsBackend {}
@@ -1110,6 +1157,33 @@ mod tests {
     impl LocalDiscoveryBackend for TestUnrepresentableBackend {
         const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::SystemDnsSd;
         const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.example.com.";
+    }
+
+    /// A descriptor that forgot to fully qualify its type.
+    ///
+    /// Deliberately [`DiscoveryMechanism::SystemDnsSd`]: that path needs no
+    /// entitlement, so nothing downstream would have caught the bad type.
+    enum TestUnqualifiedBackend {}
+
+    impl LocalDiscoveryBackend for TestUnqualifiedBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::SystemDnsSd;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp";
+    }
+
+    /// A descriptor whose domain suffix was applied twice.
+    enum TestRepeatedDomainBackend {}
+
+    impl LocalDiscoveryBackend for TestRepeatedDomainBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::InProcessMulticast;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.local.local.";
+    }
+
+    /// A descriptor that is nothing but the domain.
+    enum TestBareDomainBackend {}
+
+    impl LocalDiscoveryBackend for TestBareDomainBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::InProcessMulticast;
+        const DNS_SD_SERVICE_TYPE: &'static str = ".local.";
     }
 
     fn service_type(text: &str) -> BonjourServiceType {
@@ -1409,6 +1483,41 @@ mod tests {
     }
 
     #[test]
+    fn a_permit_for_the_raw_backend_is_not_a_claim_that_ios_can_browse() {
+        let declarations = HostAppDeclarations::new()
+            .with_local_network_usage(DeclarationStatus::Declared)
+            .with_bonjour_services(
+                DeclarationStatus::Declared,
+                [GatewayMdnsBackend::bonjour_service_type().expect("must derive")],
+            )
+            .with_entitlement(
+                HostAppEntitlement::MulticastNetworking,
+                EntitlementStatus::Granted,
+            );
+        let permitted = declarations
+            .discovery_precondition::<GatewayMdnsBackend>()
+            .expect("every declared prerequisite is present");
+
+        assert_eq!(
+            permitted.mechanism(),
+            DiscoveryMechanism::InProcessMulticast,
+            "the permit must name the mechanism it was checked against, but read {permitted:?}"
+        );
+
+        let record = ClientTransport::BonjourDiscovery.ios_record();
+        assert!(
+            !record.confirmed_on_ios(),
+            "a satisfied permit must not upgrade the recorded iOS transport status: the \
+             raw-multicast browser in claw-nodes is compiled out for non-desktop targets, so \
+             there is nothing on iOS for this permit to authorise, and the record read {record}"
+        );
+        assert!(
+            !record.usable_today(),
+            "the permit describes a prerequisite, not a capability, but the record read {record}"
+        );
+    }
+
+    #[test]
     fn the_gateway_backend_binds_its_own_sockets_so_it_needs_the_entitlement() {
         assert_eq!(
             GatewayMdnsBackend::MECHANISM,
@@ -1462,6 +1571,48 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_that_is_not_a_fully_qualified_local_type_is_refused() {
+        for (label, derived) in [
+            (
+                "missing domain",
+                TestUnqualifiedBackend::bonjour_service_type(),
+            ),
+            (
+                "repeated domain",
+                TestRepeatedDomainBackend::bonjour_service_type(),
+            ),
+            ("bare domain", TestBareDomainBackend::bonjour_service_type()),
+        ] {
+            let rendered = format!("{derived:?}");
+            let error = derived.expect_err(&format!(
+                "a {label} descriptor must not derive a plist form, but it produced {rendered}"
+            ));
+            assert_eq!(
+                error,
+                ServiceTypeError::NotFullyQualifiedLocal,
+                "a {label} descriptor was refused with {error}, which does not name the \
+                 qualification problem"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unqualified_descriptor_cannot_obtain_a_permit() {
+        let error = fully_declared()
+            .discovery_precondition::<TestUnqualifiedBackend>()
+            .expect_err("a descriptor missing the .local. domain must not be permitted");
+
+        assert_eq!(
+            error,
+            DiscoveryUnavailable::BackendServiceTypeInvalid {
+                service_type: "_gtaclaw._tcp",
+                error: ServiceTypeError::NotFullyQualifiedLocal,
+            },
+            "an unqualified descriptor must be refused against its own constant"
+        );
+    }
+
+    #[test]
     fn a_backend_type_with_no_plist_form_is_reported_rather_than_truncated() {
         let error = fully_declared()
             .discovery_precondition::<TestUnrepresentableBackend>()
@@ -1471,7 +1622,7 @@ mod tests {
             error,
             DiscoveryUnavailable::BackendServiceTypeInvalid {
                 service_type: "_gtaclaw._tcp.example.com.",
-                error: ServiceTypeError::MissingTransportSuffix,
+                error: ServiceTypeError::NotFullyQualifiedLocal,
             },
             "an underivable plist entry must be reported against the backend constant"
         );

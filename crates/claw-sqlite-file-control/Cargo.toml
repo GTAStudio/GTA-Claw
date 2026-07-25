@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-futures-core = "=0.3.32"
+futures-core = "=0.3.33"
 libsqlite3-sys = "0.37.0"
 sqlx.workspace = true
 tokio.workspace = true
