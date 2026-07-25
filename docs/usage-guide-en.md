@@ -394,6 +394,12 @@ HTTPS_PROXY=http://127.0.0.1:7890
 HTTP_PROXY=http://127.0.0.1:7890
 ```
 
+Outbound HTTPS webhooks resolve and validate the destination locally, then use the exact
+validated public IP as the proxy `CONNECT` authority. A hostname-only enterprise proxy
+may reject that IP-literal authority. GTA-Claw reports this as a policy-pinned proxy
+rejection and does not retry with the hostname, because doing so would delegate DNS and
+destination policy to the proxy.
+
 ---
 
 ## 7. FAQ

@@ -818,8 +818,9 @@ where
     if response.len() != header_end + 4 {
         return Err(WebhookError::MalformedResponse);
     }
-    if parse_response_status(&response)? != 200 {
-        return Err(WebhookError::ProxyConnect);
+    let status = parse_response_status(&response)?;
+    if status != 200 {
+        return Err(WebhookError::ProxyConnect(status));
     }
     Ok(stream)
 }
@@ -1373,8 +1374,8 @@ pub enum WebhookError {
     ProxyConfiguration,
     /// The configured proxy protocol is not supported.
     UnsupportedProxy,
-    /// The proxy rejected a CONNECT tunnel.
-    ProxyConnect,
+    /// The proxy rejected a CONNECT tunnel to a policy-pinned IP authority.
+    ProxyConnect(u16),
     /// The validated socket or TLS exchange failed.
     Transport,
     /// The complete transport operation timed out.
@@ -1436,7 +1437,10 @@ impl Display for WebhookError {
             Self::TlsConfiguration => formatter.write_str("webhook TLS configuration unavailable"),
             Self::ProxyConfiguration => formatter.write_str("invalid webhook proxy configuration"),
             Self::UnsupportedProxy => formatter.write_str("unsupported webhook proxy protocol"),
-            Self::ProxyConnect => formatter.write_str("webhook proxy tunnel rejected"),
+            Self::ProxyConnect(status) => write!(
+                formatter,
+                "webhook proxy refused the policy-pinned IP-literal CONNECT authority with HTTP {status}"
+            ),
             Self::Transport => formatter.write_str("webhook transport failed"),
             Self::TransportTimeout => formatter.write_str("webhook transport timed out"),
             Self::MalformedResponse => formatter.write_str("malformed webhook HTTP response"),
@@ -2028,15 +2032,19 @@ mod tests {
         });
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 443);
 
-        assert!(matches!(
-            establish_http_connect(client, destination, None).await,
-            Err(WebhookError::ProxyConnect)
-        ));
+        let error = establish_http_connect(client, destination, None)
+            .await
+            .expect_err("proxy rejection");
+        assert!(matches!(&error, WebhookError::ProxyConnect(407)));
+        assert_eq!(
+            error.to_string(),
+            "webhook proxy refused the policy-pinned IP-literal CONNECT authority with HTTP 407"
+        );
         assert_eq!(
             server.await.expect("proxy server"),
             b"CONNECT 8.8.4.4:443 HTTP/1.1\r\nHost: 8.8.4.4:443\r\n\r\n"
         );
-        assert!(!WebhookError::ProxyConnect.retryable_delivery_failure());
+        assert!(!error.retryable_delivery_failure());
     }
 
     #[test]
