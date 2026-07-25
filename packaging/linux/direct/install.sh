@@ -383,7 +383,10 @@ fi
 if [ -d /run/systemd/system ]; then
   preflight_load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
   if [ "$preflight_load_state" = "masked" ] &&
-    { [ ! -e "$replacement_fence" ] || [ ! -e "$failure_marker" ]; }; then
+    {
+      [ ! -e "$replacement_fence" ] ||
+        { [ ! -e "$failure_marker" ] && [ ! -e "$persistent_failure_marker" ]; }
+    }; then
     echo "refusing externally masked gta-claw daemon" >&2
     exit 1
   fi
