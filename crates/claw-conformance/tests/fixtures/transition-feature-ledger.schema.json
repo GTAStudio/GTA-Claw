@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GTAStudio/GTA-Claw/compat/upstream/feature-ledger.schema.json",
+  "title": "OpenClaw Compatibility Feature Ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ledger_id",
+    "classification",
+    "baseline_sha",
+    "features"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "ledger_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "classification": {
+      "$ref": "#/$defs/classification"
+    },
+    "baseline_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/feature"
+      }
+    }
+  },
+  "$defs": {
+    "classification": {
+      "enum": [
+        "gateway_core",
+        "official_integration",
+        "official_client_interop"
+      ]
+    },
+    "feature_status": {
+      "enum": [
+        "unimplemented",
+        "partial",
+        "implemented"
+      ]
+    },
+    "acceptance_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "test"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+        },
+        "test": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*$"
+        }
+      }
+    },
+    "implementation_pointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "note"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "feature_id",
+        "title",
+        "domain",
+        "tier",
+        "profile",
+        "classification",
+        "upstream_source",
+        "status",
+        "acceptance_evidence",
+        "last_verified_sha",
+        "known_differences"
+      ],
+      "properties": {
+        "feature_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tier": {
+          "enum": [
+            "tier_1",
+            "tier_2",
+            "tier_3"
+          ]
+        },
+        "profile": {
+          "enum": [
+            "core_gateway",
+            "client_interop",
+            "platform_integration"
+          ]
+        },
+        "classification": {
+          "$ref": "#/$defs/classification"
+        },
+        "upstream_source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "paths"
+          ],
+          "properties": {
+            "repository": {
+              "const": "openclaw/openclaw"
+            },
+            "paths": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "official_url": {
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/feature_status"
+        },
+        "acceptance_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "artifacts",
+            "required"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "missing",
+                "partial",
+                "accepted"
+              ]
+            },
+            "artifacts": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/acceptance_artifact"
+              }
+            },
+            "required": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "last_verified_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "known_differences": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "implementation_pointers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/implementation_pointer"
+          }
+        }
+      }
+    }
+  }
+}
