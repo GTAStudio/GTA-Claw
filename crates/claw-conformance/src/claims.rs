@@ -220,7 +220,6 @@ pub struct Registry {
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
-    workspace_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +256,41 @@ struct CargoManifestTarget {
     name: Option<String>,
     path: Option<PathBuf>,
     harness: Option<bool>,
+}
+
+#[derive(Debug)]
+struct CargoWorkspaceSpec {
+    directory: PathBuf,
+    members: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CargoManifestScope {
+    package: bool,
+    workspace: Option<CargoWorkspaceSpec>,
+}
+
+impl CargoWorkspaceSpec {
+    fn includes_package(&self, package_directory: &Path) -> bool {
+        if package_directory == self.directory {
+            return true;
+        }
+        let Ok(relative) = package_directory.strip_prefix(&self.directory) else {
+            return false;
+        };
+        let relative = normalized_api_path(relative.to_path_buf());
+        if self
+            .exclude
+            .iter()
+            .any(|pattern| cargo_exclude_pattern_covers(pattern, &relative))
+        {
+            return false;
+        }
+        self.members
+            .iter()
+            .any(|pattern| cargo_pattern_matches(pattern, &relative))
+    }
 }
 
 impl CargoManifestTargets {
@@ -313,8 +347,7 @@ impl CargoTestTargets {
                 format!("cannot discover Cargo manifests: {error}"),
             )
         })?;
-        let mut processed_manifests = BTreeSet::new();
-        let mut target_roots = BTreeSet::new();
+        let mut scoped_manifests = Vec::new();
         for manifest_path in manifests {
             let canonical_manifest = manifest_path.canonicalize().map_err(|error| {
                 ConformanceError::new(
@@ -326,14 +359,39 @@ impl CargoTestTargets {
                     ),
                 )
             })?;
-            if processed_manifests.contains(&canonical_manifest) {
+            let scope = load_manifest_scope(&canonical_root, &canonical_manifest, code)?;
+            scoped_manifests.push((canonical_manifest, scope));
+        }
+        let workspace_directories = scoped_manifests
+            .iter()
+            .filter_map(|(_, scope)| {
+                scope
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.directory.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let mut target_roots = BTreeSet::new();
+        for (canonical_manifest, scope) in scoped_manifests {
+            let package_directory = canonical_manifest
+                .parent()
+                .expect("a canonical Cargo manifest has a parent");
+            let workspace = if let Some(workspace) = scope.workspace {
+                workspace
+            } else if scope.package
+                && !workspace_directories
+                    .iter()
+                    .any(|directory| package_directory.starts_with(directory))
+            {
+                CargoWorkspaceSpec {
+                    directory: package_directory.to_path_buf(),
+                    members: Vec::new(),
+                    exclude: Vec::new(),
+                }
+            } else {
                 continue;
-            }
+            };
             let metadata = load_cargo_metadata(&canonical_root, &canonical_manifest, code)?;
-            let workspace_manifest = metadata.workspace_root.join("Cargo.toml");
-            if let Ok(path) = workspace_manifest.canonicalize() {
-                processed_manifests.insert(path);
-            }
             for package in metadata.packages {
                 let package_manifest = package.manifest_path.canonicalize().map_err(|error| {
                     ConformanceError::new(
@@ -345,9 +403,6 @@ impl CargoTestTargets {
                         ),
                     )
                 })?;
-                processed_manifests.insert(package_manifest.clone());
-                let manifest_targets =
-                    load_manifest_targets(&canonical_root, &package_manifest, code)?;
                 let package_directory = package_manifest.parent().ok_or_else(|| {
                     ConformanceError::new(
                         code,
@@ -358,6 +413,11 @@ impl CargoTestTargets {
                         ),
                     )
                 })?;
+                if !workspace.includes_package(package_directory) {
+                    continue;
+                }
+                let manifest_targets =
+                    load_manifest_targets(&canonical_root, &package_manifest, code)?;
                 for target in package.targets.into_iter().filter(|target| {
                     target.test
                         && manifest_targets.uses_standard_test_harness(package_directory, target)
@@ -394,6 +454,134 @@ impl CargoTestTargets {
             .canonicalize()
             .is_ok_and(|root| root == self.repository_root)
     }
+}
+
+fn load_manifest_scope(
+    repository_root: &Path,
+    manifest_path: &Path,
+    code: ViolationCode,
+) -> Result<CargoManifestScope, ConformanceError> {
+    let subject = normalized_api_path(
+        manifest_path
+            .strip_prefix(repository_root)
+            .unwrap_or(manifest_path)
+            .to_path_buf(),
+    );
+    let source = fs::read_to_string(manifest_path).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject.clone()),
+            format!("cannot read Cargo manifest: {error}"),
+        )
+    })?;
+    let document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject),
+            format!("cannot parse Cargo manifest: {error}"),
+        )
+    })?;
+    let package = document
+        .get("package")
+        .and_then(toml_edit::Item::as_table)
+        .is_some_and(|package| !package.is_implicit());
+    let Some(workspace) = document
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table)
+        .filter(|workspace| !workspace.is_implicit())
+    else {
+        return Ok(CargoManifestScope {
+            package,
+            workspace: None,
+        });
+    };
+    let strings = |key: &str| {
+        workspace
+            .get(key)
+            .and_then(toml_edit::Item::as_array)
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter_map(toml_edit::Value::as_str)
+            .map(|value| value.trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+    };
+    let directory = manifest_path
+        .parent()
+        .expect("a canonical Cargo manifest has a parent")
+        .to_path_buf();
+    Ok(CargoManifestScope {
+        package,
+        workspace: Some(CargoWorkspaceSpec {
+            directory,
+            members: strings("members"),
+            exclude: strings("exclude"),
+        }),
+    })
+}
+
+fn cargo_exclude_pattern_covers(pattern: &str, relative_directory: &str) -> bool {
+    let mut prefix = String::new();
+    relative_directory.split('/').any(|segment| {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        cargo_pattern_matches(pattern, &prefix)
+    })
+}
+
+fn cargo_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    fn matches(
+        pattern: &[char],
+        candidate: &[char],
+        pattern_index: usize,
+        candidate_index: usize,
+        memo: &mut BTreeMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, candidate_index)) {
+            return *result;
+        }
+        let result = if pattern_index == pattern.len() {
+            candidate_index == candidate.len()
+        } else if pattern[pattern_index] == '*' && pattern.get(pattern_index + 1) == Some(&'*') {
+            matches(pattern, candidate, pattern_index + 2, candidate_index, memo)
+                || (candidate_index < candidate.len()
+                    && matches(pattern, candidate, pattern_index, candidate_index + 1, memo))
+        } else if pattern[pattern_index] == '*' {
+            matches(pattern, candidate, pattern_index + 1, candidate_index, memo)
+                || (candidate
+                    .get(candidate_index)
+                    .is_some_and(|value| *value != '/')
+                    && matches(pattern, candidate, pattern_index, candidate_index + 1, memo))
+        } else if pattern[pattern_index] == '?' {
+            candidate
+                .get(candidate_index)
+                .is_some_and(|value| *value != '/')
+                && matches(
+                    pattern,
+                    candidate,
+                    pattern_index + 1,
+                    candidate_index + 1,
+                    memo,
+                )
+        } else {
+            candidate.get(candidate_index) == Some(&pattern[pattern_index])
+                && matches(
+                    pattern,
+                    candidate,
+                    pattern_index + 1,
+                    candidate_index + 1,
+                    memo,
+                )
+        };
+        memo.insert((pattern_index, candidate_index), result);
+        result
+    }
+
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let candidate = candidate.chars().collect::<Vec<_>>();
+    matches(&pattern, &candidate, 0, 0, &mut BTreeMap::new())
 }
 
 fn load_manifest_targets(
@@ -1841,8 +2029,9 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        CargoTestTargets, cargo_executable, declares_enabled_test, normalized_api_path,
-        resolve_cargo_executable, resolve_external_executable,
+        CargoTestTargets, cargo_executable, cargo_pattern_matches, declares_enabled_test,
+        load_manifest_scope, normalized_api_path, resolve_cargo_executable,
+        resolve_external_executable,
     };
     use crate::ViolationCode;
 
@@ -2059,16 +2248,31 @@ mod tests {
 
         let targets =
             CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
-        let rejected = tracked
+        let verdicts = tracked
             .into_iter()
-            .filter(|path| {
+            .map(|path| {
                 let canonical = root
-                    .join(path)
+                    .join(&path)
                     .canonicalize()
                     .expect("canonical tracked Rust source");
-                !targets.contains(&canonical)
+                let accepted = targets.contains(&canonical);
+                (normalized_api_path(PathBuf::from(path)), accepted)
             })
-            .map(|path| normalized_api_path(PathBuf::from(path)))
+            .collect::<Vec<_>>();
+        if let Some(output_path) = env::var_os("CLAW_CONFORMANCE_VERDICT_OUT") {
+            let mut lines = verdicts
+                .iter()
+                .map(|(path, accepted)| {
+                    format!("{}\t{path}", if *accepted { "accept" } else { "reject" })
+                })
+                .collect::<Vec<_>>();
+            lines.sort();
+            fs::write(output_path, format!("{}\n", lines.join("\n")))
+                .expect("write Rust reachability verdicts");
+        }
+        let rejected = verdicts
+            .into_iter()
+            .filter_map(|(path, accepted)| (!accepted).then_some(path))
             .collect::<BTreeSet<_>>();
         assert_eq!(
             rejected,
@@ -2656,6 +2860,199 @@ mod nested {
             );
         }
         fs::remove_dir_all(root).expect("remove target compiler oracle");
+    }
+
+    #[test]
+    fn workspace_membership_requires_declared_build_roots() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-workspace-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for directory in [
+            "crates/real/src",
+            "crates/ghost/src",
+            "globbed/member/src",
+            "standalone/src",
+            "vendored/src",
+        ] {
+            fs::create_dir_all(root.join(directory)).expect("create membership oracle directory");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n\
+             members = [\"crates/real\", \"globbed/*\"]\n\
+             exclude = [\"vendored\"]\n\
+             resolver = \"3\"\n",
+        )
+        .expect("write membership oracle workspace");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"ghost\"\n\
+             version = \"0.0.0\"\n\n\
+             [[package]]\n\
+             name = \"globbed-member\"\n\
+             version = \"0.0.0\"\n\n\
+             [[package]]\n\
+             name = \"real\"\n\
+             version = \"0.0.0\"\n\
+             dependencies = [\n\
+              \"ghost\",\n\
+             ]\n",
+        )
+        .expect("write membership oracle lockfile");
+        for (directory, name, extra) in [
+            (
+                "crates/real",
+                "real",
+                "\n[dependencies]\nghost = { path = \"../ghost\" }\n",
+            ),
+            ("crates/ghost", "ghost", ""),
+            ("globbed/member", "globbed-member", ""),
+            ("vendored", "vendored", ""),
+        ] {
+            fs::write(
+                root.join(directory).join("Cargo.toml"),
+                format!(
+                    "[package]\n\
+                     name = \"{name}\"\n\
+                     version = \"0.0.0\"\n\
+                     edition = \"2024\"\n\
+                     {extra}"
+                ),
+            )
+            .expect("write membership oracle package");
+        }
+        fs::write(
+            root.join("standalone").join("Cargo.toml"),
+            "[package]\n\
+             name = \"standalone\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [workspace]\n\
+             resolver = \"3\"\n",
+        )
+        .expect("write standalone workspace package");
+        fs::write(
+            root.join("standalone").join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"standalone\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write standalone workspace lockfile");
+        for (path, test) in [
+            ("crates/real/src/lib.rs", "real_test"),
+            ("crates/ghost/src/lib.rs", "implicit_path_member_test"),
+            ("globbed/member/src/lib.rs", "globbed_member_test"),
+            ("standalone/src/lib.rs", "standalone_workspace_test"),
+            ("vendored/src/lib.rs", "excluded_package_test"),
+        ] {
+            fs::write(root.join(path), format!("#[test]\nfn {test}() {{}}\n"))
+                .expect("write membership oracle source");
+        }
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args([
+                "test",
+                "--workspace",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run membership compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout)
+            .expect("membership oracle output is UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([
+                "globbed_member_test".to_owned(),
+                "implicit_path_member_test".to_owned(),
+                "real_test".to_owned(),
+            ])
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        for (path, expected) in [
+            ("crates/real/src/lib.rs", true),
+            ("crates/ghost/src/lib.rs", false),
+            ("globbed/member/src/lib.rs", true),
+            ("standalone/src/lib.rs", true),
+            ("vendored/src/lib.rs", false),
+        ] {
+            let canonical = root.join(path).canonicalize().expect("canonical source");
+            assert_eq!(
+                targets.contains(&canonical),
+                expected,
+                "workspace admission diverged for {path}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove membership compiler oracle");
+    }
+
+    #[test]
+    fn only_explicit_workspace_table_establishes_a_build_root() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-workspace-marker-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create workspace marker fixture");
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\n\
+             name = \"workspace-marker\"\n\
+             version = \"0.0.0\"\n\
+             description = '''\n\
+             [workspace]\n\
+             '''\n\n\
+             [workspace.package]\n\
+             edition = \"2024\"\n",
+        )
+        .expect("write workspace marker fixture");
+
+        let scope = load_manifest_scope(&root, &manifest, ViolationCode::ClaimEvidence)
+            .expect("parse workspace marker fixture");
+        assert!(scope.package);
+        assert!(scope.workspace.is_none());
+        fs::remove_dir_all(root).expect("remove workspace marker fixture");
+    }
+
+    #[test]
+    fn cargo_workspace_patterns_match_only_declared_path_shapes() {
+        for (pattern, candidate, expected) in [
+            ("crates/*", "crates/real", true),
+            ("crates/*", "crates/nested/real", false),
+            ("crates/**", "crates/nested/real", true),
+            ("crates/rea?", "crates/real", true),
+            ("crates/rea?", "crates/real/deeper", false),
+            ("crates/[real]", "crates/r", false),
+        ] {
+            assert_eq!(
+                cargo_pattern_matches(pattern, candidate),
+                expected,
+                "Cargo workspace pattern verdict diverged for {pattern:?} and {candidate:?}"
+            );
+        }
     }
 
     #[test]
