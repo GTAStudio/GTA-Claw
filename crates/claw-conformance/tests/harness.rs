@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use claw_conformance::{
     ClaimLevel, ConformanceError, Contract, Evidence, FeatureClaim, InventoryClaim, ParityStatus,
-    Registry, ViolationCode, generate_report,
+    Registry, ViolationCode, discover_claim_files, generate_report,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +114,32 @@ fn real_frozen_contract_loads_every_row() {
             ("release-deployment", 24),
             ("skills", 51),
         ]
+    );
+}
+
+#[test]
+fn workspace_claim_manifests_pass_conformance() {
+    let repository = repository_root();
+    let contract =
+        Contract::load(repository.join("compat").join("upstream")).expect("load frozen contract");
+    let mut registry = Registry::new();
+    let claim_files = discover_claim_files(&repository).expect("discover workspace claims");
+    for claim_file in claim_files {
+        registry
+            .load_claims_file(claim_file)
+            .expect("load workspace claims");
+    }
+
+    let report =
+        generate_report(&contract, &registry, &repository).expect("validate workspace claims");
+    assert_eq!(report.totals.total, 47);
+    assert_eq!(
+        report
+            .inventories
+            .iter()
+            .map(|inventory| inventory.total)
+            .sum::<usize>(),
+        717
     );
 }
 
