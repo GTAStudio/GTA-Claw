@@ -785,6 +785,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gta-claw-android"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-gateway-client",
+ "claw-platform",
+ "claw-protocol",
+ "claw-security",
+ "rand_core 0.10.1",
+ "ring",
+ "secrecy",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "gta-claw-cli"
 version = "0.1.0"
 dependencies = [
