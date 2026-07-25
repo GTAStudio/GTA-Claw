@@ -668,6 +668,7 @@ fn final_tree(label: &str) -> TempTree {
     ] {
         write_from_policy(&tree, source, destination);
     }
+    write_active_repository_policy_workflow(&tree);
     tree
 }
 
@@ -861,6 +862,14 @@ jobs:
         run: cargo test --locked --package claw-repo-policy --test repository_policy
 "#;
 
+fn write_active_repository_policy_workflow(tree: &TempTree) {
+    fs::write(
+        tree.join(".github/workflows/upstream-gateway-reference.yml"),
+        ACTIVE_REPOSITORY_POLICY_WORKFLOW,
+    )
+    .expect("write active repository policy workflow");
+}
+
 fn deactivate_repository_policy(tree: &TempTree) {
     let root_manifest_path = tree.join("Cargo.toml");
     let mut root_manifest: toml::Value = toml::from_str(
@@ -930,11 +939,7 @@ fn activate_repository_policy(tree: &TempTree) {
         REPOSITORY_POLICY_TEST_FIXTURE,
     )
     .expect("write repository policy test fixture");
-    fs::write(
-        tree.join(".github/workflows/upstream-gateway-reference.yml"),
-        ACTIVE_REPOSITORY_POLICY_WORKFLOW,
-    )
-    .expect("write active repository policy workflow");
+    write_active_repository_policy_workflow(tree);
 }
 
 fn write_release_workspace(
