@@ -22,6 +22,8 @@ members = [
   "crates/claw-plugin-api",
   "crates/claw-plugin-host",
   "crates/claw-protocol",
+  "crates/claw-provider-sdk",
+  "crates/claw-providers",
   "crates/claw-relay",
   "crates/claw-repo-policy",
   "crates/claw-security",
@@ -50,6 +52,8 @@ claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-plugin-api = { path = "crates/claw-plugin-api", version = "0.1.0" }
 claw-plugin-host = { path = "crates/claw-plugin-host", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
+claw-provider-sdk = { path = "crates/claw-provider-sdk", version = "0.1.0" }
+claw-providers = { path = "crates/claw-providers", version = "0.1.0" }
 claw-relay = { path = "crates/claw-relay", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
