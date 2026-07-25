@@ -7,6 +7,8 @@ mod onboarding;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod product_state;
 #[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+mod software_renderer_smoke;
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 mod test_gateway;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod ui_adapter;

@@ -1,23 +1,18 @@
 //! Headless smoke coverage for the complete external Slint component tree.
 
-#![cfg(any(target_os = "windows", target_os = "macos"))]
-#![allow(
-    missing_docs,
-    unreachable_pub,
-    reason = "Slint generates public bindings for this smoke-test executable"
-)]
-
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::generated_ui::{
+    ActivityItem, AppWindow, DeliverableItem, DiffItem, ExtensionItem, FileItem, RunItem,
+    ScheduleItem, TranscriptItem, VisualPreferences, WorkspaceItem,
+};
 use slint::ComponentHandle as _;
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
 };
 use slint::platform::{Platform, PlatformError, WindowAdapter};
-
-slint::include_modules!();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RgbPixel {
