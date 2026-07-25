@@ -10,7 +10,8 @@ use crate::protocol::{CdpRequest, ExtensionMessage, RelayTab};
 
 const BROWSER_TARGET_ID: &str = "openclaw-extension-relay";
 const BROWSER_CONTEXT_ID: &str = "openclaw-extension-context";
-const DEFAULT_PENDING_LIMIT: usize = 256;
+const DEFAULT_PENDING_LIMIT: usize = 32;
+const MAX_CDP_CONNECTIONS: usize = 8;
 
 /// Shared page target exposed through CDP discovery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -70,6 +71,18 @@ struct PendingCommand {
     request_id: u64,
     response_session_id: Option<String>,
     kind: PendingKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AbandonedCommand {
+    tab_id: Option<u64>,
+    owner: ConnectionId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupDetach {
+    tab_id: u64,
+    owner: ConnectionId,
 }
 
 /// Command sent from the bridge to the paired extension.
@@ -199,10 +212,12 @@ pub struct CdpBridge {
     browser_sessions: BTreeMap<String, ConnectionId>,
     child_sessions: BTreeMap<String, ChildSessionState>,
     auto_attach: BTreeSet<ConnectionId>,
+    auto_attach_suppressed: BTreeMap<ConnectionId, BTreeSet<u64>>,
     pending: BTreeMap<u64, PendingCommand>,
-    abandoned: BTreeMap<u64, Option<u64>>,
-    cleanup_detaches: BTreeMap<u64, u64>,
+    abandoned: BTreeMap<u64, AbandonedCommand>,
+    cleanup_detaches: BTreeMap<u64, CleanupDetach>,
     pending_limit: usize,
+    global_pending_limit: usize,
     next_command: u64,
     next_session: u64,
 }
@@ -227,22 +242,28 @@ impl CdpBridge {
             browser_sessions: BTreeMap::new(),
             child_sessions: BTreeMap::new(),
             auto_attach: BTreeSet::new(),
+            auto_attach_suppressed: BTreeMap::new(),
             pending: BTreeMap::new(),
             abandoned: BTreeMap::new(),
             cleanup_detaches: BTreeMap::new(),
             pending_limit: DEFAULT_PENDING_LIMIT,
+            global_pending_limit: DEFAULT_PENDING_LIMIT * MAX_CDP_CONNECTIONS,
             next_command: 1,
             next_session: 1,
         }
     }
 
-    /// Creates a disconnected bridge with explicit pending-work and child-session bounds.
+    /// Creates a disconnected bridge with explicit per-client pending-work and child-session bounds.
     pub fn with_pending_limit(pending_limit: usize) -> Result<Self, BridgeError> {
         if pending_limit == 0 {
             return Err(BridgeError::InvalidPendingLimit);
         }
+        let global_pending_limit = pending_limit
+            .checked_mul(MAX_CDP_CONNECTIONS)
+            .ok_or(BridgeError::InvalidPendingLimit)?;
         Ok(Self {
             pending_limit,
+            global_pending_limit,
             ..Self::new()
         })
     }
@@ -260,9 +281,13 @@ impl CdpBridge {
 
     /// Attaches one authenticated CDP client.
     pub fn connect_cdp(&mut self, connection: ConnectionId) -> Result<(), BridgeError> {
-        if !self.clients.insert(connection) {
+        if self.clients.contains(&connection) {
             return Err(BridgeError::DuplicateConnection);
         }
+        if self.clients.len() >= MAX_CDP_CONNECTIONS {
+            return Err(BridgeError::CdpConnectionLimit);
+        }
+        self.clients.insert(connection);
         Ok(())
     }
 
@@ -307,9 +332,22 @@ impl CdpBridge {
             ExtensionMessage::Result { seq, result } => self.complete(seq, Ok(result)),
             ExtensionMessage::Error { seq, message } => self.complete(seq, Err(message)),
             ExtensionMessage::Detached { tab_id, reason: _ } => {
+                if !self.targets.contains_key(&tab_id) {
+                    return Err(BridgeError::UnknownTab);
+                }
                 self.clear_quarantine_for_tab(tab_id);
                 let mut effects = self.fail_pending_for_tab(tab_id, "Chrome target detached");
                 effects.extend(self.detach_tab(tab_id));
+                if self.extension.is_none() {
+                    return Ok(effects);
+                }
+                for connection in &self.auto_attach {
+                    self.auto_attach_suppressed
+                        .entry(*connection)
+                        .or_default()
+                        .insert(tab_id);
+                }
+                effects.extend(self.schedule_available_auto_attaches()?);
                 Ok(effects)
             }
             ExtensionMessage::Pong => Ok(Vec::new()),
@@ -346,6 +384,7 @@ impl CdpBridge {
         self.abandoned.clear();
         self.cleanup_detaches.clear();
         self.child_sessions.clear();
+        self.auto_attach_suppressed.clear();
         let mut effects = pending
             .into_values()
             .filter(|pending| {
@@ -386,6 +425,7 @@ impl CdpBridge {
         }
         let mut effects = Vec::new();
         self.auto_attach.remove(&connection);
+        self.auto_attach_suppressed.remove(&connection);
         self.browser_sessions
             .retain(|_, owner| *owner != connection);
         self.child_sessions
@@ -403,11 +443,12 @@ impl CdpBridge {
             self.release_detach_reservation(seq, &pending.kind);
             match pending.kind {
                 PendingKind::Attach { tab_id, respond: _ } => {
-                    effects.extend(self.abandon_sequence(seq, Some(tab_id)));
+                    effects.extend(self.abandon_sequence(seq, Some(tab_id), pending.client));
                 }
                 PendingKind::Cdp { tab_id: _ } => {}
                 PendingKind::Detach { tab_id } => {
-                    if let Err(reason) = self.promote_detach_to_cleanup(seq, tab_id) {
+                    if let Err(reason) = self.promote_detach_to_cleanup(seq, tab_id, pending.client)
+                    {
                         return self.fail_closed_extension(reason);
                     }
                 }
@@ -431,7 +472,7 @@ impl CdpBridge {
                 target.session = None;
             }
             if self.extension_hello_seen {
-                match self.schedule_cleanup_detach(tab_id, false) {
+                match self.schedule_cleanup_detach(tab_id, connection) {
                     Ok(effect) => effects.push(effect),
                     Err(reason) => return self.fail_closed_extension(reason),
                 }
@@ -445,22 +486,24 @@ impl CdpBridge {
         if self.cleanup_detaches.contains_key(&seq) {
             return Ok(self.fail_closed_extension("Chrome debugger cleanup timed out"));
         }
-        if let Some(&tab_id) = self.abandoned.get(&seq) {
-            return match tab_id {
+        if let Some(&abandoned) = self.abandoned.get(&seq) {
+            return match abandoned.tab_id {
                 Some(tab_id)
                     if self.extension_hello_seen
                         && self.can_cleanup_abandoned_attach(seq, tab_id) =>
                 {
-                    let effect = match self.schedule_cleanup_detach(tab_id, true) {
+                    self.abandoned.remove(&seq);
+                    let effect = match self.schedule_cleanup_detach(tab_id, abandoned.owner) {
                         Ok(effect) => effect,
                         Err(reason) => return Ok(self.fail_closed_extension(reason)),
                     };
-                    self.abandoned.remove(&seq);
                     Ok(vec![effect])
                 }
                 Some(_) | None => {
                     self.abandoned.remove(&seq);
-                    Ok(Vec::new())
+                    self.schedule_available_auto_attaches_excluding(
+                        abandoned.tab_id.map(|tab_id| (abandoned.owner, tab_id)),
+                    )
                 }
             };
         }
@@ -474,10 +517,24 @@ impl CdpBridge {
         self.release_attach_reservation(seq, &pending.kind);
         self.release_detach_reservation(seq, &pending.kind);
         let mut effects = match &pending.kind {
-            PendingKind::Attach { tab_id, respond: _ } => self.abandon_sequence(seq, Some(*tab_id)),
+            PendingKind::Attach { tab_id, respond: _ } => {
+                if matches!(
+                    pending.kind,
+                    PendingKind::Attach {
+                        tab_id: _,
+                        respond: false
+                    }
+                ) {
+                    self.auto_attach_suppressed
+                        .entry(pending.client)
+                        .or_default()
+                        .insert(*tab_id);
+                }
+                self.abandon_sequence(seq, Some(*tab_id), pending.client)
+            }
             PendingKind::Cdp { tab_id: _ } => Vec::new(),
             PendingKind::Detach { tab_id } => {
-                if let Err(reason) = self.promote_detach_to_cleanup(seq, *tab_id) {
+                if let Err(reason) = self.promote_detach_to_cleanup(seq, *tab_id, pending.client) {
                     self.fail_closed_extension(reason)
                 } else {
                     Vec::new()
@@ -506,6 +563,9 @@ impl CdpBridge {
                 }),
             },
         });
+        if matches!(pending.kind, PendingKind::Cdp { tab_id: _ }) {
+            effects.extend(self.schedule_available_auto_attaches()?);
+        }
         Ok(effects)
     }
 
@@ -630,29 +690,13 @@ impl CdpBridge {
                     .unwrap_or(true);
                 if !enabled {
                     self.auto_attach.remove(&connection);
+                    self.auto_attach_suppressed.remove(&connection);
                     return Ok(vec![success_effect(connection, &request, json!({}))]);
                 }
-                let abandoned_tabs = self.abandoned_attach_tabs();
-                let tab_ids = self
-                    .targets
-                    .iter()
-                    .filter_map(|(tab_id, target)| {
-                        (target.session.is_none()
-                            && target.attach_seq.is_none()
-                            && !abandoned_tabs.contains(tab_id))
-                        .then_some(*tab_id)
-                    })
-                    .collect::<Vec<_>>();
-                self.preflight_pending(tab_ids.len())?;
                 self.auto_attach.insert(connection);
+                self.auto_attach_suppressed.remove(&connection);
                 let mut effects = vec![success_effect(connection, &request, json!({}))];
-                for tab_id in tab_ids {
-                    let seq = self.reserve_attach_fields(connection, 0, None, tab_id, false)?;
-                    effects.push(BridgeEffect::ToExtension(ExtensionCommand::Attach {
-                        seq,
-                        tab_id,
-                    }));
-                }
+                effects.extend(self.schedule_available_auto_attaches()?);
                 Ok(effects)
             }
             "Target.getTargets" => Ok(vec![success_effect(
@@ -817,7 +861,7 @@ impl CdpBridge {
         if self.extension.is_none() || !self.extension_hello_seen {
             return Err(BridgeError::ExtensionUnavailable);
         }
-        self.preflight_pending(1)?;
+        self.preflight_pending(client, 1)?;
         let seq = self.next_command;
         self.next_command = self
             .next_command
@@ -850,6 +894,8 @@ impl CdpBridge {
         {
             return Err(BridgeError::TargetAttachmentReserved);
         }
+        self.preflight_pending(client, 1)?;
+        self.preflight_session_lifecycle(client)?;
         let seq = self.reserve_pending_fields(
             client,
             request_id,
@@ -863,23 +909,71 @@ impl CdpBridge {
         Ok(seq)
     }
 
-    fn preflight_pending(&self, additional: usize) -> Result<(), BridgeError> {
-        self.preflight_pending_after_reaping(0, additional)
+    fn preflight_session_lifecycle(&self, client: ConnectionId) -> Result<(), BridgeError> {
+        let (owned, total) = self.session_lifecycle_counts(client)?;
+        if owned >= self.pending_limit || total >= self.global_pending_limit {
+            return Err(BridgeError::SessionLimit);
+        }
+        Ok(())
     }
 
-    fn preflight_pending_after_reaping(
+    fn session_lifecycle_counts(
         &self,
-        reaped: usize,
+        client: ConnectionId,
+    ) -> Result<(usize, usize), BridgeError> {
+        let mut owned = 0_usize;
+        let mut total = 0_usize;
+        let mut add = |is_owned: bool| -> Result<(), BridgeError> {
+            total = total.checked_add(1).ok_or(BridgeError::SessionLimit)?;
+            if is_owned {
+                owned = owned.checked_add(1).ok_or(BridgeError::SessionLimit)?;
+            }
+            Ok(())
+        };
+        for session in self.targets.values().filter_map(|target| target.session) {
+            add(session.owner == client)?;
+        }
+        for pending in self.pending.values().filter(|pending| {
+            matches!(
+                pending.kind,
+                PendingKind::Attach {
+                    tab_id: _,
+                    respond: _
+                }
+            )
+        }) {
+            add(pending.client == client)?;
+        }
+        for abandoned in self.abandoned.values() {
+            add(abandoned.owner == client)?;
+        }
+        for cleanup in self.cleanup_detaches.values() {
+            add(cleanup.owner == client)?;
+        }
+        Ok((owned, total))
+    }
+
+    fn preflight_pending(
+        &self,
+        client: ConnectionId,
         additional: usize,
     ) -> Result<(), BridgeError> {
         let total = self
             .pending
             .len()
-            .checked_sub(reaped)
-            .ok_or(BridgeError::PendingLimit)?
             .checked_add(additional)
             .ok_or(BridgeError::PendingLimit)?;
-        if total > self.pending_limit {
+        if total > self.global_pending_limit {
+            return Err(BridgeError::PendingLimit);
+        }
+        let owned = self
+            .pending
+            .values()
+            .filter(|pending| pending.client == client)
+            .count()
+            .checked_add(additional)
+            .ok_or(BridgeError::PendingLimit)?;
+        if owned > self.pending_limit {
             return Err(BridgeError::PendingLimit);
         }
         let additional = u64::try_from(additional).map_err(|_| BridgeError::SequenceExhausted)?;
@@ -897,27 +991,29 @@ impl CdpBridge {
         if self.cleanup_detaches.contains_key(&seq) {
             if result.is_ok() {
                 self.cleanup_detaches.remove(&seq);
-                return Ok(Vec::new());
+                return self.schedule_available_auto_attaches();
             }
             return Ok(self.fail_closed_extension("Chrome debugger cleanup failed"));
         }
-        if let Some(&tab_id) = self.abandoned.get(&seq) {
-            return match tab_id {
+        if let Some(&abandoned) = self.abandoned.get(&seq) {
+            return match abandoned.tab_id {
                 Some(tab_id)
                     if result.is_ok()
                         && self.extension_hello_seen
                         && self.can_cleanup_abandoned_attach(seq, tab_id) =>
                 {
-                    let effect = match self.schedule_cleanup_detach(tab_id, true) {
+                    self.abandoned.remove(&seq);
+                    let effect = match self.schedule_cleanup_detach(tab_id, abandoned.owner) {
                         Ok(effect) => effect,
                         Err(reason) => return Ok(self.fail_closed_extension(reason)),
                     };
-                    self.abandoned.remove(&seq);
                     Ok(vec![effect])
                 }
                 Some(_) | None => {
                     self.abandoned.remove(&seq);
-                    Ok(Vec::new())
+                    self.schedule_available_auto_attaches_excluding(
+                        abandoned.tab_id.map(|tab_id| (abandoned.owner, tab_id)),
+                    )
                 }
             };
         }
@@ -927,6 +1023,17 @@ impl CdpBridge {
             } else {
                 Err(BridgeError::UnknownCommandSequence)
             };
+        };
+        let auto_attach_exclusion = match &pending.kind {
+            PendingKind::Attach { tab_id, respond: _ } if result.is_err() => {
+                Some(Some((pending.client, *tab_id)))
+            }
+            PendingKind::Cdp { tab_id: _ } => Some(None),
+            PendingKind::Detach { tab_id } => Some(Some((pending.client, *tab_id))),
+            PendingKind::Attach {
+                tab_id: _,
+                respond: _,
+            } => None,
         };
         self.release_attach_reservation(seq, &pending.kind);
         self.release_detach_reservation(seq, &pending.kind);
@@ -939,7 +1046,14 @@ impl CdpBridge {
                 }
             )
         {
-            return Ok(Vec::new());
+            let PendingKind::Attach { tab_id, respond: _ } = pending.kind else {
+                unreachable!("matched auto-attach command");
+            };
+            self.auto_attach_suppressed
+                .entry(pending.client)
+                .or_default()
+                .insert(tab_id);
+            return self.schedule_available_auto_attaches();
         }
         let response = match result {
             Err(message) => CdpResponse {
@@ -975,6 +1089,9 @@ impl CdpBridge {
                         owner: pending.client,
                         attach_seq: seq,
                     });
+                    if let Some(suppressed) = self.auto_attach_suppressed.get_mut(&pending.client) {
+                        suppressed.remove(&tab_id);
+                    }
                     let session_name = session_name(session_id);
                     let mut effects = vec![BridgeEffect::EventToCdp {
                         connection: pending.client,
@@ -999,6 +1116,7 @@ impl CdpBridge {
                             },
                         });
                     }
+                    effects.extend(self.schedule_available_auto_attaches()?);
                     return Ok(effects);
                 }
                 PendingKind::Cdp { tab_id: _ } => CdpResponse {
@@ -1021,13 +1139,18 @@ impl CdpBridge {
                 }
             },
         };
-        Ok(vec![BridgeEffect::ToCdp {
+        let mut effects = vec![BridgeEffect::ToCdp {
             connection: pending.client,
             response,
-        }])
+        }];
+        if let Some(excluded_tab) = auto_attach_exclusion {
+            effects.extend(self.schedule_available_auto_attaches_excluding(excluded_tab)?);
+        }
+        Ok(effects)
     }
 
     fn sync_tabs(&mut self, tabs: Vec<RelayTab>) -> Result<Vec<BridgeEffect>, BridgeError> {
+        self.auto_attach_suppressed.clear();
         let incoming = tabs.iter().map(|tab| tab.tab_id).collect::<BTreeSet<_>>();
         let removed = self
             .targets
@@ -1035,23 +1158,6 @@ impl CdpBridge {
             .filter(|tab_id| !incoming.contains(tab_id))
             .copied()
             .collect::<Vec<_>>();
-        let new_tab_ids = tabs
-            .iter()
-            .filter_map(|tab| {
-                (!self.targets.contains_key(&tab.tab_id) && !self.has_abandoned_attach(tab.tab_id))
-                    .then_some(tab.tab_id)
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if self.auto_attach.first().is_some() {
-            let reaped = self
-                .pending
-                .values()
-                .filter(|pending| removed.contains(&pending_tab_id(&pending.kind)))
-                .count();
-            self.preflight_pending_after_reaping(reaped, new_tab_ids.len())?;
-        }
         let mut effects = Vec::new();
         for tab_id in removed {
             self.clear_quarantine_for_tab(tab_id);
@@ -1074,8 +1180,52 @@ impl CdpBridge {
                     session: None,
                 });
         }
-        if let Some(connection) = self.auto_attach.first().copied() {
-            for tab_id in new_tab_ids {
+        effects.extend(self.schedule_available_auto_attaches()?);
+        Ok(effects)
+    }
+
+    fn schedule_available_auto_attaches(&mut self) -> Result<Vec<BridgeEffect>, BridgeError> {
+        self.schedule_available_auto_attaches_excluding(None)
+    }
+
+    fn schedule_available_auto_attaches_excluding(
+        &mut self,
+        excluded: Option<(ConnectionId, u64)>,
+    ) -> Result<Vec<BridgeEffect>, BridgeError> {
+        let abandoned_tabs = self.abandoned_attach_tabs();
+        let connections = self.auto_attach.iter().copied().collect::<Vec<_>>();
+        let mut effects = Vec::new();
+        for connection in connections {
+            let pending_available = self
+                .global_pending_limit
+                .saturating_sub(self.pending.len())
+                .min(
+                    self.pending_limit.saturating_sub(
+                        self.pending
+                            .values()
+                            .filter(|pending| pending.client == connection)
+                            .count(),
+                    ),
+                );
+            let (owned_lifecycle, total_lifecycle) = self.session_lifecycle_counts(connection)?;
+            let available = pending_available
+                .min(self.pending_limit.saturating_sub(owned_lifecycle))
+                .min(self.global_pending_limit.saturating_sub(total_lifecycle));
+            let suppressed_tabs = self.auto_attach_suppressed.get(&connection);
+            let tab_ids = self
+                .targets
+                .iter()
+                .filter_map(|(tab_id, target)| {
+                    (target.session.is_none()
+                        && target.attach_seq.is_none()
+                        && excluded != Some((connection, *tab_id))
+                        && suppressed_tabs.is_none_or(|suppressed| !suppressed.contains(tab_id))
+                        && !abandoned_tabs.contains(tab_id))
+                    .then_some(*tab_id)
+                })
+                .take(available)
+                .collect::<Vec<_>>();
+            for tab_id in tab_ids {
                 let seq = self.reserve_attach_fields(connection, 0, None, tab_id, false)?;
                 effects.push(BridgeEffect::ToExtension(ExtensionCommand::Attach {
                     seq,
@@ -1135,37 +1285,41 @@ impl CdpBridge {
         effects
     }
 
-    fn abandon_sequence(&mut self, seq: u64, attached_tab: Option<u64>) -> Vec<BridgeEffect> {
-        let Some(quarantine_count) = self
-            .abandoned
-            .len()
-            .checked_add(self.cleanup_detaches.len())
-        else {
-            return self.fail_closed_extension("relay cleanup quarantine count overflowed");
-        };
-        if quarantine_count >= self.pending_limit {
+    fn abandon_sequence(
+        &mut self,
+        seq: u64,
+        attached_tab: Option<u64>,
+        owner: ConnectionId,
+    ) -> Vec<BridgeEffect> {
+        if self.ensure_cleanup_capacity(owner).is_err() {
             return self.fail_closed_extension("relay cleanup quarantine limit reached");
         }
-        self.abandoned.insert(seq, attached_tab);
+        self.abandoned.insert(
+            seq,
+            AbandonedCommand {
+                tab_id: attached_tab,
+                owner,
+            },
+        );
         Vec::new()
     }
 
     fn abandoned_attach_tabs(&self) -> BTreeSet<u64> {
         self.abandoned
             .values()
-            .filter_map(|tab_id| *tab_id)
-            .chain(self.cleanup_detaches.values().copied())
+            .filter_map(|abandoned| abandoned.tab_id)
+            .chain(self.cleanup_detaches.values().map(|cleanup| cleanup.tab_id))
             .collect()
     }
 
     fn has_abandoned_attach(&self, tab_id: u64) -> bool {
         self.abandoned
             .values()
-            .any(|abandoned_tab| *abandoned_tab == Some(tab_id))
+            .any(|abandoned| abandoned.tab_id == Some(tab_id))
             || self
                 .cleanup_detaches
                 .values()
-                .any(|cleanup_tab| *cleanup_tab == tab_id)
+                .any(|cleanup| cleanup.tab_id == tab_id)
     }
 
     fn can_cleanup_abandoned_attach(&self, seq: u64, tab_id: u64) -> bool {
@@ -1181,9 +1335,9 @@ impl CdpBridge {
 
     fn clear_quarantine_for_tab(&mut self, tab_id: u64) {
         self.abandoned
-            .retain(|_, abandoned_tab| *abandoned_tab != Some(tab_id));
+            .retain(|_, abandoned| abandoned.tab_id != Some(tab_id));
         self.cleanup_detaches
-            .retain(|_, cleanup_tab| *cleanup_tab != tab_id);
+            .retain(|_, cleanup| cleanup.tab_id != tab_id);
     }
 
     fn release_attach_reservation(&mut self, seq: u64, kind: &PendingKind) {
@@ -1211,45 +1365,66 @@ impl CdpBridge {
     fn schedule_cleanup_detach(
         &mut self,
         tab_id: u64,
-        replaces_quarantine: bool,
+        owner: ConnectionId,
     ) -> Result<BridgeEffect, &'static str> {
-        self.ensure_cleanup_capacity(replaces_quarantine)?;
+        self.ensure_cleanup_capacity(owner)?;
         let seq = self.next_command;
         self.next_command = self
             .next_command
             .checked_add(1)
             .ok_or("relay cleanup sequence exhausted")?;
-        self.cleanup_detaches.insert(seq, tab_id);
+        self.cleanup_detaches
+            .insert(seq, CleanupDetach { tab_id, owner });
         Ok(BridgeEffect::ToExtension(ExtensionCommand::Detach {
             seq,
             tab_id,
         }))
     }
 
-    fn promote_detach_to_cleanup(&mut self, seq: u64, tab_id: u64) -> Result<(), &'static str> {
-        self.ensure_cleanup_capacity(false)?;
-        self.cleanup_detaches.insert(seq, tab_id);
+    fn promote_detach_to_cleanup(
+        &mut self,
+        seq: u64,
+        tab_id: u64,
+        owner: ConnectionId,
+    ) -> Result<(), &'static str> {
         self.remove_child_sessions_for_tab(tab_id);
         if let Some(target) = self.targets.get_mut(&tab_id) {
             target.session = None;
         }
+        self.ensure_cleanup_capacity(owner)?;
+        self.cleanup_detaches
+            .insert(seq, CleanupDetach { tab_id, owner });
         Ok(())
     }
 
-    fn ensure_cleanup_capacity(&self, replaces_quarantine: bool) -> Result<(), &'static str> {
+    fn ensure_cleanup_capacity(&self, owner: ConnectionId) -> Result<(), &'static str> {
         let quarantine_count = self
             .abandoned
             .len()
             .checked_add(self.cleanup_detaches.len())
             .ok_or("relay cleanup quarantine count overflowed")?;
-        let required_count = if replaces_quarantine {
-            quarantine_count
-        } else {
-            quarantine_count
-                .checked_add(1)
-                .ok_or("relay cleanup quarantine count overflowed")?
-        };
-        if required_count > self.pending_limit {
+        let required_count = quarantine_count
+            .checked_add(1)
+            .ok_or("relay cleanup quarantine count overflowed")?;
+        if required_count > self.global_pending_limit {
+            return Err("relay cleanup quarantine limit reached");
+        }
+        let owner_count = self
+            .abandoned
+            .values()
+            .filter(|abandoned| abandoned.owner == owner)
+            .count()
+            .checked_add(
+                self.cleanup_detaches
+                    .values()
+                    .filter(|cleanup| cleanup.owner == owner)
+                    .count(),
+            )
+            .ok_or("relay cleanup quarantine count overflowed")?;
+        let owner_required = owner_count
+            .checked_add(1)
+            .ok_or("relay cleanup quarantine count overflowed")?;
+        if owner_required > self.pending_limit {
             return Err("relay cleanup quarantine limit reached");
         }
         Ok(())
@@ -1298,12 +1473,21 @@ impl CdpBridge {
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .ok_or(BridgeError::InvalidChildSessionId)?;
-            self.register_child_session(
+            if let Err(error) = self.register_child_session(
                 announced_session_id,
                 tab_id,
                 session,
                 child_session_id.clone(),
-            )?;
+            ) {
+                if error == BridgeError::ChildSessionLimit {
+                    return Ok(vec![BridgeEffect::CloseCdp {
+                        connection: session.owner,
+                        code: 1013,
+                        reason: "relay child session limit reached",
+                    }]);
+                }
+                return Err(error);
+            }
         } else if method == "Target.detachedFromTarget" {
             let detached_session_id = params
                 .get("sessionId")
@@ -1351,8 +1535,13 @@ impl CdpBridge {
                 Err(BridgeError::ChildSessionCollision)
             };
         }
-        if self.child_sessions.len() >= self.pending_limit {
-            return Ok(());
+        let owned = self
+            .child_sessions
+            .values()
+            .filter(|child| child.owner == root.owner)
+            .count();
+        if owned >= self.pending_limit || self.child_sessions.len() >= self.global_pending_limit {
+            return Err(BridgeError::ChildSessionLimit);
         }
         self.child_sessions
             .insert(child_session_id.to_owned(), state);
@@ -1484,14 +1673,6 @@ fn browser_session_name(id: u64) -> String {
     format!("gta-claw-browser-{id}")
 }
 
-fn pending_tab_id(kind: &PendingKind) -> u64 {
-    match kind {
-        PendingKind::Attach { tab_id, respond: _ }
-        | PendingKind::Cdp { tab_id }
-        | PendingKind::Detach { tab_id } => *tab_id,
-    }
-}
-
 fn target_info(target: &TargetState) -> TargetInfo {
     TargetInfo {
         target_id: target.target_id.clone(),
@@ -1617,6 +1798,8 @@ pub enum BridgeError {
     InvalidPendingLimit,
     /// Connection was attached twice.
     DuplicateConnection,
+    /// The bridge's bounded CDP client partitions are all assigned.
+    CdpConnectionLimit,
     /// Frame did not come from the active extension.
     UnknownExtensionConnection,
     /// Extension's first frame must be hello.
@@ -1633,6 +1816,8 @@ pub enum BridgeError {
     SequenceExhausted,
     /// In-flight extension command bound was reached.
     PendingLimit,
+    /// One client's bounded root-session lifecycle partition was exhausted.
+    SessionLimit,
     /// Extension response sequence was not pending.
     UnknownCommandSequence,
     /// Target vanished while an extension command was in flight.
@@ -1645,6 +1830,8 @@ pub enum BridgeError {
     TabNotAttached,
     /// Extension referenced a child session outside the target's current root session.
     ChildSessionNotFound,
+    /// One client's bounded child-session partition was exhausted.
+    ChildSessionLimit,
     /// Extension announced an empty or relay-reserved child session identifier.
     InvalidChildSessionId,
     /// Extension reused a child session identifier for a different root session.
@@ -1656,6 +1843,7 @@ impl Display for BridgeError {
         formatter.write_str(match self {
             Self::InvalidPendingLimit => "pending command limit must be positive",
             Self::DuplicateConnection => "relay connection is already attached",
+            Self::CdpConnectionLimit => "relay CDP connection limit reached",
             Self::UnknownExtensionConnection => "unknown extension connection",
             Self::HelloRequired => "extension hello is required as the first frame",
             Self::DuplicateHello => "extension hello was already received",
@@ -1664,12 +1852,14 @@ impl Display for BridgeError {
             Self::TargetAttachmentReserved => "target attachment is already reserved",
             Self::SequenceExhausted => "relay sequence exhausted",
             Self::PendingLimit => "relay pending command limit reached",
+            Self::SessionLimit => "relay root session limit reached for this CDP connection",
             Self::UnknownCommandSequence => "unknown extension command sequence",
             Self::TargetDiedDuringCommand => "target died while command was in flight",
             Self::ExtensionEventNotAllowed => "extension CDP event is not allowed",
             Self::UnknownTab => "extension referenced an unknown tab",
             Self::TabNotAttached => "extension referenced an unattached tab",
             Self::ChildSessionNotFound => "extension referenced an unknown child session",
+            Self::ChildSessionLimit => "relay child session limit reached for this CDP connection",
             Self::InvalidChildSessionId => "extension sent an invalid child session identifier",
             Self::ChildSessionCollision => "extension reused a child session identifier",
         })
