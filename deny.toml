@@ -5,7 +5,7 @@ all-features = true
 ignore = []
 
 [licenses]
-allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+allow = ["Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.8
 
 [bans]
@@ -17,6 +17,31 @@ highlight = "all"
 [[bans.skip]]
 name = "rand_core"
 version = "=0.6.4"
+
+# fastwebsockets 0.10 retains getrandom 0.2 while russh and hickory-resolver use 0.4.
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+
+# fastwebsockets 0.10 retains rand 0.8 while russh and hickory-resolver use 0.10.
+[[bans.skip]]
+name = "rand"
+version = "=0.8.7"
+
+# Apple-target dependencies straddle the core-foundation 0.9 and 0.10 lines.
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+
+# Build dependencies straddle syn 2 and syn 3; syn is not linked into the runtime.
+[[bans.skip]]
+name = "syn"
+version = "=3.0.3"
+
+# russh 0.62 contains sha3 0.11 in its SSH subtree while the graph also uses 0.12.
+[[bans.skip]]
+name = "sha3"
+version = "=0.11.0"
 
 [[bans.skip]]
 name = "windows-sys"

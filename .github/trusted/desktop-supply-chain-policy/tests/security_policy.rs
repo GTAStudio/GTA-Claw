@@ -10,7 +10,7 @@ use std::time::Duration;
 use desktop_supply_chain_policy::changes::{
     ChangeManifest, ChangedPath, MAX_GIT_PACK_FILES, MAX_PULL_REQUEST_COMMITS, compute_manifest,
     has_policy_relevant_change, is_policy_relevant, read_manifest,
-    validate_pull_request_commit_count, write_manifest,
+    validate_pull_request_commit_count, validate_tree_entries, write_manifest,
 };
 use desktop_supply_chain_policy::identity::canonical_caseless;
 use desktop_supply_chain_policy::input::{SafeRoot, compare_trees, sha256};
@@ -27,6 +27,7 @@ use desktop_supply_chain_policy::policy::{
     validate_casefold_paths, validate_final_static, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
+use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
 use desktop_supply_chain_policy::validation::{
     BaseState, ValidationRequest, candidate_requires_final, validate_request,
 };
@@ -416,13 +417,13 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "1419ffd6b5eba450fe1971895ee7f8ce390706bd01b57d4e8bfbf57987fd41c7",
     "8cdb8b459b89f41ac4a34f8ae604f6ed21f8bb457c257c6076fe806df4f65efe",
     "774426b359f177abf4fa535d352bc172233e1c65d715ef29659459f7bb82dc1d",
-    "f4775eb50cf55c650c2728ecd8df5ecdb1416594a8040e842170f5e2955644ec",
-    "7e484191a722d535eb1999415ae4501800d68886a4239ce698414e3be671c026",
-    "ef8cdaff12a8668db1d6baa3bc6de9fe9ea21ba5155d489da461bd164beeaf3e",
-    "fa8679ae53080ddeac28d06766a7c477f804bf97ddbd78229322375ac5ba4f61",
-    "14d751183327dde77c2c7562160cc86cf13791d8812f5864da879965dc89a3cb",
-    "be91c8b6cf649072ffb4288b1d2c108ed5483224b1010a63484853e955160b00",
-    "ec1672f8007f5e9c21c2199fd034b6bf8d2fc922d6c227af9086af58b383691d",
+    "9d78edc9a17824bfd4cd489bbed5af52f2b8c87a53bcac0e3722afa1fc1b48c2",
+    "0d7c8789ebddd4e3d4ad204e769aace4d6e37c587333e3b4db32f0904e5e5b7a",
+    "b2b277e556c2fe0329c008f6d6a3bef9a91e8303ae9983b77a5b39c23825f941",
+    "8ea60763c2cc7b09fbe3bc2a2805fdd7c2fd999f6e4f9b6ba968fd27dcd56968",
+    "319e37b49c49ca1968a2d30a4f22d1a3e108045391d0ba7acb8f6b5b8f452d29",
+    "2035257e3908a0fb05632f71268e1fac9f6c5cb1c24169fcbb4561020f8f237f",
+    "ee45dd9d1f8d74a76c7f82b84eeb36d31441e7e8114f5fc9730a475324fed309",
     "dbbf5e53488e8977958a95ab58e03ba89ee9da7503ffe0e58dd946946afb8179",
     "bb2febc949e862a6e5c0904f4041b19853e7bde3f06f17627f4c828519b856d7",
     "781a04de8ae53429a22b602b303fe9f870def0c545f7a056c7ea322677984409",
@@ -442,8 +443,8 @@ const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
 const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
     "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
-const P03B_ROOT_DENY_SHA256: &str =
-    "f5c7a2a654d35d14aa4b7a277f457c67d85e4364f30fefa858a0bb3d489aa065";
+const FINAL_ROOT_DENY_SHA256: &str =
+    "57f6b07a72e9ef2fe90a14f1d4262b73221429ecac49b82e37d4925558343ce3";
 const SUPERSEDED_ROOT_DENY_SHA256: &str =
     "a822bdccf7d6e235f03fdadbc6d43e381f7219d02abad80d8253c10c7e1529db";
 const P03B_SQLITE_FILE_CONTROL_MANIFEST: &str = r#"[package]
@@ -751,6 +752,132 @@ fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
         "\n[[package]]\nname = \"{package_name}\"\nversion = \"0.1.0\"\n"
     ));
     fs::write(tree.join("Cargo.lock"), lock).expect("write synthetic member lock entry");
+}
+
+const REPOSITORY_POLICY_MANIFEST: &str = r#"[package]
+name = "claw-repo-policy"
+description = "Repository-wide architecture policy gates for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+"#;
+
+const REPOSITORY_POLICY_TEST_FIXTURE: &str = r#"const FORBIDDEN_FILE_NAMES: &[&str] = &[
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.json",
+    "deno.jsonc",
+];
+const FORBIDDEN_DIRECTORY_NAMES: &[&str] = &["node_modules", ".yarn", ".pnpm-store"];
+const FORBIDDEN_EXTENSIONS: &[&str] =
+    &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "node"];
+const FORBIDDEN_WORKFLOW_COMMANDS: &[&str] = &[
+    "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "corepack",
+];
+const LEGACY_RUNTIME_INVENTORY: &[&str] = &[
+    "Dockerfile",
+    "package-lock.json",
+    "package.json",
+    "src/auth/deviceFlow.ts",
+    "src/bot/teamsBot.ts",
+    "src/channels/discordGateway.ts",
+    "src/channels/messageProcessor.ts",
+    "src/channels/telegramPolling.ts",
+    "src/channels/whatsappWebhook.ts",
+    "src/config.ts",
+    "src/engine/copilotEngine.ts",
+    "src/engine/sessionManager.ts",
+    "src/engine/toolExecutor.ts",
+    "src/index.ts",
+    "src/loader/roleLoader.ts",
+    "src/loader/skillLoader.ts",
+    "src/server.ts",
+    "src/updater/sdkUpdater.ts",
+    "src/utils/logger.ts",
+    "src/utils/proxy.ts",
+    "src/utils/splitMessage.ts",
+    "tsconfig.json",
+];
+const ALLOWED_ADVERSARIAL_SHELL_FIXTURES: &[&str] =
+    &[".github/fixtures/security-tools/bash-env-poison.sh"];
+const ALLOWED_COMPAT_FIXTURES: &[&str] = &[];
+
+#[test]
+fn repository_legacy_javascript_surface_does_not_grow() {}
+
+#[test]
+fn new_typescript_path_outside_legacy_inventory_is_rejected() {
+    fixture.write("src/newFeature.ts", b"new");
+    assert_eq!(violations, ["src/newFeature.ts"]);
+}
+
+#[test]
+fn removing_allowlisted_legacy_entry_keeps_ratchet_green() {
+    fs::remove_file(fixture.path().join("src/index.ts")).unwrap();
+}
+
+#[test]
+fn workflow_commands_are_checked_without_rejecting_inert_search_patterns() {}
+
+#[test]
+fn tracked_symlink_and_gitlink_modes_are_rejected() {
+    let _ = b"120000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let _ = b"160000 cccccccccccccccccccccccccccccccccccccccc";
+}
+"#;
+
+const ACTIVE_REPOSITORY_POLICY_WORKFLOW: &str = r#"name: pinned upstream Gateway reference
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    name: Repository policy
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout GTA Claw
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Reject JavaScript toolchain artifacts
+        run: cargo test --locked --package claw-repo-policy --test repository_policy
+"#;
+
+fn activate_repository_policy(tree: &TempTree) {
+    add_root_member(tree, "crates/claw-repo-policy", REPOSITORY_POLICY_MANIFEST);
+    fs::write(
+        tree.join("crates/claw-repo-policy/src/lib.rs"),
+        "//! Repository-wide architecture policy gates for GTA Claw.\n",
+    )
+    .expect("write repository policy library");
+    fs::create_dir_all(tree.join("crates/claw-repo-policy/tests"))
+        .expect("create repository policy tests");
+    fs::write(
+        tree.join("crates/claw-repo-policy/tests/repository_policy.rs"),
+        REPOSITORY_POLICY_TEST_FIXTURE,
+    )
+    .expect("write repository policy test fixture");
+    fs::write(
+        tree.join(".github/workflows/upstream-gateway-reference.yml"),
+        ACTIVE_REPOSITORY_POLICY_WORKFLOW,
+    )
+    .expect("write active repository policy workflow");
 }
 
 fn write_release_workspace(
@@ -1666,14 +1793,16 @@ fn final_dependency_fixture_writer_is_canonical() {
 }
 
 #[test]
-fn final_root_deny_accepts_only_the_reviewed_p03b_bytes() {
-    let canonical = final_tree("p03b-root-deny");
+fn final_root_deny_accepts_only_the_reviewed_bytes() {
+    let canonical = final_tree("reviewed-root-deny");
     let canonical_text = fs::read_to_string(canonical.join("deny.toml"))
         .expect("read canonical root deny")
         .replace("\r\n", "\n");
-    assert_eq!(sha256(canonical_text.as_bytes()), P03B_ROOT_DENY_SHA256);
-    validate_final_static(&SafeRoot::new(&canonical.path).expect("open P03b root deny fixture"))
-        .expect("accept exact reviewed P03b root deny");
+    assert_eq!(sha256(canonical_text.as_bytes()), FINAL_ROOT_DENY_SHA256);
+    validate_final_static(
+        &SafeRoot::new(&canonical.path).expect("open reviewed root deny fixture"),
+    )
+    .expect("accept exact reviewed root deny");
 
     let bootstrap = bootstrap_tree("superseded-root-deny-source");
     let superseded_text = fs::read_to_string(bootstrap.join("deny.toml"))
@@ -2544,16 +2673,19 @@ fn release_metadata_version_is_format_independent_and_requires_agreement() {
 #[test]
 fn compliant_declared_root_member_and_lock_evolution_pass() {
     let tree = final_tree("root-growth");
-    replace(
-        &tree.join("Cargo.toml"),
-        "  \"crates/claw-gateway-client\",\n",
-        "  \"crates/claw-gateway-client\",\n  \"crates/claw-new\",\n",
-    );
-    let manifest = tree.join("crates/claw-new/Cargo.toml");
-    fs::create_dir_all(manifest.parent().expect("new member parent")).expect("create new member");
-    fs::write(
-        &manifest,
-        r#"[package]
+    let migrate_manifest = r#"[package]
+name = "claw-migrate"
+description = "Compliant future root crate in the h through n range"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+"#;
+    let new_manifest = r#"[package]
 name = "claw-new"
 description = "Compliant future root crate"
 version.workspace = true
@@ -2564,23 +2696,20 @@ repository.workspace = true
 
 [lints]
 workspace = true
-"#,
-    )
-    .expect("write new member manifest");
-    fs::create_dir_all(tree.join("crates/claw-new/src")).expect("create new member source");
-    fs::write(tree.join("crates/claw-new/src/lib.rs"), "").expect("write new member source");
-    let mut lock = fs::read_to_string(tree.join("Cargo.lock")).expect("read root lock");
-    lock.push_str(
-        r#"
-[[package]]
-name = "claw-new"
-version = "0.1.0"
-"#,
-    );
-    fs::write(tree.join("Cargo.lock"), lock).expect("write evolved root lock");
+"#;
+    add_root_member(&tree, "crates/claw-migrate", migrate_manifest);
+    add_root_member(&tree, "crates/claw-new", new_manifest);
 
     let root = SafeRoot::new(&tree.path).expect("open evolved fixture");
     let workspace = validate_final_static(&root).expect("accept compliant root growth");
+    assert_eq!(
+        workspace
+            .members
+            .get("crates/claw-migrate")
+            .map(String::as_str),
+        Some("claw-migrate"),
+        "a pre-existing h through n member must not invalidate ordinal insertion"
+    );
     assert_eq!(
         workspace.members.get("crates/claw-new").map(String::as_str),
         Some("claw-new")
@@ -2588,6 +2717,108 @@ version = "0.1.0"
     let isolation = TempTree::new("root-growth-metadata");
     validate_root_metadata(&root, &workspace, &local_metadata_tools(), &isolation.path)
         .expect("Cargo accepts compliant declared root member and lock evolution");
+}
+
+#[test]
+fn git_tree_inventory_rejects_symlinks_and_gitlinks() {
+    let regular = b"100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tREADME.md\0\
+100755 blob bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tdeploy/run.sh\0";
+    validate_tree_entries(regular, "fixture").expect("accept regular tracked files");
+
+    for (mode, kind, expected) in [
+        ("120000", "blob", "tracked symbolic link"),
+        ("160000", "commit", "tracked gitlink"),
+    ] {
+        let fixture =
+            format!("{mode} {kind} cccccccccccccccccccccccccccccccccccccccc\tvendor/runtime\0");
+        let error = validate_tree_entries(fixture.as_bytes(), "fixture")
+            .expect_err("tracked indirection unexpectedly passed")
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "tracked mode failed through the wrong rule: {error}"
+        );
+    }
+}
+
+#[test]
+fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
+    let trusted = final_tree("repository-ratchet-base");
+    let candidate = final_tree("repository-ratchet-candidate");
+    fs::write(candidate.join("src/newFeature.ts"), "new legacy feature")
+        .expect("plant TypeScript addition");
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open ratchet base");
+    let candidate_root = SafeRoot::new(&candidate.path).expect("open ratchet candidate");
+    let error = validate_repository_policy_transition(&trusted_root, &candidate_root)
+        .expect_err("new TypeScript artifact unexpectedly passed")
+        .to_string();
+    assert!(
+        error.contains("outside the exact ceiling"),
+        "new TypeScript artifact failed through the wrong rule: {error}"
+    );
+
+    fs::remove_file(candidate.join("src/newFeature.ts")).expect("remove planted addition");
+    fs::remove_file(candidate.join("src/utils/proxy.ts"))
+        .expect("remove one grandfathered TypeScript file");
+    validate_repository_policy_transition(&trusted_root, &candidate_root)
+        .expect("deleting a grandfathered artifact must keep the ratchet green");
+
+    let reduced_base = final_tree("repository-ratchet-reduced-base");
+    fs::remove_file(reduced_base.join("src/utils/proxy.ts"))
+        .expect("remove grandfathered artifact from protected-base fixture");
+    let reintroduced_candidate = final_tree("repository-ratchet-reintroduced-candidate");
+    let error = validate_repository_policy_transition(
+        &SafeRoot::new(&reduced_base.path).expect("open reduced protected base"),
+        &SafeRoot::new(&reintroduced_candidate.path).expect("open reintroduced candidate"),
+    )
+    .expect_err("reintroduced grandfathered artifact unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("reintroduced or added legacy Node artifacts"),
+        "reintroduced artifact failed through the wrong rule: {error}"
+    );
+}
+
+#[test]
+fn base_owned_repository_ratchet_rejects_new_node_workflow_debt() {
+    let trusted = final_tree("repository-workflow-ratchet-base");
+    let candidate = final_tree("repository-workflow-ratchet-candidate");
+    fs::write(
+        candidate.join(".github/workflows/new-node.yml"),
+        "name: forbidden\non: workflow_dispatch\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci\n",
+    )
+    .expect("plant Node workflow addition");
+    let error = validate_repository_policy_transition(
+        &SafeRoot::new(&trusted.path).expect("open workflow ratchet base"),
+        &SafeRoot::new(&candidate.path).expect("open workflow ratchet candidate"),
+    )
+    .expect_err("new Node workflow debt unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("introduced new Node workflow/action violations"),
+        "workflow addition failed through the wrong rule: {error}"
+    );
+}
+
+#[test]
+fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
+    let trusted = final_tree("repository-policy-inactive-base");
+    let candidate = final_tree("repository-policy-active-candidate");
+    activate_repository_policy(&candidate);
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open inactive policy base");
+    let candidate_root = SafeRoot::new(&candidate.path).expect("open active policy candidate");
+    validate_repository_policy_transition(&trusted_root, &candidate_root)
+        .expect("accept the exact first repository-policy activation");
+
+    fs::remove_file(candidate.join("crates/claw-repo-policy/tests/repository_policy.rs"))
+        .expect("remove required policy self-tests");
+    let error = validate_repository_policy_transition(&trusted_root, &candidate_root)
+        .expect_err("repository policy without self-tests unexpectedly passed")
+        .to_string();
+    assert!(
+        error.contains("claw-repo-policy file inventory changed"),
+        "missing self-tests failed through the wrong rule: {error}"
+    );
 }
 
 #[test]

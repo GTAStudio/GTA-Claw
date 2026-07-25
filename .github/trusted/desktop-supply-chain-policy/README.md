@@ -93,9 +93,27 @@ native-FFI lint table (`missing_docs = "warn"`, `unsafe_code = "allow"`,
 `clippy.all = "warn"`). Aliases, sibling paths, additional lint keys, and any level drift
 fail closed.
 
-The Final root `deny.toml` is the exact reviewed P03b policy. It permits only the
-version-pinned duplicate skips recorded there; the former root deny bytes, wildcard or
-versionless skips, source widening, advisory exceptions, and any other drift are rejected.
+The Final root `deny.toml` is the exact reviewed policy. Its license allow-list adds only
+`Apache-2.0 WITH LLVM-exception` to the former P03b set; the LLVM exception is more permissive
+than plain Apache-2.0 and is required by the Wasmtime/Cranelift plugin-host dependency graph.
+The policy permits only the version-pinned duplicate skips recorded there; wildcard or
+versionless skips, source widening, advisory exceptions, graph target filtering, and any other
+drift are rejected.
+
+## Legacy Node shrink-only ratchet
+
+For every Final protected base, the validator independently inventories both trees. The
+candidate legacy surface must be a subset of the base surface, and both must remain within the
+exact historical ceiling of 18 `src/**/*.ts` files plus `Dockerfile`, `package.json`,
+`package-lock.json`, and `tsconfig.json`. Deletion passes; a deleted artifact can never return.
+Tracked symbolic links, gitlinks, new package-manager artifacts, and new Node workflow or local
+action debt fail from the base side.
+
+`crates/claw-repo-policy` is transitionally absent until its accepted product-policy pull request
+lands. Its first appearance must have the exact dependency-free workspace shape, explicit
+ceiling, fixture exceptions, add-fails/delete-passes tests, workflow/action and index tests, and
+both CI execution paths. Once it exists in a protected base, removing or weakening that shape is
+forbidden. Activation also requires zero remaining Node workflow/action violations.
 
 ## Trust-root updates
 
