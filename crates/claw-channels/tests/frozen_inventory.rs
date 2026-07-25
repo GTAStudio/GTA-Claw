@@ -1,11 +1,20 @@
 //! Frozen official channel inventory parity.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use claw_channels::{AuthMode, ChannelCapability, ImplementationStatus, registry};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 struct Inventory {
+    counts: InventoryCounts,
     items: Vec<InventoryItem>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct InventoryCounts {
+    total: usize,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
@@ -21,11 +30,16 @@ struct InventoryItem {
     catalog_source_path: Option<String>,
 }
 
+fn frozen_inventory() -> Inventory {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../compat/upstream/inventories/channels.json");
+    let json = std::fs::read_to_string(path).expect("read frozen inventory");
+    serde_json::from_str(json.trim_start_matches('\u{feff}')).expect("valid frozen inventory")
+}
+
 #[test]
 fn registry_matches_every_frozen_identity_and_provenance_field() {
-    let json = include_str!("../../../compat/upstream/inventories/channels.json")
-        .trim_start_matches('\u{feff}');
-    let frozen: Inventory = serde_json::from_str(json).expect("valid frozen inventory");
+    let frozen = frozen_inventory();
     let actual = registry()
         .iter()
         .map(|entry| InventoryItem {
@@ -41,7 +55,9 @@ fn registry_matches_every_frozen_identity_and_provenance_field() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(frozen.items.len(), 29);
+    assert_eq!(frozen.counts.total, 29);
+    assert_eq!(frozen.items.len(), frozen.counts.total);
+    assert_eq!(actual.len(), frozen.counts.total);
     assert_eq!(actual, frozen.items);
 }
 
@@ -52,7 +68,6 @@ fn executable_capabilities_are_never_claimed_by_registration_only_entries() {
         .filter(|entry| entry.implementation == ImplementationStatus::RegistrationOnly)
         .map(|entry| (entry.id, entry.capabilities))
         .collect::<Vec<_>>();
-    assert_eq!(registration_only.len(), 24);
     assert!(
         registration_only
             .iter()
@@ -75,14 +90,18 @@ fn executable_capabilities_are_never_claimed_by_registration_only_entries() {
 }
 
 #[test]
-fn registry_auth_modes_match_frozen_plugin_configuration_contracts() {
+fn declared_auth_policy_covers_frozen_channel_ids_exactly() {
+    // Authentication is crate-owned policy: the frozen inventory has no auth
+    // fields. Keeping this table independent makes policy changes deliberate,
+    // while exact ID-set equality prevents upstream additions or removals from
+    // silently escaping review.
     let expected = [
-        ("mattermost", vec![AuthMode::BotToken]),
+        ("mattermost", vec![AuthMode::WebhookUrl]),
         ("msteams", vec![AuthMode::AppCredentials]),
         ("feishu", vec![AuthMode::AppCredentials]),
         ("sms", vec![AuthMode::AppCredentials]),
         ("openclaw-weixin", vec![AuthMode::ExternalPlugin]),
-        ("googlechat", vec![AuthMode::ServiceAccount]),
+        ("googlechat", vec![AuthMode::WebhookUrl]),
         ("clickclack", vec![AuthMode::BotToken]),
         ("line", vec![AuthMode::AccessToken, AuthMode::WebhookSecret]),
         ("zalouser", vec![AuthMode::PlatformSession]),
@@ -97,8 +116,8 @@ fn registry_auth_modes_match_frozen_plugin_configuration_contracts() {
             "nextcloud-talk",
             vec![AuthMode::BotToken, AuthMode::Password],
         ),
-        ("slack", vec![AuthMode::BotToken]),
-        ("discord", vec![AuthMode::BotToken]),
+        ("slack", vec![AuthMode::WebhookUrl]),
+        ("discord", vec![AuthMode::WebhookUrl]),
         ("twitch", vec![AuthMode::OAuth2]),
         ("openclaw-zaloclawbot", vec![AuthMode::ExternalPlugin]),
         (
@@ -117,5 +136,16 @@ fn registry_auth_modes_match_frozen_plugin_configuration_contracts() {
         .iter()
         .map(|entry| (entry.id, entry.auth_modes.to_vec()))
         .collect::<Vec<_>>();
+    let frozen_ids = frozen_inventory()
+        .items
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect::<BTreeSet<_>>();
+    let expected_ids = expected
+        .iter()
+        .map(|(id, _)| (*id).to_owned())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(expected_ids, frozen_ids);
     assert_eq!(actual, expected);
 }

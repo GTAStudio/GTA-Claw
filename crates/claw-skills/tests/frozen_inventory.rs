@@ -1,11 +1,19 @@
 //! Frozen bundled-skill inventory parity.
 
+use std::path::Path;
+
 use claw_skills::{SkillImplementation, registry};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 struct Inventory {
+    counts: InventoryCounts,
     items: Vec<InventoryItem>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct InventoryCounts {
+    total: usize,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
@@ -17,11 +25,16 @@ struct InventoryItem {
     license: String,
 }
 
+fn frozen_inventory() -> Inventory {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compat/upstream/inventories/skills.json");
+    let json = std::fs::read_to_string(path).expect("read frozen inventory");
+    serde_json::from_str(json.trim_start_matches('\u{feff}')).expect("valid frozen inventory")
+}
+
 #[test]
 fn registry_matches_every_frozen_skill_field() {
-    let json = include_str!("../../../compat/upstream/inventories/skills.json")
-        .trim_start_matches('\u{feff}');
-    let frozen: Inventory = serde_json::from_str(json).expect("valid frozen inventory");
+    let frozen = frozen_inventory();
     let actual = registry()
         .iter()
         .map(|entry| InventoryItem {
@@ -33,7 +46,9 @@ fn registry_matches_every_frozen_skill_field() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(frozen.items.len(), 51);
+    assert_eq!(frozen.counts.total, 51);
+    assert_eq!(frozen.items.len(), frozen.counts.total);
+    assert_eq!(actual.len(), frozen.counts.total);
     assert_eq!(actual, frozen.items);
     assert!(
         registry()

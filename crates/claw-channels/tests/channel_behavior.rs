@@ -7,13 +7,21 @@ use std::rc::Rc;
 use std::thread;
 
 use claw_channel_sdk::{
-    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind, CredentialRequest,
-    DeliveryAcknowledgement, DeliveryState, InboundMessage, OutboundMessage, UnsupportedOperation,
+    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialBindingError,
+    CredentialKind, CredentialRequest, DeliveryAcknowledgement, DeliveryState, InboundMessage,
+    OutboundMessage, UnsupportedOperation,
 };
 use claw_channels::{
-    LoopbackHttpTransport, QaChannel, RedirectPolicy, UnixClock, WebhookChannel, WebhookRequest,
-    WebhookResponse, WebhookTransport,
+    AuthMode, ImplementationStatus, LoopbackHttpTransport, QaChannel, RedirectPolicy, UnixClock,
+    WebhookChannel, WebhookRequest, WebhookResponse, WebhookTransport, registry,
 };
+
+const FIXTURE_WEBHOOK_CASES: [(&str, &[u8]); 4] = [
+    ("mattermost", br#"{"text":"hello fixture"}"#),
+    ("googlechat", br#"{"text":"hello fixture"}"#),
+    ("slack", br#"{"text":"hello fixture"}"#),
+    ("discord", br#"{"content":"hello fixture"}"#),
+];
 
 #[derive(Clone, Copy, Debug)]
 struct FixedClock(u64);
@@ -204,13 +212,18 @@ fn webhook_authentication_failure_is_typed_and_body_free() {
 
 #[test]
 fn every_partial_webhook_adapter_completes_against_a_local_server() {
-    let cases = [
-        ("mattermost", br#"{"text":"hello fixture"}"#.as_slice()),
-        ("googlechat", br#"{"text":"hello fixture"}"#.as_slice()),
-        ("slack", br#"{"text":"hello fixture"}"#.as_slice()),
-        ("discord", br#"{"content":"hello fixture"}"#.as_slice()),
-    ];
-    for (channel_id, expected_body) in cases {
+    let registered = registry()
+        .iter()
+        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
+        .map(|entry| entry.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let exercised = FIXTURE_WEBHOOK_CASES
+        .iter()
+        .map(|(channel_id, _)| *channel_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(exercised, registered);
+
+    for (channel_id, expected_body) in FIXTURE_WEBHOOK_CASES {
         let (endpoint, server) = fixture_server(200);
         let credential = webhook_credential(channel_id, endpoint);
         let mut channel = WebhookChannel::new(
@@ -231,6 +244,60 @@ fn every_partial_webhook_adapter_completes_against_a_local_server() {
         );
         assert_eq!(server.join().expect("fixture server").body, expected_body);
     }
+}
+
+#[test]
+fn outbound_webhook_auth_advertisement_matches_executable_credential_policy() {
+    let rendered = Rc::new(RefCell::new(Vec::new()));
+    for entry in registry()
+        .iter()
+        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
+    {
+        assert_eq!(entry.auth_modes, &[AuthMode::WebhookUrl]);
+        let transport = InspectingTransport {
+            rendered: Rc::clone(&rendered),
+        };
+        let mut channel = WebhookChannel::new(entry.id, "primary", transport, FixedClock(42))
+            .expect("advertised webhook adapter");
+        let credential = webhook_credential(
+            entry.id,
+            format!("https://{0}.example/hooks/fixture-secret", entry.id),
+        );
+        assert_eq!(
+            channel.send_outbound(&outbound(), Some(&credential)),
+            Ok(DeliveryAcknowledgement {
+                idempotency_key: "delivery-1".to_owned(),
+                remote_message_id: None,
+                state: DeliveryState::Accepted,
+                accepted_at_unix_ms: 42,
+            })
+        );
+
+        for kind in [
+            CredentialKind::Token,
+            CredentialKind::ClientSecret,
+            CredentialKind::Password,
+            CredentialKind::PrivateKey,
+        ] {
+            let unsupported = ChannelCredential::bind(
+                "not-a-webhook",
+                CredentialRequest {
+                    channel_id: entry.id.to_owned(),
+                    account_id: "primary".to_owned(),
+                    kind,
+                    binding: CredentialBinding::LocalOnly,
+                },
+            )
+            .expect("valid non-webhook binding");
+            assert_eq!(
+                channel.send_outbound(&outbound(), Some(&unsupported)),
+                Err(ChannelError::CredentialBinding(
+                    CredentialBindingError::ScopeMismatch
+                ))
+            );
+        }
+    }
+    assert_eq!(rendered.borrow().len(), FIXTURE_WEBHOOK_CASES.len());
 }
 
 #[test]

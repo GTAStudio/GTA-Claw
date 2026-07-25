@@ -37,8 +37,8 @@ const PASSWORD: &[AuthMode] = &[AuthMode::Password];
 const PLATFORM_SESSION: &[AuthMode] = &[AuthMode::PlatformSession];
 const PRIVATE_KEY: &[AuthMode] = &[AuthMode::PrivateKey];
 const PROFILE: &[AuthMode] = &[AuthMode::Profile];
-const SERVICE_ACCOUNT: &[AuthMode] = &[AuthMode::ServiceAccount];
 const TOKEN_AND_WEBHOOK: &[AuthMode] = &[AuthMode::AccessToken, AuthMode::WebhookSecret];
+const WEBHOOK_URL: &[AuthMode] = &[AuthMode::WebhookUrl];
 
 /// One channel capability implemented by this Rust crate.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -49,7 +49,7 @@ pub enum ChannelCapability {
     OutboundText,
 }
 
-/// Upstream credential model recorded for configuration routing.
+/// Credential mode declared by this crate for configuration routing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthMode {
     /// Bot token.
@@ -62,8 +62,10 @@ pub enum AuthMode {
     ServiceAccount,
     /// Bearer or personal access token.
     AccessToken,
-    /// Webhook URL or signing secret.
+    /// Webhook signing secret used by a provider-native integration.
     WebhookSecret,
+    /// Incoming webhook URL that embeds its destination and secret.
+    WebhookUrl,
     /// Platform-owned authenticated session.
     PlatformSession,
     /// Locally managed companion service.
@@ -117,7 +119,9 @@ pub struct ChannelDescriptor {
     pub catalog_source_path: Option<&'static str>,
     /// Capabilities actually implemented by this crate.
     pub capabilities: &'static [ChannelCapability],
-    /// Upstream credential model used for configuration routing.
+    /// Credential policy declared by this crate for configuration routing.
+    ///
+    /// The frozen channel inventory does not specify authentication modes.
     pub auth_modes: &'static [AuthMode],
     /// Executable coverage, kept distinct from registry presence.
     pub implementation: ImplementationStatus,
@@ -183,7 +187,7 @@ macro_rules! catalog_channel {
 static REGISTRY: [ChannelDescriptor; 29] = [
     source_channel!(
         "mattermost",
-        BOT_TOKEN,
+        WEBHOOK_URL,
         TEXT_OUT,
         ImplementationStatus::OutboundWebhook
     ),
@@ -212,7 +216,7 @@ static REGISTRY: [ChannelDescriptor; 29] = [
     ),
     source_channel!(
         "googlechat",
-        SERVICE_ACCOUNT,
+        WEBHOOK_URL,
         TEXT_OUT,
         ImplementationStatus::OutboundWebhook
     ),
@@ -274,13 +278,13 @@ static REGISTRY: [ChannelDescriptor; 29] = [
     ),
     source_channel!(
         "slack",
-        BOT_TOKEN,
+        WEBHOOK_URL,
         TEXT_OUT,
         ImplementationStatus::OutboundWebhook
     ),
     source_channel!(
         "discord",
-        BOT_TOKEN,
+        WEBHOOK_URL,
         TEXT_OUT,
         ImplementationStatus::OutboundWebhook
     ),
