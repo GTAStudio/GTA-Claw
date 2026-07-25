@@ -1,5 +1,5 @@
-const MINIMUM_DENSITY_SCALE: f32 = 0.85;
-const MAXIMUM_DENSITY_SCALE: f32 = 1.35;
+const MINIMUM_DENSITY_SCALE: f32 = 0.8;
+const MAXIMUM_DENSITY_SCALE: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UiTheme {
@@ -76,5 +76,8 @@ mod tests {
         assert!(state.high_contrast());
         assert!(state.reduced_motion());
         assert_eq!(state.density_scale(), MAXIMUM_DENSITY_SCALE);
+
+        state.set_density_scale(0.1);
+        assert_eq!(state.density_scale(), MINIMUM_DENSITY_SCALE);
     }
 }

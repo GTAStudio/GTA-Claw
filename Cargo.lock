@@ -306,6 +306,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-crestodian"
+version = "0.1.0"
+dependencies = [
+ "claw-config",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+]
+
+[[package]]
 name = "claw-domain"
 version = "0.1.0"
 
@@ -351,6 +361,14 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "claw-memory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -421,6 +439,17 @@ dependencies = [
  "subtle",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "claw-tools"
+version = "0.1.0"
+dependencies = [
+ "claw-security",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -974,6 +1003,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gta-claw-android"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-gateway-client",
+ "claw-platform",
+ "claw-protocol",
+ "claw-security",
+ "rand_core 0.10.1",
+ "ring",
+ "secrecy",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "gta-claw-cli"
 version = "0.1.0"
 dependencies = [
@@ -1005,6 +1051,22 @@ dependencies = [
  "claw-application",
  "claw-platform",
  "claw-protocol",
+]
+
+[[package]]
+name = "gta-claw-ios"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-gateway-client",
+ "claw-platform",
+ "claw-protocol",
+ "claw-security",
+ "rand_chacha 0.10.0",
+ "secrecy",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -1470,9 +1532,15 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -2169,6 +2237,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
