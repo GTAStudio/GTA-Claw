@@ -73,7 +73,7 @@ Assert-PlainFile $license | Out-Null
 Assert-PlainFile $assetSpec | Out-Null
 Assert-PlainFile $manifestTemplate | Out-Null
 Test-WixSource $wixSource
-Assert-HeadlessGraph $repoRoot
+Assert-HeadlessGraph -RepoRoot $repoRoot -TargetTriple $arch.RustTarget
 
 $workRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '.work'))
 [System.IO.Directory]::CreateDirectory($workRoot) | Out-Null

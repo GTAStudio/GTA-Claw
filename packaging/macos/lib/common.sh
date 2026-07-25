@@ -321,15 +321,17 @@ validate_headless_archive() {
 }
 
 assert_headless_cargo_tree() {
+  local target="$1"
   local tree
   tree="$(cargo tree \
     --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --target "$target" \
     --locked \
     --offline \
     --prefix none \
-    --format '{p}')" || die "cargo tree failed for the headless workspace"
+    --format '{p}')" || die "cargo tree failed for the headless workspace target $target"
   if grep -E '^(slint|slint-build|i-slint[-A-Za-z0-9]*) v' <<<"$tree" >/dev/null; then
-    die "headless Cargo graph contains Slint"
+    die "headless Cargo graph contains Slint for target $target"
   fi
 }
 

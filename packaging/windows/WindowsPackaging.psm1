@@ -1224,22 +1224,28 @@ function Test-MsixBundle {
 }
 
 function Assert-HeadlessGraph {
-    param([Parameter(Mandatory)][string]$RepoRoot)
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)]
+        [ValidateSet('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')]
+        [string]$TargetTriple
+    )
     $cargo = (Get-Command cargo -ErrorAction Stop).Source
     $tree = & $cargo tree `
         --manifest-path (Join-Path $RepoRoot 'Cargo.toml') `
+        --target $TargetTriple `
         --locked `
         --offline `
         --prefix none `
         --format '{p}'
     if ($LASTEXITCODE -ne 0) {
-        throw "cargo tree failed for the headless workspace."
+        throw "cargo tree failed for the headless workspace target '$TargetTriple'."
     }
     $forbidden = @($tree | Where-Object {
         $_ -match '^(slint|slint-build|i-slint[-A-Za-z0-9]*)\s+v'
     })
     if ($forbidden.Count -ne 0) {
-        throw "Headless Cargo graph contains Slint packages: $($forbidden -join ', ')"
+        throw "Headless Cargo graph for '$TargetTriple' contains Slint packages: $($forbidden -join ', ')"
     }
 }
 

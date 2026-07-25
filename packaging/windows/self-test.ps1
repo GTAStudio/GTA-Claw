@@ -125,6 +125,33 @@ try {
     Test-WixSource (Join-Path $scriptRoot 'wix\GtaClaw.wxs')
     $passed++
 
+    $fakeCargoRoot = Join-Path $testRoot 'fake-cargo'
+    [System.IO.Directory]::CreateDirectory($fakeCargoRoot) | Out-Null
+    $fakeCargo = Join-Path $fakeCargoRoot 'cargo.cmd'
+    $cargoArguments = Join-Path $fakeCargoRoot 'arguments.txt'
+    Write-Utf8File -Path $fakeCargo -Content @"
+@echo off
+echo %* > "%GTA_CLAW_TEST_CARGO_ARGUMENTS%"
+echo gta-claw-cli v0.1.0
+"@
+    $priorPath = $env:PATH
+    $priorCargoArguments = $env:GTA_CLAW_TEST_CARGO_ARGUMENTS
+    try {
+        $env:PATH = "$fakeCargoRoot;$priorPath"
+        $env:GTA_CLAW_TEST_CARGO_ARGUMENTS = $cargoArguments
+        foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            Assert-HeadlessGraph -RepoRoot $repoRoot -TargetTriple $target
+            $arguments = [System.IO.File]::ReadAllText($cargoArguments)
+            if ($arguments -notmatch "(^|\s)--target\s+$([regex]::Escape($target))(\s|$)") {
+                throw "Headless Cargo graph proof omitted target '$target': $arguments"
+            }
+        }
+        $passed++
+    } finally {
+        $env:PATH = $priorPath
+        $env:GTA_CLAW_TEST_CARGO_ARGUMENTS = $priorCargoArguments
+    }
+
     Assert-Throws {
         & (Join-Path $scriptRoot 'package.ps1') -Architecture x64 -ReleaseMode
     } 'release without signing'
@@ -141,8 +168,8 @@ try {
     & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
     $passed++
 
-    if ($passed -ne 20) {
-        throw "Expected 20 self-tests, completed $passed."
+    if ($passed -ne 21) {
+        throw "Expected 21 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

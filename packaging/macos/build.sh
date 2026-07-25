@@ -30,7 +30,32 @@ case "$mode" in
     ;;
 esac
 
-assert_headless_cargo_tree
+prepare_target() {
+  local target="$1"
+  local -a cargo_network_args=()
+  if [[ "${GTA_CLAW_OFFLINE:-0}" == "1" ]]; then
+    rustup target list --installed | grep -Fx "$target" >/dev/null ||
+      die "offline build requires preinstalled Rust target: $target"
+    cargo_network_args=(--offline)
+  else
+    rustup target add "$target"
+  fi
+
+  note "acquiring locked dependencies for $target"
+  cargo fetch \
+    --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --locked \
+    --target "$target" \
+    "${cargo_network_args[@]+"${cargo_network_args[@]}"}" ||
+    die "locked headless dependencies are unavailable for $target"
+  cargo fetch \
+    --manifest-path "$REPO_ROOT/desktop/Cargo.toml" \
+    --locked \
+    --target "$target" \
+    "${cargo_network_args[@]+"${cargo_network_args[@]}"}" ||
+    die "locked desktop dependencies are unavailable for $target"
+  assert_headless_cargo_tree "$target"
+}
 
 build_target() {
   local target="$1"
@@ -52,12 +77,7 @@ build_target() {
   encoded_rustflags+="--remap-path-prefix=$REPO_ROOT=."
   encoded_rustflags+=$'\x1f-Dwarnings'
   if [[ "${GTA_CLAW_OFFLINE:-0}" == "1" ]]; then
-    rustup target list --installed | grep -Fx "$target" >/dev/null ||
-      die "offline build requires preinstalled Rust target: $target"
     cargo_network_args=(--offline)
-  else
-    rustup target add "$target"
-    cargo_network_args=()
   fi
 
   note "building root headless workspace for $target"
@@ -71,7 +91,7 @@ build_target() {
     cargo build \
       --manifest-path "$REPO_ROOT/Cargo.toml" \
       --locked \
-      "${cargo_network_args[@]}" \
+      "${cargo_network_args[@]+"${cargo_network_args[@]}"}" \
       --release \
       --target "$target" \
       --package gta-claw-cli \
@@ -88,7 +108,7 @@ build_target() {
     cargo build \
       --manifest-path "$REPO_ROOT/desktop/Cargo.toml" \
       --locked \
-      "${cargo_network_args[@]}" \
+      "${cargo_network_args[@]+"${cargo_network_args[@]}"}" \
       --release \
       --target "$target" \
       --package gta-claw-desktop
@@ -106,6 +126,10 @@ build_target() {
   "$MACOS_DIR/archive-headless.sh" "$daemon" gta-claw-daemon "$arch" "$arch"
   write_artifact_set_checksums "$OUTPUT_ROOT/headless/$arch"
 }
+
+for target in "${targets[@]}"; do
+  prepare_target "$target"
+done
 
 for target in "${targets[@]}"; do
   build_target "$target"
