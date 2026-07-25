@@ -1,0 +1,56 @@
+[package]
+name = "claw-mcp"
+description = "Pure-Rust Model Context Protocol interoperability for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "=0.1.89"
+base64 = "=0.22.1"
+claw-domain.workspace = true
+futures-util = { version = "=0.3.32", default-features = false, features = ["alloc", "std"] }
+http = "=1.4.0"
+reqwest = { version = "=0.13.2", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
+rmcp = { version = "=2.2.0", default-features = false, features = [
+  "base64",
+  "client",
+  "server",
+  "transport-child-process",
+  "transport-io",
+  "transport-streamable-http-client-reqwest",
+] }
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+process-wrap = { version = "=9.1.0", default-features = false, features = [
+  "job-object",
+  "kill-on-drop",
+  "process-group",
+  "tokio1",
+] }
+secrecy = "=0.10.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sse-stream = "=0.2.5"
+thiserror = "=2.0.18"
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+url = "=2.5.8"
+uuid = { version = "=1.18.1", features = ["v4"] }
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+axum = "=0.8.9"
+rand_chacha = "=0.10.0"
+rand_core = "=0.10.1"
+
+[[bin]]
+name = "claw-mcp-fixture"
+path = "tests/fixtures/mcp_fixture.rs"
+test = false
+
+[lints]
+workspace = true

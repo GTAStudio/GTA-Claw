@@ -4,6 +4,7 @@ members = [
   "apps/gta-claw-cli",
   "apps/gta-claw-daemon",
   "apps/gta-claw-ios",
+  "crates/claw-acp",
   "crates/claw-application",
   "crates/claw-channel-sdk",
   "crates/claw-channels",
@@ -14,6 +15,7 @@ members = [
   "crates/claw-gateway",
   "crates/claw-gateway-client",
   "crates/claw-memory",
+  "crates/claw-mcp",
   "crates/claw-observability",
   "crates/claw-platform",
   "crates/claw-protocol",
@@ -26,6 +28,7 @@ exclude = ["desktop"]
 resolver = "3"
 
 [workspace.dependencies]
+claw-acp = { path = "crates/claw-acp", version = "0.1.0" }
 claw-application = { path = "crates/claw-application", version = "0.1.0" }
 claw-channel-sdk = { path = "crates/claw-channel-sdk", version = "0.1.0" }
 claw-channels = { path = "crates/claw-channels", version = "0.1.0" }
@@ -36,6 +39,7 @@ claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway = { path = "crates/claw-gateway", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
 claw-memory = { path = "crates/claw-memory", version = "0.1.0" }
+claw-mcp = { path = "crates/claw-mcp", version = "0.1.0" }
 claw-observability = { path = "crates/claw-observability", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
