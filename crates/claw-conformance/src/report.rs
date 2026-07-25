@@ -6,7 +6,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::claims::{ClaimLevel, Registry, validate_evidence, validate_implementation_pointers};
+use crate::claims::{
+    CargoTestTargets, ClaimLevel, Registry, validate_evidence, validate_implementation_pointers,
+};
 use crate::error::{ConformanceError, ViolationCode};
 use crate::loader::Contract;
 
@@ -186,6 +188,8 @@ pub fn generate_report(
         .flat_map(|ledger| ledger.features())
         .map(|feature| feature.id())
         .collect::<BTreeSet<_>>();
+    let mut cargo_test_targets: Option<CargoTestTargets> =
+        contract.cargo_test_targets(repository_root);
     for (feature_id, claim) in &registry.features {
         if !known_features.contains(feature_id.as_str()) {
             return Err(ConformanceError::new(
@@ -195,7 +199,12 @@ pub fn generate_report(
             ));
         }
         if claim.level != ClaimLevel::Registered || !claim.evidence.is_empty() {
-            validate_evidence(repository_root, feature_id, &claim.evidence)?;
+            validate_evidence(
+                repository_root,
+                feature_id,
+                &claim.evidence,
+                &mut cargo_test_targets,
+            )?;
         }
         validate_implementation_pointers(
             repository_root,
@@ -227,6 +236,7 @@ pub fn generate_report(
                 repository_root,
                 &format!("{inventory_id}:{record_id}"),
                 &claim.evidence,
+                &mut cargo_test_targets,
             )?;
         }
         validate_implementation_pointers(

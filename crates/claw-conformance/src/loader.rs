@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
-use crate::claims::{validate_evidence_as, validate_implementation_pointers};
+use crate::claims::{CargoTestTargets, validate_evidence_as, validate_implementation_pointers};
 use crate::error::{ConformanceError, ViolationCode};
 use crate::model::{
     ChannelCounts, ChannelItem, Classification, ClientCounts, ClientItem, ConfigDomainCounts,
@@ -117,6 +117,7 @@ pub struct Contract {
     baseline_sha: String,
     ledgers: Vec<FeatureLedger>,
     inventories: BTreeMap<String, Vec<InventoryRecord>>,
+    cargo_test_targets: Option<CargoTestTargets>,
 }
 
 impl Contract {
@@ -148,6 +149,7 @@ impl Contract {
 
         let mut ledgers = Vec::with_capacity(LEDGER_SPECS.len());
         let mut feature_ids = BTreeSet::new();
+        let mut cargo_test_targets = None;
         for (path, expected_id, classification, expected_rows) in LEDGER_SPECS {
             let bytes = read_file(root, path)?;
             let ledger: FeatureLedger = parse_bytes(path, &bytes)?;
@@ -158,6 +160,7 @@ impl Contract {
                 classification,
                 expected_rows,
                 &repository_root,
+                &mut cargo_test_targets,
             )?;
             for feature in ledger.features() {
                 if !feature_ids.insert(feature.id().to_owned()) {
@@ -202,6 +205,7 @@ impl Contract {
             baseline_sha: manifest.baseline_sha,
             ledgers,
             inventories,
+            cargo_test_targets,
         })
     }
 
@@ -227,6 +231,13 @@ impl Contract {
     #[must_use]
     pub fn inventories(&self) -> &BTreeMap<String, Vec<InventoryRecord>> {
         &self.inventories
+    }
+
+    pub(crate) fn cargo_test_targets(&self, repository_root: &Path) -> Option<CargoTestTargets> {
+        self.cargo_test_targets
+            .as_ref()
+            .filter(|targets| targets.is_for_repository(repository_root))
+            .cloned()
     }
 }
 
@@ -428,6 +439,7 @@ fn validate_ledger(
     expected_classification: Classification,
     expected_rows: usize,
     repository_root: &Path,
+    cargo_test_targets: &mut Option<CargoTestTargets>,
 ) -> Result<(), ConformanceError> {
     if ledger.schema_version != 1
         || ledger.id() != expected_id
@@ -483,7 +495,7 @@ fn validate_ledger(
                 "acceptance evidence requirement must not be blank".to_owned(),
             ));
         }
-        validate_ledger_evidence(feature, repository_root)?;
+        validate_ledger_evidence(feature, repository_root, cargo_test_targets)?;
     }
     Ok(())
 }
@@ -554,6 +566,7 @@ fn validate_feature_schema(
 fn validate_ledger_evidence(
     feature: &crate::model::Feature,
     repository_root: &Path,
+    cargo_test_targets: &mut Option<CargoTestTargets>,
 ) -> Result<(), ConformanceError> {
     let fail = |message: &str| {
         ConformanceError::new(
@@ -621,6 +634,7 @@ fn validate_ledger_evidence(
             repository_root,
             feature.id(),
             &feature.acceptance_evidence.artifacts,
+            cargo_test_targets,
             ViolationCode::LedgerEvidence,
         )?;
         validate_implementation_pointers(

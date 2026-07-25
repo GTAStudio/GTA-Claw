@@ -1,8 +1,10 @@
 //! Typed implementation claims and evidence registration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -214,6 +216,107 @@ pub struct Registry {
     pub(crate) inventories: BTreeMap<(String, String), InventoryClaim>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackage {
+    targets: Vec<CargoTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoTarget {
+    src_path: PathBuf,
+    test: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CargoTestTargets {
+    repository_root: PathBuf,
+    source_paths: BTreeSet<PathBuf>,
+}
+
+impl CargoTestTargets {
+    fn load(repository_root: &Path, code: ViolationCode) -> Result<Self, ConformanceError> {
+        let manifest_path = repository_root.join("Cargo.toml");
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .current_dir(repository_root)
+            .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+            .arg("--manifest-path")
+            .arg(&manifest_path)
+            .output()
+            .map_err(|error| {
+                ConformanceError::new(
+                    code,
+                    Some("Cargo.toml".to_owned()),
+                    format!("cannot run cargo metadata: {error}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!(
+                    "cargo metadata failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        let metadata: CargoMetadata = serde_json::from_slice(&output.stdout).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!("cannot parse cargo metadata: {error}"),
+            )
+        })?;
+        let canonical_root = repository_root.canonicalize().map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!("cannot resolve repository root: {error}"),
+            )
+        })?;
+        let mut source_paths = BTreeSet::new();
+        for target in metadata
+            .packages
+            .into_iter()
+            .flat_map(|package| package.targets)
+            .filter(|target| target.test)
+        {
+            let source_path = target.src_path.canonicalize().map_err(|error| {
+                ConformanceError::new(
+                    code,
+                    Some("Cargo.toml".to_owned()),
+                    format!(
+                        "cannot resolve test-enabled Cargo target '{}': {error}",
+                        target.src_path.display()
+                    ),
+                )
+            })?;
+            if source_path.starts_with(&canonical_root) {
+                source_paths.insert(source_path);
+            }
+        }
+        Ok(Self {
+            repository_root: canonical_root,
+            source_paths,
+        })
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.source_paths.contains(path)
+    }
+
+    pub(crate) fn is_for_repository(&self, repository_root: &Path) -> bool {
+        repository_root
+            .canonicalize()
+            .is_ok_and(|root| root == self.repository_root)
+    }
+}
+
 impl Registry {
     /// Creates an empty registry, the honest zero-implementer baseline.
     #[must_use]
@@ -341,11 +444,13 @@ pub(crate) fn validate_evidence(
     repository_root: &Path,
     subject: &str,
     evidence: &[Evidence],
+    cargo_test_targets: &mut Option<CargoTestTargets>,
 ) -> Result<(), ConformanceError> {
     validate_evidence_as(
         repository_root,
         subject,
         evidence,
+        cargo_test_targets,
         ViolationCode::ClaimEvidence,
     )
 }
@@ -354,6 +459,7 @@ pub(crate) fn validate_evidence_as(
     repository_root: &Path,
     subject: &str,
     evidence: &[Evidence],
+    cargo_test_targets: &mut Option<CargoTestTargets>,
     code: ViolationCode,
 ) -> Result<(), ConformanceError> {
     if evidence.is_empty() {
@@ -472,6 +578,22 @@ pub(crate) fn validate_evidence_as(
                 format!(
                     "evidence test '{}' is not declared in '{}'",
                     item.test, item.path
+                ),
+            ));
+        }
+        if cargo_test_targets.is_none() {
+            *cargo_test_targets = Some(CargoTestTargets::load(repository_root, code)?);
+        }
+        let is_test_target = cargo_test_targets
+            .as_ref()
+            .is_some_and(|targets| targets.contains(&canonical_path));
+        if !is_test_target {
+            return Err(ConformanceError::new(
+                code,
+                Some(subject.to_owned()),
+                format!(
+                    "evidence path '{}' is not a test-enabled Cargo target source",
+                    item.path
                 ),
             ));
         }
