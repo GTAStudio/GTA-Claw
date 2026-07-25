@@ -41,6 +41,14 @@ fn unique_dir(label: &str) -> PathBuf {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&path).expect("the temporary directory is created");
+    #[cfg(unix)]
+    {
+        // `FileSecretStore` refuses a credential root any other user can read, and
+        // `create_dir_all` yields `0o777 & !umask`, i.e. `0o755` under the usual `0o022`.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("the temporary directory is made private");
+    }
     path
 }
 

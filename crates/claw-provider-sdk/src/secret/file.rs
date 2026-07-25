@@ -116,6 +116,7 @@ impl SecretStore for FileSecretStore {
         if let Some(systemd_root) = &self.systemd_root {
             let systemd_path = systemd_root.join(encode_key(key));
             if systemd_path.exists() {
+                check_private_file(&systemd_path)?;
                 return Self::read_file(&systemd_path);
             }
         }
@@ -462,6 +463,51 @@ mod tests {
 
     struct TempDir(PathBuf);
 
+    /// Creates a directory holding credential material.
+    ///
+    /// On Unix this must be `0o700`: `FileSecretStore` refuses a credential root that
+    /// any other user can read, so a directory left at the umask default of `0o755`
+    /// makes the store fail to open. `mkdir(2)` masks the requested mode with the
+    /// process umask, which can only clear bits, so the result is never wider than
+    /// `0o700` whatever the ambient umask is.
+    #[cfg(unix)]
+    fn create_temp_dir(path: &Path) {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(path)
+            .expect("temporary directory");
+        let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "temporary credential directory {} was created as {mode:o}, not 0o700",
+            path.display()
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn create_temp_dir(path: &Path) {
+        fs::create_dir_all(path).expect("temporary directory");
+    }
+
+    /// Plants a credential file the way a real one exists on disk.
+    ///
+    /// Plain [`fs::write`] creates `0o666 & !umask`, i.e. `0o644` under the usual
+    /// `0o022`. The store refuses to read any credential with group or other bits
+    /// set, so a file planted with [`fs::write`] is rejected on permissions before
+    /// its contents are ever examined.
+    fn write_private(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+    }
+
     impl TempDir {
         fn new(label: &str) -> Self {
             let nanos = std::time::SystemTime::now()
@@ -469,7 +515,7 @@ mod tests {
                 .expect("clock is after the epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!("claw-cred-{label}-{nanos}"));
-            fs::create_dir_all(&path).expect("temporary directory");
+            create_temp_dir(&path);
             Self(path)
         }
 
@@ -566,7 +612,7 @@ mod tests {
         let temporary = TempDir::new("corrupt");
         let store = FileSecretStore::new(temporary.path()).expect("store");
         let key = CredentialKey::new("gta-claw:openai", "default").expect("valid");
-        fs::write(temporary.path().join(encode_key(&key)), [0xFF, 0xFE]).expect("write");
+        write_private(&temporary.path().join(encode_key(&key)), &[0xFF, 0xFE]);
         assert_eq!(
             store.get(&key),
             Err(SecretStoreError::Corrupt { backend: "file" })
@@ -579,7 +625,7 @@ mod tests {
         let systemd = temporary.path().join("systemd");
         fs::create_dir_all(&systemd).expect("systemd directory");
         let key = CredentialKey::new("gta-claw:openai", "default").expect("valid");
-        fs::write(systemd.join(encode_key(&key)), b"from-systemd").expect("write");
+        write_private(&systemd.join(encode_key(&key)), b"from-systemd");
 
         let store = FileSecretStore::new(temporary.path().join("credentials"))
             .expect("store")
@@ -655,6 +701,37 @@ mod tests {
         assert_eq!(
             FileSecretStore::new(&root).map(|_| ()),
             Err(SecretStoreError::InsecurePermissions { mode: 0o750 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_refuses_a_world_readable_systemd_credential() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = TempDir::new("systemd-insecure");
+        let systemd = temporary.path().join("systemd");
+        fs::create_dir_all(&systemd).expect("systemd directory");
+        let key = CredentialKey::new("gta-claw:openai", "default").expect("valid");
+        let planted = systemd.join(encode_key(&key));
+        fs::write(&planted, b"from-systemd").expect("write");
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let store = FileSecretStore::new(temporary.path().join("credentials"))
+            .expect("store")
+            .with_systemd_root(Some(systemd));
+        assert_eq!(
+            store.get(&key),
+            Err(SecretStoreError::InsecurePermissions { mode: 0o644 }),
+            "a systemd credential any other user can read must be refused, \
+             exactly as a local one is"
+        );
+
+        // systemd itself installs credentials as 0o400, which must still be readable.
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o400)).expect("chmod");
+        assert_eq!(
+            store.get(&key).expect("get").expect("present").expose(),
+            "from-systemd"
         );
     }
 
