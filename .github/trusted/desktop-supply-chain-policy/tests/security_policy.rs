@@ -2780,24 +2780,36 @@ fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
 }
 
 #[test]
-fn base_owned_repository_ratchet_rejects_new_node_workflow_debt() {
-    let trusted = final_tree("repository-workflow-ratchet-base");
-    let candidate = final_tree("repository-workflow-ratchet-candidate");
-    fs::write(
-        candidate.join(".github/workflows/new-node.yml"),
-        "name: forbidden\non: workflow_dispatch\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci\n",
-    )
-    .expect("plant Node workflow addition");
-    let error = validate_repository_policy_transition(
-        &SafeRoot::new(&trusted.path).expect("open workflow ratchet base"),
-        &SafeRoot::new(&candidate.path).expect("open workflow ratchet candidate"),
-    )
-    .expect_err("new Node workflow debt unexpectedly passed")
-    .to_string();
-    assert!(
-        error.contains("introduced new Node workflow/action violations"),
-        "workflow addition failed through the wrong rule: {error}"
-    );
+fn base_owned_repository_ratchet_rejects_node_in_future_mobile_workflows() {
+    for (workflow, step) in [
+        (
+            "ios-packaging.yml",
+            "      - uses: actions/setup-node@0123456789abcdef0123456789abcdef01234567\n",
+        ),
+        ("android-packaging.yml", "      - run: npm ci\n"),
+    ] {
+        let trusted = final_tree(&format!("repository-{workflow}-ratchet-base"));
+        let candidate = final_tree(&format!("repository-{workflow}-ratchet-candidate"));
+        let path = format!(".github/workflows/{workflow}");
+        fs::write(
+            candidate.join(&path),
+            format!(
+                "name: forbidden mobile Node dependency\non: workflow_dispatch\njobs:\n  package:\n    runs-on: ubuntu-latest\n    steps:\n{step}"
+            ),
+        )
+        .expect("plant Node dependency in a future mobile workflow");
+        let error = validate_repository_policy_transition(
+            &SafeRoot::new(&trusted.path).expect("open mobile workflow ratchet base"),
+            &SafeRoot::new(&candidate.path).expect("open mobile workflow ratchet candidate"),
+        )
+        .expect_err("new mobile Node workflow debt unexpectedly passed")
+        .to_string();
+        assert!(
+            error.contains("introduced new Node workflow/action violations")
+                && error.contains(&path),
+            "{workflow} addition failed through the wrong rule: {error}"
+        );
+    }
 }
 
 #[test]
