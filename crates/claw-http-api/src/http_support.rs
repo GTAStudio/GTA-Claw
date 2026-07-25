@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::ApiError;
 
+const MAX_REJECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(crate) struct CancelOnDrop(CancellationToken);
 
 impl CancelOnDrop {
@@ -63,6 +65,59 @@ pub(crate) async fn read_json_value(
             "invalid_request_error",
         )
     })
+}
+
+pub(crate) async fn drain_request_body(
+    request: Request,
+    max_bytes: usize,
+    body_timeout: Duration,
+) -> Result<(), ApiError> {
+    timeout(body_timeout, to_bytes(request.into_body(), max_bytes))
+        .await
+        .map_err(|_| {
+            ApiError::openai(
+                StatusCode::REQUEST_TIMEOUT,
+                "Request body timeout",
+                "invalid_request_error",
+            )
+        })?
+        .map_err(|_| {
+            ApiError::openai(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload too large",
+                "invalid_request_error",
+            )
+        })?;
+    Ok(())
+}
+
+pub(crate) async fn rejected_response(
+    request: Request,
+    max_bytes: usize,
+    body_timeout: Duration,
+    rejection: impl IntoResponse,
+) -> Response {
+    let drained = drain_request_body(
+        request,
+        max_bytes,
+        body_timeout.min(MAX_REJECTION_DRAIN_TIMEOUT),
+    )
+    .await
+    .is_ok();
+    let response = rejection.into_response();
+    if drained {
+        response
+    } else {
+        close_connection_response(response)
+    }
+}
+
+pub(crate) fn close_connection_response(response: impl IntoResponse) -> Response {
+    let mut response = response.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 pub(crate) async fn read_json<T: DeserializeOwned>(

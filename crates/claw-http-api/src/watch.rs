@@ -20,7 +20,10 @@ use tokio::time::{sleep, timeout};
 use crate::auth::bearer_token;
 use crate::config::HttpLimits;
 use crate::error::ApiError;
-use crate::http_support::{CancelOnDrop, json_response, read_json};
+use crate::http_support::{
+    CancelOnDrop, close_connection_response, drain_request_body, json_response, read_json,
+    rejected_response,
+};
 use crate::ports::{PortError, WatchResultPort};
 use crate::state::ApiState;
 
@@ -403,7 +406,28 @@ pub(crate) async fn poll(
     State(state): State<ApiState>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let session = authenticated_session(&state, &request)?;
+    let token = bearer_token(request.headers()).map(str::to_owned);
+    let session = match authenticated_session(&state, token.as_deref()) {
+        Ok(session) => session,
+        Err(error) => {
+            return Ok(rejected_response(
+                request,
+                state.inner.config.limits.watch_body_bytes,
+                state.inner.config.limits.body_timeout,
+                error,
+            )
+            .await);
+        }
+    };
+    if let Err(error) = drain_request_body(
+        request,
+        state.inner.config.limits.watch_body_bytes,
+        state.inner.config.limits.body_timeout,
+    )
+    .await
+    {
+        return Ok(close_connection_response(error));
+    }
     if let Some(event) = session.pop()? {
         return Ok(json_response(
             StatusCode::OK,
@@ -466,7 +490,28 @@ pub(crate) async fn disconnect(
     State(state): State<ApiState>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let session = authenticated_session(&state, &request)?;
+    let token = bearer_token(request.headers()).map(str::to_owned);
+    let session = match authenticated_session(&state, token.as_deref()) {
+        Ok(session) => session,
+        Err(error) => {
+            return Ok(rejected_response(
+                request,
+                state.inner.config.limits.watch_body_bytes,
+                state.inner.config.limits.body_timeout,
+                error,
+            )
+            .await);
+        }
+    };
+    if let Err(error) = drain_request_body(
+        request,
+        state.inner.config.limits.watch_body_bytes,
+        state.inner.config.limits.body_timeout,
+    )
+    .await
+    {
+        return Ok(close_connection_response(error));
+    }
     state.inner.watch.close_session(&session)?;
     Ok(json_response(StatusCode::OK, json!({"ok":true})))
 }
@@ -480,8 +525,16 @@ pub(crate) async fn result(
         .as_deref()
         .map(|token| state.inner.watch.session(token))
         .transpose()?
-        .flatten()
-        .ok_or_else(unauthorized)?;
+        .flatten();
+    let Some(session) = session else {
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.watch_body_bytes,
+            state.inner.config.limits.body_timeout,
+            unauthorized(),
+        )
+        .await);
+    };
     let limits = &state.inner.config.limits;
     let value: Value = read_json(request, limits.watch_body_bytes, limits.body_timeout).await?;
     let valid = value.as_object().is_some_and(|body| {
@@ -521,9 +574,9 @@ pub(crate) async fn result(
 
 fn authenticated_session(
     state: &ApiState,
-    request: &Request,
+    token: Option<&str>,
 ) -> Result<Arc<WatchSession>, ApiError> {
-    bearer_token(request.headers())
+    token
         .map(|token| state.inner.watch.session(token))
         .transpose()?
         .flatten()

@@ -138,6 +138,7 @@ impl HttpApi {
     pub fn new(config: ApiConfig, services: ApiServices) -> Self {
         let auth_state = AuthMiddlewareState {
             authenticator: config.authenticator.clone(),
+            limits: config.limits.clone(),
         };
         let cors_origins = config.cors_origins.clone();
         let state = ApiState::new(config, services);
