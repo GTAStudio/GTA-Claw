@@ -35,6 +35,8 @@ impl TestDir {
             std::fs::remove_dir_all(&path).expect("remove stale test directory");
         }
         std::fs::create_dir(&path).expect("create isolated test directory");
+        #[cfg(unix)]
+        let path = std::fs::canonicalize(path).expect("resolve system temporary directory aliases");
         #[cfg(windows)]
         Self::lock_test_directory(&path);
         Self { path }
@@ -186,6 +188,9 @@ async fn handle_connection(
         .await
         .expect("write local response body");
     stream.flush().await.expect("flush local response");
+    if plan.write_bytes < plan.body.len() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn handler<F>(handler: F) -> Handler

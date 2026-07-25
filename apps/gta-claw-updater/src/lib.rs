@@ -1807,7 +1807,7 @@ fn rustix_error(error: rustix::io::Errno) -> io::Error {
 
 #[cfg(unix)]
 fn rustix_open_error(error: rustix::io::Errno) -> UpdateError {
-    if error == rustix::io::Errno::LOOP {
+    if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
         UpdateError::UnsafeFilesystemObject
     } else {
         UpdateError::Io(rustix_error(error))
@@ -2637,6 +2637,8 @@ mod unit_tests {
                 fs::remove_dir_all(&path).expect("remove stale unit test directory");
             }
             fs::create_dir(&path).expect("create unit test directory");
+            #[cfg(unix)]
+            let path = fs::canonicalize(path).expect("resolve system temporary directory aliases");
             #[cfg(windows)]
             lock_down_windows_directory(&path).expect("protect unit test directory");
             Self { path }
