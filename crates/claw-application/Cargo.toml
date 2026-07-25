@@ -8,10 +8,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+claw-domain.workspace = true
 claw-protocol.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
-claw-domain.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

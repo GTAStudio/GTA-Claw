@@ -51,6 +51,8 @@ version = "0.1.0"
 dependencies = [
  "claw-domain",
  "claw-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -110,6 +112,18 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2",
+]
+
+[[package]]
+name = "claw-runtime"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-domain",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

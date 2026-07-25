@@ -5,6 +5,18 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEvent};
 
+pub mod model;
+pub mod ports;
+
+pub use ports::approval::ApprovalPort;
+pub use ports::clock::ClockPort;
+pub use ports::context::ContextEnginePort;
+pub use ports::goal::GoalStorePort;
+pub use ports::provider::{ProviderPort, ProviderStream};
+pub use ports::state::StatePort;
+pub use ports::tool::ToolPort;
+pub use ports::{PortError, PortFuture};
+
 /// Supplies native runtime identity without coupling the application to an OS.
 pub trait SystemProbe {
     /// Returns the native runtime identity.

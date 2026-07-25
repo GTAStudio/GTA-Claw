@@ -8,6 +8,7 @@ members = [
   "crates/claw-gateway-client",
   "crates/claw-platform",
   "crates/claw-protocol",
+  "crates/claw-runtime",
   "crates/claw-security",
 ]
 exclude = ["desktop"]
@@ -20,6 +21,7 @@ claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
+claw-runtime = { path = "crates/claw-runtime", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
