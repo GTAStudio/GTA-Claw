@@ -25,6 +25,7 @@ create_private_validation_directory() {
 validate_archive_entries() {
   local archive="$1"
   local compression="$2"
+  local root_policy="${3:-optional}"
   local max_compressed
   local max_expanded
   local max_file
@@ -49,6 +50,7 @@ validate_archive_entries() {
     "$max_expanded" \
     "$max_file" \
     4096 \
+    "$root_policy" \
     >/dev/null
 }
 
@@ -118,7 +120,7 @@ validate_published_oci() {
     die "OCI validation root must be new"
   create_private_validation_directory "$validation_root"
   create_private_validation_directory "$extract_root"
-  validate_archive_entries "$archive" gzip
+  validate_archive_entries "$archive" gzip forbidden
   listing="$(tar --quoting-style=escape -tzf "$archive")"
   [[ "$(awk -F/ 'NF { print $1 }' <<<"$listing" | LC_ALL=C sort -u)" == \
     "$expected_layout_name" ]] || die "OCI archive has an unexpected top-level layout"
@@ -196,6 +198,12 @@ validate_published_oci() {
     .config.Labels["org.opencontainers.image.licenses"] ==
       "MIT AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)"
   ' "$config" >/dev/null || die "published OCI config contract is invalid"
+  [[ "$(jq -er '.config.Labels["org.opencontainers.image.version"]' "$config")" == \
+    "$VERSION-$LINUX_PACKAGE_RELEASE" ]] ||
+    die "published OCI config omits package release identity"
+  [[ "$(jq -er '.manifests[0].annotations["org.opencontainers.image.ref.name"]' \
+    "$layout/index.json")" == "gta-claw:$VERSION-$LINUX_PACKAGE_RELEASE" ]] ||
+    die "published OCI index reference omits package release identity"
 
   layer_count="$(jq -er '.layers | length' "$manifest")"
   [[ "$layer_count" -eq 2 ]] || die "published OCI manifest must contain exactly two layers"
@@ -208,7 +216,11 @@ validate_published_oci() {
     diff_id="$(jq -er ".rootfs.diff_ids[$index]" "$config")"
     [[ "$diff_id" == "sha256:$(sha256_file "$layer")" ]] ||
       die "published OCI layer[$index] DiffID mismatch"
-    validate_archive_entries "$layer" none
+    if [[ "$index" -eq 0 ]]; then
+      validate_archive_entries "$layer" none required
+    else
+      validate_archive_entries "$layer" none forbidden
+    fi
     if [[ "$index" -eq 0 ]]; then
       root_layer="$layer"
       root_layer_sha="$(sha256_file "$layer")"

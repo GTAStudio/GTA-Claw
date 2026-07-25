@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in dpkg flock rpm sha256sum systemctl tar; do
+for tool in dpkg flock jq rpm sha256sum systemctl tar; do
   require_tool "$tool"
 done
 [[ "$#" -eq 6 ]] ||
@@ -95,11 +95,26 @@ direct_root="$(mktemp -d)"
   die "lifecycle test requires an absent protected namespace"
 
 assert_disabled_and_inactive() {
-  local state
-  state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
-  [[ "$state" != "enabled" ]] || die "service was enabled on fresh install"
-  ! systemctl is-active --quiet gta-claw-daemon.service ||
-    die "service was started on fresh install"
+  local active_state
+  local control_pid
+  local enabled_state
+  local load_state
+  local main_pid
+  enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
+  load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service)"
+  [[ "$enabled_state" == "disabled" ]] ||
+    die "fresh service enablement is not exactly disabled: $enabled_state"
+  [[ "$load_state" == "loaded" ]] ||
+    die "fresh service is not loaded and unmasked: $load_state"
+  [[ "$active_state:$main_pid:$control_pid" == "inactive:0:0" ]] ||
+    die "fresh service runtime state is not exactly inactive with zero PIDs"
+  [[ ! -e /run/gta-claw-state-init/initialization-failed &&
+    ! -e /run/gta-claw-state-init/initialization-complete &&
+    ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+    die "fresh service retained an initialization transaction marker"
 }
 
 assert_protected_contract() {
@@ -309,11 +324,42 @@ establish_package_runtime_fence() {
   esac
 }
 
+simulate_direct_reboot() {
+  sudo systemctl unmask --runtime gta-claw-daemon.service
+  sudo rm -rf /run/gta-claw-state-init
+  sudo rm -f \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.was-active
+  sudo systemctl daemon-reload
+  [[ -e /var/lib/gta-claw-install/transaction-failed &&
+    -e /var/lib/gta-claw-install/was-active ]] ||
+    die "direct hard interruption lost its persistent transaction journal"
+  if sudo systemctl start gta-claw-daemon.service; then
+    die "direct hard interruption allowed a start after simulated reboot"
+  fi
+  ! systemctl is-active --quiet gta-claw-daemon.service ||
+    die "direct hard interruption left the daemon active after simulated reboot"
+}
+
 mkdir "$direct_root/release1" "$direct_root/release2"
 tar -xzf "$tar1" -C "$direct_root/release1"
 tar -xzf "$tar2" -C "$direct_root/release2"
 direct1="$(find "$direct_root/release1" -mindepth 1 -maxdepth 1 -type d)"
 direct2="$(find "$direct_root/release2" -mindepth 1 -maxdepth 1 -type d)"
+[[ "$(cat "$direct1/package-version")" == "$VERSION-1" &&
+  "$(cat "$direct2/package-version")" == "$VERSION-2" ]] ||
+  die "release package-version identities are not distinct"
+spdx_namespace1="$(jq -er '.documentNamespace' "$direct1/sbom.spdx.json")"
+spdx_namespace2="$(jq -er '.documentNamespace' "$direct2/sbom.spdx.json")"
+[[ "$spdx_namespace1" != "$spdx_namespace2" &&
+  "$spdx_namespace1" == *"/$VERSION-1/native-tar" &&
+  "$spdx_namespace2" == *"/$VERSION-2/native-tar" ]] ||
+  die "release SPDX namespaces are not package-release specific"
+[[ "$(jq -er '.packages[] | select(.name == "gta-claw") | .versionInfo' \
+  "$direct1/sbom.spdx.json")" == "$VERSION-1" &&
+  "$(jq -er '.packages[] | select(.name == "gta-claw") | .versionInfo' \
+  "$direct2/sbom.spdx.json")" == "$VERSION-2" ]] ||
+  die "release SPDX package versions are not package-release specific"
 assert_identity_absent
 sudo "$direct1/install.sh"
 assert_disabled_and_inactive
@@ -342,6 +388,38 @@ direct_upgrade_snapshot="$(state_identity_snapshot)"
 sudo "$direct2/install.sh"
 assert_active_restart "$direct_pid"
 assert_identity_preserved "$direct_upgrade_snapshot"
+for direct_boundary in unit daemon; do
+  direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  if sudo env \
+    GTA_CLAW_DIRECT_TEST_INTERRUPT_AFTER="$direct_boundary" \
+    "$direct2/install.sh"; then
+    die "direct install ignored a hard interruption at $direct_boundary"
+  fi
+  simulate_direct_reboot
+  sudo "$direct2/install.sh"
+  assert_active_restart "$direct_pid"
+  [[ ! -e /var/lib/gta-claw-install/transaction-failed &&
+    ! -e /var/lib/gta-claw-install/was-active ]] ||
+    die "direct install retry left its persistent transaction journal"
+done
+bin_true_hash="$(sha256sum /bin/true)"
+if sudo env \
+  GTA_CLAW_DIRECT_TEST_BREAK_FAILURE_FENCE=1 \
+  GTA_CLAW_DIRECT_TEST_FAIL_AFTER=unit \
+  "$direct2/install.sh"; then
+  die "direct install ignored a failure-fence authentication fault"
+fi
+[[ -L /run/gta-claw-state-init/initialization-failed &&
+  "$(readlink /run/gta-claw-state-init/initialization-failed)" == "/bin/true" ]] ||
+  die "direct failure-fence authentication fixture was not retained"
+[[ "$(sha256sum /bin/true)" == "$bin_true_hash" ]] ||
+  die "direct failure handling modified the symlink target"
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct marker-authentication failure left a retrying daemon"
+sudo rm /run/gta-claw-state-init/initialization-failed
+sudo "$direct2/install.sh"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct marker-authentication recovery did not resume the daemon"
 if sudo "$direct1/install.sh"; then
   die "direct deployment accepted a downgrade"
 fi
@@ -384,6 +462,46 @@ fi
 systemctl is-active --quiet gta-claw-daemon.service ||
   die "direct stop failure did not leave the daemon active"
 remove_failure_dropin
+install_initializer_stop_denial
+if sudo "$direct2/uninstall.sh"; then
+  die "direct removal ignored a late initializer-stop failure"
+fi
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct late removal failure did not restore the active daemon"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
+  die "direct late removal failure changed persistent enablement"
+[[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "direct late removal failure unlinked the daemon"
+remove_initializer_stop_denial
+
+sudo systemctl stop gta-claw-daemon.service
+start_manual_writer_lock
+if sudo "$direct2/uninstall.sh"; then
+  die "direct removal ignored an escaped writer-lock holder"
+fi
+[[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "direct lock rejection unlinked the daemon"
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct lock rejection changed the inactive runtime state"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
+  die "direct lock rejection changed persistent enablement"
+stop_manual_writer_lock
+sudo systemctl start gta-claw-daemon.service
+
+sudo systemctl disable gta-claw-daemon.service
+sudo systemctl enable --runtime gta-claw-daemon.service
+install_initializer_stop_denial
+if sudo "$direct2/uninstall.sh"; then
+  die "direct removal ignored runtime-only rollback coverage"
+fi
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "direct runtime-only rollback did not restore the active daemon"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled-runtime" ]] ||
+  die "direct removal changed runtime-only enablement during rollback"
+remove_initializer_stop_denial
+sudo systemctl disable --runtime gta-claw-daemon.service
+sudo systemctl enable gta-claw-daemon.service
+
 direct_snapshot="$(state_identity_snapshot)"
 sudo "$direct2/uninstall.sh"
 assert_identity_preserved "$direct_snapshot"
@@ -422,7 +540,15 @@ reset_test_namespace
 reset_test_identity
 
 assert_identity_absent
-sudo dpkg -i "$deb1"
+if sudo env GTA_CLAW_PACKAGE_TEST_FAIL_AFTER=preset dpkg -i "$deb1"; then
+  die "Debian fresh install ignored a post-preset transaction fault"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian post-preset fault left the daemon active"
+[[ -e /run/gta-claw-state-init/initialization-failed &&
+  -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "Debian post-preset fault lost its transaction fence"
+sudo dpkg --configure gta-claw
 assert_disabled_and_inactive
 assert_protected_contract
 [[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
@@ -439,6 +565,67 @@ deb_upgrade_snapshot="$(state_identity_snapshot)"
 sudo dpkg -i "$deb2"
 assert_active_restart "$deb_pid"
 assert_identity_preserved "$deb_upgrade_snapshot"
+install_failure_dropin Unit 'RefuseManualStop=yes'
+deb_preinst_hash="$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)"
+if sudo dpkg -i "$deb2"; then
+  die "Debian preinst ignored a RefuseManualStop failure"
+fi
+[[ "$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)" == "$deb_preinst_hash" ]] ||
+  die "failed Debian preinst replaced the installed daemon"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "failed Debian preinst did not restore the active daemon"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "enabled" ]] ||
+  die "failed Debian preinst changed persistent enablement"
+remove_failure_dropin
+
+sudo systemctl stop gta-claw-daemon.service
+start_manual_writer_lock
+if sudo dpkg -i "$deb2"; then
+  die "Debian preinst ignored an escaped writer-lock holder"
+fi
+[[ "$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)" == "$deb_preinst_hash" ]] ||
+  die "writer-lock-rejected Debian preinst replaced the daemon"
+[[ "$(dpkg-query -W -f='${Status}' gta-claw)" == "install ok installed" ]] ||
+  die "writer-lock-rejected Debian preinst changed package status"
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "writer-lock-rejected Debian preinst changed inactive state"
+stop_manual_writer_lock
+sudo systemctl start gta-claw-daemon.service
+
+for package_boundary in initialization unmask daemon-reload restart readiness; do
+  deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  if sudo env \
+    GTA_CLAW_PACKAGE_TEST_FAIL_AFTER="$package_boundary" \
+    dpkg -i "$deb2"; then
+    die "Debian configure ignored a $package_boundary transaction fault"
+  fi
+  ! systemctl is-active --quiet gta-claw-daemon.service ||
+    die "Debian $package_boundary fault left the daemon active"
+  [[ -e /run/gta-claw-state-init/initialization-failed &&
+    -e /run/gta-claw-state-init/replacement-fenced ]] ||
+    die "Debian $package_boundary fault lost its transaction fence"
+  sudo dpkg --configure gta-claw
+  assert_active_restart "$deb_pid"
+done
+
+bin_true_hash="$(sha256sum /bin/true)"
+if sudo env \
+  GTA_CLAW_PACKAGE_TEST_BREAK_FAILURE_FENCE=1 \
+  GTA_CLAW_PACKAGE_TEST_FAIL_AFTER=initialization \
+  dpkg -i "$deb2"; then
+  die "Debian configure ignored a failure-fence authentication fault"
+fi
+[[ -L /run/gta-claw-state-init/initialization-failed &&
+  "$(readlink /run/gta-claw-state-init/initialization-failed)" == "/bin/true" ]] ||
+  die "Debian failure-fence authentication fixture was not retained"
+[[ "$(sha256sum /bin/true)" == "$bin_true_hash" ]] ||
+  die "Debian failure handling modified the symlink target"
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian marker-authentication failure left a retrying daemon"
+sudo rm /run/gta-claw-state-init/initialization-failed
+sudo dpkg --configure gta-claw
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian marker-authentication recovery did not resume the daemon"
 if sudo dpkg -i --force-downgrade "$deb1"; then
   die "Debian package accepted a downgrade"
 fi
@@ -574,7 +761,19 @@ fi
   die "RPM rejection removed an administrator-owned runtime mask"
 sudo systemctl unmask --runtime gta-claw-daemon.service
 sudo systemctl daemon-reload
-sudo rpm -ivh --nodeps "$rpm1"
+set +e
+sudo env GTA_CLAW_PACKAGE_TEST_FAIL_AFTER=preset rpm -ivh --nodeps "$rpm1"
+rpm_preset_status=$?
+set -e
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM post-preset fault left the daemon active"
+[[ -e /run/gta-claw-state-init/initialization-failed &&
+  -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "RPM post-preset fault lost its transaction fence"
+if [[ "$rpm_preset_status" -eq 0 ]]; then
+  echo "RPM reported failed post-preset scriptlet as a warning; runtime remained fenced" >&2
+fi
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm1"
 assert_disabled_and_inactive
 assert_protected_contract
 [[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
@@ -591,6 +790,75 @@ rpm_upgrade_snapshot="$(state_identity_snapshot)"
 sudo rpm -Uvh --nodeps "$rpm2"
 assert_active_restart "$rpm_pid"
 assert_identity_preserved "$rpm_upgrade_snapshot"
+install_failure_dropin Unit 'RefuseManualStop=yes'
+rpm_pre_hash="$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)"
+if sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"; then
+  die "RPM pre-install ignored a RefuseManualStop failure"
+fi
+[[ "$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)" == "$rpm_pre_hash" ]] ||
+  die "failed RPM pre-install replaced the daemon"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "failed RPM pre-install did not restore the active daemon"
+remove_failure_dropin
+
+sudo systemctl stop gta-claw-daemon.service
+start_manual_writer_lock
+if sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"; then
+  die "RPM pre-install ignored an escaped writer-lock holder"
+fi
+[[ "$(sha256sum /usr/libexec/gta-claw/gta-claw-daemon)" == "$rpm_pre_hash" ]] ||
+  die "writer-lock-rejected RPM pre-install replaced the daemon"
+[[ "$(rpm -q gta-claw | wc -l)" -eq 1 ]] ||
+  die "writer-lock-rejected RPM pre-install changed package instances"
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "writer-lock-rejected RPM pre-install changed inactive state"
+stop_manual_writer_lock
+sudo systemctl start gta-claw-daemon.service
+
+for package_boundary in initialization unmask daemon-reload restart readiness; do
+  rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  set +e
+  sudo env \
+    GTA_CLAW_PACKAGE_TEST_FAIL_AFTER="$package_boundary" \
+    rpm -Uvh --nodeps --replacepkgs "$rpm2"
+  rpm_boundary_status=$?
+  set -e
+  ! systemctl is-active --quiet gta-claw-daemon.service ||
+    die "RPM $package_boundary fault left the daemon active"
+  [[ -e /run/gta-claw-state-init/initialization-failed &&
+    -e /run/gta-claw-state-init/replacement-fenced ]] ||
+    die "RPM $package_boundary fault lost its transaction fence"
+  if [[ "$rpm_boundary_status" -eq 0 ]]; then
+    echo "RPM reported failed $package_boundary scriptlet as a warning; runtime remained fenced" >&2
+  fi
+  sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+  [[ "$(rpm -q gta-claw | wc -l)" -eq 1 ]] ||
+    die "RPM $package_boundary recovery left duplicate package instances"
+  assert_active_restart "$rpm_pid"
+done
+
+bin_true_hash="$(sha256sum /bin/true)"
+set +e
+sudo env \
+  GTA_CLAW_PACKAGE_TEST_BREAK_FAILURE_FENCE=1 \
+  GTA_CLAW_PACKAGE_TEST_FAIL_AFTER=initialization \
+  rpm -Uvh --nodeps --replacepkgs "$rpm2"
+rpm_marker_status=$?
+set -e
+[[ -L /run/gta-claw-state-init/initialization-failed &&
+  "$(readlink /run/gta-claw-state-init/initialization-failed)" == "/bin/true" ]] ||
+  die "RPM failure-fence authentication fixture was not retained"
+[[ "$(sha256sum /bin/true)" == "$bin_true_hash" ]] ||
+  die "RPM failure handling modified the symlink target"
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM marker-authentication failure left a retrying daemon"
+if [[ "$rpm_marker_status" -eq 0 ]]; then
+  echo "RPM reported marker-authentication scriptlet failure as a warning; runtime remained fenced" >&2
+fi
+sudo rm /run/gta-claw-state-init/initialization-failed
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM marker-authentication recovery did not resume the daemon"
 if sudo rpm -Uvh --nodeps --oldpackage "$rpm1"; then
   die "RPM package accepted a downgrade"
 fi
@@ -670,6 +938,24 @@ systemctl is-active --quiet gta-claw-daemon.service ||
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "RPM late removal failure unlinked the daemon"
 remove_initializer_stop_denial
+for remove_marker in \
+  /run/gta-claw-daemon.remove-was-active \
+  /run/gta-claw-daemon.remove-was-enabled \
+  /run/gta-claw-daemon.remove-was-enabled-runtime \
+  /run/gta-claw-state-init/remove-was-active \
+  /run/gta-claw-state-init/remove-prepared \
+  /run/gta-claw-state-init/remove-was-package-fenced; do
+  [[ ! -e "$remove_marker" && ! -L "$remove_marker" ]] ||
+    die "failed RPM erase left stale removal intent: $remove_marker"
+done
+sudo systemctl disable --runtime gta-claw-daemon.service
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "disabled" ]] ||
+  die "RPM failed-erase administrator change did not take effect"
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM recovery after failed erase did not preserve active state"
+[[ "$(systemctl is-enabled gta-claw-daemon.service)" == "disabled" ]] ||
+  die "stale RPM removal intent overrode an administrator enablement change"
 rpm_snapshot="$(state_identity_snapshot)"
 sudo rpm -e --nodeps gta-claw
 assert_identity_preserved "$rpm_snapshot"

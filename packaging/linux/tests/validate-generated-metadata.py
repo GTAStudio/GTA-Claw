@@ -67,6 +67,7 @@ def expected_toolchain(arguments):
 
 def expected_provenance(arguments, build_manifest, runtime_manifest, toolchain):
     root = Path(arguments.root)
+    package_identity = f"{arguments.version}-{arguments.package_release}"
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": [
@@ -86,7 +87,9 @@ def expected_provenance(arguments, build_manifest, runtime_manifest, toolchain):
                 "externalParameters": {
                     "architecture": arguments.arch,
                     "rustTarget": arguments.target,
-                    "version": arguments.version,
+                    "version": package_identity,
+                    "packageRelease": arguments.package_release,
+                    "packageVersion": package_identity,
                 },
                 "internalParameters": {
                     "sourceDateEpoch": int(arguments.source_epoch)
@@ -149,6 +152,7 @@ def verification_code(records, owner):
 
 def expected_spdx(arguments, runtime_manifest):
     root = Path(arguments.root)
+    package_identity = f"{arguments.version}-{arguments.package_release}"
     sbom_relative = f"./{arguments.sbom}"
     checksum_parent = Path(arguments.sbom).parent.as_posix()
     checksum_relative = (
@@ -252,7 +256,7 @@ def expected_spdx(arguments, runtime_manifest):
         "name": "gta-claw-linux-headless",
         "documentNamespace": (
             "https://github.com/GTAStudio/GTA-Claw/spdx/"
-            f"{arguments.source_sha}/{arguments.arch}/{arguments.label}"
+            f"{arguments.source_sha}/{arguments.arch}/{package_identity}/{arguments.label}"
         ),
         "creationInfo": {
             "created": arguments.created,
@@ -262,7 +266,8 @@ def expected_spdx(arguments, runtime_manifest):
             {
                 "SPDXID": "SPDXRef-Package-GTA-Claw",
                 "name": "gta-claw",
-                "versionInfo": arguments.version,
+                "versionInfo": package_identity,
+                "comment": f"Linux package release: {arguments.package_release}",
                 "downloadLocation": "NOASSERTION",
                 "filesAnalyzed": True,
                 "packageVerificationCode": {
@@ -283,6 +288,7 @@ def expected_spdx(arguments, runtime_manifest):
                         "referenceType": "purl",
                         "referenceLocator": (
                             f"pkg:github/GTAStudio/GTA-Claw@{arguments.source_sha}"
+                            f"?package_release={arguments.package_release}"
                         ),
                     }
                 ],
@@ -298,6 +304,7 @@ def expected_artifact_provenance(
     arguments, build_manifest, runtime_manifest, toolchain
 ):
     artifact_dir = Path(arguments.artifact_dir)
+    package_identity = f"{arguments.version}-{arguments.package_release}"
     return {
         "schemaVersion": 1,
         "source": {
@@ -313,7 +320,8 @@ def expected_artifact_provenance(
         "packageToolchain": toolchain,
         "package": {
             "name": "gta-claw",
-            "version": arguments.version,
+            "version": package_identity,
+            "release": arguments.package_release,
             "architecture": arguments.arch,
         },
         "subjects": [
@@ -380,6 +388,7 @@ def main():
     parser.add_argument("--arch", required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--package-release", required=True, type=int)
     parser.add_argument("--build-image", required=True)
     parser.add_argument("--debian-snapshot", required=True)
     parser.add_argument("--artifact-dir")

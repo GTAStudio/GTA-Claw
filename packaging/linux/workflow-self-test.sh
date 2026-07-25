@@ -436,21 +436,7 @@ validate_workflow() {
   actual="$(workflow_event_names "$candidate")"
   assert_exact_block "workflow events" "$expected" "$actual" || return 1
 
-  expected="$(printf '%s\n' \
-    '.gitattributes' \
-    '.github/workflows/linux-packaging.yml' \
-    '.github/workflows/macos-packaging.yml' \
-    '.github/workflows/windows-packaging.yml' \
-    'packaging/linux/**' \
-    'apps/**' \
-    'crates/**' \
-    'compat/**' \
-    'desktop/**' \
-    'Cargo.lock' \
-    'Cargo.toml' \
-    'deny.toml' \
-    'rust-toolchain.toml' \
-    'rustfmt.toml')"
+  expected='**'
   for event in push pull_request; do
     actual="$(workflow_trigger_paths "$event" "$candidate")" || return 1
     assert_exact_block "$event trigger paths" "$expected" "$actual" || return 1
@@ -502,7 +488,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    9443154dac13aec6ab55d9923a389701e5f2ac412fbff0b6d40c60532b5cbb86 \
+    a429b74dcce18dc1d0269963c2da4d68a66b8f2fc3db316b4d448cc07f9b449f \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \
@@ -560,6 +546,7 @@ workflow_accepts_path() {
 
   while IFS= read -r pattern; do
     case "$pattern" in
+      '**') return 0 ;;
       */'**')
         prefix="${pattern%/**}"
         [[ "$changed_path" == "$prefix"/* ]] && return 0
@@ -618,7 +605,7 @@ insert_event_path() {
     in_event && $0 != "  " event ":" && /^  [^ ]/ {
       in_event = 0
     }
-    in_event && !inserted && $0 == "      - \"apps/**\"" {
+    in_event && !inserted && $0 == "      - \"**\"" {
       print
       print entry
       inserted++
@@ -645,7 +632,7 @@ insert_event_block_path() {
     in_event && $0 != "  " event ":" && /^  [^ ]/ {
       in_event = 0
     }
-    in_event && !inserted && $0 == "      - \"apps/**\"" {
+    in_event && !inserted && $0 == "      - \"**\"" {
       print
       print "      - " style
       print "        !apps/**"
@@ -661,13 +648,24 @@ insert_event_block_path() {
   ' "$candidate" >"$output"
 }
 
-synthetic_app_path="apps/gta-claw-cli/src/lib.rs"
+consumed_paths="$(
+  printf '%s\n' \
+    apps/gta-claw-cli/src/lib.rs \
+    .cargo/audit.toml \
+    .gitignore \
+    .github/workflows/upstream-gateway-reference.yml \
+    desktop/Cargo.toml \
+    .github/workflows/windows-packaging.yml \
+    .github/workflows/macos-packaging.yml
+)"
 for event in push pull_request; do
-  workflow_accepts_path "$event" "$synthetic_app_path" "$workflow" || {
-    printf '%s does not accept apps-only change: %s\n' \
-      "$event" "$synthetic_app_path" >&2
-    exit 1
-  }
+  while IFS= read -r consumed_path; do
+    workflow_accepts_path "$event" "$consumed_path" "$workflow" || {
+      printf '%s does not accept consumed input change: %s\n' \
+        "$event" "$consumed_path" >&2
+      exit 1
+    }
+  done <<<"$consumed_paths"
 done
 
 validate_workflow "$workflow"
@@ -913,25 +911,20 @@ expect_actionlint_valid_validation_failure \
   "$tmp_dir/masking-workflow-defaults.yml"
 
 awk '
-  !changed && /^      - "apps\/\*\*"$/ {
-    print "      - '\''apps/**'\''"
+  !changed && /^      - "\*\*"$/ {
+    print "      - '\''**'\''"
     changed = 1
-    next
-  }
-  changed == 1 && /^      - "apps\/\*\*"$/ {
-    print "      - apps/**"
-    changed = 2
     next
   }
   { print }
   END {
-    if (changed != 2) {
+    if (changed != 1) {
       exit 1
     }
   }
 ' "$workflow" >"$tmp_dir/equivalent-path-scalars.yml"
 expect_actionlint_valid_validation_success \
-  "single-quoted and unquoted positive path scalars" \
+  "single-quoted positive path scalar" \
   "$tmp_dir/equivalent-path-scalars.yml"
 
 insert_event_path \
@@ -1018,8 +1011,8 @@ awk '
   in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
     in_pr = 0
   }
-  in_pr && !changed && /^      - "apps\/\*\*"$/ {
-    print "      - apps/** # semantically equivalent but unsupported comment"
+  in_pr && !changed && /^      - "\*\*"$/ {
+    print "      - \"**\" # semantically equivalent but unsupported comment"
     changed++
     next
   }
@@ -1041,7 +1034,7 @@ awk '
   in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
     in_pr = 0
   }
-  in_pr && !inserted && /^      - "apps\/\*\*"$/ {
+  in_pr && !inserted && /^      - "\*\*"$/ {
     print
     print "      - docs/**"
     inserted++

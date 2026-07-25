@@ -367,6 +367,7 @@ build_scriptlet_fixture() {
   local name="$1"
   local extra="$2"
   local file_extra="${3:-}"
+  local header_extra="${4:-}"
   local top="$work/rpm-$name"
   local spec="$top/SPECS/$name.spec"
   mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
@@ -378,7 +379,11 @@ build_scriptlet_fixture() {
       'Release: 1' \
       'Summary: scriptlet policy fixture' \
       'License: MIT' \
-      'BuildArch: noarch' \
+      'BuildArch: noarch'
+    if [[ -n "$header_extra" ]]; then
+      printf '%s\n' "$header_extra"
+    fi
+    printf '%s\n' \
       '%description' \
       'scriptlet policy fixture' \
       '%prep' \
@@ -421,6 +426,16 @@ ghost_rpm="$(
 )"
 if (reject_rpm_ghost_files "$ghost_rpm"); then
   die "RPM header policy accepted a ghost path"
+fi
+node_requirement_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-node-requirement-test \
+    "" \
+    "" \
+    'Requires: nodejs'
+)"
+if (reject_forbidden_rpm_requirements "$node_requirement_rpm"); then
+  die "RPM dependency policy accepted nodejs"
 fi
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign

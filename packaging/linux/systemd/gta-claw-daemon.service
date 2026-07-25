@@ -10,12 +10,12 @@ Type=notify
 NotifyAccess=main
 TimeoutStartSec=60s
 ExecStartPre=/usr/bin/test ! -e /run/gta-claw-state-init/initialization-failed
+ExecStartPre=/usr/bin/test ! -e /var/lib/gta-claw-install/transaction-failed
 ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected
 ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected
 User=gta-claw
 Group=gta-claw
 SupplementaryGroups=
-EnvironmentFile=-/etc/gta-claw/gta-claw.env
 LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf
 CacheDirectory=gta-claw
 CacheDirectoryMode=0700

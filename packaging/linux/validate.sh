@@ -53,6 +53,7 @@ validate_generated_metadata() {
     --arch "$arch" \
     --target "$rust_target" \
     --version "$VERSION" \
+    --package-release "$LINUX_PACKAGE_RELEASE" \
     --build-image "$LINUX_BUILD_IMAGE" \
     --debian-snapshot "$LINUX_DEBIAN_SNAPSHOT" \
     "$@"
@@ -95,6 +96,7 @@ native_tar_files() {
     lib/systemd/system/gta-claw-state-init.service \
     lib/sysusers.d/gta-claw.conf \
     libexec/gta-claw-runtime-ready \
+    libexec/gta-claw-direct-config \
     libexec/gta-claw-state-init \
     package-version \
     provenance.json \
@@ -296,7 +298,7 @@ python3 "$LINUX_DIR/strict_artifact.py" \
   "$artifact_dir/provenance-$arch.json" \
   >/dev/null
 
-validate_archive_entries "$tar_artifact" gzip
+validate_archive_entries "$tar_artifact" gzip forbidden
 tar_listing="$(tar -tzf "$tar_artifact")"
 assert_no_protected_payload_path "native tar" "$tar_listing"
 if grep -Eiq '(^|/)(node(js)?|npm|npx|pnpm|bun)(/|$)|\.(js|mjs|cjs|node)$' \
@@ -337,6 +339,7 @@ for source_target in \
   "systemd/80-gta-claw.preset|lib/systemd/system-preset/80-gta-claw.preset" \
   "sysusers/gta-claw.conf|lib/sysusers.d/gta-claw.conf" \
   "libexec/gta-claw-runtime-ready|libexec/gta-claw-runtime-ready" \
+  "direct/config-safeio.py|libexec/gta-claw-direct-config" \
   "libexec/gta-claw-state-init|libexec/gta-claw-state-init" \
   "systemd/gta-claw.env|etc/gta-claw/gta-claw.env" \
   "systemd/daemon.conf|etc/gta-claw/credentials/daemon.conf" \
@@ -372,6 +375,7 @@ for executable in \
   install.sh \
   uninstall.sh \
   libexec/gta-claw-runtime-ready \
+  libexec/gta-claw-direct-config \
   libexec/gta-claw-state-init; do
   assert_mode "$archive_root" "$executable" 755
 done
@@ -441,8 +445,8 @@ finish_output_file
 open_output_file "$deb_control_tar" 0644
 dpkg-deb --ctrl-tarfile "$deb_artifact" >&"$OPEN_OUTPUT_FD"
 finish_output_file
-validate_archive_entries "$deb_payload_tar" none
-validate_archive_entries "$deb_control_tar" none
+validate_archive_entries "$deb_payload_tar" none required
+validate_archive_entries "$deb_control_tar" none required
 deb_payload_listing="$(
   tar -tf "$deb_payload_tar" |
     sed -e 's#^\./##' -e 's#/$##' -e '/^$/d' |
@@ -550,6 +554,10 @@ cmp -s "$expected_md5sums" "$deb_control_root/md5sums" ||
 
 [[ "$(rpm -qp --qf '%{ARCH}' "$rpm_artifact")" == "$rpm_architecture" ]] ||
   die "RPM architecture mismatch"
+[[ "$(rpm -qp --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}' \
+  "$rpm_artifact")" == \
+  "$LINUX_PACKAGE_NAME|0|$VERSION|$LINUX_PACKAGE_RELEASE|$rpm_architecture" ]] ||
+  die "RPM NEVRA identity differs from the exact package policy"
 rpm -qpl "$rpm_artifact" | grep -Fx '/usr/bin/gta-claw-cli' >/dev/null
 rpm -qpl "$rpm_artifact" |
   grep -Fx '/usr/libexec/gta-claw/gta-claw-daemon' >/dev/null
@@ -584,6 +592,7 @@ actual_rpm_flags="$(
 [[ "$actual_rpm_flags" == "$expected_rpm_flags" ]] ||
   die "RPM header file flags differ from the exact config/document policy"
 reject_rpm_ghost_files "$rpm_artifact"
+reject_forbidden_rpm_requirements "$rpm_artifact"
 rpm -qp --requires "$rpm_artifact" | grep -Fx "glibc >= $BUILD_GLIBC_REQUIREMENT" >/dev/null ||
   die "RPM glibc dependency does not match ELF-derived requirement"
 rpm -qp --requires "$rpm_artifact" | grep -Fx "util-linux" >/dev/null ||
@@ -646,6 +655,50 @@ create_private_validation_directory "$rpm_payload_root"
 )
 reject_links_and_special_files "$rpm_payload_root"
 validate_published_native_root "$rpm_payload_root" "RPM package"
+[[ -x /usr/lib/rpm/rpmdeps ]] ||
+  die "RPM dependency validation requires /usr/lib/rpm/rpmdeps"
+expected_rpm_requires="$(
+  {
+    find "$rpm_payload_root" -type f -print0 |
+      xargs -0 /usr/lib/rpm/rpmdeps --requires
+    printf '%s\n' \
+      "glibc >= $BUILD_GLIBC_REQUIREMENT" \
+      libgcc \
+      "systemd >= 249" \
+      util-linux \
+      'rpmlib(CompressedFileNames) <= 3.0.4-1' \
+      'rpmlib(FileDigests) <= 4.6.0-1' \
+      'rpmlib(PayloadFilesHavePrefix) <= 4.0-1'
+  } | LC_ALL=C sort -u
+)"
+actual_rpm_requires="$(rpm -qp --requires "$rpm_artifact" | LC_ALL=C sort -u)"
+[[ "$actual_rpm_requires" == "$expected_rpm_requires" ]] ||
+  die "RPM dependency inventory differs from payload-derived exact policy"
+expected_rpm_metadata="$(
+  while IFS= read -r path; do
+    flag=
+    case "$path" in
+      etc/gta-claw/credentials/daemon.conf | etc/gta-claw/gta-claw.env)
+        flag=cn
+        ;;
+      usr/share/doc/gta-claw/*)
+        flag=d
+        ;;
+    esac
+    printf '/%s\t%s\troot\troot\t%s\n' \
+      "$path" \
+      "$(stat -c '%A' "$rpm_payload_root/$path")" \
+      "$flag"
+  done <<<"$expected_rpm_file_listing"
+)"
+actual_rpm_metadata="$(
+  rpm -qp --qf \
+    '[%{FILENAMES}\t%{FILEMODES:perms}\t%{FILEUSERNAME}\t%{FILEGROUPNAME}\t%{FILEFLAGS:fflags}\n]' \
+    "$rpm_artifact" |
+    LC_ALL=C sort
+)"
+[[ "$actual_rpm_metadata" == "$expected_rpm_metadata" ]] ||
+  die "RPM per-file mode/owner/group/flag inventory differs from exact policy"
 diff --no-dereference --recursive "$deb_payload_root" "$rpm_payload_root" >/dev/null ||
   die "Debian and RPM published payload bytes or metadata differ"
 

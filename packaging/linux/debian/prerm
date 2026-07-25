@@ -102,6 +102,16 @@ restore_enablement() {
   fi
 }
 
+retire_remove_journal() {
+  rm -f \
+    "$remove_was_active" \
+    "$remove_was_enabled" \
+    "$remove_was_enabled_runtime" \
+    "$remove_initializer_was_active" \
+    "$remove_prepared" \
+    "$remove_was_package_fenced"
+}
+
 restore_on_failure() {
   status=$?
   trap - 0 HUP INT TERM
@@ -138,6 +148,7 @@ restore_on_failure() {
           fence_failed_restore
       fi
     fi
+    retire_remove_journal || fence_failed_restore
   fi
   exit "$status"
 }

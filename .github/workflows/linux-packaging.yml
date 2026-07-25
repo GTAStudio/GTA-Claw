@@ -5,36 +5,10 @@ on:
     branches:
       - main
     paths:
-      - ".gitattributes"
-      - ".github/workflows/linux-packaging.yml"
-      - ".github/workflows/macos-packaging.yml"
-      - ".github/workflows/windows-packaging.yml"
-      - "packaging/linux/**"
-      - "apps/**"
-      - "crates/**"
-      - "compat/**"
-      - "desktop/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "deny.toml"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
+      - "**"
   pull_request:
     paths:
-      - ".gitattributes"
-      - ".github/workflows/linux-packaging.yml"
-      - ".github/workflows/macos-packaging.yml"
-      - ".github/workflows/windows-packaging.yml"
-      - "packaging/linux/**"
-      - "apps/**"
-      - "crates/**"
-      - "compat/**"
-      - "desktop/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "deny.toml"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
+      - "**"
   workflow_dispatch:
 
 permissions:
@@ -120,6 +94,8 @@ jobs:
           actionlint .github/workflows/linux-packaging.yml
           ./packaging/linux/workflow-self-test.sh
           ./packaging/linux/self-test.sh
+          sudo ./packaging/linux/tests/direct-config-self-test.sh \
+            "$RUNNER_TEMP/gta-claw-direct-config-self-test"
           TMPDIR="$RUNNER_TEMP" python3 packaging/linux/safeio.py \
             run-create linux-safeio-self-test -- \
             ./packaging/linux/safeio-self-test.sh

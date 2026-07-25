@@ -7,6 +7,8 @@ import shlex
 import sys
 from pathlib import Path, PurePosixPath
 
+import yaml
+
 FORBIDDEN = frozenset({"bun", "node", "nodejs", "npm", "npx", "pnpm"})
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 SHELL_SHEBANG = re.compile(r"^#!.*(?:ba|da|k|z)?sh(?:\s|$)")
@@ -14,7 +16,7 @@ FORBIDDEN_WORD = re.compile(
     r"(^|[^A-Za-z0-9_.-])(bun|node|nodejs|npm|npx|pnpm)(?=[^A-Za-z0-9_.-]|$)"
 )
 SEPARATORS = frozenset({"\n", ";", ";;", "&", "&&", "|", "||", "(", ")", "{", "}", "`"})
-REDIRECTIONS = frozenset({"<", ">", "<<", ">>", "<>", "<&", ">&"})
+REDIRECTIONS = frozenset({"<", ">", "<<", "<<<", ">>", "<>", "<&", ">&"})
 RESERVED = frozenset(
     {
         "!",
@@ -56,6 +58,24 @@ PREFIX_OPTIONS_WITH_VALUES = {
     "sudo": frozenset({"-C", "-D", "-g", "-h", "-p", "-R", "-r", "-t", "-T", "-u"}),
     "stdbuf": frozenset({"-e", "--error", "-i", "--input", "-o", "--output"}),
     "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
+    "xargs": frozenset(
+        {
+            "-d",
+            "--delimiter",
+            "-E",
+            "--eof",
+            "-I",
+            "--replace",
+            "-L",
+            "--max-lines",
+            "-n",
+            "--max-args",
+            "-P",
+            "--max-procs",
+            "-s",
+            "--max-chars",
+        }
+    ),
 }
 SHELL_DIRECTORIES = frozenset({"debian", "direct", "libexec", "rpm"})
 PYTHON_COMMAND_CALLS = frozenset(
@@ -82,6 +102,39 @@ PYTHON_COMMAND_CALLS = frozenset(
         "subprocess.Popen",
         "subprocess.run",
     }
+)
+PYTHON_INTERPRETER = re.compile(r"^python(?:[0-9]+(?:\.[0-9]+)?)?$")
+STATIC_VARIABLES = {
+    "LINUX_DIR": "/trusted/linux",
+    "LINUX_CLI_NAME": "gta-claw-cli",
+    "LINUX_DAEMON_NAME": "gta-claw-daemon",
+    "OUTPUT_ROOT": "/trusted/output",
+    "REPO_ROOT": "/trusted/repository",
+    "SAFEIO_HELPER": "/trusted/linux/safeio.py",
+    "SAFEIO_BUILD_FD": "12",
+    "SAFEIO_OUTPUT_FD": "11",
+    "SAFEIO_TARGET_FD": "10",
+    "SCRIPT_DIR": "/trusted/script",
+}
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def unique_yaml_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    unique_yaml_mapping,
 )
 
 
@@ -202,8 +255,16 @@ def shell_tokens(text):
             value = flush()
             if value is not None:
                 yield value
+            triple = text[index : index + 3]
             pair = text[index : index + 2]
-            punctuation = pair if pair in {"&&", "||", ";;", "<<", ">>", "<>", "<&", ">&"} else character
+            if triple == "<<<":
+                punctuation = triple
+            else:
+                punctuation = (
+                    pair
+                    if pair in {"&&", "||", ";;", "<<", ">>", "<>", "<&", ">&"}
+                    else character
+                )
             if punctuation == "(" and command_depth > 0:
                 command_depth += 1
             elif punctuation == ")" and command_depth > 0:
@@ -265,7 +326,7 @@ def skip_options(tokens, index, command):
     return index
 
 
-def inspect_env(tokens, index, depth):
+def inspect_env(tokens, index, depth, variables=None, allow_positional=False):
     while index < len(tokens):
         option, line = tokens[index]
         if option == "--":
@@ -278,13 +339,23 @@ def inspect_env(tokens, index, depth):
                 split = shlex.split(tokens[index + 1][0], posix=True)
             except ValueError as error:
                 raise ValueError(f"invalid env split string: {error}") from error
-            return inspect_command([(value, line) for value in split], depth + 1)
+            return inspect_command(
+                [(value, line) for value in split],
+                depth + 1,
+                variables,
+                allow_positional,
+            )
         if option.startswith("--split-string="):
             try:
                 split = shlex.split(option.split("=", 1)[1], posix=True)
             except ValueError as error:
                 raise ValueError(f"invalid env split string: {error}") from error
-            return inspect_command([(value, line) for value in split], depth + 1)
+            return inspect_command(
+                [(value, line) for value in split],
+                depth + 1,
+                variables,
+                allow_positional,
+            )
         if ASSIGNMENT.match(option):
             index += 1
             continue
@@ -296,7 +367,16 @@ def inspect_env(tokens, index, depth):
         index = next_index
     while index < len(tokens) and ASSIGNMENT.match(tokens[index][0]):
         index += 1
-    return inspect_command(tokens[index:], depth + 1) if index < len(tokens) else []
+    return (
+        inspect_command(
+            tokens[index:],
+            depth + 1,
+            variables,
+            allow_positional,
+        )
+        if index < len(tokens)
+        else []
+    )
 
 
 def shell_command_string(tokens, index):
@@ -318,17 +398,69 @@ def shell_command_string(tokens, index):
     return None
 
 
-def inspect_command(segment, depth=0):
+def expand_static(value, variables):
+    unresolved = False
+
+    def replace(match):
+        nonlocal unresolved
+        name = match.group(1) or match.group(2)
+        if name not in variables:
+            unresolved = True
+            return match.group(0)
+        return variables[name]
+
+    expanded = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, value)
+    return None if unresolved or "$(" in expanded or "`" in expanded else expanded
+
+
+def inspect_command(
+    segment,
+    depth=0,
+    variables=None,
+    allow_positional=False,
+    allow_dynamic_lines=frozenset(),
+):
     if depth > 16:
         raise ValueError("shell command recursion exceeds policy bound")
+    variables = dict(STATIC_VARIABLES if variables is None else variables)
     tokens = remove_redirections(segment)
+    if tokens and tokens[0][0] in {"case", "for", "select", "until", "while"}:
+        return []
     index = 0
-    while index < len(tokens) and (ASSIGNMENT.match(tokens[index][0]) or tokens[index][0] in RESERVED):
+    while index < len(tokens) and ASSIGNMENT.match(tokens[index][0]):
+        name, value = tokens[index][0].split("=", 1)
+        expanded = expand_static(value, variables)
+        if expanded is not None:
+            variables[name] = expanded
+        index += 1
+    while index < len(tokens) and tokens[index][0] in RESERVED:
         index += 1
     if index >= len(tokens):
         return []
     command_token, line = tokens[index]
-    command = command_name(command_token.lstrip("-+!:@"))
+    if tokens[-1][0] in {"]", "]]"}:
+        return []
+    if any(
+        token in {"==", "!=", "=~", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"}
+        for token, _ in tokens
+    ):
+        return []
+    if command_token.endswith("}") and command_token.startswith("/"):
+        return []
+    if any(character.isspace() for character in command_token):
+        return []
+    if command_token in {"$@", "$*"}:
+        if allow_positional:
+            return []
+        raise ValueError("unresolved positional command is forbidden")
+    expanded_command = expand_static(command_token, variables)
+    if expanded_command is None:
+        if line in allow_dynamic_lines:
+            return []
+        raise ValueError(
+            f"unresolved dynamic command position at line {line}: {command_token}"
+        )
+    command = command_name(expanded_command.lstrip("-+!:@"))
     findings = []
     if command in FORBIDDEN:
         findings.append((line, command))
@@ -337,30 +469,59 @@ def inspect_command(segment, depth=0):
         if script_index is not None:
             if script_index >= len(tokens):
                 raise ValueError(f"{command} command option requires a script")
-            findings.extend(inspect_shell(tokens[script_index][0], line, depth + 1))
+            findings.extend(
+                inspect_shell(
+                    tokens[script_index][0],
+                    line,
+                    depth + 1,
+                    variables,
+                    allow_positional,
+                )
+            )
+        return findings
+    if PYTHON_INTERPRETER.fullmatch(command):
+        option_index = index + 1
+        while option_index < len(tokens):
+            option = tokens[option_index][0]
+            if option == "-c":
+                if option_index + 1 >= len(tokens):
+                    raise ValueError("Python -c requires source")
+                findings.extend(
+                    inspect_python_text(tokens[option_index + 1][0], line)
+                )
+                return findings
+            if option in {"-m", "-W", "-X"}:
+                option_index += 2
+                continue
+            if option.startswith("-"):
+                option_index += 1
+                continue
+            return findings
         return findings
     if command == "eval":
         script = " ".join(token for token, _ in tokens[index + 1 :])
-        findings.extend(inspect_shell(script, line, depth + 1))
+        findings.extend(inspect_shell(script, line, depth + 1, variables, allow_positional))
         return findings
     if command == "command" and index + 1 < len(tokens) and tokens[index + 1][0] in {"-v", "-V"}:
         return findings
     if command == "env":
-        findings.extend(inspect_env(tokens, index + 1, depth))
+        findings.extend(
+            inspect_env(tokens, index + 1, depth, variables, allow_positional)
+        )
         return findings
     if command == "timeout":
         index = skip_options(tokens, index + 1, command)
         if index < len(tokens):
             index += 1
         if index < len(tokens):
-            findings.extend(inspect_command(tokens[index:], depth + 1))
+            findings.extend(inspect_command(tokens[index:], depth + 1, variables, allow_positional))
         return findings
     if command == "chroot":
         index = skip_options(tokens, index + 1, command)
         if index < len(tokens):
             index += 1
         if index < len(tokens):
-            findings.extend(inspect_command(tokens[index:], depth + 1))
+            findings.extend(inspect_command(tokens[index:], depth + 1, variables, allow_positional))
         return findings
     if command in {
         "command",
@@ -379,14 +540,149 @@ def inspect_command(segment, depth=0):
         while index < len(tokens) and ASSIGNMENT.match(tokens[index][0]):
             index += 1
         if index < len(tokens):
-            findings.extend(inspect_command(tokens[index:], depth + 1))
+            findings.extend(inspect_command(tokens[index:], depth + 1, variables, allow_positional))
     return findings
 
 
-def inspect_shell(text, base_line=1, depth=0):
-    findings = []
-    for segment in command_segments(text):
-        for line, command in inspect_command(segment, depth):
+def command_substitutions(text):
+    def find_end(start):
+        cursor = start
+        depth = 1
+        quote = None
+        while cursor < len(text):
+            character = text[cursor]
+            if quote == "'":
+                if character == "'":
+                    quote = None
+                cursor += 1
+                continue
+            if quote == '"':
+                if character == "\\" and cursor + 1 < len(text):
+                    cursor += 2
+                    continue
+                if character == '"':
+                    quote = None
+                    cursor += 1
+                    continue
+                if text[cursor : cursor + 2] == "$(":
+                    cursor = find_end(cursor + 2)
+                    continue
+                cursor += 1
+                continue
+            if character == "\\" and cursor + 1 < len(text):
+                cursor += 2
+                continue
+            if character == "'":
+                quote = "'"
+            elif character == '"':
+                quote = '"'
+            elif text[cursor : cursor + 2] in {"$(", "<(", ">("}:
+                cursor = find_end(cursor + 2)
+                continue
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+            cursor += 1
+        raise ValueError("unterminated command substitution")
+
+    masked = []
+    substitutions = []
+    index = 0
+    line = 1
+    quote = None
+    while index < len(text):
+        character = text[index]
+        if quote == "'":
+            masked.append(character)
+            if character == "'":
+                quote = None
+            line += character == "\n"
+            index += 1
+            continue
+        if quote == '"' and character == '"':
+            quote = None
+            masked.append(character)
+            index += 1
+            continue
+        if character == "\\" and index + 1 < len(text):
+            masked.extend(text[index : index + 2])
+            line += text[index + 1] == "\n"
+            index += 2
+            continue
+        if character == "'" and quote is None:
+            quote = "'"
+            masked.append(character)
+            index += 1
+            continue
+        if character == '"' and quote is None:
+            quote = '"'
+            masked.append(character)
+            index += 1
+            continue
+        substitution = text[index : index + 2]
+        if substitution == "$(" or (
+            quote is None and substitution in {"<(", ">("}
+        ):
+            start_line = line
+            inner_start = index + 2
+            cursor = find_end(inner_start)
+            content = text[inner_start : cursor - 1]
+            substitutions.append((content, start_line))
+            replacement = "__GTA_CLAW_COMMAND_SUBSTITUTION__"
+            replacement += "\\\n" * content.count("\n")
+            masked.append(replacement)
+            line += content.count("\n")
+            index = cursor
+            continue
+        masked.append(character)
+        line += character == "\n"
+        index += 1
+    return "".join(masked), substitutions
+
+
+def inspect_shell(text, base_line=1, depth=0, variables=None, allow_positional=False):
+    variables = dict(STATIC_VARIABLES if variables is None else variables)
+    masked_text, substitutions = command_substitutions(text)
+    heredoc_lines = set()
+    heredoc_terminator = None
+    for number, source_line in enumerate(masked_text.splitlines(), start=1):
+        if heredoc_terminator is not None:
+            heredoc_lines.add(number)
+            if source_line == heredoc_terminator:
+                heredoc_terminator = None
+            continue
+        stripped = source_line.strip()
+        heredoc = re.search(r"<<-?['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", source_line)
+        if heredoc:
+            heredoc_terminator = heredoc.group(1)
+    findings = [
+        finding
+        for content, line in substitutions
+        for finding in inspect_shell(
+            content,
+            base_line + line - 1,
+            depth + 1,
+            variables,
+            allow_positional,
+        )
+    ]
+    for segment in command_segments(masked_text):
+        for token, _ in segment:
+            if ASSIGNMENT.match(token):
+                name, value = token.split("=", 1)
+                expanded = expand_static(value, variables)
+                if expanded is not None:
+                    variables[name] = expanded
+        for line, command in inspect_command(
+            segment,
+            depth,
+            variables,
+            allow_positional,
+            heredoc_lines,
+        ):
             findings.append((base_line + line - 1, command))
     return findings
 
@@ -408,11 +704,11 @@ def literal_strings(node):
             yield from literal_strings(element)
 
 
-def inspect_python(path, text):
+def inspect_python_text(text, base_line=1):
     findings = []
-    tree = ast.parse(text, filename=str(path))
+    tree = ast.parse(text)
     aliases = {}
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name in {"asyncio", "os", "subprocess"}:
@@ -435,11 +731,19 @@ def inspect_python(path, text):
             continue
         for argument in node.args:
             for value in literal_strings(argument):
-                findings.extend(inspect_shell(value, node.lineno))
+                findings.extend(inspect_shell(value, base_line + node.lineno - 1))
         for keyword in node.keywords:
             for value in literal_strings(keyword.value):
-                findings.extend(inspect_shell(value, node.lineno))
+                findings.extend(inspect_shell(value, base_line + node.lineno - 1))
     return findings
+
+
+def inspect_python(path, text):
+    try:
+        return inspect_python_text(text)
+    except SyntaxError as error:
+        error.filename = str(path)
+        raise
 
 
 def inspect_systemd(text):
@@ -451,7 +755,23 @@ def inspect_systemd(text):
             line,
         ):
             continue
-        findings.extend(inspect_shell(line.split("=", 1)[1], number))
+        command = line.split("=", 1)[1]
+        command = re.sub(
+            r"\\x([0-9A-Fa-f]{2})",
+            lambda match: chr(int(match.group(1), 16)),
+            command,
+        )
+        command = re.sub(
+            r"\\u([0-9A-Fa-f]{4})",
+            lambda match: chr(int(match.group(1), 16)),
+            command,
+        )
+        command = re.sub(
+            r"\\U([0-9A-Fa-f]{8})",
+            lambda match: chr(int(match.group(1), 16)),
+            command,
+        )
+        findings.extend(inspect_shell(command, number))
     return findings
 
 
@@ -500,6 +820,43 @@ def inspect_dockerfile(text):
     return findings
 
 
+def inspect_yaml_value(value, line=1):
+    findings = []
+    if isinstance(value, dict):
+        command = value.get("command")
+        arguments = value.get("args")
+        if isinstance(command, list) and all(isinstance(item, str) for item in command):
+            combined = list(command)
+            if isinstance(arguments, list) and all(
+                isinstance(item, str) for item in arguments
+            ):
+                combined.extend(arguments)
+            findings.extend(inspect_command([(item, line) for item in combined]))
+        for key, child in value.items():
+            if key == "run" and isinstance(child, str):
+                findings.extend(inspect_shell(child, line))
+            elif key in {"command", "entrypoint"} and isinstance(child, str):
+                findings.extend(inspect_shell(child, line))
+            elif key == "image" and isinstance(child, str):
+                image_command = command_name(child.split("@", 1)[0].split(":", 1)[0])
+                if image_command in FORBIDDEN:
+                    findings.append((line, image_command))
+            findings.extend(inspect_yaml_value(child, line))
+    elif isinstance(value, list):
+        for child in value:
+            findings.extend(inspect_yaml_value(child, line))
+    return findings
+
+
+def inspect_yaml(text):
+    documents = list(yaml.load_all(text, Loader=UniqueKeyLoader))
+    return [
+        finding
+        for document in documents
+        for finding in inspect_yaml_value(document)
+    ]
+
+
 def shell_surface(path, text):
     relative_parts = set(path.parts)
     return (
@@ -512,18 +869,17 @@ def shell_surface(path, text):
 def inspect_path(path):
     text = path.read_text(encoding="utf-8")
     if shell_surface(path, text):
-        return inspect_shell(text)
+        return inspect_shell(
+            text,
+            allow_positional=path.name.endswith("self-test.sh")
+            or "tests" in path.parts,
+        )
     if path.suffix == ".py":
         return inspect_python(path, text)
     if path.suffix == ".service":
         return inspect_systemd(text)
     if path.suffix in {".yaml", ".yml"}:
-        return [
-            (number, match.group(2))
-            for number, line in enumerate(text.splitlines(), start=1)
-            for match in [FORBIDDEN_WORD.search(line)]
-            if match
-        ]
+        return inspect_yaml(text)
     if path.name.startswith("Dockerfile"):
         return inspect_dockerfile(text)
     if path.suffix == ".md":
@@ -538,13 +894,17 @@ def main():
     failed = False
     try:
         for path in input_paths(sys.argv[1:]):
-            for number, command in inspect_path(path):
+            try:
+                path_findings = inspect_path(path)
+            except (SyntaxError, ValueError, yaml.YAMLError) as error:
+                raise ValueError(f"{path}: {error}") from error
+            for number, command in path_findings:
                 print(
                     f"{path}:{number}: forbidden JavaScript command: {command}",
                     file=sys.stderr,
                 )
                 failed = True
-    except (OSError, SyntaxError, UnicodeError, ValueError) as error:
+    except (OSError, SyntaxError, UnicodeError, ValueError, yaml.YAMLError) as error:
         print(f"JavaScript command policy could not inspect input: {error}", file=sys.stderr)
         return 2
     return 1 if failed else 0

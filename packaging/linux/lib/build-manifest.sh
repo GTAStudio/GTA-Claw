@@ -105,6 +105,7 @@ verify_build_manifest() {
       .source.clean == true and
       (.source.commit | test("^[0-9a-f]{40}$")) and
       (.source.tree | test("^[0-9a-f]{40}$")) and
+      (.source.snapshotTreeReceipt | test("^[0-9a-f]{64}$")) and
       .builder.image == $image and
       (.builder.environmentImageId | test("^sha256:[0-9a-f]{64}$")) and
       .builder.debianSnapshot == $snapshot and
@@ -130,16 +131,24 @@ verify_build_manifest() {
       "$(sha256_file "$LINUX_DIR/Dockerfile.build")" ]] ||
       die "build recipe digest does not match current Dockerfile.build"
 
-  git -C "$REPO_ROOT" diff --quiet
-  git -C "$REPO_ROOT" diff --cached --quiet
-  source_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
-  [[ -z "$source_status" ]] || die "current source worktree is dirty: $source_status"
   BUILD_SOURCE_SHA="$(jq -er '.source.commit' "$manifest")"
   BUILD_SOURCE_TREE="$(jq -er '.source.tree' "$manifest")"
-  [[ "$BUILD_SOURCE_SHA" == "$(git -C "$REPO_ROOT" rev-parse HEAD)" ]] ||
-    die "build source commit does not match current HEAD"
-  [[ "$BUILD_SOURCE_TREE" == "$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')" ]] ||
-    die "build source tree does not match current HEAD"
+  if [[ "${IMMUTABLE_SOURCE_SNAPSHOT:-0}" == "1" ]]; then
+    [[ "$BUILD_SOURCE_SHA" == "${SOURCE_COMMIT:-}" &&
+      "$BUILD_SOURCE_TREE" == "${SOURCE_TREE:-}" &&
+      "$(jq -er '.source.snapshotTreeReceipt' "$manifest")" == \
+        "${SOURCE_TREE_RECEIPT:-}" ]] ||
+      die "build source identity does not match immutable source snapshot"
+  else
+    git -C "$REPO_ROOT" diff --quiet
+    git -C "$REPO_ROOT" diff --cached --quiet
+    source_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
+    [[ -z "$source_status" ]] || die "current source worktree is dirty: $source_status"
+    [[ "$BUILD_SOURCE_SHA" == "$(git -C "$REPO_ROOT" rev-parse HEAD)" ]] ||
+      die "build source commit does not match current HEAD"
+    [[ "$BUILD_SOURCE_TREE" == "$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')" ]] ||
+      die "build source tree does not match current HEAD"
+  fi
   [[ "$(jq -er '.source.sourceDateEpoch' "$manifest")" == "$SOURCE_DATE_EPOCH" ]] ||
     die "build source epoch does not match current commit"
 

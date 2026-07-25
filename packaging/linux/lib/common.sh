@@ -77,14 +77,20 @@ canonical_target_root() {
   [[ "$repository" == "$REPO_ROOT" ]] || die "repository root changed during validation"
   validate_absolute_path "$target" "canonical target directory"
   [[ ! -L "$target" ]] || die "canonical target directory must not be a symlink"
-  if [[ ! -e "$target" ]]; then
-    mkdir -m 0700 -- "$target"
+  if [[ -n "${GTA_CLAW_TARGET_ROOT:-}" ]]; then
+    [[ -d "$target" ]] || die "external target root must already exist"
+    [[ "$(stat -c '%u:%a' "$target")" == "$(id -u):700" ]] ||
+      die "external target root must be caller-owned mode 0700"
+  else
+    if [[ ! -e "$target" ]]; then
+      mkdir -m 0700 -- "$target"
+    fi
+    [[ "$(stat -c '%u' "$target")" -eq "$(id -u)" ]] ||
+      die "canonical target directory is not owned by the current user"
+    chmod 0700 -- "$target"
   fi
   [[ -d "$target" && ! -L "$target" ]] ||
     die "canonical target path is not a real directory"
-  [[ "$(stat -c '%u' "$target")" -eq "$(id -u)" ]] ||
-    die "canonical target directory is not owned by the current user"
-  chmod 0700 -- "$target"
   [[ "$(stat -c '%a' "$target")" == "700" ]] ||
     die "repository target directory is not private"
   canonical="$(cd "$target" && pwd -P)"
@@ -803,6 +809,7 @@ validate_service_contract() {
     'After=local-fs.target gta-claw-state-init.service' \
     'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
     'ExecStartPre=/usr/bin/test ! -e /run/gta-claw-state-init/initialization-failed' \
+    'ExecStartPre=/usr/bin/test ! -e /var/lib/gta-claw-install/transaction-failed' \
     'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'Type=notify' \
@@ -936,10 +943,18 @@ validate_direct_lifecycle_contract() {
   local installer="$1"
   local uninstaller="$2"
   local required
+  local mask_line
+  local stop_line
+  local lock_line
+  local unlink_line
   for required in \
     'refusing gta-claw downgrade' \
-    'validate_regular_or_absent /etc/gta-claw/gta-claw.env' \
+    'gta-claw-direct-config' \
+    'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
+    'persistent_was_active_marker=$persistent_runtime_directory/was-active' \
     'ensure_failure_fence' \
+    'ensure_persistent_failure_fence' \
+    'trap cancel_incomplete_install 0 HUP INT TERM' \
     'stop_runtime_for_replacement' \
     'verify_runtime_stopped' \
     'active | activating | reloading | deactivating)' \
@@ -949,6 +964,8 @@ validate_direct_lifecycle_contract() {
     'replacement_fence=$runtime_directory/replacement-fenced' \
     'stop_initializer_for_replacement' \
     'fail_install_runtime' \
+    'systemctl kill' \
+    '--kill-whom=all' \
     'systemctl reset-failed gta-claw-daemon.service' \
     '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
     '/usr/libexec/gta-claw/gta-claw-state-init' \
@@ -958,14 +975,41 @@ validate_direct_lifecycle_contract() {
       die "direct installer lifecycle contract missing: $required"
   done
   for required in \
-    'load_state="$(systemctl show -P LoadState "$unit")"' \
-    'if [ "$load_state" = "not-found" ]; then' \
-    'systemctl stop "$unit"' \
-    'active_state="$(systemctl show -P ActiveState "$unit")"' \
-    'systemctl disable "$unit"'; do
+    'persistent_enable_link=/etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service' \
+    'runtime_enable_link=/run/systemd/system/multi-user.target.wants/gta-claw-daemon.service' \
+    'persistent_mask_link=/etc/systemd/system/gta-claw-daemon.service' \
+    'runtime_mask_link=/run/systemd/system/gta-claw-daemon.service' \
+    'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
+    'marker_state()' \
+    'capture_link()' \
+    'rollback_removal()' \
+    'acquire_writer_lock' \
+    'verify_held_writer_lock' \
+    'main_pid="$(systemctl show -P MainPID "$unit")"' \
+    'control_pid="$(systemctl show -P ControlPID "$unit")"' \
+    'systemctl mask --runtime gta-claw-daemon.service' \
+    'payload_mutated=1'; do
     grep -F -- "$required" "$uninstaller" >/dev/null ||
       die "direct uninstaller lifecycle contract missing: $required"
   done
+  mask_line="$(
+    grep -nF '  systemctl mask --runtime gta-claw-daemon.service' "$uninstaller" |
+      tail -n 1 |
+      cut -d: -f1
+  )"
+  stop_line="$(
+    grep -nF '  systemctl stop gta-claw-daemon.service' "$uninstaller" |
+      tail -n 1 |
+      cut -d: -f1
+  )"
+  lock_line="$(grep -nF 'acquire_writer_lock' "$uninstaller" | tail -n 1 | cut -d: -f1)"
+  unlink_line="$(grep -nF 'payload_mutated=1' "$uninstaller" | tail -n 1 | cut -d: -f1)"
+  [[ -n "$mask_line" && -n "$stop_line" && -n "$lock_line" &&
+    -n "$unlink_line" &&
+    "$mask_line" -lt "$stop_line" &&
+    "$stop_line" -lt "$lock_line" &&
+    "$lock_line" -lt "$unlink_line" ]] ||
+    die "direct uninstaller does not mask, stop, lock, and unlink in order"
   grep -F 'preserved /var/lib/gta-claw-protected' "$uninstaller" >/dev/null ||
     die "direct uninstaller does not declare protected-state preservation"
   if grep -Eq 'rm .*gta-claw-protected|rm -[^[:space:]]*r.*gta-claw-protected' \
@@ -1082,6 +1126,14 @@ reject_rpm_ghost_files() {
       awk -F '\t' 'index($2, "g") { print $1; exit }'
   )"
   [[ -z "$ghost" ]] || die "RPM contains an unexpected ghost path: $ghost"
+}
+
+reject_forbidden_rpm_requirements() {
+  local artifact="$1"
+  if rpm -qp --requires "$artifact" |
+    grep -Eiq '(^|[[:space:]])(node|nodejs|npm|npx|pnpm|bun)([[:space:]]|$)'; then
+    die "RPM declares a forbidden JavaScript runtime or package-manager dependency"
+  fi
 }
 
 source "$LINUX_DIR/config.sh"

@@ -7,10 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/worktree-git.sh"
 bootstrap_windows_worktree_git "$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/container-trust.sh"
 source "$SCRIPT_DIR/lib/container-mount.sh"
 
 require_linux
-for tool in docker id sha256sum; do
+for tool in docker findmnt git id python3 realpath sha256sum stat tar; do
   require_tool "$tool"
 done
 [[ "$#" -eq 1 ]] || die "usage: build-container.sh ARCH"
@@ -19,6 +20,11 @@ arch_target "$arch" >/dev/null
 
 : "${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must select a new private build root}"
 target_root="$(canonical_target_root)"
+git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
+assert_isolated_target_root "$REPO_ROOT" "$git_common_dir" "$target_root"
+assert_no_path_overlap "$REPO_ROOT" "source repository" "$TMPDIR" "snapshot temp root"
+assert_no_path_overlap "$git_common_dir" "Git common directory" "$TMPDIR" "snapshot temp root"
+assert_no_path_overlap "$target_root" "target root" "$TMPDIR" "snapshot temp root"
 validate_new_private_root_path "$CARGO_TARGET_DIR" "CARGO_TARGET_DIR"
 target_relative="${CARGO_TARGET_DIR#"$target_root/"}"
 validate_safe_component "$target_relative" "CARGO_TARGET_DIR component"
@@ -29,89 +35,92 @@ case "$build_input_umask" in
   *) die "BUILD_INPUT_UMASK must be 000 or 002" ;;
 esac
 
-recipe_sha="$(sha256_file "$SCRIPT_DIR/Dockerfile.build")"
+create_verified_source_snapshot "$REPO_ROOT"
+trap cleanup_container_trust EXIT INT TERM
+assert_no_path_overlap \
+  "$SOURCE_SNAPSHOT_DIRECTORY" \
+  "immutable source snapshot" \
+  "$target_root" \
+  "target root"
+prepare_output_component "$target_root" "$target_relative"
+assert_no_path_overlap \
+  "$SOURCE_SNAPSHOT_DIRECTORY" \
+  "immutable source snapshot" \
+  "$OUTPUT_COMPONENT_PATH" \
+  "build output"
+source_receipt="$(trust_receipt "$SOURCE_SNAPSHOT_DIRECTORY" "immutable source snapshot")"
+repository_receipt="$(trust_receipt "$REPO_ROOT" "source repository")"
+git_receipt="$(trust_receipt "$git_common_dir" "Git common directory")"
+target_receipt="$(trust_receipt "$target_root" "target root")"
+output_receipt="$(trust_receipt "$OUTPUT_COMPONENT_PATH" "build output")"
+
+recipe_sha="$(sha256_file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build")"
 image_tag="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
-git -C "$REPO_ROOT" archive --format=tar HEAD |
 docker build \
-  --file packaging/linux/Dockerfile.build \
+  --file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build" \
   --build-arg "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
   --tag "$image_tag" \
-  -
+  "$SOURCE_SNAPSHOT_DIRECTORY"
 environment_image_id="$(docker image inspect --format '{{.Id}}' "$image_tag")"
 [[ "$environment_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "pinned build environment produced an invalid image ID"
 
-git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
-git_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-dir)"
-if [[ "$git_dir" == "$git_common_dir" ]]; then
-  git_relative=""
-elif [[ "$git_dir" == "$git_common_dir/"* ]]; then
-  git_relative="${git_dir#"$git_common_dir/"}"
-else
-  die "worktree Git directory is outside the common Git directory"
-fi
-container_git_dir="/gta-claw-git${git_relative:+/$git_relative}"
-exec {repo_mount_fd}<"$REPO_ROOT"
-exec {target_mount_fd}<"$target_root"
-exec {git_mount_fd}<"$git_common_dir"
-repo_mount="/proc/$BASHPID/fd/$repo_mount_fd"
-target_mount="/proc/$BASHPID/fd/$target_mount_fd"
-git_mount="/proc/$BASHPID/fd/$git_mount_fd"
-repo_mount_id="$(stat -Lc '%d:%i' "$repo_mount")"
-target_mount_id="$(stat -Lc '%d:%i' "$target_mount")"
-git_mount_id="$(stat -Lc '%d:%i' "$git_mount")"
-create_anchored_mounts "$repo_mount" "$target_mount" "$git_mount"
+exec {source_fd}<"$SOURCE_SNAPSHOT_DIRECTORY"
+create_anchored_mounts \
+  "/proc/$BASHPID/fd/$source_fd" \
+  "/proc/$BASHPID/fd/$OUTPUT_COMPONENT_FD"
+trap 'cleanup_anchored_mounts; cleanup_container_trust' EXIT INT TERM
 container_manifest="$(
-docker run --rm \
-  --cap-drop ALL \
-  --cap-add CHOWN \
-  --cap-add DAC_OVERRIDE \
-  --cap-add FOWNER \
-  --security-opt no-new-privileges \
-  --env "BUILD_IMAGE=$LINUX_BUILD_IMAGE" \
-  --env "BUILD_INPUT_UMASK=$build_input_umask" \
-  --env "BUILD_ENVIRONMENT_IMAGE_ID=$environment_image_id" \
-  --env "BUILD_RECIPE_SHA256=$recipe_sha" \
-  --env "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
-  --env "RUSTFLAGS=-Dwarnings" \
-  --env GIT_CONFIG_COUNT=2 \
-  --env GIT_CONFIG_KEY_0=safe.directory \
-  --env GIT_CONFIG_VALUE_0=/workspace \
-  --env GIT_CONFIG_KEY_1=core.autocrlf \
-  --env GIT_CONFIG_VALUE_1=true \
-  --env "SAFEIO_RETURN_UID=$(id -u)" \
-  --env "SAFEIO_RETURN_GID=$(id -g)" \
-  --env SAFEIO_TARGET_PATH=/gta-claw-target \
-  --env "GIT_DIR=$container_git_dir" \
-  --env GIT_WORK_TREE=/workspace \
-  --env GIT_OPTIONAL_LOCKS=0 \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/gta-claw-target" \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/git,target=/gta-claw-git,readonly" \
-  --workdir /workspace \
-  "$image_tag" \
-  /usr/local/bin/gta-claw-safeio \
-  run-create \
-  "$target_relative" \
-  -- \
-  bash -c "
-    export CARGO_TARGET_DIR=\"\$OUTPUT_ROOT\"
-    export CARGO_HOME=\"\$OUTPUT_ROOT/cargo-home\"
-    export HOME=\"\$OUTPUT_ROOT/home\"
-    umask '$build_input_umask'
-    ./packaging/linux/build.sh '$arch'
-  "
+  docker run --rm \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --cap-add DAC_OVERRIDE \
+    --cap-add FOWNER \
+    --security-opt no-new-privileges \
+    --env "BUILD_IMAGE=$LINUX_BUILD_IMAGE" \
+    --env "BUILD_INPUT_UMASK=$build_input_umask" \
+    --env "BUILD_ENVIRONMENT_IMAGE_ID=$environment_image_id" \
+    --env "BUILD_RECIPE_SHA256=$recipe_sha" \
+    --env "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
+    --env IMMUTABLE_SOURCE_SNAPSHOT=1 \
+    --env "SOURCE_COMMIT=$SOURCE_COMMIT" \
+    --env "SOURCE_TREE=$SOURCE_TREE" \
+    --env "SOURCE_TREE_RECEIPT=$SOURCE_TREE_RECEIPT" \
+    --env "SOURCE_DATE_EPOCH=$SOURCE_EPOCH" \
+    --env "RUSTFLAGS=-Dwarnings" \
+    --env "SAFEIO_RETURN_UID=$(id -u)" \
+    --env "SAFEIO_RETURN_GID=$(id -g)" \
+    --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/source,target=/workspace,readonly" \
+    --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/output,target=/gta-claw-output" \
+    --workdir /workspace \
+    "$image_tag" \
+    /usr/local/bin/gta-claw-safeio \
+    run-mounted \
+    /gta-claw-output \
+    -- \
+    bash -c "
+      export CARGO_TARGET_DIR=\"\$OUTPUT_ROOT\"
+      export CARGO_HOME=\"\$OUTPUT_ROOT/cargo-home\"
+      export HOME=\"\$OUTPUT_ROOT/home\"
+      umask '$build_input_umask'
+      ./packaging/linux/build.sh '$arch'
+    "
 )"
 cleanup_anchored_mounts
-[[ "$(stat -Lc '%d:%i' "$REPO_ROOT")" == "$repo_mount_id" ]] ||
-  die "repository path identity changed during container build"
-[[ "$(stat -Lc '%d:%i' "$target_root")" == "$target_mount_id" ]] ||
-  die "target path identity changed during container build"
-[[ "$(stat -Lc '%d:%i' "$git_common_dir")" == "$git_mount_id" ]] ||
-  die "Git common directory identity changed during container build"
-[[ "$(stat -Lc '%d:%i' "$CARGO_TARGET_DIR")" == \
-  "$(stat -Lc '%d:%i' "$target_mount/$target_relative")" ]] ||
-  die "Cargo output component identity changed during container build"
+verify_container_transaction_receipts
+[[ "$(trust_receipt "$SOURCE_SNAPSHOT_DIRECTORY" "immutable source snapshot")" == \
+  "$source_receipt" ]] || die "source snapshot receipt changed"
+[[ "$(trust_receipt "$REPO_ROOT" "source repository")" == "$repository_receipt" ]] ||
+  die "source repository receipt changed"
+[[ "$(trust_receipt "$git_common_dir" "Git common directory")" == "$git_receipt" ]] ||
+  die "Git common directory receipt changed"
+[[ "$(trust_receipt "$target_root" "target root")" == "$target_receipt" ]] ||
+  die "target root receipt changed"
+[[ "$(trust_receipt "$OUTPUT_COMPONENT_PATH" "build output")" == "$output_receipt" ]] ||
+  die "build output receipt changed"
+cleanup_container_trust
+trap - EXIT INT TERM
+
 [[ "$container_manifest" == "/proc/self/fd/"*"/build-manifest.json|"* ]] ||
   die "build container returned an unexpected manifest path: $container_manifest"
 container_fingerprint="${container_manifest##*|}"

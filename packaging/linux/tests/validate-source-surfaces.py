@@ -18,19 +18,21 @@ EXECUTABLE_SURFACES = frozenset(
         "debian/postrm",
         "debian/preinst.in",
         "debian/prerm",
+        "direct/config-safeio.py",
         "direct/install.sh",
         "direct/uninstall.sh",
         "lib/build-manifest.sh",
         "lib/common.sh",
         "lib/container-mount.sh",
+        "lib/container-trust.sh",
         "lib/oci-validation.sh",
         "lib/worktree-git.sh",
         "libexec/gta-claw-runtime-ready",
         "libexec/gta-claw-state-init",
         "lifecycle-test.sh",
+        "oci/cri-probe.sh",
         "oci-self-test-container.sh",
         "oci-self-test.sh",
-        "oci/cri-probe.sh",
         "package-container.sh",
         "package.sh",
         "release.sh",
@@ -44,13 +46,18 @@ EXECUTABLE_SURFACES = frozenset(
         "self-test.sh",
         "strict_artifact.py",
         "strict_elf.py",
+        "tests/container-trust-self-test.sh",
+        "tests/cri-probe-self-test.sh",
+        "tests/direct-config-self-test.sh",
         "tests/make-malicious-tar.py",
         "tests/reject-javascript-commands-self-test.py",
         "tests/reject-javascript-commands.py",
+        "tests/strict-artifact-self-test.py",
         "tests/validate-cri-fixtures.py",
         "tests/validate-generated-metadata.py",
         "tests/validate-orchestration.py",
         "tests/validate-source-surfaces.py",
+        "tests/verify-git-snapshot.py",
         "validate-oci-artifact.sh",
         "validate.sh",
         "workflow-self-test.sh",
@@ -105,7 +112,11 @@ def validate_repository(repository, root):
             "required Linux packaging executables are not tracked mode 100755: "
             + ", ".join(wrong_modes)
         )
-    unexpected = sorted(path for path, mode in modes.items() if mode == "100755" and path not in EXECUTABLE_SURFACES)
+    unexpected = sorted(
+        path
+        for path, mode in modes.items()
+        if mode == "100755" and path not in EXECUTABLE_SURFACES
+    )
     if unexpected:
         fail(f"unexpected executable Linux packaging sources: {', '.join(unexpected)}")
     for relative in EXECUTABLE_SURFACES:

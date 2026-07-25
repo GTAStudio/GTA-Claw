@@ -14,7 +14,7 @@ IFS=$'\n\t'
     echo "CRI_RUNTIME_ENDPOINT must be a fully qualified unix socket" >&2
     exit 2
   }
-for tool in crictl jq stat; do
+for tool in crictl find jq stat; do
   command -v "$tool" >/dev/null 2>&1 ||
     {
       echo "missing CRI probe tool: $tool" >&2
@@ -27,14 +27,80 @@ done
     exit 2
   }
 
-sandbox_config="$1"
-init_config="$2"
-runtime_config="$3"
-state_root=/var/lib/gta-claw-cri-probe
-log_root=/var/log/gta-claw-cri-probe
+source_sandbox_config="$1"
+source_init_config="$2"
+source_runtime_config="$3"
+state_parent="${CRI_STATE_PARENT:-/var/lib/gta-claw-cri-probes}"
+log_parent="${CRI_LOG_PARENT:-/var/log/gta-claw-cri-probes}"
+config_parent="${CRI_CONFIG_PARENT:-/run/gta-claw-cri-probes}"
+state_root=
+log_root=
+config_root=
+state_receipt=
+log_receipt=
+config_receipt=
+state_fd=
+log_fd=
+config_fd=
+state_created=0
+log_created=0
+config_created=0
 sandbox_id=
 init_id=
 runtime_id=
+cleanup_failed=0
+
+directory_receipt() {
+  stat -Lc '%d:%i:%u:%g:%a' "$1"
+}
+
+ensure_parent() {
+  local path="$1"
+  local label="$2"
+  if [[ -L "$path" || (-e "$path" && ! -d "$path") ]]; then
+    echo "$label parent is not a physical directory" >&2
+    return 1
+  fi
+  if [[ ! -e "$path" ]]; then
+    install -d -o root -g root -m 0755 "$path"
+  fi
+  [[ "$(stat -Lc '%u:%g:%a' "$path")" == "0:0:755" ]] ||
+    {
+      echo "$label parent must be root:root mode 0755" >&2
+      return 1
+    }
+}
+
+remove_owned_directory() {
+  local path="$1"
+  local receipt="$2"
+  local label="$3"
+  local descriptor="$4"
+  local capability="/proc/self/fd/$descriptor"
+  [[ -n "$path" && -n "$receipt" && -n "$descriptor" ]] || return
+  if [[ ! -d "$capability" ||
+    "$(directory_receipt "$capability")" != "$receipt" ]]; then
+    echo "$label held directory identity changed; refusing cleanup" >&2
+    cleanup_failed=1
+    return
+  fi
+  find "$capability/" -depth -mindepth 1 -xdev -delete ||
+    {
+      echo "$label held contents could not be removed" >&2
+      cleanup_failed=1
+      return
+    }
+  if [[ ! -d "$path" || -L "$path" ||
+    "$(directory_receipt "$path")" != "$receipt" ]]; then
+    echo "$label path identity changed; refusing cleanup: $path" >&2
+    cleanup_failed=1
+    return
+  fi
+  if ! rmdir "$path"; then
+    echo "$label root identity changed or could not be removed" >&2
+    cleanup_failed=1
+  fi
+}
 
 cri() {
   crictl --runtime-endpoint "$CRI_RUNTIME_ENDPOINT" "$@"
@@ -63,26 +129,102 @@ wait_for_container_exit() {
 }
 
 cleanup() {
+  local original_status=$?
+  trap - EXIT INT TERM
   if [[ -n "$runtime_id" ]]; then
-    cri rm -f "$runtime_id" >/dev/null 2>&1 || true
+    cri rm -f "$runtime_id" >/dev/null 2>&1 || cleanup_failed=1
   fi
   if [[ -n "$init_id" ]]; then
-    cri rm -f "$init_id" >/dev/null 2>&1 || true
+    cri rm -f "$init_id" >/dev/null 2>&1 || cleanup_failed=1
   fi
   if [[ -n "$sandbox_id" ]]; then
-    cri stopp "$sandbox_id" >/dev/null 2>&1 || true
-    cri rmp -f "$sandbox_id" >/dev/null 2>&1 || true
+    cri stopp "$sandbox_id" >/dev/null 2>&1 || cleanup_failed=1
+    cri rmp -f "$sandbox_id" >/dev/null 2>&1 || cleanup_failed=1
   fi
-  rm -rf "$state_root" "$log_root"
+  [[ "$config_created" -eq 0 ]] ||
+    remove_owned_directory "$config_root" "$config_receipt" "CRI config" "$config_fd"
+  [[ "$log_created" -eq 0 ]] ||
+    remove_owned_directory "$log_root" "$log_receipt" "CRI log" "$log_fd"
+  [[ "$state_created" -eq 0 ]] ||
+    remove_owned_directory "$state_root" "$state_receipt" "CRI state" "$state_fd"
+  if [[ -n "$config_fd" ]]; then
+    exec {config_fd}>&-
+  fi
+  if [[ -n "$log_fd" ]]; then
+    exec {log_fd}>&-
+  fi
+  if [[ -n "$state_fd" ]]; then
+    exec {state_fd}>&-
+  fi
+  if [[ "$original_status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+    exit 1
+  fi
+  exit "$original_status"
 }
 trap cleanup EXIT INT TERM
 
-[[ ! -e "$state_root" && ! -L "$state_root" ]] ||
-  {
-    echo "CRI probe state path already exists" >&2
-    exit 1
-  }
-install -d -m 0755 "$state_root" "$log_root"
+ensure_parent "$state_parent" "CRI state"
+ensure_parent "$log_parent" "CRI log"
+ensure_parent "$config_parent" "CRI config"
+state_root="$(mktemp -d "$state_parent/probe.XXXXXXXX")"
+chmod 0700 "$state_root"
+exec {state_fd}<"$state_root"
+state_receipt="$(directory_receipt "/proc/self/fd/$state_fd")"
+[[ "$(directory_receipt "$state_root")" == "$state_receipt" ]]
+state_created=1
+if [[ "${GTA_CLAW_CRI_TEST_FAIL_AFTER_STATE:-0}" == "1" ]]; then
+  exit 1
+fi
+log_root="$(mktemp -d "$log_parent/probe.XXXXXXXX")"
+chmod 0700 "$log_root"
+exec {log_fd}<"$log_root"
+log_receipt="$(directory_receipt "/proc/self/fd/$log_fd")"
+[[ "$(directory_receipt "$log_root")" == "$log_receipt" ]]
+log_created=1
+config_root="$(mktemp -d "$config_parent/probe.XXXXXXXX")"
+chmod 0700 "$config_root"
+exec {config_fd}<"$config_root"
+config_receipt="$(directory_receipt "/proc/self/fd/$config_fd")"
+[[ "$(directory_receipt "$config_root")" == "$config_receipt" ]]
+config_created=1
+
+if [[ "${GTA_CLAW_CRI_TEST_REPLACE_STATE:-0}" == "1" ]]; then
+  rm -rf "$state_root"
+  mkdir -m 0700 "$state_root"
+  printf 'replacement\n' >"$state_root/replacement"
+  exit 1
+fi
+if [[ "${GTA_CLAW_CRI_TEST_REPLACE_LOG:-0}" == "1" ]]; then
+  rm -rf "$log_root"
+  mkdir -m 0700 "$log_root"
+  printf 'replacement\n' >"$log_root/replacement"
+  exit 1
+fi
+if [[ "${GTA_CLAW_CRI_TEST_REPLACE_CONFIG:-0}" == "1" ]]; then
+  rm -rf "$config_root"
+  mkdir -m 0700 "$config_root"
+  printf 'replacement\n' >"$config_root/replacement"
+  exit 1
+fi
+
+sandbox_config="$config_root/sandbox.json"
+init_config="$config_root/init.json"
+runtime_config="$config_root/runtime.json"
+jq --arg log_directory "$log_root" \
+  '.log_directory = $log_directory' \
+  "$source_sandbox_config" >"$sandbox_config"
+jq --arg host_path "$state_root" \
+  '.mounts[0].host_path = $host_path' \
+  "$source_init_config" >"$init_config"
+jq --arg host_path "$state_root" \
+  '.mounts[0].host_path = $host_path' \
+  "$source_runtime_config" >"$runtime_config"
+chmod 0600 "$sandbox_config" "$init_config" "$runtime_config"
+
+if [[ "${GTA_CLAW_CRI_TEST_STOP_AFTER_CONFIG:-0}" == "1" ]]; then
+  exit 1
+fi
+
 image="$(jq -er '.image.image' "$init_config")"
 [[ "$(jq -er '.image.image' "$runtime_config")" == "$image" ]] ||
   {

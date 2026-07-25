@@ -40,6 +40,7 @@ deb_architecture="$(deb_arch "$arch")"
 rpm_architecture="$(rpm_arch "$arch")"
 oci_architecture="$(oci_arch "$arch")"
 base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
+package_identity="$VERSION-$LINUX_PACKAGE_RELEASE"
 validate_oci_orchestration_templates \
   "$LINUX_DIR/oci/compose.yaml.in" \
   "$LINUX_DIR/oci/kubernetes.yaml.in"
@@ -102,7 +103,9 @@ generate_provenance() {
     --arg source_tree "$source_tree" \
     --arg build_manifest_sha "$build_manifest_sha" \
     --arg source_epoch "$SOURCE_DATE_EPOCH" \
-    --arg version "$VERSION" \
+    --arg version "$package_identity" \
+    --arg package_release "$LINUX_PACKAGE_RELEASE" \
+    --arg package_identity "$package_identity" \
     --arg arch "$arch" \
     --arg target "$target" \
     --arg daemon_path "$daemon_path" \
@@ -122,7 +125,9 @@ generate_provenance() {
           "externalParameters": {
             "architecture": $arch,
             "rustTarget": $target,
-            "version": $version
+            "version": $version,
+            "packageRelease": ($package_release | tonumber),
+            "packageVersion": $package_identity
           },
           "internalParameters": {
             "sourceDateEpoch": ($source_epoch | tonumber)
@@ -255,9 +260,10 @@ generate_spdx() {
     --arg libgcc_arch "$libgcc_arch" \
     --arg sbom_relative "$sbom_relative" \
     --arg checksum_relative "$checksum_relative" \
-    --arg namespace "https://github.com/GTAStudio/GTA-Claw/spdx/$source_sha/$arch/$label" \
+    --arg namespace "https://github.com/GTAStudio/GTA-Claw/spdx/$source_sha/$arch/$package_identity/$label" \
     --arg created "$created_at" \
-    --arg version "$VERSION" \
+    --arg version "$package_identity" \
+    --arg package_release "$LINUX_PACKAGE_RELEASE" \
     --arg source_sha "$source_sha" \
     '{
       spdxVersion: "SPDX-2.3",
@@ -274,6 +280,7 @@ generate_spdx() {
           SPDXID: "SPDXRef-Package-GTA-Claw",
           name: "gta-claw",
           versionInfo: $version,
+          comment: ("Linux package release: " + $package_release),
           downloadLocation: "NOASSERTION",
           filesAnalyzed: true,
           packageVerificationCode: {
@@ -289,7 +296,10 @@ generate_spdx() {
           externalRefs: [{
             referenceCategory: "PACKAGE-MANAGER",
             referenceType: "purl",
-            referenceLocator: ("pkg:github/GTAStudio/GTA-Claw@" + $source_sha)
+            referenceLocator: (
+              "pkg:github/GTAStudio/GTA-Claw@" + $source_sha +
+              "?package_release=" + $package_release
+            )
           }]
         },
         ({
@@ -391,10 +401,14 @@ copy_regular_input "$LINUX_DIR/direct/uninstall.sh" "$archive_stage/uninstall.sh
 write_output_text \
   "$archive_stage/package-version" \
   0644 \
-  "$VERSION-$LINUX_PACKAGE_RELEASE"$'\n'
+  "$package_identity"$'\n'
 copy_regular_input \
   "$LINUX_DIR/libexec/gta-claw-state-init" \
   "$archive_stage/libexec/gta-claw-state-init" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/direct/config-safeio.py" \
+  "$archive_stage/libexec/gta-claw-direct-config" \
   0755
 copy_regular_input \
   "$LINUX_DIR/libexec/gta-claw-runtime-ready" \
@@ -860,7 +874,7 @@ oci_config_source="$oci_work/config.json"
 write_json "$oci_config_source" -n \
   --arg created "$created_at" \
   --arg architecture "$oci_architecture" \
-  --arg version "$VERSION" \
+  --arg version "$package_identity" \
   --arg revision "$source_sha" \
   --arg root_digest "sha256:$root_layer_digest" \
   --arg writable_digest "sha256:$writable_layer_digest" \
@@ -956,7 +970,7 @@ write_json "$oci_layout/index.json" -n \
   --arg digest "sha256:$oci_manifest_digest" \
   --argjson size "$oci_manifest_size" \
   --arg architecture "$oci_architecture" \
-  --arg version "$VERSION" \
+  --arg version "$package_identity" \
   '{
     schemaVersion: 2,
     mediaType: "application/vnd.oci.image.index.v1+json",
@@ -1016,7 +1030,8 @@ write_json "$artifact_provenance" -n \
   --arg source_sha "$source_sha" \
   --arg source_tree "$source_tree" \
   --arg build_manifest_sha "$build_manifest_sha" \
-  --arg version "$VERSION" \
+  --arg version "$package_identity" \
+  --arg package_release "$LINUX_PACKAGE_RELEASE" \
   --arg architecture "$arch" \
   --arg tar_name "$(basename "$tar_artifact")" \
   --arg tar_sha "$(sha256_file "$tar_artifact")" \
@@ -1051,7 +1066,12 @@ write_json "$artifact_provenance" -n \
     },
     runtimeDependencies: $runtime_manifest[0].packages,
     packageToolchain: $package_toolchain[0],
-    package: {name: "gta-claw", version: $version, architecture: $architecture},
+    package: {
+      name: "gta-claw",
+      version: $version,
+      release: ($package_release | tonumber),
+      architecture: $architecture
+    },
     subjects: [
       {name: $tar_name, digest: {sha256: $tar_sha}},
       {name: $deb_name, digest: {sha256: $deb_sha}},

@@ -9,6 +9,7 @@ daemon=/usr/libexec/gta-claw/gta-claw-daemon
 namespace=/var/lib/gta-claw-protected
 runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
+complete_marker=$runtime_directory/initialization-complete
 
 if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
   echo "gta-claw protected initialization requires real and effective UID 0" >&2
@@ -35,6 +36,7 @@ fi
 touch "$failure_marker"
 chown 0:0 "$failure_marker"
 chmod 0644 "$failure_marker"
+rm -f "$complete_marker"
 
 if [ ! -x "$daemon" ]; then
   echo "gta-claw daemon is not executable: $daemon" >&2
@@ -67,4 +69,10 @@ fi
   --service-uid "$service_uid" \
   --service-gid "$service_gid"
 
-rm -f "$failure_marker"
+if [ "${GTA_CLAW_DEFER_FENCE_CLEAR:-0}" = "1" ]; then
+  touch "$complete_marker"
+  chown 0:0 "$complete_marker"
+  chmod 0644 "$complete_marker"
+else
+  rm -f "$failure_marker" "$complete_marker"
+fi

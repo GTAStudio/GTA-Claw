@@ -108,7 +108,17 @@ stop_initializer_for_replacement() {
 }
 
 marker_state() {
-  if [ -e "$1" ]; then
+  path="$1"
+  if [ -L "$path" ]; then
+    echo "gta-claw transaction marker must not be a symlink: $path" >&2
+    return 1
+  fi
+  if [ -e "$path" ]; then
+    if [ ! -f "$path" ] ||
+      [ "$(stat -c '%u:%g:%a:%h' "$path")" != "0:0:644:1" ]; then
+      echo "gta-claw transaction marker is not an authenticated physical file: $path" >&2
+      return 1
+    fi
     printf '1\n'
   else
     printf '0\n'
@@ -119,25 +129,50 @@ restore_marker() {
   path="$1"
   existed="$2"
   if [ "$existed" -eq 1 ]; then
-    touch "$path"
+    touch "$path" &&
+      chown 0:0 "$path" &&
+      chmod 0644 "$path"
   else
     rm -f "$path"
   fi
 }
 
 fence_failed_rollback() {
-  ensure_failure_fence
-  touch "$replacement_fence"
+  failure=0
+  ensure_failure_fence ||
+    {
+      echo "gta-claw RPM rollback could not retain its failure marker" >&2
+      failure=1
+    }
+  restore_marker "$replacement_fence" 1 ||
+    {
+      echo "gta-claw RPM rollback could not retain its replacement fence" >&2
+      failure=1
+    }
   if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
     echo "gta-claw daemon could not be runtime-masked after RPM rollback failure" >&2
+    failure=1
   fi
   if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
     echo "gta-claw daemon stop failed after RPM rollback failure" >&2
+    failure=1
+  fi
+  if ! verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"; then
+    if ! systemctl kill \
+      --kill-whom=all \
+      --signal=KILL \
+      gta-claw-daemon.service >/dev/null 2>&1; then
+      echo "gta-claw daemon processes could not be killed after RPM rollback failure" >&2
+      failure=1
+    fi
   fi
   if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
     echo "gta-claw initializer stop failed after RPM rollback failure" >&2
+    failure=1
   fi
-  verify_runtime_stopped
+  verify_runtime_stopped || failure=1
+  [ "$failure" -eq 0 ] ||
+    echo "gta-claw RPM rollback cancellation completed with errors" >&2
   exit 1
 }
 
@@ -177,6 +212,9 @@ restore_pre_failure() {
           restore_marker "$ready" "$had_ready"
         fi
       fi
+      if [ "$had_runtime_directory" -eq 0 ]; then
+        rmdir "$runtime_directory" >/dev/null 2>&1 || fence_failed_rollback
+      fi
     fi
   fi
   exit "$status"
@@ -206,9 +244,13 @@ had_replacement="$(marker_state "$replacement")"
 had_ready="$(marker_state "$ready")"
 had_was_active="$(marker_state "$was_active")"
 had_fresh_install="$(marker_state "$fresh_install")"
+had_runtime_directory=0
+if [ -e "$runtime_directory" ]; then
+  had_runtime_directory=1
+fi
 trap restore_pre_failure 0 HUP INT TERM
-ensure_failure_fence
 runtime_touched=1
+ensure_failure_fence
 if [ "$installed" -eq 1 ]; then
   rm -f "$ready" "$fresh_install"
   touch "$replacement"
@@ -266,7 +308,9 @@ if [ -d /run/systemd/system ]; then
       exit 1
     } ;;
   esac
-  stop_initializer_for_replacement
+  if [ "$package_fenced" -eq 0 ]; then
+    stop_initializer_for_replacement
+  fi
   verify_writer_lock_released
 else
   touch "$replacement_fence"

@@ -148,6 +148,14 @@ def open_component(target_fd: int, component: str, label: str) -> int:
     return fd
 
 
+def open_mounted_directory(path: str, label: str) -> int:
+    if not path.startswith("/") or "\x00" in path:
+        fail(f"{label} path is not an absolute path")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | O_NOFOLLOW)
+    check_directory(fd, label, owners=(RETURN_UID, os.getuid()))
+    return fd
+
+
 def chown_tree(root_fd: int, uid: int, gid: int) -> None:
     with os.scandir(root_fd) as entries:
         for entry in entries:
@@ -298,6 +306,70 @@ def command_run_package(arguments: list[str]) -> int:
         os.close(repo_fd)
 
 
+def command_run_mounted(arguments: list[str]) -> int:
+    if len(arguments) < 3 or arguments[1] != "--":
+        fail("usage: safeio.py run-mounted OUTPUT_PATH -- COMMAND...")
+    output_path = arguments[0]
+    command = arguments[2:]
+    output_fd = open_mounted_directory(output_path, "mounted output root")
+    target_fd = os.dup(output_fd)
+    try:
+        return run_child(
+            command,
+            {"SAFEIO_TARGET_FD": target_fd, "SAFEIO_OUTPUT_FD": output_fd},
+            {
+                "SAFEIO_OUTPUT_COMPONENT": os.path.basename(output_path),
+                "SAFEIO_OUTPUT_REALPATH": output_path,
+                "OUTPUT_ROOT": f"/proc/self/fd/{output_fd}",
+            },
+        )
+    finally:
+        if not same_inode_path(output_path, output_fd):
+            fail("mounted output identity changed during transaction")
+        chown_tree(output_fd, RETURN_UID, RETURN_GID)
+        os.close(target_fd)
+        os.close(output_fd)
+
+
+def command_run_mounted_package(arguments: list[str]) -> int:
+    if len(arguments) < 4 or arguments[2] != "--":
+        fail(
+            "usage: safeio.py run-mounted-package BUILD_PATH OUTPUT_PATH -- COMMAND..."
+        )
+    build_path, output_path = arguments[:2]
+    command = arguments[3:]
+    build_fd = open_mounted_directory(build_path, "mounted build root")
+    output_fd = open_mounted_directory(output_path, "mounted output root")
+    target_fd = os.dup(output_fd)
+    try:
+        if same_inode_path(build_path, output_fd):
+            fail("mounted build and output roots are identical")
+        return run_child(
+            command,
+            {
+                "SAFEIO_TARGET_FD": target_fd,
+                "SAFEIO_BUILD_FD": build_fd,
+                "SAFEIO_OUTPUT_FD": output_fd,
+            },
+            {
+                "BUILD_ROOT": f"/proc/self/fd/{build_fd}",
+                "BUILD_MANIFEST": f"/proc/self/fd/{build_fd}/build-manifest.json",
+                "SAFEIO_BUILD_COMPONENT": os.path.basename(build_path),
+                "SAFEIO_OUTPUT_COMPONENT": os.path.basename(output_path),
+                "SAFEIO_OUTPUT_REALPATH": output_path,
+                "OUTPUT_ROOT": f"/proc/self/fd/{output_fd}",
+            },
+        )
+    finally:
+        if not same_inode_path(build_path, build_fd):
+            fail("mounted build identity changed during transaction")
+        if not same_inode_path(output_path, output_fd):
+            fail("mounted output identity changed during transaction")
+        chown_tree(output_fd, RETURN_UID, RETURN_GID)
+        os.close(target_fd)
+        os.close(output_fd)
+
+
 def command_write(arguments: list[str]) -> int:
     if len(arguments) != 3:
         fail("usage: safeio.py write ROOT_FD RELATIVE MODE")
@@ -409,6 +481,8 @@ def command_check(arguments: list[str]) -> int:
 COMMANDS = {
     "run-create": command_run_create,
     "run-package": command_run_package,
+    "run-mounted": command_run_mounted,
+    "run-mounted-package": command_run_mounted_package,
     "write": command_write,
     "mkdirs": command_mkdirs,
     "publish": command_publish,
