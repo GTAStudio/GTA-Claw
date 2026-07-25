@@ -76,11 +76,12 @@ build_receipt="$(trust_receipt "$BUILD_COMPONENT_PATH" "build component")"
 output_receipt="$(trust_receipt "$OUTPUT_COMPONENT_PATH" "package output")"
 
 IMMUTABLE_SOURCE_SNAPSHOT=1 \
+BUILD_MANIFEST_ENVELOPE_ONLY=1 \
 SOURCE_COMMIT="$SOURCE_COMMIT" \
 SOURCE_TREE="$SOURCE_TREE" \
 SOURCE_TREE_RECEIPT="$SOURCE_TREE_RECEIPT" \
   verify_build_manifest "$host_manifest" "$arch" "$expected_build_key_sha"
-packaging_image_id="$(jq -er '.builder.environmentImageId' "$host_manifest")"
+packaging_image_id="$BUILD_ENVIRONMENT_IMAGE_ID"
 [[ "$packaging_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "packaging image ID is invalid"
 [[ "$(docker image inspect --format '{{.Id}}' "$packaging_image_id")" == \

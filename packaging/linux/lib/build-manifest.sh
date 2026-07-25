@@ -151,6 +151,13 @@ verify_build_manifest() {
   fi
   [[ "$(jq -er '.source.sourceDateEpoch' "$manifest")" == "$SOURCE_DATE_EPOCH" ]] ||
     die "build source epoch does not match current commit"
+  if [[ "${BUILD_MANIFEST_ENVELOPE_ONLY:-0}" == "1" ]]; then
+    # shellcheck disable=SC2034
+    BUILD_ENVIRONMENT_IMAGE_ID="$(
+      jq -er '.builder.environmentImageId' "$manifest"
+    )"
+    return
+  fi
 
   BUILD_GLIBC_REQUIREMENT="$(jq -er '.glibcRequirement' "$manifest")"
   if ! printf '%s\n%s\n' "$BUILD_GLIBC_REQUIREMENT" "$LINUX_GLIBC_CEILING" | sort -VC; then
