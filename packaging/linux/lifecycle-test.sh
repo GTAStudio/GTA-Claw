@@ -490,6 +490,9 @@ zombie_start="$(
     "/proc/$zombie_pid/stat"
 )"
 sudo install -d -o root -g root -m 0755 /run/gta-claw-state-init
+sudo touch /run/gta-claw-state-init/initialization-failed
+sudo chown root:root /run/gta-claw-state-init/initialization-failed
+sudo chmod 0644 /run/gta-claw-state-init/initialization-failed
 printf '%s %s\n' "$zombie_pid" "$zombie_start" |
   sudo tee /run/gta-claw-state-init/start-authorized >/dev/null
 sudo chown root:root /run/gta-claw-state-init/start-authorized
@@ -497,7 +500,9 @@ sudo chmod 0600 /run/gta-claw-state-init/start-authorized
 if sudo /usr/libexec/gta-claw/gta-claw-start-authorized check; then
   die "start authorization accepted a zombie installer process"
 fi
-sudo rm -f /run/gta-claw-state-init/start-authorized
+sudo rm -f \
+  /run/gta-claw-state-init/start-authorized \
+  /run/gta-claw-state-init/initialization-failed
 sudo kill "$zombie_parent_job"
 wait "$zombie_parent_job" >/dev/null 2>&1 || true
 zombie_parent_job=
