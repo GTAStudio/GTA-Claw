@@ -80,6 +80,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-clients"
+version = "0.1.0"
+dependencies = [
+ "claw-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "claw-config"
 version = "0.1.0"
 dependencies = [
@@ -196,6 +205,15 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2",
+]
+
+[[package]]
+name = "claw-relay"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subtle",
 ]
 
 [[package]]
