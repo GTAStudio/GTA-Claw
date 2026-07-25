@@ -11,8 +11,11 @@
 //!   the host enforces at its import boundary.
 //! * [`limits`] - the per-plugin resource envelope.
 //! * [`manifest`] - the strict plugin manifest schema and its validation.
-//! * [`trust`] - where components may be loaded from, plus manifest signature
-//!   verification.
+//! * [`policy`] - the operator-owned capability ceiling a manifest's requests
+//!   are intersected with, so a manifest can only ever narrow what the operator
+//!   allowed.
+//! * [`trust`] - where components may be loaded from, which key may sign for
+//!   which plugin identity, plus manifest signature verification.
 //! * [`registry`] - all 137 descriptors from the frozen upstream inventory,
 //!   with an explicit and deliberately conservative implementation status.
 //!
@@ -25,6 +28,7 @@ pub mod abi;
 pub mod capability;
 pub mod limits;
 pub mod manifest;
+pub mod policy;
 pub mod registry;
 mod registry_data;
 pub mod trust;

@@ -1,6 +1,7 @@
-//! Where components may be loaded from, and who must have signed them.
+//! Where components may be loaded from, who must have signed them, and which
+//! identity a given key is allowed to present.
 //!
-//! Two independent gates run before a component's bytes are handed to the
+//! Three independent gates run before a component's bytes are handed to the
 //! engine:
 //!
 //! 1. [`TrustPolicy::authorize`] resolves the manifest directory and the
@@ -8,7 +9,13 @@
 //!    does not stay inside a configured trusted root. Because both sides are
 //!    canonicalised, `..` traversal, junctions and symlinks that point outside
 //!    a root are rejected rather than followed.
-//! 2. Integrity and provenance: [`component_sha256`] must match the manifest's
+//! 2. Identity: an [`IdentityBinding`] pins a plugin id to one delivery class,
+//!    one installation directory and an exact set of signing keys. Every id in
+//!    the frozen [`crate::registry`] must have one, and its declared delivery
+//!    class must agree with the inventory. A key that is trusted to sign some
+//!    plugin therefore cannot sign a component that claims a *different*
+//!    plugin's identity and inherit that identity's namespaces.
+//! 3. Integrity and provenance: [`component_sha256`] must match the manifest's
 //!    pinned digest, and the configured [`SignatureVerifier`] must accept the
 //!    manifest. The default verifier, [`RejectAllSignatures`], accepts only
 //!    unsigned manifests, so an operator who turns on `require_signature`
@@ -23,7 +30,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::{PluginManifest, SignatureAlgorithm};
-use crate::registry::DeliveryClass;
+use crate::registry::{DeliveryClass, PluginRegistry};
 
 /// Domain separator prefixed to every signed manifest payload.
 pub const SIGNING_DOMAIN: &[u8] = b"gta-claw:plugin-manifest-signature:v1\0";
@@ -243,6 +250,74 @@ impl fmt::Display for VerificationError {
 
 impl core::error::Error for VerificationError {}
 
+/// Binds one plugin identity to the only provenance that may present it.
+///
+/// Trusting a key id on its own is not enough. A key that is trusted to sign
+/// *some* plugin can otherwise sign a component that claims *another* plugin's
+/// id and delivery class, and thereby inherit that id's configuration
+/// namespace, store namespace and operator capability ceiling. A binding
+/// pins the identity to a delivery class, an installation directory and an
+/// exact set of signing keys, so impersonation fails before the component is
+/// read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityBinding {
+    plugin_id: String,
+    delivery_class: DeliveryClass,
+    location: PathBuf,
+    key_ids: BTreeSet<String>,
+}
+
+impl IdentityBinding {
+    /// Binds `plugin_id` to a delivery class and a canonical install directory.
+    ///
+    /// No signing key is accepted until one is added, so the binding starts by
+    /// permitting only an unsigned manifest - and only if the policy does not
+    /// require signatures.
+    #[must_use]
+    pub fn new(
+        plugin_id: impl Into<String>,
+        delivery_class: DeliveryClass,
+        location: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            delivery_class,
+            location: location.into(),
+            key_ids: BTreeSet::new(),
+        }
+    }
+
+    /// Adds a signing key id that may present this identity.
+    #[must_use]
+    pub fn with_key_id(mut self, key_id: impl Into<String>) -> Self {
+        self.key_ids.insert(key_id.into());
+        self
+    }
+
+    /// The bound plugin id.
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    /// The only delivery class this identity may declare.
+    #[must_use]
+    pub const fn delivery_class(&self) -> DeliveryClass {
+        self.delivery_class
+    }
+
+    /// The only directory this identity may be loaded from.
+    #[must_use]
+    pub fn location(&self) -> &Path {
+        &self.location
+    }
+
+    /// The signing key ids that may present this identity.
+    pub fn key_ids(&self) -> impl Iterator<Item = &str> {
+        self.key_ids.iter().map(String::as_str)
+    }
+}
+
 /// Where components may come from and which provenance is acceptable.
 ///
 /// [`TrustPolicy::deny_all`] is the starting point: no roots, no delivery
@@ -251,8 +326,10 @@ impl core::error::Error for VerificationError {}
 pub struct TrustPolicy {
     roots: Vec<PathBuf>,
     require_signature: bool,
+    require_identity_binding: bool,
     trusted_key_ids: BTreeSet<String>,
     allowed_delivery_classes: BTreeSet<DeliveryClass>,
+    bindings: BTreeMap<String, IdentityBinding>,
 }
 
 impl Default for TrustPolicy {
@@ -268,8 +345,10 @@ impl TrustPolicy {
         Self {
             roots: Vec::new(),
             require_signature: true,
+            require_identity_binding: true,
             trusted_key_ids: BTreeSet::new(),
             allowed_delivery_classes: BTreeSet::new(),
+            bindings: BTreeMap::new(),
         }
     }
 
@@ -299,6 +378,41 @@ impl TrustPolicy {
     pub fn allow_delivery_class(mut self, class: DeliveryClass) -> Self {
         self.allowed_delivery_classes.insert(class);
         self
+    }
+
+    /// Sets whether *every* plugin id needs an identity binding.
+    ///
+    /// On by default. Turning it off only relaxes ids that are absent from the
+    /// frozen [`crate::registry`]: a registry id always needs a binding, because
+    /// those ids own persistent configuration and store namespaces that a
+    /// component must not be able to claim merely by naming them.
+    #[must_use]
+    pub fn require_identity_binding(mut self, required: bool) -> Self {
+        self.require_identity_binding = required;
+        self
+    }
+
+    /// Whether every plugin id needs an identity binding.
+    #[must_use]
+    pub const fn identity_binding_required(&self) -> bool {
+        self.require_identity_binding
+    }
+
+    /// Binds a plugin identity to a delivery class, a location and its keys.
+    ///
+    /// Every id in the frozen [`crate::registry`] *must* have a binding before
+    /// it can be loaded; there is no opt-out. Ids outside the registry may have
+    /// one, and it is enforced when present.
+    #[must_use]
+    pub fn with_identity_binding(mut self, binding: IdentityBinding) -> Self {
+        self.bindings.insert(binding.plugin_id.clone(), binding);
+        self
+    }
+
+    /// The binding for `plugin_id`, if one is configured.
+    #[must_use]
+    pub fn identity_binding(&self, plugin_id: &str) -> Option<&IdentityBinding> {
+        self.bindings.get(plugin_id)
     }
 
     /// Whether signatures are mandatory.
@@ -332,6 +446,36 @@ impl TrustPolicy {
             });
         }
 
+        // A component that claims a reserved id must agree with the frozen
+        // inventory about what kind of plugin that id is.
+        if let Some(descriptor) = PluginRegistry::get(&manifest.id)
+            && descriptor.delivery_class() != manifest.delivery_class
+        {
+            return Err(TrustError::RegistryClassMismatch {
+                plugin_id: manifest.id.clone(),
+                registry: descriptor.delivery_class(),
+                declared: manifest.delivery_class,
+            });
+        }
+
+        let binding = self.bindings.get(&manifest.id);
+        let reserved = PluginRegistry::get(&manifest.id).is_some();
+        if binding.is_none() && (self.require_identity_binding || reserved) {
+            return Err(TrustError::UnboundIdentity {
+                plugin_id: manifest.id.clone(),
+                reserved,
+            });
+        }
+        if let Some(binding) = binding
+            && binding.delivery_class != manifest.delivery_class
+        {
+            return Err(TrustError::BindingClassMismatch {
+                plugin_id: manifest.id.clone(),
+                bound: binding.delivery_class,
+                declared: manifest.delivery_class,
+            });
+        }
+
         let canonical_roots = self
             .roots
             .iter()
@@ -359,6 +503,22 @@ impl TrustPolicy {
             })?
             .clone();
 
+        if let Some(binding) = binding {
+            let bound = std::fs::canonicalize(&binding.location).map_err(|error| {
+                TrustError::UnresolvablePath {
+                    path: binding.location.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            if bound != canonical_dir {
+                return Err(TrustError::BindingLocationMismatch {
+                    plugin_id: manifest.id.clone(),
+                    bound,
+                    found: canonical_dir,
+                });
+            }
+        }
+
         let mut component_path = canonical_dir.clone();
         for segment in manifest.component.path.split('/') {
             component_path.push(segment);
@@ -380,12 +540,30 @@ impl TrustPolicy {
                 if self.require_signature {
                     return Err(TrustError::SignatureRequired);
                 }
+                if let Some(binding) = binding
+                    && !binding.key_ids.is_empty()
+                {
+                    return Err(TrustError::BindingKeyMismatch {
+                        plugin_id: manifest.id.clone(),
+                        key_id: None,
+                    });
+                }
                 None
             }
             Some(signature) => {
                 if !self.trusted_key_ids.contains(&signature.key_id) {
                     return Err(TrustError::UntrustedKeyId {
                         key_id: signature.key_id.clone(),
+                    });
+                }
+                // Host-wide trust is necessary but not sufficient: the key must
+                // also be one of the keys bound to *this* identity.
+                if let Some(binding) = binding
+                    && !binding.key_ids.contains(&signature.key_id)
+                {
+                    return Err(TrustError::BindingKeyMismatch {
+                        plugin_id: manifest.id.clone(),
+                        key_id: Some(signature.key_id.clone()),
                     });
                 }
                 Some(signature.key_id.clone())
@@ -472,6 +650,47 @@ pub enum TrustError {
         /// The rejected key id.
         key_id: String,
     },
+    /// The id is in the frozen inventory but declares a different class.
+    RegistryClassMismatch {
+        /// The plugin id that was claimed.
+        plugin_id: String,
+        /// The class the frozen inventory records for that id.
+        registry: DeliveryClass,
+        /// The class the manifest declared.
+        declared: DeliveryClass,
+    },
+    /// The plugin id has no identity binding on this host.
+    UnboundIdentity {
+        /// The plugin id that was claimed.
+        plugin_id: String,
+        /// Whether the id is reserved by the frozen inventory.
+        reserved: bool,
+    },
+    /// The manifest declares a class the identity binding does not allow.
+    BindingClassMismatch {
+        /// The plugin id that was claimed.
+        plugin_id: String,
+        /// The class the binding pins.
+        bound: DeliveryClass,
+        /// The class the manifest declared.
+        declared: DeliveryClass,
+    },
+    /// The plugin was found somewhere other than its bound location.
+    BindingLocationMismatch {
+        /// The plugin id that was claimed.
+        plugin_id: String,
+        /// The canonical directory the binding pins.
+        bound: PathBuf,
+        /// The canonical directory the plugin was actually found in.
+        found: PathBuf,
+    },
+    /// The signing key is trusted by this host but not for this identity.
+    BindingKeyMismatch {
+        /// The plugin id that was claimed.
+        plugin_id: String,
+        /// The key that signed it, or `None` when it was unsigned.
+        key_id: Option<String>,
+    },
 }
 
 impl fmt::Display for TrustError {
@@ -504,6 +723,62 @@ impl fmt::Display for TrustError {
             Self::UntrustedKeyId { key_id } => {
                 write!(f, "signing key id `{key_id}` is not trusted by this host")
             }
+            Self::RegistryClassMismatch {
+                plugin_id,
+                registry,
+                declared,
+            } => write!(
+                f,
+                "plugin id `{plugin_id}` is a `{}` plugin in the frozen inventory but the manifest declares `{}`",
+                registry.as_str(),
+                declared.as_str()
+            ),
+            Self::UnboundIdentity {
+                plugin_id,
+                reserved,
+            } => {
+                if *reserved {
+                    write!(
+                        f,
+                        "plugin id `{plugin_id}` is reserved by the frozen inventory and this host has no identity binding for it"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "plugin id `{plugin_id}` has no identity binding on this host"
+                    )
+                }
+            }
+            Self::BindingClassMismatch {
+                plugin_id,
+                bound,
+                declared,
+            } => write!(
+                f,
+                "plugin id `{plugin_id}` is bound to delivery class `{}` but the manifest declares `{}`",
+                bound.as_str(),
+                declared.as_str()
+            ),
+            Self::BindingLocationMismatch {
+                plugin_id,
+                bound,
+                found,
+            } => write!(
+                f,
+                "plugin id `{plugin_id}` is bound to `{}` but was found in `{}`",
+                bound.display(),
+                found.display()
+            ),
+            Self::BindingKeyMismatch { plugin_id, key_id } => match key_id {
+                Some(key_id) => write!(
+                    f,
+                    "signing key id `{key_id}` is not bound to plugin id `{plugin_id}`"
+                ),
+                None => write!(
+                    f,
+                    "plugin id `{plugin_id}` is bound to a signing key but the manifest is unsigned"
+                ),
+            },
         }
     }
 }

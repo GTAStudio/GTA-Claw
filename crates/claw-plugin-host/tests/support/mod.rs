@@ -9,11 +9,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use claw_plugin_api::capability::CapabilityGrant;
+use claw_plugin_api::capability::{CapabilityGrant, CapabilitySet};
 use claw_plugin_api::limits::ResourceLimits;
 use claw_plugin_api::manifest::{ComponentRef, MANIFEST_VERSION, PluginManifest};
+use claw_plugin_api::policy::OperatorPolicy;
 use claw_plugin_api::registry::DeliveryClass;
-use claw_plugin_api::trust::{TrustPolicy, component_sha256};
+use claw_plugin_api::trust::{IdentityBinding, TrustPolicy, component_sha256};
 
 /// The component text every fixture is derived from.
 pub const PROBE_WAT: &str = include_str!("../fixtures/probe-guest.wat");
@@ -81,12 +82,81 @@ pub fn tempdir() -> TempDir {
 /// A trust policy that accepts unsigned core plugins below `root`.
 ///
 /// Everything else stays closed: no other root, no other delivery class.
+/// Identity bindings are relaxed for ids outside the frozen registry, because
+/// the fixture id is not a real plugin; `tests/identity_binding.rs` exercises
+/// the binding rules directly, including the ones that cannot be relaxed.
 #[must_use]
 pub fn unsigned_core_policy(root: &Path) -> TrustPolicy {
     TrustPolicy::deny_all()
         .with_root(root.to_path_buf())
         .require_signature(false)
+        .require_identity_binding(false)
         .allow_delivery_class(DeliveryClass::Core)
+}
+
+/// A trust policy that additionally binds `id` to `directory`.
+#[must_use]
+pub fn bound_core_policy(root: &Path, directory: &Path, id: &str) -> TrustPolicy {
+    unsigned_core_policy(root)
+        .require_identity_binding(true)
+        .with_identity_binding(IdentityBinding::new(
+            id,
+            DeliveryClass::Core,
+            directory.to_path_buf(),
+        ))
+}
+
+/// An operator ceiling that allows `plugin_id` exactly `grants`.
+///
+/// Tests that are about the *runtime* capability boundary use this so the
+/// intersection is the identity function and the grant under test survives it
+/// unchanged. Tests that are about the ceiling itself build their own.
+#[must_use]
+pub fn ceiling_for(plugin_id: &str, grants: Vec<CapabilityGrant>) -> OperatorPolicy {
+    let set = CapabilitySet::new(grants).expect("the ceiling must be a valid capability set");
+    OperatorPolicy::deny_all().allow(plugin_id, set)
+}
+
+/// An operator ceiling for the probe fixture allowing exactly `grants`.
+#[must_use]
+pub fn probe_ceiling(grants: Vec<CapabilityGrant>) -> OperatorPolicy {
+    ceiling_for(PROBE_ID, grants)
+}
+
+/// An operator ceiling matching whatever the manifest in `directory` requests.
+///
+/// This deliberately makes the intersection an identity function, because the
+/// tests that use it are about what the *runtime* boundary does with a granted
+/// capability. The ceiling's own narrowing and withholding behaviour is proved
+/// separately, in `tests/operator_policy.rs` and in the `claw-plugin-api` unit
+/// tests, where the ceiling and the request differ.
+#[must_use]
+pub fn ceiling_from(directory: &Path) -> OperatorPolicy {
+    ceiling_from_all(&[directory])
+}
+
+/// The union of [`ceiling_from`] over several plugin directories.
+///
+/// Panics when two directories claim the same plugin id, since that would
+/// silently drop one of the ceilings.
+#[must_use]
+pub fn ceiling_from_all(directories: &[&Path]) -> OperatorPolicy {
+    let mut policy = OperatorPolicy::deny_all();
+    let mut seen = std::collections::BTreeSet::new();
+    for directory in directories {
+        let bytes = std::fs::read(directory.join("plugin.json")).expect("read the manifest back");
+        let manifest: PluginManifest =
+            serde_json::from_slice(&bytes).expect("the manifest must parse");
+        assert!(
+            seen.insert(manifest.id.clone()),
+            "two fixtures claim the plugin id `{}`",
+            manifest.id
+        );
+        let set = CapabilitySet::new(manifest.capabilities)
+            .expect("the ceiling must be a valid capability set");
+        policy = policy.allow(manifest.id, set);
+    }
+    policy
 }
 
 /// Assembles a probe component that also imports a WASI interface.
@@ -141,6 +211,88 @@ pub fn probe_component_named(id: &str) -> Vec<u8> {
     );
     assert_ne!(text, PROBE_WAT, "the id replacement must have been applied");
     wat::parse_str(&text).expect("the renamed fixture must assemble")
+}
+
+/// The fixture source with line endings normalised.
+///
+/// The `.wat` may be checked out with CRLF on Windows, so every anchor-based
+/// helper below works against this normalised copy rather than `PROBE_WAT`.
+fn probe_wat_lf() -> String {
+    PROBE_WAT.replace("\r\n", "\n")
+}
+
+/// Assembles a probe component that reads a file from inside `describe`.
+///
+/// `describe` runs before the host has established that the component really is
+/// the plugin its manifest names, so a host call there must be refused no
+/// matter what the manifest was granted.
+#[must_use]
+pub fn probe_component_reading_during_describe() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let anchor = "    (func (export \"describe\") (result i32)\n";
+    assert!(source.contains(anchor), "the describe anchor must exist");
+    let text = source.replacen(
+        anchor,
+        &format!(
+            "{anchor}      (call $h-fs-read (i32.const 1064) (i32.const 9) (i32.const 288))\n"
+        ),
+        1,
+    );
+    assert_ne!(text, source, "the describe host call must be inserted");
+    wat::parse_str(&text).expect("the describe fixture must assemble")
+}
+
+/// Assembles a probe component that logs and emits an event from `deactivate`.
+///
+/// `log` is in the cleanup set and must still work; `events` is not and must be
+/// refused, even though both were granted for the active window.
+#[must_use]
+pub fn probe_component_calling_during_deactivate() -> Vec<u8> {
+    let source = probe_wat_lf();
+    let anchor = "    (func (export \"deactivate\") (result i32)\n";
+    assert!(source.contains(anchor), "the deactivate anchor must exist");
+    let injected = concat!(
+        "      (call $h-log (i32.const 2) (i32.const 1048) (i32.const 2) (i32.const 288))\n",
+        "      (call $h-events\n",
+        "        (i32.const 5) (i64.const 0)\n",
+        "        (i32.const 1052) (i32.const 5)\n",
+        "        (i32.const 1120) (i32.const 2)\n",
+        "        (i32.const 288))\n",
+    );
+    let text = source.replacen(anchor, &format!("{anchor}{injected}"), 1);
+    assert_ne!(text, source, "the deactivate host calls must be inserted");
+    wat::parse_str(&text).expect("the deactivate fixture must assemble")
+}
+
+/// Assembles a probe component that registers `count` distinct tools.
+///
+/// Names are `ta`, `tb`, ... so a quota of *n* can be tested by asking for more
+/// than *n*. The answer is the two-byte code of the *last* registration that
+/// was attempted, so a refusal in the middle is visible.
+#[must_use]
+pub fn probe_component_registering_tools(count: u32) -> Vec<u8> {
+    assert!(
+        (1..=26).contains(&count),
+        "the fixture supports 1..=26 tools"
+    );
+    let source = probe_wat_lf();
+    let anchor = "      ;; l: host-events.emit";
+    assert!(source.contains(anchor), "the emit anchor must exist");
+    let mut body = String::from("      ;; z: register several distinct tools\n");
+    body.push_str("      (if (i32.eq (local.get $selector) (i32.const 122))\n        (then\n");
+    for index in 0..count {
+        // Each name is two bytes: `t` followed by a distinct letter, written
+        // into scratch memory (between the answer buffer and the literals, so
+        // it cannot collide with a `cabi_realloc` allocation) before the call.
+        body.push_str(&format!(
+            "          (i32.store8 (i32.const 640) (i32.const 116))\n          (i32.store8 (i32.const 641) (i32.const {}))\n          (call $h-tools\n            (i32.const 640) (i32.const 2)\n            (i32.const 1108) (i32.const 10)\n            (i32.const 1120) (i32.const 2)\n            (i32.const 288))\n",
+            97 + index
+        ));
+    }
+    body.push_str("          (return (call $answer (i32.const 288) (i32.const 4)))))\n");
+    let text = source.replacen(anchor, &format!("{body}{anchor}"), 1);
+    assert_ne!(text, source, "the tool loop must be inserted");
+    wat::parse_str(&text).expect("the tool-quota fixture must assemble")
 }
 
 /// A manifest describing `component` with no capabilities and default limits.
@@ -217,4 +369,16 @@ pub fn install_probe_named(
     manifest.id = id.to_owned();
     manifest.capabilities = grants;
     install(root, directory, &component, &manifest)
+}
+
+/// Installs an arbitrary probe variant with the given grants.
+pub fn install_variant(
+    root: &Path,
+    directory: &str,
+    component: &[u8],
+    grants: Vec<CapabilityGrant>,
+) -> PathBuf {
+    let mut manifest = manifest_for(component);
+    manifest.capabilities = grants;
+    install(root, directory, component, &manifest)
 }

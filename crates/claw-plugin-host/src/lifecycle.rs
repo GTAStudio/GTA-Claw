@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use claw_plugin_api::abi::{ABI_VERSION, Version, check_compatibility};
-use claw_plugin_api::capability::{CapabilityDenial, CapabilitySet};
+use claw_plugin_api::capability::{Capability, CapabilityDenial, CapabilitySet};
 use claw_plugin_api::limits::ResourceLimits;
 use claw_plugin_api::manifest::PluginManifest;
+use claw_plugin_api::policy::{OperatorPolicy, Withheld};
 use claw_plugin_api::trust::{
     RejectAllSignatures, SignatureVerifier, TrustDecision, TrustPolicy, VerificationRequest,
     component_sha256,
@@ -23,7 +24,16 @@ use crate::error::{GuestFailure, HostError, TerminationCause};
 use crate::host_impl::wit_event;
 use crate::limiter::HostCallGate;
 use crate::services::{HostEvent, HostServices};
-use crate::state::{PluginState, PluginStateConfig, ViolationPolicy};
+use crate::state::{LifecyclePhase, PluginState, PluginStateConfig, ViolationPolicy};
+
+/// Whether a lifecycle transition withdraws the plugin's tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purge {
+    /// Withdraw only when the transition did not succeed.
+    OnFailure,
+    /// Withdraw whatever the outcome.
+    Always,
+}
 
 /// The file every plugin directory must contain.
 pub const MANIFEST_FILE_NAME: &str = "plugin.json";
@@ -138,6 +148,8 @@ struct Loaded {
     component_path: PathBuf,
     digest: String,
     state: LifecycleState,
+    withheld: Vec<Withheld>,
+    narrowed: Vec<Capability>,
     instance: Option<Instance>,
     last_denials: Vec<CapabilityDenial>,
     last_usage: ResourceUsage,
@@ -150,9 +162,11 @@ struct Loaded {
 /// [`ViolationPolicy::ReturnError`].
 pub struct PluginHostBuilder {
     trust: TrustPolicy,
+    operator_policy: OperatorPolicy,
     verifier: Arc<dyn SignatureVerifier>,
     services: HostServices,
     policy: ViolationPolicy,
+    gate: Option<HostCallGate>,
     max_host_call_concurrency: u32,
 }
 
@@ -160,6 +174,7 @@ impl core::fmt::Debug for PluginHostBuilder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PluginHostBuilder")
             .field("trust", &self.trust)
+            .field("operator_policy", &self.operator_policy)
             .field("policy", &self.policy)
             .field("max_host_call_concurrency", &self.max_host_call_concurrency)
             .finish_non_exhaustive()
@@ -170,9 +185,11 @@ impl Default for PluginHostBuilder {
     fn default() -> Self {
         Self {
             trust: TrustPolicy::deny_all(),
+            operator_policy: OperatorPolicy::deny_all(),
             verifier: Arc::new(RejectAllSignatures),
             services: HostServices::deny_all(),
             policy: ViolationPolicy::ReturnError,
+            gate: None,
             max_host_call_concurrency: 8,
         }
     }
@@ -189,6 +206,18 @@ impl PluginHostBuilder {
     #[must_use]
     pub fn trust_policy(mut self, policy: TrustPolicy) -> Self {
         self.trust = policy;
+        self
+    }
+
+    /// Sets the operator capability policy.
+    ///
+    /// This is the ceiling. A manifest's requested capabilities are intersected
+    /// with it, so a manifest can only ever ask for *less* than the operator
+    /// already decided to allow. The default, [`OperatorPolicy::deny_all`],
+    /// grants nothing to anyone.
+    #[must_use]
+    pub fn operator_policy(mut self, policy: OperatorPolicy) -> Self {
+        self.operator_policy = policy;
         self
     }
 
@@ -220,19 +249,34 @@ impl PluginHostBuilder {
         self
     }
 
+    /// Shares an existing host-wide host-call gate with this host.
+    ///
+    /// Takes precedence over [`PluginHostBuilder::max_host_call_concurrency`].
+    /// Sharing one gate across hosts is how an embedder bounds total host-call
+    /// concurrency for a whole process rather than per host.
+    #[must_use]
+    pub fn host_call_gate(mut self, gate: HostCallGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     /// Builds the host, which also builds the engine and starts its ticker.
     ///
     /// # Errors
     ///
     /// Returns [`HostError::Instantiate`] when the engine cannot be created.
     pub fn build(self) -> Result<PluginHost, HostError> {
+        let gate = self
+            .gate
+            .unwrap_or_else(|| HostCallGate::new(self.max_host_call_concurrency));
         Ok(PluginHost {
             engine: PluginEngine::new()?,
             trust: self.trust,
+            operator_policy: self.operator_policy,
             verifier: self.verifier,
             services: self.services,
             policy: self.policy,
-            gate: HostCallGate::new(self.max_host_call_concurrency),
+            gate,
             plugins: BTreeMap::new(),
         })
     }
@@ -242,6 +286,7 @@ impl PluginHostBuilder {
 pub struct PluginHost {
     engine: PluginEngine,
     trust: TrustPolicy,
+    operator_policy: OperatorPolicy,
     verifier: Arc<dyn SignatureVerifier>,
     services: HostServices,
     policy: ViolationPolicy,
@@ -269,6 +314,59 @@ impl PluginHost {
     #[must_use]
     pub const fn trust_policy(&self) -> &TrustPolicy {
         &self.trust
+    }
+
+    /// The operator capability ceiling in force.
+    #[must_use]
+    pub const fn operator_policy(&self) -> &OperatorPolicy {
+        &self.operator_policy
+    }
+
+    /// The capabilities a plugin asked for and did not get.
+    ///
+    /// Empty when the operator ceiling covered everything the manifest
+    /// requested, which is also the case for a plugin that asked for nothing.
+    #[must_use]
+    pub fn withheld_capabilities(&self, id: &str) -> Option<&[Withheld]> {
+        self.plugins
+            .get(id)
+            .map(|plugin| plugin.withheld.as_slice())
+    }
+
+    /// The capabilities a plugin got, but with a scope narrower than it asked
+    /// for.
+    #[must_use]
+    pub fn narrowed_capabilities(&self, id: &str) -> Option<&[Capability]> {
+        self.plugins
+            .get(id)
+            .map(|plugin| plugin.narrowed.as_slice())
+    }
+
+    /// The capabilities a plugin's live instance actually holds.
+    #[must_use]
+    pub fn effective_capabilities(&self, id: &str) -> Option<&CapabilitySet> {
+        self.plugins
+            .get(id)
+            .and_then(|plugin| plugin.instance.as_ref())
+            .map(|instance| instance.store.data().capabilities())
+    }
+
+    /// Which part of the lifecycle a plugin's live instance is executing.
+    #[must_use]
+    pub fn phase(&self, id: &str) -> Option<LifecyclePhase> {
+        self.plugins
+            .get(id)
+            .and_then(|plugin| plugin.instance.as_ref())
+            .map(|instance| instance.store.data().phase())
+    }
+
+    /// The tools a plugin's live instance currently holds, sorted.
+    #[must_use]
+    pub fn registered_tools(&self, id: &str) -> Option<Vec<String>> {
+        self.plugins
+            .get(id)
+            .and_then(|plugin| plugin.instance.as_ref())
+            .map(|instance| instance.store.data().registered_tools())
     }
 
     /// The ids of every loaded plugin, sorted.
@@ -377,10 +475,19 @@ impl PluginHost {
         }
 
         manifest.limits.validate()?;
-        let capabilities = CapabilitySet::new(manifest.capabilities.iter().cloned())?;
+        let requested = CapabilitySet::new(manifest.capabilities.iter().cloned())?;
         let declared_abi = Version::parse(&manifest.abi_version)?;
         check_compatibility(ABI_VERSION, declared_abi)?;
         let manifest_version = Version::parse(&manifest.version)?;
+
+        // The manifest states what the plugin *wants*. What it gets is that
+        // request intersected with the operator's ceiling for this exact
+        // plugin id, so a validly signed but hostile manifest can only ever
+        // narrow its own reach, never widen it.
+        let effective = self.operator_policy.effective(&manifest.id, &requested);
+        let capabilities = effective.granted().clone();
+        let withheld = effective.withheld().to_vec();
+        let narrowed = effective.narrowed().to_vec();
 
         let decision: TrustDecision = self.trust.authorize(directory, &manifest)?;
 
@@ -435,6 +542,11 @@ impl PluginHost {
             .map_err(|error| HostError::Instantiate(format!("{error:#}")))?;
         disarm_call(&mut store);
 
+        // Instantiation ran the component's start function and `describe` is
+        // about to run, both before the host has established that this really
+        // is the plugin the manifest names. The store is still in
+        // `LifecyclePhase::Starting`, so neither can reach a host effect.
+        debug_assert_eq!(store.data().phase(), LifecyclePhase::Starting);
         arm_call(&mut store, &manifest.limits);
         let info = bindings
             .gta_claw_plugin_guest()
@@ -474,6 +586,10 @@ impl PluginHost {
         }
 
         let id = manifest.id.clone();
+        // Identity is now established, so the instance leaves the closed
+        // starting phase. It is still not activated, and `Loaded` permits
+        // nothing either.
+        store.data_mut().set_phase(LifecyclePhase::Loaded);
         self.plugins.insert(
             id.clone(),
             Loaded {
@@ -481,6 +597,8 @@ impl PluginHost {
                 directory: directory.to_path_buf(),
                 component_path: decision.component_path().to_path_buf(),
                 digest,
+                withheld,
+                narrowed,
                 state: LifecycleState::Loaded,
                 instance: Some(Instance { store, bindings }),
                 last_denials: Vec::new(),
@@ -502,11 +620,19 @@ impl PluginHost {
             "activate",
             &[LifecycleState::Loaded, LifecycleState::Inactive],
             LifecycleState::Active,
+            LifecyclePhase::Active,
+            LifecyclePhase::Active,
+            Purge::OnFailure,
             |bindings, store| bindings.gta_claw_plugin_guest().call_activate(store),
         )
     }
 
     /// Calls `deactivate` on an active plugin.
+    ///
+    /// Capabilities are revoked *before* the guest is invoked: only
+    /// [`LifecyclePhase::CLEANUP`] remains reachable for the duration of the
+    /// call, and nothing at all afterwards. Every tool the plugin registered is
+    /// withdrawn synchronously whether or not the guest cooperates.
     ///
     /// # Errors
     ///
@@ -518,16 +644,23 @@ impl PluginHost {
             "deactivate",
             &[LifecycleState::Active],
             LifecycleState::Inactive,
+            LifecyclePhase::Deactivating,
+            LifecyclePhase::Inactive,
+            Purge::Always,
             |bindings, store| bindings.gta_claw_plugin_guest().call_deactivate(store),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transition(
         &mut self,
         id: &str,
         operation: &'static str,
         allowed: &[LifecycleState],
         next: LifecycleState,
+        during: LifecyclePhase,
+        after_success: LifecyclePhase,
+        purge: Purge,
         call: impl FnOnce(
             &Plugin,
             &mut Store<PluginState>,
@@ -556,7 +689,7 @@ impl PluginHost {
             plugin.manifest.limits
         };
 
-        let outcome = {
+        let (outcome, previous_phase) = {
             let plugin = self
                 .plugins
                 .get_mut(id)
@@ -569,11 +702,38 @@ impl PluginHost {
                     actual: "unloaded",
                     expected: operation,
                 })?;
+            let previous_phase = instance.store.data().phase();
+            instance.store.data_mut().set_phase(during);
             arm_call(&mut instance.store, &limits);
             let raw = call(&instance.bindings, &mut instance.store);
             disarm_call(&mut instance.store);
-            raw.map_err(|error| classify(&error, instance.store.data()))
+            (
+                raw.map_err(|error| classify(&error, instance.store.data())),
+                previous_phase,
+            )
         };
+
+        // The phase is restored before anything else can observe the instance,
+        // so a guest that fails its own activation never keeps the capabilities
+        // that activation would have given it.
+        let succeeded = matches!(outcome, Ok(Ok(())));
+        if outcome.is_ok() {
+            let phase = if succeeded {
+                after_success
+            } else {
+                previous_phase
+            };
+            if let Some(instance) = self
+                .plugins
+                .get_mut(id)
+                .and_then(|plugin| plugin.instance.as_mut())
+            {
+                instance.store.data_mut().set_phase(phase);
+            }
+        }
+        if matches!(purge, Purge::Always) || !succeeded {
+            self.purge_tools(id);
+        }
 
         match outcome {
             Ok(Ok(())) => {
@@ -698,8 +858,11 @@ impl PluginHost {
     /// Marks a plugin faulted and destroys its instance.
     ///
     /// Only this plugin's store is dropped. Every other plugin keeps running
-    /// on its own store, which is what makes a trap non-contagious.
+    /// on its own store, which is what makes a trap non-contagious. The tools
+    /// the plugin had advertised are withdrawn first, so a trapped plugin
+    /// cannot leave callable entry points behind it.
     fn fault(&mut self, id: &str, error: &HostError) {
+        self.purge_tools(id);
         let cause = error.termination().unwrap_or(TerminationCause::Trap);
         if let Some(plugin) = self.plugins.get_mut(id) {
             if let Some(instance) = plugin.instance.take() {
@@ -710,10 +873,27 @@ impl PluginHost {
         }
     }
 
+    /// Withdraws every tool the live instance still holds.
+    ///
+    /// The names come from the instance's own ledger rather than from the
+    /// sink, so one plugin can never purge another's registrations.
+    fn purge_tools(&mut self, id: &str) {
+        let names = self
+            .plugins
+            .get_mut(id)
+            .and_then(|plugin| plugin.instance.as_mut())
+            .map(|instance| instance.store.data_mut().take_registered_tools())
+            .unwrap_or_default();
+        for name in names {
+            self.services.tools.unregister(id, &name);
+        }
+    }
+
     /// Drops a plugin's instance and forgets it.
     ///
     /// Deactivation is attempted first for an active plugin, but a guest that
-    /// refuses to deactivate cannot keep itself loaded.
+    /// refuses to deactivate cannot keep itself loaded, and its tools are
+    /// withdrawn either way.
     ///
     /// # Errors
     ///
@@ -725,6 +905,7 @@ impl PluginHost {
         if self.state(id) == Some(LifecycleState::Active) {
             let _ = self.deactivate(id);
         }
+        self.purge_tools(id);
         self.plugins.remove(id);
         Ok(())
     }

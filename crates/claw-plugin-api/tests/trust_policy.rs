@@ -51,6 +51,7 @@ fn permissive_policy(root: &Path) -> TrustPolicy {
     TrustPolicy::deny_all()
         .with_root(root)
         .require_signature(false)
+        .require_identity_binding(false)
         .allow_delivery_class(DeliveryClass::Core)
 }
 
@@ -79,6 +80,7 @@ fn a_policy_with_no_roots_refuses_even_an_allowed_delivery_class() {
 
     let policy = TrustPolicy::deny_all()
         .require_signature(false)
+        .require_identity_binding(false)
         .allow_delivery_class(DeliveryClass::Core);
     assert_eq!(
         policy.authorize(&plugin_dir, &manifest),
@@ -179,6 +181,7 @@ fn each_delivery_class_must_be_enabled_explicitly() {
 
     let policy = TrustPolicy::deny_all()
         .with_root(&root)
+        .require_identity_binding(false)
         .require_signature(false)
         .allow_delivery_class(DeliveryClass::Core);
 
@@ -206,6 +209,7 @@ fn an_unsigned_plugin_is_refused_when_signatures_are_required() {
 
     let policy = TrustPolicy::deny_all()
         .with_root(&root)
+        .require_identity_binding(false)
         .allow_delivery_class(DeliveryClass::Core);
     assert_eq!(
         policy.authorize(&plugin_dir, &manifest),
@@ -228,6 +232,7 @@ fn a_signature_from_an_untrusted_key_id_is_refused() {
 
     let policy = TrustPolicy::deny_all()
         .with_root(&root)
+        .require_identity_binding(false)
         .allow_delivery_class(DeliveryClass::Core)
         .with_trusted_key_id("release-2026");
     assert_eq!(

@@ -18,7 +18,7 @@ use claw_plugin_api::capability::{
     Capability, CapabilityDenial, ConfigScope, HttpMethod, MAX_KEY_LEN, host_matches,
     join_under_root, validate_key, validate_relative_path,
 };
-use claw_security::ssrf::{TargetPolicy, validate_target};
+use claw_security::ssrf::{TargetPolicy, ValidatedTarget, validate_redirect, validate_target};
 
 use crate::bindings::gta_claw::plugin::types::{Error as WitError, ErrorCode, Event as WitEvent};
 use crate::bindings::gta_claw::plugin::{
@@ -26,7 +26,7 @@ use crate::bindings::gta_claw::plugin::{
     host_tools, types,
 };
 use crate::convert::{event_kind_from_wit, level_from_wit};
-use crate::services::{HostEvent, LogRecord, OutboundRequest, ToolRegistration};
+use crate::services::{HostEvent, InboundResponse, LogRecord, OutboundRequest, ToolRegistration};
 use crate::state::{PluginState, wit_error};
 
 /// Headers a plugin may never set, because the host owns them.
@@ -40,6 +40,13 @@ const FORBIDDEN_HEADERS: [&str; 8] = [
     "transfer-encoding",
     "upgrade",
 ];
+
+/// How many `Location` hops the host will follow before giving up.
+///
+/// Each hop is a full re-validation, so this is a cost bound rather than a
+/// safety bound, but it also stops a redirect loop from occupying a host-call
+/// slot indefinitely.
+const MAX_HTTP_REDIRECTS: u32 = 3;
 
 type HostResult<T> = wasmtime::Result<Result<T, WitError>>;
 
@@ -491,41 +498,8 @@ impl host_http::Host for PluginState {
         }
 
         // `claw-security` rejects userinfo, fragments, non-HTTP schemes and any
-        // address that is not publicly routable, which is what stops a plugin
-        // reaching the host's own loopback or link-local services.
-        let target = match validate_target(&req.url, &TargetPolicy::PublicInternet) {
-            Ok(target) => target,
-            Err(error) => {
-                drop(permit);
-                return self.deny(CapabilityDenial::out_of_scope(
-                    Capability::Http,
-                    "send",
-                    format!("target refused: {error}"),
-                ));
-            }
-        };
-        if !grant.allow_plaintext && !target.as_str().starts_with("https://") {
-            drop(permit);
-            return self.deny(CapabilityDenial::out_of_scope(
-                Capability::Http,
-                "send",
-                "plaintext HTTP is not enabled for this plugin",
-            ));
-        }
-        let host = target.host().as_str();
-        if !grant
-            .hosts
-            .iter()
-            .any(|pattern| host_matches(pattern, &host))
-        {
-            drop(permit);
-            return self.deny(CapabilityDenial::out_of_scope(
-                Capability::Http,
-                "send",
-                format!("host `{host}` is not in the granted host list"),
-            ));
-        }
-
+        // address that is not publicly routable; that check, the grant host
+        // allowlist and DNS revalidation all run per hop in `attempt_http`.
         let mut headers = Vec::with_capacity(req.headers.len());
         for (name, value) in req.headers {
             let lowered = name.to_ascii_lowercase();
@@ -564,26 +538,175 @@ impl host_http::Host for PluginState {
             ));
         }
 
-        let outbound = OutboundRequest {
-            method,
-            url: target.as_str().to_owned(),
-            headers,
-            body: req.body,
-        };
-        let response = self.services().http.send(self.plugin_id(), outbound);
-        let response = match response {
-            Ok(response) => response,
-            Err(message) => {
+        // Redirects are followed by the host, never by the transport, so that
+        // every hop re-runs the whole check chain: scheme, grant allowlist,
+        // resolution and address policy. A transport that followed a `Location`
+        // itself would be making an unchecked request on the plugin's behalf.
+        let mut url = req.url;
+        let mut method = method;
+        let mut body = req.body;
+        let mut hops = 0_u32;
+        loop {
+            let attempt = match self.attempt_http(&grant, &method, &url, &headers, body.clone()) {
+                Ok(Ok(attempt)) => attempt,
+                Ok(Err(error)) => {
+                    drop(permit);
+                    return Ok(Err(error));
+                }
+                Err(denial) => {
+                    drop(permit);
+                    return self.deny(denial);
+                }
+            };
+            let Some(location) = redirect_location(&attempt.response) else {
                 drop(permit);
-                return Ok(Err(wit_error(ErrorCode::Internal, message)));
+                return Ok(Ok(host_http::Response {
+                    status: attempt.response.status,
+                    headers: attempt.response.headers,
+                    body: attempt.response.body,
+                }));
+            };
+            hops += 1;
+            if hops > MAX_HTTP_REDIRECTS {
+                drop(permit);
+                return self.deny(CapabilityDenial::quota_exceeded(
+                    Capability::Http,
+                    "send",
+                    format!("more than {MAX_HTTP_REDIRECTS} redirects"),
+                ));
             }
+            // Resolving the `Location` against the hop that produced it is what
+            // makes a relative redirect unambiguous; `validate_redirect` then
+            // re-runs the full target policy on the result.
+            let next = match validate_redirect(
+                &attempt.target,
+                &location,
+                &TargetPolicy::PublicInternet,
+            ) {
+                Ok(next) => next,
+                Err(error) => {
+                    drop(permit);
+                    return self.deny(CapabilityDenial::out_of_scope(
+                        Capability::Http,
+                        "send",
+                        format!("redirect to `{location}` refused: {error}"),
+                    ));
+                }
+            };
+            if attempt.response.status == 303 {
+                method = "GET".to_owned();
+                body = None;
+                if !grant
+                    .methods
+                    .iter()
+                    .any(|candidate| HttpMethod::as_str(*candidate) == method)
+                {
+                    drop(permit);
+                    return self.deny(CapabilityDenial::out_of_scope(
+                        Capability::Http,
+                        "send",
+                        "a 303 redirect requires `GET`, which is not in the granted method list",
+                    ));
+                }
+            }
+            url = next.as_str().to_owned();
+        }
+    }
+}
+
+/// One completed hop: the target the host actually validated and connected to,
+/// paired with the response it produced.
+struct HttpAttempt {
+    target: ValidatedTarget,
+    response: InboundResponse,
+}
+
+impl PluginState {
+    /// Validates, resolves and issues exactly one hop.
+    ///
+    /// The outer `Result` separates a capability denial (which the caller must
+    /// route through the audit log) from a transport error (which is reported
+    /// to the guest as-is).
+    fn attempt_http(
+        &mut self,
+        grant: &claw_plugin_api::capability::HttpGrant,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<Vec<u8>>,
+    ) -> Result<Result<HttpAttempt, WitError>, CapabilityDenial> {
+        // `claw-security` rejects userinfo, fragments, non-HTTP schemes and any
+        // address literal that is not publicly routable, which is what stops a
+        // plugin reaching the host's own loopback or link-local services.
+        let target = validate_target(url, &TargetPolicy::PublicInternet).map_err(|error| {
+            CapabilityDenial::out_of_scope(
+                Capability::Http,
+                "send",
+                format!("target refused: {error}"),
+            )
+        })?;
+        if !grant.allow_plaintext && !target.as_str().starts_with("https://") {
+            return Err(CapabilityDenial::out_of_scope(
+                Capability::Http,
+                "send",
+                "plaintext HTTP is not enabled for this plugin",
+            ));
+        }
+        let host = target.host().as_str();
+        if !grant
+            .hosts
+            .iter()
+            .any(|pattern| host_matches(pattern, &host))
+        {
+            return Err(CapabilityDenial::out_of_scope(
+                Capability::Http,
+                "send",
+                format!("host `{host}` is not in the granted host list"),
+            ));
+        }
+
+        // Resolution happens here, in the host, immediately before the request
+        // is issued, and the *addresses* are what the transport is given. A
+        // hostile authoritative server can therefore not answer a second,
+        // unchecked lookup inside the transport with a loopback or metadata
+        // address.
+        let addresses = self
+            .services()
+            .dns
+            .resolve(&host, target.port())
+            .map_err(|error| {
+                CapabilityDenial::out_of_scope(
+                    Capability::Http,
+                    "send",
+                    format!("`{host}` could not be resolved: {error}"),
+                )
+            })?;
+        target.validate_resolution(&addresses).map_err(|error| {
+            CapabilityDenial::out_of_scope(
+                Capability::Http,
+                "send",
+                format!("`{host}` resolved to an address that is not reachable: {error}"),
+            )
+        })?;
+
+        let outbound = OutboundRequest {
+            method: method.to_owned(),
+            url: target.as_str().to_owned(),
+            host: host.clone(),
+            port: target.port(),
+            addresses,
+            headers: headers.to_vec(),
+            body,
+        };
+        let response = match self.services().http.send(self.plugin_id(), outbound) {
+            Ok(response) => response,
+            Err(message) => return Ok(Err(wit_error(ErrorCode::Internal, message))),
         };
         let response_len = response.body.len() as u64;
         if response_len > grant.max_response_bytes
             || response_len > u64::from(self.limits().max_payload_bytes)
         {
-            drop(permit);
-            return self.deny(CapabilityDenial::quota_exceeded(
+            return Err(CapabilityDenial::quota_exceeded(
                 Capability::Http,
                 "send",
                 format!(
@@ -592,13 +715,20 @@ impl host_http::Host for PluginState {
                 ),
             ));
         }
-        drop(permit);
-        Ok(Ok(host_http::Response {
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
-        }))
+        Ok(Ok(HttpAttempt { target, response }))
     }
+}
+
+/// Extracts a redirect destination, if the response is one.
+fn redirect_location(response: &InboundResponse) -> Option<String> {
+    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone())
 }
 
 impl host_clock::Host for PluginState {
@@ -726,13 +856,33 @@ impl host_tools::Host for PluginState {
                 "input schema is not valid JSON",
             ));
         }
+        // The quota counts distinct names this instance currently holds, so
+        // replacing an existing registration is always allowed and only a new
+        // name can push the plugin over its ceiling.
+        let already_registered = self.registered_tools().contains(&tool.name);
+        if !already_registered {
+            let held = self.registered_tools().len() as u64;
+            if held >= u64::from(grant.max_tools) {
+                drop(permit);
+                return self.deny(CapabilityDenial::quota_exceeded(
+                    Capability::Tools,
+                    "register",
+                    format!(
+                        "this plugin already holds {held} of its {} granted tools",
+                        grant.max_tools
+                    ),
+                ));
+            }
+        }
         let plugin_id = self.plugin_id().to_owned();
+        let name = tool.name.clone();
         self.services().tools.register(ToolRegistration {
             plugin_id,
             name: tool.name,
             summary: tool.summary,
             input_schema: tool.input_schema,
         });
+        self.note_tool_registered(name);
         drop(permit);
         Ok(Ok(()))
     }
@@ -751,6 +901,7 @@ impl host_tools::Host for PluginState {
             ));
         }
         let removed = self.services().tools.unregister(self.plugin_id(), &name);
+        self.note_tool_unregistered(&name);
         drop(permit);
         Ok(Ok(removed))
     }

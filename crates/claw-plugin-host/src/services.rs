@@ -6,6 +6,7 @@
 //! rules. All defaults deny.
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
 use claw_plugin_api::capability::{EventKind, LogLevel};
@@ -48,12 +49,25 @@ pub struct ToolRegistration {
 }
 
 /// An outbound HTTP request that already passed every host-side check.
+///
+/// The transport must connect to one of [`OutboundRequest::addresses`]. Those
+/// addresses were resolved by the host and revalidated immediately before this
+/// value was constructed, so re-resolving [`OutboundRequest::host`] inside the
+/// transport would reopen the DNS-rebinding window the host just closed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboundRequest {
     /// Uppercase method, already checked against the grant's allowlist.
     pub method: String,
     /// Canonical URL produced by `claw-security`'s SSRF validator.
     pub url: String,
+    /// Canonical target host. Use it for the `Host` header and for TLS SNI,
+    /// never for a fresh name lookup.
+    pub host: String,
+    /// Explicit or scheme-default port.
+    pub port: u16,
+    /// The addresses the host resolved and validated for this attempt. Connect
+    /// to one of these and to nothing else.
+    pub addresses: Vec<IpAddr>,
     /// Headers, already filtered.
     pub headers: Vec<(String, String)>,
     /// Optional body.
@@ -104,9 +118,34 @@ pub trait StoreBackend: Send + Sync {
     fn key_count(&self, plugin_id: &str) -> u32;
 }
 
+/// Name resolution for outbound HTTP.
+///
+/// The host resolves names itself, immediately before it hands a request to a
+/// transport, so that the addresses the SSRF validator inspected are the same
+/// addresses the connection uses. Leaving resolution to the transport would
+/// mean the validator's verdict and the connection's target are two separate
+/// lookups, which is precisely the DNS-rebinding hole.
+pub trait DnsResolver: Send + Sync {
+    /// Resolves `host` to every address a connection might use.
+    ///
+    /// Implementations must return *all* candidate addresses; returning only
+    /// the first would let a hostile authoritative server hide a loopback
+    /// answer behind a public one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the name cannot be resolved.
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String>;
+}
+
 /// Outbound HTTP transport.
 pub trait HttpTransport: Send + Sync {
     /// Performs one already-validated request.
+    ///
+    /// Implementations must connect to one of [`OutboundRequest::addresses`],
+    /// must send [`OutboundRequest::host`] as the `Host` header and TLS SNI,
+    /// and must **not** follow redirects: the host re-runs the full SSRF check
+    /// on every hop itself and will issue the next hop as a fresh request.
     ///
     /// # Errors
     ///
@@ -175,6 +214,71 @@ pub struct DenyAllHttp;
 impl HttpTransport for DenyAllHttp {
     fn send(&self, _plugin_id: &str, _request: OutboundRequest) -> Result<InboundResponse, String> {
         Err("this host has no HTTP transport installed".to_owned())
+    }
+}
+
+/// A resolver that resolves nothing.
+///
+/// This is the default, so a host that installs a transport but forgets to
+/// install a resolver cannot reach the network at all rather than silently
+/// falling back to ambient name resolution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenyAllDns;
+
+impl DnsResolver for DenyAllDns {
+    fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+        Err("this host has no DNS resolver installed".to_owned())
+    }
+}
+
+/// The operating-system resolver.
+///
+/// Opt in explicitly. Every address it returns is still checked against the
+/// SSRF policy before a connection is attempted.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemDnsResolver;
+
+impl DnsResolver for SystemDnsResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+        let addresses: Vec<IpAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| error.to_string())?
+            .map(|address| address.ip())
+            .collect();
+        if addresses.is_empty() {
+            return Err(format!("`{host}` resolved to no addresses"));
+        }
+        Ok(addresses)
+    }
+}
+
+/// A resolver with a fixed answer table, for deterministic tests.
+#[derive(Clone, Debug, Default)]
+pub struct StaticDns {
+    answers: BTreeMap<String, Vec<IpAddr>>,
+}
+
+impl StaticDns {
+    /// A resolver that knows no names.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds one answer, replacing any previous answer for the same host.
+    #[must_use]
+    pub fn with(mut self, host: impl Into<String>, addresses: Vec<IpAddr>) -> Self {
+        self.answers.insert(host.into(), addresses);
+        self
+    }
+}
+
+impl DnsResolver for StaticDns {
+    fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+        self.answers
+            .get(host)
+            .cloned()
+            .ok_or_else(|| format!("`{host}` is not in the static answer table"))
     }
 }
 
@@ -444,6 +548,7 @@ pub struct HostServices {
     pub(crate) config: Arc<dyn ConfigProvider>,
     pub(crate) store: Arc<dyn StoreBackend>,
     pub(crate) http: Arc<dyn HttpTransport>,
+    pub(crate) dns: Arc<dyn DnsResolver>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) random: Arc<dyn RandomSource>,
     pub(crate) tools: Arc<dyn ToolSink>,
@@ -471,6 +576,7 @@ impl HostServices {
             config: Arc::new(EmptyConfig),
             store: Arc::new(NullStore),
             http: Arc::new(DenyAllHttp),
+            dns: Arc::new(DenyAllDns),
             clock: Arc::new(SystemClock),
             random: Arc::new(OsRandom),
             tools: Arc::new(DiscardTools),
@@ -503,6 +609,16 @@ impl HostServices {
     #[must_use]
     pub fn with_http(mut self, transport: Arc<dyn HttpTransport>) -> Self {
         self.http = transport;
+        self
+    }
+
+    /// Installs a DNS resolver.
+    ///
+    /// Without one, outbound HTTP fails at the resolution step even when the
+    /// capability is granted and a transport is installed.
+    #[must_use]
+    pub fn with_dns(mut self, resolver: Arc<dyn DnsResolver>) -> Self {
+        self.dns = resolver;
         self
     }
 

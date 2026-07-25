@@ -315,6 +315,7 @@ fn an_unsigned_plugin_is_refused_when_the_policy_demands_a_signature() {
     let policy = TrustPolicy::deny_all()
         .with_root(root.path().to_path_buf())
         .require_signature(true)
+        .require_identity_binding(false)
         .allow_delivery_class(DeliveryClass::Core);
     let mut host = host(policy);
 
@@ -360,6 +361,7 @@ fn a_signed_plugin_loads_and_a_tampered_one_does_not() {
     let policy = TrustPolicy::deny_all()
         .with_root(root.path().to_path_buf())
         .require_signature(true)
+        .require_identity_binding(false)
         .with_trusted_key_id("release")
         .allow_delivery_class(DeliveryClass::Core);
     let mut host = PluginHost::builder()

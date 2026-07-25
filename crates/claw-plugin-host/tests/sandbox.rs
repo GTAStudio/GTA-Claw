@@ -59,6 +59,7 @@ fn a_plugin_with_no_grants_is_refused_every_single_host_call() {
     let recorder = RecordingSink::new();
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .services(recording_services(&recorder))
         .build()
         .expect("host");
@@ -122,6 +123,7 @@ fn granting_one_capability_does_not_open_any_other() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -162,6 +164,7 @@ fn filesystem_reads_are_confined_to_the_granted_root() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&inside))
         .build()
         .expect("host");
     let id = host.load(&inside).expect("load");
@@ -214,6 +217,7 @@ fn a_guest_cannot_climb_out_of_its_granted_root() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -269,6 +273,7 @@ fn a_filesystem_grant_for_the_wrong_root_is_out_of_scope() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -319,6 +324,7 @@ fn http_grants_are_scoped_to_host_and_method() {
 
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from_all(&[&wrong_host, &wrong_method]))
         .build()
         .expect("host");
 
@@ -371,6 +377,7 @@ fn config_reads_are_scoped_to_the_granted_keys() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .services(HostServices::deny_all().with_config(Arc::new(config)))
         .build()
         .expect("host");
@@ -405,6 +412,7 @@ fn a_store_grant_with_no_room_refuses_writes_but_still_allows_reads() {
     let store = InMemoryStore::new();
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .services(HostServices::deny_all().with_store(Arc::new(store.clone())))
         .build()
         .expect("host");
@@ -451,6 +459,7 @@ fn log_grants_filter_by_level() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .services(HostServices::deny_all().with_logs(Arc::new(recorder.clone())))
         .build()
         .expect("host");
@@ -490,6 +499,7 @@ fn event_grants_are_scoped_to_the_granted_kinds() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .services(HostServices::deny_all().with_events(Arc::new(recorder.clone())))
         .build()
         .expect("host");
@@ -543,6 +553,7 @@ fn granted_calls_actually_reach_the_host_services() {
     );
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .services(recording_services(&recorder))
         .build()
         .expect("host");
@@ -586,6 +597,7 @@ fn the_trap_violation_policy_kills_the_call_instead_of_returning_an_error() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .violation_policy(ViolationPolicy::Trap)
         .build()
         .expect("host");
@@ -633,6 +645,7 @@ fn two_plugins_never_share_a_grant() {
 
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from_all(&[&privileged, &plain]))
         .build()
         .expect("host");
     let privileged_id = host.load(&privileged).expect("load privileged");

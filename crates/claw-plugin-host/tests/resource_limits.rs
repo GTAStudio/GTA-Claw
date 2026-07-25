@@ -19,6 +19,15 @@ fn host_for(root: &std::path::Path) -> PluginHost {
         .expect("host")
 }
 
+/// A host whose operator ceiling matches the manifests in `directories`.
+fn host_for_all(root: &std::path::Path, directories: &[&std::path::Path]) -> PluginHost {
+    PluginHost::builder()
+        .trust_policy(unsigned_core_policy(root))
+        .operator_policy(support::ceiling_from_all(directories))
+        .build()
+        .expect("host")
+}
+
 #[test]
 fn an_infinite_loop_runs_out_of_fuel() {
     let root = support::tempdir();
@@ -204,7 +213,7 @@ fn a_bystander_keeps_working_while_its_neighbour_keeps_running_away() {
         vec![CapabilityGrant::Clock(ClockGrant { resolution_ms: 1 })],
     );
 
-    let mut host = host_for(root.path());
+    let mut host = host_for_all(root.path(), &[&victim, &bystander]);
     let victim_id = host.load(&victim).expect("load victim");
     let bystander_id = host.load(&bystander).expect("load bystander");
     host.activate(&victim_id).expect("activate victim");

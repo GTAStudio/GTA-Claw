@@ -21,9 +21,10 @@ fn event(kind: EventKind, sequence: u64) -> HostEvent {
 #[test]
 fn the_states_follow_discover_load_activate_deactivate_unload() {
     let root = support::tempdir();
-    install_probe(root.path(), "probe", Vec::new());
+    let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
 
@@ -66,6 +67,7 @@ fn operations_are_refused_in_the_wrong_state() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -144,6 +146,7 @@ fn events_reach_the_guest_and_its_answer_comes_back() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -183,6 +186,7 @@ fn a_guest_error_is_surfaced_without_faulting_the_plugin() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -216,6 +220,7 @@ fn reload_picks_up_new_bytes_from_disk() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");
@@ -249,6 +254,7 @@ fn unloading_forgets_everything_about_a_plugin() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
     let id = host.load(&dir).expect("load");

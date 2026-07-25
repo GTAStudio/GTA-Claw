@@ -21,6 +21,7 @@ fn the_probe_fixture_loads_activates_and_answers() {
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
+        .operator_policy(support::ceiling_from(&dir))
         .build()
         .expect("host");
 

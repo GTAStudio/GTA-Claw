@@ -574,6 +574,12 @@ impl CapabilitySet {
         self.grants.values()
     }
 
+    /// The grant scoping `capability`, if it was granted.
+    #[must_use]
+    pub fn grant(&self, capability: Capability) -> Option<&CapabilityGrant> {
+        self.grants.get(&capability)
+    }
+
     /// Number of granted capabilities.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -711,6 +717,9 @@ impl core::error::Error for CapabilitySetError {
 pub enum DenialReason {
     /// The capability was never granted.
     NotGranted,
+    /// The capability was granted, but not for the lifecycle phase the plugin
+    /// is currently in.
+    WrongPhase(String),
     /// The capability was granted but this call fell outside its scope.
     OutOfScope(String),
     /// The call was in scope but exceeded a quota.
@@ -735,6 +744,20 @@ impl CapabilityDenial {
             capability,
             operation,
             reason: DenialReason::NotGranted,
+        }
+    }
+
+    /// Records a denial for a call made outside the plugin's active window.
+    #[must_use]
+    pub fn wrong_phase(
+        capability: Capability,
+        operation: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            capability,
+            operation,
+            reason: DenialReason::WrongPhase(detail.into()),
         }
     }
 
@@ -806,6 +829,11 @@ impl fmt::Display for CapabilityDenial {
                 f,
                 "`{}` requires capability `{}`, which is not granted",
                 self.operation, self.capability
+            ),
+            DenialReason::WrongPhase(detail) => write!(
+                f,
+                "`{}` is not reachable in this lifecycle phase: {detail}",
+                self.operation
             ),
             DenialReason::OutOfScope(detail) => write!(
                 f,
