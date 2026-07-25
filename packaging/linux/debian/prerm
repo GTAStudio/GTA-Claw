@@ -11,9 +11,11 @@ remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
 remove_was_enabled_runtime=/run/gta-claw-daemon.remove-was-enabled-runtime
 runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
+replacement_fence=$runtime_directory/replacement-fenced
 remove_initializer_was_active=$runtime_directory/remove-was-active
 lock=/var/lib/gta-claw-protected/state.writer.lock
 prepared=0
+package_fenced=0
 
 lock_holder_pid() {
   if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
@@ -95,23 +97,34 @@ restore_on_failure() {
   status=$?
   trap - 0 HUP INT TERM
   if [ "$prepared" -eq 0 ]; then
-    systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
-      fence_failed_restore
-    systemctl daemon-reload >/dev/null 2>&1 || fence_failed_restore
-    if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
-      systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
+    if [ "$package_fenced" -eq 1 ]; then
+      restore_enablement >/dev/null 2>&1 || fence_failed_restore
+      ensure_failure_fence || fence_failed_restore
+      systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
         fence_failed_restore
-    fi
-    restore_enablement >/dev/null 2>&1 || fence_failed_restore
-    if [ -e "$remove_initializer_was_active" ]; then
-      systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
+      systemctl stop gta-claw-daemon.service >/dev/null 2>&1 ||
         fence_failed_restore
-    fi
-    if [ -e "$remove_was_active" ]; then
-      systemctl start gta-claw-daemon.service >/dev/null 2>&1 ||
+      verify_unit_stopped gta-claw-daemon.service
+      verify_writer_lock_released
+    else
+      systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
         fence_failed_restore
-      /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 ||
-        fence_failed_restore
+      systemctl daemon-reload >/dev/null 2>&1 || fence_failed_restore
+      if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
+        systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_restore
+      fi
+      restore_enablement >/dev/null 2>&1 || fence_failed_restore
+      if [ -e "$remove_initializer_was_active" ]; then
+        systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
+          fence_failed_restore
+      fi
+      if [ -e "$remove_was_active" ]; then
+        systemctl start gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_restore
+        /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 ||
+          fence_failed_restore
+      fi
     fi
   fi
   exit "$status"
@@ -128,9 +141,26 @@ if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
     : # disabled and not-found states are returned with nonzero status.
   fi
   case "$enabled_state" in
+    masked | masked-runtime)
+      if [ ! -e "$replacement_fence" ] || [ ! -e "$failure_marker" ]; then
+        echo "refusing externally masked gta-claw daemon during removal" >&2
+        exit 1
+      fi
+      package_fenced=1
+      trap restore_on_failure 0 HUP INT TERM
+      verify_unit_stopped gta-claw-daemon.service
+      verify_writer_lock_released
+      systemctl unmask --runtime gta-claw-daemon.service
+      systemctl daemon-reload
+      if ! enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+        : # disabled and not-found states are returned with nonzero status.
+      fi
+      ;;
+  esac
+  case "$enabled_state" in
     enabled) touch "$remove_was_enabled" ;;
     enabled-runtime) touch "$remove_was_enabled_runtime" ;;
-    disabled | indirect | static | generated | transient | masked | not-found | '') ;;
+    disabled | indirect | static | generated | transient | not-found | '') ;;
     *) {
       echo "unexpected gta-claw enablement state before removal: $enabled_state" >&2
       exit 1

@@ -4,6 +4,8 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/lib/worktree-git.sh"
+bootstrap_windows_worktree_git "$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/container-mount.sh"
 

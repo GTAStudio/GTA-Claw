@@ -1074,4 +1074,14 @@ reject_unexpected_rpm_scriptlets() {
   done
 }
 
+reject_rpm_ghost_files() {
+  local artifact="$1"
+  local ghost
+  ghost="$(
+    rpm -qp --qf '[%{FILENAMES}\t%{FILEFLAGS:fflags}\n]' "$artifact" |
+      awk -F '\t' 'index($2, "g") { print $1; exit }'
+  )"
+  [[ -z "$ghost" ]] || die "RPM contains an unexpected ghost path: $ghost"
+}
+
 source "$LINUX_DIR/config.sh"

@@ -129,6 +129,7 @@ stop_for_idempotent_configure() {
         echo "refusing externally masked gta-claw daemon" >&2
         exit 1
       fi
+      systemctl stop gta-claw-daemon.service
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       stop_initializer_for_replacement
       verify_writer_lock_released
@@ -259,7 +260,6 @@ case "$1" in
     ;;
   abort-remove)
     if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
-      systemctl --system daemon-reload >/dev/null
       restore_remove_state
     fi
     ;;

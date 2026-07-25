@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import ast
+import json
 import re
 import shlex
 import sys
@@ -36,6 +37,7 @@ RESERVED = frozenset(
 )
 SHELLS = frozenset({"ash", "bash", "dash", "ksh", "sh", "zsh"})
 PREFIX_OPTIONS_WITH_VALUES = {
+    "exec": frozenset({"-a"}),
     "env": frozenset({"-C", "--chdir", "-S", "--split-string", "-u", "--unset"}),
     "nice": frozenset({"-n", "--adjustment"}),
     "runuser": frozenset({"-g", "--group", "-G", "--supp-group", "-u", "--user"}),
@@ -307,6 +309,9 @@ def shell_command_string(tokens, index):
             short_options = option[1:] if not option.startswith("--") else ""
             if "c" in short_options:
                 return index + 1
+            if option in {"-o", "+o", "--init-file", "--rcfile"}:
+                index += 2
+                continue
             index += 1
             continue
         break
@@ -406,8 +411,27 @@ def literal_strings(node):
 def inspect_python(path, text):
     findings = []
     tree = ast.parse(text, filename=str(path))
+    aliases = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in {"asyncio", "os", "subprocess"}:
+                    aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in {
+            "asyncio",
+            "os",
+            "subprocess",
+        }:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or dotted_name(node.func) not in PYTHON_COMMAND_CALLS:
+        if not isinstance(node, ast.Call):
+            continue
+        name = dotted_name(node.func)
+        first, separator, remainder = name.partition(".")
+        if first in aliases:
+            name = aliases[first] + (separator + remainder if separator else "")
+        if name not in PYTHON_COMMAND_CALLS:
             continue
         for argument in node.args:
             for value in literal_strings(argument):
@@ -455,7 +479,24 @@ def inspect_dockerfile(text):
     for number, line in enumerate(logical.splitlines(), start=1):
         match = re.match(r"^\s*(RUN|CMD|ENTRYPOINT)\s+(.*)$", line, re.IGNORECASE)
         if match:
-            findings.extend(inspect_shell(match.group(2), number))
+            command = match.group(2)
+            if command.lstrip().startswith("["):
+                try:
+                    arguments = json.loads(command)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"invalid Docker JSON command: {error}") from error
+                if not isinstance(arguments, list) or not all(
+                    isinstance(argument, str) for argument in arguments
+                ):
+                    raise ValueError("Docker JSON command must be an array of strings")
+                if arguments:
+                    findings.extend(
+                        inspect_command(
+                            [(argument, number) for argument in arguments],
+                        )
+                    )
+            else:
+                findings.extend(inspect_shell(command, number))
     return findings
 
 

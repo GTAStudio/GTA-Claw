@@ -437,6 +437,7 @@ validate_workflow() {
   assert_exact_block "workflow events" "$expected" "$actual" || return 1
 
   expected="$(printf '%s\n' \
+    '.gitattributes' \
     '.github/workflows/linux-packaging.yml' \
     '.github/workflows/macos-packaging.yml' \
     '.github/workflows/windows-packaging.yml' \
@@ -501,7 +502,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    bd9b4fe92603082aa655a0bcc31ba983e4f567a08ded53b485b016e40ff67a20 \
+    9443154dac13aec6ab55d9923a389701e5f2ac412fbff0b6d40c60532b5cbb86 \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \

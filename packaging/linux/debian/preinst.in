@@ -90,6 +90,7 @@ stop_runtime_for_replacement() {
         echo "refusing externally masked gta-claw daemon" >&2
         exit 1
       fi
+      systemctl stop gta-claw-daemon.service
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;
     not-found)

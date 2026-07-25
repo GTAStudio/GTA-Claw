@@ -290,6 +290,25 @@ remove_initializer_stop_denial() {
   sudo systemctl reset-failed gta-claw-state-init.service >/dev/null 2>&1 || true
 }
 
+establish_package_runtime_fence() {
+  sudo install -d -o root -g root -m 0755 /run/gta-claw-state-init
+  sudo touch \
+    /run/gta-claw-state-init/initialization-failed \
+    /run/gta-claw-state-init/replacement-fenced
+  sudo chown root:root \
+    /run/gta-claw-state-init/initialization-failed \
+    /run/gta-claw-state-init/replacement-fenced
+  sudo chmod 0644 \
+    /run/gta-claw-state-init/initialization-failed \
+    /run/gta-claw-state-init/replacement-fenced
+  sudo systemctl mask --runtime gta-claw-daemon.service
+  sudo systemctl stop gta-claw-daemon.service
+  case "$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)" in
+    masked | masked-runtime) ;;
+    *) die "package-owned runtime fence did not mask the daemon" ;;
+  esac
+}
+
 mkdir "$direct_root/release1" "$direct_root/release2"
 tar -xzf "$tar1" -C "$direct_root/release1"
 tar -xzf "$tar2" -C "$direct_root/release2"
@@ -506,7 +525,11 @@ sudo dpkg -i "$deb2"
 assert_disabled_and_inactive
 assert_preserved "$deb_inactive_upgrade_snapshot"
 deb_inactive_snapshot="$(state_snapshot)"
+establish_package_runtime_fence
 sudo dpkg --remove gta-claw
+[[ ! -e /run/gta-claw-state-init/initialization-failed &&
+  ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "Debian removal did not clear deferred package-fence markers"
 assert_preserved "$deb_inactive_snapshot"
 sudo dpkg --purge gta-claw
 assert_preserved "$deb_inactive_snapshot"
@@ -523,6 +546,14 @@ reset_test_namespace
 reset_test_identity
 
 assert_identity_absent
+sudo systemctl mask --runtime gta-claw-daemon.service
+if sudo rpm -ivh --nodeps "$rpm1"; then
+  die "RPM install accepted an administrator-owned runtime mask"
+fi
+[[ "$(systemctl show -P LoadState gta-claw-daemon.service)" == "masked" ]] ||
+  die "RPM rejection removed an administrator-owned runtime mask"
+sudo systemctl unmask --runtime gta-claw-daemon.service
+sudo systemctl daemon-reload
 sudo rpm -ivh --nodeps "$rpm1"
 assert_disabled_and_inactive
 assert_protected_contract
@@ -633,7 +664,11 @@ sudo rpm -Uvh --nodeps "$rpm2"
 assert_disabled_and_inactive
 assert_preserved "$rpm_inactive_upgrade_snapshot"
 rpm_inactive_snapshot="$(state_snapshot)"
+establish_package_runtime_fence
 sudo rpm -e --nodeps gta-claw
+[[ ! -e /run/gta-claw-state-init/initialization-failed &&
+  ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "RPM removal did not clear deferred package-fence markers"
 assert_preserved "$rpm_inactive_snapshot"
 reset_test_namespace
 reset_test_identity

@@ -24,6 +24,7 @@ EXECUTABLE_SURFACES = frozenset(
         "lib/common.sh",
         "lib/container-mount.sh",
         "lib/oci-validation.sh",
+        "lib/worktree-git.sh",
         "libexec/gta-claw-runtime-ready",
         "libexec/gta-claw-state-init",
         "lifecycle-test.sh",

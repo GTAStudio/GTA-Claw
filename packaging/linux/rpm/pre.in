@@ -19,6 +19,7 @@ runtime_touched=0
 old_active=0
 old_initializer_active=0
 package_fenced=0
+created_runtime_mask=0
 
 ensure_failure_fence() {
   if [ -L "$runtime_directory" ] ||
@@ -157,7 +158,7 @@ restore_pre_failure() {
         systemctl stop gta-claw-daemon.service >/dev/null 2>&1 ||
           fence_failed_rollback
         verify_runtime_stopped
-      else
+      elif [ "$created_runtime_mask" -eq 1 ]; then
         systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
           fence_failed_rollback
         if [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" = "failed" ]; then
@@ -228,6 +229,7 @@ if [ -d /run/systemd/system ]; then
       if [ "$had_was_active" -eq 1 ]; then
         old_active=1
       fi
+      systemctl stop gta-claw-daemon.service
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;
     not-found)
@@ -236,6 +238,7 @@ if [ -d /run/systemd/system ]; then
       fi
       touch "$replacement_fence"
       systemctl mask --runtime gta-claw-daemon.service
+      created_runtime_mask=1
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;
     loaded)
@@ -254,6 +257,7 @@ if [ -d /run/systemd/system ]; then
       esac
       touch "$replacement_fence"
       systemctl mask --runtime gta-claw-daemon.service
+      created_runtime_mask=1
       systemctl stop gta-claw-daemon.service
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;

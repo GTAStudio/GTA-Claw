@@ -10,7 +10,7 @@ source "$SCRIPT_DIR/lib/oci-validation.sh"
 
 require_linux
 adopt_safe_output_root
-for tool in cpio cmp date diff dpkg-deb dpkg-query jq readelf rpm rpm2cpio sha256sum stat tar; do
+for tool in cpio cmp date diff dpkg-deb dpkg-query du jq md5sum readelf rpm rpm2cpio sed sha256sum stat tar xargs; do
   require_tool "$tool"
 done
 [[ "$#" -eq 4 ]] ||
@@ -513,6 +513,40 @@ create_private_validation_directory "$deb_payload_root"
   tar --numeric-owner -xf "$deb_payload_tar" -C "$deb_payload_root"
 )
 validate_published_native_root "$deb_payload_root" "Debian package"
+expected_deb_control_file="$work_dir/deb-control.expected"
+installed_size="$(du -sk "$deb_payload_root" | awk '{ print $1 }')"
+cat >"$expected_deb_control_file" <<EOF
+Package: $LINUX_PACKAGE_NAME
+Version: $VERSION-$LINUX_PACKAGE_RELEASE
+Section: utils
+Priority: optional
+Architecture: $deb_architecture
+Maintainer: GTAStudio <noreply@github.com>
+Installed-Size: $installed_size
+Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249), util-linux
+Homepage: https://github.com/GTAStudio/GTA-Claw
+Description: GTA Claw native Rust headless prototype
+ Packages gta-claw-daemon and gta-claw-cli without the legacy JavaScript
+ runtime or the Slint desktop application. This is not a feature-parity claim.
+EOF
+cmp -s "$expected_deb_control_file" "$deb_control_root/control" ||
+  die "Debian control metadata differs from the independently rendered policy"
+cmp -s \
+  <(printf '%s\n' \
+    /etc/gta-claw/gta-claw.env \
+    /etc/gta-claw/credentials/daemon.conf) \
+  "$deb_control_root/conffiles" ||
+  die "Debian conffiles metadata differs from the exact policy"
+expected_md5sums="$work_dir/deb-md5sums.expected"
+(
+  cd "$deb_payload_root"
+  find . -type f -print |
+    sed 's#^\./##' |
+    LC_ALL=C sort |
+    xargs md5sum
+) >"$expected_md5sums"
+cmp -s "$expected_md5sums" "$deb_control_root/md5sums" ||
+  die "Debian md5sums metadata differs from the extracted payload"
 
 [[ "$(rpm -qp --qf '%{ARCH}' "$rpm_artifact")" == "$rpm_architecture" ]] ||
   die "RPM architecture mismatch"
@@ -521,6 +555,35 @@ rpm -qpl "$rpm_artifact" |
   grep -Fx '/usr/libexec/gta-claw/gta-claw-daemon' >/dev/null
 rpm_file_listing="$(rpm -qpl "$rpm_artifact" | sed 's#^/##' | LC_ALL=C sort -u)"
 assert_no_protected_payload_path "RPM package" "$rpm_file_listing"
+expected_rpm_file_listing="$(
+  {
+    native_rootfs_files
+    printf '%s\n' usr/share/doc/gta-claw
+  } | LC_ALL=C sort -u
+)"
+[[ "$rpm_file_listing" == "$expected_rpm_file_listing" ]] ||
+  die "RPM header path inventory differs from the exact payload allowlist"
+expected_rpm_flags="$(
+  while IFS= read -r path; do
+    flag=
+    case "$path" in
+      etc/gta-claw/credentials/daemon.conf | etc/gta-claw/gta-claw.env)
+        flag=cn
+        ;;
+      usr/share/doc/gta-claw/*)
+        flag=d
+        ;;
+    esac
+    printf '/%s\t%s\n' "$path" "$flag"
+  done <<<"$expected_rpm_file_listing"
+)"
+actual_rpm_flags="$(
+  rpm -qp --qf '[%{FILENAMES}\t%{FILEFLAGS:fflags}\n]' "$rpm_artifact" |
+    LC_ALL=C sort
+)"
+[[ "$actual_rpm_flags" == "$expected_rpm_flags" ]] ||
+  die "RPM header file flags differ from the exact config/document policy"
+reject_rpm_ghost_files "$rpm_artifact"
 rpm -qp --requires "$rpm_artifact" | grep -Fx "glibc >= $BUILD_GLIBC_REQUIREMENT" >/dev/null ||
   die "RPM glibc dependency does not match ELF-derived requirement"
 rpm -qp --requires "$rpm_artifact" | grep -Fx "util-linux" >/dev/null ||

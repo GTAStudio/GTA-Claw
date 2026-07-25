@@ -366,6 +366,7 @@ expect_failure oci-compose-duplicate-key \
 build_scriptlet_fixture() {
   local name="$1"
   local extra="$2"
+  local file_extra="${3:-}"
   local top="$work/rpm-$name"
   local spec="$top/SPECS/$name.spec"
   mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
@@ -386,7 +387,11 @@ build_scriptlet_fixture() {
       'mkdir -p %{buildroot}/usr/share/gta-claw-test' \
       'printf fixture >%{buildroot}/usr/share/gta-claw-test/value' \
       '%files' \
-      '/usr/share/gta-claw-test/value' \
+      '/usr/share/gta-claw-test/value'
+    if [[ -n "$file_extra" ]]; then
+      printf '%s\n' "$file_extra"
+    fi
+    printf '%s\n' \
       '%pre' ':' \
       '%post' ':' \
       '%preun' ':' \
@@ -407,6 +412,15 @@ trigger_extra=$'%triggerin -- gta-claw-trigger-target\n:'
 trigger_rpm="$(build_scriptlet_fixture gta-claw-trigger-test "$trigger_extra")"
 if (reject_unexpected_rpm_scriptlets "$trigger_rpm"); then
   die "RPM scriptlet policy accepted an extra trigger"
+fi
+ghost_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-ghost-test \
+    "" \
+    '%ghost /var/lib/gta-claw-protected'
+)"
+if (reject_rpm_ghost_files "$ghost_rpm"); then
+  die "RPM header policy accepted a ghost path"
 fi
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
