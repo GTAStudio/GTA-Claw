@@ -977,6 +977,7 @@ name = "gta-claw-ios"
 version = "0.1.0"
 dependencies = [
  "claw-application",
+ "claw-clients",
  "claw-gateway-client",
  "claw-platform",
  "claw-protocol",
