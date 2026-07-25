@@ -94,6 +94,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-memory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "claw-platform"
 version = "0.1.0"
 dependencies = [
@@ -126,6 +134,16 @@ dependencies = [
  "subtle",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "claw-tools"
+version = "0.1.0"
+dependencies = [
+ "claw-security",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

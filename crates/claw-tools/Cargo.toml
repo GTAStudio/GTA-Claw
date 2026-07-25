@@ -1,0 +1,20 @@
+[package]
+name = "claw-tools"
+description = "Sandboxed agent tool surface with deny-by-default capability grants for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+claw-security.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.180"
+
+[lints]
+workspace = true
