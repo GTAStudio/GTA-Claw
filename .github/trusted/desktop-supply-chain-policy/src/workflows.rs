@@ -64,7 +64,7 @@ pub fn linux_actionlint(path: PathBuf) -> ActionlintTool {
     }
 }
 
-const ALLOWED_WORKFLOWS: [&str; 8] = [
+const REQUIRED_WORKFLOWS: [&str; 8] = [
     ".github/workflows/bootstrap-desktop-supply-chain-policy.yml",
     ".github/workflows/docker-publish.yml",
     ".github/workflows/linux-packaging.yml",
@@ -73,6 +73,10 @@ const ALLOWED_WORKFLOWS: [&str; 8] = [
     ".github/workflows/trusted-desktop-supply-chain-policy.yml",
     ".github/workflows/upstream-gateway-reference.yml",
     ".github/workflows/windows-packaging.yml",
+];
+const OPTIONAL_WORKFLOWS: [&str; 2] = [
+    ".github/workflows/android-packaging.yml",
+    ".github/workflows/ios-packaging.yml",
 ];
 
 /// Parsed workflow identity used to prevent required-check spoofing.
@@ -372,19 +376,33 @@ fn validate_ruleset_workflow_eligibility(workflow: &YamlValue) -> PolicyResult<(
     Ok(())
 }
 
-fn expected_workflow_files(root: &SafeRoot) -> PolicyResult<Vec<String>> {
+fn admitted_workflow_files(root: &SafeRoot) -> PolicyResult<Vec<String>> {
     let files = root.list_tree(WORKFLOW_DIRECTORY, 32, MAX_WORKFLOW_TREE_BYTES)?;
     let actual = files
         .into_iter()
         .map(|file| file.relative)
         .collect::<Vec<_>>();
-    let expected = ALLOWED_WORKFLOWS
+    let actual_set = actual.iter().cloned().collect::<BTreeSet<_>>();
+    let required = REQUIRED_WORKFLOWS
         .into_iter()
         .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let admitted = required
+        .iter()
+        .cloned()
+        .chain(OPTIONAL_WORKFLOWS.into_iter().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let missing = required
+        .difference(&actual_set)
+        .cloned()
         .collect::<Vec<_>>();
-    if actual != expected {
+    let unexpected = actual_set
+        .difference(&admitted)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() {
         return Err(PolicyError::new(format!(
-            "workflow directory inventory changed: expected {expected:?}, found {actual:?}"
+            "workflow directory inventory changed: missing {missing:?}, unexpected {unexpected:?}"
         )));
     }
     Ok(actual)
@@ -401,7 +419,7 @@ fn owns_reserved_identity(identity: &WorkflowIdentity, reserved: &str) -> bool {
 
 /// Validates the complete workflow inventory and required-check identities.
 pub fn validate_inventory(root: &SafeRoot) -> PolicyResult<Vec<WorkflowIdentity>> {
-    let paths = expected_workflow_files(root)?;
+    let paths = admitted_workflow_files(root)?;
     let mut identities = Vec::with_capacity(paths.len());
     let mut workflow_names = BTreeMap::new();
     for path in paths {
@@ -563,11 +581,11 @@ pub fn run_actionlint(
     }
     fs::create_dir_all(&copy_root).map_err(|cause| error("create actionlint input", cause))?;
     let mut copied = Vec::new();
-    for path in ALLOWED_WORKFLOWS {
-        let destination = copied_workflow_path(&copy_root, path)?;
+    for path in admitted_workflow_files(candidate)? {
+        let destination = copied_workflow_path(&copy_root, &path)?;
         fs::write(
             &destination,
-            candidate.read_bytes(path, MAX_WORKFLOW_BYTES)?,
+            candidate.read_bytes(&path, MAX_WORKFLOW_BYTES)?,
         )
         .map_err(|cause| error("write isolated actionlint input", cause))?;
         copied.push(destination);
@@ -592,8 +610,11 @@ pub fn run_actionlint(
     Ok(())
 }
 
-/// Returns the exact allowed workflow paths.
+/// Returns every admitted workflow path, including optional future mobile workflows.
 #[must_use]
 pub fn allowed_workflows() -> BTreeSet<&'static str> {
-    ALLOWED_WORKFLOWS.into_iter().collect()
+    REQUIRED_WORKFLOWS
+        .into_iter()
+        .chain(OPTIONAL_WORKFLOWS)
+        .collect()
 }

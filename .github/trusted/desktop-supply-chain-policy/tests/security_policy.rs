@@ -1128,6 +1128,68 @@ fn live_tree_is_a_valid_bootstrap_or_final_policy_state() {
 }
 
 #[test]
+fn workflow_inventory_admits_mobile_workflows_without_demanding_them() {
+    let absent = final_tree("mobile-workflows-absent");
+    let identities =
+        validate_inventory(&SafeRoot::new(&absent.path).expect("open absent mobile workflows"))
+            .expect("mobile workflows remain optional");
+    assert_eq!(identities.len(), 8);
+    assert!(
+        identities
+            .iter()
+            .all(|identity| !identity.path.contains("ios-packaging")
+                && !identity.path.contains("android-packaging"))
+    );
+
+    for workflows in [
+        vec![("ios-packaging.yml", "iOS packaging")],
+        vec![("android-packaging.yml", "Android packaging")],
+        vec![
+            ("ios-packaging.yml", "iOS packaging"),
+            ("android-packaging.yml", "Android packaging"),
+        ],
+    ] {
+        let tree = final_tree(&format!("mobile-workflows-present-{}", workflows.len()));
+        for (workflow, name) in &workflows {
+            fs::write(
+                tree.join(format!(".github/workflows/{workflow}")),
+                format!(
+                    "name: {name}\non: workflow_dispatch\njobs:\n  package:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo build --locked\n"
+                ),
+            )
+            .expect("write admitted mobile workflow");
+        }
+        let identities =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open present mobile workflows"))
+                .expect("present mobile workflows are admitted");
+        assert_eq!(identities.len(), 8 + workflows.len());
+        for (workflow, _) in workflows {
+            let path = format!(".github/workflows/{workflow}");
+            assert!(
+                identities.iter().any(|identity| identity.path == path),
+                "admitted mobile workflow was not validated: {path}"
+            );
+        }
+    }
+
+    let unexpected = final_tree("unexpected-workflow");
+    let path = ".github/workflows/mobile-packaging.yml";
+    fs::write(
+        unexpected.join(path),
+        "name: unexpected\non: workflow_dispatch\njobs:\n  package:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo build --locked\n",
+    )
+    .expect("write unexpected workflow");
+    let error =
+        validate_inventory(&SafeRoot::new(&unexpected.path).expect("open unexpected workflow"))
+            .expect_err("unreviewed workflow path unexpectedly passed")
+            .to_string();
+    assert!(
+        error.contains("unexpected") && error.contains(path),
+        "unexpected workflow failed through the wrong rule: {error}"
+    );
+}
+
+#[test]
 fn immutable_bootstrap_snapshot_matches_the_transition_fingerprint() {
     let tree = bootstrap_tree("immutable-bootstrap");
     let root = SafeRoot::new(&tree.path).expect("open immutable bootstrap fixture");
