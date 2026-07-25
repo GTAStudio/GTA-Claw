@@ -12,6 +12,9 @@ CASES = {
     "combined-shell-options.sh": "#!/bin/sh\nbash -lc 'node daemon.js'\n",
     "shell-option-operand.sh": "#!/bin/sh\nbash -o errexit -c 'node daemon.js'\n",
     "eval.sh": "#!/bin/sh\neval 'node daemon.js'\n",
+    "temporary-assignment.sh": (
+        "#!/bin/sh\ncmd=node\ncmd=true /bin/true\n\"$cmd\" daemon.js\n"
+    ),
     "env-split.sh": "#!/bin/sh\nenv -S 'node daemon.js'\n",
     "timeout.sh": "#!/bin/sh\ntimeout 5 node daemon.js\n",
     "setpriv.sh": "#!/bin/sh\nsetpriv --clear-groups -- node daemon.js\n",
@@ -170,6 +173,12 @@ def main():
             ),
             "dynamic-shell-reassignment.sh": (
                 "#!/bin/sh\ncmd=true\ncmd=$unresolved\n\"$cmd\"\n"
+            ),
+            "dynamic-default-expansion.sh": (
+                "#!/bin/sh\n\"${missing:-node}\" daemon.js\n"
+            ),
+            "dynamic-command-substitution.sh": (
+                "#!/bin/sh\n$(printf node) daemon.js\n"
             ),
         }.items():
             dynamic = root / name

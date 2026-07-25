@@ -299,6 +299,9 @@ fail_install_runtime() {
   if ! ensure_persistent_failure_fence; then
     echo "gta-claw persistent install failure marker could not be retained" >&2
     failure=1
+  elif ! /usr/bin/sync -f "$persistent_failure_marker"; then
+    echo "gta-claw persistent install failure marker could not be persisted" >&2
+    failure=1
   fi
   if ! ensure_failure_fence; then
     echo "gta-claw initialization failure marker could not be retained" >&2
@@ -359,6 +362,8 @@ acquire_lifecycle_lock || exit 1
 validate_regular_or_absent "$installed_version_file"
 validate_regular_or_absent "$persistent_failure_marker"
 validate_regular_or_absent "$persistent_was_active_marker"
+validate_regular_or_absent "$failure_marker"
+validate_regular_or_absent "$replacement_fence"
 if [ -e "$installed_version_file" ]; then
   fresh_install=0
   installed_version="$(cat "$installed_version_file")"
@@ -375,13 +380,22 @@ fi
 if [ -e "$persistent_failure_marker" ]; then
   resuming_persistent_transaction=1
 fi
+if [ -d /run/systemd/system ]; then
+  preflight_load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+  if [ "$preflight_load_state" = "masked" ] &&
+    { [ ! -e "$replacement_fence" ] || [ ! -e "$failure_marker" ]; }; then
+    echo "refusing externally masked gta-claw daemon" >&2
+    exit 1
+  fi
+fi
+ensure_persistent_failure_fence || fail_install_runtime
+/usr/bin/sync -f "$persistent_failure_marker" || fail_install_runtime
 /usr/bin/python3 \
   "$source_root/libexec/gta-claw-direct-config" \
   install \
   / \
   "$source_root/etc/gta-claw/gta-claw.env" \
   "$source_root/etc/gta-claw/credentials/daemon.conf"
-ensure_persistent_failure_fence || fail_install_runtime
 if [ "$resuming_persistent_transaction" -eq 0 ]; then
   rm -f "$persistent_was_active_marker"
 fi

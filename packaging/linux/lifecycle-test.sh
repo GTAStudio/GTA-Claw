@@ -395,6 +395,21 @@ sudo "$direct1/install.sh"
 assert_disabled_and_inactive
 assert_protected_contract
 static_identity="$(id -u gta-claw):$(id -g gta-claw)"
+sudo systemctl mask --runtime gta-claw-daemon.service
+for _ in 1 2; do
+  if sudo "$direct1/install.sh"; then
+    die "direct deployment accepted an administrator-owned runtime mask"
+  fi
+  case "$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)" in
+    masked | masked-runtime) ;;
+    *) die "direct mask rejection changed administrator mask ownership" ;;
+  esac
+  [[ ! -e /var/lib/gta-claw-install/transaction-failed &&
+    ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+    die "direct mask rejection claimed an administrator-owned transaction"
+done
+sudo systemctl unmask --runtime gta-claw-daemon.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now gta-claw-daemon.service
 assert_live_initializer_rejected
 direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
@@ -887,16 +902,16 @@ fi
 sudo systemctl unmask --runtime gta-claw-daemon.service
 sudo systemctl daemon-reload
 set +e
-sudo env GTA_CLAW_PACKAGE_TEST_FAIL_AFTER=preset rpm -ivh --nodeps "$rpm1"
+sudo env GTA_CLAW_PACKAGE_TEST_FAIL_AFTER=before-preset rpm -ivh --nodeps "$rpm1"
 rpm_preset_status=$?
 set -e
 ! systemctl is-active --quiet gta-claw-daemon.service ||
-  die "RPM post-preset fault left the daemon active"
+  die "RPM pre-preset fault left the daemon active"
 [[ -e /run/gta-claw-state-init/initialization-failed &&
   -e /run/gta-claw-state-init/replacement-fenced ]] ||
-  die "RPM post-preset fault lost its transaction fence"
+  die "RPM pre-preset fault lost its transaction fence"
 if [[ "$rpm_preset_status" -eq 0 ]]; then
-  echo "RPM reported failed post-preset scriptlet as a warning; runtime remained fenced" >&2
+  echo "RPM reported failed pre-preset scriptlet as a warning; runtime remained fenced" >&2
 fi
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm1"
 assert_disabled_and_inactive
@@ -1088,6 +1103,9 @@ systemctl is-active --quiet gta-claw-daemon.service ||
 [[ "$(systemctl is-enabled gta-claw-daemon.service)" == "disabled" ]] ||
   die "stale RPM removal intent overrode an administrator enablement change"
 rpm_snapshot="$(state_identity_snapshot)"
+sudo sh "$SCRIPT_DIR/rpm/preun" 0
+[[ -e /run/gta-claw-state-init/remove-prepared ]] ||
+  die "RPM interrupted-removal fixture did not retain its journal"
 sudo rpm -e --nodeps gta-claw
 assert_identity_preserved "$rpm_snapshot"
 [[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||

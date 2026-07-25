@@ -262,6 +262,7 @@ if [ -d /run/systemd/system ]; then
     fi
   fi
   if [ -e "$fresh_install" ]; then
+    fail_configure_after before-preset
     if ! systemctl preset gta-claw-daemon.service >/dev/null; then
       fence_failed_runtime
     fi

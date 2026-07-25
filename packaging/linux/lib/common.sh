@@ -1187,7 +1187,7 @@ validate_exact_rpm_relationships() {
   local prefix
   [[ "$(rpm_relationship_rows "$artifact" PROVIDE)" == "$expected_provides" ]] ||
     die "RPM Provides arrays differ from the exact package policy"
-  for prefix in CONFLICT OBSOLETE RECOMMEND SUGGEST SUPPLEMENT ENHANCE; do
+  for prefix in CONFLICT OBSOLETE RECOMMEND SUGGEST SUPPLEMENT ENHANCE ORDER; do
     [[ -z "$(rpm_relationship_rows "$artifact" "$prefix")" ]] ||
       die "RPM contains an unexpected $prefix relationship"
   done

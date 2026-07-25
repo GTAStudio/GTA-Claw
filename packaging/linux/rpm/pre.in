@@ -263,8 +263,13 @@ trap 'restore_pre_failure 143' TERM
 runtime_touched=1
 ensure_failure_fence
 if [ "$installed" -eq 1 ]; then
-  rm -f "$ready" "$fresh_install"
-  touch "$replacement"
+  rm -f "$ready"
+  if [ "$had_fresh_install" -eq 1 ]; then
+    rm -f "$replacement"
+  else
+    rm -f "$fresh_install"
+    touch "$replacement"
+  fi
 else
   rm -f "$ready" "$replacement"
   touch "$fresh_install"

@@ -122,6 +122,27 @@ STATIC_VARIABLES = {
     "SAFEIO_TARGET_FD": "10",
     "SCRIPT_DIR": "/trusted/script",
 }
+TRUSTED_PATH_INITIALIZERS = {
+    "SCRIPT_DIR": {
+        '"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"',
+        '"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"',
+    },
+    "LINUX_DIR": {
+        '"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"',
+    },
+    "REPO_ROOT": {
+        '"$(cd "$LINUX_DIR/../.." && pwd -P)"',
+        '"$(cd "$SCRIPT_DIR/../.." && pwd -P)"',
+    },
+}
+TRUSTED_DISCOVERED_PATH_INITIALIZERS = {
+    'direct1="$(find "$direct_root/release1" -mindepth 1 -maxdepth 1 -type d)"': (
+        "direct1=/trusted/direct-release1"
+    ),
+    'direct2="$(find "$direct_root/release2" -mindepth 1 -maxdepth 1 -type d)"': (
+        "direct2=/trusted/direct-release2"
+    ),
+}
 
 
 class UniqueKeyLoader(yaml.SafeLoader):
@@ -293,8 +314,17 @@ def shell_tokens(text):
 def command_segments(text):
     segment = []
     test_terminator = None
+    in_case = False
+    expect_case_pattern = False
     for token in shell_tokens(text):
         value = token[0]
+        if expect_case_pattern:
+            if value == "esac":
+                expect_case_pattern = False
+                in_case = False
+            elif value == ")":
+                expect_case_pattern = False
+            continue
         if (
             test_terminator is None
             and value in {"[", "[["}
@@ -307,8 +337,15 @@ def command_segments(text):
                 test_terminator = None
         elif value in SEPARATORS:
             if segment:
+                if segment[0][0] == "case":
+                    in_case = True
+                    expect_case_pattern = True
+                elif segment[0][0] == "esac":
+                    in_case = False
                 yield segment
                 segment = []
+            if value == ";;" and in_case:
+                expect_case_pattern = True
         else:
             segment.append(token)
     if segment:
@@ -428,7 +465,13 @@ def expand_static(value, variables):
         return variables[name]
 
     expanded = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, value)
-    return None if unresolved or "$(" in expanded or "`" in expanded else expanded
+    return (
+        None
+        if unresolved
+        or "$" in expanded
+        or "`" in expanded
+        else expanded
+    )
 
 
 def inspect_command(
@@ -454,6 +497,14 @@ def inspect_command(
             variables.pop(name, None)
         index += 1
     while index < len(tokens) and tokens[index][0] in RESERVED:
+        index += 1
+    while index < len(tokens) and ASSIGNMENT.match(tokens[index][0]):
+        name, value = tokens[index][0].split("=", 1)
+        expanded = expand_static(value, variables)
+        if expanded is not None:
+            variables[name] = expanded
+        else:
+            variables.pop(name, None)
         index += 1
     if index >= len(tokens):
         return []
@@ -533,6 +584,8 @@ def inspect_command(
         return findings
     if command == "eval":
         script = " ".join(token for token, _ in tokens[index + 1 :])
+        if re.fullmatch(r"exec \$[A-Za-z_][A-Za-z0-9_]*>&-", script):
+            return findings
         findings.extend(inspect_shell(script, line, depth + 1, variables, allow_positional))
         return findings
     if command == "command" and index + 1 < len(tokens) and tokens[index + 1][0] in {"-v", "-V"}:
@@ -683,7 +736,7 @@ def command_substitutions(text):
             cursor = find_end(inner_start)
             content = text[inner_start : cursor - 1]
             substitutions.append((content, start_line))
-            replacement = "__GTA_CLAW_COMMAND_SUBSTITUTION__"
+            replacement = "$__GTA_CLAW_COMMAND_SUBSTITUTION__"
             replacement += "\\\n" * content.count("\n")
             masked.append(replacement)
             line += content.count("\n")
@@ -722,8 +775,15 @@ def inspect_shell(text, base_line=1, depth=0, variables=None, allow_positional=F
         )
     ]
     for segment in command_segments(masked_text):
-        for token, _ in segment:
-            if ASSIGNMENT.match(token):
+        cleaned = remove_redirections(segment)
+        assignment_count = 0
+        while (
+            assignment_count < len(cleaned)
+            and ASSIGNMENT.match(cleaned[assignment_count][0])
+        ):
+            assignment_count += 1
+        if assignment_count == len(cleaned):
+            for token, _ in cleaned:
                 name, value = token.split("=", 1)
                 expanded = expand_static(value, variables)
                 if expanded is not None:
@@ -1184,6 +1244,20 @@ def shell_surface(path, text):
     )
 
 
+def normalize_trusted_path_initializers(text):
+    normalized = []
+    for line in text.splitlines(keepends=True):
+        source = line.rstrip("\r\n")
+        ending = line[len(source) :]
+        if source in TRUSTED_DISCOVERED_PATH_INITIALIZERS:
+            source = TRUSTED_DISCOVERED_PATH_INITIALIZERS[source]
+        name, separator, value = source.partition("=")
+        if separator and value in TRUSTED_PATH_INITIALIZERS.get(name, ()):
+            source = f"{name}={STATIC_VARIABLES[name]}"
+        normalized.append(source + ending)
+    return "".join(normalized)
+
+
 def inspect_path(path):
     text = path.read_text(encoding="utf-8")
     if path.name.endswith((".yaml.in", ".yml.in")):
@@ -1196,7 +1270,7 @@ def inspect_path(path):
         return inspect_yaml(rendered)
     if shell_surface(path, text):
         return inspect_shell(
-            text,
+            normalize_trusted_path_initializers(text),
             allow_positional=path.name.endswith("self-test.sh")
             or "tests" in path.parts,
         )

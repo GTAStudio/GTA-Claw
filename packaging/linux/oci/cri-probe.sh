@@ -42,6 +42,9 @@ config_receipt=
 state_token=
 log_token=
 config_token=
+state_creation_output=
+log_creation_output=
+config_creation_output=
 state_fd=
 log_fd=
 config_fd=
@@ -355,9 +358,73 @@ wait_for_container_exit() {
   return 1
 }
 
+recover_unregistered_creation() {
+  local output="$1"
+  local label="$2"
+  local -n root_ref="$3"
+  local -n receipt_ref="$4"
+  local -n token_ref="$5"
+  local -n descriptor_ref="$6"
+  local -n created_ref="$7"
+  local -a recovered
+  local opened_fd
+  [[ -n "$output" ]] || return 0
+  if [[ "$created_ref" -eq 1 && -n "$descriptor_ref" ]]; then
+    return 0
+  fi
+  mapfile -t recovered <<<"$output"
+  if [[ "${#recovered[@]}" -ne 3 ]]; then
+    echo "$label creation receipt is incomplete during cleanup" >&2
+    cleanup_failed=1
+    return 0
+  fi
+  root_ref="${recovered[0]}"
+  receipt_ref="${recovered[1]}"
+  # shellcheck disable=SC2034 # Assigned through a nameref for cleanup.
+  token_ref="${recovered[2]}"
+  created_ref=1
+  if [[ -z "$descriptor_ref" ]]; then
+    if ! exec {opened_fd}<"$root_ref"; then
+      echo "$label directory could not be reopened during cleanup" >&2
+      cleanup_failed=1
+      return 0
+    fi
+    descriptor_ref="$opened_fd"
+  fi
+  if [[ "$(directory_receipt "/proc/self/fd/$descriptor_ref")" != "$receipt_ref" ||
+    "$(directory_receipt "$root_ref")" != "$receipt_ref" ]]; then
+    echo "$label directory changed before cleanup registration" >&2
+    cleanup_failed=1
+  fi
+}
+
 cleanup() {
   local original_status="${1:-$?}"
   trap - EXIT INT TERM
+  recover_unregistered_creation \
+    "$state_creation_output" \
+    "CRI state" \
+    state_root \
+    state_receipt \
+    state_token \
+    state_fd \
+    state_created
+  recover_unregistered_creation \
+    "$log_creation_output" \
+    "CRI log" \
+    log_root \
+    log_receipt \
+    log_token \
+    log_fd \
+    log_created
+  recover_unregistered_creation \
+    "$config_creation_output" \
+    "CRI config" \
+    config_root \
+    config_receipt \
+    config_token \
+    config_fd \
+    config_created
   if [[ -n "$runtime_id" ]]; then
     cri rm -f "$runtime_id" >/dev/null 2>&1 || cleanup_failed=1
   fi
@@ -404,6 +471,9 @@ state_creation_output="$(create_owned_directory "$state_parent")" ||
     echo "CRI state directory could not be created safely" >&2
     exit 1
   }
+if [[ "${GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CREATION:-}" == "state" ]]; then
+  kill -TERM "$$"
+fi
 mapfile -t state_creation <<<"$state_creation_output"
 [[ "${#state_creation[@]}" -eq 3 ]]
 state_root="${state_creation[0]}"
@@ -421,6 +491,9 @@ log_creation_output="$(create_owned_directory "$log_parent")" ||
     echo "CRI log directory could not be created safely" >&2
     exit 1
   }
+if [[ "${GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CREATION:-}" == "log" ]]; then
+  kill -TERM "$$"
+fi
 mapfile -t log_creation <<<"$log_creation_output"
 [[ "${#log_creation[@]}" -eq 3 ]]
 log_root="${log_creation[0]}"
@@ -435,6 +508,9 @@ config_creation_output="$(create_owned_directory "$config_parent")" ||
     echo "CRI config directory could not be created safely" >&2
     exit 1
   }
+if [[ "${GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CREATION:-}" == "config" ]]; then
+  kill -TERM "$$"
+fi
 mapfile -t config_creation <<<"$config_creation_output"
 [[ "${#config_creation[@]}" -eq 3 ]]
 config_root="${config_creation[0]}"

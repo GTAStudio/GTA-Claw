@@ -155,6 +155,11 @@ config_replacement="$(
 run_probe_status 129 GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CONFIG=HUP
 run_probe_status 130 GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CONFIG=INT
 run_probe_status 143 GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CONFIG=TERM
+for creation_stage in state log config; do
+  run_probe_status \
+    143 \
+    "GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CREATION=$creation_stage"
+done
 [[ "$(cat "$work/state/pre-existing/sentinel")" == "state sentinel" &&
   "$(cat "$work/log/pre-existing/sentinel")" == "log sentinel" ]] ||
   {

@@ -714,24 +714,34 @@ reject_links_and_special_files "$rpm_payload_root"
 validate_published_native_root "$rpm_payload_root" "RPM package"
 [[ -x /usr/lib/rpm/rpmdeps ]] ||
   die "RPM dependency validation requires /usr/lib/rpm/rpmdeps"
-expected_rpm_requires="$(
+expected_rpm_requirements="$(
   {
     find "$rpm_payload_root" -type f -print0 |
-      xargs -0 /usr/lib/rpm/rpmdeps --requires
-    printf '%s\n' \
-      "config($LINUX_PACKAGE_NAME) = $VERSION-$LINUX_PACKAGE_RELEASE" \
-      "glibc >= $BUILD_GLIBC_REQUIREMENT" \
-      libgcc \
-      "systemd >= 249" \
-      util-linux \
-      'rpmlib(CompressedFileNames) <= 3.0.4-1' \
-      'rpmlib(FileDigests) <= 4.6.0-1' \
-      'rpmlib(PayloadFilesHavePrefix) <= 4.0-1'
-  } | LC_ALL=C sort -u
+      xargs -0 /usr/lib/rpm/rpmdeps --requires |
+      LC_ALL=C sort -u |
+      while IFS= read -r requirement; do
+        [[ -n "$requirement" ]] &&
+          printf '%s\t\t16384\n' "$requirement"
+      done
+    printf '%s\t%s\t%s\n' \
+      /bin/sh '' 288 \
+      /bin/sh '' 768 \
+      /bin/sh '' 1280 \
+      /bin/sh '' 2304 \
+      /bin/sh '' 4352 \
+      "config($LINUX_PACKAGE_NAME)" "$VERSION-$LINUX_PACKAGE_RELEASE" 268435464 \
+      glibc "$BUILD_GLIBC_REQUIREMENT" 12 \
+      libgcc '' 0 \
+      'rpmlib(CompressedFileNames)' '3.0.4-1' 16777226 \
+      'rpmlib(FileDigests)' '4.6.0-1' 16777226 \
+      'rpmlib(PayloadFilesHavePrefix)' '4.0-1' 16777226 \
+      systemd 249 12 \
+      util-linux '' 0
+  } | LC_ALL=C sort
 )"
-actual_rpm_requires="$(rpm -qp --requires "$rpm_artifact" | LC_ALL=C sort -u)"
-[[ "$actual_rpm_requires" == "$expected_rpm_requires" ]] ||
-  die "RPM dependency inventory differs from payload-derived exact policy"
+actual_rpm_requirements="$(rpm_relationship_rows "$rpm_artifact" REQUIRE)"
+[[ "$actual_rpm_requirements" == "$expected_rpm_requirements" ]] ||
+  die "RPM raw requirement arrays differ from payload-derived exact policy"
 expected_rpm_metadata="$(
   while IFS= read -r path; do
     flag=

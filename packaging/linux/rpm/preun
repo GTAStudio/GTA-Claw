@@ -12,6 +12,7 @@ remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
 remove_was_enabled_runtime=/run/gta-claw-daemon.remove-was-enabled-runtime
 persistent_enable_link=/etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service
 runtime_enable_link=/run/systemd/system/multi-user.target.wants/gta-claw-daemon.service
+runtime_mask_link=/run/systemd/system/gta-claw-daemon.service
 runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 replacement_fence=$runtime_directory/replacement-fenced
@@ -155,6 +156,17 @@ retire_remove_journal() {
     "$remove_was_package_fenced"
 }
 
+validate_remove_journal_marker() {
+  marker="$1"
+  [ ! -e "$marker" ] && [ ! -L "$marker" ] && return 0
+  if [ -L "$marker" ] ||
+    [ ! -f "$marker" ] ||
+    [ "$(stat -c '%u:%g:%a:%h' "$marker")" != "0:0:644:1" ]; then
+    echo "gta-claw removal journal marker is invalid: $marker" >&2
+    return 1
+  fi
+}
+
 restore_on_failure() {
   status="${1:-$?}"
   trap - 0 HUP INT TERM
@@ -205,6 +217,41 @@ if [ -d /run/systemd/system ]; then
       exit 1
     fi
     ensure_runtime_directory
+    if [ -e "$remove_prepared" ] || [ -L "$remove_prepared" ]; then
+      for journal_marker in \
+        "$remove_was_active" \
+        "$remove_was_enabled" \
+        "$remove_was_enabled_runtime" \
+        "$remove_initializer_was_active" \
+        "$remove_prepared" \
+        "$remove_was_package_fenced"; do
+        validate_remove_journal_marker "$journal_marker"
+      done
+      if [ -e "$remove_was_package_fenced" ]; then
+        package_fenced=1
+      fi
+      trap 'restore_on_failure "$?"' 0
+      trap 'restore_on_failure 129' HUP
+      trap 'restore_on_failure 130' INT
+      trap 'restore_on_failure 143' TERM
+      if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "masked" ] ||
+        [ ! -L "$runtime_mask_link" ] ||
+        [ "$(readlink "$runtime_mask_link")" != "/dev/null" ]; then
+        echo "gta-claw runtime mask changed during interrupted RPM removal" >&2
+        exit 1
+      fi
+      verify_unit_stopped gta-claw-daemon.service
+      verify_writer_lock_released
+      if [ -e "$persistent_enable_link" ] || [ -L "$persistent_enable_link" ] ||
+        [ -e "$runtime_enable_link" ] || [ -L "$runtime_enable_link" ]; then
+        echo "gta-claw enablement changed during interrupted RPM removal" >&2
+        exit 1
+      fi
+      stop_initializer
+      prepared=1
+      trap - 0 HUP INT TERM
+      exit 0
+    fi
     rm -f \
       "$remove_was_active" \
       "$remove_was_enabled" \

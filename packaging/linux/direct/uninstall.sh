@@ -295,7 +295,8 @@ rollback_removal() {
       restore_failed=1
     elif [ "$old_daemon_active" -eq 1 ]; then
       case "$current_daemon_state" in
-        active | activating | reloading | deactivating) ;;
+        active | reloading) ;;
+        activating | deactivating) daemon_needs_start=1 ;;
         inactive | failed) daemon_needs_start=1 ;;
         *) restore_failed=1 ;;
       esac
@@ -310,7 +311,8 @@ rollback_removal() {
       restore_failed=1
     elif [ "$old_initializer_active" -eq 1 ]; then
       case "$current_initializer_state" in
-        active | activating | reloading | deactivating) ;;
+        active | reloading) ;;
+        activating | deactivating) initializer_needs_start=1 ;;
         inactive | failed) initializer_needs_start=1 ;;
         *) restore_failed=1 ;;
       esac
@@ -368,15 +370,31 @@ rollback_removal() {
     if ! systemctl daemon-reload >/dev/null 2>&1; then
       restore_failed=1
     fi
-    if [ "$initializer_needs_start" -eq 1 ]; then
+    if ! /usr/bin/sync -f /etc/systemd/system; then
+      restore_failed=1
+    fi
+  fi
+  if ! /usr/bin/sync -f /var/lib; then
+    restore_failed=1
+  fi
+  if [ -d /run/systemd/system ]; then
+    if [ "$restore_failed" -eq 0 ] && [ "$initializer_needs_start" -eq 1 ]; then
       if ! systemctl start gta-claw-state-init.service >/dev/null 2>&1; then
         restore_failed=1
       fi
     fi
-    if [ "$daemon_needs_start" -eq 1 ]; then
+    if [ "$restore_failed" -eq 0 ] && [ "$old_initializer_active" -eq 1 ] &&
+      ! systemctl is-active --quiet gta-claw-state-init.service; then
+      restore_failed=1
+    fi
+    if [ "$restore_failed" -eq 0 ] && [ "$daemon_needs_start" -eq 1 ]; then
       if ! systemctl start gta-claw-daemon.service >/dev/null 2>&1; then
         restore_failed=1
-      elif ! /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1; then
+      fi
+    fi
+    if [ "$restore_failed" -eq 0 ] && [ "$old_daemon_active" -eq 1 ]; then
+      if ! systemctl is-active --quiet gta-claw-daemon.service ||
+        ! /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1; then
         restore_failed=1
       fi
     fi

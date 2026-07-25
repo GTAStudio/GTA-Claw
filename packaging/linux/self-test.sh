@@ -465,6 +465,18 @@ if (validate_exact_rpm_relationships \
   "$(rpm_relationship_rows "$weak_dependency_rpm" PROVIDE)"); then
   die "RPM relationship policy accepted an undeclared weak dependency"
 fi
+ordered_dependency_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-ordered-dependency-test \
+    "" \
+    "" \
+    'OrderWithRequires: harmless-ordered-capability'
+)"
+if (validate_exact_rpm_relationships \
+  "$ordered_dependency_rpm" \
+  "$(rpm_relationship_rows "$ordered_dependency_rpm" PROVIDE)"); then
+  die "RPM relationship policy accepted an undeclared ordered dependency"
+fi
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish
