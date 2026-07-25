@@ -47,14 +47,14 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 Repository CI additionally *executes* this crate's tests — not merely compiles
 them — on macOS arm64 (`macos-latest`), Linux and Windows, because the crate is
-a root workspace member and the headless matrix runs `--workspace`. All 75 pass
+a root workspace member and the headless matrix runs `--workspace`. All 77 pass
 on all three. That is the only non-Windows evidence about this code that exists,
 and it says nothing about an Apple *target* build: those runners build for the
 host, not for `aarch64-apple-ios`.
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 75 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 77 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
