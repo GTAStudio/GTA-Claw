@@ -751,6 +751,100 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "reachability-corpus-case-deleted"
+        expected_message = "reachability-corpus must contain exactly"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # The shared reachability corpus is the only instrument that compares
+            # the two resolvers on constructs the real tree does not contain.
+            # Deleting a case is how a disagreement would be hidden.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases = @($corpus.cases | Select-Object -Skip 1)
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-expectation-flipped"
+        expected_message = "accepting cases; found"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Flipping an accepting case to rejecting is how a resolver that
+            # started refusing legitimate evidence would be papered over. The
+            # accepting/rejecting split is pinned so the false-rejection
+            # direction cannot be quietly relaxed.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            foreach ($case in $corpus.cases) {
+                if ($case.expect -eq "accept") {
+                    $case.expect = "reject"
+                    break
+                }
+            }
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-cites-undefined-file"
+        expected_message = "which the case does not define"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # A case that cites a path it never defines would assert a verdict
+            # about a file the fixture never contained - and on a replayer that
+            # materializes into a real checkout, about a file that already exists
+            # there. Same fabricated-citation defence as the ledger itself.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases[0].cite = "crates/claw-migrate/tests/providers.rs"
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-path-escapes-fixture-root"
+        expected_message = "must not contain a dot segment"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # A dot segment in a fixture key lets any harness that materializes
+            # this corpus write outside its fixture root.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $files = [ordered]@{}
+            foreach ($property in $corpus.cases[0].files.PSObject.Properties) {
+                $files["../" + $property.Name] = $property.Value
+            }
+            $corpus.cases[0].files = [pscustomobject]$files
+            $corpus.cases[0].cite = "../" + $corpus.cases[0].cite
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-removed"
+        expected_message = "fixed artifact topology mismatch; missing=[reachability-corpus.json]"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Remove-Item -LiteralPath (Join-Path $caseRoot "reachability-corpus.json") -Force
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-case-renamed"
+        expected_message = "reachability-corpus digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Renaming preserves the count and the accept/reject split, so only
+            # the frozen digest catches it.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases[0].name = "renamed-case"
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
         name = "frozen-acceptance-bar-weakened"
         expected_message = "frozen feature text changed"
         regenerate_digests = $true
@@ -1828,11 +1922,12 @@ $cases = @(
                 "feature-ledger.schema.json",
                 "baseline.json",
                 "manifest.json",
-                # git checks this out with CRLF on Windows and LF on Linux. Its
-                # digest is structural and every newline inside a case source is
+                # git checks these out with CRLF on Windows and LF on Linux. Their
+                # digests are structural and every newline inside a case source is
                 # a \n escape, so both checkouts must reach the same digest and
-                # the same 85 verdicts.
-                "enabled-test-oracle.json"
+                # the same 120 oracle verdicts and 27 reachability verdicts.
+                "enabled-test-oracle.json",
+                "reachability-corpus.json"
             )
             foreach ($target in $targets) {
                 $path = Join-Path $caseRoot $target

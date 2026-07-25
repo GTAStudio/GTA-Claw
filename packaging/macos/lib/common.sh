@@ -264,8 +264,234 @@ reject_symlinks() {
   [[ -z "$link" ]] || die "symlinks are not permitted in staged content: $link"
 }
 
+assert_no_javascript_payload() {
+  local root="$1"
+  local forbidden
+  forbidden="$(find "$root" -type f \( \
+    -iname 'node' -o -iname 'node.exe' -o -iname 'npm' -o -iname 'npx' -o \
+    -iname 'bun' -o -iname 'pnpm' -o -iname 'package.json' -o \
+    -iname '*.js' -o -iname '*.mjs' -o -iname '*.cjs' -o -iname '*.node' \
+  \) -print -quit)"
+  [[ -z "$forbidden" ]] || die "JavaScript or Node runtime material is forbidden: $forbidden"
+}
+
+assert_binary_has_no_forbidden_markers() {
+  local binary="$1"
+  if strings "$binary" |
+    grep -Eai '(slint|i-slint|node_modules|package\.json|javascript)' >/dev/null; then
+    die "headless binary contains a forbidden GUI or JavaScript marker: $binary"
+  fi
+}
+
+validate_headless_archive() {
+  local archive="$1"
+  local component="$2"
+  local arch_label="$3"
+  local expected_arch="$4"
+  local expected_root="$component-$VERSION-macos-$arch_label"
+  local inspection="$OUTPUT_ROOT/published-inspection/$expected_root"
+  local listing="$inspection.listing"
+  local extracted="$inspection/$expected_root"
+  assert_output_path "$inspection"
+  assert_output_path "$listing"
+  safe_reset_dir "$inspection"
+  tar -tzf "$archive" >"$listing"
+  if grep -E '(^/|(^|/)\.\.(/|$)|\\)' "$listing" >/dev/null; then
+    die "headless archive contains an unsafe path: $archive"
+  fi
+  if tar -tvzf "$archive" | awk '$1 ~ /^[lh]/ { found = 1 } END { exit !found }'; then
+    die "headless archive contains a link entry: $archive"
+  fi
+  tar -xzf "$archive" -C "$inspection"
+  reject_symlinks "$inspection"
+  local actual
+  local expected
+  actual="$(cd "$inspection" && find . -type f -print | LC_ALL=C sort)"
+  expected="$(printf './%s/%s\n./%s/SHA256SUMS\n' \
+    "$expected_root" "$component" "$expected_root" | LC_ALL=C sort)"
+  [[ "$actual" == "$expected" ]] || die "headless archive content differs from its allowlist"
+  verify_sha256_manifest "$extracted" "$extracted/SHA256SUMS" >/dev/null
+  assert_no_javascript_payload "$extracted"
+  assert_binary_arches "$extracted/$component" "$expected_arch"
+  assert_macho_minimum_version "$extracted/$component"
+  validate_macho_dependencies "$extracted/$component" "$OUTPUT_ROOT"
+  assert_binary_has_no_forbidden_markers "$extracted/$component"
+  safe_reset_dir "$inspection"
+  rm -f -- "$listing"
+}
+
+acquire_locked_dependencies() {
+  cargo fetch --manifest-path "$REPO_ROOT/Cargo.toml" --locked ||
+    die "failed to acquire locked root workspace dependencies"
+  cargo fetch --manifest-path "$REPO_ROOT/desktop/Cargo.toml" --locked ||
+    die "failed to acquire locked desktop workspace dependencies"
+}
+
+assert_headless_cargo_tree() {
+  local target="$1"
+  local tree
+  tree="$(cargo tree \
+    --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --target "$target" \
+    --locked \
+    --offline \
+    --prefix none \
+    --format '{p}')" ||
+    die "cargo tree failed for $target; acquire locked dependencies with cargo fetch before running build.sh"
+  if grep -E '^(slint|slint-build|i-slint[-A-Za-z0-9]*) v' <<<"$tree" >/dev/null; then
+    die "headless Cargo graph contains Slint for target $target"
+  fi
+}
+
 sha256_file() {
   shasum -a 256 "$1" | awk '{ print $1 }'
+}
+
+write_spdx_package_inventory() {
+  local normalized_packages="$1"
+  local name
+  local version
+  local spdx_id
+  while IFS=' ' read -r name version; do
+    [[ -n "$name" && -n "$version" ]] || continue
+    spdx_id="$(printf '%s-%s' "$name" "$version" | tr -c 'A-Za-z0-9.-' '-')"
+    printf '\nPackageName: %s\n' "$name"
+    printf 'SPDXID: SPDXRef-Package-%s\n' "$spdx_id"
+    printf 'PackageVersion: %s\n' "$version"
+    printf 'PackageDownloadLocation: NOASSERTION\n'
+    printf 'FilesAnalyzed: false\n'
+    printf 'PackageLicenseConcluded: NOASSERTION\n'
+    printf 'PackageLicenseDeclared: NOASSERTION\n'
+    printf 'PackageCopyrightText: NOASSERTION\n'
+    printf 'ExternalRef: PACKAGE-MANAGER purl pkg:cargo/%s@%s\n' "$name" "$version"
+  done < <(LC_ALL=C sort -u <<<"$normalized_packages")
+}
+
+write_artifact_supply_chain() {
+  local artifact="$1"
+  local component_set="$2"
+  local rust_targets="$3"
+  local artifact_name
+  local artifact_hash
+  local source_revision
+  local sbom
+  local provenance
+  local tree
+  local normalized_packages
+  local package
+  local name
+  local version
+  local spdx_id
+  local target_label
+  local target_triple
+  local resolved_dependencies
+  [[ -f "$artifact" && ! -L "$artifact" ]] || die "missing published artifact: $artifact"
+  case "$component_set" in
+    desktop | headless | combined) ;;
+    *) die "invalid supply-chain component set: $component_set" ;;
+  esac
+  artifact_name="$(basename "$artifact")"
+  artifact_hash="$(sha256_file "$artifact")"
+  source_revision="${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || die "invalid provenance source revision"
+  sbom="$artifact.spdx"
+  provenance="$artifact.provenance.json"
+  assert_output_file_slot "$sbom"
+  assert_output_file_slot "$provenance"
+  case "$component_set" in
+    desktop)
+      resolved_dependencies="{\"uri\":\"desktop/Cargo.lock\",\"digest\":{\"sha256\":\"$(sha256_file "$REPO_ROOT/desktop/Cargo.lock")\"}}"
+      ;;
+    headless)
+      resolved_dependencies="{\"uri\":\"Cargo.lock\",\"digest\":{\"sha256\":\"$(sha256_file "$REPO_ROOT/Cargo.lock")\"}}"
+      ;;
+    combined)
+      resolved_dependencies="{\"uri\":\"Cargo.lock\",\"digest\":{\"sha256\":\"$(sha256_file "$REPO_ROOT/Cargo.lock")\"}},{\"uri\":\"desktop/Cargo.lock\",\"digest\":{\"sha256\":\"$(sha256_file "$REPO_ROOT/desktop/Cargo.lock")\"}}"
+      ;;
+  esac
+
+  {
+    printf 'SPDXVersion: SPDX-2.3\n'
+    printf 'DataLicense: CC0-1.0\n'
+    printf 'SPDXID: SPDXRef-DOCUMENT\n'
+    printf 'DocumentName: %s SBOM\n' "$artifact_name"
+    printf 'DocumentNamespace: https://github.com/GTAStudio/GTA-Claw/releases/sbom/%s\n' "$artifact_hash"
+    printf 'Creator: Tool: GTA-Claw-macOS-Packaging\n'
+    printf 'Created: 2000-01-01T00:00:00Z\n'
+    printf 'DocumentDescribes: SPDXRef-Artifact\n\n'
+    printf 'FileName: ./%s\n' "$artifact_name"
+    printf 'SPDXID: SPDXRef-Artifact\n'
+    printf 'FileChecksum: SHA256: %s\n' "$artifact_hash"
+    printf 'LicenseConcluded: NOASSERTION\n'
+    printf 'CopyrightText: NOASSERTION\n'
+
+    tree=""
+    while IFS= read -r target_label; do
+      case "$target_label" in
+        arm64) target_triple="aarch64-apple-darwin" ;;
+        x86_64) target_triple="x86_64-apple-darwin" ;;
+        *) die "invalid SBOM Rust target label: $target_label" ;;
+      esac
+      if [[ "$component_set" == "desktop" || "$component_set" == "combined" ]]; then
+        tree+="$(cargo tree \
+          --manifest-path "$REPO_ROOT/desktop/Cargo.toml" \
+          --target "$target_triple" \
+          --locked --offline --prefix none --format '{p}')"$'\n'
+      fi
+      if [[ "$component_set" == "headless" || "$component_set" == "combined" ]]; then
+        tree+="$(cargo tree \
+          --manifest-path "$REPO_ROOT/Cargo.toml" \
+          --target "$target_triple" \
+          --locked --offline --prefix none --format '{p}')"$'\n'
+      fi
+    done < <(tr ' ' '\n' <<<"$rust_targets" | sed '/^$/d')
+    normalized_packages=""
+    while IFS= read -r package; do
+      [[ "$package" =~ ^([^[:space:]]+)[[:space:]]v([^[:space:]]+) ]] || continue
+      name="${BASH_REMATCH[1]}"
+      version="${BASH_REMATCH[2]}"
+      normalized_packages+="$name $version"$'\n'
+    done <<<"$tree"
+    write_spdx_package_inventory "$normalized_packages"
+  } >"$sbom"
+
+  printf '%s\n' \
+    "{\"_type\":\"https://in-toto.io/Statement/v1\",\"subject\":[{\"name\":\"$artifact_name\",\"digest\":{\"sha256\":\"$artifact_hash\"}}],\"predicateType\":\"https://slsa.dev/provenance/v1\",\"predicate\":{\"buildDefinition\":{\"buildType\":\"https://github.com/GTAStudio/GTA-Claw/packaging/macos/v1\",\"externalParameters\":{\"componentSet\":\"$component_set\",\"profile\":\"release\",\"rustTargets\":\"$rust_targets\",\"offline\":true},\"internalParameters\":{},\"resolvedDependencies\":[$resolved_dependencies]},\"runDetails\":{\"builder\":{\"id\":\"https://github.com/GTAStudio/GTA-Claw/.github/workflows/macos-packaging.yml\"},\"metadata\":{\"invocationId\":\"$source_revision\"}}}}" \
+    >"$provenance"
+  test_artifact_supply_chain "$artifact"
+}
+
+test_artifact_supply_chain() {
+  local artifact="$1"
+  local artifact_name
+  local artifact_hash
+  local sbom="$artifact.spdx"
+  local provenance="$artifact.provenance.json"
+  artifact_name="$(basename "$artifact")"
+  artifact_hash="$(sha256_file "$artifact")"
+  [[ -f "$sbom" && ! -L "$sbom" && -f "$provenance" && ! -L "$provenance" ]] ||
+    die "artifact lacks SBOM or provenance companions: $artifact"
+  grep -F "FileName: ./$artifact_name" "$sbom" >/dev/null ||
+    die "SBOM does not name published artifact: $artifact"
+  grep -F "FileChecksum: SHA256: $artifact_hash" "$sbom" >/dev/null ||
+    die "SBOM does not hash published artifact: $artifact"
+  grep -F "\"name\":\"$artifact_name\",\"digest\":{\"sha256\":\"$artifact_hash\"}" \
+    "$provenance" >/dev/null ||
+    die "provenance does not attest published artifact: $artifact"
+  [[ -n "$(awk '$1 == "PackageName:" { print $2; exit }' "$sbom")" ]] ||
+    die "SBOM has no package inventory: $artifact"
+  [[ -z "$(awk '$1 == "SPDXID:" { print $2 }' "$sbom" | LC_ALL=C sort | uniq -d)" ]] ||
+    die "SBOM contains duplicate SPDX identifiers: $artifact"
+}
+
+write_artifact_set_checksums() {
+  local root="$1"
+  local manifest_name="${2:-SHA256SUMS}"
+  [[ "$manifest_name" =~ ^SHA256SUMS(-[a-z]+)?$ ]] ||
+    die "invalid artifact checksum manifest name: $manifest_name"
+  local manifest="$root/$manifest_name"
+  write_sha256_manifest "$root" "$manifest"
+  verify_sha256_manifest "$root" "$manifest" >/dev/null
 }
 
 write_sha256_manifest() {
@@ -320,6 +546,37 @@ write_sha256_manifest() {
 verify_sha256_manifest() {
   local root="$1"
   local manifest="$2"
+  local line
+  local relative
+  local manifest_relative=""
+  local recorded=""
+  local expected
+  local recorded_sorted
+  [[ -f "$manifest" && ! -L "$manifest" ]] || die "missing checksum manifest: $manifest"
+  if [[ "$manifest" == "$root/"* ]]; then
+    manifest_relative="./${manifest#"$root/"}"
+  fi
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([0-9a-f]{64})[[:space:]][[:space:]](\./.+)$ ]] ||
+      die "invalid checksum manifest entry: $line"
+    relative="${BASH_REMATCH[2]}"
+    [[ "$relative" != *\\* && "/${relative#./}/" != */../* &&
+      "/${relative#./}/" != */./* ]] ||
+      die "unsafe checksum manifest path: $relative"
+    [[ -f "$root/$relative" && ! -L "$root/$relative" ]] ||
+      die "checksum manifest entry is not a plain file: $relative"
+    recorded+="$relative"$'\n'
+  done <"$manifest"
+  [[ -n "$recorded" ]] || die "checksum manifest is empty: $manifest"
+  expected="$(
+    cd "$root"
+    find . -type f -print |
+      { if [[ -n "$manifest_relative" ]]; then grep -Fvx "$manifest_relative"; else cat; fi; } |
+      LC_ALL=C sort
+  )"
+  recorded_sorted="$(printf '%s' "$recorded" | sed '/^$/d' | LC_ALL=C sort)"
+  [[ "$recorded_sorted" == "$expected" ]] ||
+    die "checksum manifest coverage differs from published files below $root"
   (cd "$root" && shasum -a 256 -c "$manifest")
 }
 
@@ -327,9 +584,36 @@ expected_lipo_arch() {
   case "$1" in
     aarch64-apple-darwin | arm64) printf 'arm64\n' ;;
     x86_64-apple-darwin | x86_64) printf 'x86_64\n' ;;
-    universal2) printf 'arm64 x86_64\n' ;;
     *) die "unsupported macOS architecture or target: $1" ;;
   esac
+}
+
+distribution_app_archive_label() {
+  local label="${1:-arm64}"
+  validate_safe_component "$label" APP_ARCHIVE_LABEL
+  [[ "$label" == "arm64" ]] ||
+    die "unsupported macOS distribution archive label: $label"
+  printf '%s\n' "$label"
+}
+
+distribution_app_archive_name() {
+  local qualifier="$1"
+  local label
+  case "$qualifier" in
+    unsigned-non-release | signed-notarized) ;;
+    *) die "unsupported app archive qualifier: $qualifier" ;;
+  esac
+  label="$(distribution_app_archive_label "${2:-}")"
+  printf 'gta-claw-%s-macos-%s-%s.app.zip\n' "$VERSION" "$label" "$qualifier"
+}
+
+distribution_expected_arches() {
+  local arches="${1:-arm64}"
+  arches="${arches//,/ }"
+  arches="$(awk '{$1=$1; print}' <<<"$arches")"
+  [[ "$arches" == "arm64" ]] ||
+    die "unsupported macOS distribution architecture set: $arches"
+  printf '%s\n' "$arches"
 }
 
 host_target() {

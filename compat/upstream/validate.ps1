@@ -44,6 +44,13 @@ $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f4
 $ExpectedOracleCorpusDigest = "e8853b665f2d09e2d526dee5349b56223b249817df5872e408fc7a5d0b182c25"
 $ExpectedOracleCorpusCases = 120
 $ExpectedOracleCorpusTrue = 46
+# The shared reachability corpus is frozen on exactly the same terms. Its
+# expectations were produced by running cargo and rustc against each fixture, so
+# neither resolver is normative for reachability and neither may edit a case to
+# match itself. -WriteLedgerDigests cannot reach these constants.
+$ExpectedReachabilityCorpusDigest = "08dd0269372fb8ef4d9e5fdfbcf5c58eca92ec4b8cce0b79536a4a06b25cbe5f"
+$ExpectedReachabilityCorpusCases = 27
+$ExpectedReachabilityCorpusAccepting = 13
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -87,6 +94,7 @@ $ExpectedJsonPaths = @(
     "enabled-test-oracle.json",
     "feature-ledger.schema.json",
     "manifest.json",
+    "reachability-corpus.json",
     "inventories/channels.json",
     "inventories/clients.json",
     "inventories/config-domains.json",
@@ -237,7 +245,7 @@ $InventorySpecs = [ordered]@{
 }
 
 $ExpectedCanonicalCounts = [ordered]@{
-    artifact_json_files = 17
+    artifact_json_files = 18
     ledgers = 3
     feature_rows = 47
     inventory_files = 10
@@ -1719,6 +1727,116 @@ function Assert-EnabledTestOracle {
     }
 }
 
+function Assert-ReachabilityCorpusPath {
+    param(
+        [string]$Path,
+        [string]$Context
+    )
+    Assert-RelativeSourcePath $Path $Context
+    # Assert-RelativeSourcePath's character class admits "." and ".." as whole
+    # segments. A corpus key containing a dot segment would let any harness that
+    # materializes these fixtures write outside the fixture root, so reject them
+    # here rather than trusting every future replayer to notice.
+    foreach ($segment in $Path.Split("/")) {
+        if ((Test-OrdinalStringEqual $segment ".") -or (Test-OrdinalStringEqual $segment "..")) {
+            Fail "$Context '$Path' must not contain a dot segment"
+        }
+    }
+}
+
+function Assert-ReachabilityCorpus {
+    param([object]$Corpus)
+    # Structural and digest pin only. This function deliberately does NOT
+    # materialize the fixtures and replay them in-process: the resolver memoizes
+    # per-crate compiled-file sets in script-scoped caches, and seeding those
+    # caches from attacker-supplied fixture trees during a real validation run
+    # would be a forgery vector, not a convenience. Behavioural replay belongs in
+    # validate-self-test.ps1, where every case runs in an isolated child process
+    # against its own repository root.
+    Assert-ExactPropertySet $Corpus @(
+        "schema_version", "purpose", "rule", "arbiter", "implementations", "cases"
+    ) "reachability-corpus"
+    if ($Corpus.schema_version -ne 1) {
+        Fail "reachability-corpus schema_version must be 1"
+    }
+    $implementations = @($Corpus.implementations)
+    if ($implementations.Count -ne 2) {
+        Fail "reachability-corpus must record exactly the two resolvers it compares"
+    }
+    foreach ($implementation in $implementations) {
+        Assert-ExactPropertySet $implementation @("path", "entry_point") "reachability-corpus.implementations"
+    }
+    if (-not (Test-OrdinalStringEqual ([string]$implementations[0].path) "crates/claw-conformance/src/claims.rs") -or
+        -not (Test-OrdinalStringEqual ([string]$implementations[1].path) "compat/upstream/validate.ps1")) {
+        Fail "reachability-corpus must name claw-conformance and validate.ps1 as the two compared resolvers"
+    }
+    $cases = @($Corpus.cases)
+    if ($cases.Count -ne $ExpectedReachabilityCorpusCases) {
+        Fail ("reachability-corpus must contain exactly {0} cases; found {1}" -f $ExpectedReachabilityCorpusCases, $cases.Count)
+    }
+    $names = @{}
+    $accepting = 0
+    foreach ($case in $cases) {
+        Assert-ExactPropertySet $case @("name", "files", "cite", "expect", "why") "reachability-corpus case"
+        $name = [string]$case.name
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            Fail "reachability-corpus case name must not be empty"
+        }
+        if ($names.ContainsKey($name)) {
+            Fail "reachability-corpus case name '$name' is duplicated"
+        }
+        $names[$name] = $true
+        $expect = [string]$case.expect
+        if (-not (Test-OrdinalStringEqual $expect "accept") -and -not (Test-OrdinalStringEqual $expect "reject")) {
+            Fail "reachability-corpus case '$name' expect must be 'accept' or 'reject'"
+        }
+        if (Test-OrdinalStringEqual $expect "accept") {
+            $accepting += 1
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$case.why)) {
+            Fail "reachability-corpus case '$name' must record why the toolchain produces this verdict"
+        }
+        $fileNames = @($case.files.PSObject.Properties.Name)
+        if ($fileNames.Count -lt 2) {
+            Fail "reachability-corpus case '$name' must define a manifest and at least one source"
+        }
+        $hasManifest = $false
+        foreach ($fileName in $fileNames) {
+            Assert-ReachabilityCorpusPath $fileName ("reachability-corpus case '$name' file")
+            if ($fileName.EndsWith("Cargo.toml", [System.StringComparison]::Ordinal)) {
+                $hasManifest = $true
+            }
+        }
+        if (-not $hasManifest) {
+            Fail "reachability-corpus case '$name' must define at least one Cargo.toml"
+        }
+        # A case may only cite a file it actually defines. Without this a corpus
+        # case could cite a path that exists in the real repository and quietly
+        # assert a verdict about something the fixture never contained.
+        $cite = [string]$case.cite
+        Assert-ReachabilityCorpusPath $cite ("reachability-corpus case '$name' cite")
+        if (-not $cite.EndsWith(".rs", [System.StringComparison]::Ordinal)) {
+            Fail "reachability-corpus case '$name' must cite a .rs source"
+        }
+        $citeIsDefined = $false
+        foreach ($fileName in $fileNames) {
+            if (Test-OrdinalStringEqual $fileName $cite) {
+                $citeIsDefined = $true
+            }
+        }
+        if (-not $citeIsDefined) {
+            Fail "reachability-corpus case '$name' cites '$cite', which the case does not define"
+        }
+    }
+    if ($accepting -ne $ExpectedReachabilityCorpusAccepting) {
+        Fail ("reachability-corpus must record exactly {0} accepting cases; found {1}" -f $ExpectedReachabilityCorpusAccepting, $accepting)
+    }
+    $digest = Get-ObjectDigest $Corpus
+    if (-not (Test-OrdinalStringEqual $digest $ExpectedReachabilityCorpusDigest)) {
+        Fail ("reachability-corpus digest mismatch; expected {0}, found {1}" -f $ExpectedReachabilityCorpusDigest, $digest)
+    }
+}
+
 function Assert-RustTestSymbol {
     param(
         [string]$Text,
@@ -2803,10 +2921,11 @@ if ($actualFilePaths.Count -ne $expectedFilePaths.Count -or
 }
 $missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
 $unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
-if ($actualJsonPaths.Count -ne 17 -or
+if ($actualJsonPaths.Count -ne 18 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
-    Fail "fixed JSON topology mismatch; missing=[$($missingJsonFiles -join ',')], unexpected=[$($unexpectedJsonFiles -join ',')]"
+    Fail ("fixed JSON topology mismatch; expected 18 JSON artifacts, found {0}; missing=[{1}], unexpected=[{2}]" -f
+        $actualJsonPaths.Count, ($missingJsonFiles -join ','), ($unexpectedJsonFiles -join ','))
 }
 
 $documents = @{}
@@ -2818,6 +2937,7 @@ foreach ($relativePath in $ExpectedJsonPaths) {
 # any evidence is judged with it. A drifted oracle must never get the chance to
 # accept or reject a parity claim.
 Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
+Assert-ReachabilityCorpus $documents["reachability-corpus.json"]
 
 $baseline = $documents["baseline.json"]
 Assert-ExactPropertySet $baseline @("schema_version", "upstream", "stable_release", "gateway_protocol", "licensing") "baseline"
