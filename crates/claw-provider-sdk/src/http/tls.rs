@@ -9,16 +9,31 @@
 //!
 //! Nothing here is provider-specific; it is the smallest connector that
 //! satisfies [`hyper_util::client::legacy::Client`].
+//!
+//! # Proxies
+//!
+//! Only `https` destinations are proxied, and only through a `CONNECT` tunnel.
+//! Plaintext is deliberately never proxied: the TLS policy already restricts it
+//! to loopback, and forwarding such a request to an external proxy would put an
+//! `authorization` header on the wire in the clear. Because a tunnel is
+//! end-to-end, the TLS handshake still authenticates the *destination*, so a
+//! proxy — hostile or merely compromised — sees ciphertext and an SNI name
+//! rather than a credential.
 
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use bytes::Bytes;
 use http::Uri;
+use http_body_util::Empty;
 use hyper::rt::{Read, ReadBufCursor, Write};
+use hyper::upgrade::Upgraded;
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
+use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use hyper_util::rt::TokioIo;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::ServerName;
@@ -26,16 +41,31 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
 
-/// A TCP stream that may or may not have been upgraded to TLS.
+use crate::http::ProxyPolicy;
+
+/// A TLS session established directly over TCP.
+type DirectStream = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
+/// A TLS session established inside a proxy `CONNECT` tunnel.
+type TunnelStream = TokioIo<tokio_rustls::client::TlsStream<TokioIo<Upgraded>>>;
+/// The error type `hyper-util` expects a connector to produce.
+type ConnectError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A transport that may or may not have been upgraded to TLS.
 ///
 /// Plaintext is reachable only for loopback URLs, and only when the caller
 /// opted in through [`crate::http::TlsPolicy::AllowLoopbackPlaintext`]; the
 /// scheme check happens before a request ever reaches this connector.
+///
+/// The TLS variants are boxed because a `TlsStream` is far larger than a
+/// `TcpStream`, and an unboxed enum would pay for the biggest variant on every
+/// plaintext connection.
 pub(crate) enum MaybeTlsStream {
     /// Plaintext HTTP, loopback only.
     Plain(TokioIo<TcpStream>),
-    /// HTTPS over rustls.
-    Tls(Box<TokioIo<tokio_rustls::client::TlsStream<TcpStream>>>),
+    /// HTTPS negotiated directly with the destination.
+    Tls(Box<DirectStream>),
+    /// HTTPS negotiated with the destination through a proxy tunnel.
+    Tunnelled(Box<TunnelStream>),
 }
 
 impl Connection for MaybeTlsStream {
@@ -43,6 +73,11 @@ impl Connection for MaybeTlsStream {
         match self {
             Self::Plain(stream) => stream.inner().connected(),
             Self::Tls(stream) => stream.inner().get_ref().0.connected(),
+            // A tunnel is transparent once established, so the request must be
+            // written in origin form exactly as if it were direct. Reporting
+            // `proxy(true)` here would switch `hyper-util` to absolute form and
+            // put the full URL on a wire the proxy can no longer read anyway.
+            Self::Tunnelled(_) => Connected::new(),
         }
     }
 }
@@ -56,6 +91,7 @@ impl Read for MaybeTlsStream {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(context, buffer),
+            Self::Tunnelled(stream) => Pin::new(stream.as_mut()).poll_read(context, buffer),
         }
     }
 }
@@ -69,6 +105,7 @@ impl Write for MaybeTlsStream {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_write(context, data),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(context, data),
+            Self::Tunnelled(stream) => Pin::new(stream.as_mut()).poll_write(context, data),
         }
     }
 
@@ -76,6 +113,7 @@ impl Write for MaybeTlsStream {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_flush(context),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(context),
+            Self::Tunnelled(stream) => Pin::new(stream.as_mut()).poll_flush(context),
         }
     }
 
@@ -83,6 +121,7 @@ impl Write for MaybeTlsStream {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
             Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(context),
+            Self::Tunnelled(stream) => Pin::new(stream.as_mut()).poll_shutdown(context),
         }
     }
 }
@@ -126,34 +165,154 @@ fn native_roots() -> Result<Arc<ClientConfig>, TlsSetupError> {
         .clone()
 }
 
+/// Returns `true` when a host names the local machine.
+///
+/// Loopback traffic is never proxied. Sending it to an external proxy would be
+/// meaningless for a local inference server and actively harmful for a
+/// plaintext request, so this is checked before the matcher runs and
+/// independently of whatever `NO_PROXY` happens to say.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = unbracketed.parse::<std::net::IpAddr>() {
+        return address.is_loopback();
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// Builds the proxy matcher a policy asks for.
+fn matcher_for(policy: &ProxyPolicy) -> Option<Matcher> {
+    match policy {
+        ProxyPolicy::Disabled => None,
+        ProxyPolicy::FromEnvironment => Some(Matcher::from_env()),
+        ProxyPolicy::Explicit { url, no_proxy } => {
+            let mut builder = Matcher::builder().all(url.clone());
+            if let Some(list) = no_proxy {
+                builder = builder.no(list.clone());
+            }
+            Some(builder.build())
+        }
+    }
+}
+
+/// Converts a host into the owned server name the handshake needs.
+///
+/// The owned form is what lets the handshake run in a `'static` future; a
+/// borrowed `ServerName` would tie it to the host string.
+fn server_name_for(host: &str) -> Result<ServerName<'static>, ConnectError> {
+    let unbracketed = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    ServerName::try_from(unbracketed)
+        .map_err(|_| io::Error::other("the URL host is not a valid TLS server name").into())
+}
+
+/// Opens a `CONNECT` tunnel to `authority` through `proxy`.
+///
+/// `hyper`'s own upgrade machinery is used rather than a hand-written handshake
+/// because it correctly hands back any bytes the proxy pipelined after its
+/// `200`. A hand-rolled reader that over-consumed the header would silently eat
+/// the first TLS record.
+async fn open_tunnel(
+    mut http: HttpConnector,
+    proxy: Intercept,
+    authority: String,
+) -> Result<Upgraded, ConnectError> {
+    let stream = http.call(proxy.uri().clone()).await?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(stream).await?;
+    tokio::spawn(async move {
+        // `with_upgrades` is what keeps the socket alive past the 200 instead
+        // of closing it when the response body ends.
+        let _ = connection.with_upgrades().await;
+    });
+
+    let mut request = http::Request::connect(&authority)
+        .body(Empty::<Bytes>::new())
+        .map_err(|_| io::Error::other("the CONNECT request could not be assembled"))?;
+    // `hyper`'s low-level client does not synthesise a `Host` header the way
+    // the pooled client does, and RFC 9110 requires one on every HTTP/1.1
+    // request. Proxies that enforce it reject a tunnel without it.
+    let host = http::HeaderValue::from_str(&authority)
+        .map_err(|_| io::Error::other("the destination authority is not a valid header value"))?;
+    request.headers_mut().insert(http::header::HOST, host);
+    if let Some(credential) = proxy.basic_auth() {
+        let mut value = credential.clone();
+        value.set_sensitive(true);
+        request
+            .headers_mut()
+            .insert(http::header::PROXY_AUTHORIZATION, value);
+    }
+
+    let response = sender.send_request(request).await?;
+    let status = response.status();
+    if !status.is_success() {
+        // Only the status is reported. A proxy URL may embed credentials, so it
+        // must never reach an error message.
+        return Err(io::Error::other(format!(
+            "the proxy refused the tunnel with status {}",
+            status.as_u16()
+        ))
+        .into());
+    }
+    Ok(hyper::upgrade::on(response).await?)
+}
+
 /// Connects plaintext to loopback and TLS everywhere else.
 #[derive(Clone)]
 pub(crate) struct TlsConnectorService {
     http: HttpConnector,
     tls: TlsConnector,
+    /// Shared because the connector is cloned per connection and a `Matcher`
+    /// holds parsed `NO_PROXY` rules that are not worth rebuilding.
+    proxy: Option<Arc<Matcher>>,
+    connect_timeout: Duration,
 }
 
 impl TlsConnectorService {
     /// Builds the connector, loading platform roots on first use.
-    pub(crate) fn new(connect_timeout: std::time::Duration) -> Result<Self, TlsSetupError> {
+    pub(crate) fn new(
+        connect_timeout: Duration,
+        proxy_policy: &ProxyPolicy,
+    ) -> Result<Self, TlsSetupError> {
         let config = native_roots()?;
         let mut http = HttpConnector::new();
         // The scheme is already validated against the transport's TLS policy,
-        // and this connector handles `https` itself, so the built-in
-        // http-only guard would reject every secure request.
+        // and this connector handles `https` itself, so the built-in http-only
+        // guard would reject every secure request.
         http.enforce_http(false);
         http.set_connect_timeout(Some(connect_timeout));
         http.set_nodelay(true);
         Ok(Self {
             http,
             tls: TlsConnector::from(config),
+            proxy: matcher_for(proxy_policy).map(Arc::new),
+            connect_timeout,
         })
+    }
+
+    /// Returns the proxy that should carry `uri`, if any.
+    ///
+    /// Plaintext and loopback are excluded before the matcher is consulted, so
+    /// no `NO_PROXY` mistake can route them through a proxy.
+    fn intercept(&self, uri: &Uri) -> Option<Intercept> {
+        if uri.scheme_str() != Some("https") {
+            return None;
+        }
+        match uri.host() {
+            None => return None,
+            Some(host) if is_loopback_host(host) => return None,
+            Some(_) => {}
+        }
+        self.proxy.as_deref()?.intercept(uri)
     }
 }
 
 impl Service<Uri> for TlsConnectorService {
     type Response = MaybeTlsStream;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Error = ConnectError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -163,20 +322,37 @@ impl Service<Uri> for TlsConnectorService {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let is_tls = uri.scheme_str() == Some("https");
         let host = uri.host().map(str::to_owned);
+        let port = uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
+        let intercept = self.intercept(&uri);
         let tls = self.tls.clone();
-        let connecting = self.http.call(uri);
+        let connect_timeout = self.connect_timeout;
+        let mut http = self.http.clone();
+
         Box::pin(async move {
-            let stream = connecting.await?;
+            let missing_host = || io::Error::other("the URL names no host");
+            if let Some(proxy) = intercept {
+                let host = host.ok_or_else(missing_host)?;
+                // The handshake authenticates the destination, never the proxy.
+                let server_name = server_name_for(&host)?;
+                let authority = format!("{host}:{port}");
+                let tunnel =
+                    tokio::time::timeout(connect_timeout, open_tunnel(http, proxy, authority))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "the proxy tunnel timed out")
+                        })??;
+                let secured = tls.connect(server_name, TokioIo::new(tunnel)).await?;
+                return Ok(MaybeTlsStream::Tunnelled(Box::new(TokioIo::new(secured))));
+            }
+
+            let stream = http.call(uri).await?;
             if !is_tls {
                 return Ok(MaybeTlsStream::Plain(stream));
             }
-            let host = host.ok_or_else(|| io::Error::other("the URL names no host"))?;
-            // The owned form is what lets the handshake run in a `'static`
-            // future; a borrowed `ServerName` would tie it to `host`.
-            let server_name = ServerName::try_from(host)
-                .map_err(|_| io::Error::other("the URL host is not a valid TLS server name"))?;
-            let upgraded = tls.connect(server_name, stream.into_inner()).await?;
-            Ok(MaybeTlsStream::Tls(Box::new(TokioIo::new(upgraded))))
+            let host = host.ok_or_else(missing_host)?;
+            let server_name = server_name_for(&host)?;
+            let secured = tls.connect(server_name, stream.into_inner()).await?;
+            Ok(MaybeTlsStream::Tls(Box::new(TokioIo::new(secured))))
         })
     }
 }

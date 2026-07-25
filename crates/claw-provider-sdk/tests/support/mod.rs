@@ -11,6 +11,8 @@
 
 #![allow(dead_code, unreachable_pub)]
 
+pub mod proxy;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

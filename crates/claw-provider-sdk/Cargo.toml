@@ -15,7 +15,7 @@ futures-util = { version = "=0.3.32", default-features = false, features = ["std
 http = "=1.4.0"
 http-body-util = "=0.1.4"
 hyper = { version = "=1.11.0", default-features = false, features = ["client", "http1"] }
-hyper-util = { version = "=0.1.20", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["client-legacy", "client-proxy", "http1", "tokio"] }
 keyring-core = "=1.0.0"
 rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"

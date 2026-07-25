@@ -14,10 +14,11 @@ use std::time::Duration;
 use claw_provider_sdk::cancel::CancelToken;
 use claw_provider_sdk::error::{ErrorKind, Operation};
 use claw_provider_sdk::http::{
-    Body, HttpRequest, HttpTransport, Method, TlsPolicy, TransportConfig,
+    Body, HttpRequest, HttpTransport, Method, ProxyPolicy, TlsPolicy, TransportConfig,
 };
 use claw_provider_sdk::secret::SecretString;
 use futures_util::StreamExt as _;
+use support::proxy::TestProxy;
 use support::{Reply, TestServer};
 
 fn transport() -> HttpTransport {
@@ -405,4 +406,275 @@ async fn a_redirect_is_returned_to_the_caller_instead_of_replaying_the_credentia
         Some("sk-live-redirect")
     );
     assert_eq!(requests[0].target, "/v1/chat/completions");
+}
+
+// ---------------------------------------------------------------------------
+// Proxy support.
+//
+// Only `https` destinations are tunnelled, so these tests cannot complete a
+// handshake against the loopback proxy — there is no in-process TLS server.
+// What they prove is everything that happens up to and including the first
+// tunnel byte, which is where every proxy bug of consequence lives: the request
+// line, the credential header, and whose identity the TLS session is about to
+// authenticate.
+// ---------------------------------------------------------------------------
+
+/// Builds a transport that tunnels through `proxy_url`.
+fn proxied_transport(proxy_url: String, no_proxy: Option<String>) -> HttpTransport {
+    HttpTransport::with_config(&TransportConfig {
+        tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+        proxy_policy: ProxyPolicy::Explicit {
+            url: proxy_url,
+            no_proxy,
+        },
+        connect_timeout: Duration::from_secs(5),
+        ..TransportConfig::default()
+    })
+    .expect("build transport")
+}
+
+/// Issues a request that is expected to fail once the tunnel is open, because
+/// the loopback proxy cannot terminate TLS.
+async fn attempt_proxied_request(transport: &HttpTransport, url: &str) -> ErrorKind {
+    let url = url::Url::parse(url).expect("parse the destination URL");
+    transport
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, url)
+                .secret_header("authorization", SecretString::new("sk-live-proxy"))
+                .body(Body::Json(r#"{"model":"m"}"#.to_owned())),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("no TLS peer exists behind the test proxy")
+        .kind()
+}
+
+#[tokio::test]
+async fn an_https_request_is_tunnelled_with_a_well_formed_connect_request() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(None), None);
+
+    attempt_proxied_request(&transport, "https://api.example.com/v1/chat/completions").await;
+
+    assert!(
+        proxy.wait_for_tunnels(1, Duration::from_secs(5)).await,
+        "the request must reach the proxy"
+    );
+    let tunnels = proxy.tunnels().await;
+    assert_eq!(tunnels.len(), 1);
+    // Authority form, default port made explicit, and no scheme or path — an
+    // absolute-form or origin-form request line here would be rejected by a
+    // real proxy.
+    assert_eq!(
+        tunnels[0].request_line,
+        "CONNECT api.example.com:443 HTTP/1.1"
+    );
+    assert_eq!(tunnels[0].header("host"), Some("api.example.com:443"));
+    assert_eq!(tunnels[0].header("proxy-authorization"), None);
+}
+
+#[tokio::test]
+async fn a_non_default_destination_port_is_preserved_in_the_connect_target() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(None), None);
+
+    attempt_proxied_request(&transport, "https://api.example.com:8443/v1/models").await;
+
+    assert!(proxy.wait_for_tunnels(1, Duration::from_secs(5)).await);
+    assert_eq!(
+        proxy.tunnels().await[0].request_line,
+        "CONNECT api.example.com:8443 HTTP/1.1"
+    );
+}
+
+#[tokio::test]
+async fn the_tunnelled_handshake_authenticates_the_destination_and_not_the_proxy() {
+    // This is the property that makes proxying safe at all. The proxy sees only
+    // a TLS record addressed to the destination's name, so it cannot read the
+    // `authorization` header or impersonate the origin without a certificate
+    // the platform trust store already accepts for that name.
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(None), None);
+
+    attempt_proxied_request(&transport, "https://api.openai.com/v1/chat/completions").await;
+
+    assert!(proxy.wait_for_tunnels(1, Duration::from_secs(5)).await);
+    let tunnels = proxy.tunnels().await;
+    let first = tunnels[0].tunnelled.first().copied();
+    assert_eq!(
+        first,
+        Some(0x16),
+        "the first tunnel byte must be a TLS handshake record"
+    );
+    assert_eq!(
+        tunnels[0].sni_host().as_deref(),
+        Some("api.openai.com"),
+        "the handshake must name the destination, never the proxy"
+    );
+
+    let sent = String::from_utf8_lossy(&tunnels[0].tunnelled).into_owned();
+    assert!(
+        !sent.contains("sk-live-proxy"),
+        "the credential must never appear on the proxy-visible wire"
+    );
+    assert!(
+        !sent.contains("authorization"),
+        "no request header may precede the handshake"
+    );
+}
+
+#[tokio::test]
+async fn proxy_credentials_are_sent_as_basic_authentication() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(Some("Aladdin:opensesame")), None);
+
+    attempt_proxied_request(&transport, "https://api.example.com/v1/models").await;
+
+    assert!(proxy.wait_for_tunnels(1, Duration::from_secs(5)).await);
+    assert_eq!(
+        proxy.tunnels().await[0].header("proxy-authorization"),
+        Some("Basic QWxhZGRpbjpvcGVuc2VzYW1l")
+    );
+}
+
+#[tokio::test]
+async fn a_refused_tunnel_is_a_transport_error_that_leaks_no_proxy_credential() {
+    let proxy = TestProxy::start(407).await;
+    let proxy_url = proxy.url(Some("corp-user:corp-secret"));
+    let transport = proxied_transport(proxy_url, None);
+
+    let url = url::Url::parse("https://api.example.com/v1/models").expect("parse URL");
+    let error = transport
+        .send(
+            "test",
+            Operation::ListModels,
+            HttpRequest::new(Method::Get, url),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("a refused tunnel must fail");
+
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains("corp-secret"),
+        "the proxy password must not reach an error message: {rendered}"
+    );
+    assert!(
+        !rendered.contains("corp-user"),
+        "the proxy username must not reach an error message: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_destination_is_never_proxied() {
+    // Loopback plaintext is the one case that would put an `authorization`
+    // header on the wire in the clear, so it must bypass the proxy even though
+    // the policy names no `NO_PROXY` entry at all.
+    let proxy = TestProxy::start(200).await;
+    let server = TestServer::start(vec![Reply::json(r#"{"ok":true}"#)]).await;
+    let transport = proxied_transport(proxy.url(None), None);
+
+    let response = transport
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .secret_header("authorization", SecretString::new("sk-live-loopback"))
+                .body(Body::Json("{}".to_owned())),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("a loopback request must go direct");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.request_count().await, 1);
+    assert_eq!(
+        proxy.tunnels().await.len(),
+        0,
+        "the proxy must not have been contacted"
+    );
+}
+
+#[tokio::test]
+async fn a_no_proxy_entry_bypasses_the_tunnel() {
+    let proxy = TestProxy::start(200).await;
+    let transport = proxied_transport(proxy.url(None), Some("api.invalid".to_owned()));
+
+    // `.invalid` is reserved by RFC 2606 and can never resolve, so the direct
+    // attempt fails inside the resolver without a packet leaving the machine.
+    // The assertion that matters is that the failure did not come via the proxy.
+    let kind = attempt_proxied_request(&transport, "https://api.invalid/v1/models").await;
+    assert_eq!(kind, ErrorKind::Transport);
+
+    assert_eq!(
+        proxy.tunnels().await.len(),
+        0,
+        "a NO_PROXY host must not be tunnelled"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_policy_ignores_a_configured_proxy() {
+    let proxy = TestProxy::start(200).await;
+    let server = TestServer::start(vec![Reply::json("{}")]).await;
+    let transport = HttpTransport::with_config(&TransportConfig {
+        tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+        proxy_policy: ProxyPolicy::Disabled,
+        ..TransportConfig::default()
+    })
+    .expect("build transport");
+
+    transport
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/models")),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("the request must go direct");
+
+    assert_eq!(server.request_count().await, 1);
+    assert_eq!(proxy.tunnels().await.len(), 0);
+}
+
+#[test]
+fn a_proxy_policy_never_prints_its_url() {
+    // A proxy URL routinely embeds `user:password@`, which is a credential in
+    // exactly the way a provider key is.
+    let policy = ProxyPolicy::Explicit {
+        url: "http://corp-user:corp-secret@proxy.internal:3128".to_owned(),
+        no_proxy: Some("internal.example".to_owned()),
+    };
+    let rendered = format!("{policy:?}");
+    assert_eq!(
+        rendered,
+        r#"Explicit { url: "<redacted>", has_no_proxy: true }"#
+    );
+
+    assert_eq!(format!("{:?}", ProxyPolicy::Disabled), "Disabled");
+    assert_eq!(
+        format!("{:?}", ProxyPolicy::FromEnvironment),
+        "FromEnvironment"
+    );
+}
+
+#[tokio::test]
+async fn a_transport_debug_reports_its_proxy_policy_without_the_url() {
+    let transport = proxied_transport(
+        "http://corp-user:corp-secret@proxy.internal:3128".to_owned(),
+        None,
+    );
+    let rendered = format!("{transport:?}");
+    assert!(
+        !rendered.contains("corp-secret"),
+        "the transport must not print proxy credentials: {rendered}"
+    );
+    assert!(
+        rendered.contains(r#"url: "<redacted>""#),
+        "the transport must report that a proxy is configured: {rendered}"
+    );
 }

@@ -461,6 +461,47 @@ pub enum TlsPolicy {
     AllowLoopbackPlaintext,
 }
 
+/// Where the transport should look for an HTTP proxy.
+///
+/// Only `https` destinations are proxied, and only through a `CONNECT` tunnel,
+/// so a proxy never sees request headers. Loopback is never proxied regardless
+/// of policy.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub enum ProxyPolicy {
+    /// Read `ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from the
+    /// environment, matching the conventions `curl` uses.
+    #[default]
+    FromEnvironment,
+    /// Never use a proxy, whatever the environment says.
+    Disabled,
+    /// Use an explicitly configured proxy.
+    Explicit {
+        /// Proxy URL. May carry `user:password@` for Basic authentication.
+        url: String,
+        /// Comma-separated hosts that must bypass the proxy.
+        no_proxy: Option<String>,
+    },
+}
+
+impl Debug for ProxyPolicy {
+    /// Redacts the proxy URL.
+    ///
+    /// A proxy URL routinely embeds `user:password@`, which is a credential
+    /// exactly like a provider key, so the URL is never printed. `hyper-util`
+    /// redacts its own `Intercept` for the same reason.
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FromEnvironment => formatter.write_str("FromEnvironment"),
+            Self::Disabled => formatter.write_str("Disabled"),
+            Self::Explicit { no_proxy, .. } => formatter
+                .debug_struct("Explicit")
+                .field("url", &REDACTED)
+                .field("has_no_proxy", &no_proxy.is_some())
+                .finish(),
+        }
+    }
+}
+
 /// Configuration for [`HttpTransport`].
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
@@ -474,6 +515,8 @@ pub struct TransportConfig {
     pub pool_idle_timeout: Duration,
     /// TLS policy.
     pub tls_policy: TlsPolicy,
+    /// Proxy policy.
+    pub proxy_policy: ProxyPolicy,
 }
 
 impl Default for TransportConfig {
@@ -484,6 +527,7 @@ impl Default for TransportConfig {
             connect_timeout: Duration::from_secs(15),
             pool_idle_timeout: Duration::from_secs(60),
             tls_policy: TlsPolicy::RequireHttps,
+            proxy_policy: ProxyPolicy::FromEnvironment,
         }
     }
 }
@@ -493,6 +537,7 @@ impl Default for TransportConfig {
 pub struct HttpTransport {
     client: HyperClient<TlsConnectorService, Full<Bytes>>,
     tls_policy: TlsPolicy,
+    proxy_policy: ProxyPolicy,
     user_agent: String,
     request_timeout: Duration,
 }
@@ -502,6 +547,7 @@ impl Debug for HttpTransport {
         formatter
             .debug_struct("HttpTransport")
             .field("tls_policy", &self.tls_policy)
+            .field("proxy_policy", &self.proxy_policy)
             .field("user_agent", &self.user_agent)
             .field("request_timeout", &self.request_timeout)
             .finish()
@@ -527,23 +573,25 @@ impl HttpTransport {
     /// usable root certificate, or when the RING provider rejects the
     /// requested TLS versions.
     pub fn with_config(config: &TransportConfig) -> Result<Self, ProviderError> {
-        let connector = TlsConnectorService::new(config.connect_timeout).map_err(|error| {
-            let detail = match error {
-                TlsSetupError::NoRoots => {
-                    "the platform trust store contains no usable root certificate"
-                }
-                TlsSetupError::Provider => {
-                    "the TLS provider rejected the required protocol versions"
-                }
-            };
-            ProviderError::new(ErrorKind::Transport, "http", Operation::Transport, detail)
-        })?;
+        let connector = TlsConnectorService::new(config.connect_timeout, &config.proxy_policy)
+            .map_err(|error| {
+                let detail = match error {
+                    TlsSetupError::NoRoots => {
+                        "the platform trust store contains no usable root certificate"
+                    }
+                    TlsSetupError::Provider => {
+                        "the TLS provider rejected the required protocol versions"
+                    }
+                };
+                ProviderError::new(ErrorKind::Transport, "http", Operation::Transport, detail)
+            })?;
         let client = HyperClient::builder(TokioExecutor::new())
             .pool_idle_timeout(config.pool_idle_timeout)
             .build(connector);
         Ok(Self {
             client,
             tls_policy: config.tls_policy,
+            proxy_policy: config.proxy_policy.clone(),
             user_agent: config.user_agent.clone(),
             request_timeout: config.request_timeout,
         })
@@ -553,6 +601,12 @@ impl HttpTransport {
     #[must_use]
     pub const fn tls_policy(&self) -> TlsPolicy {
         self.tls_policy
+    }
+
+    /// Returns the proxy policy in force.
+    #[must_use]
+    pub const fn proxy_policy(&self) -> &ProxyPolicy {
+        &self.proxy_policy
     }
 
     /// Sends a request and buffers the whole response.
@@ -790,13 +844,12 @@ impl Stream for CancellableChunks {
 /// Returns `true` when a URL targets the loopback interface.
 #[must_use]
 pub fn is_loopback(url: &Url) -> bool {
+    // Delegates so the plaintext-policy check and the never-proxy-loopback
+    // check can never disagree about what "loopback" means.
     match url.host() {
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => {
-            domain.eq_ignore_ascii_case("localhost")
-                || domain.to_ascii_lowercase().ends_with(".localhost")
-        }
+        Some(url::Host::Domain(domain)) => tls::is_loopback_host(domain),
         None => false,
     }
 }
