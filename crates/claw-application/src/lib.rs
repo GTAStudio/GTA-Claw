@@ -5,6 +5,8 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEvent};
 
+pub mod composition;
+
 /// Supplies native runtime identity without coupling the application to an OS.
 pub trait SystemProbe {
     /// Returns the native runtime identity.

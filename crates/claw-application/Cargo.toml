@@ -8,10 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+claw-domain.workspace = true
 claw-protocol.workspace = true
+secrecy = "=0.10.3"
+url = "=2.5.8"
 
 [dev-dependencies]
-claw-domain.workspace = true
+tokio = { version = "=1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true
