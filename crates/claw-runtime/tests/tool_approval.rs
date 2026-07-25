@@ -2,16 +2,19 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use claw_application::model::approval::{
-    ApprovalDecision, ApprovalOutcome, ApprovalScope, ApprovalVerdict, ApprovalWithdrawal,
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, ApprovalScope, ApprovalVerdict,
+    ApprovalWithdrawal,
 };
 use claw_application::model::ids::{ApprovalId, TurnId};
 use claw_application::model::message::ToolCall;
 use claw_application::model::session::SessionState;
+use claw_application::ports::approval::ApprovalPort;
 use claw_application::ports::tool::{ToolInvocation, ToolStatus};
+use claw_application::ports::{PortError, PortFuture};
 use claw_runtime::approval::{ApprovalBroker, ApprovalError, ApprovalTicket};
 use claw_runtime::command::{CommandError, OperatorScope, ScopeSet};
 use claw_runtime::runtime::{CommandOutcome, Runtime, RuntimeConfig, RuntimeError, RuntimePorts};
@@ -602,6 +605,10 @@ async fn answering_without_the_approvals_scope_is_refused() {
 /// path inside `request`, so the broker must retract the entry itself. Otherwise the request stays
 /// answerable forever and `resolve` would record an "always allow" memory for a call that no
 /// longer exists.
+///
+/// The dismissal must reach the adapter *during the drop*, not at the next shutdown: until it
+/// does, the prompt is still on the operator's screen and an abandoned request is indistinguishable
+/// from a slow one.
 #[tokio::test]
 async fn a_dropped_request_retracts_itself_and_is_still_reported_to_the_adapter() {
     let clock = FakeClock::new(0);
@@ -623,9 +630,24 @@ async fn a_dropped_request_retracts_itself_and_is_still_reported_to_the_adapter(
             .collect::<Vec<_>>(),
         vec![approval_id.clone()]
     );
+    assert_eq!(
+        approvals.records(),
+        vec![ApprovalRecord::Presented(approval_id.clone())],
+        "nothing is dismissed while the request is still live"
+    );
 
     // The waiter goes away without ever resolving the future.
     drop(waiting);
+
+    // No await, no shutdown, no executor turn: the dismissal is already delivered.
+    assert_eq!(
+        approvals.records(),
+        vec![
+            ApprovalRecord::Presented(approval_id.clone()),
+            ApprovalRecord::Abandoned(approval_id.clone()),
+        ],
+        "the adapter must be told inside the drop, not at the next shutdown"
+    );
 
     assert!(
         broker.outstanding().is_empty(),
@@ -639,7 +661,7 @@ async fn a_dropped_request_retracts_itself_and_is_still_reported_to_the_adapter(
     );
     assert_eq!(broker.remembered(&session("approvals"), "write_file"), None);
 
-    // `Drop` cannot run the asynchronous notification, so the adapter learns about it here.
+    // The broker keeps no orphan list, so a later shutdown adds nothing.
     broker
         .withdraw_all(ApprovalWithdrawal::Cancelled)
         .await
@@ -648,8 +670,140 @@ async fn a_dropped_request_retracts_itself_and_is_still_reported_to_the_adapter(
         approvals.records(),
         vec![
             ApprovalRecord::Presented(approval_id.clone()),
-            ApprovalRecord::Withdrawn(approval_id, ApprovalWithdrawal::Cancelled),
-        ]
+            ApprovalRecord::Abandoned(approval_id),
+        ],
+        "an abandoned request must not be dismissed a second time"
+    );
+}
+
+/// `request` registers nothing until it is first polled, so a future that is created and dropped
+/// without ever being polled must leave no trace at all — not even a dismissal for a request the
+/// adapter was never shown.
+#[tokio::test]
+async fn a_request_dropped_before_its_first_poll_leaves_no_trace() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let cancel = CancellationToken::new();
+
+    let waiting = broker.request(ticket("write_file"), &cancel);
+    drop(waiting);
+
+    assert_eq!(
+        approvals.records(),
+        Vec::new(),
+        "a never-polled request was never presented, so it must not be dismissed"
+    );
+    assert!(broker.outstanding().is_empty());
+}
+
+/// An adapter that calls straight back into the broker from `abandon`.
+///
+/// A surface dismissing a prompt will plausibly ask what is still outstanding in order to redraw
+/// itself. `abandon` runs inside `Drop`, which the broker reaches while it is mutating its own
+/// state, so this is only safe if the broker has released its lock first.
+struct ReentrantApprovals {
+    broker: Mutex<Option<ApprovalBroker>>,
+    observed: Mutex<Vec<usize>>,
+}
+
+impl ReentrantApprovals {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            broker: Mutex::new(None),
+            observed: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn attach(&self, broker: ApprovalBroker) {
+        *self.broker.lock().expect("the fixture mutex is healthy") = Some(broker);
+    }
+
+    /// How many requests the broker reported as outstanding during each `abandon` call.
+    fn observed(&self) -> Vec<usize> {
+        self.observed
+            .lock()
+            .expect("the fixture mutex is healthy")
+            .clone()
+    }
+}
+
+impl ApprovalPort for ReentrantApprovals {
+    fn present(&self, _request: ApprovalRequest) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn settle(&self, _approval_id: &ApprovalId) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn withdraw(
+        &self,
+        _approval_id: &ApprovalId,
+        _reason: ApprovalWithdrawal,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn abandon(&self, _approval_id: &ApprovalId) {
+        let broker = self.broker.lock().expect("the fixture mutex is healthy");
+        let outstanding = broker
+            .as_ref()
+            .expect("the broker is attached before any request")
+            .outstanding()
+            .len();
+        self.observed
+            .lock()
+            .expect("the fixture mutex is healthy")
+            .push(outstanding);
+    }
+}
+
+/// Regression: the broker must not hold its state lock while calling `abandon`.
+///
+/// The drop runs on a dedicated thread. A `std::sync::Mutex` deadlock blocks whichever thread
+/// hits it, so waiting for it on the test's own thread would hang — and so would a
+/// `tokio::time::timeout`, because the executor driving that timeout is the very thread that is
+/// stuck. Only an out-of-band wait can turn this regression into a failure instead of a hang.
+#[test]
+fn abandoning_a_request_does_not_hold_the_broker_lock() {
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async move {
+            let clock = FakeClock::new(0);
+            let approvals = ReentrantApprovals::new();
+            let broker = ApprovalBroker::new(
+                Arc::clone(&approvals) as Arc<_>,
+                Arc::clone(&clock) as Arc<_>,
+                Duration::from_secs(30),
+            );
+            approvals.attach(broker.clone());
+            let cancel = CancellationToken::new();
+
+            let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+            assert!(
+                support::poll_once(&mut waiting).is_pending(),
+                "an unanswered request must park"
+            );
+
+            drop(waiting);
+            let _ = sender.send(approvals.observed());
+        });
+    });
+
+    let observed = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("dropping the request deadlocked against the broker's own lock");
+    assert_eq!(
+        observed,
+        vec![0],
+        "the entry must already be removed when the adapter is called, so the surface never sees \
+         a request it has just been told is gone"
     );
 }
 

@@ -137,6 +137,13 @@ pub struct ApprovalRequest {
 }
 
 /// Why an approval request stopped being outstanding without an operator decision.
+///
+/// Abandonment is deliberately *not* a variant here. A dropped waiter never returns an outcome,
+/// so `Withdrawn { reason: Abandoned }` would be an unreachable state that every match arm would
+/// still have to handle. Abandonment is signalled by [`ApprovalPort::abandon`] being a distinct
+/// method, which distinguishes it at the type level rather than by a value a caller must inspect.
+///
+/// [`ApprovalPort::abandon`]: crate::ports::approval::ApprovalPort::abandon
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ApprovalWithdrawal {
     /// The deadline passed.

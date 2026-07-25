@@ -495,6 +495,8 @@ pub(crate) enum ApprovalRecord {
     Settled(ApprovalId),
     /// A request was taken back.
     Withdrawn(ApprovalId, ApprovalWithdrawal),
+    /// A request was dismissed synchronously because its waiter was dropped.
+    Abandoned(ApprovalId),
 }
 
 /// An [`ApprovalPort`] that records every notification.
@@ -533,6 +535,10 @@ impl ApprovalPort for RecordingApprovals {
     ) -> PortFuture<'_, Result<(), PortError>> {
         guard(&self.records).push(ApprovalRecord::Withdrawn(approval_id.clone(), reason));
         Box::pin(async move { Ok(()) })
+    }
+
+    fn abandon(&self, approval_id: &ApprovalId) {
+        guard(&self.records).push(ApprovalRecord::Abandoned(approval_id.clone()));
     }
 }
 

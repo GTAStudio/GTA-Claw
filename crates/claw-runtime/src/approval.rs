@@ -78,7 +78,6 @@ struct Pending {
 struct BrokerState {
     pending: HashMap<ApprovalId, Pending>,
     remembered: HashMap<(String, String), ApprovalDecision>,
-    abandoned: Vec<ApprovalId>,
     next_id: u64,
 }
 
@@ -95,11 +94,13 @@ fn lock_state(state: &Mutex<BrokerState>) -> std::sync::MutexGuard<'_, BrokerSta
 /// still be listed by [`ApprovalBroker::outstanding`], and [`ApprovalBroker::resolve`] would
 /// accept it and record an "always allow" memory for a tool call that no longer exists.
 ///
-/// [`Drop`] cannot run the asynchronous [`ApprovalPort::withdraw`] notification, so the guard
-/// records the identifier in `abandoned` and [`ApprovalBroker::withdraw_all`] tells the adapter
-/// about it. `request` disarms the guard on every path that removes the entry deliberately.
+/// The retraction and the notification both happen here, synchronously. [`Drop`] cannot await, so
+/// an invariant whose only enforcement is asynchronous is unenforced under cancellation; that is
+/// why [`ApprovalPort::abandon`] is not a future. `request` disarms the guard on every path that
+/// removes the entry deliberately.
 struct PendingGuard {
     state: Arc<Mutex<BrokerState>>,
+    approvals: Arc<dyn ApprovalPort>,
     approval_id: ApprovalId,
     armed: bool,
 }
@@ -116,9 +117,14 @@ impl Drop for PendingGuard {
         if !self.armed {
             return;
         }
-        let mut state = lock_state(&self.state);
-        if state.pending.remove(&self.approval_id).is_some() {
-            state.abandoned.push(self.approval_id.clone());
+        // The lock is released before the port is called: `abandon` is arbitrary adapter code and
+        // may re-enter the broker, which would deadlock this non-reentrant mutex.
+        let removed = {
+            let mut state = lock_state(&self.state);
+            state.pending.remove(&self.approval_id).is_some()
+        };
+        if removed {
+            self.approvals.abandon(&self.approval_id);
         }
     }
 }
@@ -232,9 +238,9 @@ impl ApprovalBroker {
 
     /// Withdraws every outstanding request, waking each waiter with `reason`.
     ///
-    /// Requests whose waiter was dropped rather than cancelled are retracted from the broker at
-    /// drop time but cannot be reported to the adapter from a synchronous [`Drop`]; they are
-    /// notified here as well, so no presented request is left un-dismissed after a shutdown.
+    /// Abandoned requests are not reported here: [`PendingGuard`] retracts and dismisses them
+    /// synchronously at drop time, so by the time this runs they are already gone. Nothing is
+    /// accumulated between a drop and a shutdown, which is why the broker keeps no orphan list.
     ///
     /// # Errors
     ///
@@ -243,9 +249,8 @@ impl ApprovalBroker {
     pub async fn withdraw_all(&self, reason: ApprovalWithdrawal) -> Result<(), ApprovalError> {
         let drained: Vec<ApprovalId> = {
             let mut state = self.lock();
-            let mut ids: Vec<ApprovalId> = state.pending.keys().cloned().collect();
+            let ids: Vec<ApprovalId> = state.pending.keys().cloned().collect();
             state.pending.clear();
-            ids.append(&mut state.abandoned);
             ids
         };
 
@@ -267,8 +272,9 @@ impl ApprovalBroker {
     /// presented through [`ApprovalPort`] and the call waits until an operator answers, the
     /// clock passes the deadline, or `cancel` fires.
     ///
-    /// Dropping the returned future retracts the request from the broker, so an abandoned waiter
-    /// cannot leave a resolvable entry behind.
+    /// Dropping the returned future retracts the request from the broker and dismisses it through
+    /// [`ApprovalPort::abandon`] before the drop returns, so an abandoned waiter can neither leave
+    /// a resolvable entry behind nor leave a prompt on an operator's screen.
     ///
     /// # Errors
     ///
@@ -320,6 +326,7 @@ impl ApprovalBroker {
         // Armed for exactly the window in which this future owns the pending entry.
         let mut guard = PendingGuard {
             state: Arc::clone(&self.state),
+            approvals: Arc::clone(&self.approvals),
             approval_id: approval_id.clone(),
             armed: true,
         };
@@ -394,4 +401,6 @@ impl ApprovalPort for SilentApprovalPort {
     ) -> PortFuture<'_, Result<(), PortError>> {
         Box::pin(std::future::ready(Ok(())))
     }
+
+    fn abandon(&self, _approval_id: &ApprovalId) {}
 }
