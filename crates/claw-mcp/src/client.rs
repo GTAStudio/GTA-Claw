@@ -394,7 +394,7 @@ impl McpClient {
         });
         let io = BoundedIoTransport::with_max_frame_bytes(stdout, stdin, config.max_frame_bytes);
         let diagnostics = io.diagnostics();
-        let service = connect_transport(
+        let service = match connect_transport(
             ChildTreeTransport {
                 io,
                 child: Some(child),
@@ -403,7 +403,10 @@ impl McpClient {
             GtaClientHandler { sampling, events },
         )
         .await
-        .map_err(|error| diagnostics.protocol_error().unwrap_or(error))?;
+        {
+            Ok(service) => service,
+            Err(error) => return Err(diagnostics.promote_after_disconnect(error).await),
+        };
         Ok(Self {
             service,
             request_timeout: config.request_timeout,

@@ -28,6 +28,8 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BoundedIoDiagnostics {
     protocol_failure: Arc<Mutex<Option<String>>>,
+    transport_disconnected: CancellationToken,
+    reader_finished: CancellationToken,
 }
 
 impl BoundedIoDiagnostics {
@@ -62,6 +64,13 @@ impl BoundedIoDiagnostics {
             .expect("bounded stdio diagnostics lock poisoned")
             .clone()
             .map(McpError::Protocol)
+    }
+
+    pub(crate) async fn promote_after_disconnect(&self, error: McpError) -> McpError {
+        if self.transport_disconnected.is_cancelled() {
+            self.reader_finished.cancelled().await;
+        }
+        self.protocol_error().unwrap_or(error)
     }
 }
 
@@ -179,15 +188,19 @@ where
         let (read_tx, reads) = mpsc::channel(32);
         let diagnostics = BoundedIoDiagnostics::default();
         let reader_diagnostics = diagnostics.clone();
-        let disconnected = CancellationToken::new();
+        let disconnected = diagnostics.transport_disconnected.clone();
         let reader_disconnected = disconnected.clone();
+        let reader_finished = diagnostics.reader_finished.clone();
+        let reader_finished_guard = reader_finished.drop_guard();
         let reader = tokio::spawn(async move {
+            let _reader_finished = reader_finished_guard;
             let mut decoder = JsonLineDecoder::new(max_frame_bytes);
             let mut bytes = [0_u8; 16 * 1024];
             loop {
                 let count = tokio::select! {
-                    _ = reader_disconnected.cancelled() => return Ok(()),
+                    biased;
                     result = input.read(&mut bytes) => result?,
+                    _ = reader_disconnected.cancelled() => return Ok(()),
                 };
                 if count == 0 {
                     if let Err(error) = decoder.finish() {
@@ -203,6 +216,9 @@ where
                         return Err(protocol_io_error(error));
                     }
                 };
+                if reader_disconnected.is_cancelled() {
+                    return Ok(());
+                }
                 for value in values {
                     let message = match serde_json::from_value(value) {
                         Ok(message) => message,
@@ -363,7 +379,7 @@ mod tests {
         time::{Duration, timeout},
     };
 
-    use super::{BoundedIoTransport, JsonLineDecoder, encode};
+    use super::{BoundedIoTransport, JsonLineDecoder, McpError, encode};
 
     #[test]
     fn split_frame_is_reassembled_byte_for_byte() {
@@ -506,5 +522,56 @@ mod tests {
             next.is_none(),
             "transport must not receive work after writer failure"
         );
+    }
+
+    #[tokio::test]
+    async fn buffered_protocol_diagnosis_wins_over_writer_failure() {
+        let (mut peer_input, transport_input) = duplex(1024);
+        let (transport_output, peer_output) = duplex(1024);
+        drop(peer_output);
+        let mut transport =
+            BoundedIoTransport::<RoleServer>::new(transport_input, transport_output);
+        let diagnostics = transport.diagnostics();
+        peer_input
+            .write_all(b"{not-json}\n")
+            .await
+            .expect("write malformed peer frame");
+        let response: TxJsonRpcMessage<RoleServer> = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": []}
+        }))
+        .expect("valid server response");
+        let writer_error = transport
+            .send(response)
+            .await
+            .expect_err("closed peer read half must fail the writer");
+
+        let error = diagnostics
+            .promote_after_disconnect(McpError::Io(writer_error))
+            .await;
+
+        assert_eq!(
+            error.to_string(),
+            "MCP protocol violation: stdio frame contains invalid JSON: key must be a string at line 1 column 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_abort_before_first_poll_reports_completion() {
+        let (_peer_input, transport_input) = duplex(1024);
+        let (transport_output, _peer_output) = duplex(1024);
+        let transport = BoundedIoTransport::<RoleServer>::new(transport_input, transport_output);
+        let diagnostics = transport.diagnostics();
+        diagnostics.transport_disconnected.cancel();
+
+        drop(transport);
+
+        timeout(
+            Duration::from_secs(1),
+            diagnostics.reader_finished.cancelled(),
+        )
+        .await
+        .expect("aborted reader must report completion");
     }
 }
