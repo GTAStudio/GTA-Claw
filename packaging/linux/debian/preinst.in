@@ -75,6 +75,22 @@ restore_marker() {
   fi
 }
 
+read_enable_state() {
+  enable_state=
+  if enable_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+    :
+  fi
+  case "$enable_state" in
+    enabled | enabled-runtime | disabled | indirect | static | generated | transient | \
+      masked | masked-runtime | not-found | '') ;;
+    *) {
+      echo "unexpected gta-claw enablement state: $enable_state" >&2
+      return 1
+    } ;;
+  esac
+  printf '%s\n' "$enable_state"
+}
+
 lock_holder_pid() {
   if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
     echo "gta-claw writer-lock ownership could not be inspected" >&2
@@ -191,7 +207,7 @@ restore_preinst_failure() {
           fence_rollback_failure
         restore_marker "$ready" "$had_ready" || fence_rollback_failure
       fi
-      restored_enable_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
+      restored_enable_state="$(read_enable_state)"
       [ "$restored_enable_state" = "$old_enable_state" ] ||
         fence_rollback_failure
     fi
@@ -299,7 +315,7 @@ case "$1" in
       if [ -e "$runtime_directory" ]; then
         had_runtime_directory=1
       fi
-      old_enable_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)"
+      old_enable_state="$(read_enable_state)"
       trap restore_preinst_failure 0 HUP INT TERM
       runtime_touched=1
       ensure_failure_fence
