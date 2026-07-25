@@ -803,6 +803,8 @@ enum RustToken {
     CloseParen,
     ColonColon,
     Semi,
+    Literal,
+    Other,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -848,15 +850,21 @@ fn declares_in_items(
             break;
         }
         index = skip_visibility(tokens, index, end);
-        while matches!(
-            tokens.get(index),
-            Some(RustToken::Ident(value))
-                if matches!(
-                    value.as_str(),
-                    "async" | "const" | "default" | "extern" | "unsafe"
-                )
-        ) {
-            index += 1;
+        loop {
+            match tokens.get(index) {
+                Some(RustToken::Ident(value)) if value == "extern" => {
+                    index += 1;
+                    if tokens.get(index) == Some(&RustToken::Literal) {
+                        index += 1;
+                    }
+                }
+                Some(RustToken::Ident(value))
+                    if matches!(value.as_str(), "async" | "const" | "default" | "unsafe") =>
+                {
+                    index += 1;
+                }
+                _ => break,
+            }
         }
         match (tokens.get(index), tokens.get(index + 1)) {
             (Some(RustToken::Ident(keyword)), Some(RustToken::Ident(name))) if keyword == "mod" => {
@@ -935,40 +943,30 @@ fn attributes_declare_enabled_test(attributes: &[RustAttribute]) -> bool {
             .last()
             .is_some_and(|segment| segment == "test")
     });
-    let ignored = attributes.iter().any(|attribute| {
-        attribute
-            .path
-            .first()
-            .is_some_and(|segment| segment == "ignore")
-    });
-    let cfg_gated = attributes.iter().any(|attribute| {
-        attribute
-            .path
-            .first()
-            .is_some_and(|segment| matches!(segment.as_str(), "cfg" | "cfg_attr"))
-    });
-    has_test && !ignored && !cfg_gated
+    has_test && attributes.iter().all(attribute_enables_tests)
 }
 
 fn module_attributes_enable_tests(attributes: &[RustAttribute]) -> bool {
-    attributes.iter().all(|attribute| {
-        let Some(first) = attribute.path.first() else {
-            return true;
-        };
-        if first == "ignore" || first == "cfg_attr" {
-            return false;
-        }
-        if first != "cfg" {
-            return true;
-        }
-        attribute.tokens.as_slice()
-            == [
-                RustToken::Ident("cfg".to_owned()),
-                RustToken::OpenParen,
-                RustToken::Ident("test".to_owned()),
-                RustToken::CloseParen,
-            ]
-    })
+    attributes.iter().all(attribute_enables_tests)
+}
+
+fn attribute_enables_tests(attribute: &RustAttribute) -> bool {
+    let Some(first) = attribute.path.first() else {
+        return true;
+    };
+    if first == "ignore" || first == "cfg_attr" {
+        return false;
+    }
+    if first != "cfg" {
+        return true;
+    }
+    attribute.tokens.as_slice()
+        == [
+            RustToken::Ident("cfg".to_owned()),
+            RustToken::OpenParen,
+            RustToken::Ident("test".to_owned()),
+            RustToken::CloseParen,
+        ]
 }
 
 fn test_identity_matches(modules: &[String], function: &str, target: &[&str]) -> bool {
@@ -994,7 +992,24 @@ fn skip_visibility(tokens: &[RustToken], mut index: usize, end: usize) -> usize 
 }
 
 fn skip_item(tokens: &[RustToken], mut index: usize, end: usize) -> usize {
+    let item_start = index;
     while index < end {
+        if matches!(tokens.get(index), Some(RustToken::Ident(_)))
+            && tokens.get(index + 1) == Some(&RustToken::Bang)
+        {
+            let Some(after_macro) = macro_invocation_end(tokens, index, end) else {
+                return end;
+            };
+            let macro_is_item = macro_item_prefix(tokens, item_start, index);
+            index = after_macro;
+            if macro_is_item {
+                if tokens.get(index) == Some(&RustToken::Semi) {
+                    index += 1;
+                }
+                return index;
+            }
+            continue;
+        }
         match &tokens[index] {
             RustToken::Semi => return index + 1,
             RustToken::OpenBrace => {
@@ -1008,20 +1023,61 @@ fn skip_item(tokens: &[RustToken], mut index: usize, end: usize) -> usize {
     end
 }
 
+fn macro_invocation_end(tokens: &[RustToken], index: usize, end: usize) -> Option<usize> {
+    if !matches!(tokens.get(index), Some(RustToken::Ident(_)))
+        || tokens.get(index + 1) != Some(&RustToken::Bang)
+    {
+        return None;
+    }
+    let mut open = index + 2;
+    if matches!(tokens.get(index), Some(RustToken::Ident(name)) if name == "macro_rules")
+        && matches!(tokens.get(open), Some(RustToken::Ident(_)))
+    {
+        open += 1;
+    }
+    if !matches!(
+        tokens.get(open),
+        Some(RustToken::OpenBracket | RustToken::OpenBrace | RustToken::OpenParen)
+    ) {
+        return None;
+    }
+    matching_delimiter(tokens, open, end).map(|close| close + 1)
+}
+
+fn macro_item_prefix(tokens: &[RustToken], start: usize, macro_name: usize) -> bool {
+    let mut prefix = &tokens[start..=macro_name];
+    if prefix.first() == Some(&RustToken::ColonColon) {
+        prefix = &prefix[1..];
+    }
+    !prefix.is_empty()
+        && prefix.iter().enumerate().all(|(offset, token)| {
+            if offset % 2 == 0 {
+                matches!(token, RustToken::Ident(_))
+            } else {
+                token == &RustToken::ColonColon
+            }
+        })
+}
+
 fn matching_delimiter(tokens: &[RustToken], open: usize, end: usize) -> Option<usize> {
-    let (opening, closing) = match tokens.get(open)? {
-        RustToken::OpenBracket => (RustToken::OpenBracket, RustToken::CloseBracket),
-        RustToken::OpenBrace => (RustToken::OpenBrace, RustToken::CloseBrace),
-        RustToken::OpenParen => (RustToken::OpenParen, RustToken::CloseParen),
-        _ => return None,
-    };
-    let mut depth = 0_usize;
+    let mut expected = Vec::new();
     for (index, token) in tokens.iter().enumerate().take(end).skip(open) {
-        if token == &opening {
-            depth += 1;
-        } else if token == &closing {
-            depth -= 1;
-            if depth == 0 {
+        let closing = match token {
+            RustToken::OpenBracket => Some(RustToken::CloseBracket),
+            RustToken::OpenBrace => Some(RustToken::CloseBrace),
+            RustToken::OpenParen => Some(RustToken::CloseParen),
+            _ => None,
+        };
+        if let Some(closing) = closing {
+            expected.push(closing);
+        } else if matches!(
+            token,
+            RustToken::CloseBracket | RustToken::CloseBrace | RustToken::CloseParen
+        ) {
+            if expected.pop().as_ref() != Some(token) {
+                return None;
+            }
+            if expected.is_empty() {
                 return Some(index);
             }
         }
@@ -1034,7 +1090,9 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
     let mut tokens = Vec::new();
     let mut index = 0_usize;
     while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
+        if bytes.get(index..index + 3) == Some(&[0xef, 0xbb, 0xbf]) {
+            index += 3;
+        } else if bytes[index].is_ascii_whitespace() {
             index += 1;
         } else if bytes.get(index..index + 2) == Some(b"//") {
             index += 2;
@@ -1044,10 +1102,12 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
         } else if bytes.get(index..index + 2) == Some(b"/*") {
             index = skip_block_comment(bytes, index);
         } else if let Some(end) = raw_string_end(bytes, index) {
+            tokens.push(RustToken::Literal);
             index = end;
         } else if bytes[index] == b'"'
             || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"'))
         {
+            tokens.push(RustToken::Literal);
             let quote = if bytes[index] == b'"' {
                 index
             } else {
@@ -1055,14 +1115,26 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
             };
             index = quoted_end(bytes, quote, b'"');
         } else if bytes[index] == b'\'' {
+            tokens.push(RustToken::Literal);
             index = char_literal_end(bytes, index).unwrap_or(index + 1);
-        } else if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+        } else if bytes[index].is_ascii_alphabetic()
+            || bytes[index] == b'_'
+            || !bytes[index].is_ascii()
+        {
             let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-            {
-                index += 1;
+            index += if bytes[index].is_ascii() {
+                1
+            } else {
+                source[index..].chars().next().map_or(1, char::len_utf8)
+            };
+            while index < bytes.len() {
+                if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
+                    index += 1;
+                } else if !bytes[index].is_ascii() {
+                    index += source[index..].chars().next().map_or(1, char::len_utf8);
+                } else {
+                    break;
+                }
             }
             tokens.push(RustToken::Ident(source[start..index].to_owned()));
         } else {
@@ -1080,7 +1152,7 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
                     tokens.push(RustToken::ColonColon);
                     index += 1;
                 }
-                _ => {}
+                _ => tokens.push(RustToken::Other),
             }
             index += 1;
         }
@@ -1165,13 +1237,119 @@ fn char_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use serde::Deserialize;
+
     use super::declares_enabled_test;
+
+    static NEXT_COMPILER_ORACLE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Deserialize)]
+    struct SharedOracleCorpus {
+        cases: Vec<SharedOracleCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct SharedOracleCase {
+        name: String,
+        source: String,
+        test: String,
+        expected: bool,
+    }
+
+    struct CompilerOracleFixture {
+        root: PathBuf,
+    }
+
+    impl CompilerOracleFixture {
+        fn new(source: &str) -> Self {
+            let root = env::temp_dir().join(format!(
+                "claw-conformance-compiler-oracle-{}-{}",
+                std::process::id(),
+                NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let tests = root.join("tests");
+            fs::create_dir_all(&tests).expect("create compiler oracle fixture");
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\n\
+                 name = \"claw-conformance-compiler-oracle\"\n\
+                 version = \"0.0.0\"\n\
+                 edition = \"2024\"\n\n\
+                 [[test]]\n\
+                 name = \"oracle\"\n\
+                 path = \"tests/oracle.rs\"\n",
+            )
+            .expect("write compiler oracle manifest");
+            fs::write(tests.join("oracle.rs"), source).expect("write compiler oracle source");
+            Self { root }
+        }
+
+        fn cargo_test_list(&self, ignored_only: bool) -> BTreeSet<String> {
+            let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut command = Command::new(cargo);
+            command
+                .current_dir(&self.root)
+                .env("CARGO_TARGET_DIR", self.root.join("target"))
+                .args([
+                    "test",
+                    "--offline",
+                    "--quiet",
+                    "--manifest-path",
+                    "Cargo.toml",
+                    "--test",
+                    "oracle",
+                    "--",
+                    "--list",
+                    "--format",
+                    "terse",
+                ]);
+            if ignored_only {
+                command.arg("--ignored");
+            }
+            let output = command.output().expect("run compiler oracle");
+            assert_command_succeeded(&output);
+            String::from_utf8(output.stdout)
+                .expect("compiler oracle output is UTF-8")
+                .lines()
+                .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+                .collect()
+        }
+    }
+
+    impl Drop for CompilerOracleFixture {
+        fn drop(&mut self) {
+            if self.root.exists() {
+                fs::remove_dir_all(&self.root).expect("remove compiler oracle fixture");
+            }
+        }
+    }
+
+    fn assert_command_succeeded(output: &Output) {
+        assert!(
+            output.status.success(),
+            "compiler oracle failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn evidence_requires_an_enabled_test_declaration() {
         let cases = [
             ("#[test]\nfn exact_name() {}", true),
             ("#[tokio::test]\nasync fn exact_name() {}", true),
+            ("#[cfg(test)]\n#[test]\nfn exact_name() {}", true),
+            (
+                "#[cfg(test = \"disabled\")]\n#[test]\nfn exact_name() {}",
+                false,
+            ),
             ("#[test]\n#[ignore]\nfn exact_name() {}", false),
             (
                 "#[test]\n#[cfg(target_os = \"none\")]\nfn exact_name() {}",
@@ -1240,5 +1418,111 @@ mod tests {
         assert!(!declares_enabled_test(string_literal, "exact_name"));
         let raw_string = "const SOURCE: &str = r#\"#[test] fn exact_name() {}\"#;";
         assert!(!declares_enabled_test(raw_string, "exact_name"));
+        let macro_tokens = "const _D: &str = stringify!({} #[test] fn forged_evidence_test() {});";
+        assert!(!declares_enabled_test(macro_tokens, "forged_evidence_test"));
+        let malformed_macro = "m!([); #[test] fn forged_evidence_test() {}])";
+        assert!(!declares_enabled_test(
+            malformed_macro,
+            "forged_evidence_test"
+        ));
+    }
+
+    #[test]
+    fn cargo_test_listing_matches_enabled_test_detector() {
+        let source = concat!(
+            r#"
+const _FORGED: &str = stringify!({} #[test] fn forged_evidence_test() {});
+const _FORGED_BRACE: &str = stringify! { #[test] fn forged_brace_test() {} };
+const _FORGED_BRACKET: &str = stringify![#[test] fn forged_bracket_test() {}];
+
+macro_rules! discard {
+    ($($tokens:tt)*) => {};
+}
+discard! {
+    #[test]
+    fn discarded_macro_test() {}
+}
+
+macro_rules! dormant {
+    () => {
+        #[test]
+        fn macro_definition_test() {}
+    };
+}
+"#,
+            "macro_rules! \u{5b8f} { ($($tokens:tt)*) => {}; }\n",
+            "\u{5b8f}!(const _: () = (); #[test] fn unicode_macro_test() {});\n",
+            r#"
+::std::thread_local! { static ABSOLUTE_MACRO_VALUE: u32 = 1; }
+
+#[test]
+fn after_absolute_macro() {}
+
+#[test]
+fn direct_test() {}
+
+#[cfg(test)]
+#[test]
+fn cfg_test_function() {}
+
+#[cfg(test = "disabled")]
+#[test]
+fn cfg_key_value_test() {}
+
+#[test]
+#[ignore]
+fn ignored_test() {}
+
+mod nested {
+    #[test]
+    fn nested_test() {}
+}
+"#
+        );
+        let fixture = CompilerOracleFixture::new(source);
+        let listed = fixture.cargo_test_list(false);
+        let ignored = fixture.cargo_test_list(true);
+        let enabled = listed
+            .difference(&ignored)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let identities = [
+            "forged_evidence_test",
+            "forged_brace_test",
+            "forged_bracket_test",
+            "discarded_macro_test",
+            "macro_definition_test",
+            "unicode_macro_test",
+            "after_absolute_macro",
+            "direct_test",
+            "cfg_test_function",
+            "cfg_key_value_test",
+            "ignored_test",
+            "nested::nested_test",
+        ];
+        for identity in identities {
+            assert_eq!(
+                declares_enabled_test(source, identity),
+                enabled.contains(identity),
+                "detector diverged from Cargo for {identity}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_enabled_test_oracle_corpus_matches() {
+        let corpus: SharedOracleCorpus = serde_json::from_str(include_str!(
+            "../../../compat/upstream/enabled-test-oracle.json"
+        ))
+        .expect("parse shared enabled-test oracle");
+        assert_eq!(corpus.cases.len(), 85);
+        for case in corpus.cases {
+            assert_eq!(
+                declares_enabled_test(&case.source, &case.test),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
     }
 }

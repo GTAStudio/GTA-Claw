@@ -562,6 +562,141 @@ fn orphan_source_file_cannot_supply_acceptance_evidence() {
 }
 
 #[test]
+fn macro_tokens_cannot_forge_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("tests")
+        .join("protocol.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "const _D: &str = stringify!({} #[test] fn forged_evidence_test() {});\n",
+    )
+    .expect("write macro-token forgery");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "forged_evidence_test")],
+        ))
+        .expect("register forged claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("macro tokens must not count as acceptance evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'forged_evidence_test' is not declared in \
+         'crates/demo/tests/protocol.rs'"
+    );
+}
+
+#[test]
+fn unicode_macro_tokens_cannot_forge_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("tests")
+        .join("protocol.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        concat!(
+            "macro_rules! \u{5b8f} { ($($tokens:tt)*) => {}; }\n",
+            "\u{5b8f}!(const _: () = (); #[test] fn forged_evidence_test() {});\n"
+        ),
+    )
+    .expect("write Unicode macro-token forgery");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "forged_evidence_test")],
+        ))
+        .expect("register Unicode macro forged claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("Unicode macro tokens must not count as acceptance evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'forged_evidence_test' is not declared in \
+         'crates/demo/tests/protocol.rs'"
+    );
+}
+
+#[test]
+fn malformed_macro_delimiters_cannot_forge_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("tests")
+        .join("protocol.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "m!([); #[test] fn forged_evidence_test() {}])\n",
+    )
+    .expect("write malformed macro forgery");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "forged_evidence_test")],
+        ))
+        .expect("register malformed forged claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("mismatched macro delimiters must fail closed");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'forged_evidence_test' is not declared in \
+         'crates/demo/tests/protocol.rs'"
+    );
+}
+
+#[test]
+fn cfg_key_value_cannot_forge_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("tests")
+        .join("protocol.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[cfg(test = \"disabled\")]\n#[test]\nfn forged_evidence_test() {}\n",
+    )
+    .expect("write disabled cfg evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "forged_evidence_test")],
+        ))
+        .expect("register fabricated claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("disabled cfg test must not count as acceptance evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'forged_evidence_test' is not declared in \
+         'crates/demo/tests/protocol.rs'"
+    );
+}
+
+#[test]
 fn cargo_target_disabled_for_testing_cannot_supply_acceptance_evidence() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
     let fixture = Fixture::empty();
