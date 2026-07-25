@@ -5,6 +5,8 @@
 //! platform declarations and an Apple-granted multicast entitlement. Those mobile
 //! capabilities cannot be established by this pure-Rust crate, so mobile targets
 //! retain signed-record parsing and verification without exposing network discovery.
+//! Desktop runtimes consume an [`MdnsCapability`] minted only after an active IPv4
+//! multicast query/response observation; daemon allocation alone never implies availability.
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::collections::HashMap;
@@ -13,7 +15,11 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::net::IpAddr;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-use std::time::Duration;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -22,16 +28,18 @@ use claw_security::identity::{
     DeviceId, DeviceIdentity, DevicePublicKey, DeviceSignature, HandshakeSigningInput,
 };
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-use flume::RecvTimeoutError;
+use flume::{RecvError, RecvTimeoutError, Selector, TryRecvError};
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use hickory_resolver::TokioResolver;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use hickory_resolver::proto::rr::{RData, RecordType};
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use mdns_sd::{
-    DaemonEvent, Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo,
+    DaemonEvent, MDNS_PORT, Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo,
     UnregisterStatus,
 };
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::identity::{NodeClientKind, NodeIdentity, admit_protocol};
 
@@ -50,6 +58,18 @@ const TXT_SIGNATURE: &str = "signature";
 const TXT_SIGNED_AT: &str = "signedAt";
 const MAX_INSTANCE_BYTES: usize = 63;
 const MAX_TXT_ENTRY_BYTES: usize = 255;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+const MDNS_CAPABILITY_PROBE_TYPE: &str = "_gtaclaw-probe._udp.local.";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+const MAX_MDNS_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+const MDNS_RUNTIME_START_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+const MDNS_MULTICAST_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+static MDNS_CAPABILITY_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Parameters mirrored from the pinned OpenClaw Bonjour advertiser.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -622,6 +642,362 @@ pub fn resolve_wide_area_fixture(
     .verify(now_unix_millis, signature_window_millis)
 }
 
+/// Proof that the local runtime observed bidirectional IPv4 mDNS multicast traffic.
+///
+/// The capability owns the already-probed daemon and cannot be constructed directly.
+/// It is consumed when a browser or advertiser starts, so a successful daemon allocation
+/// alone is never reported as discovery availability.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+pub struct MdnsCapability {
+    daemon: ServiceDaemon,
+    monitor: Receiver<DaemonEvent>,
+    activation_timeout: Duration,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+impl MdnsCapability {
+    /// Observes an IPv4 multicast query and response before minting a runtime capability.
+    pub fn observe(timeout: Duration) -> Result<Self, DnsSdError> {
+        if timeout.is_zero() || timeout > MAX_MDNS_CAPABILITY_PROBE_TIMEOUT {
+            return Err(DnsSdError::InvalidCapabilityProbeTimeout);
+        }
+
+        let responder = ServiceDaemon::new().map_err(DnsSdError::Mdns)?;
+        let monitor = match responder.monitor() {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                let operation = DnsSdError::Mdns(error);
+                let cleanup = shutdown_daemon(&responder, probe_cleanup_timeout(timeout));
+                return Err(combine_probe_error(operation, cleanup));
+            }
+        };
+
+        match probe_daemon(&responder, &monitor, timeout) {
+            Ok(()) => Ok(Self {
+                daemon: responder,
+                monitor,
+                activation_timeout: timeout,
+            }),
+            Err(operation) => {
+                let cleanup = shutdown_daemon(&responder, probe_cleanup_timeout(timeout));
+                Err(combine_probe_error(operation, cleanup))
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn probe_daemon(
+    responder: &ServiceDaemon,
+    monitor: &Receiver<DaemonEvent>,
+    timeout: Duration,
+) -> Result<(), DnsSdError> {
+    discard_probe_events(monitor)?;
+    let interface = probe_ipv4_interface()?;
+    let service = capability_probe_service(interface)?;
+    let fullname = service.get_fullname().to_owned();
+    responder.register(service).map_err(DnsSdError::Mdns)?;
+
+    let observation = observe_multicast_response(monitor, interface, timeout);
+    let cleanup = withdraw_probe(responder, &fullname, probe_cleanup_timeout(timeout));
+    match (observation, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(operation), cleanup) => Err(combine_probe_error(operation, cleanup)),
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn capability_probe_service(interface: Ipv4Addr) -> Result<ServiceInfo, DnsSdError> {
+    let (instance, host) = capability_probe_names(interface);
+    let mut service = ServiceInfo::new(
+        MDNS_CAPABILITY_PROBE_TYPE,
+        &instance,
+        &host,
+        &[IpAddr::V4(interface)] as &[IpAddr],
+        9,
+        None::<HashMap<String, String>>,
+    )
+    .map_err(DnsSdError::Mdns)?;
+    // This private, unique probe record is never product identity. Waiting for the normal
+    // three-packet uniqueness sequence would measure name probing rather than multicast.
+    service.set_requires_probe(false);
+    Ok(service)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn capability_probe_names(interface: Ipv4Addr) -> (String, String) {
+    let sequence = MDNS_CAPABILITY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!(
+        "{:08x}-{}-{sequence}",
+        u32::from(interface),
+        std::process::id()
+    );
+    (
+        format!("GTA-Claw capability {suffix}"),
+        format!("gta-claw-capability-{suffix}.local."),
+    )
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn probe_cleanup_timeout(observation_timeout: Duration) -> Duration {
+    observation_timeout.min(MDNS_RUNTIME_START_CLEANUP_TIMEOUT)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn probe_ipv4_interface() -> Result<Ipv4Addr, DnsSdError> {
+    let route_probe =
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(DnsSdError::MulticastProbeIo)?;
+    route_probe
+        .connect((Ipv4Addr::new(192, 0, 2, 1), 9))
+        .map_err(|_| DnsSdError::MulticastUnavailable(MdnsUnavailableReason::NoUsableInterface))?;
+    match route_probe
+        .local_addr()
+        .map_err(|_| DnsSdError::MulticastUnavailable(MdnsUnavailableReason::NoUsableInterface))?
+        .ip()
+    {
+        IpAddr::V4(address) if !address.is_loopback() && !address.is_unspecified() => Ok(address),
+        _ => Err(DnsSdError::MulticastUnavailable(
+            MdnsUnavailableReason::NoUsableInterface,
+        )),
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn probe_socket(interface: Ipv4Addr) -> Result<UdpSocket, DnsSdError> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(DnsSdError::MulticastProbeIo)?;
+    socket
+        .set_reuse_address(true)
+        .map_err(DnsSdError::MulticastProbeIo)?;
+    #[cfg(unix)]
+    socket
+        .set_reuse_port(true)
+        .map_err(DnsSdError::MulticastProbeIo)?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT).into())
+        .map_err(DnsSdError::MulticastProbeIo)?;
+    socket
+        .set_multicast_if_v4(&interface)
+        .map_err(DnsSdError::MulticastProbeIo)?;
+    socket
+        .set_multicast_loop_v4(true)
+        .map_err(DnsSdError::MulticastProbeIo)?;
+    Ok(socket.into())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn ptr_query(service_type: &str) -> Result<Vec<u8>, DnsSdError> {
+    let mut query = vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in service_type.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(DnsSdError::InvalidTxtValue);
+        }
+        let length = u8::try_from(label.len()).map_err(|_| DnsSdError::InvalidTxtValue)?;
+        query.push(length);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 12, 0, 1]);
+    Ok(query)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn observe_multicast_response(
+    monitor: &Receiver<DaemonEvent>,
+    interface: Ipv4Addr,
+    timeout: Duration,
+) -> Result<(), DnsSdError> {
+    let socket = probe_socket(interface)?;
+    let query = ptr_query(MDNS_CAPABILITY_PROBE_TYPE)?;
+    let destination = SocketAddrV4::new(MDNS_MULTICAST_V4, MDNS_PORT);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(DnsSdError::MulticastUnavailable(
+                MdnsUnavailableReason::NoTrafficObserved,
+            ));
+        }
+        if drain_probe_events(monitor)? {
+            return Ok(());
+        }
+        socket
+            .send_to(&query, destination)
+            .map_err(DnsSdError::MulticastProbeIo)?;
+
+        let attempt_deadline = Instant::now() + remaining.min(PROBE_ATTEMPT_TIMEOUT);
+        loop {
+            let attempt_remaining = attempt_deadline.saturating_duration_since(Instant::now());
+            if attempt_remaining.is_zero() {
+                break;
+            }
+            match monitor.recv_timeout(attempt_remaining) {
+                Ok(event) => {
+                    if inspect_probe_event(event)? {
+                        return Ok(());
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return Err(DnsSdError::ChannelClosed),
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn drain_probe_events(monitor: &Receiver<DaemonEvent>) -> Result<bool, DnsSdError> {
+    loop {
+        match monitor.try_recv() {
+            Ok(event) => {
+                if inspect_probe_event(event)? {
+                    return Ok(true);
+                }
+            }
+            Err(TryRecvError::Empty) => return Ok(false),
+            Err(TryRecvError::Disconnected) => return Err(DnsSdError::ChannelClosed),
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn discard_probe_events(monitor: &Receiver<DaemonEvent>) -> Result<(), DnsSdError> {
+    loop {
+        match monitor.try_recv() {
+            Ok(DaemonEvent::Respond(_)) => {}
+            Ok(event) => inspect_browser_runtime(event)?,
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => return Err(DnsSdError::ChannelClosed),
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn inspect_probe_event(event: DaemonEvent) -> Result<bool, DnsSdError> {
+    match event {
+        DaemonEvent::Respond(_) => Ok(true),
+        other => {
+            inspect_browser_runtime(other)?;
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
+fn wait_for_probe_event(
+    monitor: &Receiver<DaemonEvent>,
+    timeout: Duration,
+) -> Result<(), DnsSdError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(DnsSdError::MulticastUnavailable(
+                MdnsUnavailableReason::NoTrafficObserved,
+            ));
+        }
+        match monitor.recv_timeout(remaining) {
+            Ok(event) => {
+                if inspect_probe_event(event)? {
+                    return Ok(());
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(DnsSdError::MulticastUnavailable(
+                    MdnsUnavailableReason::NoTrafficObserved,
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => return Err(DnsSdError::ChannelClosed),
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn withdraw_probe(
+    responder: &ServiceDaemon,
+    fullname: &str,
+    timeout: Duration,
+) -> Result<(), DnsSdError> {
+    let status = responder
+        .unregister(fullname)
+        .map_err(DnsSdError::Mdns)?
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            RecvTimeoutError::Timeout => DnsSdError::OperationTimedOut,
+            RecvTimeoutError::Disconnected => DnsSdError::ChannelClosed,
+        })?;
+    if matches!(status, UnregisterStatus::OK) {
+        Ok(())
+    } else {
+        Err(DnsSdError::UnregisterFailed)
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn shutdown_daemon(daemon: &ServiceDaemon, timeout: Duration) -> Result<(), DnsSdError> {
+    daemon
+        .shutdown()
+        .map_err(DnsSdError::Mdns)?
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            RecvTimeoutError::Timeout => DnsSdError::OperationTimedOut,
+            RecvTimeoutError::Disconnected => DnsSdError::ChannelClosed,
+        })?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn combine_probe_error(operation: DnsSdError, cleanup: Result<(), DnsSdError>) -> DnsSdError {
+    match cleanup {
+        Ok(()) => operation,
+        Err(cleanup) => DnsSdError::MulticastProbeCleanupFailed {
+            operation: operation.to_string(),
+            cleanup: cleanup.to_string(),
+        },
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn ensure_capability_current(monitor: &Receiver<DaemonEvent>) -> Result<(), DnsSdError> {
+    loop {
+        match monitor.try_recv() {
+            Ok(event) => inspect_browser_runtime(event)?,
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => return Err(DnsSdError::ChannelClosed),
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn activate_capability(
+    capability: MdnsCapability,
+) -> Result<(ServiceDaemon, Receiver<DaemonEvent>), DnsSdError> {
+    let MdnsCapability {
+        daemon,
+        monitor,
+        activation_timeout,
+    } = capability;
+    if let Err(operation) = ensure_capability_current(&monitor)
+        .and_then(|()| probe_daemon(&daemon, &monitor, activation_timeout))
+    {
+        return Err(runtime_start_error(operation, &daemon));
+    }
+    Ok((daemon, monitor))
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn runtime_start_error(operation: DnsSdError, daemon: &ServiceDaemon) -> DnsSdError {
+    match shutdown_daemon(daemon, MDNS_RUNTIME_START_CLEANUP_TIMEOUT) {
+        Ok(()) => operation,
+        Err(cleanup) => DnsSdError::RuntimeStartCleanupFailed {
+            operation: operation.to_string(),
+            cleanup: cleanup.to_string(),
+        },
+    }
+}
+
 /// Active pure-Rust mDNS advertisement.
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub struct MdnsAdvertiser {
@@ -632,13 +1008,17 @@ pub struct MdnsAdvertiser {
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl MdnsAdvertiser {
-    /// Starts advertising the exact signed IPv4/IPv6 address set.
-    pub fn start(advertisement: &GatewayAdvertisement) -> Result<Self, DnsSdError> {
+    /// Starts advertising after consuming an observed multicast capability.
+    pub fn start(
+        capability: MdnsCapability,
+        advertisement: &GatewayAdvertisement,
+    ) -> Result<Self, DnsSdError> {
         advertisement.validate_own_signature()?;
-        let daemon = ServiceDaemon::new().map_err(DnsSdError::Mdns)?;
-        let monitor = daemon.monitor().map_err(DnsSdError::Mdns)?;
         let service = advertisement.service_info()?;
-        daemon.register(service).map_err(DnsSdError::Mdns)?;
+        let (daemon, monitor) = activate_capability(capability)?;
+        if let Err(error) = daemon.register(service) {
+            return Err(runtime_start_error(DnsSdError::Mdns(error), &daemon));
+        }
         Ok(Self {
             daemon,
             advertisement: advertisement.clone(),
@@ -748,41 +1128,63 @@ pub enum MdnsRuntimeEvent {
 pub struct MdnsBrowser {
     daemon: ServiceDaemon,
     receiver: Receiver<ServiceEvent>,
+    monitor: Receiver<DaemonEvent>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl MdnsBrowser {
-    /// Starts browsing the frozen local Gateway service type.
-    pub fn start() -> Result<Self, DnsSdError> {
-        let daemon = ServiceDaemon::new().map_err(DnsSdError::Mdns)?;
-        let receiver = daemon
-            .browse(GATEWAY_SERVICE_TYPE)
-            .map_err(DnsSdError::Mdns)?;
-        Ok(Self { daemon, receiver })
+    /// Starts browsing after consuming an observed multicast capability.
+    pub fn start(capability: MdnsCapability) -> Result<Self, DnsSdError> {
+        let (daemon, monitor) = activate_capability(capability)?;
+        let receiver = match daemon.browse(GATEWAY_SERVICE_TYPE) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                return Err(runtime_start_error(DnsSdError::Mdns(error), &daemon));
+            }
+        };
+        Ok(Self {
+            daemon,
+            receiver,
+            monitor,
+        })
     }
 
-    /// Returns the next authenticated resolution or removal event.
+    /// Returns the next authenticated event or explicit runtime unavailability.
     pub fn next_event(
         &self,
         timeout: Duration,
         now_unix_millis: u64,
         signature_window_millis: u64,
     ) -> Result<Option<DiscoveryEvent>, DnsSdError> {
-        match self.receiver.recv_timeout(timeout) {
-            Ok(ServiceEvent::ServiceResolved(service)) => {
-                let advertisement = advertisement_from_mdns(&service)?;
-                advertisement
-                    .verify(now_unix_millis, signature_window_millis)
-                    .map(Box::new)
-                    .map(DiscoveryEvent::Resolved)
-                    .map(Some)
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
             }
-            Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
-                Ok(Some(DiscoveryEvent::Removed(fullname)))
+            let input = Selector::new()
+                .recv(&self.receiver, BrowserInput::Service)
+                .recv(&self.monitor, BrowserInput::Runtime)
+                .wait_timeout(remaining);
+            match input {
+                Ok(BrowserInput::Service(Ok(ServiceEvent::ServiceResolved(service)))) => {
+                    let advertisement = advertisement_from_mdns(&service)?;
+                    return advertisement
+                        .verify(now_unix_millis, signature_window_millis)
+                        .map(Box::new)
+                        .map(DiscoveryEvent::Resolved)
+                        .map(Some);
+                }
+                Ok(BrowserInput::Service(Ok(ServiceEvent::ServiceRemoved(_, fullname)))) => {
+                    return Ok(Some(DiscoveryEvent::Removed(fullname)));
+                }
+                Ok(BrowserInput::Runtime(Ok(event))) => inspect_browser_runtime(event)?,
+                Ok(BrowserInput::Service(Ok(_))) => {}
+                Ok(BrowserInput::Service(Err(_))) | Ok(BrowserInput::Runtime(Err(_))) => {
+                    return Err(DnsSdError::ChannelClosed);
+                }
+                Err(_) => return Ok(None),
             }
-            Ok(_) => Ok(None),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Err(DnsSdError::ChannelClosed),
         }
     }
 
@@ -800,6 +1202,23 @@ impl MdnsBrowser {
                 RecvTimeoutError::Disconnected => DnsSdError::ChannelClosed,
             })?;
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+enum BrowserInput {
+    Service(Result<ServiceEvent, RecvError>),
+    Runtime(Result<DaemonEvent, RecvError>),
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn inspect_browser_runtime(event: DaemonEvent) -> Result<(), DnsSdError> {
+    match event {
+        DaemonEvent::Error(error) => Err(DnsSdError::Mdns(error)),
+        DaemonEvent::IpDel(_) => Err(DnsSdError::MulticastUnavailable(
+            MdnsUnavailableReason::NetworkChanged,
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1005,6 +1424,17 @@ fn truthy(value: Option<&String>) -> bool {
     })
 }
 
+/// Why an mDNS runtime cannot currently make an availability claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MdnsUnavailableReason {
+    /// No non-loopback IPv4 interface can carry the bounded active probe.
+    NoUsableInterface,
+    /// The active capability probe observed no multicast response before its deadline.
+    NoTrafficObserved,
+    /// An interface disappeared after the capability was observed.
+    NetworkChanged,
+}
+
 /// Strict DNS-SD boundary failure.
 #[derive(Debug)]
 pub enum DnsSdError {
@@ -1050,6 +1480,27 @@ pub enum DnsSdError {
     ChannelClosed,
     /// A bounded responder operation timed out.
     OperationTimedOut,
+    /// The multicast capability probe timeout is zero or exceeds the safety bound.
+    InvalidCapabilityProbeTimeout,
+    /// The local runtime cannot currently demonstrate working multicast.
+    MulticastUnavailable(MdnsUnavailableReason),
+    /// The operating system rejected the active multicast probe.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    MulticastProbeIo(std::io::Error),
+    /// A capability probe failed and its bounded cleanup also failed.
+    MulticastProbeCleanupFailed {
+        /// Probe or first cleanup failure.
+        operation: String,
+        /// Subsequent cleanup failure.
+        cleanup: String,
+    },
+    /// Runtime activation failed and its bounded daemon cleanup also failed.
+    RuntimeStartCleanupFailed {
+        /// Runtime activation failure.
+        operation: String,
+        /// Daemon cleanup failure.
+        cleanup: String,
+    },
     /// Graceful record withdrawal failed.
     UnregisterFailed,
     /// Updating a record failed and restoring the previous record also failed.
@@ -1095,6 +1546,30 @@ impl Display for DnsSdError {
             }
             Self::ChannelClosed => formatter.write_str("mDNS channel closed"),
             Self::OperationTimedOut => formatter.write_str("mDNS operation timed out"),
+            Self::InvalidCapabilityProbeTimeout => {
+                formatter.write_str("invalid mDNS capability probe timeout")
+            }
+            Self::MulticastUnavailable(MdnsUnavailableReason::NoUsableInterface) => {
+                formatter.write_str("mDNS unavailable: no usable multicast interface")
+            }
+            Self::MulticastUnavailable(MdnsUnavailableReason::NoTrafficObserved) => {
+                formatter.write_str("mDNS unavailable: no multicast traffic was observed")
+            }
+            Self::MulticastUnavailable(MdnsUnavailableReason::NetworkChanged) => {
+                formatter.write_str("mDNS unavailable: the observed network changed")
+            }
+            Self::MulticastProbeCleanupFailed { operation, cleanup } => write!(
+                formatter,
+                "mDNS capability probe failed ({operation}) and cleanup failed ({cleanup})"
+            ),
+            Self::RuntimeStartCleanupFailed { operation, cleanup } => write!(
+                formatter,
+                "mDNS runtime start failed ({operation}) and cleanup failed ({cleanup})"
+            ),
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+            Self::MulticastProbeIo(error) => {
+                write!(formatter, "mDNS multicast probe failed: {error}")
+            }
             Self::UnregisterFailed => formatter.write_str("mDNS record withdrawal failed"),
             Self::RegistrationRollbackFailed {
                 operation,
@@ -1116,6 +1591,8 @@ impl Error for DnsSdError {
         match self {
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             Self::Mdns(error) => Some(error),
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+            Self::MulticastProbeIo(error) => Some(error),
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             Self::Resolve(error) => Some(error),
             _ => None,
@@ -1156,6 +1633,130 @@ mod tests {
             1_750_000_000_000,
         )
         .expect("valid fixture")
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn capability_is_not_minted_from_daemon_activity_without_observed_multicast() {
+        let (sender, monitor) = flume::bounded(1);
+        sender
+            .send(DaemonEvent::Announce(
+                "fixture._gtaclaw-probe._udp.local.".to_owned(),
+                "fixture.local.:loopback".to_owned(),
+            ))
+            .expect("fixture monitor remains connected");
+
+        let error = wait_for_probe_event(&monitor, Duration::from_millis(10))
+            .expect_err("an announcement is not proof of received multicast");
+        assert_eq!(
+            error.to_string(),
+            "mDNS unavailable: no multicast traffic was observed"
+        );
+        match error {
+            DnsSdError::MulticastUnavailable(reason) => {
+                assert_eq!(reason, MdnsUnavailableReason::NoTrafficObserved);
+            }
+            other => panic!("expected explicit multicast unavailability, got {other}"),
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn capability_requires_the_responder_to_observe_a_multicast_query() {
+        let (sender, monitor) = flume::bounded(1);
+        sender
+            .send(DaemonEvent::Respond("fixture-interface".to_owned()))
+            .expect("fixture monitor remains connected");
+
+        assert_eq!(
+            wait_for_probe_event(&monitor, Duration::from_secs(1))
+                .map_err(|error| error.to_string()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn response_arriving_between_probe_attempts_is_not_discarded() {
+        let (sender, monitor) = flume::bounded(1);
+        sender
+            .send(DaemonEvent::Respond("fixture-interface".to_owned()))
+            .expect("fixture monitor remains connected");
+
+        assert_eq!(
+            drain_probe_events(&monitor).map_err(|error| error.to_string()),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn capability_probe_emits_the_exact_bounded_ptr_query() {
+        assert_eq!(
+            ptr_query(MDNS_CAPABILITY_PROBE_TYPE).expect("pinned probe type is valid"),
+            vec![
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, b'_',
+                b'g', b't', b'a', b'c', b'l', b'a', b'w', b'-', b'p', b'r', b'o', b'b', b'e', 0x04,
+                b'_', b'u', b'd', b'p', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00, 0x0c, 0x00,
+                0x01,
+            ]
+        );
+        assert_eq!(
+            ptr_query(&format!("_{}._udp.local.", "x".repeat(64)))
+                .expect_err("DNS labels longer than 63 bytes must be rejected")
+                .to_string(),
+            "invalid DNS-SD TXT value"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn ephemeral_probe_names_are_unique_without_delaying_for_name_conflict_probing() {
+        let interface = Ipv4Addr::new(192, 0, 2, 40);
+        let first = capability_probe_service(interface).expect("first probe service");
+        let second = capability_probe_service(interface).expect("second probe service");
+
+        assert_ne!(first.get_fullname(), second.get_fullname());
+        assert_eq!(first.get_type(), MDNS_CAPABILITY_PROBE_TYPE);
+        assert_eq!(second.get_type(), MDNS_CAPABILITY_PROBE_TYPE);
+        assert!(!first.requires_probe());
+        assert!(!second.requires_probe());
+        assert!(first.get_fullname().len() < 255);
+        assert!(second.get_fullname().len() < 255);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn invalid_probe_deadlines_fail_before_any_network_runtime_is_constructed() {
+        for timeout in [Duration::ZERO, Duration::from_secs(31)] {
+            let Err(error) = MdnsCapability::observe(timeout) else {
+                panic!("invalid timeout must be rejected before probing");
+            };
+            assert_eq!(error.to_string(), "invalid mDNS capability probe timeout");
+            assert!(matches!(error, DnsSdError::InvalidCapabilityProbeTimeout));
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn interface_loss_revokes_a_retained_capability_instead_of_reporting_no_peers() {
+        let (sender, monitor) = flume::bounded(1);
+        sender
+            .send(DaemonEvent::IpDel(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))))
+            .expect("fixture monitor remains connected");
+        let error = ensure_capability_current(&monitor)
+            .expect_err("interface loss must revoke a retained capability");
+
+        assert_eq!(
+            error.to_string(),
+            "mDNS unavailable: the observed network changed"
+        );
+        match error {
+            DnsSdError::MulticastUnavailable(reason) => {
+                assert_eq!(reason, MdnsUnavailableReason::NetworkChanged);
+            }
+            other => panic!("expected network-change unavailability, got {other}"),
+        }
     }
 
     #[test]

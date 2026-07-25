@@ -424,6 +424,15 @@ Set multiple `ENABLE_xxx=true` flags with their corresponding tokens in the conf
 2. Check proxy settings (a proxy is needed to reach the Telegram API from some regions)
 3. Check logs for connection errors
 
+### Q: Why does local node discovery report mDNS as unavailable?
+GTA-Claw does not treat a successfully allocated mDNS daemon as proof that discovery
+works. Before browsing or advertising, it must observe a real IPv4 multicast query and
+response through the local network stack, then repeat that observation when the
+capability is consumed. Discovery records can still resolve both IPv4 and IPv6 endpoints.
+A probe timeout or later interface removal is reported as explicit unavailability, not
+as an empty peer list. Check multicast firewall policy and the routing-selected active
+interface; GTA-Claw will not convert this condition into "zero peers."
+
 ### Q: What AI models are supported?
 
 | Category | Model | Notes |
