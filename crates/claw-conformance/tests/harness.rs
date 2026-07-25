@@ -161,6 +161,32 @@ fn enable_transition_policy(root: &Path, unimplemented: usize, partial: usize, i
     });
 }
 
+fn install_legacy_schema_and_policy(root: &Path) {
+    let schema = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("legacy-feature-ledger.schema.json");
+    fs::copy(schema, root.join("feature-ledger.schema.json"))
+        .expect("install legacy schema fixture");
+    mutate_json(&root.join("manifest.json"), |manifest| {
+        let policy = manifest["evidence_policy"]
+            .as_object_mut()
+            .expect("evidence policy object");
+        for field in [
+            "allowed_statuses",
+            "artifact_fields",
+            "every_artifact_names_an_enabled_rust_test",
+            "implementation_pointers_are_not_acceptance_evidence",
+            "status_totals",
+        ] {
+            assert!(
+                policy.remove(field).is_some(),
+                "remove transition-only policy field {field}"
+            );
+        }
+    });
+}
+
 #[test]
 fn real_frozen_contract_loads_every_row() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
@@ -994,6 +1020,7 @@ fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
 #[test]
 fn legacy_schema_cannot_authorize_a_ledger_transition() {
     let fixture = Fixture::copy_upstream();
+    install_legacy_schema_and_policy(&fixture.root);
     let tests = fixture
         .root
         .join("crates")
