@@ -43,7 +43,14 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 ## What has actually been executed
 
-**Windows x86_64 (`x86_64-pc-windows-msvc`), rustc 1.97.0. Nothing else.**
+**Locally: Windows x86_64 (`x86_64-pc-windows-msvc`), rustc 1.97.0. Nothing else.**
+
+Repository CI additionally *executes* this crate's tests — not merely compiles
+them — on macOS arm64 (`macos-latest`), Linux and Windows, because the crate is
+a root workspace member and the headless matrix runs `--workspace`. All 75 pass
+on all three. That is the only non-Windows evidence about this code that exists,
+and it says nothing about an Apple *target* build: those runners build for the
+host, not for `aarch64-apple-ios`.
 
 | Check | Result |
 | --- | --- |
