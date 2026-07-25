@@ -1739,7 +1739,27 @@ mod tests {
         assert_eq!(client.base_url().as_str(), "https://api.anthropic.com/");
         assert_eq!(client.default_max_tokens(), DEFAULT_MAX_TOKENS);
         assert_eq!(client.id().as_str(), "anthropic");
-        assert_eq!(client.capabilities(), CAPABILITIES);
+        // Stated independently of `CAPABILITIES` on purpose: comparing the client's
+        // answer to the very constant it returns cannot fail. Upstream publishes no
+        // capability data, so the strongest available check is an exhaustive,
+        // hand-written restatement of what Anthropic's API actually offers.
+        let supported = [
+            Capability::Completion,
+            Capability::Streaming,
+            Capability::ToolCalling,
+            Capability::ModelListing,
+            Capability::Vision,
+            Capability::Reasoning,
+            Capability::PromptCaching,
+        ];
+        for capability in Capability::ALL {
+            assert_eq!(
+                client.capabilities().contains(capability),
+                supported.contains(&capability),
+                "anthropic capability {capability:?}"
+            );
+        }
+        assert_eq!(client.capabilities().len(), supported.len() as u32);
         assert!(!client.capabilities().contains(Capability::Embeddings));
 
         let request = client

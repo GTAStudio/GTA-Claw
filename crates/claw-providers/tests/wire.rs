@@ -15,8 +15,9 @@ use claw_provider_sdk::clock::{Clock, FixedJitter, ManualClock};
 use claw_provider_sdk::error::{ErrorKind, Operation};
 use claw_provider_sdk::http::{HttpTransport, TlsPolicy, TransportConfig};
 use claw_provider_sdk::model::{
-    AssistantMessage, CapabilitySet, ChatMessage, CompletionRequest, ContentPart, FinishReason,
-    ModelId, ProviderId, ToolArguments, ToolCall, ToolDefinition, ToolParameters, Usage,
+    AssistantMessage, Capability, CapabilitySet, ChatMessage, CompletionRequest, ContentPart,
+    FinishReason, ModelId, ProviderId, ToolArguments, ToolCall, ToolDefinition, ToolParameters,
+    Usage,
 };
 use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval};
 use claw_provider_sdk::provider::{Provider as _, RequestContext};
@@ -24,7 +25,7 @@ use claw_provider_sdk::retry::{JitterMode, RetryPolicy};
 use claw_provider_sdk::secret::{ApiKey, SecretString};
 use claw_provider_sdk::stream::{StreamAccumulator, StreamEvent};
 use claw_providers::anthropic::{Anthropic, AnthropicConfig};
-use claw_providers::descriptor::{ANTHROPIC_CAPABILITIES, OPENAI_CAPABILITIES};
+use claw_providers::descriptor::OPENAI_CAPABILITIES;
 use claw_providers::github_copilot::{
     DeviceFlow, DeviceFlowConfig, DevicePollOutcome, GitHubCopilot, GitHubCopilotConfig,
 };
@@ -771,7 +772,11 @@ async fn an_anthropic_overload_is_retried_and_the_key_never_leaks() {
 async fn anthropic_advertises_no_embeddings_support() {
     let server = TestServer::start(Vec::new()).await;
     let client = anthropic_client(&server);
-    assert_eq!(client.capabilities(), ANTHROPIC_CAPABILITIES);
+    assert!(
+        !client.capabilities().contains(Capability::Embeddings),
+        "anthropic serves no embeddings API"
+    );
+    assert!(client.capabilities().contains(Capability::Completion));
 
     let error = client
         .embed(
