@@ -108,12 +108,54 @@ function New-SyntheticRepositoryRoot {
         "loose/outside.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/data/fixture.json" = "{}`n"
+        # The cited test exists only inside a macro token tree. cargo expands
+        # stringify! to a string literal, so no test named $SyntheticTestName is
+        # ever compiled or run. The {} before the attribute is deliberate: it is
+        # what made an earlier port stop at the first brace and resume INSIDE the
+        # token tree, which made the forged item visible.
+        "crates/synthetic/tests/macro_forged.rs" =
+            "const _FORGED: &str = stringify!({} #[test] fn $SyntheticTestName() {});`n"
+        # The accepting direction for the same rule: an item-position macro must
+        # not swallow the real test that follows it.
+        "crates/synthetic/tests/macro_then_real.rs" =
+            "::std::thread_local! { static V: u32 = 1; }`n`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A function-level #[cfg(test)] genuinely does run under cargo test, so
+        # it must be accepted. Pinning this stops the cfg rule from being
+        # tightened back into a false-rejection engine.
+        "crates/synthetic/tests/cfg_test_fn.rs" =
+            "#[cfg(test)]`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         # A second crate whose manifest names an orphan under a dependency table
         # rather than a target section. cargo builds nothing from it.
         "crates/decoy/Cargo.toml" =
             "[package]`nname = `"decoy`"`n`n[dependencies.other]`npath = `"src/blessed.rs`"`n"
         "crates/decoy/src/lib.rs" = "`n"
         "crates/decoy/src/blessed.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # bench and example targets default to test = false, so cargo test
+        # compiles them but never runs a #[test] inside one. Measured against
+        # cargo metadata rather than recalled.
+        "crates/synthetic/benches/bench.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/examples/demo.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # The accepting direction for the same rule: a bin target under src/bin
+        # does run its tests, so it must stay citable.
+        "crates/synthetic/src/bin/cli.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A crate that switches off every route by which cargo test would reach
+        # its files: auto-discovery of tests/, an explicit bin with test = false,
+        # and an explicit test target whose own main() replaces the libtest
+        # harness so its #[test] items are inert.
+        "crates/nonrunning/Cargo.toml" =
+            ("[package]`nname = `"nonrunning`"`nautotests = false`n`n" +
+             "[[bin]]`nname = `"notest`"`npath = `"src/bin/notest.rs`"`ntest = false`n`n" +
+             "[[test]]`nname = `"noharness`"`npath = `"tests/noharness.rs`"`nharness = false`n")
+        "crates/nonrunning/src/lib.rs" = "`n"
+        "crates/nonrunning/src/bin/notest.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/noharness.rs" =
+            "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/nonrunning/tests/autodiscovered.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
@@ -617,6 +659,58 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "frozen-acceptance-bar-weakened"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # The claimant rewrites the row's own statement of what parity means,
+            # then re-blesses the ledger digest through the documented command.
+            # acceptance_evidence.required is contract text, not a mutable field:
+            # a party that could edit it would be setting the bar it is judged
+            # against. Only the frozen projection digest catches this, and
+            # -WriteLedgerDigests cannot reach that constant.
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].acceptance_evidence.required = "Any test at all exists."
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "frozen-feature-title-rewritten"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].title = "Something easier to claim"
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "frozen-upstream-source-narrowed"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Shrinking the upstream surface a row is measured against is the same
+            # forgery as weakening its required text, one level down.
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].upstream_source.paths = @("docs")
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "frozen-feature-tier-downgraded"
+        expected_message = "frozen feature text changed"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            $ledger.features[0].tier = "tier_3"
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
         name = "oracle-corpus-case-renamed"
         expected_message = "enabled-test-oracle digest mismatch"
         regenerate_digests = $true
@@ -758,6 +852,90 @@ $cases = @(
             )
         }
     },    [ordered]@{
+        name = "implemented-citing-bench-target-test"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A bench target defaults to test = false. cargo test compiles the
+            # file and never runs the #[test] inside it, so citing one is a claim
+            # backed by code that never executes -- and it needs no manifest edit
+            # at all, only a file in benches/.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/benches/bench.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-example-target-test"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Same rule as benches/: example targets default to test = false.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/examples/demo.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-src-bin-target-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The accepting direction: a bin target under src/bin DOES run its
+            # tests. Dropping benches/ and examples/ from the root set must not
+            # take src/bin/ with them.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/bin/cli.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-test-false-bin-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # An explicit [[bin]] with test = false, whose path also sits under
+            # src/bin/. Auto-discovery must not resurrect the target the manifest
+            # disabled: this is the fix for the fix, and it fails without the
+            # explicit-path precedence rule.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/src/bin/notest.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-harness-false-test-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # harness = false replaces libtest with the target's own main(), so
+            # every #[test] item in the file is inert. cargo metadata cannot
+            # express this -- it still reports test = true -- so this rule is
+            # deliberately stricter than a metadata-only root set.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/noharness.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-autotests-disabled-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # autotests = false switches off discovery of tests/*.rs entirely, so
+            # the file is never built into a target.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/autodiscovered.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
         name = "implemented-with-cfg-gated-test"
         expected_message = "is not declared as an enabled #[test]"
         regenerate_digests = $true
@@ -766,6 +944,53 @@ $cases = @(
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/synthetic/tests/cfg_gated.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-citing-macro-token-tree-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The whole forgery, end to end: the file is a real cargo test
+            # target, the path exists, the citation is well formed, and the text
+            # "#[test] fn <name>" is genuinely present. It is inside a macro
+            # token tree, so cargo never compiles a test by that name. This is
+            # the ledger-level form of the corpus case, and it is the one that
+            # proves the oracle re-port protects the ledger and not just itself.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/macro_forged.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-citing-macro-then-real-test-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A tightening rule needs its false-positive cases pinned as much as
+            # its true-positive ones. An item-position macro invocation before
+            # the test must not hide it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/macro_then_real.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-citing-cfg-test-function-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[cfg(test)] #[test] fn runs under cargo test, so refusing it would
+            # reject honest evidence. An earlier port did refuse it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/cfg_test_fn.rs" $SyntheticTestName)
             )
         }
     },
