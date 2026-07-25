@@ -94,7 +94,7 @@ function New-SyntheticRepositoryRoot {
         # can ever run.
         "crates/synthetic/src/lib.rs" =
             ("mod wired;`nmod nested;`n#[path = `"relocated.rs`"]`nmod aliased;`nmod carrier;`n" +
-             "pub(crate) mod restricted;`n")
+             "pub(crate) mod restricted;`nmod inline_host;`nmod twinned;`n")
         "crates/synthetic/src/wired.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/src/relocated.rs" =
@@ -133,6 +133,31 @@ function New-SyntheticRepositoryRoot {
         "crates/synthetic/src/rawsib.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/src/carrier/three.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A #[path] on an INLINE module renames the directory its children live
+        # in. cargo compiles blessed/proof.rs here; a reader that treats the
+        # inline block as a plain name segment looks under inline_host/scope/
+        # instead, so a decoy is planted there.
+        "crates/synthetic/src/inline_host.rs" =
+            ("#[path = `"blessed`"]`nmod scope {`n    mod proof;`n}`n" +
+             "mod holder {`n    #[path = `"renamed`"]`n    mod deeper {`n        mod nestleaf;`n    }`n}`n")
+        "crates/synthetic/src/blessed/proof.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/inline_host/scope/proof.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A path on a NESTED inline module is relative to the enclosing module
+        # directory, not to the directory holding the file. Verified against
+        # cargo: it compiles inline_host/holder/renamed/nestleaf.rs.
+        "crates/synthetic/src/inline_host/holder/renamed/nestleaf.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/inline_host/holder/deeper/nestleaf.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # 'mod twinned;' is answered by BOTH files below. rustc rejects that with
+        # E0761 and compiles neither, so both must fail closed. They are the only
+        # fixture files deliberately left unbuildable.
+        "crates/synthetic/src/twinned.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/twinned/mod.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         # Declared with a restricted visibility. The token walk has to step over
         # the whole (crate) group before it can see the mod keyword; stopping
@@ -955,6 +980,91 @@ $cases = @(
             # children. Nothing compiles it.
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/synthetic/src/modular/mod/child.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-inline-path-attribute-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[path = "blessed"] on the inline 'mod scope { }' renames the
+            # directory its children resolve in, so 'mod proof;' inside the block
+            # is src/blessed/proof.rs. This pins the accepting direction: a rule
+            # that simply dropped inline path support would reject honest
+            # evidence here rather than merely bless the decoy below.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/blessed/proof.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-inline-path-attribute-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # src/inline_host/scope/proof.rs is where a reader that carried the
+            # inline module's NAME instead of its #[path] would look. cargo never
+            # compiles it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/inline_host/scope/proof.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-nested-inline-path-attribute-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[path = "renamed"] on an inline module nested inside another
+            # inline module resolves against the ENCLOSING module directory
+            # (inline_host/holder/), not against the directory holding the file.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/inline_host/holder/renamed/nestleaf.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-nested-inline-path-attribute-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Where a reader that ignored the nested path attribute would look.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/inline_host/holder/deeper/nestleaf.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-ambiguous-module-file-side"
+        expected_message = "E0761: file for module found at both paths"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # src/twinned.rs and src/twinned/mod.rs both answer 'mod twinned;'.
+            # rustc refuses the crate outright, so neither file is ever compiled
+            # and neither can carry acceptance evidence.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/twinned.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-ambiguous-module-directory-side"
+        expected_message = "E0761: file for module found at both paths"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The other side of the same ambiguity. Both must fail, and both must
+            # fail for the ambiguity rather than for the generic unreachable
+            # message, or the report sends the reader to rewire a module that is
+            # already wired twice.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/twinned/mod.rs" $SyntheticTestName)
             )
         }
     },    [ordered]@{

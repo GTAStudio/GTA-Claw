@@ -215,8 +215,16 @@ crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package
   **holding the source file**. For `src/a/b.rs`, `#[path = "foo.rs"] mod c;`
   names `src/a/foo.rs`, not `src/a/b/foo.rs`. The two coincide for *mod-rs*
   files — crate roots and `mod.rs` — and differ for every other file.
-- Inside an inline `mod { }` block, the path is relative to the module directory
-  plus the inline components.
+- Inside an inline `mod { }` block, a path on a *nested* declaration is relative
+  to the module directory plus the inline components.
+- A path attribute **on an inline `mod name { ... }` block itself** renames the
+  directory that block's children live in. `#[path = "actual"] mod outer {
+  #[path = "proof.rs"] mod proof; }` compiles `actual/proof.rs`, never
+  `outer/proof.rs`; the value is a directory, and it is resolved by the same
+  base rule as the two bullets above — against the directory holding the source
+  file at the top level of a file, and against the enclosing module directory
+  when nested. The enclosing scopes therefore cannot be carried as a list of
+  plain module names.
 - A path naming a `mod.rs` makes that module mod-rs, so **its** children resolve
   beside it: `#[path = "sub/mod.rs"] mod two;` puts `two`'s children in `sub/`,
   not in `sub/mod/`.
@@ -224,6 +232,17 @@ crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package
 - A `path` attribute whose value this reader cannot resolve resolves to
   **nothing**. It must never fall back to resolving by module name, or an
   attribute pointing at one file blesses another.
+
+If a `mod name;` declaration is answered by **both** `<scope>/name.rs` and
+`<scope>/name/mod.rs`, the resolution fails closed and **neither** file is
+citable. `rustc` rejects that ambiguity outright — `E0761: file for module found
+at both paths` — and compiles neither, so a rule that picked either one, or both,
+would bless a test out of a crate that does not build. The rejection names the
+counterpart file and the error code rather than reporting the file as unwired,
+because telling someone to wire in a module that is already wired twice sends
+them the wrong way. Only the two ambiguous files are withdrawn; this validator is
+not a compiler and does not attempt to prove that the rest of the crate builds,
+which `cargo test` establishes far more directly in CI.
 
 Getting any of these wrong is a forgery vector and not merely a false rejection,
 because each wrong answer names a *specific* other file — one that nothing
@@ -291,8 +310,8 @@ Two deliberate limits, both disclosed rather than left to be found:
 Verified against cargo itself rather than reasoned: on a planted workspace,
 `cargo test --workspace` compiles only the listed member and never touches an
 unlisted or excluded package, and expands a `crates/*` member glob. On the real
-tree the rule changes **no** verdict — all twenty-seven packages are accounted
-for by twenty-five root members, one `desktop/` member and one self-rooted
+tree the rule changes **no** verdict — all twenty-nine packages are accounted
+for by twenty-seven root members, one `desktop/` member and one self-rooted
 workspace.
 
 Three limits, stated plainly rather than left to be discovered:
@@ -305,7 +324,12 @@ Three limits, stated plainly rather than left to be discovered:
   as a root. `cargo metadata` does not filter on `required-features` either — it
   reports such targets with `test = true` — so both implementations are
   permissive here by the same rule. Evaluating either would reject honest
-  evidence, and the disclosed vector is the unreferenced file.
+  evidence, and the disclosed vector is the unreferenced file. The same
+  permissiveness applies when a `cfg` decides the *path* rather than the
+  module's existence: `#[cfg_attr(unix, path = "unix.rs")] mod imp;` is read as
+  a plain `mod imp;`, so `imp.rs` is treated as reachable. That is the honest
+  answer on a non-unix host and a permissive one on unix, which is the same
+  trade made above.
 - Reachability is computed within the owning crate: the crate that owns the
   *cited* file must itself reach it. A file pulled in only by a
   `#[path = "..."]` from a *different* crate is not recognised; cite a test in
@@ -320,18 +344,23 @@ Three limits, stated plainly rather than left to be discovered:
 This rule is **shared, not locally owned**. `crates/claw-conformance` implements
 the same rule — "a target root, or reachable from a target root" — after a
 proposal to require the cited file to *be* a target root was put to the
-compatibility owner and then withdrawn: target-root-only left 225 tests across
-34 files in 9 crates with no legal citation at all, and the only workaround was
-widening the visibility of private items in production code, which would have
-let the ledger dictate the API surface.
+compatibility owner and then withdrawn: target-root-only left, at the time it was
+proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
+and the only workaround was widening the visibility of private items in
+production code, which would have let the ledger dictate the API surface.
+Re-measured on the current tree — 276 tracked `.rs` files, counting `#[test]`
+occurrences in files this rule accepts that are not themselves target roots — the
+cost is now **768 tests across 99 files in 17 crates**. The figure is a lower
+bound on the harm and it grows with every crate the fleet adds, which is why it
+is recorded with its method and denominator rather than as a bare number.
 
 The two implementations are therefore intended to be **identical**, not merely
 ordered. A divergence in *either* direction is a defect and must be reported
 rather than managed: if this validator were the looser side, a row it blesses
 could be rejected by the parity report. The specification above is deliberately
-complete enough to be mirrored; the twenty-seven `implemented-citing-*` cases in
-`validate-self-test.ps1` are its executable form — fifteen that must be rejected
-and twelve that must be accepted.
+complete enough to be mirrored; the thirty-three `implemented-citing-*` cases in
+`validate-self-test.ps1` are its executable form — nineteen that must be rejected
+and fourteen that must be accepted.
 
 The root set is derived here by reading the manifest rather than by shelling out
 to `cargo metadata`, which keeps this trust root hermetic: it reads files and
@@ -511,9 +540,9 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 233 child
+The adversarial self-test is a separate, slower step. It spawns 245 child
 validator processes — one baseline run against the real tree, one per each of the
-141 cases, and a re-blessing pre-run for the 91 cases that model an attacker who
+147 cases, and a re-blessing pre-run for the 97 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:
