@@ -7,11 +7,14 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signer as _, SigningKey};
+#[cfg(not(windows))]
+use gta_claw_updater::InstallOutcome;
 use gta_claw_updater::{
-    ArtifactKind, InstallMode, InstallOutcome, InstallTarget, ReleaseArtifact, ReleaseManifest,
+    ArtifactKind, AvailableUpdate, InstallMode, InstallTarget, ReleaseArtifact, ReleaseManifest,
     SignedManifest, UpdateDecision, UpdateOutcome, Updater,
 };
 use semver::Version;
+#[cfg(not(windows))]
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -263,6 +266,35 @@ fn executable_target(directory: &Path) -> InstallTarget {
         .expect("test executable target")
 }
 
+fn authorized_update(updater: &Updater, artifact: ReleaseArtifact) -> AvailableUpdate {
+    let sequence = artifact.release_sequence;
+    let version = format!("2.0.{sequence}");
+    let decision = updater
+        .check_manifest_bytes(
+            &signed_bytes(manifest(
+                &version,
+                sequence,
+                Vec::new(),
+                vec![artifact.clone()],
+            )),
+            &Version::parse("1.0.0").expect("current version"),
+        )
+        .expect("signed artifact authorization");
+    match decision {
+        UpdateDecision::Available {
+            version: accepted,
+            update,
+        } => {
+            assert_eq!(accepted, Version::parse(&version).expect("release version"));
+            assert_eq!(update.artifact(), &artifact);
+            update
+        }
+        UpdateDecision::Current { version } => {
+            panic!("expected available update, got current {version}")
+        }
+    }
+}
+
 #[test]
 fn verifies_independent_ed25519_signature_vector() {
     let directory = TestDir::new("signature-vector");
@@ -333,13 +365,15 @@ async fn checks_valid_signed_manifest_and_rejects_forged_or_unsigned_data() {
         )
         .await
         .expect("valid manifest check");
-    assert_eq!(
-        decision,
-        UpdateDecision::Available {
-            version: Version::parse("2.1.0").expect("release version"),
-            artifact: manifest.artifacts[0].clone(),
+    match decision {
+        UpdateDecision::Available { version, update } => {
+            assert_eq!(version, Version::parse("2.1.0").expect("release version"));
+            assert_eq!(update.artifact(), &manifest.artifacts[0]);
         }
-    );
+        UpdateDecision::Current { version } => {
+            panic!("expected available update, got current {version}")
+        }
+    }
 
     let mut forged: SignedManifest =
         serde_json::from_slice(&envelope).expect("decode signed envelope");
@@ -394,16 +428,21 @@ async fn persists_anti_rollback_floor_and_enforces_expiry_and_revocation() {
         )
         .await
         .expect("newest manifest accepted");
-    assert_eq!(
-        first,
-        UpdateDecision::Available {
-            version: Version::parse("3.0.0").expect("new version"),
-            artifact: ReleaseArtifact {
-                release_sequence: 30,
-                ..release.clone()
-            },
+    match first {
+        UpdateDecision::Available { version, update } => {
+            assert_eq!(version, Version::parse("3.0.0").expect("new version"));
+            assert_eq!(
+                update.artifact(),
+                &ReleaseArtifact {
+                    release_sequence: 30,
+                    ..release.clone()
+                }
+            );
         }
-    );
+        UpdateDecision::Current { version } => {
+            panic!("expected available update, got current {version}")
+        }
+    }
     let replay_error = updater
         .check(
             &server.url("manifest"),
@@ -449,6 +488,81 @@ async fn persists_anti_rollback_floor_and_enforces_expiry_and_revocation() {
 }
 
 #[tokio::test]
+async fn interrupted_verified_upgrade_cannot_install_after_a_newer_persisted_floor() {
+    let directory = TestDir::new("interrupted-floor");
+    let replacement = b"sequence 30 replacement".to_vec();
+    let server_bytes = replacement.clone();
+    let server = LocalServer::spawn(handler(move |_, _| ResponsePlan {
+        status: "200 OK",
+        headers: Vec::new(),
+        write_bytes: server_bytes.len(),
+        body: server_bytes.clone(),
+    }))
+    .await;
+    let mut release_30 = artifact(
+        server.url("artifact"),
+        &replacement,
+        ArtifactKind::Executable,
+    );
+    release_30.release_sequence = 30;
+    let updater_30 = updater(&directory.path);
+    let decision_30 = updater_30
+        .check_manifest_bytes(
+            &signed_bytes(manifest("3.0.0", 30, Vec::new(), vec![release_30.clone()])),
+            &Version::parse("1.0.0").expect("current version"),
+        )
+        .expect("sequence 30 accepted");
+    let update_30 = match decision_30 {
+        UpdateDecision::Available { version, update } => {
+            assert_eq!(version, Version::parse("3.0.0").expect("release version"));
+            update
+        }
+        UpdateDecision::Current { version } => {
+            panic!("expected available update, got current {version}")
+        }
+    };
+    let target = executable_target(&directory.path);
+    std::fs::write(target.path(), b"known good").expect("write existing target");
+    let verified_30 = updater_30
+        .download(&update_30, &target)
+        .await
+        .expect("sequence 30 verifies before interruption");
+    drop(updater_30);
+
+    let mut release_40 = release_30;
+    release_40.release_sequence = 40;
+    let updater_40 = updater(&directory.path);
+    let decision_40 = updater_40
+        .check_manifest_bytes(
+            &signed_bytes(manifest("4.0.0", 40, Vec::new(), vec![release_40])),
+            &Version::parse("1.0.0").expect("current version"),
+        )
+        .expect("sequence 40 persists after interruption");
+    match decision_40 {
+        UpdateDecision::Available { version, update } => {
+            assert_eq!(version, Version::parse("4.0.0").expect("release version"));
+            assert_eq!(update.artifact().release_sequence, 40);
+        }
+        UpdateDecision::Current { version } => {
+            panic!("expected available update, got current {version}")
+        }
+    }
+
+    let stale_error = updater_40
+        .install(verified_30, &target)
+        .await
+        .expect_err("stale verified artifact rejected at install");
+    assert_eq!(
+        stale_error.to_string(),
+        "signed release sequence 30 is below verified floor 40"
+    );
+    assert_eq!(
+        std::fs::read(target.path()).expect("read untouched target"),
+        b"known good"
+    );
+}
+
+#[tokio::test]
 async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
     let directory = TestDir::new("tampered");
     let trusted = b"verified update bytes".to_vec();
@@ -473,8 +587,10 @@ async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
     .await;
     let release = artifact(server.url("artifact"), &trusted, ArtifactKind::Executable);
     let target = executable_target(&directory.path);
-    let error = updater(&directory.path)
-        .download(&release, &target)
+    let updater = updater(&directory.path);
+    let update = authorized_update(&updater, release);
+    let error = updater
+        .download(&update, &target)
         .await
         .expect_err("tampered artifact rejected");
     assert_eq!(error.to_string(), "artifact SHA-256 mismatch");
@@ -482,7 +598,7 @@ async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
         std::fs::read_dir(&directory.path)
             .expect("read test directory")
             .count(),
-        1
+        2
     );
     assert_eq!(
         std::fs::read_dir(directory.path.join(".gta-claw.exe.gta-claw-stage"))
@@ -542,24 +658,28 @@ async fn rejects_mismatched_content_range_and_cross_artifact_resume() {
     .await;
     let target = executable_target(&directory.path);
     let first = artifact(server.url("first"), &first_bytes, ArtifactKind::Executable);
-    let interrupted = updater(&directory.path)
-        .download(&first, &target)
+    let updater = updater(&directory.path);
+    let first_update = authorized_update(&updater, first);
+    let interrupted = updater
+        .download(&first_update, &target)
         .await
         .expect_err("first artifact interrupted");
     assert_eq!(interrupted.to_string(), "update HTTP transfer failed");
-    let range_error = updater(&directory.path)
-        .download(&first, &target)
+    let range_error = updater
+        .download(&first_update, &target)
         .await
         .expect_err("mismatched range rejected");
     assert_eq!(range_error.to_string(), "resume response range is invalid");
 
-    let second = artifact(
+    let mut second = artifact(
         server.url("second"),
         &second_bytes,
         ArtifactKind::Executable,
     );
-    let verified = updater(&directory.path)
-        .download(&second, &target)
+    second.release_sequence = 2;
+    let second_update = authorized_update(&updater, second);
+    let verified = updater
+        .download(&second_update, &target)
         .await
         .expect("different artifact starts from zero");
     assert_eq!(
@@ -614,8 +734,10 @@ async fn interrupted_download_resumes_from_exact_persisted_offset() {
     .await;
     let release = artifact(server.url("artifact"), &bytes, ArtifactKind::Executable);
     let target = executable_target(&directory.path);
-    let first_error = updater(&directory.path)
-        .download(&release, &target)
+    let updater = updater(&directory.path);
+    let update = authorized_update(&updater, release);
+    let first_error = updater
+        .download(&update, &target)
         .await
         .expect_err("first transfer is interrupted");
     assert_eq!(first_error.to_string(), "update HTTP transfer failed");
@@ -625,8 +747,8 @@ async fn interrupted_download_resumes_from_exact_persisted_offset() {
         .join("artifact.part");
     assert_eq!(std::fs::read(&part).expect("persisted partial"), bytes[..8]);
 
-    let verified = updater(&directory.path)
-        .download(&release, &target)
+    let verified = updater
+        .download(&update, &target)
         .await
         .expect("resumed artifact verifies");
     assert_eq!(
@@ -677,14 +799,16 @@ async fn complete_partial_is_verified_without_an_invalid_range_request() {
     }))
     .await;
     let release = artifact(server.url("artifact"), &bytes, ArtifactKind::Executable);
-    let first_error = updater(&directory.path)
-        .download(&release, &target)
+    let updater = updater(&directory.path);
+    let update = authorized_update(&updater, release);
+    let first_error = updater
+        .download(&update, &target)
         .await
         .expect_err("framing interruption leaves all expected bytes");
     assert_eq!(first_error.to_string(), "update HTTP transfer failed");
 
-    let verified = updater(&directory.path)
-        .download(&release, &target)
+    let verified = updater
+        .download(&update, &target)
         .await
         .expect("complete partial verifies locally");
     assert_eq!(
@@ -700,6 +824,7 @@ async fn complete_partial_is_verified_without_an_invalid_range_request() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
     let directory = TestDir::new("bundle");
@@ -733,11 +858,13 @@ async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
     let release = artifact(server.url("bundle"), &bundle, ArtifactKind::MacOsBundle);
     let target = InstallTarget::new(target_path.clone(), InstallMode::MacOsBundle)
         .expect("macOS bundle target");
-    let verified = updater(&directory.path)
-        .download(&release, &target)
+    let updater = updater(&directory.path);
+    let update = authorized_update(&updater, release);
+    let verified = updater
+        .download(&update, &target)
         .await
         .expect("download bundle");
-    let outcome = updater(&directory.path)
+    let outcome = updater
         .install(verified, &target)
         .await
         .expect("install bundle");
@@ -769,16 +896,18 @@ async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
         body: unsafe_server_body.clone(),
     }))
     .await;
-    let unsafe_release = artifact(
+    let mut unsafe_release = artifact(
         unsafe_server.url("bundle"),
         &unsafe_bundle,
         ArtifactKind::MacOsBundle,
     );
-    let verified = updater(&directory.path)
-        .download(&unsafe_release, &target)
+    unsafe_release.release_sequence = 2;
+    let unsafe_update = authorized_update(&updater, unsafe_release);
+    let verified = updater
+        .download(&unsafe_update, &target)
         .await
         .expect("unsafe archive bytes still verify");
-    let error = updater(&directory.path)
+    let error = updater
         .install(verified, &target)
         .await
         .expect_err("archive traversal rejected");

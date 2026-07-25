@@ -58,6 +58,7 @@ const STAGED_PART: &str = "artifact.part";
 const STAGED_VERIFIED: &str = "artifact.verified";
 const RESUME_BINDING: &str = "artifact.resume.json";
 const SWAP_JOURNAL: &str = "swap-journal.json";
+const ROLLBACK_LOCK: &str = "release-floor.lock";
 
 trait UpdateIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -191,9 +192,34 @@ pub enum UpdateDecision {
     Available {
         /// New release version.
         version: Version,
-        /// Matching target artifact.
-        artifact: ReleaseArtifact,
+        /// Matching artifact bound to its signed release authorization.
+        update: AvailableUpdate,
     },
+}
+
+/// Opaque signed authorization for one available artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailableUpdate {
+    artifact: ReleaseArtifact,
+    authorization: ReleaseAuthorization,
+}
+
+impl AvailableUpdate {
+    /// Returns the signed artifact metadata.
+    #[must_use]
+    pub fn artifact(&self) -> &ReleaseArtifact {
+        &self.artifact
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReleaseAuthorization {
+    sequence: u64,
+    version: String,
+    published_at_unix: u64,
+    expires_at_unix: u64,
+    manifest_sha256: String,
+    artifact_sha256: String,
 }
 
 /// Local installation shape. It is never sourced from the manifest.
@@ -361,7 +387,16 @@ impl Updater {
         )
         .await
         .map_err(|_| UpdateError::HttpTimeout)??;
-        let manifest = self.verify_manifest(&bytes)?;
+        self.check_manifest_bytes(&bytes, current)
+    }
+
+    /// Verifies and accepts already-fetched manifest bytes before comparing versions.
+    pub fn check_manifest_bytes(
+        &self,
+        bytes: &[u8],
+        current: &Version,
+    ) -> Result<UpdateDecision, UpdateError> {
+        let manifest = self.verify_manifest(bytes)?;
         let rollback_state = self.accept_manifest(&manifest)?;
         let available =
             Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
@@ -384,17 +419,22 @@ impl Updater {
         }
         let artifact = manifest
             .artifacts
-            .into_iter()
-            .find(|artifact| artifact.target == self.target_triple);
+            .iter()
+            .find(|artifact| artifact.target == self.target_triple)
+            .cloned();
         let artifact = match artifact {
             Some(artifact) => artifact,
             None if current_revoked => return Err(UpdateError::CurrentReleaseRevoked),
             None => return Err(UpdateError::ArtifactUnavailable),
         };
         validate_artifact(&artifact, self.allow_loopback_http)?;
+        let authorization = release_authorization(&manifest, &artifact)?;
         Ok(UpdateDecision::Available {
             version: available,
-            artifact,
+            update: AvailableUpdate {
+                artifact,
+                authorization,
+            },
         })
     }
 
@@ -426,33 +466,20 @@ impl Updater {
     }
 
     fn accept_manifest(&self, manifest: &ReleaseManifest) -> Result<RollbackState, UpdateError> {
-        let state_root = SecureDirectory::open_or_create(&self.state_dir, true)?;
-        let state_directory =
-            state_root.create_child(&rollback_state_directory(&self.target_triple), true)?;
-        let mut state = RollbackState::default();
-        for name in state_directory.list_names()? {
-            let Some(sequence) = rollback_sequence_from_name(&name) else {
-                continue;
-            };
-            let candidate = state_directory
-                .read_json::<RollbackState>(&name)?
-                .ok_or(UpdateError::CorruptState)?;
-            if candidate.highest_sequence != sequence
-                || validate_rollback_state(&candidate).is_err()
-            {
-                return Err(UpdateError::CorruptState);
-            }
-            if candidate.highest_sequence > state.highest_sequence {
-                state = candidate;
-            } else if candidate.highest_sequence == state.highest_sequence && candidate != state {
-                return Err(UpdateError::CorruptState);
-            }
-        }
+        let guard = self.lock_rollback_state()?;
+        self.accept_manifest_locked(manifest, &guard)
+    }
+
+    fn accept_manifest_locked(
+        &self,
+        manifest: &ReleaseManifest,
+        guard: &RollbackGuard,
+    ) -> Result<RollbackState, UpdateError> {
+        let state_directory = &guard.directory;
+        let mut state = load_rollback_state(state_directory)?;
         let available =
             Version::parse(&manifest.version).map_err(|_| UpdateError::InvalidVersion)?;
-        let manifest_sha256 = encode_hex(&Sha256::digest(
-            serde_json::to_vec(manifest).map_err(UpdateError::ManifestJson)?,
-        ));
+        let manifest_sha256 = manifest_digest(manifest)?;
 
         if manifest.sequence < state.highest_sequence {
             return Err(UpdateError::RollbackManifest {
@@ -494,12 +521,75 @@ impl Updater {
         Ok(state)
     }
 
+    fn lock_rollback_state(&self) -> Result<RollbackGuard, UpdateError> {
+        let state_root = SecureDirectory::open_or_create(&self.state_dir, true)?;
+        let directory =
+            state_root.create_child(&rollback_state_directory(&self.target_triple), true)?;
+        let lock = directory.lock_file(OsStr::new(ROLLBACK_LOCK))?;
+        Ok(RollbackGuard {
+            directory,
+            _lock: lock,
+        })
+    }
+
+    fn authorize_install(
+        &self,
+        authorization: &ReleaseAuthorization,
+        guard: &RollbackGuard,
+    ) -> Result<(), UpdateError> {
+        validate_authorization_time(authorization, unix_time_now()?)?;
+        let state = load_rollback_state(&guard.directory)?;
+        if state.highest_sequence > authorization.sequence {
+            return Err(UpdateError::RollbackManifest {
+                observed: state.highest_sequence,
+                received: authorization.sequence,
+            });
+        }
+        if state.highest_sequence < authorization.sequence {
+            return Err(UpdateError::CorruptState);
+        }
+        if state.highest_version != authorization.version
+            || state.manifest_sha256 != authorization.manifest_sha256
+        {
+            return Err(UpdateError::ReleaseSequenceConflict);
+        }
+        if state.revoked_versions.contains(&authorization.version) {
+            return Err(UpdateError::RevokedRelease);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn accept_manifest_while_locked(
+        &self,
+        manifest: &ReleaseManifest,
+        guard: &RollbackGuard,
+    ) -> Result<RollbackState, UpdateError> {
+        self.accept_manifest_locked(manifest, guard)
+    }
+
+    #[cfg(test)]
+    fn rollback_lock_for_test(&self) -> Result<RollbackGuard, UpdateError> {
+        self.lock_rollback_state()
+    }
+
+    fn validate_update_binding(&self, update: &AvailableUpdate) -> Result<(), UpdateError> {
+        if artifact_digest(&update.artifact)? != update.authorization.artifact_sha256
+            || update.artifact.release_sequence != update.authorization.sequence
+        {
+            return Err(UpdateError::InvalidReleaseMetadata);
+        }
+        Ok(())
+    }
+
     /// Downloads one signed artifact with safe resume and verifies exact size and SHA-256.
     pub async fn download(
         &self,
-        artifact: &ReleaseArtifact,
+        update: &AvailableUpdate,
         target: &InstallTarget,
     ) -> Result<VerifiedArtifact, UpdateError> {
+        self.validate_update_binding(update)?;
+        let artifact = &update.artifact;
         validate_artifact(artifact, self.allow_loopback_http)?;
         ensure_kind_matches(artifact.kind, target.mode)?;
         let url = Url::parse(&artifact.url).map_err(|_| UpdateError::InvalidArtifactUrl)?;
@@ -613,6 +703,7 @@ impl Updater {
         stage
             .directory
             .remove_file_if_exists(OsStr::new(RESUME_BINDING))?;
+        #[cfg(unix)]
         ensure_entry_identity(&stage.directory, OsStr::new(STAGED_VERIFIED), &retained)?;
         let staged_path = stage.directory.path.join(STAGED_VERIFIED);
         Ok(VerifiedArtifact {
@@ -622,6 +713,7 @@ impl Updater {
             digest,
             size: artifact.size,
             kind: artifact.kind,
+            authorization: update.authorization.clone(),
         })
     }
 
@@ -637,6 +729,7 @@ impl Updater {
         {
             return Err(UpdateError::StagedArtifactChanged);
         }
+        #[cfg(unix)]
         ensure_entry_identity(
             &verified.stage.directory,
             OsStr::new(STAGED_VERIFIED),
@@ -648,9 +741,15 @@ impl Updater {
                 source_name: OsString::from(STAGED_VERIFIED),
                 handle: verified.file.try_clone().map_err(UpdateError::Io)?,
                 stage: Arc::clone(&verified.stage),
+                #[cfg(windows)]
+                digest: verified.digest,
+                #[cfg(windows)]
+                size: verified.size,
             },
             ArtifactKind::MacOsBundle => prepare_bundle(&verified).await?,
         };
+        let guard = self.lock_rollback_state()?;
+        self.authorize_install(&verified.authorization, &guard)?;
         atomic_swap_verified(&prepared, cfg!(windows))
     }
 
@@ -666,8 +765,8 @@ impl Updater {
         }
         match self.check(manifest_url, current).await? {
             UpdateDecision::Current { version } => Ok(UpdateOutcome::Current(version)),
-            UpdateDecision::Available { version, artifact } => {
-                let verified = self.download(&artifact, target).await?;
+            UpdateDecision::Available { version, update } => {
+                let verified = self.download(&update, target).await?;
                 match self.install(verified, target).await? {
                     InstallOutcome::Installed => Ok(UpdateOutcome::Installed(version)),
                     InstallOutcome::RestartRequired { staged_path } => {
@@ -829,6 +928,7 @@ pub struct VerifiedArtifact {
     digest: [u8; 32],
     size: u64,
     kind: ArtifactKind,
+    authorization: ReleaseAuthorization,
 }
 
 #[derive(Debug)]
@@ -837,6 +937,10 @@ struct PreparedArtifact {
     source_name: OsString,
     handle: File,
     stage: Arc<SecureStaging>,
+    #[cfg(windows)]
+    digest: [u8; 32],
+    #[cfg(windows)]
+    size: u64,
 }
 
 impl VerifiedArtifact {
@@ -1080,6 +1184,11 @@ impl Error for UpdateError {
     }
 }
 
+struct RollbackGuard {
+    directory: SecureDirectory,
+    _lock: File,
+}
+
 #[derive(Clone, Debug)]
 struct SecureDirectory {
     path: PathBuf,
@@ -1243,10 +1352,13 @@ impl SecureDirectory {
         #[cfg(windows)]
         let file = {
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
             let mut options = OpenOptions::new();
             options
                 .read(true)
                 .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             if create_new {
                 options.create_new(true);
@@ -1270,6 +1382,78 @@ impl SecureDirectory {
         Ok(file)
     }
 
+    #[cfg(windows)]
+    fn create_exclusive_regular(&self, name: &OsStr) -> Result<File, UpdateError> {
+        validate_single_component(name)?;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(name))
+            .map_err(UpdateError::Io)?;
+        let metadata = file.metadata().map_err(UpdateError::Io)?;
+        if !metadata.is_file() || is_windows_reparse(&metadata) {
+            return Err(UpdateError::UnsafeFilesystemObject);
+        }
+        Ok(file)
+    }
+
+    fn lock_file(&self, name: &OsStr) -> Result<File, UpdateError> {
+        validate_single_component(name)?;
+        #[cfg(unix)]
+        {
+            let descriptor = rustix::fs::openat(
+                &*self.handle,
+                name,
+                rustix::fs::OFlags::RDWR
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .map_err(rustix_open_error)?;
+            let file = File::from(descriptor);
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+                .map_err(rustix_error)
+                .map_err(UpdateError::Io)?;
+            Ok(file)
+        }
+        #[cfg(windows)]
+        {
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let path = self.path.join(name);
+            let started = std::time::Instant::now();
+            loop {
+                let result = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .share_mode(0)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&path);
+                match result {
+                    Ok(file) => {
+                        let metadata = file.metadata().map_err(UpdateError::Io)?;
+                        if !metadata.is_file() || is_windows_reparse(&metadata) {
+                            return Err(UpdateError::UnsafeFilesystemObject);
+                        }
+                        return Ok(file);
+                    }
+                    Err(error)
+                        if is_windows_sharing_violation(&error)
+                            && started.elapsed() < Duration::from_secs(300) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(UpdateError::Io(error)),
+                }
+            }
+        }
+    }
+
     fn open_object(&self, name: &OsStr) -> Result<File, UpdateError> {
         validate_single_component(name)?;
         #[cfg(unix)]
@@ -1289,8 +1473,11 @@ impl SecureDirectory {
         let file = {
             const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
             OpenOptions::new()
                 .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(self.path.join(name))
                 .map_err(UpdateError::Io)?
@@ -1562,24 +1749,13 @@ fn file_identity(file: &File) -> Result<(u64, u64), UpdateError> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+#[cfg(unix)]
 fn ensure_entry_identity(
     directory: &SecureDirectory,
     name: &OsStr,
     retained: &File,
 ) -> Result<(), UpdateError> {
     let entry = directory.open_object(name)?;
-    #[cfg(windows)]
-    {
-        let entry = same_file::Handle::from_file(entry).map_err(UpdateError::Io)?;
-        let retained = same_file::Handle::from_file(retained.try_clone().map_err(UpdateError::Io)?)
-            .map_err(UpdateError::Io)?;
-        if entry == retained {
-            Ok(())
-        } else {
-            Err(UpdateError::StagedArtifactChanged)
-        }
-    }
-    #[cfg(unix)]
     if file_identity(&entry)? == file_identity(retained)? {
         Ok(())
     } else {
@@ -1680,7 +1856,24 @@ fn recover_interrupted_swap(stage: &SecureStaging) -> Result<(), UpdateError> {
         }
         (Some(journal), true, has_backup) => {
             if object_digest(&stage.parent, &stage.target_name)? != journal.recovery_digest {
-                return Err(UpdateError::SwapRecoveryConflict);
+                if has_backup {
+                    stage.parent.remove_entry_recursive(&stage.target_name)?;
+                    stage
+                        .parent
+                        .rename_to(&stage.backup_name, &stage.parent, &stage.target_name)
+                        .map_err(UpdateError::Io)?;
+                    stage
+                        .directory
+                        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
+                    stage.parent.sync().map_err(UpdateError::Io)?;
+                    return Ok(());
+                }
+                stage.parent.remove_entry_recursive(&stage.target_name)?;
+                stage
+                    .directory
+                    .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
+                stage.parent.sync().map_err(UpdateError::Io)?;
+                return Ok(());
             }
             if has_backup {
                 discard_backup(stage)?;
@@ -1739,6 +1932,66 @@ fn rollback_sequence_from_name(name: &OsStr) -> Option<u64> {
         .strip_suffix(".json")?
         .parse()
         .ok()
+}
+
+fn load_rollback_state(state_directory: &SecureDirectory) -> Result<RollbackState, UpdateError> {
+    let mut state = RollbackState::default();
+    for name in state_directory.list_names()? {
+        let Some(sequence) = rollback_sequence_from_name(&name) else {
+            continue;
+        };
+        let candidate = state_directory
+            .read_json::<RollbackState>(&name)?
+            .ok_or(UpdateError::CorruptState)?;
+        if candidate.highest_sequence != sequence || validate_rollback_state(&candidate).is_err() {
+            return Err(UpdateError::CorruptState);
+        }
+        if candidate.highest_sequence > state.highest_sequence {
+            state = candidate;
+        } else if candidate.highest_sequence == state.highest_sequence && candidate != state {
+            return Err(UpdateError::CorruptState);
+        }
+    }
+    Ok(state)
+}
+
+fn manifest_digest(manifest: &ReleaseManifest) -> Result<String, UpdateError> {
+    let bytes = serde_json::to_vec(manifest).map_err(UpdateError::ManifestJson)?;
+    Ok(encode_hex(&Sha256::digest(bytes)))
+}
+
+fn artifact_digest(artifact: &ReleaseArtifact) -> Result<String, UpdateError> {
+    let bytes = serde_json::to_vec(artifact).map_err(UpdateError::ManifestJson)?;
+    Ok(encode_hex(&Sha256::digest(bytes)))
+}
+
+fn release_authorization(
+    manifest: &ReleaseManifest,
+    artifact: &ReleaseArtifact,
+) -> Result<ReleaseAuthorization, UpdateError> {
+    Ok(ReleaseAuthorization {
+        sequence: manifest.sequence,
+        version: manifest.version.clone(),
+        published_at_unix: manifest.published_at_unix,
+        expires_at_unix: manifest.expires_at_unix,
+        manifest_sha256: manifest_digest(manifest)?,
+        artifact_sha256: artifact_digest(artifact)?,
+    })
+}
+
+fn validate_authorization_time(
+    authorization: &ReleaseAuthorization,
+    now: u64,
+) -> Result<(), UpdateError> {
+    if authorization.published_at_unix > now.saturating_add(MAX_CLOCK_SKEW_SECONDS)
+        || authorization.expires_at_unix <= authorization.published_at_unix
+    {
+        return Err(UpdateError::InvalidReleaseMetadata);
+    }
+    if authorization.expires_at_unix < now {
+        return Err(UpdateError::ExpiredManifest);
+    }
+    Ok(())
 }
 
 fn validate_rollback_state(state: &RollbackState) -> Result<(), UpdateError> {
@@ -2392,6 +2645,10 @@ async fn prepare_bundle(verified: &VerifiedArtifact) -> Result<PreparedArtifact,
         source_name: prepared_name,
         handle: prepared.handle.try_clone().map_err(UpdateError::Io)?,
         stage: Arc::clone(&verified.stage),
+        #[cfg(windows)]
+        digest: verified.digest,
+        #[cfg(windows)]
+        size: verified.size,
     })
 }
 
@@ -2479,6 +2736,7 @@ fn set_safe_mode(_file: &File, _requested: u32) -> Result<(), UpdateError> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn atomic_swap_verified(
     prepared: &PreparedArtifact,
     windows_lock_behavior: bool,
@@ -2532,13 +2790,137 @@ fn atomic_swap_verified(
     }
     stage
         .directory
-        .remove_file_if_exists(OsStr::new(STAGED_VERIFIED))?;
+        .remove_file_if_exists(&prepared.source_name)?;
     stage
         .directory
         .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
     stage.parent.sync().map_err(UpdateError::Io)?;
     stage.directory.sync().map_err(UpdateError::Io)?;
     Ok(InstallOutcome::Installed)
+}
+
+#[cfg(windows)]
+fn atomic_swap_verified(
+    prepared: &PreparedArtifact,
+    windows_lock_behavior: bool,
+) -> Result<InstallOutcome, UpdateError> {
+    let stage = &prepared.stage;
+    recover_interrupted_swap(stage)?;
+    let journal = SwapJournal {
+        recovery_digest: file_object_digest(&prepared.handle)?,
+    };
+    stage
+        .directory
+        .write_json_atomic(OsStr::new(SWAP_JOURNAL), &journal)?;
+
+    let had_target = stage.parent.object_exists(&stage.target_name)?;
+    if had_target
+        && let Err(error) =
+            stage
+                .parent
+                .rename_to(&stage.target_name, &stage.parent, &stage.backup_name)
+    {
+        stage
+            .directory
+            .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
+        if windows_lock_behavior && is_windows_sharing_violation(&error) {
+            return Ok(InstallOutcome::RestartRequired {
+                staged_path: prepared.path.clone(),
+            });
+        }
+        return Err(UpdateError::Io(error));
+    }
+    stage.parent.sync().map_err(UpdateError::Io)?;
+
+    let install_result = (|| {
+        let mut destination = stage.parent.create_exclusive_regular(&stage.target_name)?;
+        copy_verified_handle(
+            &prepared.handle,
+            &mut destination,
+            prepared.size,
+            prepared.digest,
+        )?;
+        destination.sync_all().map_err(UpdateError::Io)
+    })();
+    if let Err(error) = install_result {
+        let install = io::Error::other(error.to_string());
+        return rollback_secure_swap(stage, had_target, install);
+    }
+    stage.parent.sync().map_err(UpdateError::Io)?;
+
+    if had_target {
+        discard_backup(stage)?;
+    }
+    stage
+        .directory
+        .remove_file_if_exists(&prepared.source_name)?;
+    stage
+        .directory
+        .remove_file_if_exists(OsStr::new(SWAP_JOURNAL))?;
+    stage.parent.sync().map_err(UpdateError::Io)?;
+    stage.directory.sync().map_err(UpdateError::Io)?;
+    Ok(InstallOutcome::Installed)
+}
+
+#[cfg(windows)]
+fn copy_verified_handle(
+    source: &File,
+    destination: &mut File,
+    expected_size: u64,
+    expected_digest: [u8; 32],
+) -> Result<(), UpdateError> {
+    let mut source = source.try_clone().map_err(UpdateError::Io)?;
+    source.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
+    destination.set_len(0).map_err(UpdateError::Io)?;
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(UpdateError::Io)?;
+    let mut digest = Sha256::new();
+    let mut written = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = source.read(&mut buffer).map_err(UpdateError::Io)?;
+        if count == 0 {
+            break;
+        }
+        written = written
+            .checked_add(u64::try_from(count).map_err(|_| UpdateError::StagedArtifactChanged)?)
+            .ok_or(UpdateError::StagedArtifactChanged)?;
+        if written > expected_size {
+            return Err(UpdateError::StagedArtifactChanged);
+        }
+        digest.update(&buffer[..count]);
+        destination
+            .write_all(&buffer[..count])
+            .map_err(UpdateError::Io)?;
+    }
+    let actual_digest: [u8; 32] = digest.finalize().into();
+    if written != expected_size || actual_digest != expected_digest {
+        return Err(UpdateError::StagedArtifactChanged);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn file_object_digest(file: &File) -> Result<String, UpdateError> {
+    let mut file = file.try_clone().map_err(UpdateError::Io)?;
+    let metadata = file.metadata().map_err(UpdateError::Io)?;
+    if !metadata.is_file() {
+        return Err(UpdateError::UnsafeFilesystemObject);
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"file");
+    digest.update(metadata.len().to_be_bytes());
+    file.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(UpdateError::Io)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(encode_hex(&digest.finalize()))
 }
 
 fn rollback_secure_swap(
@@ -2616,8 +2998,10 @@ fn is_windows_sharing_violation(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod unit_tests {
-    use std::sync::Mutex;
+    #[cfg(windows)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex, mpsc};
 
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -2925,6 +3309,10 @@ mod unit_tests {
             source_name: OsString::from(STAGED_VERIFIED),
             handle: staged,
             stage: Arc::clone(&stage),
+            #[cfg(windows)]
+            digest: Sha256::digest(b"new executable").into(),
+            #[cfg(windows)]
+            size: 14,
         };
 
         let outcome = atomic_swap_verified(&prepared, false).expect("real commit succeeds");
@@ -2947,15 +3335,14 @@ mod unit_tests {
         next.write_all(b"third executable")
             .expect("write next executable");
         next.sync_all().expect("sync next executable");
+        #[cfg(windows)]
+        let recovery_digest = file_object_digest(&next).expect("staged digest");
+        #[cfg(not(windows))]
+        let recovery_digest =
+            object_digest(&stage.directory, OsStr::new(STAGED_VERIFIED)).expect("staged digest");
         stage
             .directory
-            .write_json_atomic(
-                OsStr::new(SWAP_JOURNAL),
-                &SwapJournal {
-                    recovery_digest: object_digest(&stage.directory, OsStr::new(STAGED_VERIFIED))
-                        .expect("staged digest"),
-                },
-            )
+            .write_json_atomic(OsStr::new(SWAP_JOURNAL), &SwapJournal { recovery_digest })
             .expect("write swap journal");
         stage
             .parent
@@ -3026,6 +3413,49 @@ mod unit_tests {
         );
     }
 
+    #[test]
+    fn fresh_install_recovery_removes_an_incomplete_target() {
+        let directory = UnitTestDir::new("fresh-crash");
+        let target_path = directory.path.join("gta-claw");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = SecureStaging::open(&target).expect("secure stage");
+        let mut staged = stage
+            .directory
+            .open_regular(OsStr::new(STAGED_VERIFIED), true)
+            .expect("create staged executable");
+        staged
+            .write_all(b"complete replacement")
+            .expect("write staged executable");
+        staged.sync_all().expect("sync staged executable");
+        #[cfg(windows)]
+        let recovery_digest = file_object_digest(&staged).expect("staged digest");
+        #[cfg(not(windows))]
+        let recovery_digest =
+            object_digest(&stage.directory, OsStr::new(STAGED_VERIFIED)).expect("staged digest");
+        stage
+            .directory
+            .write_json_atomic(OsStr::new(SWAP_JOURNAL), &SwapJournal { recovery_digest })
+            .expect("write swap journal");
+        let mut partial = stage
+            .parent
+            .open_regular(&stage.target_name, true)
+            .expect("create partial target");
+        partial.write_all(b"partial").expect("write partial target");
+        partial.sync_all().expect("sync partial target");
+        drop(partial);
+
+        recover_interrupted_swap(&stage).expect("recover fresh interrupted install");
+
+        assert!(!target_path.exists());
+        assert!(
+            !stage
+                .directory
+                .object_exists(OsStr::new(SWAP_JOURNAL))
+                .expect("journal state")
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn real_windows_sharing_lock_keeps_verified_object_staged() {
@@ -3056,6 +3486,10 @@ mod unit_tests {
             source_name: OsString::from(STAGED_VERIFIED),
             handle: staged,
             stage,
+            #[cfg(windows)]
+            digest: Sha256::digest(b"verified replacement").into(),
+            #[cfg(windows)]
+            size: 20,
         };
 
         let outcome =
@@ -3075,6 +3509,215 @@ mod unit_tests {
             fs::read(staged_path).expect("read retained staged executable"),
             b"verified replacement"
         );
+    }
+
+    #[test]
+    fn stale_install_contends_with_and_yields_to_a_higher_floor() {
+        let directory = UnitTestDir::new("floor-race");
+        let updater = Arc::new(
+            Updater::with_public_key_and_state(
+                PRODUCTION_PUBLIC_KEY,
+                "race-target",
+                directory.path.join("state"),
+            )
+            .expect("race updater"),
+        );
+
+        for iteration in 0_u64..32 {
+            let stale_sequence = iteration * 2 + 1;
+            let high_sequence = stale_sequence + 1;
+            let replacement = format!("verified replacement {iteration}").into_bytes();
+            let artifact = ReleaseArtifact {
+                release_sequence: stale_sequence,
+                target: "race-target".to_owned(),
+                url: "https://updates.example.invalid/gta-claw.exe".to_owned(),
+                sha256: encode_hex(&Sha256::digest(&replacement)),
+                size: u64::try_from(replacement.len()).expect("small replacement"),
+                kind: ArtifactKind::Executable,
+            };
+            let stale_manifest = ReleaseManifest {
+                version: format!("1.0.{stale_sequence}"),
+                sequence: stale_sequence,
+                published_at_unix: 1_700_000_000,
+                expires_at_unix: 4_102_444_800,
+                revoked_versions: Vec::new(),
+                artifacts: vec![artifact.clone()],
+            };
+            updater
+                .accept_manifest(&stale_manifest)
+                .expect("persist stale floor before racing");
+            let authorization =
+                release_authorization(&stale_manifest, &artifact).expect("authorization");
+
+            let target_path = directory.path.join(format!("gta-claw-{iteration}.exe"));
+            fs::write(&target_path, b"known good").expect("write existing target");
+            let target = InstallTarget::new(target_path.clone(), InstallMode::Executable)
+                .expect("install target");
+            let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
+            let mut staged = stage
+                .directory
+                .open_regular(OsStr::new(STAGED_VERIFIED), true)
+                .expect("create staged replacement");
+            staged
+                .write_all(&replacement)
+                .expect("write staged replacement");
+            staged.sync_all().expect("sync staged replacement");
+            let verified = VerifiedArtifact {
+                path: stage.directory.path.join(STAGED_VERIFIED),
+                file: staged,
+                stage,
+                digest: Sha256::digest(&replacement).into(),
+                size: u64::try_from(replacement.len()).expect("small replacement"),
+                kind: ArtifactKind::Executable,
+                authorization,
+            };
+
+            let high_manifest = ReleaseManifest {
+                version: format!("1.0.{high_sequence}"),
+                sequence: high_sequence,
+                published_at_unix: 1_700_000_000,
+                expires_at_unix: 4_102_444_800,
+                revoked_versions: Vec::new(),
+                artifacts: vec![ReleaseArtifact {
+                    release_sequence: high_sequence,
+                    ..artifact
+                }],
+            };
+            let high_ready = Arc::new(Barrier::new(2));
+            let release_high = Arc::new(Barrier::new(2));
+            let high_updater = Arc::clone(&updater);
+            let high_ready_thread = Arc::clone(&high_ready);
+            let release_high_thread = Arc::clone(&release_high);
+            let high_thread = std::thread::spawn(move || {
+                let guard = high_updater
+                    .rollback_lock_for_test()
+                    .expect("higher floor lock");
+                high_updater
+                    .accept_manifest_while_locked(&high_manifest, &guard)
+                    .expect("persist higher floor");
+                high_ready_thread.wait();
+                release_high_thread.wait();
+            });
+            high_ready.wait();
+
+            let stale_updater = Arc::clone(&updater);
+            let (completed_tx, completed_rx) = mpsc::channel();
+            let stale_thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("stale installer runtime");
+                let result = runtime.block_on(stale_updater.install(verified, &target));
+                completed_tx.send(()).expect("report stale completion");
+                result
+            });
+            let completed_while_high_floor_locked =
+                completed_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+            release_high.wait();
+            high_thread.join().expect("higher floor thread");
+            let stale_error = stale_thread
+                .join()
+                .expect("stale installer thread")
+                .expect_err("stale install must be rejected");
+
+            assert!(!completed_while_high_floor_locked);
+            assert_eq!(
+                stale_error.to_string(),
+                format!(
+                    "signed release sequence {stale_sequence} is below verified floor {high_sequence}"
+                )
+            );
+            assert_eq!(
+                fs::read(&target_path).expect("read untouched target"),
+                b"known good"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verified_handle_rejects_racing_writers_during_real_swaps() {
+        for iteration in 0..32 {
+            let directory = UnitTestDir::new("windows-writer-race");
+            let target_path = directory.path.join(format!("gta-claw-{iteration}.exe"));
+            fs::write(&target_path, b"known good").expect("write existing target");
+            let target = InstallTarget::new(target_path.clone(), InstallMode::Executable)
+                .expect("install target");
+            let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
+            let replacement = format!("verified replacement {iteration}").into_bytes();
+            let mut staged = stage
+                .directory
+                .open_regular(OsStr::new(STAGED_VERIFIED), true)
+                .expect("create staged replacement");
+            staged
+                .write_all(&replacement)
+                .expect("write staged replacement");
+            staged.sync_all().expect("sync staged replacement");
+            let staged_path = stage.directory.path.join(STAGED_VERIFIED);
+            let prepared = PreparedArtifact {
+                path: staged_path.clone(),
+                source_name: OsString::from(STAGED_VERIFIED),
+                handle: staged,
+                stage: Arc::clone(&stage),
+                digest: Sha256::digest(&replacement).into(),
+                size: u64::try_from(replacement.len()).expect("small replacement"),
+            };
+
+            let start = Arc::new(Barrier::new(2));
+            let first_attempt = Arc::new(Barrier::new(2));
+            let done = Arc::new(AtomicBool::new(false));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let successful_writes = Arc::new(AtomicUsize::new(0));
+            let writer_start = Arc::clone(&start);
+            let writer_first_attempt = Arc::clone(&first_attempt);
+            let writer_done = Arc::clone(&done);
+            let writer_attempts = Arc::clone(&attempts);
+            let writer_successes = Arc::clone(&successful_writes);
+            let writer = std::thread::spawn(move || {
+                writer_start.wait();
+                for attempt in 0..128 {
+                    writer_attempts.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut replacement) = OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(&staged_path)
+                    {
+                        replacement
+                            .write_all(b"attacker-controlled bytes")
+                            .expect("racing write");
+                        replacement.sync_all().expect("sync racing write");
+                        writer_successes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if attempt == 0 {
+                        writer_first_attempt.wait();
+                    }
+                    if writer_done.load(Ordering::SeqCst) && attempt >= 63 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+
+            start.wait();
+            first_attempt.wait();
+            let outcome = atomic_swap_verified(&prepared, true).expect("real swap");
+            done.store(true, Ordering::SeqCst);
+            writer.join().expect("racing writer thread");
+
+            assert_eq!(outcome, InstallOutcome::Installed);
+            assert!(attempts.load(Ordering::SeqCst) >= 64);
+            assert_eq!(successful_writes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fs::read(&target_path).expect("read installed object"),
+                replacement
+            );
+            assert!(
+                !stage
+                    .parent
+                    .object_exists(&stage.backup_name)
+                    .expect("backup state")
+            );
+        }
     }
 
     #[cfg(windows)]
