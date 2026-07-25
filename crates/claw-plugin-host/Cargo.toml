@@ -1,0 +1,28 @@
+[package]
+name = "claw-plugin-host"
+description = "Wasmtime component-model host that runs GTA Claw WebAssembly plugins in a deny-by-default sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claw-plugin-api = { workspace = true }
+claw-security = { workspace = true }
+getrandom = "0.4.3"
+serde_json = "1.0.149"
+wasmtime = { version = "46.0.1", default-features = false, features = [
+  "component-model",
+  "cranelift",
+  "runtime",
+  "std",
+] }
+
+[dev-dependencies]
+ed25519-dalek = "3.0.0"
+tempfile = "3.24.0"
+wat = "=1.251.0"
+
+[lints]
+workspace = true

@@ -7,6 +7,8 @@ members = [
   "crates/claw-domain",
   "crates/claw-gateway-client",
   "crates/claw-platform",
+  "crates/claw-plugin-api",
+  "crates/claw-plugin-host",
   "crates/claw-protocol",
   "crates/claw-security",
 ]
@@ -19,6 +21,8 @@ claw-config = { path = "crates/claw-config", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
+claw-plugin-api = { path = "crates/claw-plugin-api", version = "0.1.0" }
+claw-plugin-host = { path = "crates/claw-plugin-host", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 serde = { version = "=1.0.228", features = ["derive"] }
