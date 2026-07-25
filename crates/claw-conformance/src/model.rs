@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::claims::{Evidence, ImplementationPointer};
+
 /// Frozen compatibility classification.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,7 +73,7 @@ where
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcceptanceEvidence {
     pub(crate) status: EvidenceStatus,
-    pub(crate) artifacts: Vec<String>,
+    pub(crate) artifacts: Vec<Evidence>,
     pub(crate) required: String,
 }
 
@@ -90,6 +92,8 @@ pub struct Feature {
     pub(crate) acceptance_evidence: AcceptanceEvidence,
     pub(crate) last_verified_sha: String,
     pub(crate) known_differences: Vec<String>,
+    #[serde(default)]
+    pub(crate) implementation_pointers: Vec<ImplementationPointer>,
 }
 
 impl Feature {
@@ -174,6 +178,16 @@ pub(crate) struct EvidencePolicy {
     pub(crate) initial_status: String,
     pub(crate) acceptance_evidence_state: String,
     pub(crate) legacy_typescript_is_not_rust_acceptance_evidence: bool,
+    #[serde(default)]
+    pub(crate) allowed_statuses: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) artifact_fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) every_artifact_names_an_enabled_rust_test: Option<bool>,
+    #[serde(default)]
+    pub(crate) implementation_pointers_are_not_acceptance_evidence: Option<bool>,
+    #[serde(default)]
+    pub(crate) status_totals: Option<BTreeMap<String, usize>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

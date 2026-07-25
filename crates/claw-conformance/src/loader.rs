@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
+use crate::claims::{validate_evidence_as, validate_implementation_pointers};
 use crate::error::{ConformanceError, ViolationCode};
 use crate::model::{
     ChannelCounts, ChannelItem, Classification, ClientCounts, ClientItem, ConfigDomainCounts,
@@ -18,17 +19,12 @@ use crate::model::{
 };
 
 const BASELINE_SHA: &str = "b43e832fcc8000ed7287c7accc54e381db607f85";
-
-const IMMUTABLE_SUPPORT_SPECS: [(&str, &str); 2] = [
-    (
-        "baseline.json",
-        "02bdfca9e47ace25ffd99199f2efc8dd04b80f0c4b35c8a63b08700dd9846dea",
-    ),
-    (
-        "feature-ledger.schema.json",
-        "ee62fe4022cf7a3dc5165b817547dc07a49b3d0db763ca8b2c153512ce328525",
-    ),
-];
+const BASELINE_HASH: &str = "02bdfca9e47ace25ffd99199f2efc8dd04b80f0c4b35c8a63b08700dd9846dea";
+const LEGACY_FEATURE_SCHEMA_HASH: &str =
+    "ee62fe4022cf7a3dc5165b817547dc07a49b3d0db763ca8b2c153512ce328525";
+const TRANSITION_FEATURE_SCHEMA_HASH: &str =
+    "15a7a366313e5c23dac7abdc5105f6eb630082c334dc0d0dfcd263acddeffcfe";
+const BASELINE_KNOWN_DIFFERENCE: &str = "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline.";
 
 const LEDGER_SPECS: [(&str, &str, Classification, usize); 3] = [
     (
@@ -127,26 +123,42 @@ impl Contract {
     /// Loads all three ledgers and all ten inventories from `compat/upstream`.
     pub fn load(root: impl AsRef<Path>) -> Result<Self, ConformanceError> {
         let root = root.as_ref();
+        let repository_root = repository_root_for_contract(root);
+        let baseline_bytes = read_file(root, "baseline.json")?;
+        verify_hash(
+            "baseline.json",
+            &baseline_bytes,
+            BASELINE_HASH,
+            ViolationCode::ManifestDrift,
+            "baseline.json",
+            "frozen support artifact changed",
+        )?;
+        let schema_bytes = read_file(root, "feature-ledger.schema.json")?;
+        let schema_hash = verify_hashes(
+            "feature-ledger.schema.json",
+            &schema_bytes,
+            &[LEGACY_FEATURE_SCHEMA_HASH, TRANSITION_FEATURE_SCHEMA_HASH],
+            ViolationCode::ManifestDrift,
+            "feature-ledger.schema.json",
+            "frozen support artifact changed",
+        )?;
+        let transition_schema = schema_hash == TRANSITION_FEATURE_SCHEMA_HASH;
         let manifest: Manifest = parse_file(root, "manifest.json")?;
-        validate_manifest(&manifest)?;
-        for (path, expected_hash) in IMMUTABLE_SUPPORT_SPECS {
-            let bytes = read_file(root, path)?;
-            verify_hash(
-                path,
-                &bytes,
-                expected_hash,
-                ViolationCode::ManifestDrift,
-                path,
-                "frozen support artifact changed",
-            )?;
-        }
+        validate_manifest(&manifest, transition_schema)?;
 
         let mut ledgers = Vec::with_capacity(LEDGER_SPECS.len());
         let mut feature_ids = BTreeSet::new();
         for (path, expected_id, classification, expected_rows) in LEDGER_SPECS {
             let bytes = read_file(root, path)?;
             let ledger: FeatureLedger = parse_bytes(path, &bytes)?;
-            validate_ledger(&ledger, path, expected_id, classification, expected_rows)?;
+            validate_ledger(
+                &ledger,
+                path,
+                expected_id,
+                classification,
+                expected_rows,
+                &repository_root,
+            )?;
             for feature in ledger.features() {
                 if !feature_ids.insert(feature.id().to_owned()) {
                     return Err(ConformanceError::new(
@@ -168,6 +180,7 @@ impl Contract {
                 ),
             ));
         }
+        validate_manifest_status_totals(&manifest, &ledgers, transition_schema)?;
 
         let mut inventories = BTreeMap::new();
         for (path, expected_id, expected_rows, expected_hash) in INVENTORY_SPECS {
@@ -217,7 +230,7 @@ impl Contract {
     }
 }
 
-fn validate_manifest(manifest: &Manifest) -> Result<(), ConformanceError> {
+fn validate_manifest(manifest: &Manifest, transition_schema: bool) -> Result<(), ConformanceError> {
     let fail = |message: String| {
         ConformanceError::new(
             ViolationCode::ManifestDrift,
@@ -309,6 +322,102 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ConformanceError> {
             "canonical counts or evidence policy changed".to_owned(),
         ));
     }
+    let transition_fields = [
+        manifest.evidence_policy.allowed_statuses.is_some(),
+        manifest.evidence_policy.artifact_fields.is_some(),
+        manifest
+            .evidence_policy
+            .every_artifact_names_an_enabled_rust_test
+            .is_some(),
+        manifest
+            .evidence_policy
+            .implementation_pointers_are_not_acceptance_evidence
+            .is_some(),
+        manifest.evidence_policy.status_totals.is_some(),
+    ];
+    if !transition_schema && transition_fields.iter().any(|present| *present) {
+        return Err(fail(
+            "legacy evidence policy must not declare transition fields".to_owned(),
+        ));
+    }
+    if transition_schema && transition_fields.iter().any(|present| !present) {
+        return Err(fail(
+            "transition evidence lifecycle policy is incomplete".to_owned(),
+        ));
+    }
+    if transition_schema
+        && (manifest.evidence_policy.allowed_statuses.as_deref()
+            != Some(&[
+                "unimplemented".to_owned(),
+                "partial".to_owned(),
+                "implemented".to_owned(),
+            ])
+            || manifest.evidence_policy.artifact_fields.as_deref()
+                != Some(&["path".to_owned(), "test".to_owned()])
+            || manifest
+                .evidence_policy
+                .every_artifact_names_an_enabled_rust_test
+                != Some(true)
+            || manifest
+                .evidence_policy
+                .implementation_pointers_are_not_acceptance_evidence
+                != Some(true))
+    {
+        return Err(fail(
+            "transition evidence lifecycle policy changed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_status_totals(
+    manifest: &Manifest,
+    ledgers: &[FeatureLedger],
+    transition_schema: bool,
+) -> Result<(), ConformanceError> {
+    if !transition_schema {
+        if ledgers
+            .iter()
+            .flat_map(FeatureLedger::features)
+            .any(|feature| feature.status != LedgerStatus::Unimplemented)
+        {
+            return Err(ConformanceError::new(
+                ViolationCode::LedgerDrift,
+                Some("ledgers".to_owned()),
+                "legacy feature schema does not permit ledger status transitions".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let Some(expected) = &manifest.evidence_policy.status_totals else {
+        return Err(ConformanceError::new(
+            ViolationCode::ManifestDrift,
+            Some("manifest.json".to_owned()),
+            "transition manifest must declare status_totals".to_owned(),
+        ));
+    };
+    let mut actual = [
+        ("unimplemented".to_owned(), 0_usize),
+        ("partial".to_owned(), 0_usize),
+        ("implemented".to_owned(), 0_usize),
+    ]
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    for feature in ledgers.iter().flat_map(FeatureLedger::features) {
+        let key = match feature.status {
+            LedgerStatus::Unimplemented => "unimplemented",
+            LedgerStatus::Partial => "partial",
+            LedgerStatus::Implemented => "implemented",
+        };
+        *actual.get_mut(key).expect("status key is fixed") += 1;
+    }
+    if expected != &actual {
+        return Err(ConformanceError::new(
+            ViolationCode::ManifestDrift,
+            Some("manifest.json".to_owned()),
+            "manifest status_totals do not match mutable ledger rows".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -318,6 +427,7 @@ fn validate_ledger(
     expected_id: &str,
     expected_classification: Classification,
     expected_rows: usize,
+    repository_root: &Path,
 ) -> Result<(), ConformanceError> {
     if ledger.schema_version != 1
         || ledger.id() != expected_id
@@ -366,18 +476,6 @@ fn validate_ledger(
                 format!("last_verified_sha must equal {BASELINE_SHA}"),
             ));
         }
-        if feature
-            .acceptance_evidence
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.trim().is_empty())
-        {
-            return Err(ConformanceError::new(
-                ViolationCode::LedgerEvidence,
-                Some(feature.id().to_owned()),
-                "acceptance evidence contains a blank artifact".to_owned(),
-            ));
-        }
         if feature.acceptance_evidence.required.trim().is_empty() {
             return Err(ConformanceError::new(
                 ViolationCode::LedgerEvidence,
@@ -385,7 +483,7 @@ fn validate_ledger(
                 "acceptance evidence requirement must not be blank".to_owned(),
             ));
         }
-        validate_ledger_evidence(feature)?;
+        validate_ledger_evidence(feature, repository_root)?;
     }
     Ok(())
 }
@@ -453,7 +551,10 @@ fn validate_feature_schema(
     Ok(())
 }
 
-fn validate_ledger_evidence(feature: &crate::model::Feature) -> Result<(), ConformanceError> {
+fn validate_ledger_evidence(
+    feature: &crate::model::Feature,
+    repository_root: &Path,
+) -> Result<(), ConformanceError> {
     let fail = |message: &str| {
         ConformanceError::new(
             ViolationCode::LedgerEvidence,
@@ -468,6 +569,16 @@ fn validate_ledger_evidence(feature: &crate::model::Feature) -> Result<(), Confo
             {
                 return Err(fail(
                     "unimplemented ledger status requires missing acceptance evidence",
+                ));
+            }
+            if !feature.implementation_pointers.is_empty() {
+                return Err(fail(
+                    "unimplemented ledger status must not record implementation pointers",
+                ));
+            }
+            if feature.known_differences.as_slice() != [BASELINE_KNOWN_DIFFERENCE] {
+                return Err(fail(
+                    "unimplemented ledger status must keep the frozen baseline known difference",
                 ));
             }
         }
@@ -495,6 +606,29 @@ fn validate_ledger_evidence(feature: &crate::model::Feature) -> Result<(), Confo
                 return Err(fail("implemented ledger status requires accepted evidence"));
             }
         }
+    }
+    if feature.status != LedgerStatus::Unimplemented {
+        if feature
+            .known_differences
+            .iter()
+            .any(|difference| difference == BASELINE_KNOWN_DIFFERENCE)
+        {
+            return Err(fail(
+                "implemented or partial ledger status must remove the baseline no-implementation difference",
+            ));
+        }
+        validate_evidence_as(
+            repository_root,
+            feature.id(),
+            &feature.acceptance_evidence.artifacts,
+            ViolationCode::LedgerEvidence,
+        )?;
+        validate_implementation_pointers(
+            repository_root,
+            feature.id(),
+            &feature.implementation_pointers,
+            ViolationCode::LedgerEvidence,
+        )?;
     }
     Ok(())
 }
@@ -716,6 +850,24 @@ fn read_file(root: &Path, relative: &str) -> Result<Vec<u8>, ConformanceError> {
     })
 }
 
+fn repository_root_for_contract(contract_root: &Path) -> PathBuf {
+    if contract_root.file_name().and_then(|name| name.to_str()) == Some("upstream")
+        && contract_root
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("compat")
+    {
+        contract_root
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(contract_root)
+            .to_path_buf()
+    } else {
+        contract_root.to_path_buf()
+    }
+}
+
 fn verify_hash(
     path: &str,
     bytes: &[u8],
@@ -738,6 +890,35 @@ fn verify_hash(
             format!("{reason} in {path}; expected SHA-256 {expected}, found {actual}"),
         ))
     }
+}
+
+fn verify_hashes<'a>(
+    path: &str,
+    bytes: &[u8],
+    expected: &'a [&str],
+    code: ViolationCode,
+    subject: &str,
+    reason: &str,
+) -> Result<&'a str, ConformanceError> {
+    let normalized = normalize_line_endings(bytes);
+    let actual = Sha256::digest(&normalized)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    expected
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == actual)
+        .ok_or_else(|| {
+            ConformanceError::new(
+                code,
+                Some(subject.to_owned()),
+                format!(
+                    "{reason} in {path}; expected one of SHA-256 {}, found {actual}",
+                    expected.join(", ")
+                ),
+            )
+        })
 }
 
 fn normalize_line_endings(bytes: &[u8]) -> Vec<u8> {

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use claw_conformance::{
-    ClaimLevel, ConformanceError, Contract, Evidence, FeatureClaim, InventoryClaim, ParityStatus,
-    Registry, ViolationCode, discover_claim_files, generate_report,
+    ClaimLevel, ConformanceError, Contract, Evidence, FeatureClaim, ImplementationPointer,
+    InventoryClaim, ParityStatus, Registry, ViolationCode, discover_claim_files, generate_report,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +85,27 @@ fn mutate_json(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
         serde_json::to_vec_pretty(&value).expect("serialize JSON fixture"),
     )
     .expect("write JSON fixture");
+}
+
+fn enable_transition_policy(root: &Path, unimplemented: usize, partial: usize, implemented: usize) {
+    let schema = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("transition-feature-ledger.schema.json");
+    fs::copy(schema, root.join("feature-ledger.schema.json"))
+        .expect("install transition schema fixture");
+    mutate_json(&root.join("manifest.json"), |manifest| {
+        let policy = &mut manifest["evidence_policy"];
+        policy["allowed_statuses"] = serde_json::json!(["unimplemented", "partial", "implemented"]);
+        policy["artifact_fields"] = serde_json::json!(["path", "test"]);
+        policy["every_artifact_names_an_enabled_rust_test"] = serde_json::json!(true);
+        policy["implementation_pointers_are_not_acceptance_evidence"] = serde_json::json!(true);
+        policy["status_totals"] = serde_json::json!({
+            "unimplemented": unimplemented,
+            "partial": partial,
+            "implemented": implemented
+        });
+    });
 }
 
 #[test]
@@ -264,6 +285,170 @@ fn metadata_registration_never_inflates_implementation() {
 }
 
 #[test]
+fn claim_manifest_uses_structured_test_evidence_and_non_evidential_pointers() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let tests = fixture.root.join("crates").join("demo").join("tests");
+    let source = fixture.root.join("crates").join("demo").join("src");
+    fs::create_dir_all(&tests).expect("create claim test directory");
+    fs::create_dir_all(&source).expect("create claim source directory");
+    fs::write(
+        tests.join("protocol.rs"),
+        "#[test]\nfn proves_gateway_v4() {}\n",
+    )
+    .expect("write claim evidence");
+    fs::write(source.join("protocol.rs"), "pub const VERSION: u8 = 4;\n")
+        .expect("write claim implementation");
+    let claims_path = fixture.root.join("conformance-claims.json");
+    fs::write(
+        &claims_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "crate_name": "demo",
+            "features": [{
+                "feature_id": "gateway.protocol.v4",
+                "level": "implemented",
+                "evidence": [{
+                    "path": "crates/demo/tests/protocol.rs",
+                    "test": "proves_gateway_v4"
+                }],
+                "implementation_pointers": [{
+                    "path": "crates/demo/src/protocol.rs",
+                    "note": "Defines the implemented protocol version."
+                }]
+            }],
+            "inventories": []
+        }))
+        .expect("serialize claims"),
+    )
+    .expect("write claims");
+
+    let mut registry = Registry::new();
+    registry
+        .load_claims_file(&claims_path)
+        .expect("load structured claims");
+    let report =
+        generate_report(&contract, &registry, &fixture.root).expect("validate structured claims");
+    assert_eq!(report.totals.implemented, 1);
+    assert_eq!(report.totals.partial, 0);
+    assert_eq!(report.totals.unimplemented, 46);
+}
+
+#[test]
+fn claim_manifest_rejects_legacy_test_name_field() {
+    let fixture = Fixture::empty();
+    let claims_path = fixture.root.join("conformance-claims.json");
+    fs::write(
+        &claims_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "crate_name": "demo",
+            "features": [{
+                "feature_id": "gateway.protocol.v4",
+                "level": "implemented",
+                "evidence": [{
+                    "path": "crates/demo/tests/protocol.rs",
+                    "test_name": "proves_gateway_v4"
+                }]
+            }],
+            "inventories": []
+        }))
+        .expect("serialize legacy claims"),
+    )
+    .expect("write legacy claims");
+
+    let error = Registry::new()
+        .load_claims_file(&claims_path)
+        .expect_err("legacy test_name field must fail");
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), claims_path.to_str());
+    assert_eq!(error.json_path(), Some("features[0].evidence[0].test_name"));
+}
+
+#[test]
+fn implementation_pointer_cannot_replace_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let source = fixture.root.join("crates").join("demo").join("src");
+    fs::create_dir_all(&source).expect("create pointer directory");
+    fs::write(source.join("protocol.rs"), "pub const VERSION: u8 = 4;\n")
+        .expect("write pointer target");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(
+            FeatureClaim::implemented("gateway.protocol.v4", Vec::new())
+                .with_implementation_pointers(vec![ImplementationPointer::new(
+                    "crates/demo/src/protocol.rs",
+                    "Defines the protocol version.",
+                )]),
+        )
+        .expect("register pointer-only claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("pointer-only claim must fail");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(error.message(), "claim has no recorded evidence");
+}
+
+#[test]
+fn evidence_path_resolution_is_ordinal_across_platforms() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let tests = fixture.root.join("crates").join("demo").join("tests");
+    fs::create_dir_all(&tests).expect("create evidence directory");
+    fs::write(tests.join("protocol.rs"), "#[test]\nfn proves_v4() {}\n").expect("write evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test("CRATES/demo/tests/protocol.rs", "proves_v4")],
+        ))
+        .expect("register case-aliased evidence");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("case-aliased path must fail ordinal resolution");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence file 'CRATES/demo/tests/protocol.rs' does not exist"
+    );
+}
+
+#[test]
+fn trailing_dot_alias_cannot_reach_self_referential_contract_data() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let compat = fixture.root.join("compat").join("upstream");
+    fs::create_dir_all(&compat).expect("create compatibility directory");
+    fs::write(compat.join("manifest.json"), "{}\n").expect("write compatibility file");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(
+            FeatureClaim::registered("gateway.protocol.v4").with_implementation_pointers(vec![
+                ImplementationPointer::new(
+                    "compat./upstream/manifest.json",
+                    "Attempted trailing-dot alias.",
+                ),
+            ]),
+        )
+        .expect("register trailing-dot pointer");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("trailing-dot alias must fail ordinal resolution");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "implementation pointer 'compat./upstream/manifest.json' does not exist"
+    );
+}
+
+#[test]
 fn fabricated_test_name_is_rejected() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
     let fixture = Fixture::empty();
@@ -287,10 +472,114 @@ fn fabricated_test_name_is_rejected() {
     assert_eq!(error.subject(), Some("gateway.protocol.v4"));
     assert_eq!(
         error.message(),
-        format!(
-            "evidence test 'fabricated_test' is not declared in '{}'",
-            evidence_path.display()
-        )
+        "evidence test 'fabricated_test' is not declared in 'crates/demo/tests.rs'"
+    );
+}
+
+#[test]
+fn fabricated_module_qualification_is_rejected() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates").join("demo").join("tests.rs");
+    fs::create_dir_all(fixture.root.join("crates").join("demo")).expect("create evidence parent");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "mod actual_module {\n    #[test]\n    fn real_test() {}\n}\n",
+    )
+    .expect("write qualified evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(
+                &evidence_path,
+                "fabricated_module::real_test",
+            )],
+        ))
+        .expect("register qualified claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("fabricated module qualification must fail");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'fabricated_module::real_test' is not declared in \
+         'crates/demo/tests.rs'"
+    );
+}
+
+#[test]
+fn detached_test_attribute_does_not_bless_an_ordinary_function() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates").join("demo").join("tests.rs");
+    fs::create_dir_all(fixture.root.join("crates").join("demo")).expect("create evidence parent");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[test]\nfn real_test() {}\nfn ordinary_function() {}\n",
+    )
+    .expect("write detached attribute evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "ordinary_function")],
+        ))
+        .expect("register ordinary function claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("ordinary function must not inherit a detached test attribute");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'ordinary_function' is not declared in 'crates/demo/tests.rs'"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_evidence_is_rejected_even_when_its_target_is_in_repository() {
+    use std::os::unix::fs::symlink;
+
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let legacy = fixture.root.join("src");
+    let evidence = fixture.root.join("crates").join("demo").join("tests");
+    fs::create_dir_all(&legacy).expect("create legacy directory");
+    fs::create_dir_all(&evidence).expect("create evidence directory");
+    fs::write(
+        legacy.join("legacy.rs"),
+        "#[test]\nfn forged_evidence() {}\n",
+    )
+    .expect("write forbidden target");
+    symlink(
+        fixture.root.join("src").join("legacy.rs"),
+        evidence.join("proof.rs"),
+    )
+    .expect("create evidence symlink");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(
+                "crates/demo/tests/proof.rs",
+                "forged_evidence",
+            )],
+        ))
+        .expect("register symlinked evidence");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("symlinked evidence must fail");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence file 'crates/demo/tests/proof.rs' does not exist"
     );
 }
 
@@ -383,17 +672,44 @@ fn raised_ledger_status_without_evidence_is_rejected() {
 #[test]
 fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
     let fixture = Fixture::copy_upstream();
+    enable_transition_policy(&fixture.root, 45, 1, 1);
+    let tests = fixture
+        .root
+        .join("crates")
+        .join("claw-gateway")
+        .join("tests");
+    fs::create_dir_all(&tests).expect("create transitioned evidence directory");
+    fs::write(
+        tests.join("protocol.rs"),
+        "#[test]\nfn negotiates_v4() {}\n#[test]\nfn accepts_node_v3() {}\n",
+    )
+    .expect("write transitioned evidence");
+    let source = fixture.root.join("crates").join("claw-gateway").join("src");
+    fs::create_dir_all(&source).expect("create implementation directory");
+    fs::write(source.join("protocol.rs"), "pub const VERSION: u8 = 4;\n")
+        .expect("write implementation pointer");
     let path = fixture.root.join("ledgers").join("gateway-core.json");
     mutate_json(&path, |ledger| {
         let features = ledger["features"].as_array_mut().expect("features array");
         features[0]["status"] = serde_json::json!("partial");
         features[0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
-        features[0]["acceptance_evidence"]["artifacts"] =
-            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+        features[0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "negotiates_v4"
+        }]);
+        features[0]["known_differences"] =
+            serde_json::json!(["General client rejection remains incomplete."]);
+        features[0]["implementation_pointers"] = serde_json::json!([{
+            "path": "crates/claw-gateway/src/protocol.rs",
+            "note": "Defines the Rust protocol version."
+        }]);
         features[1]["status"] = serde_json::json!("implemented");
         features[1]["acceptance_evidence"]["status"] = serde_json::json!("accepted");
-        features[1]["acceptance_evidence"]["artifacts"] =
-            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::accepts_node_v3"]);
+        features[1]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "accepts_node_v3"
+        }]);
+        features[1]["known_differences"] = serde_json::json!(["No known differences."]);
     });
     let validator = fixture.root.join("validate.ps1");
     let mut validator_source = fs::read_to_string(&validator).expect("read validator");
@@ -410,6 +726,111 @@ fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
     assert_eq!(
         contract.ledgers()[0].features()[1].id(),
         "gateway.protocol.node-v3-window"
+    );
+}
+
+#[test]
+fn legacy_schema_cannot_authorize_a_ledger_transition() {
+    let fixture = Fixture::copy_upstream();
+    let tests = fixture
+        .root
+        .join("crates")
+        .join("claw-gateway")
+        .join("tests");
+    fs::create_dir_all(&tests).expect("create legacy evidence directory");
+    fs::write(
+        tests.join("protocol.rs"),
+        "#[test]\nfn negotiates_v4() {}\n",
+    )
+    .expect("write legacy evidence");
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "negotiates_v4"
+        }]);
+        ledger["features"][0]["known_differences"] =
+            serde_json::json!(["Gateway negotiation remains incomplete."]);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerDrift);
+    assert_eq!(error.subject(), Some("ledgers"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "legacy feature schema does not permit ledger status transitions"
+    );
+}
+
+#[test]
+fn transition_manifest_policy_and_status_totals_are_accepted() {
+    let fixture = Fixture::copy_upstream();
+    enable_transition_policy(&fixture.root, 47, 0, 0);
+
+    let contract = Contract::load(&fixture.root).expect("load transition manifest");
+    assert_eq!(contract.ledgers().len(), 3);
+    assert_eq!(
+        contract
+            .ledgers()
+            .iter()
+            .map(|ledger| ledger.features().len())
+            .sum::<usize>(),
+        47
+    );
+}
+
+#[test]
+fn transition_manifest_status_totals_must_match_ledgers() {
+    let fixture = Fixture::copy_upstream();
+    enable_transition_policy(&fixture.root, 46, 1, 0);
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::ManifestDrift);
+    assert_eq!(error.subject(), Some("manifest.json"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "manifest status_totals do not match mutable ledger rows"
+    );
+}
+
+#[test]
+fn ledger_artifact_must_name_an_enabled_rust_test() {
+    let fixture = Fixture::copy_upstream();
+    let tests = fixture
+        .root
+        .join("crates")
+        .join("claw-gateway")
+        .join("tests");
+    fs::create_dir_all(&tests).expect("create ledger evidence directory");
+    fs::write(
+        tests.join("protocol.rs"),
+        "#[test]\nfn real_gateway_test() {}\n",
+    )
+    .expect("write ledger evidence");
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "fabricated_gateway_test"
+        }]);
+        ledger["features"][0]["known_differences"] =
+            serde_json::json!(["Gateway negotiation remains incomplete."]);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence test 'fabricated_gateway_test' is not declared in \
+         'crates/claw-gateway/tests/protocol.rs'"
     );
 }
 
@@ -489,7 +910,12 @@ fn blank_ledger_evidence_artifact_is_rejected() {
     mutate_json(&path, |ledger| {
         ledger["features"][0]["status"] = serde_json::json!("partial");
         ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
-        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!(["   "]);
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": " ",
+            "test": "negotiates_v4"
+        }]);
+        ledger["features"][0]["known_differences"] =
+            serde_json::json!(["Negotiation remains incomplete."]);
     });
 
     let error = load_error(&fixture.root);
@@ -498,7 +924,7 @@ fn blank_ledger_evidence_artifact_is_rejected() {
     assert_eq!(error.json_path(), None);
     assert_eq!(
         error.message(),
-        "acceptance evidence contains a blank artifact"
+        "evidence path ' ' must be a repository-relative forward-slash path"
     );
 }
 
@@ -509,8 +935,10 @@ fn partial_ledger_status_requires_partial_evidence_state() {
     mutate_json(&path, |ledger| {
         ledger["features"][0]["status"] = serde_json::json!("partial");
         ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("accepted");
-        ledger["features"][0]["acceptance_evidence"]["artifacts"] =
-            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "negotiates_v4"
+        }]);
     });
 
     let error = load_error(&fixture.root);
@@ -530,8 +958,10 @@ fn blank_ledger_evidence_requirement_is_rejected() {
     mutate_json(&path, |ledger| {
         ledger["features"][0]["status"] = serde_json::json!("partial");
         ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
-        ledger["features"][0]["acceptance_evidence"]["artifacts"] =
-            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "negotiates_v4"
+        }]);
         ledger["features"][0]["acceptance_evidence"]["required"] = serde_json::json!(" ");
     });
 
@@ -551,8 +981,10 @@ fn unimplemented_ledger_status_rejects_populated_evidence() {
     let path = fixture.root.join("ledgers").join("gateway-core.json");
     mutate_json(&path, |ledger| {
         ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
-        ledger["features"][0]["acceptance_evidence"]["artifacts"] =
-            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!([{
+            "path": "crates/claw-gateway/tests/protocol.rs",
+            "test": "negotiates_v4"
+        }]);
     });
 
     let error = load_error(&fixture.root);

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::claims::{ClaimLevel, Registry, validate_evidence};
+use crate::claims::{ClaimLevel, Registry, validate_evidence, validate_implementation_pointers};
 use crate::error::{ConformanceError, ViolationCode};
 use crate::loader::Contract;
 
@@ -197,6 +197,12 @@ pub fn generate_report(
         if claim.level != ClaimLevel::Registered || !claim.evidence.is_empty() {
             validate_evidence(repository_root, feature_id, &claim.evidence)?;
         }
+        validate_implementation_pointers(
+            repository_root,
+            feature_id,
+            &claim.implementation_pointers,
+            ViolationCode::ClaimEvidence,
+        )?;
     }
 
     let known_inventory = contract
@@ -223,6 +229,12 @@ pub fn generate_report(
                 &claim.evidence,
             )?;
         }
+        validate_implementation_pointers(
+            repository_root,
+            &format!("{inventory_id}:{record_id}"),
+            &claim.implementation_pointers,
+            ViolationCode::ClaimEvidence,
+        )?;
     }
 
     let ledgers = contract
