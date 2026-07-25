@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use claw_application::model::approval::{ApprovalDecision, ApprovalWithdrawal};
 use claw_application::model::goal::GoalRecord;
-use claw_application::model::ids::{ApprovalId, GoalId, IdentifierError, TurnId};
+use claw_application::model::ids::{ApprovalId, IdentifierError, TurnId};
 use claw_application::model::message::{AssistantMessage, PartialAssistantMessage, ToolCall};
 use claw_application::model::session::{SessionEvent, SessionState};
 use claw_application::ports::PortError;
@@ -41,6 +41,7 @@ use crate::command::{
     ScopeSet, TurnOptions,
 };
 use crate::goal::{GoalConfig, GoalError, GoalService};
+use crate::goal_tool::{GOAL_TOOL_NAME, goal_tool_descriptor, parse_goal_action};
 use crate::session::{StateMachineError, TurnStateMachine};
 use crate::stream::{StreamAssembler, StreamError, StreamEvent, StreamPayload};
 use crate::suspend::{
@@ -48,6 +49,12 @@ use crate::suspend::{
     WorkRefused,
 };
 use crate::tool::{ToolExecutionError, ToolExecutor, ToolExecutorConfig};
+
+/// The `/model` argument that clears a session's model override.
+///
+/// It is matched case-insensitively, so `/model default` and `/model DEFAULT` both hand model
+/// selection back to the provider adapter.
+pub const DEFAULT_MODEL_ARGUMENT: &str = "default";
 
 /// Tunable limits for one runtime instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +71,11 @@ pub struct RuntimeConfig {
     pub context_token_budget: u32,
     /// Durable goal limits.
     pub goals: GoalConfig,
+    /// Whether the model-callable goal tool is advertised and served.
+    ///
+    /// Turning this off hides [`GOAL_TOOL_NAME`] from the provider's tool list and from `/tools`,
+    /// and makes a call to it fail like any other unknown tool.
+    pub goal_tool_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -75,6 +87,7 @@ impl Default for RuntimeConfig {
             max_rounds: 16,
             context_token_budget: 128_000,
             goals: GoalConfig::default(),
+            goal_tool_enabled: true,
         }
     }
 }
@@ -361,9 +374,17 @@ pub enum CommandOutcome {
         reclaimed_tokens: u32,
     },
     /// The registry resolved a command this runtime does not implement.
+    ///
+    /// Only [`CommandEffect::Custom`] reaches this: host-registered commands are dispatched by
+    /// whoever registered them, not by this crate.
     Unsupported {
         /// The command name.
         name: String,
+    },
+    /// The session's provider model selection after a `/model` command.
+    ModelSelected {
+        /// The model now pinned for the session, or `None` once the override was cleared.
+        model: Option<String>,
     },
 }
 
@@ -384,6 +405,7 @@ struct RuntimeInner {
     commands: CommandRegistry,
     directives: DirectiveRegistry,
     live: Mutex<HashMap<String, LiveTurn>>,
+    models: Mutex<HashMap<String, String>>,
     shutdown: CancellationToken,
 }
 
@@ -392,6 +414,21 @@ impl RuntimeInner {
         self.live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn models(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns every tool name the provider may call this turn.
+    fn tool_catalogue(&self) -> Vec<ToolDescriptor> {
+        let mut catalogue = self.executor.catalogue();
+        if self.config.goal_tool_enabled {
+            catalogue.push(goal_tool_descriptor());
+        }
+        catalogue
     }
 }
 
@@ -448,6 +485,7 @@ impl Runtime {
                 commands: CommandRegistry::builtin(),
                 directives: DirectiveRegistry::builtin(),
                 live: Mutex::new(HashMap::new()),
+                models: Mutex::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
             }),
             tracker: TaskTracker::new(),
@@ -464,6 +502,21 @@ impl Runtime {
     #[must_use]
     pub fn goals(&self) -> &GoalService {
         &self.inner.goals
+    }
+
+    /// Returns the model pinned for a session by `/model`, if any.
+    ///
+    /// A per-turn `!model` directive overrides this for that turn only and does not change what
+    /// this returns.
+    #[must_use]
+    pub fn selected_model(&self, session_id: &SessionId) -> Option<String> {
+        self.inner.models().get(session_id.as_str()).cloned()
+    }
+
+    /// Returns every tool the runtime can dispatch, including the model-callable goal tool.
+    #[must_use]
+    pub fn tool_catalogue(&self) -> Vec<ToolDescriptor> {
+        self.inner.tool_catalogue()
     }
 
     /// Returns the cooperative suspension controller.
@@ -629,7 +682,7 @@ impl Runtime {
             CommandEffect::ShowStatus => Ok(CommandOutcome::Sessions(
                 self.inner.ports.state.list_sessions().await?,
             )),
-            CommandEffect::ListTools => Ok(CommandOutcome::Tools(self.inner.executor.catalogue())),
+            CommandEffect::ListTools => Ok(CommandOutcome::Tools(self.inner.tool_catalogue())),
             CommandEffect::CancelTurn => {
                 let live = self.inner.live();
                 let turn = live
@@ -644,12 +697,7 @@ impl Runtime {
                 self.inner.goals.active(session_id).await?,
             )),
             CommandEffect::SetGoal(objective) => {
-                let goal_id = self.mint_goal_id(session_id).await?;
-                let record = self
-                    .inner
-                    .goals
-                    .set(session_id, goal_id, &objective)
-                    .await?;
+                let record = self.inner.goals.start(session_id, &objective).await?;
                 Ok(CommandOutcome::Goal(Some(record)))
             }
             CommandEffect::CloseGoal(status) => {
@@ -723,15 +771,10 @@ impl Runtime {
                     self.inner.suspension.resume(&lease_id)?,
                 ))
             }
-            CommandEffect::SetModel(_) | CommandEffect::Custom { .. } => {
-                Ok(CommandOutcome::Unsupported {
-                    name: match effect {
-                        CommandEffect::SetModel(_) => "model".to_owned(),
-                        CommandEffect::Custom { name, .. } => name,
-                        _ => unreachable!("only the two arms above reach here"),
-                    },
-                })
-            }
+            CommandEffect::SetModel(model) => Ok(CommandOutcome::ModelSelected {
+                model: self.select_model(session_id, &model),
+            }),
+            CommandEffect::Custom { name, .. } => Ok(CommandOutcome::Unsupported { name }),
         }
     }
 
@@ -782,9 +825,19 @@ impl Runtime {
         Ok(CommandOutcome::Acknowledged)
     }
 
-    async fn mint_goal_id(&self, session_id: &SessionId) -> Result<GoalId, RuntimeError> {
-        let existing = self.inner.goals.history(session_id).await?.len();
-        Ok(GoalId::new(format!("goal-{}", existing + 1))?)
+    /// Records or clears the session's provider model override.
+    ///
+    /// The literal argument [`DEFAULT_MODEL_ARGUMENT`], compared case-insensitively, clears the
+    /// override so the provider adapter falls back to its own default.
+    fn select_model(&self, session_id: &SessionId, requested: &str) -> Option<String> {
+        let requested = requested.trim();
+        let mut models = self.inner.models();
+        if requested.eq_ignore_ascii_case(DEFAULT_MODEL_ARGUMENT) {
+            models.remove(session_id.as_str());
+            return None;
+        }
+        models.insert(session_id.as_str().to_owned(), requested.to_owned());
+        Some(requested.to_owned())
     }
 }
 
@@ -867,12 +920,7 @@ impl TurnExecution {
             .await?;
 
         if let Some(objective) = self.options.goal.clone() {
-            let goal_id = GoalId::new(format!("goal-turn-{}", self.turn.ordinal()))?;
-            let record = self
-                .inner
-                .goals
-                .set(&self.session_id, goal_id, &objective)
-                .await?;
+            let record = self.inner.goals.start(&self.session_id, &objective).await?;
             self.emit(RuntimeEventKind::GoalUpdated {
                 goal: record.clone(),
             })
@@ -893,14 +941,22 @@ impl TurnExecution {
 
         let tool_names: Vec<String> = if self.options.tools_enabled {
             self.inner
-                .executor
-                .catalogue()
+                .tool_catalogue()
                 .into_iter()
                 .map(|descriptor| descriptor.name)
                 .collect()
         } else {
             Vec::new()
         };
+
+        // A `!model` directive wins for this turn only; otherwise the session's `/model` selection
+        // applies. Resolved once so every round of the turn runs against the same model even if an
+        // operator issues `/model` while the turn is streaming.
+        let model = self
+            .options
+            .model
+            .clone()
+            .or_else(|| self.inner.models().get(self.session_id.as_str()).cloned());
 
         let mut changed_workspace = false;
 
@@ -931,6 +987,7 @@ impl TurnExecution {
                     round,
                     messages: assembled.messages,
                     tool_names: tool_names.clone(),
+                    model: model.clone(),
                 })
                 .await?;
 
@@ -1018,6 +1075,29 @@ impl TurnExecution {
             }
 
             for call in calls {
+                if self.inner.config.goal_tool_enabled && call.name == GOAL_TOOL_NAME {
+                    self.emit(RuntimeEventKind::ToolStarted { call: call.clone() })
+                        .await;
+                    let outcome = self.run_goal_tool(&call).await?;
+                    self.ingest(ContextItem::ToolResult {
+                        tool_name: call.name.clone(),
+                        output: outcome.output.clone(),
+                        failed: outcome.status.is_failure(),
+                    })
+                    .await?;
+                    self.emit(RuntimeEventKind::ToolFinished {
+                        outcome: outcome.clone(),
+                    })
+                    .await;
+                    tool_outcomes.push(outcome);
+
+                    if self.cancel.is_cancelled() {
+                        self.advance(machine, SessionEvent::Cancel).await?;
+                        return Ok(());
+                    }
+                    continue;
+                }
+
                 let requires_approval = self
                     .inner
                     .executor
@@ -1090,6 +1170,47 @@ impl TurnExecution {
 
         self.advance(machine, SessionEvent::Block).await?;
         Ok(())
+    }
+
+    /// Applies one model-authored goal-tool call.
+    ///
+    /// Argument and goal-service failures become a failed [`ToolOutcome`] rather than a turn
+    /// failure, so a model that sends bad arguments is told about it and can retry within the same
+    /// turn. Only an event-channel failure can abort the turn, and that is not reachable here.
+    async fn run_goal_tool(&mut self, call: &ToolCall) -> Result<ToolOutcome, RuntimeError> {
+        let action = match parse_goal_action(&call.arguments) {
+            Ok(action) => action,
+            Err(error) => return Ok(Self::failed_goal_call(call, &error)),
+        };
+
+        let record = match self.inner.goals.apply(&self.session_id, &action).await {
+            Ok(record) => record,
+            Err(error) => return Ok(Self::failed_goal_call(call, &error)),
+        };
+
+        self.emit(RuntimeEventKind::GoalUpdated {
+            goal: record.clone(),
+        })
+        .await;
+
+        Ok(ToolOutcome {
+            call_id: call.call_id.clone(),
+            status: ToolStatus::Ok,
+            output: format!(
+                "goal {} is {} at revision {}",
+                record.goal_id, record.status, record.revision
+            ),
+            changed_workspace: false,
+        })
+    }
+
+    fn failed_goal_call(call: &ToolCall, error: &dyn Error) -> ToolOutcome {
+        ToolOutcome {
+            call_id: call.call_id.clone(),
+            status: ToolStatus::Failed,
+            output: error.to_string(),
+            changed_workspace: false,
+        }
     }
 
     /// Applies a pending pause and waits for the resume, honouring cancellation.

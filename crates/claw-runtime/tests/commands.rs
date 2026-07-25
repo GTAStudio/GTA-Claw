@@ -11,6 +11,7 @@ use claw_runtime::command::{
     CommandEffect, CommandError, Directive, DirectiveError, DirectiveScan, OperatorScope, ScopeSet,
     TurnOptions,
 };
+use claw_runtime::goal_tool::goal_tool_descriptor;
 use claw_runtime::runtime::{CommandOutcome, Runtime, RuntimeConfig, RuntimeError, RuntimePorts};
 use claw_runtime::suspend::{PrepareOutcome, SuspensionPhase};
 
@@ -23,12 +24,14 @@ struct Fixture {
     runtime: Runtime,
     state: Arc<MemoryState>,
     gate: Arc<Gate>,
+    provider: Arc<ScriptedProvider>,
 }
 
 fn fixture(rounds: Vec<Round>) -> Fixture {
     let clock = FakeClock::new(0);
     let state = MemoryState::new();
     let gate = Gate::new();
+    let provider = ScriptedProvider::new(rounds);
     let tools = RecordingTools::new(
         vec![readonly_tool("gate"), readonly_tool("read_file")],
         vec![
@@ -45,7 +48,7 @@ fn fixture(rounds: Vec<Round>) -> Fixture {
     let runtime = Runtime::new(
         RuntimePorts {
             clock: Arc::clone(&clock) as Arc<_>,
-            provider: ScriptedProvider::new(rounds) as Arc<_>,
+            provider: Arc::clone(&provider) as Arc<_>,
             state: Arc::clone(&state) as Arc<_>,
             tools: Arc::clone(&tools) as Arc<_>,
             approvals: RecordingApprovals::new() as Arc<_>,
@@ -58,6 +61,7 @@ fn fixture(rounds: Vec<Round>) -> Fixture {
         runtime,
         state,
         gate,
+        provider,
     }
 }
 
@@ -121,7 +125,11 @@ async fn tools_and_status_report_the_runtime_surface() {
         .expect("tools is readable");
     assert_eq!(
         tools,
-        CommandOutcome::Tools(vec![readonly_tool("gate"), readonly_tool("read_file")])
+        CommandOutcome::Tools(vec![
+            readonly_tool("gate"),
+            readonly_tool("read_file"),
+            goal_tool_descriptor(),
+        ])
     );
 
     let empty = fixture
@@ -179,7 +187,7 @@ async fn the_goal_commands_drive_the_durable_goal() {
     };
     assert_eq!(record.objective, "ship the runtime");
     assert_eq!(record.status, GoalStatus::Active);
-    assert_eq!(record.goal_id.as_str(), "goal-1");
+    assert_eq!(record.goal_id.as_str(), "cmd-goal:goal-1");
 
     let done = fixture
         .runtime
@@ -277,17 +285,25 @@ async fn compact_forwards_the_requested_reclaim_to_the_engine() {
 }
 
 #[tokio::test]
-async fn model_is_advertised_but_not_yet_implemented() {
+async fn only_host_registered_commands_report_as_unsupported() {
     let fixture = fixture(Vec::new());
 
+    // `Custom` is the extension point for commands a host registers itself. This runtime has no
+    // meaning for them, so it says so rather than guessing; every builtin effect is implemented.
     assert_eq!(
         fixture
             .runtime
-            .dispatch_command(&session("cmd-model"), "/model gpt", ScopeSet::all())
+            .execute_effect(
+                &session("cmd-custom"),
+                CommandEffect::Custom {
+                    name: "deploy".to_owned(),
+                    arguments: vec!["staging".to_owned()],
+                },
+            )
             .await
-            .expect("model parses"),
+            .expect("an unknown effect is reported, not an error"),
         CommandOutcome::Unsupported {
-            name: "model".to_owned()
+            name: "deploy".to_owned()
         }
     );
 
@@ -576,7 +592,7 @@ async fn a_goal_directive_records_a_durable_goal_before_the_turn_runs() {
         .expect("the store answers")
         .expect("the directive recorded a goal");
     assert_eq!(goal.objective, "survive the audit");
-    assert_eq!(goal.goal_id.as_str(), "goal-turn-0");
+    assert_eq!(goal.goal_id.as_str(), "cmd-goal-directive:goal-1");
 
     fixture.runtime.shutdown().await.expect("shutdown is clean");
 }
@@ -784,6 +800,187 @@ async fn suspend_drains_a_live_turn_before_it_grants_the_lease() {
         other => panic!("expected a granted lease, got {other:?}"),
     }
     assert_eq!(fixture.runtime.suspension().status().in_flight, 0);
+
+    fixture.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn model_pins_the_session_model_and_every_later_turn_uses_it() {
+    let fixture = fixture(vec![text_round("one"), text_round("two")]);
+    let session_id = session("cmd");
+
+    assert_eq!(fixture.runtime.selected_model(&session_id), None);
+
+    let outcome = fixture
+        .runtime
+        .dispatch_command(&session_id, "/model gpt-x", ScopeSet::all())
+        .await
+        .expect("the command runs");
+    assert_eq!(
+        outcome,
+        CommandOutcome::ModelSelected {
+            model: Some("gpt-x".to_owned()),
+        }
+    );
+    assert_eq!(
+        fixture.runtime.selected_model(&session_id),
+        Some("gpt-x".to_owned())
+    );
+
+    for input in ["first", "second"] {
+        fixture
+            .runtime
+            .submit(&session_id, input)
+            .await
+            .expect("the turn starts")
+            .join()
+            .await
+            .expect("the turn finishes");
+    }
+
+    assert_eq!(
+        fixture
+            .provider
+            .requests()
+            .iter()
+            .map(|request| request.model.clone())
+            .collect::<Vec<Option<String>>>(),
+        vec![Some("gpt-x".to_owned()), Some("gpt-x".to_owned())]
+    );
+
+    fixture.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn the_model_directive_overrides_the_pinned_model_for_one_turn_only() {
+    let fixture = fixture(vec![text_round("one"), text_round("two")]);
+    let session_id = session("cmd");
+
+    fixture
+        .runtime
+        .dispatch_command(&session_id, "/model pinned", ScopeSet::all())
+        .await
+        .expect("the command runs");
+
+    fixture
+        .runtime
+        .submit(&session_id, "!model overridden\nuse the other model")
+        .await
+        .expect("the turn starts")
+        .join()
+        .await
+        .expect("the turn finishes");
+    fixture
+        .runtime
+        .submit(&session_id, "back to the pin")
+        .await
+        .expect("the turn starts")
+        .join()
+        .await
+        .expect("the turn finishes");
+
+    assert_eq!(
+        fixture
+            .provider
+            .requests()
+            .iter()
+            .map(|request| request.model.clone())
+            .collect::<Vec<Option<String>>>(),
+        vec![Some("overridden".to_owned()), Some("pinned".to_owned())]
+    );
+    // The directive never touched the session-level selection.
+    assert_eq!(
+        fixture.runtime.selected_model(&session_id),
+        Some("pinned".to_owned())
+    );
+
+    fixture.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn model_default_clears_the_pin_case_insensitively() {
+    let fixture = fixture(vec![text_round("one")]);
+    let session_id = session("cmd");
+
+    fixture
+        .runtime
+        .dispatch_command(&session_id, "/model gpt-x", ScopeSet::all())
+        .await
+        .expect("the command runs");
+    let cleared = fixture
+        .runtime
+        .dispatch_command(&session_id, "/model DEFAULT", ScopeSet::all())
+        .await
+        .expect("the command runs");
+
+    assert_eq!(cleared, CommandOutcome::ModelSelected { model: None });
+    assert_eq!(fixture.runtime.selected_model(&session_id), None);
+
+    fixture
+        .runtime
+        .submit(&session_id, "go")
+        .await
+        .expect("the turn starts")
+        .join()
+        .await
+        .expect("the turn finishes");
+    assert_eq!(fixture.provider.requests()[0].model, None);
+
+    fixture.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn a_model_pin_is_scoped_to_one_session() {
+    let fixture = fixture(vec![text_round("one")]);
+    let pinned = session("pinned-session");
+    let other = session("other-session");
+
+    fixture
+        .runtime
+        .dispatch_command(&pinned, "/model gpt-x", ScopeSet::all())
+        .await
+        .expect("the command runs");
+
+    assert_eq!(
+        fixture.runtime.selected_model(&pinned),
+        Some("gpt-x".to_owned())
+    );
+    assert_eq!(fixture.runtime.selected_model(&other), None);
+
+    fixture
+        .runtime
+        .submit(&other, "go")
+        .await
+        .expect("the turn starts")
+        .join()
+        .await
+        .expect("the turn finishes");
+    assert_eq!(fixture.provider.requests()[0].model, None);
+
+    fixture.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn model_needs_the_write_scope() {
+    let fixture = fixture(Vec::new());
+
+    let error = fixture
+        .runtime
+        .dispatch_command(
+            &session("cmd"),
+            "/model gpt-x",
+            ScopeSet::all().without(OperatorScope::Write),
+        )
+        .await
+        .expect_err("a read-only caller may not switch models");
+
+    assert_eq!(
+        error,
+        RuntimeError::Command(CommandError::Unauthorized {
+            command: "model".to_owned(),
+            required: OperatorScope::Write,
+        })
+    );
 
     fixture.runtime.shutdown().await.expect("shutdown is clean");
 }

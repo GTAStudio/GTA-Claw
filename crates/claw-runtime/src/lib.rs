@@ -14,6 +14,7 @@ pub mod approval;
 pub mod command;
 pub mod context;
 pub mod goal;
+pub mod goal_tool;
 pub mod runtime;
 pub mod session;
 pub mod stream;
@@ -29,6 +30,9 @@ pub use command::{
 };
 pub use context::{ConformanceCheck, ConformanceReport, verify_context_engine};
 pub use goal::{GoalConfig, GoalError, GoalService};
+pub use goal_tool::{
+    GOAL_TOOL_NAME, GoalAction, GoalToolError, goal_tool_descriptor, parse_goal_action,
+};
 pub use runtime::{
     CommandOutcome, Runtime, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind,
     RuntimePorts, TurnHandle, TurnOutcome,

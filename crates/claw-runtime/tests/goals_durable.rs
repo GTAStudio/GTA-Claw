@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_application::model::goal::{GoalProgress, GoalStatus};
+use claw_application::model::ids::MAX_IDENTIFIER_BYTES;
 use claw_application::model::time::Timestamp;
 use claw_runtime::goal::{GoalConfig, GoalError, GoalService};
+use claw_runtime::goal_tool::GoalAction;
 
 use support::{FakeClock, MemoryGoals, goal_id, session};
 
@@ -342,4 +344,214 @@ async fn a_zero_entry_budget_is_rejected_rather_than_silently_dropping_history()
             .expect_err("a zero budget is refused"),
         GoalError::InvalidBudget
     );
+}
+
+#[tokio::test]
+async fn start_mints_sequential_identifiers_that_survive_a_restart() {
+    let store = MemoryGoals::new();
+    let clock = FakeClock::new(0);
+    let session_id = session("minting");
+
+    let first = service(&store, &clock, GoalConfig::default())
+        .start(&session_id, "first objective")
+        .await
+        .expect("the first goal is accepted");
+    assert_eq!(first.goal_id, goal_id("minting:goal-1"));
+
+    // A restart between the two goals: the counter comes from the store, not from memory.
+    let second = service(&store, &clock, GoalConfig::default())
+        .start(&session_id, "second objective")
+        .await
+        .expect("the second goal is accepted");
+    assert_eq!(second.goal_id, goal_id("minting:goal-2"));
+    assert_eq!(second.status, GoalStatus::Active);
+
+    let after_restart = service(&store, &clock, GoalConfig::default());
+    let history = after_restart
+        .history(&session_id)
+        .await
+        .expect("the store answers");
+    assert_eq!(
+        history
+            .iter()
+            .map(|record| (record.goal_id.clone(), record.status))
+            .collect::<Vec<(_, _)>>(),
+        vec![
+            (goal_id("minting:goal-1"), GoalStatus::Superseded),
+            (goal_id("minting:goal-2"), GoalStatus::Active),
+        ]
+    );
+    // Goals of one session never collide with goals of another.
+    assert_eq!(
+        after_restart
+            .start(&session("other"), "unrelated")
+            .await
+            .expect("the goal is accepted")
+            .goal_id,
+        goal_id("other:goal-1")
+    );
+}
+
+#[tokio::test]
+async fn apply_progress_and_close_need_an_active_goal() {
+    let store = MemoryGoals::new();
+    let clock = FakeClock::new(0);
+    let goals = service(&store, &clock, GoalConfig::default());
+    let session_id = session("apply");
+
+    assert_eq!(
+        goals
+            .apply(
+                &session_id,
+                &GoalAction::Progress {
+                    note: "nothing yet".to_owned(),
+                },
+            )
+            .await,
+        Err(GoalError::NoActiveGoal)
+    );
+    assert_eq!(
+        goals
+            .apply(
+                &session_id,
+                &GoalAction::Close {
+                    status: GoalStatus::Achieved,
+                },
+            )
+            .await,
+        Err(GoalError::NoActiveGoal)
+    );
+    assert_eq!(store.saves(), 0, "a refused action must not write");
+
+    let created = goals
+        .apply(
+            &session_id,
+            &GoalAction::Set {
+                objective: "now there is one".to_owned(),
+            },
+        )
+        .await
+        .expect("set always works");
+    assert_eq!(created.goal_id, goal_id("apply:goal-1"));
+
+    let advanced = goals
+        .apply(
+            &session_id,
+            &GoalAction::Progress {
+                note: "halfway".to_owned(),
+            },
+        )
+        .await
+        .expect("progress attaches to the active goal");
+    assert_eq!(advanced.revision, 2);
+    assert_eq!(
+        advanced
+            .progress
+            .iter()
+            .map(|entry| entry.note.clone())
+            .collect::<Vec<String>>(),
+        vec!["halfway".to_owned()]
+    );
+
+    let closed = goals
+        .apply(
+            &session_id,
+            &GoalAction::Close {
+                status: GoalStatus::Failed,
+            },
+        )
+        .await
+        .expect("close terminates the active goal");
+    assert_eq!(closed.status, GoalStatus::Failed);
+    assert_eq!(closed.revision, 3);
+
+    // Once closed, the session is back to having no active goal.
+    assert_eq!(
+        goals
+            .apply(
+                &session_id,
+                &GoalAction::Progress {
+                    note: "too late".to_owned(),
+                },
+            )
+            .await,
+        Err(GoalError::NoActiveGoal)
+    );
+}
+
+#[tokio::test]
+async fn apply_set_supersedes_the_previous_goal_and_resets_progress() {
+    let store = MemoryGoals::new();
+    let clock = FakeClock::new(0);
+    let goals = service(&store, &clock, GoalConfig::default());
+    let session_id = session("supersede");
+
+    goals
+        .apply(
+            &session_id,
+            &GoalAction::Set {
+                objective: "old plan".to_owned(),
+            },
+        )
+        .await
+        .expect("the first goal is accepted");
+    goals
+        .apply(
+            &session_id,
+            &GoalAction::Progress {
+                note: "work on the old plan".to_owned(),
+            },
+        )
+        .await
+        .expect("progress is accepted");
+
+    let replacement = goals
+        .apply(
+            &session_id,
+            &GoalAction::Set {
+                objective: "new plan".to_owned(),
+            },
+        )
+        .await
+        .expect("the second goal is accepted");
+    assert_eq!(replacement.goal_id, goal_id("supersede:goal-2"));
+    assert_eq!(replacement.revision, 1);
+    assert_eq!(replacement.progress, Vec::new());
+
+    let history = goals.history(&session_id).await.expect("the store answers");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].status, GoalStatus::Superseded);
+    assert_eq!(history[0].revision, 3);
+    assert_eq!(
+        history[0]
+            .progress
+            .iter()
+            .map(|entry| entry.note.clone())
+            .collect::<Vec<String>>(),
+        vec!["work on the old plan".to_owned()],
+        "superseding must not erase the old goal's history"
+    );
+}
+
+#[tokio::test]
+async fn a_session_id_too_long_to_scope_a_goal_id_is_refused_before_any_write() {
+    let store = MemoryGoals::new();
+    let clock = FakeClock::new(0);
+    let goals = service(&store, &clock, GoalConfig::default());
+    // 128 bytes is the identifier ceiling, so ":goal-1" cannot be appended to a maximal session.
+    let session_id = session(&"s".repeat(MAX_IDENTIFIER_BYTES));
+
+    let error = goals
+        .start(&session_id, "anything")
+        .await
+        .expect_err("the scoped goal id does not fit");
+
+    match error {
+        GoalError::UnusableGoalId(inner) => {
+            assert_eq!(inner.kind(), "goal id");
+            assert_eq!(inner.reason(), "is too long");
+        }
+        other => panic!("expected an unusable goal id, got {other:?}"),
+    }
+    assert_eq!(store.saves(), 0, "nothing may be written after the refusal");
 }

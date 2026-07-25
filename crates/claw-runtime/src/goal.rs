@@ -9,11 +9,13 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
 use claw_application::model::goal::{GoalProgress, GoalRecord, GoalStatus};
-use claw_application::model::ids::GoalId;
+use claw_application::model::ids::{GoalId, IdentifierError};
 use claw_application::ports::PortError;
 use claw_application::ports::clock::ClockPort;
 use claw_application::ports::goal::GoalStorePort;
 use claw_domain::SessionId;
+
+use crate::goal_tool::GoalAction;
 
 /// How much progress history a goal may keep.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +45,8 @@ pub enum GoalError {
     Port(PortError),
     /// No goal with that identifier exists.
     Unknown(GoalId),
+    /// The session has no active goal to act on.
+    NoActiveGoal,
     /// The goal already reached a terminal status.
     AlreadyClosed {
         /// The goal that was already closed.
@@ -58,6 +62,8 @@ pub enum GoalError {
     InvalidNote(&'static str),
     /// The configured progress budget cannot hold a single entry.
     InvalidBudget,
+    /// The session identifier cannot produce a usable goal identifier.
+    UnusableGoalId(IdentifierError),
 }
 
 impl Display for GoalError {
@@ -65,6 +71,7 @@ impl Display for GoalError {
         match self {
             Self::Port(error) => write!(formatter, "goal store failed: {error}"),
             Self::Unknown(goal_id) => write!(formatter, "unknown goal {goal_id}"),
+            Self::NoActiveGoal => formatter.write_str("the session has no active goal"),
             Self::AlreadyClosed { goal_id, status } => {
                 write!(formatter, "goal {goal_id} is already {status}")
             }
@@ -76,6 +83,7 @@ impl Display for GoalError {
             Self::InvalidBudget => {
                 formatter.write_str("progress budget must allow at least one entry")
             }
+            Self::UnusableGoalId(error) => write!(formatter, "cannot mint a goal id: {error}"),
         }
     }
 }
@@ -262,6 +270,67 @@ impl GoalService {
 
         self.store.save(record.clone()).await?;
         Ok(record)
+    }
+
+    /// Mints the next goal identifier for a session and records the objective.
+    ///
+    /// Identifiers are `<session>:goal-N`, where `N` counts every goal the session ever had. The
+    /// session is part of the identifier because [`GoalStorePort::load`] is keyed by goal id
+    /// alone: a bare `goal-N` would collide between sessions in any real store. `N` is read from
+    /// the store rather than kept in memory, so it stays correct across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GoalError::UnusableGoalId`] when the session identifier is too long to fit in a
+    /// goal identifier, and everything [`GoalService::set`] can return.
+    pub async fn start(
+        &self,
+        session_id: &SessionId,
+        objective: &str,
+    ) -> Result<GoalRecord, GoalError> {
+        let existing = self.store.list_for_session(session_id).await?.len();
+        let goal_id = GoalId::new(format!(
+            "{}:goal-{}",
+            session_id.as_str(),
+            existing.saturating_add(1)
+        ))
+        .map_err(GoalError::UnusableGoalId)?;
+        self.set(session_id, goal_id, objective).await
+    }
+
+    /// Applies one model-authored goal action to the session's durable goal.
+    ///
+    /// This is the write path behind the model-callable goal tool. Every action except
+    /// [`GoalAction::Set`] requires an active goal and fails with [`GoalError::NoActiveGoal`]
+    /// otherwise, so a model cannot silently no-op its own progress reporting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GoalError::NoActiveGoal`] when the action needs a goal the session does not have,
+    /// and everything [`GoalService::set`], [`GoalService::record_progress`] and
+    /// [`GoalService::close`] can return.
+    pub async fn apply(
+        &self,
+        session_id: &SessionId,
+        action: &GoalAction,
+    ) -> Result<GoalRecord, GoalError> {
+        match action {
+            GoalAction::Set { objective } => self.start(session_id, objective).await,
+            GoalAction::Progress { note } => {
+                let active = self
+                    .active(session_id)
+                    .await?
+                    .ok_or(GoalError::NoActiveGoal)?;
+                self.record_progress(&active.goal_id, note).await
+            }
+            GoalAction::Close { status } => {
+                let active = self
+                    .active(session_id)
+                    .await?
+                    .ok_or(GoalError::NoActiveGoal)?;
+                self.close(&active.goal_id, *status).await
+            }
+        }
     }
 
     async fn require_active(&self, goal_id: &GoalId) -> Result<GoalRecord, GoalError> {

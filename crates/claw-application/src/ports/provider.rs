@@ -53,6 +53,12 @@ pub struct ProviderRequest {
     pub messages: Vec<PromptMessage>,
     /// The tool names the provider may call.
     pub tool_names: Vec<String>,
+    /// The model the round must run against, when the operator selected one.
+    ///
+    /// `None` means the adapter picks its own default. Adapters that cannot honour an explicit
+    /// selection should fail the round rather than silently substitute another model.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// One incremental unit of provider output.
@@ -112,8 +118,46 @@ pub trait ProviderPort: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptMessage, ProviderChunk};
-    use crate::model::ids::ToolCallId;
+    use super::{PromptMessage, ProviderChunk, ProviderRequest};
+    use crate::model::ids::{ToolCallId, TurnId};
+
+    #[test]
+    fn a_request_without_a_model_field_still_deserialises() {
+        let decoded: ProviderRequest = serde_json::from_str(
+            "{\"session_id\":\"s-1\",\"turn\":0,\"round\":0,\"messages\":[],\"tool_names\":[]}",
+        )
+        .expect("legacy request deserialises");
+
+        assert_eq!(decoded.model, None);
+        assert_eq!(decoded.turn, TurnId::FIRST);
+        assert_eq!(decoded.session_id.as_str(), "s-1");
+    }
+
+    #[test]
+    fn an_explicit_model_survives_a_round_trip() {
+        let request = ProviderRequest {
+            session_id: claw_domain::SessionId::new("s-2").expect("valid session id"),
+            turn: TurnId::FIRST,
+            round: 3,
+            messages: vec![PromptMessage::User {
+                text: "hi".to_owned(),
+            }],
+            tool_names: vec!["read_file".to_owned()],
+            model: Some("gpt-x".to_owned()),
+        };
+        let encoded = serde_json::to_string(&request).expect("request serialises");
+
+        assert_eq!(
+            encoded,
+            "{\"session_id\":\"s-2\",\"turn\":0,\"round\":3,\
+\"messages\":[{\"role\":\"user\",\"text\":\"hi\"}],\
+\"tool_names\":[\"read_file\"],\"model\":\"gpt-x\"}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderRequest>(&encoded).expect("request deserialises"),
+            request
+        );
+    }
 
     #[test]
     fn chunks_serialise_with_a_tagged_representation() {
