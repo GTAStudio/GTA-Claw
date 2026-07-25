@@ -303,6 +303,9 @@ fn event_visibility_is_enforced_for_every_role_and_scope_combination() {
 
 #[test]
 fn a_node_connection_never_observes_operator_scoped_events() {
+    // Intentionally driven from the production catalog: this asserts the
+    // *runtime* set is clean. `tests/event_visibility.rs` proves the same
+    // property against a hand-written table, so neither stands alone.
     for (name, visibility) in claw_gateway::events::event_catalog() {
         if let EventVisibility::Operator(_) = visibility {
             assert!(

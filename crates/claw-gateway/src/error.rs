@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
+use std::net::SocketAddr;
 
 use claw_protocol::gateway::{
     AuthorizationError, CodecError, NegotiationError, StringValidationError,
@@ -160,6 +161,13 @@ pub enum ConnectionClose {
     },
     /// The peer stopped answering server pings.
     Unresponsive,
+    /// The device's authorization changed or was withdrawn while it was
+    /// connected, so the connection may no longer act on its old snapshot.
+    AuthorizationRevoked {
+        /// Device wire identity whose authorization no longer admits this
+        /// connection.
+        device_id: String,
+    },
     /// The transport failed.
     Transport(WireError),
 }
@@ -172,6 +180,7 @@ impl ConnectionClose {
             Self::PeerClosed => 1000,
             Self::ServerShutdown => 1001,
             Self::ProtocolViolation(_) => 1002,
+            Self::AuthorizationRevoked { .. } => 1008,
             Self::MessageTooLarge { .. } => 1009,
             Self::HandshakeRejected(_) | Self::HandshakeTimeout | Self::Transport(_) => 1011,
             Self::SlowConsumer { .. } | Self::Unresponsive => 1013,
@@ -190,6 +199,7 @@ impl ConnectionClose {
             Self::ProtocolViolation(_) => "protocol violation",
             Self::SlowConsumer { .. } => "event backlog exceeded",
             Self::Unresponsive => "peer unresponsive",
+            Self::AuthorizationRevoked { .. } => "authorization revoked",
             Self::Transport(_) => "transport failure",
         }
     }
@@ -210,6 +220,10 @@ impl Display for ConnectionClose {
                 write!(formatter, "dropped {dropped} events for a slow consumer")
             }
             Self::Unresponsive => formatter.write_str("peer stopped answering pings"),
+            Self::AuthorizationRevoked { device_id } => write!(
+                formatter,
+                "authorization for device `{device_id}` no longer admits this connection"
+            ),
             Self::Transport(error) => Display::fmt(error, formatter),
         }
     }
@@ -230,6 +244,12 @@ pub enum ServerError {
     Configuration(ConfigurationError),
     /// Installing a handler on the frozen method catalog failed.
     Registry(DispatchError),
+    /// A non-loopback address was requested while the server is configured to
+    /// serve plaintext WebSocket on loopback only.
+    NonLoopbackBindRefused {
+        /// The routable address that was refused.
+        address: SocketAddr,
+    },
 }
 
 impl Display for ServerError {
@@ -247,6 +267,13 @@ impl Display for ServerError {
             Self::Registry(error) => {
                 write!(formatter, "failed to install method handlers: {error}")
             }
+            Self::NonLoopbackBindRefused { address } => write!(
+                formatter,
+                "refusing to bind `{address}`: this Gateway serves plaintext WebSocket, so a \
+                 routable address would expose authenticated sessions to on-path injection; bind \
+                 a loopback address, or set `Exposure::TlsTerminatedByFrontend` once a TLS \
+                 terminator is in front of it"
+            ),
         }
     }
 }
@@ -257,6 +284,7 @@ impl Error for ServerError {
             Self::Bind(error) | Self::LocalAddress(error) | Self::Accept(error) => Some(error),
             Self::Configuration(error) => Some(error),
             Self::Registry(error) => Some(error),
+            Self::NonLoopbackBindRefused { .. } => None,
         }
     }
 }
@@ -511,5 +539,94 @@ impl From<CodecError> for EncodeError {
 impl From<NegotiationError> for EncodeError {
     fn from(error: NegotiationError) -> Self {
         Self::Codec(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every close classification this server can produce.
+    fn all_closes() -> Vec<ConnectionClose> {
+        vec![
+            ConnectionClose::PeerClosed,
+            ConnectionClose::ServerShutdown,
+            ConnectionClose::HandshakeRejected("nope".to_owned()),
+            ConnectionClose::HandshakeTimeout,
+            ConnectionClose::MessageTooLarge { limit: 64 },
+            ConnectionClose::ProtocolViolation("bad frame".to_owned()),
+            ConnectionClose::SlowConsumer { dropped: 3 },
+            ConnectionClose::Unresponsive,
+            ConnectionClose::AuthorizationRevoked {
+                device_id: "device-a".to_owned(),
+            },
+            ConnectionClose::Transport(WireError::Read),
+        ]
+    }
+
+    #[test]
+    fn a_revoked_authorization_closes_with_the_policy_violation_code() {
+        let close = ConnectionClose::AuthorizationRevoked {
+            device_id: "device-a".to_owned(),
+        };
+        assert_eq!(close.close_code(), 1008);
+        assert_eq!(close.close_reason(), "authorization revoked");
+        assert_eq!(
+            close.to_string(),
+            "authorization for device `device-a` no longer admits this connection"
+        );
+    }
+
+    #[test]
+    fn revocation_does_not_reuse_another_classifications_close_code() {
+        let revoked = ConnectionClose::AuthorizationRevoked {
+            device_id: "device-a".to_owned(),
+        };
+        for other in all_closes() {
+            if other == revoked {
+                continue;
+            }
+            assert_ne!(
+                other.close_code(),
+                revoked.close_code(),
+                "`{other}` shares a close code with a revoked authorization"
+            );
+            assert_ne!(
+                other.close_reason(),
+                revoked.close_reason(),
+                "`{other}` shares a close reason with a revoked authorization"
+            );
+        }
+    }
+
+    #[test]
+    fn every_close_reason_stays_inside_the_rfc6455_control_frame_budget() {
+        for close in all_closes() {
+            let reason = close.close_reason();
+            assert!(
+                reason.len() <= 123,
+                "`{reason}` does not fit in a close control frame"
+            );
+            assert!(!reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_refused_routable_bind_names_the_address_and_the_way_out() {
+        let address: SocketAddr = "0.0.0.0:8080".parse().expect("the fixture address parses");
+        let error = ServerError::NonLoopbackBindRefused { address };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("0.0.0.0:8080"),
+            "the refusal must name the address that was refused: {rendered}"
+        );
+        assert!(
+            rendered.contains("Exposure::TlsTerminatedByFrontend"),
+            "the refusal must name the explicit opt-in: {rendered}"
+        );
+        assert!(
+            Error::source(&error).is_none(),
+            "the refusal is this server's own decision, not a wrapped OS failure"
+        );
     }
 }

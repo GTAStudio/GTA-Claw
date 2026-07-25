@@ -4,7 +4,6 @@
 //! The pure reducer in `claw-protocol` decides protocol compatibility and state
 //! transitions; this module supplies the external decisions that reducer needs.
 
-use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
@@ -25,6 +24,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use secrecy::SecretString;
 use subtle::ConstantTimeEq;
 
+use crate::authority::{AuthorizationSource, DeviceDirectory};
 use crate::clock::Clock;
 
 /// Number of random bytes in an issued challenge nonce.
@@ -103,7 +103,7 @@ impl Grant {
 /// produce a typed [`HandshakeRejection`].
 pub struct StaticAuthenticator {
     credential: CredentialPolicy,
-    grants: BTreeMap<String, Grant>,
+    devices: DeviceDirectory,
     max_signature_age_ms: u64,
     clock: Arc<dyn Clock>,
 }
@@ -113,7 +113,7 @@ impl Debug for StaticAuthenticator {
         formatter
             .debug_struct("StaticAuthenticator")
             .field("credential", &self.credential)
-            .field("paired_devices", &self.grants.len())
+            .field("paired_devices", &self.devices.len())
             .field("max_signature_age_ms", &self.max_signature_age_ms)
             .finish()
     }
@@ -126,9 +126,23 @@ impl StaticAuthenticator {
     /// Creates an authenticator with no paired devices.
     #[must_use]
     pub fn new(credential: CredentialPolicy, clock: Arc<dyn Clock>) -> Self {
+        Self::with_devices(credential, clock, DeviceDirectory::new())
+    }
+
+    /// Creates an authenticator over an existing shared device directory.
+    ///
+    /// Use this when the same directory must be shared with something that
+    /// mutates pairings at runtime; the handshake and every live connection
+    /// then read one source of truth.
+    #[must_use]
+    pub fn with_devices(
+        credential: CredentialPolicy,
+        clock: Arc<dyn Clock>,
+        devices: DeviceDirectory,
+    ) -> Self {
         Self {
             credential,
-            grants: BTreeMap::new(),
+            devices,
             max_signature_age_ms: Self::DEFAULT_MAX_SIGNATURE_AGE_MS,
             clock,
         }
@@ -136,9 +150,19 @@ impl StaticAuthenticator {
 
     /// Records the grant for one paired device, replacing any previous grant.
     #[must_use]
-    pub fn with_paired_device(mut self, device_wire_id: impl Into<String>, grant: Grant) -> Self {
-        self.grants.insert(device_wire_id.into(), grant);
+    pub fn with_paired_device(self, device_wire_id: impl Into<String>, grant: Grant) -> Self {
+        self.devices.pair(device_wire_id, grant);
         self
+    }
+
+    /// Returns a handle to the shared device directory.
+    ///
+    /// This is the same directory the handshake consults, so pairing or
+    /// revoking through it takes effect on the next handshake *and* on every
+    /// connection that is already open.
+    #[must_use]
+    pub fn devices(&self) -> DeviceDirectory {
+        self.devices.clone()
     }
 
     /// Overrides the accepted device-proof signature age.
@@ -150,8 +174,8 @@ impl StaticAuthenticator {
 
     /// Returns the grant recorded for a device wire identity.
     #[must_use]
-    pub fn grant(&self, device_wire_id: &str) -> Option<&Grant> {
-        self.grants.get(device_wire_id)
+    pub fn grant(&self, device_wire_id: &str) -> Option<Grant> {
+        self.devices.current_grant(device_wire_id)
     }
 
     fn check_credential(
@@ -313,7 +337,7 @@ impl StaticAuthenticator {
         };
         let wire_id = self.verify_device(request, device)?;
 
-        let Some(grant) = self.grants.get(&wire_id) else {
+        let Some(grant) = self.devices.current_grant(&wire_id) else {
             return Err(pairing_required(
                 PairingRequiredReason::NotPaired,
                 &wire_id,
@@ -328,7 +352,7 @@ impl StaticAuthenticator {
                 &wire_id,
                 requested_role,
                 &requested_scopes,
-                Some(grant),
+                Some(&grant),
             ));
         }
         if let Some(excess) = requested_scopes

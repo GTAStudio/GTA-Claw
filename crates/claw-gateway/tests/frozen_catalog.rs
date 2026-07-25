@@ -185,8 +185,13 @@ fn the_event_catalog_holds_exactly_the_frozen_event_set() {
     assert_eq!(catalogued.len(), 33);
 }
 
+/// Consistency between the two production surfaces that expose visibility.
+///
+/// This deliberately does *not* stand in for an independent expectation — that
+/// lives in `tests/event_visibility.rs`, which states all 33 rows by hand. All
+/// this proves is that `event_catalog` and `event_visibility` cannot disagree.
 #[test]
-fn every_catalogued_event_has_exactly_one_visibility_decision() {
+fn the_catalog_and_the_lookup_never_disagree_about_visibility() {
     let catalog = event_catalog();
     let names: BTreeSet<&str> = catalog.iter().map(|(name, _)| *name).collect();
     assert_eq!(names.len(), catalog.len());

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_gateway::{
-    CredentialPolicy, GatewayServer, GatewayServerConfig, Grant, ServerHandle, ServerLimits,
-    ServerTimeouts, StaticAuthenticator,
+    CredentialPolicy, DeviceDirectory, Exposure, GatewayServer, GatewayServerConfig, Grant,
+    ServerHandle, ServerLimits, ServerTimeouts, StaticAuthenticator,
 };
 use claw_gateway_client::{
     GatewayClient, GatewayClientConfig, GatewayClientError, ProtocolFailure, ReconnectPolicy,
@@ -36,16 +36,25 @@ fn config() -> GatewayServerConfig {
             tick_interval: Duration::from_millis(60),
             ..ServerTimeouts::default()
         },
+        exposure: Exposure::LoopbackOnly,
     }
 }
 
 async fn start(authenticator: StaticAuthenticator) -> ServerHandle {
-    GatewayServer::new(config(), Arc::new(authenticator))
+    start_with_devices(authenticator).await.0
+}
+
+/// Starts a server and also hands back the live device directory, so a test can
+/// change a pairing while a connection is open.
+async fn start_with_devices(authenticator: StaticAuthenticator) -> (ServerHandle, DeviceDirectory) {
+    let devices = authenticator.devices();
+    let handle = GatewayServer::new(config(), Arc::new(authenticator), Arc::new(devices.clone()))
         .expect("the configuration and registry are valid")
         .bind("127.0.0.1:0".parse().expect("loopback address parses"))
         .await
         .expect("an ephemeral loopback port is available")
-        .start()
+        .start();
+    (handle, devices)
 }
 
 fn endpoint(handle: &ServerHandle) -> Url {
@@ -842,6 +851,293 @@ async fn a_shared_token_policy_refuses_a_client_that_presents_none() {
             Some(ConnectErrorDetailCode::AuthTokenMissing)
         ),
         other => panic!("expected an authentication failure, got {other}"),
+    }
+
+    handle.shutdown().await;
+}
+// ---------------------------------------------------------------------------
+// Authorization is re-evaluated at the moment of every action, not snapshotted
+// at the handshake and trusted forever.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn withdrawing_a_pairing_closes_an_already_open_connection() {
+    let identity = device(27);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let (handle, devices) = start_with_devices(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Admin]),
+            ),
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorAdmin],
+    ))
+    .expect("the configuration is valid");
+    let ready = client.wait_ready().await.expect("the handshake succeeds");
+    let live_epoch = ready.epoch.get();
+
+    // Prove the connection really is privileged before anything is withdrawn.
+    let response = client
+        .request(
+            request_id("before-revoke"),
+            method("sessions.create"),
+            &json!({ "id": "s-live", "agentId": "a-1" }),
+        )
+        .await
+        .expect("the server answers");
+    assert!(response.ok(), "the admin grant must work before revocation");
+
+    assert!(
+        devices.revoke(&wire_id),
+        "the fixture device really was paired"
+    );
+
+    // The socket is already authenticated; nothing about it changed. Only the
+    // directory did, and that alone must end the connection's ability to act.
+    let outcome = client
+        .request(
+            request_id("after-revoke"),
+            method("sessions.create"),
+            &json!({ "id": "s-dead", "agentId": "a-1" }),
+        )
+        .await;
+    match outcome {
+        Err(GatewayClientError::ConnectionChanged { expected }) => assert_eq!(
+            expected.get(),
+            live_epoch,
+            "the torn-down connection must be the one that held the revoked grant"
+        ),
+        Err(
+            GatewayClientError::DisconnectedNotReplayed
+            | GatewayClientError::NotReady
+            | GatewayClientError::Cancelled
+            | GatewayClientError::Transport(_),
+        ) => {}
+        Err(other) => panic!(
+            "the connection must end because authorization was withdrawn, not for another reason: \
+             {other}"
+        ),
+        Ok(response) => panic!(
+            "a revoked device was still served: ok={} error={:?}",
+            response.ok(),
+            response.error()
+        ),
+    }
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn narrowing_a_grant_takes_the_lost_scope_away_from_an_open_connection() {
+    let identity = device(28);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let (handle, devices) = start_with_devices(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(
+                    Role::Operator,
+                    [
+                        OperatorScope::Read,
+                        OperatorScope::Write,
+                        OperatorScope::Admin,
+                    ],
+                ),
+            ),
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[
+            Scope::OperatorRead,
+            Scope::OperatorWrite,
+            Scope::OperatorAdmin,
+        ],
+    ))
+    .expect("the configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    let response = client
+        .request(
+            request_id("admin-before"),
+            method("sessions.delete"),
+            &json!({ "id": "s-absent" }),
+        )
+        .await
+        .expect("the server answers");
+    let before = response
+        .error()
+        .map(|error| error.code.as_str().to_owned())
+        .unwrap_or_else(|| "OK".to_owned());
+    assert_ne!(
+        before, "UNAUTHORIZED",
+        "the admin-classified method must be reachable before narrowing"
+    );
+
+    // Same device, same role, strictly fewer scopes.
+    devices.pair(
+        wire_id.clone(),
+        Grant::new(Role::Operator, [OperatorScope::Read]),
+    );
+
+    let response = client
+        .request(
+            request_id("admin-after"),
+            method("sessions.delete"),
+            &json!({ "id": "s-absent" }),
+        )
+        .await
+        .expect("narrowing must not close the connection");
+    assert!(!response.ok());
+    assert_eq!(
+        response
+            .error()
+            .expect("a denial carries an error shape")
+            .code
+            .as_str(),
+        "UNAUTHORIZED"
+    );
+
+    // The scope it kept still works, so this narrowed rather than severed.
+    let response = client
+        .request(request_id("read-after"), method("health"), &json!({}))
+        .await
+        .expect("the connection is still usable");
+    assert!(response.ok());
+
+    client.shutdown().await.expect("the client stops cleanly");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn widening_a_grant_never_promotes_an_already_open_connection() {
+    let identity = device(29);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let (handle, devices) = start_with_devices(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    ))
+    .expect("the configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    // Grant the device far more than it proved at connect time.
+    devices.pair(
+        wire_id.clone(),
+        Grant::new(
+            Role::Operator,
+            [
+                OperatorScope::Read,
+                OperatorScope::Write,
+                OperatorScope::Admin,
+            ],
+        ),
+    );
+
+    // Re-checking authorization must never be a promotion path: this
+    // connection presented `operator.read` and signed for `operator.read`, so
+    // that is all it may ever exercise, however generous the directory becomes.
+    for (id, name) in [
+        ("widen-write", "sessions.create"),
+        ("widen-admin", "sessions.delete"),
+        ("widen-config", "config.set"),
+    ] {
+        let response = client
+            .request(
+                request_id(id),
+                method(name),
+                &json!({ "id": "s-widen", "agentId": "a-1" }),
+            )
+            .await
+            .expect("the server answers");
+        assert!(
+            !response.ok(),
+            "`{name}` was reached with a scope the connection never presented"
+        );
+        assert_eq!(
+            response
+                .error()
+                .expect("a denial carries an error shape")
+                .code
+                .as_str(),
+            "UNAUTHORIZED",
+            "`{name}` must stay denied"
+        );
+    }
+
+    client.shutdown().await.expect("the client stops cleanly");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn changing_a_device_role_closes_its_open_operator_connection() {
+    let identity = device(30);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let (handle, devices) = start_with_devices(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Admin]),
+            ),
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorAdmin],
+    ))
+    .expect("the configuration is valid");
+    let ready = client.wait_ready().await.expect("the handshake succeeds");
+    let live_epoch = ready.epoch.get();
+
+    devices.pair(wire_id.clone(), Grant::new(Role::Node, []));
+
+    let outcome = client
+        .request(
+            request_id("after-role-change"),
+            method("health"),
+            &json!({}),
+        )
+        .await;
+    match outcome {
+        Err(GatewayClientError::ConnectionChanged { expected }) => assert_eq!(
+            expected.get(),
+            live_epoch,
+            "the torn-down connection must be the operator connection that was re-roled"
+        ),
+        Err(
+            GatewayClientError::DisconnectedNotReplayed
+            | GatewayClientError::NotReady
+            | GatewayClientError::Cancelled
+            | GatewayClientError::Transport(_),
+        ) => {}
+        Err(other) => panic!("expected the connection to be cut off, got {other}"),
+        Ok(response) => panic!(
+            "a device re-roled underneath a live operator connection was still served: ok={}",
+            response.ok()
+        ),
     }
 
     handle.shutdown().await;

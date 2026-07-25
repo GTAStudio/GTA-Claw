@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 
 use crate::auth::issue_challenge;
+use crate::authority::AuthorizationSource;
 use crate::clock::Clock;
 use crate::config::ValidatedConfig;
 use crate::directory::{ConnectionDirectory, ConnectionInfo, compatibility_identity};
@@ -69,6 +70,8 @@ pub struct ConnectionServices {
     pub directory: ConnectionDirectory,
     /// Authentication port driving the negotiation reducer.
     pub authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
+    /// Authorization currency port consulted before every later action.
+    pub authorization: Arc<dyn AuthorizationSource>,
 }
 
 impl std::fmt::Debug for ConnectionServices {
@@ -160,6 +163,63 @@ struct Session {
     scopes: Vec<OperatorScope>,
     device_id: String,
     filter: Arc<Mutex<TopicFilter>>,
+    /// Authorization generation this snapshot was last validated against.
+    authorized_at: u64,
+}
+
+/// Re-evaluates a connection's authorization against the grant in force now.
+///
+/// The handshake decides whether a device may connect. It does not decide
+/// whether that device may still act minutes later, so this runs before every
+/// request the connection makes and before every event it is about to be
+/// written — the moment of the action, not the moment of the handshake.
+///
+/// Two properties matter more than the mechanism:
+///
+/// * Scopes may only **narrow**. The connection keeps the intersection of what
+///   it presented at the handshake with what the directory grants now, so a
+///   directory change can take privilege away from a live connection but can
+///   never hand it one it did not ask for and prove at connect time.
+/// * A withdrawn pairing or a changed role ends the connection. Those are not
+///   narrowings of an existing identity, so there is nothing safe to keep.
+///
+/// The generation is read *before* the grant and stored afterwards. In that
+/// order a concurrent change can only cause a redundant re-check; the reverse
+/// order could pair a fresh generation with grant data read before the change
+/// and keep a revoked grant alive.
+fn revalidate(
+    id: ConnectionId,
+    services: &ConnectionServices,
+    session: &mut Session,
+) -> Result<(), ConnectionClose> {
+    let generation = services.authorization.generation();
+    if generation == session.authorized_at {
+        return Ok(());
+    }
+    let revoked = || ConnectionClose::AuthorizationRevoked {
+        device_id: session.device_id.clone(),
+    };
+    let Some(grant) = services.authorization.current_grant(&session.device_id) else {
+        return Err(revoked());
+    };
+    if grant.role != session.role {
+        return Err(revoked());
+    }
+    let retained: Vec<OperatorScope> = session
+        .scopes
+        .iter()
+        .copied()
+        .filter(|scope| grant.scopes.contains(scope))
+        .collect();
+    let narrowed = retained.len() != session.scopes.len();
+    session.scopes = retained;
+    session.authorized_at = generation;
+    if narrowed {
+        services
+            .events
+            .reauthorize(id, session.role, session.scopes.clone());
+    }
+    Ok(())
 }
 
 async fn dispatch_loop(
@@ -167,7 +227,7 @@ async fn dispatch_loop(
     services: &ConnectionServices,
     write: &mut ServerWrite,
     inbound: &mut mpsc::Receiver<Result<Inbound, WireError>>,
-    session: Session,
+    mut session: Session,
     mut shutdown: watch::Receiver<bool>,
 ) -> ConnectionClose {
     let timeouts = *services.config.timeouts();
@@ -203,7 +263,7 @@ async fn dispatch_loop(
                             break;
                         };
                         if let Err(close) =
-                            deliver(write, &codec, &mut broadcast_seq, services, delivery).await
+                            deliver(write, &codec, &mut broadcast_seq, services, &session, delivery).await
                         {
                             return close;
                         }
@@ -212,18 +272,30 @@ async fn dispatch_loop(
                 }
             }
             message = inbound.recv() => {
+                if let Err(close) = revalidate(id, services, &mut session) {
+                    return close;
+                }
                 match handle_inbound(id, services, write, &codec, &session, message).await {
                     Ok(()) => unanswered_pings = 0,
                     Err(close) => return close,
                 }
             }
             delivery = subscription.recv() => {
-                match deliver(write, &codec, &mut broadcast_seq, services, delivery).await {
+                if let Err(close) = revalidate(id, services, &mut session) {
+                    return close;
+                }
+                match deliver(write, &codec, &mut broadcast_seq, services, &session, delivery).await {
                     Ok(()) => {}
                     Err(close) => return close,
                 }
             }
             _ = ping_timer.tick() => {
+                // An otherwise idle connection is revalidated here, so a
+                // revoked device is closed within one ping interval rather
+                // than lingering until it next chooses to speak.
+                if let Err(close) = revalidate(id, services, &mut session) {
+                    return close;
+                }
                 if unanswered_pings >= max_unanswered {
                     return ConnectionClose::Unresponsive;
                 }
@@ -241,10 +313,20 @@ async fn deliver(
     codec: &Codec,
     broadcast_seq: &mut u64,
     services: &ConnectionServices,
+    session: &Session,
     delivery: Delivery,
 ) -> Result<(), ConnectionClose> {
     match delivery {
         Delivery::Event(envelope) => {
+            // The bus filtered this envelope against the subscriber's scopes at
+            // publication time. Authorization can have narrowed in between, so
+            // the entitlement is checked again here, against the session as it
+            // stands at the instant the bytes would go out. Dropping the
+            // envelope costs no sequence number, so the peer's own `seq` stream
+            // stays consecutive and it never learns an event existed.
+            if !envelope.visibility().admits(session.role, &session.scopes) {
+                return Ok(());
+            }
             *broadcast_seq = broadcast_seq.saturating_add(1);
             let Ok(sequence) = EventSequence::new(*broadcast_seq) else {
                 return Err(ConnectionClose::ProtocolViolation(
@@ -549,6 +631,10 @@ async fn negotiate(
         inner: services.authenticator.as_ref(),
         accepted: Mutex::new(None),
     };
+    // Read the generation *before* the decision, so a revocation racing this
+    // handshake is caught on the connection's first action rather than being
+    // masked by a generation captured after the grant was already read.
+    let authorized_at = services.authorization.generation();
     if let Err(error) = negotiation.authenticate_with(&port) {
         return Err(reject(write, &preauth, &request_id, &negotiation, &error).await);
     }
@@ -613,6 +699,7 @@ async fn negotiate(
         scopes,
         device_id,
         filter: Arc::new(Mutex::new(TopicFilter::default())),
+        authorized_at,
     })
 }
 
@@ -954,6 +1041,218 @@ mod tests {
         assert_eq!(
             close_for_wire_error(WireError::Read),
             ConnectionClose::Transport(WireError::Read)
+        );
+    }
+
+    /// Builds services whose only meaningful collaborator is the directory.
+    fn services_over(devices: &crate::authority::DeviceDirectory) -> ConnectionServices {
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::ManualClock::new(1_700_000_000_000));
+        let config = crate::config::GatewayServerConfig::default()
+            .validate()
+            .expect("the default configuration is valid");
+        ConnectionServices {
+            config: Arc::new(config),
+            registry: Arc::new(crate::methods::registry().expect("every handler installs")),
+            store: Arc::new(crate::store::InMemoryGatewayStore::new(8, 8)),
+            events: EventBus::new(8, 8192),
+            clock: Arc::clone(&clock),
+            directory: ConnectionDirectory::new(),
+            authenticator: Arc::new(crate::auth::StaticAuthenticator::new(
+                crate::auth::CredentialPolicy::None,
+                clock,
+            )),
+            authorization: Arc::new(devices.clone()),
+        }
+    }
+
+    fn session_of(role: Role, scopes: &[OperatorScope], authorized_at: u64) -> Session {
+        Session {
+            role,
+            scopes: scopes.to_vec(),
+            device_id: "device-a".to_owned(),
+            filter: Arc::new(Mutex::new(TopicFilter::default())),
+            authorized_at,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_generation_leaves_the_snapshot_alone() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Admin]),
+        );
+        let services = services_over(&devices);
+        let mut session = session_of(Role::Operator, &[OperatorScope::Read], devices.generation());
+
+        revalidate(ConnectionId::new(1), &services, &mut session)
+            .expect("nothing changed, so nothing is revoked");
+        assert_eq!(session.scopes, vec![OperatorScope::Read]);
+        assert_eq!(session.authorized_at, 1);
+    }
+
+    #[test]
+    fn a_withdrawn_pairing_closes_the_connection() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Admin]),
+        );
+        let services = services_over(&devices);
+        let mut session = session_of(
+            Role::Operator,
+            &[OperatorScope::Admin],
+            devices.generation(),
+        );
+
+        assert!(devices.revoke("device-a"));
+        assert_eq!(
+            revalidate(ConnectionId::new(1), &services, &mut session),
+            Err(ConnectionClose::AuthorizationRevoked {
+                device_id: "device-a".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_changed_role_closes_the_connection() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Admin]),
+        );
+        let services = services_over(&devices);
+        let mut session = session_of(
+            Role::Operator,
+            &[OperatorScope::Admin],
+            devices.generation(),
+        );
+
+        devices.pair("device-a", crate::auth::Grant::new(Role::Node, []));
+        assert_eq!(
+            revalidate(ConnectionId::new(1), &services, &mut session),
+            Err(ConnectionClose::AuthorizationRevoked {
+                device_id: "device-a".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_narrowed_grant_removes_exactly_the_scopes_that_were_taken_away() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(
+                Role::Operator,
+                [
+                    OperatorScope::Read,
+                    OperatorScope::Write,
+                    OperatorScope::Admin,
+                ],
+            ),
+        );
+        let services = services_over(&devices);
+        let mut session = session_of(
+            Role::Operator,
+            &[
+                OperatorScope::Read,
+                OperatorScope::Write,
+                OperatorScope::Admin,
+            ],
+            devices.generation(),
+        );
+
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Read]),
+        );
+        revalidate(ConnectionId::new(1), &services, &mut session)
+            .expect("narrowing keeps the connection open");
+
+        assert_eq!(session.scopes, vec![OperatorScope::Read]);
+        assert_eq!(session.authorized_at, 2);
+    }
+
+    #[test]
+    fn a_widened_grant_never_reaches_a_connection_that_did_not_present_it() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Read]),
+        );
+        let services = services_over(&devices);
+        let mut session = session_of(Role::Operator, &[OperatorScope::Read], devices.generation());
+
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Read, OperatorScope::Admin]),
+        );
+        revalidate(ConnectionId::new(1), &services, &mut session)
+            .expect("widening is not a reason to close");
+
+        assert_eq!(
+            session.scopes,
+            vec![OperatorScope::Read],
+            "a live connection must not inherit a scope it never proved at connect time"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_scopes_survives_an_unrelated_directory_change() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair("device-a", crate::auth::Grant::new(Role::Node, []));
+        let services = services_over(&devices);
+        let mut session = session_of(Role::Node, &[], devices.generation());
+
+        devices.pair(
+            "device-b",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Admin]),
+        );
+        revalidate(ConnectionId::new(1), &services, &mut session)
+            .expect("another device's pairing is not this device's revocation");
+
+        assert_eq!(session.role, Role::Node);
+        assert!(session.scopes.is_empty());
+        assert_eq!(session.authorized_at, 2);
+    }
+
+    #[test]
+    fn narrowing_also_narrows_what_the_event_bus_will_consider_the_connection_for() {
+        let devices = crate::authority::DeviceDirectory::new();
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Admin]),
+        );
+        let services = services_over(&devices);
+        let id = ConnectionId::new(7);
+        let mut session = session_of(
+            Role::Operator,
+            &[OperatorScope::Admin],
+            devices.generation(),
+        );
+        let mut subscription = services.events.subscribe(
+            id,
+            session.role,
+            session.scopes.clone(),
+            Arc::clone(&session.filter),
+        );
+
+        devices.pair(
+            "device-a",
+            crate::auth::Grant::new(Role::Operator, [OperatorScope::Read]),
+        );
+        revalidate(id, &services, &mut session).expect("narrowing keeps the connection open");
+
+        let draft = crate::events::EventDraft::broadcast(
+            "terminal.exit",
+            &json!({ "sessionId": "s-1", "code": 0 }),
+        )
+        .expect("terminal.exit is catalogued");
+        services.events.publish(draft);
+
+        assert!(
+            subscription.try_recv().is_none(),
+            "an admin-scoped event reached a connection whose admin scope was withdrawn"
         );
     }
 }

@@ -539,6 +539,26 @@ impl EventBus {
         self.subscribers().retain(|subscriber| subscriber.id != id);
     }
 
+    /// Replaces the role and scopes fan-out uses for one subscriber.
+    ///
+    /// Returns `true` when a live subscription was updated. This is how a
+    /// connection whose authorization narrowed stops being *considered* for
+    /// events it may no longer see, rather than being handed them and
+    /// filtering afterwards.
+    pub fn reauthorize(&self, id: ConnectionId, role: Role, scopes: Vec<OperatorScope>) -> bool {
+        let mut subscribers = self.subscribers();
+        let Some(subscriber) = subscribers
+            .iter_mut()
+            .find(|subscriber| subscriber.id == id)
+        else {
+            return false;
+        };
+        subscriber.role = role;
+        subscriber.scopes = scopes;
+        drop(subscribers);
+        true
+    }
+
     /// Returns the number of live subscriptions.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {

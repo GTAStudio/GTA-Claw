@@ -18,6 +18,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 
+use crate::authority::AuthorizationSource;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{GatewayServerConfig, ValidatedConfig};
 use crate::connection::{self, ConnectionServices};
@@ -42,6 +43,7 @@ pub struct GatewayServer {
     clock: Arc<dyn Clock>,
     directory: ConnectionDirectory,
     authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
+    authorization: Arc<dyn AuthorizationSource>,
 }
 
 impl std::fmt::Debug for GatewayServer {
@@ -58,6 +60,12 @@ impl std::fmt::Debug for GatewayServer {
 impl GatewayServer {
     /// Creates a server with the in-memory persistence adapter and system clock.
     ///
+    /// `authorization` is required, not optional: it is where the server asks
+    /// whether a device is *still* allowed to act, which it must do before
+    /// every request and every event delivery. Passing
+    /// [`crate::auth::StaticAuthenticator::devices`] wires the handshake and
+    /// the live re-checks to one source of truth.
+    ///
     /// # Errors
     ///
     /// Returns [`ServerError::Configuration`] when a limit or timeout is
@@ -66,6 +74,7 @@ impl GatewayServer {
     pub fn new(
         config: GatewayServerConfig,
         authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
+        authorization: Arc<dyn AuthorizationSource>,
     ) -> Result<Self, ServerError> {
         let config = config.validate()?;
         let limits = *config.limits();
@@ -78,6 +87,7 @@ impl GatewayServer {
             directory: ConnectionDirectory::new(),
             config: Arc::new(config),
             authenticator,
+            authorization,
         })
     }
 
@@ -122,6 +132,7 @@ impl GatewayServer {
             clock: Arc::clone(&self.clock),
             directory: self.directory.clone(),
             authenticator: Arc::clone(&self.authenticator),
+            authorization: Arc::clone(&self.authorization),
         }
     }
 
@@ -129,9 +140,15 @@ impl GatewayServer {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError::Bind`] or [`ServerError::LocalAddress`] when the
-    /// operating system refuses the socket.
+    /// Returns [`ServerError::NonLoopbackBindRefused`] when `address` is not a
+    /// loopback address and the configured [`crate::config::Exposure`] does not
+    /// permit routable binds, or [`ServerError::Bind`] /
+    /// [`ServerError::LocalAddress`] when the operating system refuses the
+    /// socket.
     pub async fn bind(self, address: SocketAddr) -> Result<BoundServer, ServerError> {
+        if !self.config.exposure().admits(&address) {
+            return Err(ServerError::NonLoopbackBindRefused { address });
+        }
         let listener = TcpListener::bind(address)
             .await
             .map_err(ServerError::Bind)?;
@@ -362,7 +379,8 @@ mod tests {
         config.limits.max_connections = max_connections;
         let clock = Arc::new(ManualClock::new(1_700_000_000_000));
         let authenticator = StaticAuthenticator::new(CredentialPolicy::None, clock.clone());
-        GatewayServer::new(config, Arc::new(authenticator))
+        let devices = authenticator.devices();
+        GatewayServer::new(config, Arc::new(authenticator), Arc::new(devices))
             .expect("the default configuration is valid")
             .with_clock(clock)
     }
@@ -378,6 +396,66 @@ mod tests {
         let handle = bound.start();
         assert_eq!(handle.connection_count(), 0);
         handle.shutdown().await;
+    }
+
+    /// Builds a server with an explicit exposure policy.
+    fn server_exposed(exposure: crate::config::Exposure) -> GatewayServer {
+        let config = GatewayServerConfig {
+            exposure,
+            ..GatewayServerConfig::default()
+        };
+        let clock = Arc::new(ManualClock::new(1_700_000_000_000));
+        let authenticator = StaticAuthenticator::new(CredentialPolicy::None, clock.clone());
+        let devices = authenticator.devices();
+        GatewayServer::new(config, Arc::new(authenticator), Arc::new(devices))
+            .expect("the default configuration is valid")
+            .with_clock(clock)
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_refuses_a_wildcard_bind_before_opening_a_socket() {
+        let address: SocketAddr = "0.0.0.0:0".parse().expect("the wildcard address parses");
+        let error = server_exposed(crate::config::Exposure::LoopbackOnly)
+            .bind(address)
+            .await
+            .expect_err("a wildcard address is not loopback and must be refused by default");
+
+        match error {
+            ServerError::NonLoopbackBindRefused { address: refused } => {
+                assert_eq!(refused, address);
+            }
+            other => panic!("expected a refused bind, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_refuses_a_routable_ipv6_bind() {
+        let address: SocketAddr = "[::]:0".parse().expect("the ipv6 wildcard parses");
+        let error = server_exposed(crate::config::Exposure::LoopbackOnly)
+            .bind(address)
+            .await
+            .expect_err("the ipv6 wildcard is not loopback");
+        assert!(matches!(error, ServerError::NonLoopbackBindRefused { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_ipv6_loopback_is_admitted_by_the_default_policy() {
+        let bound = server_exposed(crate::config::Exposure::LoopbackOnly)
+            .bind("[::1]:0".parse().expect("the ipv6 loopback parses"))
+            .await
+            .expect("::1 is loopback");
+        assert!(bound.local_address().ip().is_loopback());
+        bound.start().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opting_into_front_end_tls_admits_a_wildcard_bind() {
+        let bound = server_exposed(crate::config::Exposure::TlsTerminatedByFrontend)
+            .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+            .await
+            .expect("the opt-in policy admits every address the OS accepts");
+        assert_ne!(bound.local_address().port(), 0);
+        bound.start().shutdown().await;
     }
 
     #[tokio::test]

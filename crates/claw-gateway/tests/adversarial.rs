@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_gateway::{
-    GatewayServer, GatewayServerConfig, ServerHandle, ServerLimits, ServerTimeouts,
+    DeviceDirectory, Exposure, GatewayServer, GatewayServerConfig, ServerHandle, ServerLimits,
+    ServerTimeouts,
 };
 use claw_protocol::gateway::{
     AuthenticationDecision, AuthenticationPort, AuthenticationRequest, ConnectErrorDetailCode,
@@ -46,11 +47,13 @@ impl AuthenticationPort for AdmitOperator {
 }
 
 async fn start(config: GatewayServerConfig) -> ServerHandle {
+    let authenticator = AdmitOperator {
+        scopes: vec![OperatorScope::Admin],
+    };
     GatewayServer::new(
         config,
-        Arc::new(AdmitOperator {
-            scopes: vec![OperatorScope::Admin],
-        }),
+        Arc::new(authenticator),
+        Arc::new(DeviceDirectory::new()),
     )
     .expect("the configuration and registry are valid")
     .bind("127.0.0.1:0".parse().expect("loopback address parses"))
@@ -68,6 +71,7 @@ fn fast_config() -> GatewayServerConfig {
             tick_interval: Duration::from_secs(3600),
             ..ServerTimeouts::default()
         },
+        exposure: Exposure::LoopbackOnly,
     }
 }
 

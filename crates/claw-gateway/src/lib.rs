@@ -32,6 +32,7 @@
 //! outside this crate.
 
 pub mod auth;
+pub mod authority;
 pub mod clock;
 pub mod config;
 pub mod connection;
@@ -45,8 +46,9 @@ pub mod store;
 pub mod transport;
 
 pub use auth::{CredentialPolicy, Grant, StaticAuthenticator, issue_challenge};
+pub use authority::{AuthorizationSource, DeviceDirectory};
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use config::{GatewayServerConfig, ServerLimits, ServerTimeouts, ValidatedConfig};
+pub use config::{Exposure, GatewayServerConfig, ServerLimits, ServerTimeouts, ValidatedConfig};
 pub use connection::ConnectionServices;
 pub use directory::{ConnectionDirectory, ConnectionInfo, compatibility_identity};
 pub use dispatch::{
