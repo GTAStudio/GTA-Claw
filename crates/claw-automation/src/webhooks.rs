@@ -298,6 +298,8 @@ impl InboundWebhookHandler {
         if !route.session_binding.permits(&event.session_key) {
             return Err(WebhookError::SessionDenied);
         }
+        // Dispatch may produce effects before its future is cancelled, so an authenticated nonce
+        // is intentionally burned before awaiting and is never rolled back.
         self.replay
             .reserve(&route.id, &request.nonce, timestamp, now)?;
         dispatcher.dispatch(event).await
@@ -1524,6 +1526,20 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PendingDispatcher {
+        entered: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl TaskFlowDispatcher for PendingDispatcher {
+        async fn dispatch(&self, _event: TaskFlowEvent) -> Result<DispatchReceipt, WebhookError> {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
     #[tokio::test]
     async fn authenticates_binds_and_dispatches_exact_event() {
         let event = event();
@@ -1604,6 +1620,56 @@ mod tests {
             Err(WebhookError::Replay)
         ));
         assert_eq!(*dispatcher.events.lock().expect("events"), vec![event]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_dispatch_burns_only_the_authenticated_nonce() {
+        let body = serde_json::to_vec(&event()).expect("event JSON");
+        let process_id = std::process::id();
+        let cancelled_delivery = format!("cancelled-delivery-{process_id}");
+        let next_delivery = format!("next-delivery-{process_id}");
+        let cancelled_nonce =
+            attempt_nonce(&secret(), &cancelled_delivery, 1).expect("cancelled nonce");
+        let next_nonce = attempt_nonce(&secret(), &next_delivery, 1).expect("next nonce");
+        let cancelled_request = request(&cancelled_nonce, body.clone());
+        let replay_handler = handler(4096);
+        let pending_dispatcher = PendingDispatcher::default();
+        let mut delivery = Box::pin(replay_handler.handle(
+            cancelled_request.clone(),
+            1_750_000_000,
+            &pending_dispatcher,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            std::future::Future::poll(delivery.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            pending_dispatcher
+                .entered
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        drop(delivery);
+
+        let dispatcher = RecordingDispatcher::default();
+        assert!(matches!(
+            replay_handler
+                .handle(cancelled_request, 1_750_000_001, &dispatcher)
+                .await,
+            Err(WebhookError::Replay)
+        ));
+        let receipt = replay_handler
+            .handle(request(&next_nonce, body), 1_750_000_001, &dispatcher)
+            .await
+            .expect("unrelated delivery");
+        assert_eq!(
+            receipt,
+            DispatchReceipt {
+                dispatch_id: "dispatch-1".to_owned()
+            }
+        );
+        assert_eq!(*dispatcher.events.lock().expect("events"), vec![event()]);
     }
 
     #[tokio::test]
