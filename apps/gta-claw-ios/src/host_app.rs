@@ -760,11 +760,24 @@ pub trait LocalDiscoveryBackend {
 /// Uninhabited: it exists only as a type-level descriptor, and there is no
 /// reason to hold a value of it.
 ///
-/// `DNS_SD_SERVICE_TYPE` mirrors `claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE`
-/// (PR #57 head `237b386e`), which is documented there as the frozen local
-/// Gateway service type. `MECHANISM` is [`DiscoveryMechanism::InProcessMulticast`]
-/// because that browser is built on `mdns-sd`, which binds its own UDP
-/// multicast sockets in this process.
+/// `DNS_SD_SERVICE_TYPE` mirrors `claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE`,
+/// which is documented there as the frozen local Gateway service type. The
+/// mirror exists because `claw-nodes` is not on `main` yet; it is deliberately
+/// a copy of the *value* rather than a citation of a line, because the value is
+/// the stable part — the constant has been read at three different heads of the
+/// owning branch and moved line twice. Replacement with a direct dependency is
+/// mechanical once that crate lands.
+///
+/// `MECHANISM` is [`DiscoveryMechanism::InProcessMulticast`] because that
+/// browser is built on `mdns-sd`, which binds its own UDP multicast sockets in
+/// this process.
+///
+/// Scope limit worth knowing: `claw-nodes` also exposes a zone-parameterised
+/// browser over `_openclaw-gw._tcp.{zone}`. That form has no
+/// `NSBonjourServices` representation derivable from a service type alone, so
+/// [`HostAppDeclarations::discovery_precondition`] refuses it rather than
+/// truncating it to something that looks right. This descriptor covers the
+/// `.local.` browser only.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum GatewayMdnsBackend {}
 
