@@ -13,7 +13,7 @@ axum = { version = "=0.8.9", features = ["json", "tokio"] }
 base64 = "=0.22.1"
 claw-protocol.workspace = true
 claw-security.workspace = true
-futures-core = "=0.3.32"
+futures-core = "=0.3.33"
 http = "=1.4.0"
 ring = "=0.17.14"
 serde.workspace = true

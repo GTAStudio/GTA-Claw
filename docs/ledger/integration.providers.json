@@ -1,0 +1,898 @@
+{
+    "schema_version":  1,
+    "feature_id":  "integration.providers",
+    "ledger":  "compat/upstream/ledgers/official-integration.json",
+    "ledger_row_modified":  false,
+    "ledger_row_modified_reason":  "compat/upstream/validate.ps1 pins the SHA-256 of the features array (line 1006), requires exactly 16 JSON files under compat/upstream (lines 896-912), and asserts every feature stays status=unimplemented with acceptance_evidence.status=missing and zero artifacts (lines 1017-1021). Editing the row would make the required validate.ps1 gate fail, so the frozen tree is left byte-identical and the evidence lives here.",
+    "proposed_status":  "implemented_partial",
+    "baseline_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
+    "frozen_inventory":  "compat/upstream/inventories/providers.json",
+    "crates":  [
+                   "crates/claw-provider-sdk",
+                   "crates/claw-providers"
+               ],
+    "dialects_implemented":  [
+                                 "openai_chat_completions",
+                                 "anthropic_messages",
+                                 "github_copilot"
+                             ],
+    "counts":  {
+                   "total":  78,
+                   "implemented":  28,
+                   "endpoint_required":  38,
+                   "registration_only":  12
+               },
+    "tests":  {
+                  "total":  248,
+                  "claw-provider-sdk::lib":  123,
+                  "claw-provider-sdk::tests/transport.rs":  8,
+                  "claw-providers::lib":  88,
+                  "claw-providers::tests/frozen_inventory.rs":  6,
+                  "claw-providers::tests/wire.rs":  23,
+                  "third_party_network_calls":  0
+              },
+    "providers":  [
+                      {
+                          "id":  "amazon-bedrock",
+                          "display_name":  "Amazon Bedrock",
+                          "family":  "AmazonBedrock",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "AwsSigV4"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "amazon-bedrock-mantle",
+                          "display_name":  "Amazon Bedrock (Mantle)",
+                          "family":  "AmazonBedrock",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "AwsSigV4"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "anthropic",
+                          "display_name":  "Anthropic",
+                          "family":  "AnthropicMessages",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/anthropic.rs",
+                          "auth_modes":  [
+                                             "ApiKey",
+                                             "OAuthAuthorizationCode"
+                                         ],
+                          "default_base_url":  "https://api.anthropic.com"
+                      },
+                      {
+                          "id":  "anthropic-vertex",
+                          "display_name":  "Anthropic on Vertex AI",
+                          "family":  "AnthropicMessages",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "GoogleServiceAccount"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "arcee",
+                          "display_name":  "Arcee AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://conductor.arcee.ai/v1"
+                      },
+                      {
+                          "id":  "bailian-token-plan",
+                          "display_name":  "Alibaba Bailian (token plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "byteplus",
+                          "display_name":  "BytePlus ModelArk",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "byteplus-plan",
+                          "display_name":  "BytePlus ModelArk (plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "cerebras",
+                          "display_name":  "Cerebras",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.cerebras.ai/v1"
+                      },
+                      {
+                          "id":  "chutes",
+                          "display_name":  "Chutes",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://llm.chutes.ai/v1"
+                      },
+                      {
+                          "id":  "clawrouter",
+                          "display_name":  "ClawRouter",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "cloudflare-ai-gateway",
+                          "display_name":  "Cloudflare AI Gateway",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "codex",
+                          "display_name":  "OpenAI Codex",
+                          "family":  "OpenAiResponses",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "OAuthAuthorizationCode",
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "cohere",
+                          "display_name":  "Cohere",
+                          "family":  "CohereChat",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "comfy",
+                          "display_name":  "ComfyUI",
+                          "family":  "MediaGeneration",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "None"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "copilot-proxy",
+                          "display_name":  "Copilot Proxy",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "None"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "dashscope",
+                          "display_name":  "Alibaba Cloud DashScope",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                      },
+                      {
+                          "id":  "deepinfra",
+                          "display_name":  "DeepInfra",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.deepinfra.com/v1/openai"
+                      },
+                      {
+                          "id":  "deepseek",
+                          "display_name":  "DeepSeek",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.deepseek.com/v1"
+                      },
+                      {
+                          "id":  "fal",
+                          "display_name":  "fal.ai",
+                          "family":  "MediaGeneration",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "ApiKey"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "featherless",
+                          "display_name":  "Featherless AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.featherless.ai/v1"
+                      },
+                      {
+                          "id":  "fireworks",
+                          "display_name":  "Fireworks AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.fireworks.ai/inference/v1"
+                      },
+                      {
+                          "id":  "github-copilot",
+                          "display_name":  "GitHub Copilot",
+                          "family":  "GitHubCopilot",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/github_copilot.rs",
+                          "auth_modes":  [
+                                             "OAuthDeviceCode"
+                                         ],
+                          "default_base_url":  "https://api.githubcopilot.com"
+                      },
+                      {
+                          "id":  "gmi",
+                          "display_name":  "GMI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "gmicloud",
+                          "display_name":  "GMI Cloud (legacy alias)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "gmi-cloud",
+                          "display_name":  "GMI Cloud",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "google",
+                          "display_name":  "Google Gemini",
+                          "family":  "GoogleGemini",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "ApiKey"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "google-gemini-cli",
+                          "display_name":  "Google Gemini CLI",
+                          "family":  "GoogleGemini",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "OAuthAuthorizationCode"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "google-vertex",
+                          "display_name":  "Google Vertex AI",
+                          "family":  "GoogleGemini",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "GoogleServiceAccount"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "groq",
+                          "display_name":  "Groq",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.groq.com/openai/v1"
+                      },
+                      {
+                          "id":  "huggingface",
+                          "display_name":  "Hugging Face Inference Providers",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://router.huggingface.co/v1"
+                      },
+                      {
+                          "id":  "kilocode",
+                          "display_name":  "Kilo Code",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "kimi",
+                          "display_name":  "Kimi",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "kimi-coding",
+                          "display_name":  "Kimi for Coding",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "litellm",
+                          "display_name":  "LiteLLM Proxy",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken",
+                                             "None"
+                                         ],
+                          "default_base_url":  "http://127.0.0.1:4000/v1"
+                      },
+                      {
+                          "id":  "lmstudio",
+                          "display_name":  "LM Studio",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "None"
+                                         ],
+                          "default_base_url":  "http://127.0.0.1:1234/v1"
+                      },
+                      {
+                          "id":  "longcat",
+                          "display_name":  "LongCat",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "meta",
+                          "display_name":  "Meta Llama API",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "microsoft-foundry",
+                          "display_name":  "Microsoft AI Foundry",
+                          "family":  "AzureFoundry",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "AzureIdentity",
+                                             "ApiKey"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "minimax",
+                          "display_name":  "MiniMax",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "minimax-portal",
+                          "display_name":  "MiniMax Portal",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "mistral",
+                          "display_name":  "Mistral AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.mistral.ai/v1"
+                      },
+                      {
+                          "id":  "modelstudio",
+                          "display_name":  "Alibaba Cloud Model Studio",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+                      },
+                      {
+                          "id":  "moonshot",
+                          "display_name":  "Moonshot AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.moonshot.ai/v1"
+                      },
+                      {
+                          "id":  "novita",
+                          "display_name":  "Novita AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "novitaai",
+                          "display_name":  "Novita AI (legacy alias)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "novita-ai",
+                          "display_name":  "Novita AI (alias)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "nvidia",
+                          "display_name":  "NVIDIA NIM",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://integrate.api.nvidia.com/v1"
+                      },
+                      {
+                          "id":  "ollama",
+                          "display_name":  "Ollama",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "None"
+                                         ],
+                          "default_base_url":  "http://127.0.0.1:11434/v1"
+                      },
+                      {
+                          "id":  "ollama-cloud",
+                          "display_name":  "Ollama Cloud",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "openai",
+                          "display_name":  "OpenAI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.openai.com/v1"
+                      },
+                      {
+                          "id":  "opencode",
+                          "display_name":  "OpenCode",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "opencode-go",
+                          "display_name":  "OpenCode Go",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "openrouter",
+                          "display_name":  "OpenRouter",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://openrouter.ai/api/v1"
+                      },
+                      {
+                          "id":  "qianfan",
+                          "display_name":  "Baidu AI Cloud Qianfan",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "qwen",
+                          "display_name":  "Alibaba Qwen",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "qwen-cli",
+                          "display_name":  "Alibaba Qwen CLI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "OAuthAuthorizationCode"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "qwencloud",
+                          "display_name":  "Alibaba Qwen Cloud",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "qwen-oauth",
+                          "display_name":  "Alibaba Qwen (OAuth)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "OAuthAuthorizationCode"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "qwen-portal",
+                          "display_name":  "Alibaba Qwen Portal",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "OAuthAuthorizationCode"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "qwen-token-plan",
+                          "display_name":  "Alibaba Qwen (token plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "sglang",
+                          "display_name":  "SGLang",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "None"
+                                         ],
+                          "default_base_url":  "http://127.0.0.1:30000/v1"
+                      },
+                      {
+                          "id":  "stepfun",
+                          "display_name":  "StepFun",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "stepfun-plan",
+                          "display_name":  "StepFun (plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "synthetic",
+                          "display_name":  "Synthetic",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "tencent-tokenhub",
+                          "display_name":  "Tencent Cloud TokenHub",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "tencent-tokenplan",
+                          "display_name":  "Tencent Cloud (token plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "together",
+                          "display_name":  "Together AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.together.xyz/v1"
+                      },
+                      {
+                          "id":  "venice",
+                          "display_name":  "Venice AI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.venice.ai/api/v1"
+                      },
+                      {
+                          "id":  "vercel-ai-gateway",
+                          "display_name":  "Vercel AI Gateway",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://ai-gateway.vercel.sh/v1"
+                      },
+                      {
+                          "id":  "vllm",
+                          "display_name":  "vLLM",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "None"
+                                         ],
+                          "default_base_url":  "http://127.0.0.1:8000/v1"
+                      },
+                      {
+                          "id":  "volcengine",
+                          "display_name":  "Volcengine Ark",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://ark.cn-beijing.volces.com/api/v3"
+                      },
+                      {
+                          "id":  "volcengine-plan",
+                          "display_name":  "Volcengine Ark (plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "vydra",
+                          "display_name":  "Vydra",
+                          "family":  "Unclassified",
+                          "implementation_status":  "RegistrationOnly",
+                          "client_module":  null,
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "xai",
+                          "display_name":  "xAI",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "Implemented",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  "https://api.x.ai/v1"
+                      },
+                      {
+                          "id":  "xiaomi",
+                          "display_name":  "Xiaomi MiMo",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "xiaomi-token-plan",
+                          "display_name":  "Xiaomi MiMo (token plan)",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      },
+                      {
+                          "id":  "zai",
+                          "display_name":  "Z.ai",
+                          "family":  "OpenAiChatCompletions",
+                          "implementation_status":  "EndpointRequired",
+                          "client_module":  "crates/claw-providers/src/openai_compatible.rs",
+                          "auth_modes":  [
+                                             "BearerToken"
+                                         ],
+                          "default_base_url":  null
+                      }
+                  ]
+}

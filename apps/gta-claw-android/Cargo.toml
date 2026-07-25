@@ -1,0 +1,27 @@
+[package]
+name = "gta-claw-android"
+description = "UI-independent Android client core for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claw-application.workspace = true
+claw-gateway-client.workspace = true
+claw-platform.workspace = true
+claw-protocol.workspace = true
+claw-security.workspace = true
+rand_core = "=0.10.1"
+ring = "=0.17.14"
+secrecy = "=0.10.3"
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+url = "=2.5.8"
+
+[dev-dependencies]
+claw-clients.workspace = true
+
+[lints]
+workspace = true
