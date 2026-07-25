@@ -6,6 +6,7 @@
 mod common;
 
 use claw_tools::audit::{AuditOutcome, AuditPhase, AuditReason, InMemoryAuditSink};
+use claw_tools::clock::FixedClock;
 use claw_tools::fs::{FsGlobTool, FsListTool, FsPatchTool, FsReadTool, FsSearchTool, FsWriteTool};
 use claw_tools::permission::{
     Approval, Capability, GrantLedger, GrantRequest, GrantScope, Resource,
@@ -80,7 +81,7 @@ fn call(
 ) -> Result<ToolOutput, claw_tools::error::ToolError> {
     let context = ToolContext {
         sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     registry.invoke(name, &arguments, &context, ledger, audit)
 }

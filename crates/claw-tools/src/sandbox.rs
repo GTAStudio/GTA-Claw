@@ -32,6 +32,15 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// `FILE_FLAG_OPEN_REPARSE_POINT`.
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `FILE_FLAG_BACKUP_SEMANTICS`, required to open a directory handle.
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// `FILE_SHARE_READ`.
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+/// `FILE_SHARE_WRITE`.
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 
 /// Reserved Windows device names, compared case-insensitively against the
 /// portion of a component before its first dot.
@@ -279,24 +288,44 @@ impl Sandbox {
     ///
     /// The parent must already exist inside the root, and the leaf must not
     /// collide case-insensitively with a different existing name.
+    ///
+    /// This is validation only. The result is a *name*, and a name can be
+    /// invalidated the instant this returns, so nothing may act on it without
+    /// going back through [`Sandbox::write_file`], which re-establishes the
+    /// pinned ancestor chain before it opens anything.
     pub fn resolve_for_write(
         &self,
         path: &RelativePath,
         mode: WriteMode,
     ) -> Result<ResolvedPath, SandboxError> {
+        let prepared = self.prepare_write(path, mode)?;
+        Ok(ResolvedPath {
+            relative: path.clone(),
+            absolute: prepared.absolute,
+        })
+    }
+
+    /// Validates a write target while holding every ancestor directory open.
+    ///
+    /// The returned pin must stay alive until the target file has been opened
+    /// and re-verified: it is what stops an ancestor being swapped for a link
+    /// after the checks below have passed.
+    fn prepare_write(
+        &self,
+        path: &RelativePath,
+        mode: WriteMode,
+    ) -> Result<PreparedWrite, SandboxError> {
         let Some(leaf) = path.components.last() else {
             return Err(SandboxError::EmptyPath);
         };
-        let parent = match path.parent() {
-            Some(parent) => self.resolve_directory(&parent)?,
-            None => self.resolve_root(),
-        };
-        let absolute = parent.absolute.join(leaf);
+        let parent_components = &path.components[..path.components.len() - 1];
+        let pin = self.pin_ancestors(parent_components)?;
+        let absolute = pin.path().join(leaf);
         // Scanned before the existence check so that a case-insensitive
         // filesystem cannot silently redirect the write onto a differently
         // cased file, and so the refusal is identical on every platform.
-        self.reject_case_collision(&parent.absolute, leaf)?;
-        match std::fs::symlink_metadata(&absolute) {
+        self.reject_case_collision(pin.path(), leaf)?;
+        let existed = match std::fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
                 if is_link_like(&metadata) {
                     return Err(SandboxError::SymlinkForbidden);
@@ -308,13 +337,15 @@ impl Sandbox {
                     return Err(SandboxError::AlreadyExists);
                 }
                 self.verify_canonical(&absolute, &path.components)?;
+                true
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(map_io(error)),
-        }
-        Ok(ResolvedPath {
-            relative: path.clone(),
+        };
+        Ok(PreparedWrite {
+            pin,
             absolute,
+            existed,
         })
     }
 
@@ -340,6 +371,13 @@ impl Sandbox {
     }
 
     /// Writes a whole file, refusing links, escapes, and oversized content.
+    ///
+    /// Ordering is the security property. The target is opened with no
+    /// destructive flag, the opened handle and the pinned ancestor chain are
+    /// re-verified, and only then is the file truncated. A process that wins a
+    /// race to swap a directory therefore never gets a file truncated or
+    /// written: the worst it achieves is an empty file it must already have
+    /// been able to create, which is removed again on the failure path.
     pub fn write_file(
         &self,
         path: &RelativePath,
@@ -349,9 +387,9 @@ impl Sandbox {
         if u64::try_from(content.len()).unwrap_or(u64::MAX) > self.limits.max_file_bytes {
             return Err(SandboxError::FileTooLarge);
         }
-        let resolved = self.resolve_for_write(path, mode)?;
+        let prepared = self.prepare_write(path, mode)?;
         let mut options = OpenOptions::new();
-        options.write(true).truncate(true);
+        options.write(true);
         match mode {
             WriteMode::CreateNew => {
                 options.create_new(true);
@@ -361,23 +399,34 @@ impl Sandbox {
             }
         }
         apply_no_follow(&mut options);
-        let mut file = options.open(&resolved.absolute).map_err(map_io)?;
-        verify_handle_is_not_reparse_point(&file)?;
-        self.verify_canonical(&resolved.absolute, &resolved.relative.components)?;
+        let mut file = options.open(&prepared.absolute).map_err(map_io)?;
+        let verified = verify_handle_is_not_reparse_point(&file)
+            .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
+            .and_then(|()| prepared.pin.verify());
+        if let Err(error) = verified {
+            drop(file);
+            if !prepared.existed {
+                remove_own_empty_file(&prepared.absolute);
+            }
+            return Err(error);
+        }
+        // The first mutation of the target happens here, after every check.
+        file.set_len(0).map_err(map_io)?;
         file.write_all(content).map_err(map_io)?;
         file.flush().map_err(map_io)?;
-        Ok(resolved)
+        Ok(ResolvedPath {
+            relative: path.clone(),
+            absolute: prepared.absolute,
+        })
     }
 
     /// Enumerates one directory without following links.
     pub fn read_directory(&self, path: &RelativePath) -> Result<Vec<DirectoryEntry>, SandboxError> {
-        let resolved = if path.components.is_empty() {
-            self.resolve_root()
-        } else {
-            self.resolve_directory(path)?
-        };
+        // The directory itself is pinned, so the listing cannot be redirected
+        // to another directory after the components were validated.
+        let pin = self.pin_ancestors(&path.components)?;
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&resolved.absolute).map_err(map_io)? {
+        for entry in std::fs::read_dir(pin.path()).map_err(map_io)? {
             let entry = entry.map_err(map_io)?;
             if entries.len() >= self.limits.max_directory_entries {
                 return Err(SandboxError::DirectoryTooLarge);
@@ -396,6 +445,7 @@ impl Sandbox {
                 size_bytes: (kind == EntryKind::File).then_some(metadata.len()),
             });
         }
+        pin.verify()?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(entries)
     }
@@ -424,14 +474,55 @@ impl Sandbox {
     }
 
     /// Opens an already-resolved file without following a final-component link.
+    ///
+    /// The ancestor chain is pinned again here rather than trusted from the
+    /// earlier resolution, and re-verified after the handle exists, so the file
+    /// behind the handle is provably the file that was validated.
     pub fn open_no_follow(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
+        let components = &resolved.relative.components;
+        let Some(leaf) = components.last() else {
+            return Err(SandboxError::NotAFile);
+        };
+        let pin = self.pin_ancestors(&components[..components.len() - 1])?;
+        let absolute = pin.path().join(leaf);
         let mut options = OpenOptions::new();
         options.read(true);
         apply_no_follow(&mut options);
-        let file = options.open(&resolved.absolute).map_err(map_io)?;
+        let file = options.open(&absolute).map_err(map_io)?;
         verify_handle_is_not_reparse_point(&file)?;
-        self.verify_canonical(&resolved.absolute, &resolved.relative.components)?;
+        self.verify_canonical(&absolute, components)?;
+        pin.verify()?;
         Ok(file)
+    }
+
+    /// Opens and holds a handle to the root and to every named directory below
+    /// it, refusing links at every level.
+    ///
+    /// On Windows the handles are opened without `FILE_SHARE_DELETE`, so the
+    /// operating system itself refuses to rename or delete any pinned
+    /// directory while the pin lives. On Unix, where no such lock exists, each
+    /// directory's device and inode are captured from its own handle and
+    /// re-compared in [`DirectoryPin::verify`].
+    fn pin_ancestors(&self, components: &[String]) -> Result<DirectoryPin, SandboxError> {
+        if components.len() > self.limits.max_path_components {
+            return Err(SandboxError::TooManyComponents);
+        }
+        let mut levels = Vec::with_capacity(components.len() + 1);
+        levels.push(pin_directory(&self.root)?);
+        let mut absolute = self.root.clone();
+        for component in components {
+            absolute.push(component);
+            let metadata = std::fs::symlink_metadata(&absolute).map_err(map_io)?;
+            if is_link_like(&metadata) {
+                return Err(SandboxError::SymlinkForbidden);
+            }
+            if !metadata.is_dir() {
+                return Err(SandboxError::NotADirectory);
+            }
+            levels.push(pin_directory(&absolute)?);
+        }
+        self.verify_canonical(&absolute, components)?;
+        Ok(DirectoryPin { levels })
     }
 
     fn child_of(&self, parent: &RelativePath, name: &str) -> Result<RelativePath, SandboxError> {
@@ -527,6 +618,139 @@ fn classify(metadata: &std::fs::Metadata) -> EntryKind {
 fn is_link_like(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Validated write target together with the ancestor pin that guards it.
+struct PreparedWrite {
+    pin: DirectoryPin,
+    absolute: PathBuf,
+    existed: bool,
+}
+
+/// Identity of a directory as reported by its own open handle.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn identity_of(metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+/// One pinned ancestor directory.
+#[derive(Debug)]
+struct PinnedDirectory {
+    path: PathBuf,
+    /// Held open for the whole check-and-use window. It is never read: its
+    /// value is that the operating system knows it exists.
+    #[allow(dead_code)]
+    handle: File,
+    #[cfg(unix)]
+    identity: DirectoryIdentity,
+}
+
+/// Open handles to the workspace root and to every named directory below it.
+///
+/// A pin is the object the sandbox acts on. Nothing between validation and use
+/// re-derives a directory from its name, which is what makes the check-then-use
+/// window closed rather than merely narrow.
+#[derive(Debug)]
+struct DirectoryPin {
+    levels: Vec<PinnedDirectory>,
+}
+
+impl DirectoryPin {
+    /// Returns the deepest pinned directory.
+    fn path(&self) -> &Path {
+        self.levels
+            .last()
+            .map_or_else(|| Path::new(""), |level| level.path.as_path())
+    }
+
+    /// Re-checks that every pinned directory is still the same directory.
+    fn verify(&self) -> Result<(), SandboxError> {
+        for level in &self.levels {
+            let metadata = std::fs::symlink_metadata(&level.path).map_err(map_io)?;
+            if is_link_like(&metadata) || !metadata.is_dir() {
+                return Err(SandboxError::RaceDetected);
+            }
+            #[cfg(unix)]
+            if identity_of(&metadata) != level.identity {
+                return Err(SandboxError::RaceDetected);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Opens one directory handle without following a link at its final component.
+fn pin_directory(path: &Path) -> Result<PinnedDirectory, SandboxError> {
+    let handle = open_directory_no_follow(path)?;
+    let metadata = handle.metadata().map_err(map_io)?;
+    if is_link_like(&metadata) {
+        return Err(SandboxError::SymlinkForbidden);
+    }
+    if !metadata.is_dir() {
+        return Err(SandboxError::NotADirectory);
+    }
+    Ok(PinnedDirectory {
+        path: path.to_path_buf(),
+        #[cfg(unix)]
+        identity: identity_of(&metadata),
+        handle,
+    })
+}
+
+#[cfg(windows)]
+fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
+    OpenOptions::new()
+        .read(true)
+        // Withholding FILE_SHARE_DELETE makes Windows refuse to rename or
+        // delete this directory for as long as the handle lives, which is what
+        // stops a validated ancestor being swapped for a junction.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(map_io)
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(map_io)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn open_directory_no_follow(path: &Path) -> Result<File, SandboxError> {
+    File::open(path).map_err(map_io)
+}
+
+/// Removes a file this call created, and only if it is still empty.
+///
+/// Used on the failure path of a create that was invalidated after the fact.
+/// The size and type checks mean an attacker cannot turn cleanup into a
+/// deletion primitive for a file that was already there.
+fn remove_own_empty_file(path: &Path) {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.is_file()
+        && !is_link_like(&metadata)
+        && metadata.len() == 0
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Returns whether metadata describes a symbolic link.
@@ -742,6 +966,8 @@ pub enum SandboxError {
     TrailingDotOrSpace,
     /// A symbolic link, junction, or reparse point was on the path.
     SymlinkForbidden,
+    /// An ancestor directory changed identity between validation and use.
+    RaceDetected,
     /// The resolved path left the workspace root.
     EscapesRoot,
     /// The requested casing does not match the on-disk casing.
@@ -791,6 +1017,7 @@ impl Display for SandboxError {
                 "leading or trailing spaces and trailing dots are forbidden"
             }
             Self::SymlinkForbidden => "links, junctions, and reparse points are forbidden",
+            Self::RaceDetected => "a directory on the path changed between validation and use",
             Self::EscapesRoot => "path escapes the workspace root",
             Self::CaseMismatch => "path casing does not match the on-disk name",
             Self::CaseCollision => "a name differing only by case already exists",

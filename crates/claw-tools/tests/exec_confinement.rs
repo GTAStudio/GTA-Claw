@@ -14,14 +14,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use claw_tools::audit::InMemoryAuditSink;
-use claw_tools::exec::{CancellationToken, EnvPolicy, ExecPolicy, ExecutionError, ProcessExecTool};
+use claw_tools::clock::FixedClock;
+use claw_tools::exec::{
+    ArgvPolicy, CancellationToken, EnvPolicy, ExecPolicy, ExecutionError, ProcessExecTool,
+};
 use claw_tools::permission::{Approval, Capability, GrantLedger, GrantRequest, GrantScope};
 use claw_tools::registry::ToolRegistry;
 use claw_tools::sandbox::{Sandbox, SandboxLimits};
 use claw_tools::tool::ToolContext;
 use serde_json::{Value, json};
 
-use common::TempTree;
+use common::{TempTree, try_junction, try_symlink_dir};
 
 /// Selects the behaviour of a re-executed copy of this binary.
 const ROLE_VAR: &str = "CLAW_TOOLS_EXEC_ROLE";
@@ -31,6 +34,17 @@ const DIR_VAR: &str = "CLAW_TOOLS_EXEC_DIR";
 const ARGV_SEPARATOR: char = '\u{1}';
 
 const NOW: u64 = 1_700_000_000_000;
+
+/// Canonicalizes a path the way the policy requires, without the Windows
+/// verbatim prefix an operator would never type.
+fn canonical(path: &std::path::Path) -> PathBuf {
+    let canonical = fs::canonicalize(path).expect("the path exists");
+    let text = canonical.to_string_lossy().into_owned();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.len() >= 2 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        _ => canonical,
+    }
+}
 
 /// Harness arguments that make a re-executed copy run only the helper.
 fn helper_arguments() -> Vec<String> {
@@ -87,6 +101,32 @@ fn exec_helper_entry() {
         }
         "sleep" => {
             thread::sleep(Duration::from_secs(30));
+        }
+        "detacher" => {
+            // Spawns a payload that inherits this process's pipes, waits until
+            // it is demonstrably running, then exits successfully. Nothing is
+            // redirected, so the payload holds the pipe write ends open after
+            // this process is gone.
+            let executable = std::env::current_exe().expect("the helper knows its own path");
+            // Deliberately never reaped: the point of this role is to leave a
+            // live descendant behind after the direct child exits cleanly.
+            let mut payload = Command::new(executable)
+                .args(helper_arguments())
+                .env(ROLE_VAR, "grandchild")
+                .env(DIR_VAR, &directory)
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("the grandchild spawns");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && !directory.join("grandchild_started").exists() {
+                thread::sleep(Duration::from_millis(20));
+            }
+            fs::write(directory.join("parent_started"), "1")
+                .expect("the helper can write its marker");
+            // Detach without waiting; the supervisor under test is responsible
+            // for reaping the whole tree.
+            let _ = payload.try_wait();
+            drop(payload);
         }
         "parent" => {
             let executable = std::env::current_exe().expect("the helper knows its own path");
@@ -153,6 +193,18 @@ impl Harness {
     }
 
     fn policy(&self, role: &str) -> ExecPolicy {
+        let mut policy = self.base_policy(role);
+        policy
+            .allow_program(
+                "helper",
+                canonical(&std::env::current_exe().expect("the test binary knows its own path")),
+            )
+            .expect("the test binary is an acceptable program");
+        policy
+    }
+
+    /// Builds the environment and limits without allowlisting any program.
+    fn base_policy(&self, role: &str) -> ExecPolicy {
         let mut env = EnvPolicy::empty()
             .with_platform_minimum()
             .expect("the platform minimum is valid");
@@ -162,16 +214,9 @@ impl Harness {
             self.markers().to_str().expect("temporary paths are UTF-8"),
         )
         .expect("the marker directory is valid");
-        let mut policy = ExecPolicy::deny_all()
+        ExecPolicy::deny_all()
             .with_env(env)
-            .with_timeout(Duration::from_secs(45));
-        policy
-            .allow_program(
-                "helper",
-                std::env::current_exe().expect("the test binary knows its own path"),
-            )
-            .expect("the test binary is an acceptable program");
-        policy
+            .with_timeout(Duration::from_secs(45))
     }
 
     fn run(
@@ -185,7 +230,7 @@ impl Harness {
             .expect("process_exec registers");
         let context = ToolContext {
             sandbox: &self.sandbox,
-            unix_millis: NOW,
+            clock: &FixedClock::new(NOW),
         };
         registry.invoke(
             "process_exec",
@@ -429,5 +474,165 @@ fn cancellation_kills_the_whole_process_tree_not_just_the_child() {
     assert!(
         harness.marker("grandchild_survived").is_none(),
         "a grandchild outlived the cancelled invocation"
+    );
+}
+
+#[test]
+fn an_allowlisted_executable_that_is_replaced_is_refused_before_it_runs() {
+    // The audited attack: an operator allowlists a path, the agent overwrites
+    // that path with something else, and the existing grant then runs it.
+    // Identity is re-checked immediately before the spawn, so the substituted
+    // file is refused even though the pathname is unchanged.
+    let mut harness = Harness::new("exec-substitute");
+    let binary = harness.tree.join("bin/helper-copy.exe");
+    fs::create_dir_all(binary.parent().expect("bin has a parent"))
+        .expect("bin directory is creatable");
+    let original = std::env::current_exe().expect("the test binary knows its own path");
+    fs::copy(&original, &binary).expect("the test binary is copyable");
+
+    let mut policy = harness.base_policy("argv");
+    policy
+        .allow_program("helper", canonical(&binary))
+        .expect("a real executable is allowlisted");
+
+    // The attacker now replaces the file at the allowlisted path.
+    fs::write(&binary, b"#!/bin/sh\nid\n").expect("the executable is overwritable");
+
+    let tool = ProcessExecTool::new(policy);
+    let error = harness
+        .run(
+            tool,
+            &json!({ "program": "helper", "args": helper_arguments() }),
+        )
+        .expect_err("a substituted executable must not run");
+    assert_eq!(
+        error.execution(),
+        Some(&ExecutionError::ExecutableChanged),
+        "unexpected error {error:?}"
+    );
+    assert!(
+        harness.marker("argv.txt").is_none(),
+        "the substituted executable ran anyway"
+    );
+}
+
+#[test]
+fn an_executable_the_agent_can_write_cannot_be_allowlisted() {
+    // `tools/lint` inside the workspace is the concrete example from the
+    // audit: write permission plus an allowlisted workspace path is arbitrary
+    // execution, so the binding is refused at configuration time.
+    let harness = Harness::new("exec-writable");
+    let inside = harness.tree.join("workspace/tools/lint.exe");
+    fs::create_dir_all(inside.parent().expect("tools has a parent"))
+        .expect("tools directory is creatable");
+    let original = std::env::current_exe().expect("the test binary knows its own path");
+    fs::copy(&original, &inside).expect("the test binary is copyable");
+
+    let mut policy = ExecPolicy::deny_all().with_writable_root(harness.tree.join("workspace"));
+    assert_eq!(
+        policy.allow_program("lint", canonical(&inside)),
+        Err(ExecutionError::ExecutableInsideWritableRoot)
+    );
+    assert!(policy.program_names().is_empty());
+}
+
+#[test]
+fn a_shebang_script_cannot_be_allowlisted_even_without_an_extension() {
+    // An extensionless script keeps the executable bit and looks like a
+    // binary; only its first two bytes give it away.
+    let harness = Harness::new("exec-shebang");
+    let script = harness.tree.join("bin/lint");
+    fs::create_dir_all(script.parent().expect("bin has a parent"))
+        .expect("bin directory is creatable");
+    fs::write(&script, b"#!/bin/sh\nexec /bin/sh \"$@\"\n").expect("script is writable");
+    let mut policy = ExecPolicy::deny_all();
+    assert_eq!(
+        policy.allow_program("lint", canonical(&script)),
+        Err(ExecutionError::InterpretedProgramForbidden)
+    );
+    assert!(policy.program_names().is_empty());
+}
+
+#[test]
+fn an_executable_reached_through_a_linked_directory_is_refused() {
+    // A junctioned parent means the real target can change without the
+    // configured path changing, so the binding is refused.
+    let harness = Harness::new("exec-junction");
+    let real = harness.tree.dir("realbin");
+    let original = std::env::current_exe().expect("the test binary knows its own path");
+    fs::copy(&original, real.join("helper.exe")).expect("the test binary is copyable");
+    let link = harness.tree.join("linkbin");
+    if !try_symlink_dir(&real, &link) && !try_junction(&real, &link) {
+        return;
+    }
+    let mut policy = ExecPolicy::deny_all();
+    assert_eq!(
+        policy.allow_program("helper", link.join("helper.exe")),
+        Err(ExecutionError::ExecutablePathNotCanonical)
+    );
+    assert!(policy.program_names().is_empty());
+}
+
+#[test]
+fn an_argument_outside_the_programs_policy_is_refused_before_the_spawn() {
+    let mut harness = Harness::new("exec-argvpolicy");
+    let mut policy = harness.base_policy("argv");
+    let mut allowed = helper_arguments();
+    allowed.push("--allowed-flag".to_owned());
+    policy
+        .allow_program_with_argv(
+            "helper",
+            canonical(&std::env::current_exe().expect("the test binary knows its own path")),
+            ArgvPolicy::exactly(allowed),
+        )
+        .expect("the test binary is an acceptable program");
+
+    let mut rejected = helper_arguments();
+    rejected.push("--not-in-the-policy".to_owned());
+    let tool = ProcessExecTool::new(policy);
+    let error = harness
+        .run(tool, &json!({ "program": "helper", "args": rejected }))
+        .expect_err("an argument outside the policy must be refused");
+    assert_eq!(
+        error.execution(),
+        Some(&ExecutionError::ArgumentNotAllowed),
+        "unexpected error {error:?}"
+    );
+    assert!(
+        harness.marker("argv.txt").is_none(),
+        "the program ran despite a rejected argument"
+    );
+}
+
+#[test]
+fn a_detached_grandchild_does_not_outlive_a_clean_parent_exit() {
+    // The audited gap: supervision ended when the direct child exited
+    // successfully, so a payload it had already detached survived. The
+    // grandchild here also inherits the pipes, which is what used to make the
+    // reader threads wait for it.
+    let mut harness = Harness::new("exec-detach");
+    let tool = ProcessExecTool::new(harness.policy("detacher"));
+    let started = Instant::now();
+    let output = harness
+        .run(
+            tool,
+            &json!({ "program": "helper", "args": helper_arguments() }),
+        )
+        .expect("the parent exits cleanly");
+    assert_eq!(output.structured["exit_code"], 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "a detached grandchild held the invocation open"
+    );
+    assert!(
+        harness.marker("grandchild_started").is_some(),
+        "the grandchild never started, so this test proved nothing"
+    );
+
+    // The grandchild writes its survival marker twenty seconds in.
+    thread::sleep(Duration::from_secs(6));
+    assert!(
+        harness.marker("grandchild_survived").is_none(),
+        "a detached grandchild outlived the invocation"
     );
 }

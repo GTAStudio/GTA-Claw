@@ -38,7 +38,8 @@ const PATCH_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max_bytes: MAX_PATCH_BYTES,
         },
     },
-]);
+])
+.recording(&["path"]);
 
 /// Line terminator style preserved across a patch application.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

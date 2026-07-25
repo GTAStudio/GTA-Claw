@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::audit::{AuditOutcome, AuditPhase, AuditReason, ToolAuditRecord, ToolAuditSink, redact};
+use crate::audit::{
+    AuditOutcome, AuditPhase, AuditReason, ToolAuditRecord, ToolAuditSink, opaque_arguments,
+};
+use crate::clock::Clock;
 use crate::error::ToolError;
 use crate::permission::{
     Authorization, Capability, DenialReason, GrantId, PermissionBroker, PermissionDecision,
@@ -92,8 +95,10 @@ impl ToolRegistry {
         B: PermissionBroker,
         S: ToolAuditSink,
     {
-        let redacted = redact(arguments);
+        let now = context.unix_millis();
         let Some(tool) = self.tools.get(name) else {
+            // An unregistered name has no schema to project through, so the
+            // payload contributes nothing but its shape to the record.
             let record = ToolAuditRecord {
                 tool: sanitize_tool_name(name),
                 phase: AuditPhase::Completed,
@@ -103,14 +108,17 @@ impl ToolRegistry {
                 outcome: AuditOutcome::Denied,
                 reason: AuditReason::UnknownTool,
                 denial: None,
-                arguments: redacted,
-                unix_millis: context.unix_millis,
+                arguments: opaque_arguments(arguments),
+                unix_millis: now,
             };
             audit.persist(&record)?;
             return Err(ToolError::UnknownTool);
         };
         let descriptor = tool.descriptor();
         let capability = descriptor.permission.capability;
+        // Schema-aware projection, not heuristic redaction: a parameter reaches
+        // the audit log only when its schema classified it as safe to record.
+        let redacted = descriptor.schema.project_audit(arguments);
 
         let validated = match descriptor.schema.validate(arguments) {
             Ok(validated) => validated,
@@ -122,7 +130,7 @@ impl ToolRegistry {
                     AuditReason::ValidationRejected,
                     None,
                     redacted,
-                    context.unix_millis,
+                    now,
                 )?;
                 return Err(ToolError::Schema(error));
             }
@@ -132,15 +140,7 @@ impl ToolRegistry {
             Ok(resource) => resource,
             Err(error) => {
                 let reason = error.audit_reason();
-                self.audit_refusal(
-                    audit,
-                    &descriptor,
-                    None,
-                    reason,
-                    None,
-                    redacted,
-                    context.unix_millis,
-                )?;
+                self.audit_refusal(audit, &descriptor, None, reason, None, redacted, now)?;
                 return Err(error);
             }
         };
@@ -150,7 +150,7 @@ impl ToolRegistry {
             capability,
             resource: resource.clone(),
             requires_approval: descriptor.permission.requires_approval,
-            unix_millis: context.unix_millis,
+            unix_millis: now,
         };
         let grant = match broker.evaluate(&request) {
             PermissionDecision::Granted(grant) => grant,
@@ -162,7 +162,7 @@ impl ToolRegistry {
                     AuditReason::PolicyRejected,
                     Some(reason),
                     redacted,
-                    context.unix_millis,
+                    now,
                 )?;
                 return Err(ToolError::Permission(PermissionError {
                     tool: descriptor.name,
@@ -182,7 +182,7 @@ impl ToolRegistry {
             reason: AuditReason::PolicySatisfied,
             denial: None,
             arguments: redacted.clone(),
-            unix_millis: context.unix_millis,
+            unix_millis: now,
         };
         // The authorization record is committed before any side effect so a
         // crash during execution still leaves the decision on record.
@@ -198,7 +198,7 @@ impl ToolRegistry {
                 tool: descriptor.name,
                 capability,
                 requires_approval: descriptor.permission.requires_approval,
-                unix_millis: context.unix_millis,
+                clock: context.clock,
                 arguments: redacted.clone(),
             };
             let authorization = Authorization::new(grant, capability, &gate);
@@ -218,7 +218,7 @@ impl ToolRegistry {
             reason,
             denial: None,
             arguments: redacted,
-            unix_millis: context.unix_millis,
+            unix_millis: now,
         })?;
         result
     }
@@ -252,16 +252,17 @@ impl ToolRegistry {
 
 /// Re-authorization gate handed to a tool for the duration of one invocation.
 ///
-/// It re-asks the same broker that authorized the invocation, and durably
-/// records every answer, so a tool that widens its resource set mid-flight is
-/// both re-checked and accounted for.
+/// It re-asks the same broker that authorized the invocation, against the time
+/// read at that moment rather than the time the invocation began, and durably
+/// records every answer. A tool that widens its resource set mid-flight is
+/// therefore re-checked, re-timed, and accounted for.
 struct BrokerGate<'a, B: PermissionBroker, S: ToolAuditSink> {
     broker: RefCell<&'a mut B>,
     audit: RefCell<&'a mut S>,
     tool: &'static str,
     capability: Capability,
     requires_approval: bool,
-    unix_millis: u64,
+    clock: &'a dyn Clock,
     arguments: Value,
 }
 
@@ -277,12 +278,15 @@ impl<B: PermissionBroker, S: ToolAuditSink> BrokerGate<'_, B, S> {
 
 impl<B: PermissionBroker, S: ToolAuditSink> ResourceGate for BrokerGate<'_, B, S> {
     fn authorize(&self, resource: &Resource) -> Result<GrantId, PermissionError> {
+        // Fresh time, read now: a grant that expired while the invocation was
+        // in flight must be refused at the moment the next resource is reached.
+        let unix_millis = self.clock.unix_millis();
         let request = PermissionRequest {
             tool: self.tool,
             capability: self.capability,
             resource: resource.clone(),
             requires_approval: self.requires_approval,
-            unix_millis: self.unix_millis,
+            unix_millis,
         };
         let decision = self.broker.borrow_mut().evaluate(&request);
         let (grant, outcome, reason, denial) = match decision {
@@ -309,7 +313,7 @@ impl<B: PermissionBroker, S: ToolAuditSink> ResourceGate for BrokerGate<'_, B, S
             reason,
             denial,
             arguments: self.arguments.clone(),
-            unix_millis: self.unix_millis,
+            unix_millis,
         };
         // An unrecorded authorization is treated as no authorization.
         if self.audit.borrow_mut().persist(&record).is_err() {

@@ -14,6 +14,9 @@ use serde_json::{Map, Value, json};
 /// Longest sanitized fragment echoed back into an error message.
 const MAX_ECHOED_NAME_BYTES: usize = 48;
 
+/// Inclusive maximum number of payload keys reflected into an audit record.
+const MAX_PROJECTED_FIELDS: usize = 32;
+
 /// Declared type of one tool parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FieldType {
@@ -69,22 +72,89 @@ pub struct Field {
 }
 
 /// Closed object schema for one tool.
+///
+/// A schema also declares which parameters may appear in an audit record. The
+/// declaration is an allowlist and it is empty by default, so a parameter added
+/// later is withheld from the audit log until someone deliberately classifies
+/// it as safe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParameterSchema {
     fields: &'static [Field],
+    recorded: &'static [&'static str],
 }
 
 impl ParameterSchema {
-    /// Builds a schema from a static field table.
+    /// Builds a schema from a static field table, recording no parameter value.
     #[must_use]
     pub const fn new(fields: &'static [Field]) -> Self {
-        Self { fields }
+        Self {
+            fields,
+            recorded: &[],
+        }
+    }
+
+    /// Names the parameters whose values are safe to write to an audit log.
+    ///
+    /// Reserved for closed choices, counts, flags, operator-controlled
+    /// identifiers and workspace-relative paths. Never for payloads, patches,
+    /// queries, argument vectors or URLs, all of which routinely carry
+    /// credentials in a shape no heuristic recognizes.
+    #[must_use]
+    pub const fn recording(self, recorded: &'static [&'static str]) -> Self {
+        Self {
+            fields: self.fields,
+            recorded,
+        }
     }
 
     /// Returns the declared fields in emission order.
     #[must_use]
     pub const fn fields(&self) -> &'static [Field] {
         self.fields
+    }
+
+    /// Returns the parameters classified as safe to record verbatim.
+    #[must_use]
+    pub const fn recorded_fields(&self) -> &'static [&'static str] {
+        self.recorded
+    }
+
+    /// Projects caller-supplied arguments into an audit-safe value.
+    ///
+    /// This runs on the raw payload, before validation, so a rejected
+    /// invocation is auditable without its rejected payload being stored. Any
+    /// parameter that is not on the recording allowlist contributes only its
+    /// declared type, its JSON shape and its measured size.
+    #[must_use]
+    pub fn project_audit(&self, raw: &Value) -> Value {
+        let Some(object) = raw.as_object() else {
+            return json!({ "[shape]": shape_of(raw) });
+        };
+        let mut projected = Map::new();
+        let mut unknown: Vec<Value> = Vec::new();
+        for (key, value) in object.iter().take(MAX_PROJECTED_FIELDS) {
+            match self.fields.iter().find(|field| field.name == key) {
+                Some(field) if self.recorded.contains(&field.name) => {
+                    projected.insert(field.name.to_owned(), crate::audit::redact(value));
+                }
+                Some(field) => {
+                    projected.insert(field.name.to_owned(), measure(value, field.ty));
+                }
+                // An unknown key is a schema violation; its name is sanitized
+                // and its value never reaches the record.
+                None => unknown.push(Value::String(sanitize_name(key))),
+            }
+        }
+        if object.len() > MAX_PROJECTED_FIELDS {
+            projected.insert(
+                "[omitted]".to_owned(),
+                Value::from(object.len() - MAX_PROJECTED_FIELDS),
+            );
+        }
+        if !unknown.is_empty() {
+            projected.insert("[unknown]".to_owned(), Value::Array(unknown));
+        }
+        Value::Object(projected)
     }
 
     /// Emits a provider-facing JSON Schema object with closed properties.
@@ -128,6 +198,47 @@ impl ParameterSchema {
             }
         }
         Ok(Arguments { values })
+    }
+}
+
+/// Names the JSON shape of a value without revealing any of its content.
+fn shape_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Describes a withheld value by declared type, shape and size only.
+fn measure(value: &Value, ty: FieldType) -> Value {
+    let size = match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.len(),
+        Value::Object(entries) => entries.len(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    };
+    json!({
+        "withheld": true,
+        "declared": declared_type_name(ty),
+        "shape": shape_of(value),
+        "size": u64::try_from(size).unwrap_or(u64::MAX),
+    })
+}
+
+/// Returns the stable name of a declared parameter type.
+const fn declared_type_name(ty: FieldType) -> &'static str {
+    match ty {
+        FieldType::Text { .. } => "text",
+        FieldType::Blob { .. } => "blob",
+        FieldType::Count { .. } => "count",
+        FieldType::Flag => "flag",
+        FieldType::Choice { .. } => "choice",
+        FieldType::TextList { .. } => "text_list",
+        FieldType::TextMap { .. } => "text_map",
     }
 }
 

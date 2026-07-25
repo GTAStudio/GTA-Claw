@@ -37,7 +37,8 @@ const READ_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max: MAX_READ_LINES,
         },
     },
-]);
+])
+.recording(&["path", "start_line", "line_count"]);
 
 const WRITE_SCHEMA: ParameterSchema = ParameterSchema::new(&[
     Field {
@@ -64,7 +65,8 @@ const WRITE_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             values: &["create", "overwrite"],
         },
     },
-]);
+])
+.recording(&["path", "mode"]);
 
 const LIST_SCHEMA: ParameterSchema = ParameterSchema::new(&[
     Field {
@@ -83,7 +85,8 @@ const LIST_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max: MAX_LIST_ENTRIES,
         },
     },
-]);
+])
+.recording(&["path", "max_entries"]);
 
 /// Reads a UTF-8 text file inside the workspace sandbox.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

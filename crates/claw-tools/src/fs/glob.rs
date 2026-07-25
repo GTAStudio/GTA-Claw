@@ -46,7 +46,8 @@ const GLOB_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max: MAX_GLOB_RESULTS,
         },
     },
-]);
+])
+.recording(&["path", "max_results"]);
 
 /// A validated glob pattern.
 #[derive(Clone, Debug, Eq, PartialEq)]

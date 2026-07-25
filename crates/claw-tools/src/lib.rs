@@ -37,6 +37,7 @@
 //! ```
 
 pub mod audit;
+pub mod clock;
 pub mod error;
 pub mod exec;
 pub mod fs;
@@ -49,15 +50,22 @@ pub mod tool;
 
 pub use audit::{
     AuditError, AuditOutcome, AuditPhase, AuditReason, InMemoryAuditSink, ToolAuditRecord,
-    ToolAuditSink, redact,
+    ToolAuditSink, opaque_arguments, redact,
 };
+pub use clock::{Clock, FixedClock, MonotonicClock, SystemClock};
 pub use error::ToolError;
 pub use exec::{
-    CancellationToken, EnvPolicy, ExecPolicy, ExecutionError, ProcessExecTool, ProcessOutcome,
+    ArgvPolicy, CancellationToken, EnvPolicy, ExecPolicy, ExecutionError, ProcessExecTool,
+    ProcessOutcome,
 };
 pub use fs::{
     FsGlobTool, FsListTool, FsPatchTool, FsReadTool, FsSearchTool, FsWriteTool, GlobError,
     GlobPattern, PatchError, UnifiedPatch,
+};
+pub use net::{
+    DenyAllSearchProvider, DenyAllTransport, Destination, HttpRequest, HttpResponse, HttpTransport,
+    NetFetchTool, NetworkError, PinnedHttpTransport, PrivateOriginExceptions, SearchHit,
+    SearchProvider, UrlPolicy, WebSearchTool,
 };
 pub use permission::{
     Approval, Authorization, Capability, DenialReason, DenyAllBroker, Grant, GrantId, GrantLedger,

@@ -7,6 +7,10 @@
 mod common;
 
 use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use claw_tools::sandbox::{Sandbox, SandboxError, SandboxLimits, WriteMode};
 
@@ -501,5 +505,170 @@ fn a_root_that_is_a_file_is_refused() {
     assert_eq!(
         Sandbox::new(&tree.join("not-a-directory"), SandboxLimits::default()),
         Err(SandboxError::RootNotADirectory)
+    );
+}
+
+#[test]
+fn a_parent_swapped_after_validation_never_gets_the_write() {
+    // The audited failure: validation approved a parent directory, and the
+    // write then reopened the ORIGINAL pathname, so a parent swapped in
+    // between decided where the bytes landed. Here the swap happens after a
+    // successful validation and before the write, which is exactly that
+    // window, and the file outside the root must be untouched.
+    let (tree, sandbox) = workspace();
+    let real_parent = tree.dir("workspace/sub");
+    fs::write(tree.join("outside/target.txt"), "ORIGINAL-OUTSIDE-CONTENT")
+        .expect("outside file is writable");
+    let path = sandbox.relative("sub/target.txt").expect("legal name");
+
+    // Validation succeeds against the honest directory.
+    sandbox
+        .resolve_for_write(&path, WriteMode::Overwrite)
+        .expect("an honest parent validates");
+
+    // The attacker now replaces the approved parent with a link out of the
+    // root. Nothing about the pathname changed.
+    fs::remove_dir_all(&real_parent).expect("the real parent is removable");
+    let swapped = try_symlink_dir(&tree.join("outside"), &real_parent)
+        || try_junction(&tree.join("outside"), &real_parent);
+    if !swapped {
+        return;
+    }
+
+    let error = sandbox
+        .write_file(&path, b"ATTACKER-CONTROLLED", WriteMode::Overwrite)
+        .expect_err("a swapped parent must not be written through");
+    assert!(
+        matches!(
+            error,
+            SandboxError::SymlinkForbidden | SandboxError::EscapesRoot | SandboxError::NotFound
+        ),
+        "unexpected error {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("outside/target.txt")).expect("outside file survives"),
+        "ORIGINAL-OUTSIDE-CONTENT",
+        "the write escaped the sandbox through a swapped parent"
+    );
+}
+
+#[test]
+fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
+    // A pre-planted link is not a race. This test flips the parent directory
+    // between an honest directory and a link out of the root while writes are
+    // in flight, so the swap really can land between validation and open. The
+    // invariant is not "the write fails" (it may legitimately succeed against
+    // the honest directory) but "nothing outside the root is ever modified".
+    let (tree, sandbox) = workspace();
+    let outside = tree.dir("outside/victimdir");
+    let victim = outside.join("target.txt");
+    fs::write(&victim, "ORIGINAL-OUTSIDE-CONTENT").expect("outside file is writable");
+    let parent = tree.join("workspace/flip");
+    fs::create_dir(&parent).expect("honest parent is creatable");
+
+    // Confirm the platform can actually build the escape before racing it.
+    fs::remove_dir(&parent).expect("honest parent is removable");
+    let linkable = try_symlink_dir(&outside, &parent) || try_junction(&outside, &parent);
+    if !linkable {
+        return;
+    }
+    fs::remove_dir(&parent).expect("link is removable");
+    fs::create_dir(&parent).expect("honest parent is recreatable");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flips = Arc::new(AtomicUsize::new(0));
+    let flipper_stop = Arc::clone(&stop);
+    let flipper_count = Arc::clone(&flips);
+    let flip_target = parent.clone();
+    let flip_stash = tree.join("workspace/flipstash");
+    let flip_source = outside.clone();
+    let flipper = thread::spawn(move || {
+        while !flipper_stop.load(Ordering::Relaxed) {
+            // The honest directory is moved aside rather than deleted, so the
+            // flipper never has to reach inside a directory that might already
+            // be the link. A rename that fails means the sandbox is holding the
+            // directory open, which is itself the defence under test.
+            if fs::rename(&flip_target, &flip_stash).is_err() {
+                continue;
+            }
+            if try_symlink_dir(&flip_source, &flip_target)
+                || try_junction(&flip_source, &flip_target)
+            {
+                flipper_count.fetch_add(1, Ordering::Relaxed);
+            }
+            // Removing a directory link removes the link, never its target.
+            let _ = fs::remove_dir(&flip_target);
+            let _ = fs::rename(&flip_stash, &flip_target);
+        }
+        let _ = fs::remove_dir(&flip_target);
+        let _ = fs::rename(&flip_stash, &flip_target);
+    });
+
+    let path = sandbox.relative("flip/target.txt").expect("legal name");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempts = 0_u32;
+    while Instant::now() < deadline && (attempts < 400 || flips.load(Ordering::Relaxed) < 20) {
+        attempts += 1;
+        let _ = sandbox.write_file(&path, b"ATTACKER-CONTROLLED", WriteMode::Overwrite);
+        // Read back through a path the sandbox never validated, so the check
+        // is on the real file rather than on the sandbox's own view.
+        let survived = fs::read_to_string(&victim).unwrap_or_default();
+        assert_eq!(
+            survived, "ORIGINAL-OUTSIDE-CONTENT",
+            "a racing parent swap let a write reach outside the root"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    flipper.join().expect("flipper thread finishes");
+    // Without this the test could silently degrade into a no-op on a host
+    // where neither link type can be created.
+    assert!(
+        flips.load(Ordering::Relaxed) > 0,
+        "the swap never happened, so no race was exercised"
+    );
+    assert_eq!(
+        fs::read_to_string(&victim).expect("outside file survives"),
+        "ORIGINAL-OUTSIDE-CONTENT"
+    );
+    assert!(
+        fs::symlink_metadata(outside.join("target.txt"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+            == u64::try_from("ORIGINAL-OUTSIDE-CONTENT".len()).expect("small"),
+        "the outside file was truncated"
+    );
+}
+
+#[test]
+fn a_create_new_write_through_a_swapped_parent_creates_nothing_outside() {
+    // Creation is the other destructive primitive: a swapped parent must not
+    // let the sandbox author a brand new file in someone else's directory.
+    let (tree, sandbox) = workspace();
+    let real_parent = tree.dir("workspace/fresh");
+    let path = sandbox.relative("fresh/planted.txt").expect("legal name");
+    sandbox
+        .resolve_for_write(&path, WriteMode::CreateNew)
+        .expect("an honest parent validates");
+
+    fs::remove_dir_all(&real_parent).expect("the real parent is removable");
+    let swapped = try_symlink_dir(&tree.join("outside"), &real_parent)
+        || try_junction(&tree.join("outside"), &real_parent);
+    if !swapped {
+        return;
+    }
+
+    let error = sandbox
+        .write_file(&path, b"planted", WriteMode::CreateNew)
+        .expect_err("a swapped parent must not be created through");
+    assert!(
+        matches!(
+            error,
+            SandboxError::SymlinkForbidden | SandboxError::EscapesRoot | SandboxError::NotFound
+        ),
+        "unexpected error {error:?}"
+    );
+    assert!(
+        fs::symlink_metadata(tree.join("outside/planted.txt")).is_err(),
+        "a file was created outside the root"
     );
 }

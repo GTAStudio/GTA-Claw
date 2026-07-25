@@ -14,7 +14,9 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::net::IpAddr;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use claw_security::ssrf::{
     HostAllowlist, ResolutionError, TargetError, TargetHost, TargetPolicy, ValidatedTarget,
@@ -69,7 +71,8 @@ const FETCH_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             values: &["GET", "HEAD"],
         },
     },
-]);
+])
+.recording(&["method"]);
 
 const SEARCH_SCHEMA: ParameterSchema = ParameterSchema::new(&[
     Field {
@@ -88,7 +91,8 @@ const SEARCH_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max: MAX_SEARCH_RESULTS,
         },
     },
-]);
+])
+.recording(&["max_results"]);
 
 /// Whether a policy permits destinations that are otherwise blocked.
 ///
@@ -346,15 +350,62 @@ impl Destination {
             Self::PrivateException { origin, .. } => origin.clone(),
         }
     }
+
+    /// Returns the host and port a connection must be made to.
+    ///
+    /// For an excepted private origin the authority is taken from the origin
+    /// the operator allowlisted, never from the request URL, so a URL that
+    /// merely starts with an allowed origin cannot redirect the socket.
+    pub fn authority(&self) -> Result<(String, u16), NetworkError> {
+        match self {
+            Self::Public(target) => Ok((target.host().as_str(), target.port())),
+            Self::PrivateException { origin, .. } => split_origin_authority(origin),
+        }
+    }
+}
+
+/// Splits an already-validated origin into its host and port.
+fn split_origin_authority(origin: &str) -> Result<(String, u16), NetworkError> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .ok_or(NetworkError::InvalidExceptionOrigin)?;
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or(NetworkError::InvalidExceptionOrigin)?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| NetworkError::InvalidExceptionOrigin)?;
+    if host.is_empty() || port == 0 {
+        return Err(NetworkError::InvalidExceptionOrigin);
+    }
+    // IPv6 literals arrive bracketed; the brackets are syntax, not host.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    Ok((host.to_owned(), port))
 }
 
 /// One outbound request a transport should perform.
+///
+/// The request carries the addresses the caller validated, not just a URL. A
+/// transport that resolves the URL host again is re-opening the DNS rebinding
+/// window this crate exists to close, so implementations must connect to
+/// [`HttpRequest::pinned`] and to nothing else, while still sending `host` in
+/// the `Host` header and in TLS SNI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpRequest {
     /// Absolute, already-validated URL.
     pub url: String,
     /// HTTP method, restricted to safe read methods by the tool.
     pub method: String,
+    /// Canonical host the request is addressed to.
+    pub host: String,
+    /// Port the connection must use.
+    pub port: u16,
+    /// The only addresses the transport is permitted to connect to.
+    pub pinned: Vec<IpAddr>,
     /// Maximum number of response body bytes the caller will accept.
     pub max_body_bytes: usize,
 }
@@ -368,6 +419,12 @@ pub struct HttpResponse {
     pub location: Option<String>,
     /// Response body, already capped by the transport.
     pub body: Vec<u8>,
+    /// Address the transport actually connected to.
+    ///
+    /// The tool compares this against the pinned set, so a transport that
+    /// silently reconnected elsewhere, or that followed a redirect of its own
+    /// accord, fails the request instead of returning attacker-chosen content.
+    pub peer: IpAddr,
 }
 
 /// Host-supplied outbound HTTP port.
@@ -397,6 +454,174 @@ impl HttpTransport for DenyAllTransport {
     fn fetch(&mut self, _request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
         Err(NetworkError::TransportRefused)
     }
+}
+
+/// Cleartext HTTP/1.1 transport that connects only to pinned addresses.
+///
+/// This exists because the audited failure mode is a transport that is handed a
+/// URL and resolves it again: the check then applies to one address and the
+/// connection to another. This implementation never looks at the URL host to
+/// decide where to connect. It dials [`HttpRequest::pinned`] in order, sends
+/// `Host: host`, reports the peer it actually reached, and returns redirects to
+/// the caller rather than following them.
+///
+/// It deliberately speaks cleartext HTTP only. TLS cannot be added without a
+/// dependency, and pretending to offer `https` while not verifying certificates
+/// would be worse than refusing. Use it for loopback services and tests; supply
+/// a TLS-capable transport that upholds the same pinning contract for public
+/// traffic.
+#[derive(Clone, Copy, Debug)]
+pub struct PinnedHttpTransport {
+    connect_timeout: Duration,
+    read_timeout: Duration,
+}
+
+impl Default for PinnedHttpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PinnedHttpTransport {
+    /// Creates a transport with five second connect and read timeouts.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Overrides the connect and read timeouts.
+    #[must_use]
+    pub const fn with_timeouts(mut self, connect: Duration, read: Duration) -> Self {
+        self.connect_timeout = connect;
+        self.read_timeout = read;
+        self
+    }
+
+    /// Extracts the origin-form request target from an absolute URL.
+    fn request_target(url: &str) -> Result<String, NetworkError> {
+        let rest = url
+            .strip_prefix("http://")
+            .ok_or(NetworkError::TransportRefused)?;
+        match rest.find('/') {
+            Some(index) => Ok(rest[index..].to_owned()),
+            None => Ok("/".to_owned()),
+        }
+    }
+}
+
+impl HttpTransport for PinnedHttpTransport {
+    fn resolve(&mut self, host: &str) -> Result<Vec<IpAddr>, NetworkError> {
+        // Port zero is only a placeholder for the resolver; the connection uses
+        // the port the caller validated.
+        let addresses = (host, 0_u16)
+            .to_socket_addrs()
+            .map_err(|_| NetworkError::Resolution(ResolutionError::NoAddresses))?
+            .map(|socket| socket.ip())
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(NetworkError::Resolution(ResolutionError::NoAddresses));
+        }
+        Ok(addresses)
+    }
+
+    fn fetch(&mut self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
+        if request.pinned.is_empty() {
+            return Err(NetworkError::TransportRefused);
+        }
+        let target = Self::request_target(&request.url)?;
+        let mut stream = None;
+        for address in &request.pinned {
+            let socket = SocketAddr::new(*address, request.port);
+            if let Ok(connected) = TcpStream::connect_timeout(&socket, self.connect_timeout) {
+                stream = Some(connected);
+                break;
+            }
+        }
+        let mut stream = stream.ok_or(NetworkError::TransportRefused)?;
+        // The peer is read from the socket, not from configuration, so the
+        // caller is checking where the bytes actually came from.
+        let peer = stream
+            .peer_addr()
+            .map_err(|_| NetworkError::TransportRefused)?
+            .ip();
+        stream
+            .set_read_timeout(Some(self.read_timeout))
+            .map_err(|_| NetworkError::TransportRefused)?;
+        let head = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+            request.method, target, request.host
+        );
+        stream
+            .write_all(head.as_bytes())
+            .map_err(|_| NetworkError::TransportRefused)?;
+        stream.flush().map_err(|_| NetworkError::TransportRefused)?;
+        // The cap covers headers as well as the body, so a response cannot
+        // exhaust memory by never sending the header terminator.
+        let ceiling = request.max_body_bytes.saturating_add(MAX_HEADER_BYTES);
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(_) => break,
+            };
+            raw.extend_from_slice(&chunk[..read]);
+            if raw.len() >= ceiling {
+                raw.truncate(ceiling);
+                break;
+            }
+        }
+        let (status, location, body) = parse_http_response(&raw, request.max_body_bytes)?;
+        Ok(HttpResponse {
+            status,
+            location,
+            body,
+            peer,
+        })
+    }
+}
+
+/// Largest header block this transport will buffer.
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+/// Parses a status line, the `Location` header, and a capped body.
+fn parse_http_response(
+    raw: &[u8],
+    max_body_bytes: usize,
+) -> Result<(u16, Option<String>, Vec<u8>), NetworkError> {
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or(NetworkError::MalformedResponse)?;
+    let head = std::str::from_utf8(&raw[..split]).map_err(|_| NetworkError::MalformedResponse)?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().ok_or(NetworkError::MalformedResponse)?;
+    let mut parts = status_line.split(' ');
+    let version = parts.next().ok_or(NetworkError::MalformedResponse)?;
+    if !version.starts_with("HTTP/1.") {
+        return Err(NetworkError::MalformedResponse);
+    }
+    let status = parts
+        .next()
+        .ok_or(NetworkError::MalformedResponse)?
+        .parse::<u16>()
+        .map_err(|_| NetworkError::MalformedResponse)?;
+    let mut location = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(NetworkError::MalformedResponse);
+        };
+        if name.eq_ignore_ascii_case("location") && location.is_none() {
+            location = Some(value.trim().to_owned());
+        }
+    }
+    let mut body = raw[split + 4..].to_vec();
+    body.truncate(max_body_bytes);
+    Ok((status, location, body))
 }
 
 /// One search result.
@@ -460,9 +685,11 @@ impl<T: HttpTransport> NetFetchTool<T> {
 
     /// Runs the validated request loop, revalidating every hop.
     ///
-    /// Each hop that leaves the authorized host is re-submitted to the
-    /// permission broker through `authorization`, so a host-scoped grant cannot
-    /// be widened by an open redirect on the granted host.
+    /// Two properties are structural here. Every hop resolves again and hands
+    /// the transport the resolved addresses, so the transport never re-derives
+    /// a destination from a name; and every hop that leaves the authorized host
+    /// is re-submitted to the permission broker through `authorization`, so a
+    /// host-scoped grant cannot be widened by an open redirect.
     fn run(
         &self,
         destination: Destination,
@@ -475,21 +702,48 @@ impl<T: HttpTransport> NetFetchTool<T> {
         let mut current = destination;
         let mut redirects = 0_u8;
         loop {
-            if let Destination::Public(target) = &current {
-                // DNS is revalidated on every hop so a rebinding answer cannot
-                // reuse an earlier decision.
-                let host = target.host().as_str();
-                let addresses = transport.resolve(host.as_str())?;
-                target
-                    .validate_resolution(&addresses)
-                    .map_err(NetworkError::Resolution)?;
+            // DNS is resolved on every hop and the answer is validated on every
+            // hop, so a rebinding answer can neither reuse an earlier decision
+            // nor reach the socket layer unchecked.
+            let (host, port) = current.authority()?;
+            let addresses = transport.resolve(host.as_str())?;
+            if addresses.is_empty() {
+                return Err(NetworkError::Resolution(ResolutionError::NoAddresses).into());
+            }
+            match &current {
+                Destination::Public(target) => {
+                    target
+                        .validate_resolution(&addresses)
+                        .map_err(NetworkError::Resolution)?;
+                }
+                Destination::PrivateException { .. } => {
+                    // An excepted origin written as an IP literal is pinned to
+                    // exactly that address, so a resolver cannot repoint an
+                    // operator's narrow loopback exception at another host.
+                    if let Ok(literal) = host.parse::<IpAddr>()
+                        && addresses.iter().any(|address| *address != literal)
+                    {
+                        return Err(NetworkError::Resolution(
+                            ResolutionError::LiteralAddressMismatch,
+                        )
+                        .into());
+                    }
+                }
             }
             let request = HttpRequest {
                 url: current.url().to_owned(),
                 method: method.to_owned(),
+                host,
+                port,
+                pinned: addresses.clone(),
                 max_body_bytes: self.policy.max_body_bytes,
             };
             let response = transport.fetch(&request)?;
+            // The transport is held to its contract: it may only have talked to
+            // an address this hop validated.
+            if !addresses.contains(&response.peer) {
+                return Err(NetworkError::PeerNotPinned.into());
+            }
             if !(300..400).contains(&response.status) {
                 return Ok(FetchOutcome {
                     status: response.status,
@@ -694,6 +948,10 @@ pub enum NetworkError {
     InvalidExceptionOrigin,
     /// A redirect response carried no usable `Location`.
     MalformedRedirect,
+    /// The transport returned a response that is not valid HTTP/1.x.
+    MalformedResponse,
+    /// The transport connected to an address this hop did not validate.
+    PeerNotPinned,
     /// The redirect budget was exhausted.
     TooManyRedirects,
     /// No transport is configured, so the request was refused.
@@ -714,6 +972,10 @@ impl Display for NetworkError {
                 formatter.write_str("private-origin exception is malformed")
             }
             Self::MalformedRedirect => formatter.write_str("redirect carried no usable location"),
+            Self::MalformedResponse => formatter.write_str("response was not valid HTTP"),
+            Self::PeerNotPinned => {
+                formatter.write_str("transport connected to an address that was not validated")
+            }
             Self::TooManyRedirects => formatter.write_str("redirect budget exhausted"),
             Self::TransportRefused => formatter.write_str("no network transport is configured"),
             Self::TransportFailed => formatter.write_str("network transport failed"),
@@ -897,6 +1159,9 @@ mod tests {
             transport.fetch(&HttpRequest {
                 url: "https://example.com/".to_owned(),
                 method: "GET".to_owned(),
+                host: "example.com".to_owned(),
+                port: 443,
+                pinned: vec![IpAddr::from([93, 184, 216, 34])],
                 max_body_bytes: 1,
             }),
             Err(NetworkError::TransportRefused)

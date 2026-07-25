@@ -4,6 +4,7 @@
 //! budget, and the token counter. Given the same inputs it always produces
 //! the same output, which is what makes an agent's behaviour reviewable.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -168,10 +169,13 @@ impl<C: TokenCounter> ContextAssembler<C> {
         .map_err(ContextError::Budget)?;
 
         let admitted = plan.admitted();
+        // Membership is tested once per message against a set, so assembling a
+        // large session is linear rather than quadratic in the message count.
+        let admitted_ids: BTreeSet<u64> = admitted.iter().copied().collect();
         let messages: Vec<Message> = session
             .messages()
             .iter()
-            .filter(|message| admitted.contains(&message.id.get()))
+            .filter(|message| admitted_ids.contains(&message.id.get()))
             .cloned()
             .collect();
         if messages.len() != admitted.len() {

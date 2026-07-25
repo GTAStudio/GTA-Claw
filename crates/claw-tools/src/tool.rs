@@ -3,6 +3,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::clock::Clock;
 use crate::error::ToolError;
 use crate::permission::{Authorization, PermissionDescriptor, Resource};
 use crate::sandbox::Sandbox;
@@ -86,12 +87,25 @@ impl ToolOutput {
 }
 
 /// Ambient state shared by every tool in one invocation.
+///
+/// Time is a port rather than a captured value. A single timestamp taken at the
+/// start of an invocation would keep an expiring grant alive for as long as the
+/// invocation ran, so every permission decision reads [`Clock::unix_millis`]
+/// again at the moment it is made.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolContext<'a> {
     /// Workspace confinement root.
     pub sandbox: &'a Sandbox,
-    /// Caller-supplied wall-clock instant used for grants and audit records.
-    pub unix_millis: u64,
+    /// Trusted source of the current time.
+    pub clock: &'a dyn Clock,
+}
+
+impl ToolContext<'_> {
+    /// Reads the current time from the trusted clock.
+    #[must_use]
+    pub fn unix_millis(&self) -> u64 {
+        self.clock.unix_millis()
+    }
 }
 
 /// One agent-callable capability.

@@ -6,7 +6,8 @@
 
 mod common;
 
-use claw_tools::audit::{AuditOutcome, AuditPhase, AuditReason, InMemoryAuditSink, REDACTION};
+use claw_tools::audit::{AuditOutcome, AuditPhase, AuditReason, InMemoryAuditSink};
+use claw_tools::clock::FixedClock;
 use claw_tools::error::ToolError;
 use claw_tools::fs::{FsListTool, FsReadTool, FsWriteTool};
 use claw_tools::permission::{
@@ -21,6 +22,10 @@ use serde_json::json;
 use common::TempTree;
 
 const NOW: u64 = 1_700_000_000_000;
+
+/// A secret with no punctuation, no digits-and-letters mix and no length that
+/// any entropy heuristic would flag. It must still never be recorded.
+const SHORT_SECRET: &str = "correcthorse";
 
 fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -71,7 +76,7 @@ fn an_empty_ledger_authorizes_nothing_and_leaves_no_trace() {
     let registry = registry();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut ledger = GrantLedger::new();
     let mut audit = InMemoryAuditSink::new();
@@ -113,7 +118,7 @@ fn a_deny_all_broker_refuses_even_a_read() {
     let registry = registry();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut audit = InMemoryAuditSink::new();
     let error = registry
@@ -138,7 +143,7 @@ fn a_read_grant_never_authorizes_a_write() {
     let registry = registry();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut ledger = GrantLedger::new();
     ledger.grant(read_grant());
@@ -184,7 +189,7 @@ fn a_path_scoped_grant_does_not_leak_to_a_sibling_prefix() {
     let registry = registry();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut ledger = GrantLedger::new();
     ledger.grant(write_grant("src"));
@@ -223,7 +228,7 @@ fn revocation_takes_effect_on_the_very_next_invocation() {
     let registry = registry();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut ledger = GrantLedger::new();
     let id = ledger.grant(write_grant(""));
@@ -271,7 +276,7 @@ fn an_expired_grant_fails_closed_with_its_own_reason() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let error = registry
         .invoke(
@@ -303,7 +308,7 @@ fn a_use_bounded_grant_is_exhausted_after_its_budget() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     for index in 0..2 {
         registry
@@ -346,7 +351,7 @@ fn an_implicit_grant_cannot_satisfy_a_tool_that_demands_approval() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let error = registry
         .invoke(
@@ -381,7 +386,7 @@ fn the_broker_sees_the_exact_resource_the_tool_will_touch() {
     let registry = registry();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut broker = Recording { seen: Vec::new() };
     let mut audit = InMemoryAuditSink::new();
@@ -418,7 +423,7 @@ fn a_sandbox_refusal_is_reported_before_any_grant_is_consumed() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let error = registry
         .invoke(
@@ -455,7 +460,7 @@ fn an_unknown_tool_is_audited_with_a_sanitized_name() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let error = registry
         .invoke(
@@ -485,7 +490,7 @@ fn secrets_in_arguments_never_reach_the_audit_log() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let _ = registry.invoke(
         "fs_write",
@@ -499,8 +504,11 @@ fn secrets_in_arguments_never_reach_the_audit_log() {
         &mut audit,
     );
     let recorded = &audit.records()[0].arguments;
-    assert_eq!(recorded["api_key"], REDACTION);
-    assert_eq!(recorded["content"], REDACTION);
+    assert_eq!(
+        recorded["content"]["withheld"],
+        serde_json::Value::Bool(true)
+    );
+    assert_eq!(recorded["[unknown]"], json!(["api_key"]));
     assert_eq!(recorded["path"], "creds.txt");
     let serialized = serde_json::to_string(recorded).expect("serializable");
     assert!(
@@ -522,7 +530,7 @@ fn a_granted_invocation_writes_both_audit_phases() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     registry
         .invoke(
@@ -552,7 +560,7 @@ fn schema_violations_are_refused_before_the_broker_is_consulted() {
     let mut audit = InMemoryAuditSink::new();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let error = registry
         .invoke(
@@ -566,4 +574,103 @@ fn schema_violations_are_refused_before_the_broker_is_consulted() {
     assert!(error.schema().is_some(), "expected a schema refusal");
     assert_eq!(audit.records()[0].reason, AuditReason::ValidationRejected);
     assert_eq!(audit.records()[0].grant, None);
+}
+
+#[test]
+fn a_short_secret_without_a_recognizable_shape_is_still_withheld() {
+    // The audited weakness was heuristic redaction: a short, single-class
+    // token reads as ordinary prose. Allowlisting makes the shape irrelevant.
+    let (_tree, sandbox) = workspace();
+    let registry = registry();
+    let mut ledger = GrantLedger::new();
+    ledger.grant(write_grant(""));
+    let mut audit = InMemoryAuditSink::new();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &FixedClock::new(NOW),
+    };
+    let _ = registry.invoke(
+        "fs_write",
+        &json!({ "path": "notes.txt", "content": SHORT_SECRET }),
+        &context,
+        &mut ledger,
+        &mut audit,
+    );
+    assert!(!audit.records().is_empty(), "nothing was audited");
+    for record in audit.records() {
+        let serialized = serde_json::to_string(&record.arguments).expect("serializable");
+        assert!(
+            !serialized.contains(SHORT_SECRET),
+            "phase {:?} leaked a short secret: {serialized}",
+            record.phase
+        );
+    }
+}
+
+#[test]
+fn a_denied_invocation_does_not_persist_the_payload_it_was_denied_for() {
+    // Denial records were the other leak: the request was rejected and its
+    // arguments were stored anyway.
+    let (_tree, sandbox) = workspace();
+    let registry = registry();
+    let mut ledger = GrantLedger::new();
+    let mut audit = InMemoryAuditSink::new();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &FixedClock::new(NOW),
+    };
+    let error = registry
+        .invoke(
+            "fs_write",
+            &json!({ "path": "creds.txt", "content": SHORT_SECRET }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect_err("an ungranted write must fail closed");
+    assert!(error.permission().is_some(), "unexpected error {error:?}");
+    assert_eq!(audit.records().len(), 1);
+    let record = &audit.records()[0];
+    assert_eq!(record.outcome, AuditOutcome::Denied);
+    let serialized = serde_json::to_string(&record.arguments).expect("serializable");
+    assert!(
+        !serialized.contains(SHORT_SECRET),
+        "a denial record kept the payload: {serialized}"
+    );
+    assert_eq!(record.arguments["path"], "creds.txt");
+}
+
+#[test]
+fn an_unknown_tool_record_keeps_no_argument_values_at_all() {
+    let (_tree, sandbox) = workspace();
+    let registry = registry();
+    let mut ledger = GrantLedger::new();
+    let mut audit = InMemoryAuditSink::new();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &FixedClock::new(NOW),
+    };
+    let _ = registry.invoke(
+        "not_a_tool",
+        &json!({
+            "args": ["--token", SHORT_SECRET],
+            "url": "http://host.example/?key=leaked-query-value",
+        }),
+        &context,
+        &mut ledger,
+        &mut audit,
+    );
+    assert_eq!(audit.records().len(), 1);
+    let serialized = serde_json::to_string(&audit.records()[0].arguments).expect("serializable");
+    for leaked in [
+        SHORT_SECRET,
+        "--token",
+        "leaked-query-value",
+        "host.example",
+    ] {
+        assert!(
+            !serialized.contains(leaked),
+            "an unknown-tool record leaked {leaked}: {serialized}"
+        );
+    }
 }

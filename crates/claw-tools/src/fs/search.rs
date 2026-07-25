@@ -46,7 +46,8 @@ const SEARCH_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max: MAX_SEARCH_RESULTS,
         },
     },
-]);
+])
+.recording(&["path", "case_sensitive", "max_results"]);
 
 /// Searches workspace files for a literal string.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

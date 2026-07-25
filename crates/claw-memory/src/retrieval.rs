@@ -12,6 +12,11 @@ use crate::vector::{Embedding, EmbeddingModel, RecordId, VectorError, VectorInde
 /// Inclusive maximum number of results one query may request.
 pub const MAX_RETRIEVAL_LIMIT: usize = 100;
 
+/// Inclusive maximum byte length of a query's free text.
+///
+/// Query text reaches the tokenizer, which allocates proportionally to it.
+pub const MAX_QUERY_BYTES: usize = 4096;
+
 /// What a stored memory record represents.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +81,9 @@ impl RetrievalQuery {
     pub fn new(text: &str, limit: usize) -> Result<Self, RetrievalError> {
         if text.trim().is_empty() {
             return Err(RetrievalError::EmptyQuery);
+        }
+        if text.len() > MAX_QUERY_BYTES {
+            return Err(RetrievalError::QueryTooLong);
         }
         if limit == 0 || limit > MAX_RETRIEVAL_LIMIT {
             return Err(RetrievalError::InvalidLimit);
@@ -225,6 +233,12 @@ impl Retriever for KeywordRetriever {
                 record: record.clone(),
                 score,
             });
+            // The working set never exceeds twice the requested bound, so a
+            // query that matches every record still allocates a fixed amount.
+            if scored.len() >= query.limit().saturating_mul(2) {
+                sort_results(&mut scored);
+                scored.truncate(query.limit());
+            }
         }
         sort_results(&mut scored);
         scored.truncate(query.limit());
@@ -336,6 +350,8 @@ fn sort_results(items: &mut [RetrievedItem]) {
 pub enum RetrievalError {
     /// The query text had no searchable content.
     EmptyQuery,
+    /// The query text exceeded its byte bound.
+    QueryTooLong,
     /// The result bound was zero or above the maximum.
     InvalidLimit,
     /// A kind filter selected nothing.
@@ -348,6 +364,7 @@ impl Display for RetrievalError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyQuery => formatter.write_str("query has no searchable terms"),
+            Self::QueryTooLong => formatter.write_str("query text exceeds the maximum size"),
             Self::InvalidLimit => formatter.write_str("query result limit is out of range"),
             Self::NoKindsSelected => formatter.write_str("query selected no record kinds"),
             Self::Vector(error) => write!(formatter, "vector backend refused: {error}"),

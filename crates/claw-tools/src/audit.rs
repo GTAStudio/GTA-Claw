@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::permission::{Capability, DenialReason, GrantId, Resource};
 
@@ -191,6 +191,53 @@ impl ToolAuditSink for InMemoryAuditSink {
     fn persist(&mut self, record: &ToolAuditRecord) -> Result<(), AuditError> {
         self.records.push(record.clone());
         Ok(())
+    }
+}
+
+/// Produces an audit-safe description of a payload with no schema behind it.
+///
+/// Used only for an unregistered tool name, where nothing about the payload is
+/// trustworthy: key names are sanitized and every value is withheld.
+#[must_use]
+pub fn opaque_arguments(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return json!({ "[shape]": shape_name(value) });
+    };
+    let keys: Vec<Value> = object
+        .keys()
+        .take(MAX_AUDITED_ITEMS)
+        .map(|key| Value::String(sanitize_key(key)))
+        .collect();
+    json!({
+        "withheld": true,
+        "field_count": u64::try_from(object.len()).unwrap_or(u64::MAX),
+        "fields": Value::Array(keys),
+    })
+}
+
+/// Names the JSON shape of a value without revealing any of its content.
+fn shape_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Keeps an attacker-chosen key name out of the audit log verbatim.
+fn sanitize_key(key: &str) -> String {
+    let sanitized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(48)
+        .collect();
+    if sanitized.is_empty() {
+        "<unprintable>".to_owned()
+    } else {
+        sanitized
     }
 }
 

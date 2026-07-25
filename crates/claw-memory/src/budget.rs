@@ -238,7 +238,12 @@ pub fn plan_truncation<C: TokenCounter + ?Sized>(
 
     // Rule 4: a window that opens on a tool result is missing the request it
     // answers, so the orphan is dropped until the window opens cleanly.
-    while let Some((id, _)) = window.first().copied() {
+    //
+    // The window is consumed from an advancing offset rather than by removing
+    // the head, so a session whose window is entirely orphaned tool results
+    // costs linear rather than quadratic work.
+    let mut opening = 0_usize;
+    while let Some((id, _)) = window.get(opening).copied() {
         let message = messages
             .iter()
             .find(|message| message.id.get() == id)
@@ -248,8 +253,9 @@ pub fn plan_truncation<C: TokenCounter + ?Sized>(
         }
         used = used.saturating_sub(counter.count_message(message));
         dropped.push((id, Admission::OrphanedToolResult));
-        window.remove(0);
+        opening += 1;
     }
+    window.drain(..opening);
 
     admitted.extend(window);
     admitted.sort_unstable_by_key(|(id, _)| *id);

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -43,6 +44,65 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// rules, which reintroduces command injection. They are refused outright.
 const INTERPRETED_EXTENSIONS: [&str; 9] =
     ["bat", "cmd", "com", "js", "jse", "msc", "ps1", "vbs", "wsf"];
+
+/// Program names that turn an allowlist entry into arbitrary execution.
+///
+/// Every one of these selects the real program from its argument vector, so
+/// allowlisting it grants everything the host can run.
+const INTERPRETER_NAMES: &[&str] = &[
+    "ash",
+    "awk",
+    "bash",
+    "busybox",
+    "cmd",
+    "csh",
+    "dash",
+    "doas",
+    "env",
+    "fish",
+    "gawk",
+    "ksh",
+    "mawk",
+    "nu",
+    "osascript",
+    "rbash",
+    "runas",
+    "sh",
+    "ssh",
+    "start",
+    "sudo",
+    "tclsh",
+    "wine",
+    "wsl",
+    "xargs",
+    "zsh",
+];
+
+/// Program-name prefixes covering versioned interpreters such as `python3.12`.
+const INTERPRETER_PREFIXES: &[&str] = &[
+    "bun",
+    "deno",
+    "lua",
+    "node",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "python",
+    "ruby",
+];
+
+/// `FILE_FLAG_OPEN_REPARSE_POINT`.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `FILE_SHARE_READ`.
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+/// `FILE_SHARE_DELETE`.
+#[cfg(windows)]
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+/// Longest wait for a pipe reader to finish after the tree was terminated.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 const EXEC_SCHEMA: ParameterSchema = ParameterSchema::new(&[
     Field {
@@ -78,7 +138,8 @@ const EXEC_SCHEMA: ParameterSchema = ParameterSchema::new(&[
             max: MAX_TIMEOUT_MILLIS,
         },
     },
-]);
+])
+.recording(&["program", "cwd", "timeout_ms"]);
 
 /// Environment exposed to a child process.
 ///
@@ -166,13 +227,149 @@ fn validate_env_name(name: &str) -> Result<(), ExecutionError> {
     }
 }
 
+/// Per-program restriction on the argument vector a model may supply.
+///
+/// Argument meaning is program-specific, so the operator decides. The bounded
+/// default only caps size and count; [`ArgvPolicy::exactly`] narrows a program
+/// to a fixed vocabulary, which is the only way to make an allowlisted program
+/// that can also read files, such as a version control client, safe to expose.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArgvPolicy {
+    max_arguments: usize,
+    max_argument_bytes: usize,
+    allowed: Option<BTreeSet<String>>,
+}
+
+impl Default for ArgvPolicy {
+    fn default() -> Self {
+        Self::bounded()
+    }
+}
+
+impl ArgvPolicy {
+    /// Accepts any argument within the global count and size bounds.
+    #[must_use]
+    pub const fn bounded() -> Self {
+        Self {
+            max_arguments: MAX_ARGUMENTS,
+            max_argument_bytes: MAX_ARGUMENT_BYTES,
+            allowed: None,
+        }
+    }
+
+    /// Accepts only arguments drawn from a fixed set.
+    #[must_use]
+    pub fn exactly<I, S>(allowed: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self {
+            allowed: Some(
+                allowed
+                    .into_iter()
+                    .map(|value| value.as_ref().to_owned())
+                    .collect(),
+            ),
+            ..Self::bounded()
+        }
+    }
+
+    /// Accepts no argument at all.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            max_arguments: 0,
+            allowed: Some(BTreeSet::new()),
+            ..Self::bounded()
+        }
+    }
+
+    /// Lowers the argument count bound.
+    #[must_use]
+    pub fn with_max_arguments(mut self, max_arguments: usize) -> Self {
+        self.max_arguments = max_arguments.min(MAX_ARGUMENTS);
+        self
+    }
+
+    /// Lowers the per-argument size bound.
+    #[must_use]
+    pub fn with_max_argument_bytes(mut self, max_argument_bytes: usize) -> Self {
+        self.max_argument_bytes = max_argument_bytes.min(MAX_ARGUMENT_BYTES);
+        self
+    }
+
+    /// Checks one argument vector against this policy.
+    pub fn check(&self, argv: &[String]) -> Result<(), ExecutionError> {
+        if argv.len() > self.max_arguments {
+            return Err(ExecutionError::TooManyArguments);
+        }
+        for argument in argv {
+            if argument.contains('\0') || argument.len() > self.max_argument_bytes {
+                return Err(ExecutionError::ArgumentRejected);
+            }
+            if let Some(allowed) = &self.allowed
+                && !allowed.contains(argument.as_str())
+            {
+                return Err(ExecutionError::ArgumentNotAllowed);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Identity of an allowlisted executable, captured when it was allowlisted.
+///
+/// It is compared again immediately before every spawn, so replacing the file
+/// behind an allowlisted name is detected instead of executed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    length: u64,
+    modified_millis: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+impl ExecutableIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Result<Self, ExecutionError> {
+        let modified_millis = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_millis());
+        Ok(Self {
+            length: metadata.len(),
+            modified_millis,
+            #[cfg(unix)]
+            device: std::os::unix::fs::MetadataExt::dev(metadata),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(metadata),
+            #[cfg(unix)]
+            mode: std::os::unix::fs::MetadataExt::mode(metadata),
+        })
+    }
+}
+
+/// One allowlisted program: a pinned executable and its argument policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AllowedProgram {
+    executable: PathBuf,
+    identity: ExecutableIdentity,
+    argv: ArgvPolicy,
+}
+
 /// Operator-configured execution policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecPolicy {
-    programs: BTreeMap<String, PathBuf>,
+    programs: BTreeMap<String, AllowedProgram>,
     env: EnvPolicy,
     timeout: Duration,
     max_output_bytes: usize,
+    writable_root: Option<PathBuf>,
 }
 
 impl Default for ExecPolicy {
@@ -182,6 +379,7 @@ impl Default for ExecPolicy {
             env: EnvPolicy::empty(),
             timeout: Duration::from_secs(30),
             max_output_bytes: 256 * 1024,
+            writable_root: None,
         }
     }
 }
@@ -193,14 +391,38 @@ impl ExecPolicy {
         Self::default()
     }
 
+    /// Declares a directory whose contents may never be executed.
+    ///
+    /// Set it to the workspace root. An agent that can write a file and then
+    /// run it has no allowlist at all, so an executable located under this
+    /// directory is refused at configuration time rather than at spawn time.
+    #[must_use]
+    pub fn with_writable_root(mut self, root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        self.writable_root = Some(std::fs::canonicalize(&root).map_or(root, strip_verbatim));
+        self
+    }
+
     /// Allows one program name, bound to an absolute executable path.
     ///
     /// The binding is what removes `PATH` from the trust base: the child is
-    /// always the exact file the operator named.
+    /// always the exact file the operator named. The file must additionally be
+    /// a real, canonical, non-link regular file that is neither an interpreter
+    /// nor a script, and it must not live anywhere the agent can write.
     pub fn allow_program(
         &mut self,
         name: &str,
         executable: impl Into<PathBuf>,
+    ) -> Result<(), ExecutionError> {
+        self.allow_program_with_argv(name, executable, ArgvPolicy::bounded())
+    }
+
+    /// Allows one program name with a narrowed argument policy.
+    pub fn allow_program_with_argv(
+        &mut self,
+        name: &str,
+        executable: impl Into<PathBuf>,
+        argv: ArgvPolicy,
     ) -> Result<(), ExecutionError> {
         validate_program_name(name)?;
         let executable = executable.into();
@@ -208,7 +430,41 @@ impl ExecPolicy {
             return Err(ExecutionError::ProgramPathNotAbsolute);
         }
         reject_interpreted_extension(&executable)?;
-        self.programs.insert(name.to_owned(), executable);
+        reject_interpreter_name(&executable)?;
+
+        let metadata = std::fs::symlink_metadata(&executable)
+            .map_err(|_| ExecutionError::ExecutableNotFound)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ExecutionError::ExecutableIsALink);
+        }
+        if !metadata.is_file() {
+            return Err(ExecutionError::ExecutableNotAFile);
+        }
+        // Canonicalization resolves every ancestor. Requiring the result to be
+        // the path the operator supplied refuses an executable reached through
+        // a linked or junctioned directory, where the real target can change
+        // without the configured path changing.
+        let canonical = std::fs::canonicalize(&executable)
+            .map(strip_verbatim)
+            .map_err(|_| ExecutionError::ExecutableNotFound)?;
+        if canonical != executable {
+            return Err(ExecutionError::ExecutablePathNotCanonical);
+        }
+        if let Some(root) = &self.writable_root
+            && canonical.starts_with(root)
+        {
+            return Err(ExecutionError::ExecutableInsideWritableRoot);
+        }
+        reject_shebang(&canonical)?;
+
+        self.programs.insert(
+            name.to_owned(),
+            AllowedProgram {
+                identity: ExecutableIdentity::of(&metadata)?,
+                executable: canonical,
+                argv,
+            },
+        );
         Ok(())
     }
 
@@ -242,10 +498,105 @@ impl ExecPolicy {
     /// Resolves an allowlisted name to its bound executable.
     pub fn resolve_program(&self, name: &str) -> Result<&Path, ExecutionError> {
         validate_program_name(name)?;
+        self.program(name)
+            .map(|program| program.executable.as_path())
+    }
+
+    fn program(&self, name: &str) -> Result<&AllowedProgram, ExecutionError> {
+        validate_program_name(name)?;
         self.programs
             .get(name)
-            .map(PathBuf::as_path)
             .ok_or(ExecutionError::ProgramNotAllowed)
+    }
+}
+
+/// Opens the allowlisted executable and proves it is still the same file.
+///
+/// The returned handle is held across the spawn. On Windows it is opened
+/// without `FILE_SHARE_WRITE`, so the file cannot be overwritten in place
+/// between this check and the spawn that follows it.
+fn open_verified_executable(program: &AllowedProgram) -> Result<File, ExecutionError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let handle = options
+        .open(&program.executable)
+        .map_err(|_| ExecutionError::ExecutableNotFound)?;
+    let metadata = handle
+        .metadata()
+        .map_err(|_| ExecutionError::ExecutableNotFound)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(ExecutionError::ExecutableChanged);
+    }
+    if ExecutableIdentity::of(&metadata)? != program.identity {
+        return Err(ExecutionError::ExecutableChanged);
+    }
+    // Re-read the first bytes through the same handle: a file that became a
+    // script since it was allowlisted must not be handed to an interpreter.
+    let mut prefix = [0_u8; 2];
+    let mut source = &handle;
+    let read = source
+        .read(&mut prefix)
+        .map_err(|_| ExecutionError::ExecutableChanged)?;
+    if read == 2 && prefix == *b"#!" {
+        return Err(ExecutionError::InterpretedProgramForbidden);
+    }
+    Ok(handle)
+}
+
+/// Rejects an executable whose name is a shell, an interpreter, or a launcher.
+///
+/// Allowlisting one of these is equivalent to allowlisting every program on the
+/// host, because the argument vector alone selects what actually runs.
+fn reject_interpreter_name(executable: &Path) -> Result<(), ExecutionError> {
+    let Some(stem) = executable.file_stem().and_then(OsStr::to_str) else {
+        return Ok(());
+    };
+    let stem = stem.to_ascii_lowercase();
+    if INTERPRETER_NAMES.contains(&stem.as_str())
+        || INTERPRETER_PREFIXES
+            .iter()
+            .any(|prefix| stem.starts_with(prefix))
+    {
+        return Err(ExecutionError::ExecutableIsAnInterpreter);
+    }
+    Ok(())
+}
+
+/// Rejects a file that the operating system would hand to an interpreter.
+fn reject_shebang(executable: &Path) -> Result<(), ExecutionError> {
+    let Ok(mut file) = File::open(executable) else {
+        return Err(ExecutionError::ExecutableNotFound);
+    };
+    let mut prefix = [0_u8; 2];
+    let read = file
+        .read(&mut prefix)
+        .map_err(|_| ExecutionError::ExecutableNotFound)?;
+    if read == 2 && prefix == *b"#!" {
+        return Err(ExecutionError::InterpretedProgramForbidden);
+    }
+    Ok(())
+}
+
+/// Strips the Windows verbatim prefix so a canonical path compares equal to the
+/// path an operator would write.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy().into_owned();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.len() >= 2 && rest.as_bytes()[1] == b':' => PathBuf::from(rest),
+        _ => path,
     }
 }
 
@@ -408,27 +759,21 @@ impl Tool for ProcessExecTool {
         context: &ToolContext<'_>,
         _authorization: &Authorization<'_>,
     ) -> Result<ToolOutput, ToolError> {
-        let program = arguments.required_text("program")?;
-        let executable = self.policy.resolve_program(program)?.to_path_buf();
+        let name = arguments.required_text("program")?;
+        let program = self.policy.program(name)?;
         let argv = arguments.text_list("args").unwrap_or_default();
-        if argv.len() > MAX_ARGUMENTS {
-            return Err(ToolError::Execution(ExecutionError::TooManyArguments));
-        }
-        for argument in argv {
-            if argument.contains('\0') {
-                return Err(ToolError::Execution(ExecutionError::ArgumentRejected));
-            }
-            if argument.len() > MAX_ARGUMENT_BYTES {
-                return Err(ToolError::Execution(ExecutionError::ArgumentRejected));
-            }
-        }
+        program.argv.check(argv)?;
         let cwd = self.working_directory(arguments, context)?;
         let timeout = match arguments.count("timeout_ms") {
             Some(requested) => Duration::from_millis(requested).min(self.policy.timeout),
             None => self.policy.timeout,
         };
 
-        let mut command = Command::new(&executable);
+        // Identity is proven here, immediately before the spawn, and the handle
+        // is held until the child exists so the file cannot be replaced inside
+        // the window.
+        let pinned = open_verified_executable(program)?;
+        let mut command = Command::new(&program.executable);
         command
             .args(argv)
             .current_dir(cwd.native())
@@ -439,10 +784,12 @@ impl Tool for ProcessExecTool {
         for (name, value) in self.policy.env.resolve() {
             command.env(name, value);
         }
+        place_in_own_process_group(&mut command);
 
         let child = command
             .spawn()
             .map_err(|_| ToolError::Execution(ExecutionError::SpawnFailed))?;
+        drop(pinned);
         let cancellation = self.cancellation.as_ref().map(|handle| handle.0.clone());
         let outcome = supervise(child, timeout, self.policy.max_output_bytes, cancellation)?;
 
@@ -454,8 +801,8 @@ impl Tool for ProcessExecTool {
         Ok(ToolOutput::new(
             rendered,
             json!({
-                "program": program,
-                "args": argv,
+                "program": name,
+                "argument_count": argv.len(),
                 "cwd": cwd.relative().as_str(),
                 "exit_code": outcome.exit_code,
                 "stdout": outcome.stdout,
@@ -467,7 +814,24 @@ impl Tool for ProcessExecTool {
     }
 }
 
+/// Puts the child at the head of its own process group where the platform has
+/// one, so descendants can be signalled together even after the child exits.
+#[cfg(unix)]
+fn place_in_own_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn place_in_own_process_group(_command: &mut Command) {}
+
 /// Drives one child to completion, enforcing the deadline and the output cap.
+///
+/// The process tree is terminated on every exit path, including a clean one. A
+/// child that spawns a detached payload, closes its pipes and exits
+/// immediately would otherwise leave that payload running past the deadline
+/// and past any revocation of the grant that started it.
 fn supervise(
     mut child: Child,
     timeout: Duration,
@@ -505,17 +869,23 @@ fn supervise(
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    if let Some(reason) = expiry {
-        terminate_tree(pid);
+    // Terminate before the child handle is dropped: while it is held the
+    // operating system cannot reuse the identifier, so the sweep still finds
+    // descendants of an already-exited child.
+    terminate_tree(pid);
+    if expiry.is_some() {
         let _ = child.kill();
         let _ = child.wait();
-        drain(stdout_reader);
-        drain(stderr_reader);
-        return Err(ToolError::Execution(reason));
     }
-
+    // Bounded: a descendant that inherited the pipes and never closes them must
+    // not stall the supervisor forever.
     let (stdout, stdout_truncated) = drain(stdout_reader);
     let (stderr, stderr_truncated) = drain(stderr_reader);
+    drop(child);
+
+    if let Some(reason) = expiry {
+        return Err(ToolError::Execution(reason));
+    }
     Ok(ProcessOutcome {
         exit_code: status.and_then(|status| status.code()),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -524,42 +894,67 @@ fn supervise(
     })
 }
 
-type ReaderHandle = Option<std::thread::JoinHandle<(Vec<u8>, bool)>>;
+/// Buffer shared between a pipe reader thread and the supervisor.
+#[derive(Debug, Default)]
+struct ReaderBuffer {
+    collected: std::sync::Mutex<Vec<u8>>,
+    truncated: AtomicBool,
+}
+
+type ReaderHandle = Option<(std::thread::JoinHandle<()>, Arc<ReaderBuffer>)>;
 
 /// Reads a pipe on its own thread so a chatty child cannot deadlock the caller.
 fn spawn_reader<R: Read + Send + 'static>(stream: Option<R>, cap: usize) -> ReaderHandle {
     let mut stream = stream?;
-    Some(std::thread::spawn(move || {
-        let mut collected: Vec<u8> = Vec::new();
-        let mut truncated = false;
-        let mut buffer = [0_u8; 8192];
+    let buffer = Arc::new(ReaderBuffer::default());
+    let sink = Arc::clone(&buffer);
+    let handle = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
         loop {
-            match stream.read(&mut buffer) {
+            match stream.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
+                    let Ok(mut collected) = sink.collected.lock() else {
+                        break;
+                    };
                     if collected.len() < cap {
                         let remaining = cap - collected.len();
                         let take = remaining.min(read);
-                        collected.extend_from_slice(&buffer[..take]);
+                        collected.extend_from_slice(&chunk[..take]);
                         if take < read {
-                            truncated = true;
+                            sink.truncated.store(true, Ordering::SeqCst);
                         }
                     } else {
                         // Keep draining so the child is never blocked on a
                         // full pipe, but discard everything past the cap.
-                        truncated = true;
+                        sink.truncated.store(true, Ordering::SeqCst);
                     }
                 }
             }
         }
-        (collected, truncated)
-    }))
+    });
+    Some((handle, buffer))
 }
 
+/// Collects what a reader captured, waiting only a bounded time for it to end.
 fn drain(handle: ReaderHandle) -> (Vec<u8>, bool) {
-    handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_else(|| (Vec::new(), false))
+    let Some((thread, buffer)) = handle else {
+        return (Vec::new(), false);
+    };
+    let deadline = Instant::now() + DRAIN_GRACE;
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let collected = buffer
+        .collected
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let truncated = buffer.truncated.load(Ordering::SeqCst);
+    if thread.is_finished() {
+        let _ = thread.join();
+    }
+    (collected, truncated)
 }
 
 /// Kills a process and every descendant it spawned.
@@ -581,6 +976,19 @@ fn terminate_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
+        // The child leads its own process group, so signalling the group
+        // reaches descendants that were reparented when it exited.
+        for group in [format!("-{pid}")] {
+            let mut command = Command::new("kill");
+            command
+                .args(["-KILL", "--", &group])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Ok(mut killer) = command.spawn() {
+                let _ = killer.wait();
+            }
+        }
         let table = process_table();
         let mut targets = descendants(&table, pid);
         // Deepest first, so a parent cannot reparent a survivor mid-sweep.
@@ -662,8 +1070,24 @@ pub enum ExecutionError {
     ProgramPathNotAbsolute,
     /// The executable would run through a command interpreter.
     InterpretedProgramForbidden,
+    /// The configured executable does not exist or cannot be opened.
+    ExecutableNotFound,
+    /// The configured executable is a symbolic link or reparse point.
+    ExecutableIsALink,
+    /// The configured executable is not a regular file.
+    ExecutableNotAFile,
+    /// The configured path differs from its canonical form.
+    ExecutablePathNotCanonical,
+    /// The configured executable is a shell, interpreter, or launcher.
+    ExecutableIsAnInterpreter,
+    /// The configured executable lives where the agent can write.
+    ExecutableInsideWritableRoot,
+    /// The executable changed between being allowlisted and being run.
+    ExecutableChanged,
     /// An argv entry was rejected by a bound or contained a NUL byte.
     ArgumentRejected,
+    /// An argv entry is not in the program's allowed argument set.
+    ArgumentNotAllowed,
     /// More argv entries were supplied than the bound allows.
     TooManyArguments,
     /// An environment variable name or value was rejected.
@@ -687,7 +1111,21 @@ impl Display for ExecutionError {
             Self::InterpretedProgramForbidden => {
                 "executables interpreted by a command shell are forbidden"
             }
+            Self::ExecutableNotFound => "allowlisted executable does not exist",
+            Self::ExecutableIsALink => "allowlisted executable is a link or reparse point",
+            Self::ExecutableNotAFile => "allowlisted executable is not a regular file",
+            Self::ExecutablePathNotCanonical => {
+                "allowlisted executable path is not its own canonical path"
+            }
+            Self::ExecutableIsAnInterpreter => {
+                "shells, interpreters, and launchers cannot be allowlisted"
+            }
+            Self::ExecutableInsideWritableRoot => {
+                "an executable the agent can overwrite cannot be allowlisted"
+            }
+            Self::ExecutableChanged => "allowlisted executable changed since it was allowlisted",
             Self::ArgumentRejected => "argument was rejected",
+            Self::ArgumentNotAllowed => "argument is not in the allowed set for this program",
             Self::TooManyArguments => "too many arguments",
             Self::EnvironmentRejected => "environment variable was rejected",
             Self::SpawnFailed => "process could not be spawned",
@@ -777,16 +1215,44 @@ mod tests {
 
     #[test]
     fn an_unlisted_program_never_resolves() {
+        // A real file is required now, so the test binary stands in for an
+        // operator-supplied executable.
+        let real = std::fs::canonicalize(std::env::current_exe().expect("test binary path"))
+            .map(strip_verbatim)
+            .expect("test binary canonicalizes");
         let mut policy = ExecPolicy::deny_all();
         policy
-            .allow_program("git", absolute("git"))
+            .allow_program("runner", real.clone())
             .expect("valid program");
-        assert_eq!(policy.resolve_program("git"), Ok(absolute("git").as_path()));
+        assert_eq!(policy.resolve_program("runner"), Ok(real.as_path()));
         assert_eq!(
             policy.resolve_program("curl"),
             Err(ExecutionError::ProgramNotAllowed)
         );
-        assert_eq!(policy.program_names(), vec!["git".to_owned()]);
+        assert_eq!(policy.program_names(), vec!["runner".to_owned()]);
+    }
+
+    #[test]
+    fn an_executable_that_does_not_exist_is_refused() {
+        let mut policy = ExecPolicy::deny_all();
+        assert_eq!(
+            policy.allow_program("ghost", absolute("definitely-not-installed-xyz")),
+            Err(ExecutionError::ExecutableNotFound)
+        );
+        assert!(policy.program_names().is_empty());
+    }
+
+    #[test]
+    fn shells_and_interpreters_are_refused_by_name() {
+        let mut policy = ExecPolicy::deny_all();
+        for name in ["sh", "bash", "cmd", "powershell", "python3", "node", "env"] {
+            assert_eq!(
+                policy.allow_program("runner", absolute(name)),
+                Err(ExecutionError::ExecutableIsAnInterpreter),
+                "accepted interpreter {name}"
+            );
+        }
+        assert!(policy.program_names().is_empty());
     }
 
     #[test]

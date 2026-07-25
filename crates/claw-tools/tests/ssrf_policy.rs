@@ -7,18 +7,24 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::io::{Read, Write};
+use std::net::{IpAddr, TcpListener};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use claw_security::ssrf::{ResolutionError, TargetError};
 use claw_tools::audit::{
     AuditError, AuditOutcome, AuditPhase, AuditReason, InMemoryAuditSink, ToolAuditRecord,
     ToolAuditSink,
 };
+use claw_tools::clock::{Clock, FixedClock};
 use claw_tools::net::{
     DenyAllSearchProvider, DenyAllTransport, HttpRequest, HttpResponse, HttpTransport,
-    NetFetchTool, NetworkError, PrivateOriginExceptions, SearchHit, SearchProvider, UrlPolicy,
-    WebSearchTool,
+    NetFetchTool, NetworkError, PinnedHttpTransport, PrivateOriginExceptions, SearchHit,
+    SearchProvider, UrlPolicy, WebSearchTool,
 };
 use claw_tools::permission::{
     Approval, Capability, DenialReason, GrantLedger, GrantRequest, GrantScope, PermissionError,
@@ -69,11 +75,23 @@ impl RequestLog {
     }
 }
 
+/// A response the stub transport should replay.
+///
+/// The peer is not scripted: an honest transport connects to one of the
+/// addresses the caller pinned, so the stub reports `request.pinned` rather
+/// than a value a test could quietly choose.
+#[derive(Clone, Debug)]
+struct ScriptedResponse {
+    status: u16,
+    location: Option<String>,
+    body: Vec<u8>,
+}
+
 /// A transport that replays scripted responses and never performs I/O.
 #[derive(Default)]
 struct RecordingTransport {
     resolutions: BTreeMap<String, Vec<IpAddr>>,
-    responses: Vec<HttpResponse>,
+    responses: Vec<ScriptedResponse>,
     log: RequestLog,
 }
 
@@ -89,7 +107,7 @@ impl RecordingTransport {
         self
     }
 
-    fn returning(mut self, responses: Vec<HttpResponse>) -> Self {
+    fn returning(mut self, responses: Vec<ScriptedResponse>) -> Self {
         self.responses = responses;
         self.responses.reverse();
         self
@@ -111,7 +129,17 @@ impl HttpTransport for RecordingTransport {
 
     fn fetch(&mut self, request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
         self.log.0.borrow_mut().push(request.url.clone());
-        self.responses.pop().ok_or(NetworkError::TransportFailed)
+        let peer = *request
+            .pinned
+            .first()
+            .ok_or(NetworkError::TransportFailed)?;
+        let scripted = self.responses.pop().ok_or(NetworkError::TransportFailed)?;
+        Ok(HttpResponse {
+            status: scripted.status,
+            location: scripted.location,
+            body: scripted.body,
+            peer,
+        })
     }
 }
 
@@ -323,7 +351,7 @@ fn the_tool_refuses_forbidden_urls_before_any_transport_call() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut registry = ToolRegistry::new();
     registry
@@ -363,18 +391,18 @@ fn a_public_fetch_revalidates_dns_on_every_hop() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let transport = RecordingTransport::default()
         .with_resolution("example.com", &["93.184.216.34"])
         .with_resolution("cdn.example.net", &["93.184.216.35"])
         .returning(vec![
-            HttpResponse {
+            ScriptedResponse {
                 status: 302,
                 location: Some("https://cdn.example.net/asset".to_owned()),
                 body: Vec::new(),
             },
-            HttpResponse {
+            ScriptedResponse {
                 status: 200,
                 location: None,
                 body: b"payload".to_vec(),
@@ -426,7 +454,7 @@ fn a_host_scoped_grant_does_not_survive_a_cross_host_redirect() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let log = RequestLog::default();
     let transport = RecordingTransport::default()
@@ -434,12 +462,12 @@ fn a_host_scoped_grant_does_not_survive_a_cross_host_redirect() {
         .with_resolution("docs.example.com", &["93.184.216.34"])
         .with_resolution("attacker.test", &["93.184.216.36"])
         .returning(vec![
-            HttpResponse {
+            ScriptedResponse {
                 status: 302,
                 location: Some("https://attacker.test/collect?d=context".to_owned()),
                 body: Vec::new(),
             },
-            HttpResponse {
+            ScriptedResponse {
                 status: 200,
                 location: None,
                 body: b"exfiltrated".to_vec(),
@@ -507,19 +535,19 @@ fn a_same_host_redirect_spends_no_additional_grant_budget() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let log = RequestLog::default();
     let transport = RecordingTransport::default()
         .logging(&log)
         .with_resolution("docs.example.com", &["93.184.216.34"])
         .returning(vec![
-            HttpResponse {
+            ScriptedResponse {
                 status: 301,
                 location: Some("https://docs.example.com/guide/v2".to_owned()),
                 body: Vec::new(),
             },
-            HttpResponse {
+            ScriptedResponse {
                 status: 200,
                 location: None,
                 body: b"guide".to_vec(),
@@ -572,7 +600,7 @@ fn every_cross_host_redirect_is_re_authorized_in_order() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let log = RequestLog::default();
     let transport = RecordingTransport::default()
@@ -581,17 +609,17 @@ fn every_cross_host_redirect_is_re_authorized_in_order() {
         .with_resolution("second.example.net", &["93.184.216.35"])
         .with_resolution("third.example.org", &["93.184.216.36"])
         .returning(vec![
-            HttpResponse {
+            ScriptedResponse {
                 status: 302,
                 location: Some("https://second.example.net/b".to_owned()),
                 body: Vec::new(),
             },
-            HttpResponse {
+            ScriptedResponse {
                 status: 302,
                 location: Some("https://third.example.org/c".to_owned()),
                 body: Vec::new(),
             },
-            HttpResponse {
+            ScriptedResponse {
                 status: 200,
                 location: None,
                 body: b"final".to_vec(),
@@ -646,7 +674,7 @@ fn an_unrecordable_redirect_authorization_is_withdrawn() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let log = RequestLog::default();
     let transport = RecordingTransport::default()
@@ -654,12 +682,12 @@ fn an_unrecordable_redirect_authorization_is_withdrawn() {
         .with_resolution("docs.example.com", &["93.184.216.34"])
         .with_resolution("attacker.test", &["93.184.216.36"])
         .returning(vec![
-            HttpResponse {
+            ScriptedResponse {
                 status: 302,
                 location: Some("https://attacker.test/collect".to_owned()),
                 body: Vec::new(),
             },
-            HttpResponse {
+            ScriptedResponse {
                 status: 200,
                 location: None,
                 body: b"exfiltrated".to_vec(),
@@ -711,11 +739,11 @@ fn a_redirect_into_private_space_is_refused_mid_flight() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let transport = RecordingTransport::default()
         .with_resolution("example.com", &["93.184.216.34"])
-        .returning(vec![HttpResponse {
+        .returning(vec![ScriptedResponse {
             status: 302,
             location: Some("http://169.254.169.254/latest/meta-data/".to_owned()),
             body: Vec::new(),
@@ -750,13 +778,13 @@ fn a_rebinding_dns_answer_is_refused_before_the_request() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     // The name resolves to a public address at first glance but the answer
     // contains a loopback address; the target must never be contacted.
     let transport = RecordingTransport::default()
         .with_resolution("example.com", &["93.184.216.34", "127.0.0.1"])
-        .returning(vec![HttpResponse {
+        .returning(vec![ScriptedResponse {
             status: 200,
             location: None,
             body: b"should never be reached".to_vec(),
@@ -791,10 +819,10 @@ fn the_redirect_budget_is_finite() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let looping = (0..8)
-        .map(|index| HttpResponse {
+        .map(|index| ScriptedResponse {
             status: 302,
             location: Some(format!("https://example.com/hop{index}")),
             body: Vec::new(),
@@ -830,7 +858,7 @@ fn the_default_transport_reaches_nothing_at_all() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut registry = ToolRegistry::new();
     registry
@@ -908,7 +936,7 @@ fn search_results_pointing_at_private_space_are_dropped() {
     let sandbox = sandbox();
     let context = ToolContext {
         sandbox: &sandbox,
-        unix_millis: NOW,
+        clock: &FixedClock::new(NOW),
     };
     let mut registry = ToolRegistry::new();
     registry
@@ -944,4 +972,520 @@ fn search_results_pointing_at_private_space_are_dropped() {
         "a refused destination reached the model: {}",
         output.content
     );
+}
+
+/// A minimal, single-threaded HTTP server on loopback for transport tests.
+///
+/// It exists because a recording stub can only prove what the code under test
+/// asked for, never where the bytes actually went. This one accepts real
+/// connections, so pinning and redirect handling are observable.
+struct LoopbackServer {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LoopbackServer {
+    /// Starts a server that replies with `responses` in order, repeating the
+    /// last reply once the script is exhausted.
+    fn start(responses: Vec<String>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback bind succeeds");
+        let port = listener.local_addr().expect("bound address").port();
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let mut index = 0_usize;
+            while !thread_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // Accepted sockets inherit the listener's non-blocking
+                        // mode on Windows, which would make the first read
+                        // fail instead of waiting for the request.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        let mut raw = Vec::new();
+                        let mut chunk = [0_u8; 512];
+                        while let Ok(read) = stream.read(&mut chunk) {
+                            if read == 0 {
+                                break;
+                            }
+                            raw.extend_from_slice(&chunk[..read]);
+                            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        thread_requests
+                            .lock()
+                            .expect("request log is usable")
+                            .push(String::from_utf8_lossy(&raw).into_owned());
+                        let reply = responses
+                            .get(index)
+                            .or_else(|| responses.last())
+                            .cloned()
+                            .unwrap_or_default();
+                        index += 1;
+                        let _ = stream.write_all(reply.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn origin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("request log is usable").clone()
+    }
+}
+
+impl Drop for LoopbackServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A transport that answers honestly but claims a different peer, standing in
+/// for a client library that resolved the name again behind the caller's back.
+struct RebindingTransport {
+    answer: IpAddr,
+    peer: IpAddr,
+}
+
+impl HttpTransport for RebindingTransport {
+    fn resolve(&mut self, _host: &str) -> Result<Vec<IpAddr>, NetworkError> {
+        Ok(vec![self.answer])
+    }
+
+    fn fetch(&mut self, _request: &HttpRequest) -> Result<HttpResponse, NetworkError> {
+        Ok(HttpResponse {
+            status: 200,
+            location: None,
+            body: b"metadata".to_vec(),
+            peer: self.peer,
+        })
+    }
+}
+
+#[test]
+fn a_transport_that_connects_off_the_validated_set_is_refused() {
+    // DNS rebinding in its purest form: the answer that was validated is not
+    // the address the connection reached.
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &FixedClock::new(NOW),
+    };
+    let transport = RebindingTransport {
+        answer: "93.184.216.34".parse().expect("valid literal"),
+        peer: "169.254.169.254".parse().expect("valid literal"),
+    };
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+    let mut ledger = ledger();
+    let mut audit = InMemoryAuditSink::new();
+
+    let error = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "http://example.com/" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect_err("a rebound connection must be refused");
+    assert_eq!(
+        error.network(),
+        Some(&NetworkError::PeerNotPinned),
+        "unexpected error {error:?}"
+    );
+}
+
+#[test]
+fn the_pinned_transport_connects_to_the_pinned_address_not_to_the_host_name() {
+    // The host name here resolves nowhere. If the transport re-resolved the
+    // URL, no connection could be made at all; the request arrives because the
+    // caller's validated address is what gets dialled.
+    let server = LoopbackServer::start(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_owned(),
+    ]);
+    let mut transport =
+        PinnedHttpTransport::new().with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
+    let response = transport
+        .fetch(&HttpRequest {
+            url: format!("http://not-a-real-host.invalid:{}/thing", server.port),
+            method: "GET".to_owned(),
+            host: "not-a-real-host.invalid".to_owned(),
+            port: server.port,
+            pinned: vec!["127.0.0.1".parse().expect("valid literal")],
+            max_body_bytes: 1024,
+        })
+        .expect("the pinned address answers");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"hi");
+    assert_eq!(
+        response.peer,
+        "127.0.0.1".parse::<IpAddr>().expect("valid literal"),
+        "the transport reported a peer it did not connect to"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one request");
+    assert!(
+        requests[0].starts_with("GET /thing HTTP/1.1\r\n"),
+        "unexpected request line: {:?}",
+        requests[0]
+    );
+    assert!(
+        requests[0].contains("Host: not-a-real-host.invalid\r\n"),
+        "the Host header was rewritten: {:?}",
+        requests[0]
+    );
+}
+
+#[test]
+fn the_pinned_transport_refuses_to_connect_when_no_address_is_pinned() {
+    let server = LoopbackServer::start(vec!["HTTP/1.1 200 OK\r\n\r\n".to_owned()]);
+    let mut transport = PinnedHttpTransport::new();
+    let error = transport
+        .fetch(&HttpRequest {
+            url: format!("http://127.0.0.1:{}/", server.port),
+            method: "GET".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: server.port,
+            pinned: Vec::new(),
+            max_body_bytes: 1024,
+        })
+        .expect_err("an unpinned request must not be sent");
+    assert_eq!(error, NetworkError::TransportRefused);
+    assert!(
+        server.requests().is_empty(),
+        "an unpinned request reached the socket"
+    );
+}
+
+#[test]
+fn the_pinned_transport_returns_redirects_instead_of_following_them() {
+    // A client that follows redirects internally makes every hop invisible to
+    // policy. This one hands the redirect back and stops.
+    let server = LoopbackServer::start(vec![
+        "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n"
+            .to_owned(),
+    ]);
+    let mut transport = PinnedHttpTransport::new();
+    let response = transport
+        .fetch(&HttpRequest {
+            url: format!("http://127.0.0.1:{}/start", server.port),
+            method: "GET".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: server.port,
+            pinned: vec!["127.0.0.1".parse().expect("valid literal")],
+            max_body_bytes: 1024,
+        })
+        .expect("the server answers");
+
+    assert_eq!(response.status, 302);
+    assert_eq!(
+        response.location.as_deref(),
+        Some("http://169.254.169.254/latest/meta-data/")
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the transport followed the redirect itself"
+    );
+}
+
+#[test]
+fn a_redirect_to_the_metadata_service_is_refused_over_a_real_socket() {
+    // End to end over a real connection: an excepted loopback origin is
+    // permitted, and its open redirect to the cloud metadata address is not.
+    let server = LoopbackServer::start(vec![
+        "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n"
+            .to_owned(),
+    ]);
+    let mut exceptions = PrivateOriginExceptions::none();
+    exceptions
+        .allow_origin(&server.origin())
+        .expect("a well-formed origin");
+    let policy = UrlPolicy::public_internet().with_exceptions(exceptions);
+
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &FixedClock::new(NOW),
+    };
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            policy,
+            PinnedHttpTransport::new(),
+        )))
+        .expect("net_fetch registers");
+    let mut ledger = ledger();
+    let mut audit = InMemoryAuditSink::new();
+
+    let error = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": format!("{}/start", server.origin()) }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect_err("the metadata redirect must be refused");
+    assert!(error.network().is_some(), "unexpected error {error:?}");
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the redirect was fetched despite being refused"
+    );
+}
+
+#[test]
+fn an_excepted_loopback_origin_is_fetched_over_a_real_socket() {
+    // The positive control: without it the refusal tests above could pass for
+    // the wrong reason.
+    let server = LoopbackServer::start(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\npayload".to_owned(),
+    ]);
+    let mut exceptions = PrivateOriginExceptions::none();
+    exceptions
+        .allow_origin(&server.origin())
+        .expect("a well-formed origin");
+    let policy = UrlPolicy::public_internet().with_exceptions(exceptions);
+
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &FixedClock::new(NOW),
+    };
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            policy,
+            PinnedHttpTransport::new(),
+        )))
+        .expect("net_fetch registers");
+    let mut ledger = ledger();
+    let mut audit = InMemoryAuditSink::new();
+
+    let output = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": format!("{}/health", server.origin()) }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect("an excepted origin is reachable");
+    assert_eq!(output.structured["status"], 200);
+    assert_eq!(output.structured["body"], "payload");
+    assert_eq!(server.requests().len(), 1);
+}
+
+/// A clock that moves forward on every reading.
+///
+/// It models the only honest assumption available to a security check: time
+/// passes between decisions. Code that samples time once per invocation and
+/// reuses it cannot tell this clock apart from a frozen one.
+#[derive(Debug)]
+struct AdvancingClock {
+    start: u64,
+    step: u64,
+    readings: AtomicU64,
+}
+
+impl AdvancingClock {
+    fn new(start: u64, step: u64) -> Self {
+        Self {
+            start,
+            step,
+            readings: AtomicU64::new(0),
+        }
+    }
+
+    fn readings(&self) -> u64 {
+        self.readings.load(Ordering::Relaxed)
+    }
+}
+
+impl Clock for AdvancingClock {
+    fn unix_millis(&self) -> u64 {
+        let reading = self.readings.fetch_add(1, Ordering::Relaxed);
+        self.start + reading * self.step
+    }
+}
+
+#[test]
+fn a_grant_that_expires_mid_invocation_does_not_authorize_a_later_hop() {
+    // The audited failure: one timestamp was captured per invocation and
+    // reused for every later resource, so a grant that expired while the
+    // request was in flight still authorized the host it was redirected to.
+    // The second host's grant expires two seconds in; the clock passes that
+    // point before the redirect is reached.
+    let clock = AdvancingClock::new(NOW, 1_000);
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &clock,
+    };
+    let transport = RecordingTransport::default()
+        .with_resolution("example.com", &["93.184.216.34"])
+        .with_resolution("cdn.example.net", &["93.184.216.35"])
+        .returning(vec![
+            ScriptedResponse {
+                status: 302,
+                location: Some("http://cdn.example.net/asset".to_owned()),
+                body: Vec::new(),
+            },
+            ScriptedResponse {
+                status: 200,
+                location: None,
+                body: b"payload".to_vec(),
+            },
+        ]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+
+    let mut ledger = GrantLedger::new();
+    ledger.grant(GrantRequest {
+        capability: Capability::NetworkFetch,
+        scope: GrantScope::Host("example.com".to_owned()),
+        expires_unix_millis: None,
+        max_uses: None,
+        approval: Approval::Explicit,
+    });
+    ledger.grant(GrantRequest {
+        capability: Capability::NetworkFetch,
+        scope: GrantScope::Host("cdn.example.net".to_owned()),
+        expires_unix_millis: Some(NOW + 500),
+        max_uses: None,
+        approval: Approval::Explicit,
+    });
+    let mut audit = InMemoryAuditSink::new();
+
+    let error = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "http://example.com/start" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect_err("an expired grant must not authorize the redirect target");
+    assert!(error.permission().is_some(), "unexpected error {error:?}");
+    assert!(
+        clock.readings() > 1,
+        "the clock was read once, so expiry was evaluated against a stale time"
+    );
+    // The refusal must be the second host, reached after the first was
+    // legitimately authorized, not a blanket failure of the invocation.
+    let records = audit.records();
+    assert!(
+        records.iter().any(|record| {
+            record.resource == Some(Resource::Host("example.com".to_owned()))
+                && record.outcome == AuditOutcome::Allowed
+        }),
+        "the first host was never authorized: {records:?}"
+    );
+    let refusal = records
+        .iter()
+        .find(|record| record.resource == Some(Resource::Host("cdn.example.net".to_owned())))
+        .expect("the redirect target was evaluated");
+    assert_eq!(refusal.outcome, AuditOutcome::Denied);
+    assert_eq!(refusal.denial, Some(DenialReason::GrantExpired));
+    assert!(
+        refusal.unix_millis > NOW + 500,
+        "the refusal was recorded against a time before the grant expired"
+    );
+}
+
+#[test]
+fn the_same_redirect_succeeds_while_the_second_grant_is_still_valid() {
+    // Positive control for the test above: with a grant that outlives the
+    // invocation, the identical redirect chain completes.
+    let clock = AdvancingClock::new(NOW, 1_000);
+    let sandbox = sandbox();
+    let context = ToolContext {
+        sandbox: &sandbox,
+        clock: &clock,
+    };
+    let transport = RecordingTransport::default()
+        .with_resolution("example.com", &["93.184.216.34"])
+        .with_resolution("cdn.example.net", &["93.184.216.35"])
+        .returning(vec![
+            ScriptedResponse {
+                status: 302,
+                location: Some("http://cdn.example.net/asset".to_owned()),
+                body: Vec::new(),
+            },
+            ScriptedResponse {
+                status: 200,
+                location: None,
+                body: b"payload".to_vec(),
+            },
+        ]);
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(NetFetchTool::new(
+            UrlPolicy::public_internet(),
+            transport,
+        )))
+        .expect("net_fetch registers");
+
+    let mut ledger = GrantLedger::new();
+    for host in ["example.com", "cdn.example.net"] {
+        ledger.grant(GrantRequest {
+            capability: Capability::NetworkFetch,
+            scope: GrantScope::Host(host.to_owned()),
+            expires_unix_millis: Some(NOW + 600_000),
+            max_uses: None,
+            approval: Approval::Explicit,
+        });
+    }
+    let mut audit = InMemoryAuditSink::new();
+
+    let output = registry
+        .invoke(
+            "net_fetch",
+            &json!({ "url": "http://example.com/start" }),
+            &context,
+            &mut ledger,
+            &mut audit,
+        )
+        .expect("a live grant authorizes the redirect target");
+    assert_eq!(output.structured["status"], 200);
+    assert_eq!(output.structured["body"], "payload");
 }

@@ -10,7 +10,21 @@ use std::fmt::{self, Display, Formatter};
 use serde::{Deserialize, Serialize};
 
 /// Inclusive maximum byte length of a session identifier.
-const MAX_SESSION_ID_BYTES: usize = 128;
+pub const MAX_SESSION_ID_BYTES: usize = 128;
+
+/// Inclusive maximum byte length of one message body.
+///
+/// Message bodies arrive from model output and tool results, so they are
+/// attacker-influenced by construction. Refusing an oversized body here keeps
+/// every downstream token count, summary and context assembly working on
+/// input whose size is already known to be bounded.
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Inclusive maximum number of retained messages in one session.
+pub const MAX_MESSAGES: usize = 100_000;
+
+/// Inclusive maximum number of retained summaries in one session.
+pub const MAX_SUMMARIES: usize = 10_000;
 
 /// A validated session identifier.
 ///
@@ -196,6 +210,12 @@ impl Session {
         if content.is_empty() {
             return Err(SessionError::EmptyMessage);
         }
+        if content.len() > MAX_MESSAGE_BYTES {
+            return Err(SessionError::MessageTooLong);
+        }
+        if self.messages.len() >= MAX_MESSAGES {
+            return Err(SessionError::TooManyMessages);
+        }
         let id = MessageId(self.next_ordinal);
         self.next_ordinal = self
             .next_ordinal
@@ -245,6 +265,12 @@ impl Session {
         if summary.text.is_empty() {
             return Err(SessionError::EmptyMessage);
         }
+        if summary.text.len() > MAX_MESSAGE_BYTES {
+            return Err(SessionError::MessageTooLong);
+        }
+        if self.summaries.len() >= MAX_SUMMARIES {
+            return Err(SessionError::TooManySummaries);
+        }
         let before = self.messages.len();
         self.messages
             .retain(|message| message.is_anchor() || !summary.covers(message.id));
@@ -282,6 +308,12 @@ pub enum SessionError {
     InvalidSessionId,
     /// A message body was empty.
     EmptyMessage,
+    /// A message body exceeded its byte bound.
+    MessageTooLong,
+    /// The session already holds the maximum number of messages.
+    TooManyMessages,
+    /// The session already holds the maximum number of summaries.
+    TooManySummaries,
     /// A summary range ran backwards.
     InvalidSummaryRange,
     /// The session ran out of message identifiers.
@@ -295,6 +327,9 @@ impl Display for SessionError {
             Self::SessionIdTooLong => "session identifier is too long",
             Self::InvalidSessionId => "session identifier has unacceptable characters",
             Self::EmptyMessage => "message content must not be empty",
+            Self::MessageTooLong => "message content exceeds the maximum size",
+            Self::TooManyMessages => "session holds the maximum number of messages",
+            Self::TooManySummaries => "session holds the maximum number of summaries",
             Self::InvalidSummaryRange => "summary range runs backwards",
             Self::SessionExhausted => "session ran out of message identifiers",
         };

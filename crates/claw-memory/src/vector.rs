@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Inclusive maximum embedding dimensionality accepted by this crate.
 const MAX_DIMENSIONS: usize = 8192;
 
+/// Default maximum number of records one in-crate index will hold.
+const DEFAULT_INDEX_CAPACITY: usize = 100_000;
+
 /// A dense embedding with a validated dimensionality.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Embedding {
@@ -224,22 +227,42 @@ pub trait VectorIndex {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExactVectorIndex {
     dimensions: usize,
+    capacity: usize,
     entries: BTreeMap<RecordId, Embedding>,
 }
 
 impl ExactVectorIndex {
     /// Creates an empty index of a fixed dimensionality.
+    ///
+    /// The index is capacity-bounded because every record it holds can come
+    /// from attacker-influenced text: an unbounded index is an unbounded
+    /// allocation reachable from ordinary agent output.
     pub fn new(dimensions: usize) -> Result<Self, VectorError> {
+        Self::with_capacity(dimensions, DEFAULT_INDEX_CAPACITY)
+    }
+
+    /// Creates an empty index with an explicit record capacity.
+    pub fn with_capacity(dimensions: usize, capacity: usize) -> Result<Self, VectorError> {
         if dimensions == 0 {
             return Err(VectorError::EmptyEmbedding);
         }
         if dimensions > MAX_DIMENSIONS {
             return Err(VectorError::TooManyDimensions);
         }
+        if capacity == 0 {
+            return Err(VectorError::EmptyCapacity);
+        }
         Ok(Self {
             dimensions,
+            capacity,
             entries: BTreeMap::new(),
         })
+    }
+
+    /// Returns the maximum number of records this index will hold.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Returns the indexed identifiers in ascending order.
@@ -258,6 +281,11 @@ impl VectorIndex for ExactVectorIndex {
         if embedding.dimensions() != self.dimensions {
             return Err(VectorError::DimensionMismatch);
         }
+        // Replacing an existing record is always allowed; only growth is
+        // capped, so a full index stays usable rather than becoming read-only.
+        if !self.entries.contains_key(&id) && self.entries.len() >= self.capacity {
+            return Err(VectorError::IndexFull);
+        }
         self.entries.insert(id, embedding);
         Ok(())
     }
@@ -270,23 +298,44 @@ impl VectorIndex for ExactVectorIndex {
         if query.dimensions() != self.dimensions {
             return Err(VectorError::DimensionMismatch);
         }
-        let mut scored: Vec<ScoredMatch> = Vec::with_capacity(self.entries.len());
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Only the running best `limit` matches are retained, so the working
+        // set is bounded by the caller's limit rather than by the index size.
+        let mut best: Vec<ScoredMatch> = Vec::with_capacity(limit.min(self.entries.len()));
         for (id, embedding) in &self.entries {
-            scored.push(ScoredMatch {
+            let candidate = ScoredMatch {
                 id: id.clone(),
                 score: query.cosine_similarity(embedding)?,
-            });
+            };
+            if best.len() == limit {
+                let worst = best.last().expect("a full buffer has a last element");
+                if !ranks_before(&candidate, worst) {
+                    continue;
+                }
+                best.pop();
+            }
+            let position = best
+                .iter()
+                .position(|existing| ranks_before(&candidate, existing))
+                .unwrap_or(best.len());
+            best.insert(position, candidate);
         }
-        scored.sort_by(|left, right| match right.score.total_cmp(&left.score) {
-            Ordering::Equal => left.id.cmp(&right.id),
-            ordering => ordering,
-        });
-        scored.truncate(limit);
-        Ok(scored)
+        Ok(best)
     }
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Orders two matches by descending score, then by ascending identifier.
+fn ranks_before(candidate: &ScoredMatch, existing: &ScoredMatch) -> bool {
+    match existing.score.total_cmp(&candidate.score) {
+        Ordering::Equal => candidate.id < existing.id,
+        Ordering::Less => true,
+        Ordering::Greater => false,
     }
 }
 
@@ -305,6 +354,10 @@ pub enum VectorError {
     DimensionMismatch,
     /// A record identifier was empty or contained unacceptable characters.
     InvalidRecordId,
+    /// An index was configured with no capacity at all.
+    EmptyCapacity,
+    /// The index already holds its maximum number of records.
+    IndexFull,
 }
 
 impl Display for VectorError {
@@ -316,6 +369,8 @@ impl Display for VectorError {
             Self::ZeroEmbedding => "embedding has zero magnitude",
             Self::DimensionMismatch => "embedding dimensionalities differ",
             Self::InvalidRecordId => "record identifier is not acceptable",
+            Self::EmptyCapacity => "index capacity must be at least one record",
+            Self::IndexFull => "index holds its maximum number of records",
         };
         formatter.write_str(message)
     }
