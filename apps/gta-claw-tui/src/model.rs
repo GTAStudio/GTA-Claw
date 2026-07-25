@@ -240,6 +240,8 @@ pub struct AppModel {
     pub diff: Vec<String>,
     /// Artifact names.
     pub artifacts: Vec<String>,
+    /// Preview lines for the selected artifact.
+    pub artifact_content: Vec<String>,
     /// Whether the command palette is open.
     pub palette_open: bool,
     /// Command palette input.
@@ -264,6 +266,7 @@ impl Default for AppModel {
             prompt: None,
             diff: Vec::new(),
             artifacts: Vec::new(),
+            artifact_content: Vec::new(),
             palette_open: false,
             palette: String::new(),
             answer: String::new(),

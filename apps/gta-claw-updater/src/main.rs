@@ -9,6 +9,10 @@ use semver::Version;
 use url::Url;
 
 fn main() -> ExitCode {
+    if cfg!(target_os = "linux") {
+        println!("GTA Claw updates are managed by the system package manager.");
+        return ExitCode::SUCCESS;
+    }
     let arguments = match Arguments::parse(std::env::args_os()) {
         Ok(arguments) => arguments,
         Err(message) => {

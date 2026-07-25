@@ -45,7 +45,7 @@ impl Options {
         let mut gateway = std::env::var_os("GTA_CLAW_GATEWAY_URL")
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "ws://127.0.0.1:18789".to_owned());
-        let mut token = std::env::var_os("GTA_CLAW_GATEWAY_TOKEN")
+        let token = std::env::var_os("GTA_CLAW_GATEWAY_TOKEN")
             .map(|value| value.to_string_lossy().into_owned());
         let mut no_color = std::env::var_os("NO_COLOR").is_some();
         let mut plain = false;
@@ -59,15 +59,6 @@ impl Options {
                         .ok_or_else(|| "--gateway requires a URL".to_owned())?
                         .to_string_lossy()
                         .into_owned();
-                }
-                "--token" => {
-                    token = Some(
-                        values
-                            .next()
-                            .ok_or_else(|| "--token requires a value".to_owned())?
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
                 }
                 "--no-color" => no_color = true,
                 "--plain" => plain = true,
@@ -365,7 +356,11 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
         }
         WorkerEvent::Prompt(prompt) => model.prompt = Some(prompt),
         WorkerEvent::Diff(diff) => model.diff = diff,
-        WorkerEvent::Artifacts(artifacts) => model.artifacts = artifacts,
+        WorkerEvent::Artifacts(artifacts) => {
+            model.artifacts = artifacts;
+            model.artifact_content.clear();
+        }
+        WorkerEvent::ArtifactContent(content) => model.artifact_content = content,
         WorkerEvent::Notice(notice) => model.notice = Some(notice),
     }
 }
@@ -412,5 +407,5 @@ async fn shutdown_signal() {
 }
 
 fn help_text() -> &'static str {
-    "Usage: gta-claw-tui [--gateway ws://HOST:PORT] [--token TOKEN] [--no-color] [--plain]"
+    "Usage: gta-claw-tui [--gateway ws://HOST:PORT] [--no-color] [--plain]\nSet GTA_CLAW_GATEWAY_TOKEN for authenticated Gateways."
 }

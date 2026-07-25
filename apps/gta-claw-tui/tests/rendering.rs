@@ -139,14 +139,15 @@ fn fake_backend_renders_workspace_diff_artifacts_and_palette_cells() {
 
     model.screen = Screen::Artifacts;
     model.artifacts = vec!["report.json".to_owned(), "trace.log".to_owned()];
+    model.artifact_content = vec!["{\"status\":\"ok\"}".to_owned()];
     let artifacts = render(&model, 50, 14, true);
     assert_eq!(
         artifacts.line(6),
-        "  * report.json                                   "
+        "  * report.json     |{\"status\":\"ok\"}              "
     );
     assert_eq!(
         artifacts.line(7),
-        "  * trace.log                                     "
+        "  * trace.log       |                             "
     );
 }
 

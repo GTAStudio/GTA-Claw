@@ -6,7 +6,7 @@ mod support;
 
 use std::time::Duration;
 
-use claw_protocol::gateway::AUTHENTICATED_MAX_FRAME_BYTES;
+use claw_protocol::gateway::{AUTHENTICATED_MAX_FRAME_BYTES, Codec};
 use gta_claw_tui::gateway::{GatewayOptions, UiCommand, WorkerEvent, spawn_gateway_worker};
 use gta_claw_tui::model::{RunState, SessionSummary, TranscriptEntry};
 use serde_json::json;
@@ -70,6 +70,48 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
             }),
         )
         .await;
+        let list = receive_request(&mut socket).await;
+        assert_eq!(list.method().as_str(), "artifacts.list");
+        let list_params = Codec::authenticated()
+            .decode_opaque::<serde_json::Value>(
+                list.params().value().expect("artifact list params"),
+            )
+            .expect("decode artifact list params");
+        assert_eq!(list_params, json!({"sessionId": "session-42"}));
+        send_json(
+            &mut socket,
+            json!({
+                "type": "res",
+                "id": list.id().as_str(),
+                "ok": true,
+                "payload": {
+                    "artifacts": [{
+                        "id": "artifact-7",
+                        "name": "report.json"
+                    }]
+                }
+            }),
+        )
+        .await;
+        let get = receive_request(&mut socket).await;
+        assert_eq!(get.method().as_str(), "artifacts.get");
+        let get_params = Codec::authenticated()
+            .decode_opaque::<serde_json::Value>(get.params().value().expect("artifact get params"))
+            .expect("decode artifact get params");
+        assert_eq!(
+            get_params,
+            json!({"sessionId": "session-42", "artifactId": "artifact-7"})
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "res",
+                "id": get.id().as_str(),
+                "ok": true,
+                "payload": {"content": "{\n  \"status\": \"ok\"\n}"}
+            }),
+        )
+        .await;
         wait_for_close(&mut socket).await;
     }))
     .await;
@@ -118,6 +160,30 @@ async fn gateway_worker_loads_sessions_and_streams_transcript() {
     assert_eq!(
         changed,
         WorkerEvent::Notice("Sessions changed; press r to refresh".to_owned())
+    );
+    commands
+        .send(UiCommand::LoadArtifacts("session-42".to_owned()))
+        .await
+        .expect("request artifacts");
+    let artifacts = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .expect("artifacts event timeout")
+        .expect("artifacts event");
+    assert_eq!(
+        artifacts,
+        WorkerEvent::Artifacts(vec!["report.json".to_owned()])
+    );
+    let preview = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .expect("artifact preview timeout")
+        .expect("artifact preview");
+    assert_eq!(
+        preview,
+        WorkerEvent::ArtifactContent(vec![
+            "{".to_owned(),
+            "  \"status\": \"ok\"".to_owned(),
+            "}".to_owned(),
+        ])
     );
 
     commands

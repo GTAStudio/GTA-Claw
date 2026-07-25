@@ -79,6 +79,8 @@ pub enum WorkerEvent {
     Diff(Vec<String>),
     /// Artifact labels.
     Artifacts(Vec<String>),
+    /// Textual preview of the first artifact.
+    ArtifactContent(Vec<String>),
     /// Non-fatal status or error text.
     Notice(String),
 }
@@ -230,22 +232,47 @@ async fn handle_command(
                 &json!({"sessionId": session_id}),
             )
             .await?;
-            let artifacts = value
+            let entries = value
                 .get("artifacts")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter_map(|item| {
-                    item.get("name")
+                    let name = item
+                        .get("name")
                         .or_else(|| item.get("path"))
                         .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
+                        .map(ToOwned::to_owned)?;
+                    let id = item
+                        .get("id")
+                        .or_else(|| item.get("artifactId"))
+                        .or_else(|| item.get("path"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&name)
+                        .to_owned();
+                    Some((name, id))
                 })
-                .collect();
+                .collect::<Vec<_>>();
             sender
-                .send(WorkerEvent::Artifacts(artifacts))
+                .send(WorkerEvent::Artifacts(
+                    entries.iter().map(|(name, _)| name.clone()).collect(),
+                ))
                 .await
-                .map_err(|_| WorkerError("render loop stopped".to_owned()))
+                .map_err(|_| WorkerError("render loop stopped".to_owned()))?;
+            if let Some((_, artifact_id)) = entries.first() {
+                let preview = request_json(
+                    client,
+                    sequence,
+                    "artifacts.get",
+                    &json!({"sessionId": session_id, "artifactId": artifact_id}),
+                )
+                .await?;
+                sender
+                    .send(WorkerEvent::ArtifactContent(artifact_preview(&preview)))
+                    .await
+                    .map_err(|_| WorkerError("render loop stopped".to_owned()))?;
+            }
+            Ok(())
         }
         UiCommand::ResolveApproval { id, approved } => {
             let _ = request_json(
@@ -416,6 +443,18 @@ fn string_field(value: &Value, names: &[&str]) -> Option<String> {
         .iter()
         .find_map(|name| value.get(*name).and_then(Value::as_str))
         .map(ToOwned::to_owned)
+}
+
+fn artifact_preview(value: &Value) -> Vec<String> {
+    const MAX_PREVIEW_LINES: usize = 2_000;
+    let text = string_field(value, &["content", "text", "data"]).unwrap_or_else(|| {
+        serde_json::to_string_pretty(value)
+            .unwrap_or_else(|_| "Artifact preview unavailable".to_owned())
+    });
+    text.lines()
+        .take(MAX_PREVIEW_LINES)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn generate_identity() -> Result<DeviceIdentity, WorkerError> {

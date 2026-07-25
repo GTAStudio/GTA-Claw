@@ -122,7 +122,7 @@ impl Grid {
 /// Renders the complete application into a deterministic grid.
 #[must_use]
 pub fn render(model: &AppModel, width: u16, height: u16, no_color: bool) -> Grid {
-    let mut grid = Grid::new(width.max(20), height.max(8));
+    let mut grid = Grid::new(width.max(1), height.max(1));
     let normal = CellStyle::default();
     let accent = colored(45, no_color);
     grid.write(0, 0, " GTA Claw ", accent);
@@ -324,7 +324,12 @@ fn draw_diff(grid: &mut Grid, model: &AppModel, no_color: bool) {
 }
 
 fn draw_artifacts(grid: &mut Grid, model: &AppModel) {
+    let split = grid.width().saturating_mul(2) / 5;
     grid.write(2, 4, "Artifacts", CellStyle::default());
+    grid.write(split + 1, 4, "Preview", CellStyle::default());
+    for y in 4..grid.height().saturating_sub(2) {
+        grid.put(split, y, '|', CellStyle::default());
+    }
     for (row, artifact) in model.artifacts.iter().skip(model.scroll).enumerate() {
         let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
         if y >= grid.height().saturating_sub(2) {
@@ -332,11 +337,25 @@ fn draw_artifacts(grid: &mut Grid, model: &AppModel) {
         }
         grid.write(2, y, &format!("* {artifact}"), CellStyle::default());
     }
+    for (row, line) in model.artifact_content.iter().enumerate() {
+        let y = 6 + u16::try_from(row).unwrap_or(u16::MAX);
+        if y >= grid.height().saturating_sub(2) {
+            break;
+        }
+        grid.write(split + 1, y, line, CellStyle::default());
+    }
     if model.artifacts.is_empty() {
         grid.write(
             2,
             6,
             "No artifacts for the selected session.",
+            CellStyle::default(),
+        );
+    } else if model.artifact_content.is_empty() {
+        grid.write(
+            split + 1,
+            6,
+            "No textual preview available.",
             CellStyle::default(),
         );
     }
