@@ -1,6 +1,10 @@
 //! Bounded newline-delimited JSON-RPC framing.
 
-use std::{future::Future, io};
+use std::{
+    future::Future,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use rmcp::{
     RoleClient, RoleServer,
@@ -19,6 +23,46 @@ use crate::error::{McpError, Result};
 
 /// Default maximum JSON-RPC frame size accepted over stdio.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BoundedIoDiagnostics {
+    protocol_failure: Arc<Mutex<Option<String>>>,
+}
+
+impl BoundedIoDiagnostics {
+    fn record(&self, error: &McpError) {
+        let message = match error {
+            McpError::Protocol(message) => message.clone(),
+            McpError::Json(error) => format!("stdio frame contains invalid JSON: {error}"),
+            _ => return,
+        };
+        let mut failure = self
+            .protocol_failure
+            .lock()
+            .expect("bounded stdio diagnostics lock poisoned");
+        if failure.is_none() {
+            *failure = Some(message);
+        }
+    }
+
+    fn record_invalid_message(&self, error: &serde_json::Error) {
+        let mut failure = self
+            .protocol_failure
+            .lock()
+            .expect("bounded stdio diagnostics lock poisoned");
+        if failure.is_none() {
+            *failure = Some(format!("stdio JSON-RPC message is invalid: {error}"));
+        }
+    }
+
+    pub(crate) fn protocol_error(&self) -> Option<McpError> {
+        self.protocol_failure
+            .lock()
+            .expect("bounded stdio diagnostics lock poisoned")
+            .clone()
+            .map(McpError::Protocol)
+    }
+}
 
 /// Incremental decoder for newline-delimited JSON-RPC messages.
 ///
@@ -107,6 +151,7 @@ where
     reads: mpsc::Receiver<RxJsonRpcMessage<R>>,
     reader: Option<JoinHandle<std::result::Result<(), io::Error>>>,
     writer: Option<JoinHandle<std::result::Result<(), io::Error>>>,
+    diagnostics: BoundedIoDiagnostics,
 }
 
 impl<R> BoundedIoTransport<R>
@@ -116,21 +161,47 @@ where
     TxJsonRpcMessage<R>: Serialize + Send + 'static,
 {
     pub(crate) fn new(
+        input: impl AsyncRead + Send + Unpin + 'static,
+        output: impl AsyncWrite + Send + Unpin + 'static,
+    ) -> Self {
+        Self::with_max_frame_bytes(input, output, DEFAULT_MAX_FRAME_BYTES)
+    }
+
+    pub(crate) fn with_max_frame_bytes(
         mut input: impl AsyncRead + Send + Unpin + 'static,
         mut output: impl AsyncWrite + Send + Unpin + 'static,
+        max_frame_bytes: usize,
     ) -> Self {
         let (read_tx, reads) = mpsc::channel(32);
+        let diagnostics = BoundedIoDiagnostics::default();
+        let reader_diagnostics = diagnostics.clone();
         let reader = tokio::spawn(async move {
-            let mut decoder = JsonLineDecoder::default();
+            let mut decoder = JsonLineDecoder::new(max_frame_bytes);
             let mut bytes = [0_u8; 16 * 1024];
             loop {
                 let count = input.read(&mut bytes).await?;
                 if count == 0 {
-                    decoder.finish().map_err(protocol_io_error)?;
+                    if let Err(error) = decoder.finish() {
+                        reader_diagnostics.record(&error);
+                        return Err(protocol_io_error(error));
+                    }
                     return Ok(());
                 }
-                for value in decoder.push(&bytes[..count]).map_err(protocol_io_error)? {
-                    let message = serde_json::from_value(value).map_err(invalid_data_io_error)?;
+                let values = match decoder.push(&bytes[..count]) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        reader_diagnostics.record(&error);
+                        return Err(protocol_io_error(error));
+                    }
+                };
+                for value in values {
+                    let message = match serde_json::from_value(value) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            reader_diagnostics.record_invalid_message(&error);
+                            return Err(invalid_data_io_error(error));
+                        }
+                    };
                     if read_tx.send(message).await.is_err() {
                         return Ok(());
                     }
@@ -166,6 +237,25 @@ where
             reads,
             reader: Some(reader),
             writer: Some(writer),
+            diagnostics,
+        }
+    }
+
+    pub(crate) fn diagnostics(&self) -> BoundedIoDiagnostics {
+        self.diagnostics.clone()
+    }
+}
+
+impl<R> Drop for BoundedIoTransport<R>
+where
+    R: rmcp::service::ServiceRole,
+{
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
         }
     }
 }

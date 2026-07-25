@@ -70,7 +70,15 @@ fn fixture(arguments: Vec<String>) -> StdioClientConfig {
         environment: std::collections::HashMap::new(),
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_millis(150),
+        max_frame_bytes: claw_mcp::framing::DEFAULT_MAX_FRAME_BYTES,
     }
+}
+
+fn assert_protocol_error(error: McpError, expected: &str) {
+    let McpError::Protocol(actual) = error else {
+        panic!("expected MCP protocol error, received {error:?}");
+    };
+    assert_eq!(actual, expected);
 }
 
 async fn negotiated_client_capabilities(sampling: Arc<dyn SamplingPort>) -> Value {
@@ -440,20 +448,21 @@ async fn malformed_stdio_frame_fails_initialization() {
     .await
     .expect_err("malformed JSON-RPC must fail closed");
 
-    assert!(matches!(error, McpError::ClientInitialize(_)));
+    assert_protocol_error(
+        error,
+        "stdio frame contains invalid JSON: key must be a string at line 1 column 2",
+    );
 }
 
 #[tokio::test]
 async fn oversized_unterminated_stdio_frame_fails_initialization() {
-    let error = McpClient::connect_stdio(
-        fixture(vec!["--oversized".into()]),
-        Arc::new(RejectSampling),
-        Arc::new(DiscardEvents),
-    )
-    .await
-    .expect_err("oversized JSON-RPC must fail closed");
+    let mut config = fixture(vec!["--oversized".into()]);
+    config.max_frame_bytes = 1024;
+    let error = McpClient::connect_stdio(config, Arc::new(RejectSampling), Arc::new(DiscardEvents))
+        .await
+        .expect_err("oversized JSON-RPC must fail closed");
 
-    assert!(matches!(error, McpError::ClientInitialize(_)));
+    assert_protocol_error(error, "stdio frame exceeds byte limit");
 }
 
 #[tokio::test]

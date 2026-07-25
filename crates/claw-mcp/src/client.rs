@@ -206,6 +206,8 @@ pub struct StdioClientConfig {
     pub connect_timeout: Duration,
     /// Timeout applied to each MCP request.
     pub request_timeout: Duration,
+    /// Maximum accepted newline-delimited JSON-RPC frame size.
+    pub max_frame_bytes: usize,
 }
 
 impl StdioClientConfig {
@@ -218,6 +220,7 @@ impl StdioClientConfig {
             environment: HashMap::new(),
             connect_timeout: Duration::from_secs(15),
             request_timeout: Duration::from_secs(30),
+            max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
         }
     }
 }
@@ -341,6 +344,11 @@ impl McpClient {
         sampling: Arc<dyn SamplingPort>,
         events: Arc<dyn ClientEventSink>,
     ) -> Result<Self, McpError> {
+        if config.max_frame_bytes == 0 {
+            return Err(McpError::Protocol(
+                "MCP stdio frame limit must be greater than zero".into(),
+            ));
+        }
         let mut command = Command::new(&config.program);
         command
             .args(&config.arguments)
@@ -370,15 +378,18 @@ impl McpClient {
                 let _ = tokio::io::copy(&mut stderr, &mut destination).await;
             })
         });
+        let io = BoundedIoTransport::with_max_frame_bytes(stdout, stdin, config.max_frame_bytes);
+        let diagnostics = io.diagnostics();
         let service = connect_transport(
             ChildTreeTransport {
-                io: BoundedIoTransport::new(stdout, stdin),
+                io,
                 child: Some(child),
             },
             config.connect_timeout,
             GtaClientHandler { sampling, events },
         )
-        .await?;
+        .await
+        .map_err(|error| diagnostics.protocol_error().unwrap_or(error))?;
         Ok(Self {
             service,
             request_timeout: config.request_timeout,
