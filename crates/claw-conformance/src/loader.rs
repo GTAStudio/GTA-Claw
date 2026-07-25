@@ -322,8 +322,33 @@ fn validate_manifest(manifest: &Manifest, transition_schema: bool) -> Result<(),
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value))
     .collect::<BTreeMap<_, _>>();
-    if manifest.canonical_counts != expected_counts
-        || manifest.evidence_policy.initial_status != "unimplemented"
+    if manifest.canonical_counts != expected_counts {
+        for (key, expected) in &expected_counts {
+            match manifest.canonical_counts.get(key) {
+                Some(actual) if actual != expected => {
+                    return Err(fail(format!(
+                        "canonical count '{key}' must be {expected}, got {actual}"
+                    )));
+                }
+                None => {
+                    return Err(fail(format!(
+                        "canonical count '{key}' must be {expected}, got missing"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some((key, actual)) = manifest
+            .canonical_counts
+            .iter()
+            .find(|(key, _)| !expected_counts.contains_key(*key))
+        {
+            return Err(fail(format!(
+                "unexpected canonical count '{key}' has value {actual}"
+            )));
+        }
+    }
+    if manifest.evidence_policy.initial_status != "unimplemented"
         || manifest.evidence_policy.acceptance_evidence_state != "missing"
         || !manifest
             .evidence_policy
