@@ -1923,6 +1923,52 @@ fn alternate_codeowners_locations_fail_final_inventory() {
 }
 
 #[test]
+fn manifest_path_keys_cannot_bless_a_file_the_workspace_never_declared() {
+    // The manifest inventory is derived from `[workspace] members` only. `path` is also
+    // the source field of a dependency table, which is candidate-controlled, so a rule
+    // that treated any manifest `path =` as authorising would let one line of TOML admit
+    // an orphan crate. This pins both halves of that being closed.
+    let orphan_manifest = "[package]\nname = \"claw-orphan\"\nversion = \"0.1.0\"\n\
+         edition = \"2024\"\n\n[lints]\nworkspace = true\n";
+
+    let tree = final_tree("manifest-path-orphan-undeclared");
+    fs::create_dir_all(tree.join("crates/claw-orphan/src")).expect("create orphan crate");
+    fs::write(tree.join("crates/claw-orphan/Cargo.toml"), orphan_manifest)
+        .expect("write orphan manifest");
+    fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open orphan tree"))
+        .expect_err("an undeclared crate manifest must not enter the inventory");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Cargo.toml inventory does not match declared root members"),
+        "orphan manifest was rejected by an unrelated rule: {error}"
+    );
+
+    // Now point a workspace dependency at it, which is the "bless it with one line of
+    // TOML" move. Measured: this is caught earlier still, by the dependency rule, because
+    // a `path` dependency must resolve to an already-declared member. The inventory check
+    // above is the independent backstop, so both halves are closed by separate rules.
+    let tree = final_tree("manifest-path-orphan-blessed");
+    fs::create_dir_all(tree.join("crates/claw-orphan/src")).expect("create orphan crate");
+    fs::write(tree.join("crates/claw-orphan/Cargo.toml"), orphan_manifest)
+        .expect("write orphan manifest");
+    fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
+    replace(
+        &tree.join("Cargo.toml"),
+        "[workspace.dependencies]\n",
+        "[workspace.dependencies]\n\
+         claw-orphan = { path = \"crates/claw-orphan\", version = \"0.1.0\" }\n",
+    );
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open blessed tree"))
+        .expect_err("a dependency path must not admit an undeclared crate");
+    assert_eq!(
+        error.to_string(),
+        "path dependency is not a declared root member: claw-orphan -> crates/claw-orphan"
+    );
+}
+
+#[test]
 fn complete_final_fixture_passes_static_policy() {
     let tree = final_tree("final-static");
     let root = SafeRoot::new(&tree.path).expect("open final fixture");
