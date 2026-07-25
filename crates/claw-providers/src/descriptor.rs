@@ -187,3 +187,117 @@ impl Display for ProviderDescriptor {
         write!(formatter, "{} ({})", self.display_name, self.id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserts the exact content of a capability constant.
+    ///
+    /// `supported` must be written out by hand at the call site and must never be
+    /// derived from the constant under test: the constant *is* the subject, so
+    /// restating it from the same source would prove only that a value equals
+    /// itself. The frozen upstream inventory publishes no capability data, so a
+    /// hand-written restatement of each vendor's documented API surface is the
+    /// strongest oracle available.
+    ///
+    /// The comparison walks every [`Capability`] rather than the claimed ones, so
+    /// a capability that is wrongly *added* fails just as loudly as one wrongly
+    /// removed. The length check makes a silently widened set impossible.
+    fn assert_capability_content(actual: CapabilitySet, supported: &[Capability], family: &str) {
+        for capability in Capability::ALL {
+            assert_eq!(
+                actual.contains(capability),
+                supported.contains(&capability),
+                "{family} capability {capability:?}"
+            );
+        }
+        assert_eq!(
+            actual.len(),
+            u32::try_from(supported.len()).expect("capability count fits in u32"),
+            "{family} claims a different number of capabilities"
+        );
+    }
+
+    #[test]
+    fn the_openai_capability_constant_covers_the_whole_chat_completions_surface() {
+        assert_capability_content(
+            OPENAI_CAPABILITIES,
+            &[
+                Capability::Completion,
+                Capability::Streaming,
+                Capability::ToolCalling,
+                Capability::Embeddings,
+                Capability::ModelListing,
+                Capability::Vision,
+                Capability::Reasoning,
+                Capability::JsonMode,
+                Capability::PromptCaching,
+            ],
+            "openai",
+        );
+    }
+
+    #[test]
+    fn the_anthropic_capability_constant_claims_neither_embeddings_nor_json_mode() {
+        assert_capability_content(
+            ANTHROPIC_CAPABILITIES,
+            &[
+                Capability::Completion,
+                Capability::Streaming,
+                Capability::ToolCalling,
+                Capability::ModelListing,
+                Capability::Vision,
+                Capability::Reasoning,
+                Capability::PromptCaching,
+            ],
+            "anthropic",
+        );
+        assert!(!ANTHROPIC_CAPABILITIES.contains(Capability::Embeddings));
+        assert!(!ANTHROPIC_CAPABILITIES.contains(Capability::JsonMode));
+    }
+
+    #[test]
+    fn the_copilot_capability_constant_claims_no_embeddings_endpoint() {
+        assert_capability_content(
+            COPILOT_CAPABILITIES,
+            &[
+                Capability::Completion,
+                Capability::Streaming,
+                Capability::ToolCalling,
+                Capability::ModelListing,
+                Capability::Vision,
+                Capability::JsonMode,
+            ],
+            "github-copilot",
+        );
+        assert!(!COPILOT_CAPABILITIES.contains(Capability::Embeddings));
+    }
+
+    #[test]
+    fn a_registration_only_status_is_exactly_the_absence_of_a_client() {
+        for status in [
+            ImplementationStatus::Implemented,
+            ImplementationStatus::EndpointRequired,
+            ImplementationStatus::RegistrationOnly,
+        ] {
+            let descriptor = ProviderDescriptor {
+                record_id: "provider:probe",
+                id: "probe",
+                plugin_id: "probe",
+                source_path: "extensions/probe/openclaw.plugin.json",
+                display_name: "Probe",
+                family: ProviderFamily::OpenAiChatCompletions,
+                status,
+                auth_modes: &[AuthMode::BearerToken],
+                base_url: None,
+                capabilities: CapabilitySet::EMPTY,
+            };
+            assert_eq!(
+                descriptor.is_registration_only(),
+                !status.has_client(),
+                "{status}"
+            );
+        }
+    }
+}

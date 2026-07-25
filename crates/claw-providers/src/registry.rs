@@ -316,7 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn record_ids_and_source_paths_follow_the_frozen_naming_rules() {
+    fn the_descriptor_macro_derives_record_ids_and_paths_from_the_provider_id() {
+        // Scope, stated plainly: this pins the *macro template*, not the frozen
+        // data. `record_id` and `source_path` are built by `provider_table!` from
+        // `$id` and `$dir`, so no value of those inputs can make this fail — only
+        // an edit to the template can. Conformance against the frozen inventory is
+        // proved by `tests/frozen_inventory.rs`, which reads
+        // `compat/upstream/inventories/providers.json` at run time; a provider id
+        // that drifts from upstream is caught there and is invisible here.
         for descriptor in PROVIDERS {
             assert_eq!(
                 descriptor.record_id,
@@ -359,14 +366,16 @@ mod tests {
                     "{} must not advertise capabilities",
                     descriptor.id
                 );
-                assert!(!descriptor.status.has_client(), "{}", descriptor.id);
             } else {
+                // The load-bearing assertion of this test: `capabilities_for`
+                // falls through to `EMPTY` for any family outside the three that
+                // ship a client, so this fails if a provider claims a client
+                // status in a dialect nothing can drive.
                 assert!(
                     !descriptor.capabilities.is_empty(),
                     "{} claims a client but advertises nothing",
                     descriptor.id
                 );
-                assert!(descriptor.status.has_client(), "{}", descriptor.id);
             }
         }
     }
@@ -402,7 +411,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_match_the_dialect_of_every_provider_with_a_client() {
+    fn every_client_bearing_provider_is_dispatched_to_its_dialect_constant() {
+        // Scope, stated plainly: this pins the *dispatch* performed by
+        // `capabilities_for` — which family maps to which constant — and is blind
+        // to the *content* of those constants, because both sides of the
+        // comparison read the same three constants. Emptying `COPILOT_CAPABILITIES`
+        // or adding a false capability to it leaves this test green. The content of
+        // each constant is pinned in `descriptor.rs` against hand-written lists.
         for descriptor in PROVIDERS.iter().filter(|entry| entry.status.has_client()) {
             let expected = match descriptor.family {
                 ProviderFamily::OpenAiChatCompletions => OPENAI_CAPABILITIES,
