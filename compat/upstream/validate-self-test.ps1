@@ -108,6 +108,22 @@ function New-SyntheticRepositoryRoot {
         "loose/outside.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/data/fixture.json" = "{}`n"
+        # The cited test exists only inside a macro token tree. cargo expands
+        # stringify! to a string literal, so no test named $SyntheticTestName is
+        # ever compiled or run. The {} before the attribute is deliberate: it is
+        # what made an earlier port stop at the first brace and resume INSIDE the
+        # token tree, which made the forged item visible.
+        "crates/synthetic/tests/macro_forged.rs" =
+            "const _FORGED: &str = stringify!({} #[test] fn $SyntheticTestName() {});`n"
+        # The accepting direction for the same rule: an item-position macro must
+        # not swallow the real test that follows it.
+        "crates/synthetic/tests/macro_then_real.rs" =
+            "::std::thread_local! { static V: u32 = 1; }`n`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A function-level #[cfg(test)] genuinely does run under cargo test, so
+        # it must be accepted. Pinning this stops the cfg rule from being
+        # tightened back into a false-rejection engine.
+        "crates/synthetic/tests/cfg_test_fn.rs" =
+            "#[cfg(test)]`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         # A second crate whose manifest names an orphan under a dependency table
         # rather than a target section. cargo builds nothing from it.
         "crates/decoy/Cargo.toml" =
@@ -818,6 +834,53 @@ $cases = @(
             param($caseRoot)
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/synthetic/tests/cfg_gated.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-citing-macro-token-tree-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The whole forgery, end to end: the file is a real cargo test
+            # target, the path exists, the citation is well formed, and the text
+            # "#[test] fn <name>" is genuinely present. It is inside a macro
+            # token tree, so cargo never compiles a test by that name. This is
+            # the ledger-level form of the corpus case, and it is the one that
+            # proves the oracle re-port protects the ledger and not just itself.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/macro_forged.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-citing-macro-then-real-test-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A tightening rule needs its false-positive cases pinned as much as
+            # its true-positive ones. An item-position macro invocation before
+            # the test must not hide it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/macro_then_real.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-citing-cfg-test-function-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[cfg(test)] #[test] fn runs under cargo test, so refusing it would
+            # reject honest evidence. An earlier port did refuse it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/tests/cfg_test_fn.rs" $SyntheticTestName)
             )
         }
     },
