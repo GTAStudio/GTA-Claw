@@ -748,7 +748,10 @@ dependencies = [
 name = "claw-application"
 version = "0.1.0"
 dependencies = [
+ "claw-domain",
  "claw-protocol",
+ "secrecy",
+ "url",
 ]
 
 [[package]]
