@@ -609,12 +609,3 @@ pub fn run_actionlint(
     }
     Ok(())
 }
-
-/// Returns the exact required and admitted workflow paths.
-#[must_use]
-pub fn allowed_workflows() -> BTreeSet<&'static str> {
-    REQUIRED_WORKFLOWS
-        .into_iter()
-        .chain(ADMITTED_WORKFLOWS)
-        .collect()
-}
