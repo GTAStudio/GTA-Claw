@@ -5,7 +5,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
-    io::BufReader,
+    io::{AsyncRead, AsyncWrite, BufReader},
     sync::{Semaphore, mpsc},
     task::JoinSet,
     time::timeout,
@@ -152,10 +152,18 @@ impl AcpBridge {
 
     /// Serves the ACP bridge over process stdio until the client disconnects.
     pub async fn serve_stdio(self) -> Result<()> {
-        let peer = RpcPeer::new(tokio::io::stdout());
+        self.serve(tokio::io::stdin(), tokio::io::stdout()).await
+    }
+
+    async fn serve(
+        self,
+        input: impl AsyncRead + Send + Unpin + 'static,
+        output: impl AsyncWrite + Send + Unpin + 'static,
+    ) -> Result<()> {
+        let peer = RpcPeer::new(output);
         let (incoming_sender, mut incoming) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
         let reader = tokio::spawn(async move {
-            let mut reader = BufReader::new(tokio::io::stdin());
+            let mut reader = BufReader::new(input);
             let mut frame = Vec::new();
             loop {
                 match read_message(&mut reader, &mut frame).await {
@@ -177,6 +185,8 @@ impl AcpBridge {
         let mut tasks = JoinSet::new();
         let terminal_error = loop {
             let message = tokio::select! {
+                biased;
+                () = peer.disconnected() => break None,
                 message = incoming.recv() => message,
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(Err(error)) = completed {
@@ -185,6 +195,9 @@ impl AcpBridge {
                     continue;
                 }
             };
+            if !peer.is_connected() {
+                break None;
+            }
             let message = match message {
                 Some(Ok(message)) => message,
                 None => break None,
@@ -379,5 +392,138 @@ where
         Err(error) => {
             let _ = peer.respond::<T>(id, Err(error)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct UnusedBackend;
+
+    impl AcpBackend for UnusedBackend {
+        fn new_session<'a>(
+            &'a self,
+            _request: NewSessionRequest,
+            _context: AcpSessionContext,
+        ) -> AcpFuture<'a, NewSessionResponse> {
+            panic!("backend must not receive a session request")
+        }
+
+        fn load_session<'a>(
+            &'a self,
+            _request: LoadSessionRequest,
+            _context: AcpSessionContext,
+        ) -> AcpFuture<'a, LoadSessionResponse> {
+            panic!("backend must not receive a load request")
+        }
+
+        fn resume_session<'a>(
+            &'a self,
+            _request: ResumeSessionRequest,
+            _context: AcpSessionContext,
+        ) -> AcpFuture<'a, ResumeSessionResponse> {
+            panic!("backend must not receive a resume request")
+        }
+
+        fn list_sessions<'a>(
+            &'a self,
+            _request: ListSessionsRequest,
+        ) -> AcpFuture<'a, ListSessionsResponse> {
+            panic!("backend must not receive a list request")
+        }
+
+        fn close_session<'a>(
+            &'a self,
+            _request: CloseSessionRequest,
+        ) -> AcpFuture<'a, CloseSessionResponse> {
+            panic!("backend must not receive a close request")
+        }
+
+        fn prompt<'a>(
+            &'a self,
+            _request: PromptRequest,
+            _context: AcpSessionContext,
+        ) -> AcpFuture<'a, PromptResponse> {
+            panic!("backend must not receive a prompt request")
+        }
+
+        fn set_mode<'a>(
+            &'a self,
+            _request: SetSessionModeRequest,
+        ) -> AcpFuture<'a, SetSessionModeResponse> {
+            panic!("backend must not receive a mode request")
+        }
+
+        fn set_config_option<'a>(
+            &'a self,
+            _request: SetSessionConfigOptionRequest,
+        ) -> AcpFuture<'a, SetSessionConfigOptionResponse> {
+            panic!("backend must not receive a configuration request")
+        }
+
+        fn cancel<'a>(&'a self, _notification: CancelNotification) -> AcpFuture<'a, ()> {
+            panic!("backend must not receive a cancellation")
+        }
+    }
+
+    #[derive(Debug)]
+    struct BrokenWriter;
+
+    impl AsyncWrite for BrokenWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture output is closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_failure_terminates_dispatch_while_input_remains_open() {
+        let (mut client, input) = duplex(1024);
+        let bridge = AcpBridge::new(Arc::new(UnusedBackend), AgentCapabilities::new());
+        let server = tokio::spawn(bridge.serve(input, BrokenWriter));
+        let request = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": InitializeRequest::new(ProtocolVersion::V1),
+        }))
+        .expect("serialize initialize");
+        client.write_all(&request).await.expect("write initialize");
+        client.write_all(b"\n").await.expect("frame initialize");
+        client.flush().await.expect("flush initialize");
+
+        let result = timeout(Duration::from_secs(1), server)
+            .await
+            .expect("writer failure must terminate dispatch while input remains open")
+            .expect("bridge task must not panic");
+
+        result.expect("writer disconnect is a clean bridge shutdown");
+        drop(client);
     }
 }

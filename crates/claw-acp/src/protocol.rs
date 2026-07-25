@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt},
     sync::{mpsc, oneshot},
 };
+use tokio_util::sync::CancellationToken;
 
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
@@ -154,6 +155,7 @@ pub(crate) struct RpcPeer {
     outgoing: mpsc::Sender<Outbound>,
     state: Arc<Mutex<PeerState>>,
     next_id: Arc<AtomicU64>,
+    disconnected: CancellationToken,
 }
 
 impl RpcPeer {
@@ -163,11 +165,18 @@ impl RpcPeer {
             connected: true,
             pending: HashMap::new(),
         }));
-        tokio::spawn(writer_loop(writer, receiver, Arc::clone(&state)));
+        let disconnected = CancellationToken::new();
+        tokio::spawn(writer_loop(
+            writer,
+            receiver,
+            Arc::clone(&state),
+            disconnected.clone(),
+        ));
         Self {
             outgoing,
             state,
             next_id: Arc::new(AtomicU64::new(1)),
+            disconnected,
         }
     }
 
@@ -294,6 +303,15 @@ impl RpcPeer {
 
     pub(crate) fn mark_disconnected(&self) {
         disconnect_state(&self.state, ProtocolError::disconnected());
+        self.disconnected.cancel();
+    }
+
+    pub(crate) async fn disconnected(&self) {
+        self.disconnected.cancelled().await;
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.connected)
     }
 
     async fn write(&self, message: Value) -> std::result::Result<(), ProtocolError> {
@@ -313,9 +331,12 @@ async fn writer_loop<W>(
     mut writer: W,
     mut receiver: mpsc::Receiver<Outbound>,
     state: Arc<Mutex<PeerState>>,
+    disconnected: CancellationToken,
 ) where
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    let writer_disconnected = disconnected.clone();
+    let _disconnect_on_exit = disconnected.drop_guard();
     while let Some(outbound) = receiver.recv().await {
         let result = async {
             writer.write_all(&outbound.bytes).await?;
@@ -329,9 +350,12 @@ async fn writer_loop<W>(
             .err()
             .cloned()
             .unwrap_or_else(ProtocolError::disconnected);
-        let _ = outbound.completion.send(result);
         if failed {
             disconnect_state(&state, error.clone());
+            writer_disconnected.cancel();
+        }
+        let _ = outbound.completion.send(result);
+        if failed {
             while let Ok(outbound) = receiver.try_recv() {
                 let _ = outbound.completion.send(Err(error.clone()));
             }

@@ -18,6 +18,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{McpError, Result};
 
@@ -109,6 +110,9 @@ impl JsonLineDecoder {
                 .map_err(|_| McpError::Protocol("stdio frame is not UTF-8".into()))?;
             decoded.push(serde_json::from_str(text)?);
         }
+        if self.buffered.len() > self.max_frame_bytes {
+            return Err(McpError::Protocol("stdio frame exceeds byte limit".into()));
+        }
         Ok(decoded)
     }
 
@@ -175,11 +179,16 @@ where
         let (read_tx, reads) = mpsc::channel(32);
         let diagnostics = BoundedIoDiagnostics::default();
         let reader_diagnostics = diagnostics.clone();
+        let disconnected = CancellationToken::new();
+        let reader_disconnected = disconnected.clone();
         let reader = tokio::spawn(async move {
             let mut decoder = JsonLineDecoder::new(max_frame_bytes);
             let mut bytes = [0_u8; 16 * 1024];
             loop {
-                let count = input.read(&mut bytes).await?;
+                let count = tokio::select! {
+                    _ = reader_disconnected.cancelled() => return Ok(()),
+                    result = input.read(&mut bytes) => result?,
+                };
                 if count == 0 {
                     if let Err(error) = decoder.finish() {
                         reader_diagnostics.record(&error);
@@ -202,7 +211,11 @@ where
                             return Err(invalid_data_io_error(error));
                         }
                     };
-                    if read_tx.send(message).await.is_err() {
+                    let sent = tokio::select! {
+                        _ = reader_disconnected.cancelled() => return Ok(()),
+                        result = read_tx.send(message) => result,
+                    };
+                    if sent.is_err() {
                         return Ok(());
                     }
                 }
@@ -211,6 +224,8 @@ where
 
         let (writes, mut write_rx) = mpsc::channel::<WriteRequest<R>>(32);
         let writer = tokio::spawn(async move {
+            let writer_disconnected = disconnected.clone();
+            let _disconnect_on_exit = disconnected.drop_guard();
             while let Some((message, acknowledgement)) = write_rx.recv().await {
                 let result = async {
                     let value = serde_json::to_value(message).map_err(invalid_data_io_error)?;
@@ -221,6 +236,9 @@ where
                 }
                 .await;
                 let failed = result.is_err();
+                if failed {
+                    writer_disconnected.cancel();
+                }
                 let _ = acknowledgement.send(result);
                 if failed {
                     return Err(io::Error::new(
@@ -334,9 +352,18 @@ fn join_io_error(error: tokio::task::JoinError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use rmcp::{
+        RoleServer,
+        service::{RxJsonRpcMessage, TxJsonRpcMessage},
+        transport::Transport,
+    };
     use serde_json::json;
+    use tokio::{
+        io::{AsyncWriteExt, duplex},
+        time::{Duration, timeout},
+    };
 
-    use super::{JsonLineDecoder, encode};
+    use super::{BoundedIoTransport, JsonLineDecoder, encode};
 
     #[test]
     fn split_frame_is_reassembled_byte_for_byte() {
@@ -414,6 +441,53 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "MCP protocol violation: stdio frame exceeds byte limit"
+        );
+    }
+
+    #[test]
+    fn oversized_residual_after_a_complete_frame_is_rejected() {
+        let mut decoder = JsonLineDecoder::new(8);
+        let error = decoder
+            .push(b"{}\n123456789")
+            .expect_err("oversized residual frame must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "MCP protocol violation: stdio frame exceeds byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_failure_closes_the_receive_half() {
+        let (mut peer_input, transport_input) = duplex(1024);
+        let (transport_output, peer_output) = duplex(1024);
+        drop(peer_output);
+        let mut transport =
+            BoundedIoTransport::<RoleServer>::new(transport_input, transport_output);
+        peer_input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .expect("write first peer request");
+        let first: Option<RxJsonRpcMessage<RoleServer>> = transport.receive().await;
+        assert!(first.is_some(), "first peer request must be received");
+        let response: TxJsonRpcMessage<RoleServer> = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": []}
+        }))
+        .expect("valid server response");
+
+        let error = transport
+            .send(response)
+            .await
+            .expect_err("closed peer read half must fail the writer");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        let next = timeout(Duration::from_secs(1), transport.receive())
+            .await
+            .expect("writer failure must promptly close receive");
+        assert!(
+            next.is_none(),
+            "transport must not receive work after writer failure"
         );
     }
 }

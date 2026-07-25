@@ -47,6 +47,8 @@ use tower_service::Service;
 use url::Url;
 use zeroize::Zeroize;
 
+use crate::is_literal_loopback_host;
+
 const DEFAULT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 const JSON_MIME_TYPE: &str = "application/json";
@@ -158,6 +160,7 @@ impl HttpClient {
             .parse()
             .map_err(|_| HttpClientError::InvalidUri)?;
         if url.scheme() == "http"
+            && !url.host_str().is_some_and(is_literal_loopback_host)
             && let Some(proxy) = self.proxy_matcher.intercept(&uri)
             && let Some(value) = proxy.basic_auth()
         {
@@ -385,7 +388,11 @@ impl Service<Uri> for HttpsConnector {
         };
         let mut tcp = self.tcp.clone();
         let tls = Arc::clone(&self.tls);
-        let proxy = self.proxy_matcher.intercept(&destination);
+        let proxy = if is_literal_loopback_host(&host) {
+            None
+        } else {
+            self.proxy_matcher.intercept(&destination)
+        };
         Box::pin(async move {
             let connect_uri = proxy
                 .as_ref()
@@ -1121,6 +1128,91 @@ mod tests {
 
         assert!(matches!(error, HttpClientError::Timeout));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_literal_loopback_request_bypasses_configured_proxy() {
+        async fn capture(listener: TcpListener, response_body: &'static [u8]) -> Option<Vec<u8>> {
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                    .await
+                    .ok()?
+                    .ok()?;
+            let mut request = Vec::new();
+            while !request
+                .windows(b"oauth-secret".len())
+                .any(|window| window == b"oauth-secret")
+            {
+                let mut chunk = [0_u8; 512];
+                let count = stream.read(&mut chunk).await.ok()?;
+                if count == 0 || count > (8 * 1024_usize).saturating_sub(request.len()) {
+                    return None;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                std::str::from_utf8(response_body).expect("fixture response is ASCII")
+            );
+            stream.write_all(response.as_bytes()).await.ok()?;
+            Some(request)
+        }
+
+        let target_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback target");
+        let target_address = target_listener.local_addr().expect("target address");
+        let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        let target = tokio::spawn(capture(target_listener, b"target"));
+        let proxy = tokio::spawn(capture(proxy_listener, b"proxy"));
+        let matcher = Arc::new(
+            Matcher::builder()
+                .http(format!("******{proxy_address}"))
+                .build(),
+        );
+        let client = HttpClient::with_roots_and_proxy(
+            Duration::from_secs(5),
+            RootCertStore::empty(),
+            matcher,
+        )
+        .expect("proxied HTTP client");
+        let endpoint = Url::parse(&format!("http://{target_address}/oauth/token"))
+            .expect("loopback OAuth URL");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer loopback-token"),
+        );
+
+        let response = client
+            .request(Method::POST, &endpoint, headers, b"oauth-secret".to_vec())
+            .await
+            .expect("direct loopback request");
+
+        assert_eq!(
+            response.bytes(16).await.expect("target response"),
+            b"target"
+        );
+        let target_request = target
+            .await
+            .expect("target capture task")
+            .expect("loopback target must receive the request");
+        assert_eq!(
+            proxy.await.expect("proxy capture task"),
+            None,
+            "configured proxy must not receive literal loopback traffic"
+        );
+        let target_request = String::from_utf8(target_request).expect("ASCII target request");
+        assert!(
+            target_request
+                .lines()
+                .any(|line| line == "authorization: Bearer loopback-token")
+        );
+        assert!(target_request.ends_with("oauth-secret"));
     }
 
     #[tokio::test]

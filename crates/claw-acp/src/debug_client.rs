@@ -213,7 +213,15 @@ async fn read_client_messages(
     let result = async {
         let mut frame = Vec::new();
         loop {
-            let message = match read_message(&mut reader, &mut frame).await {
+            let incoming = tokio::select! {
+                biased;
+                () = peer.disconnected() => break,
+                message = read_message(&mut reader, &mut frame) => message,
+            };
+            if !peer.is_connected() {
+                break;
+            }
+            let message = match incoming {
                 Ok(Some(message)) => message,
                 Ok(None) => break,
                 Err(error) => {

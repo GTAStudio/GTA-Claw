@@ -18,14 +18,15 @@ pub mod sse;
 pub use http_client::HttpClientError;
 pub use rmcp::model;
 
+pub(crate) fn is_literal_loopback_host(host: &str) -> bool {
+    host.trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
 pub(crate) fn endpoint_allows_credentials(url: &url::Url) -> bool {
     url.scheme() == "https"
-        || (url.scheme() == "http"
-            && url.host_str().is_some_and(|host| {
-                host.trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-            }))
+        || (url.scheme() == "http" && url.host_str().is_some_and(is_literal_loopback_host))
 }
 
 #[cfg(test)]
