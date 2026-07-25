@@ -1,9 +1,18 @@
-//! Signed OpenClaw Gateway DNS-SD records and a pure-Rust mDNS runtime.
+//! Signed OpenClaw Gateway DNS-SD records and discovery.
+//!
+//! The raw-socket mDNS runtime is available only on Windows, macOS, and Linux. Android
+//! requires an application-held `WifiManager.MulticastLock`, and iOS requires
+//! platform declarations and an Apple-granted multicast entitlement. Those mobile
+//! capabilities cannot be established by this pure-Rust crate, so mobile targets
+//! retain signed-record parsing and verification without exposing network discovery.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::net::IpAddr;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -12,9 +21,13 @@ use claw_security::authorization::{ClientClass, Role, ScopeSet};
 use claw_security::identity::{
     DeviceId, DeviceIdentity, DevicePublicKey, DeviceSignature, HandshakeSigningInput,
 };
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use flume::RecvTimeoutError;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use hickory_resolver::TokioResolver;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use hickory_resolver::proto::rr::{RData, RecordType};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use mdns_sd::{
     DaemonEvent, Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo,
     UnregisterStatus,
@@ -321,6 +334,7 @@ impl GatewayAdvertisement {
         payload
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn service_info(&self) -> Result<ServiceInfo, DnsSdError> {
         if self.service_type != GATEWAY_SERVICE_TYPE {
             return Err(DnsSdError::UnexpectedServiceType);
@@ -341,11 +355,13 @@ impl GatewayAdvertisement {
         .map_err(DnsSdError::Mdns)
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn validate_own_signature(&self) -> Result<(), DnsSdError> {
         let signed_at = parse_u64(self.txt.get(TXT_SIGNED_AT), "signedAt")?;
         self.verify(signed_at, 0).map(|_| ())
     }
 
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn fullname(&self) -> String {
         format!("{}.{}", self.instance_name, self.service_type)
     }
@@ -460,11 +476,13 @@ pub struct WideAreaDnsRecord {
 }
 
 /// Resolves wide-area DNS-SD through the operating system's configured unicast DNS.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub struct WideAreaDnsBrowser {
     resolver: TokioResolver,
     service_type: String,
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl WideAreaDnsBrowser {
     /// Creates a browser for `_openclaw-gw._tcp.<zone>`.
     pub fn new(zone: &str) -> Result<Self, DnsSdError> {
@@ -605,12 +623,14 @@ pub fn resolve_wide_area_fixture(
 }
 
 /// Active pure-Rust mDNS advertisement.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub struct MdnsAdvertiser {
     daemon: ServiceDaemon,
     advertisement: GatewayAdvertisement,
     monitor: Receiver<DaemonEvent>,
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl MdnsAdvertiser {
     /// Starts advertising the exact signed IPv4/IPv6 address set.
     pub fn start(advertisement: &GatewayAdvertisement) -> Result<Self, DnsSdError> {
@@ -706,6 +726,7 @@ impl MdnsAdvertiser {
 
 /// Observable mDNS runtime change.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub enum MdnsRuntimeEvent {
     /// A service or hostname collision was resolved.
     NameChanged {
@@ -723,11 +744,13 @@ pub enum MdnsRuntimeEvent {
 }
 
 /// Active pure-Rust mDNS browser.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub struct MdnsBrowser {
     daemon: ServiceDaemon,
     receiver: Receiver<ServiceEvent>,
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl MdnsBrowser {
     /// Starts browsing the frozen local Gateway service type.
     pub fn start() -> Result<Self, DnsSdError> {
@@ -789,6 +812,7 @@ pub enum DiscoveryEvent {
     Removed(String),
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn advertisement_from_mdns(service: &ResolvedService) -> Result<GatewayAdvertisement, DnsSdError> {
     if service.ty_domain != GATEWAY_SERVICE_TYPE {
         return Err(DnsSdError::UnexpectedServiceType);
@@ -1036,8 +1060,10 @@ pub enum DnsSdError {
         rollback: String,
     },
     /// The pure-Rust mDNS engine rejected an operation.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     Mdns(mdns_sd::Error),
     /// The unicast DNS resolver rejected a lookup.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     Resolve(hickory_resolver::net::NetError),
 }
 
@@ -1077,7 +1103,9 @@ impl Display for DnsSdError {
                 formatter,
                 "mDNS update failed ({operation}) and restoration failed ({rollback})"
             ),
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             Self::Mdns(error) => Display::fmt(error, formatter),
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             Self::Resolve(error) => Display::fmt(error, formatter),
         }
     }
@@ -1086,7 +1114,9 @@ impl Display for DnsSdError {
 impl Error for DnsSdError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             Self::Mdns(error) => Some(error),
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             Self::Resolve(error) => Some(error),
             _ => None,
         }
@@ -1153,7 +1183,14 @@ mod tests {
                 IpAddr::V6(Ipv6Addr::LOCALHOST)
             ]
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    fn mdns_service_uses_the_signed_addresses_and_port() {
+        let advertisement = signed_advertisement();
         let service = advertisement.service_info().expect("mDNS service");
+
         assert!(!service.is_addr_auto());
         assert_eq!(service.get_port(), 18_790);
     }
@@ -1186,6 +1223,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn mdns_advertise_discover_fixture_authenticates_exact_record() {
         let advertisement = signed_advertisement();
         let resolved = advertisement
@@ -1245,6 +1283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     fn rejects_a_signed_record_replayed_under_another_dns_owner() {
         let advertisement = signed_advertisement();
         let mut resolved = advertisement
