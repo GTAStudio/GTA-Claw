@@ -1,0 +1,18 @@
+[package]
+name = "claw-migrate"
+description = "Transactional migration providers for Claude, Codex, Hermes, and legacy GTA Claw state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = ["Cargo.toml", "src/**", "tests/**"]
+
+[dependencies]
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
