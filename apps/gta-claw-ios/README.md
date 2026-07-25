@@ -47,14 +47,14 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 Repository CI additionally *executes* this crate's tests — not merely compiles
 them — on macOS arm64 (`macos-latest`), Linux and Windows, because the crate is
-a root workspace member and the headless matrix runs `--workspace`. All 75 pass
+a root workspace member and the headless matrix runs `--workspace`. All 78 pass
 on all three. That is the only non-Windows evidence about this code that exists,
 and it says nothing about an Apple *target* build: those runners build for the
 host, not for `aarch64-apple-ios`.
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 75 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 78 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
@@ -225,13 +225,25 @@ to notice; a type parameter makes it unsayable. The permit's field is private
 and it has no public constructor, so the gate is its only source.
 
 `LocalDiscoveryBackend` mirrors the backend contract agreed with the `claw-nodes`
-owner and is documented as a mirror: as of PR #57 head `237b386e` that crate
-exports `GATEWAY_SERVICE_TYPE` and `MdnsBrowser` but no descriptor trait, so a
-re-export would be a cross-PR dependency. `GatewayMdnsBackend` carries
+owner and is documented as a mirror: that crate exports `GATEWAY_SERVICE_TYPE`
+and a `MdnsBrowser` but no descriptor trait, so a re-export would be a cross-PR
+dependency. `GatewayMdnsBackend` carries
 `"_openclaw-gw._tcp.local."` and `InProcessMulticast`, and the `NSBonjourServices`
 form is **derived** from the browsed form rather than written down a second time
 — with a test asserting the derivation round-trips, because two hand-written
 copies of one name can disagree silently.
+
+**`GatewayMdnsBackend` is a descriptor, not a shipped capability.** In
+`claw-nodes`, `mdns-sd`, the Hickory system resolver and `MdnsBrowser` itself sit
+behind a `cfg` limited to Windows, macOS and Linux, so the raw-multicast browser
+is *compiled out* on iOS rather than merely unentitled. Satisfying this gate
+therefore authorises nothing that exists in an iOS build today; it records what a
+future audited adapter would have to hold. `ClientTransport::BonjourDiscovery`
+remains `NeedsHostAppFacilities`, is not `usable_today()`, and is not
+`confirmed_on_ios()` — and a test asserts that a fully satisfied permit does not
+change any of those. Note that `GATEWAY_SERVICE_TYPE` is *not* `cfg`-gated, so
+when that PR merges the constant can be imported on iOS even though the backend
+cannot.
 
 Entitlement state is tracked by its own `EntitlementStatus` (`Granted` /
 `NotGranted` / `Unknown`, fail-closed on `Unknown`) rather than by
