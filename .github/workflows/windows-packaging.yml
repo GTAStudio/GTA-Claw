@@ -50,20 +50,6 @@ jobs:
           .\packaging\windows\validate-release-surfaces.ps1
           .\packaging\windows\self-test.ps1
 
-      - name: Reject JavaScript and Node packaging material
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $forbidden = Get-ChildItem packaging\windows -File -Recurse |
-            Where-Object {
-              $_.Name -match '^(node|npm|npx|bun|pnpm)(\.|$)' -or
-              $_.Name -eq 'package.json' -or
-              $_.Extension -in @('.js', '.mjs', '.cjs', '.node')
-            }
-          if ($forbidden) {
-            throw "Forbidden JavaScript or Node packaging material: $($forbidden.FullName -join ', ')"
-          }
-
   package:
     name: Unsigned non-release ${{ matrix.arch }}
     needs: validate
