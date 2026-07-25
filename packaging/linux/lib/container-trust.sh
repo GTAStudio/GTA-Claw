@@ -2,6 +2,7 @@
 # shellcheck disable=SC2034
 
 SOURCE_SNAPSHOT_ROOT=""
+SOURCE_SNAPSHOT_ROOT_ID=""
 SOURCE_SNAPSHOT_ARCHIVE=""
 SOURCE_SNAPSHOT_DIRECTORY=""
 SOURCE_COMMIT=""
@@ -106,6 +107,20 @@ identity_is_ancestor() {
   done
 }
 
+assert_no_nested_mounts() {
+  local path="$1"
+  local label="$2"
+  local physical
+  local target
+  physical="$(physical_directory "$path" "$label")"
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || die "$label mount inventory contains an empty target"
+    if [[ "$target" != "$physical" && "$target" == "$physical/"* ]]; then
+      die "$label contains a nested mount: $target"
+    fi
+  done < <(findmnt -rn -o TARGET)
+}
+
 assert_no_path_overlap() {
   local left="$1"
   local left_label="$2"
@@ -123,6 +138,8 @@ assert_no_path_overlap() {
   local right_underlying
   left_physical="$(physical_directory "$left" "$left_label")"
   right_physical="$(physical_directory "$right" "$right_label")"
+  assert_no_nested_mounts "$left_physical" "$left_label"
+  assert_no_nested_mounts "$right_physical" "$right_label"
   left_id="$(path_identity "$left_physical")"
   right_id="$(path_identity "$right_physical")"
   if identity_is_ancestor "$left_id" "$right_physical" ||
@@ -168,10 +185,16 @@ create_verified_source_snapshot() {
   local commit
   local tree
   local archived_commit
+  local verifier
+  local verifier_mode
+  local verifier_type
+  local verifier_oid
+  local verifier_path
   local verification
   : "${TMPDIR:?TMPDIR is required for immutable source snapshots}"
   SOURCE_SNAPSHOT_ROOT="$(mktemp -d "$TMPDIR/gta-claw-source.XXXXXXXX")"
   chmod 0700 "$SOURCE_SNAPSHOT_ROOT"
+  SOURCE_SNAPSHOT_ROOT_ID="$(path_identity "$SOURCE_SNAPSHOT_ROOT")"
   SOURCE_SNAPSHOT_ARCHIVE="$SOURCE_SNAPSHOT_ROOT/source.tar"
   SOURCE_SNAPSHOT_DIRECTORY="$SOURCE_SNAPSHOT_ROOT/source"
   mkdir -m 0700 "$SOURCE_SNAPSHOT_DIRECTORY"
@@ -183,8 +206,27 @@ create_verified_source_snapshot() {
   [[ "$archived_commit" == "$commit" ]] || die "Git archive commit identity mismatch"
   tar -xf "$SOURCE_SNAPSHOT_ARCHIVE" -C "$SOURCE_SNAPSHOT_DIRECTORY" \
     --no-same-owner --no-same-permissions
+  verifier="$SOURCE_SNAPSHOT_ROOT/verify-git-snapshot.py"
+  IFS=$' \t' read -r verifier_mode verifier_type verifier_oid verifier_path < <(
+    git -C "$repository" ls-tree \
+      "$commit" \
+      -- \
+      packaging/linux/tests/verify-git-snapshot.py
+  )
+  [[ "$verifier_mode" == "100755" && "$verifier_type" == "blob" &&
+    "$verifier_oid" =~ ^[0-9a-f]{40}$ &&
+    "$verifier_path" == "packaging/linux/tests/verify-git-snapshot.py" ]] ||
+    die "trusted snapshot verifier Git object is invalid"
+  git -C "$repository" cat-file blob "$verifier_oid" >"$verifier"
+  [[ "$(git -C "$repository" hash-object "$verifier")" == "$verifier_oid" ]] ||
+    die "trusted snapshot verifier extraction changed"
+  sudo chown -hR 0:0 "$SOURCE_SNAPSHOT_ROOT"
+  sudo find "$SOURCE_SNAPSHOT_ROOT" -type d -exec chmod 0555 {} +
+  sudo find "$SOURCE_SNAPSHOT_ROOT" -type f -perm /111 -exec chmod 0555 {} +
+  sudo find "$SOURCE_SNAPSHOT_ROOT" -type f ! -perm /111 -exec chmod 0444 {} +
+  sudo chmod 0555 "$verifier"
   verification="$(
-    python3 "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/tests/verify-git-snapshot.py" \
+    python3 "$verifier" \
       "$repository" \
       "$commit" \
       "$tree" \
@@ -263,14 +305,25 @@ verify_container_transaction_receipts() {
 }
 
 cleanup_container_trust() {
+  local failed=0
   if [[ -n "$OUTPUT_COMPONENT_LOCK" && -d "$OUTPUT_COMPONENT_LOCK" &&
     ! -L "$OUTPUT_COMPONENT_LOCK" ]]; then
-    rmdir "$OUTPUT_COMPONENT_LOCK" >/dev/null 2>&1 || true
+    if rmdir "$OUTPUT_COMPONENT_LOCK" >/dev/null 2>&1; then
+      OUTPUT_COMPONENT_LOCK=""
+    else
+      failed=1
+    fi
   fi
-  if [[ -n "$SOURCE_SNAPSHOT_ROOT" && -d "$SOURCE_SNAPSHOT_ROOT" &&
-    ! -L "$SOURCE_SNAPSHOT_ROOT" ]]; then
-    rm -rf -- "$SOURCE_SNAPSHOT_ROOT"
+  if [[ -n "$SOURCE_SNAPSHOT_ROOT" ]]; then
+    if [[ ! -d "$SOURCE_SNAPSHOT_ROOT" || -L "$SOURCE_SNAPSHOT_ROOT" ||
+      "$(path_identity "$SOURCE_SNAPSHOT_ROOT")" != "$SOURCE_SNAPSHOT_ROOT_ID" ]]; then
+      failed=1
+    elif sudo rm -rf -- "$SOURCE_SNAPSHOT_ROOT"; then
+      SOURCE_SNAPSHOT_ROOT=""
+      SOURCE_SNAPSHOT_ROOT_ID=""
+    else
+      failed=1
+    fi
   fi
-  SOURCE_SNAPSHOT_ROOT=""
-  OUTPUT_COMPONENT_LOCK=""
+  return "$failed"
 }

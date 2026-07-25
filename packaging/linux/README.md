@@ -196,11 +196,14 @@ prototype artifacts.
 On Ubuntu with Docker plus the declared native package tools, run:
 
 ```sh
-export CARGO_TARGET_DIR="$PWD/target/linux-x86-build"
+export GTA_CLAW_TARGET_ROOT="${RUNNER_TEMP:-/tmp}/gta-claw-target"
+export TMPDIR="${RUNNER_TEMP:-/tmp}/gta-claw-tmp"
+install -d -m 0700 "$GTA_CLAW_TARGET_ROOT" "$TMPDIR"
+export CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-x86-build"
 build_result="$(./packaging/linux/build-container.sh x86_64)"
 build_manifest="${build_result%%|*}"
 build_key_sha="${build_result##*|}"
-OUTPUT_ROOT="$PWD/target/linux-x86-run1" \
+OUTPUT_ROOT="$GTA_CLAW_TARGET_ROOT/linux-x86-run1" \
   ./packaging/linux/package-container.sh \
     x86_64 "$build_manifest" "$build_key_sha"
 ./packaging/linux/self-test.sh

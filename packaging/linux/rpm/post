@@ -149,11 +149,13 @@ stop_for_idempotent_configure() {
       return 1
     } ;;
   esac
+  verify_writer_lock_released
   stop_initializer_for_replacement
   verify_writer_lock_released
 }
 
 fence_failed_runtime() {
+  requested_status="${1:-1}"
   trap - 0 HUP INT TERM
   failure=0
   if ! rm -f "$authorization_marker"; then
@@ -201,15 +203,18 @@ fence_failed_runtime() {
     failure=1
   fi
   [ "$failure" -eq 0 ] ||
-    echo "gta-claw RPM configure cancellation completed with errors" >&2
-  exit 1
+    {
+      echo "gta-claw RPM configure cancellation completed with errors" >&2
+      exit 1
+    }
+  exit "$requested_status"
 }
 
 cancel_incomplete_configure() {
-  status=$?
+  status="${1:-$?}"
   trap - 0 HUP INT TERM
   if [ "$configure_complete" -eq 0 ]; then
-    fence_failed_runtime
+    fence_failed_runtime "$status"
   fi
   exit "$status"
 }
@@ -225,7 +230,10 @@ fail_configure_after() {
   fi
 }
 
-trap cancel_incomplete_configure 0 HUP INT TERM
+trap 'cancel_incomplete_configure "$?"' 0
+trap 'cancel_incomplete_configure 129' HUP
+trap 'cancel_incomplete_configure 130' INT
+trap 'cancel_incomplete_configure 143' TERM
 ensure_failure_fence
 rm -f "$authorization_marker"
 if [ -d /run/systemd/system ]; then

@@ -16,6 +16,14 @@ CASES = {
     "timeout.sh": "#!/bin/sh\ntimeout 5 node daemon.js\n",
     "setpriv.sh": "#!/bin/sh\nsetpriv --clear-groups -- node daemon.js\n",
     "xargs-options.sh": "#!/bin/sh\nprintf '%s\\n' daemon.js | xargs -n 1 node\n",
+    "xargs-arg-file.sh": "#!/bin/sh\nxargs -a args.txt node daemon.js\n",
+    "xargs-long-arg-file.sh": (
+        "#!/bin/sh\nxargs --arg-file=args.txt node daemon.js\n"
+    ),
+    "while-command.sh": "#!/bin/sh\nwhile node daemon.js; do :; done\n",
+    "while-comparison-argument.sh": (
+        "#!/bin/sh\nwhile node -e daemon.js != expected; do :; done\n"
+    ),
     "python-command.sh": (
         "#!/bin/sh\n"
         "python3 -c 'import subprocess; subprocess.run([\"node\", \"daemon.js\"])'\n"
@@ -28,7 +36,19 @@ CASES = {
     "escaped-daemon.service": (
         "[Service]\nExecStart=/usr/bin/\\x6eode daemon.js\n"
     ),
+    "indented-daemon.service": (
+        "[Service]\n  ExecStart=/usr/bin/node daemon.js\n"
+    ),
+    "spaced-daemon.service": (
+        "[Service]\nExecStartPost = /usr/bin/node daemon.js\n"
+    ),
+    "octal-daemon.service": (
+        "[Service]\nExecStart=/usr/bin/\\156ode daemon.js\n"
+    ),
     "escaped-command.yaml": 'command: ["\\u006eode", "daemon.js"]\n',
+    "escaped-command.yaml.in": 'command: ["\\u006eode", "daemon.js"]\n',
+    "entrypoint-list.yaml": "entrypoint: [node, daemon.js]\n",
+    "registry-image.yaml": "image: registry.example:5000/node:20\n",
     "command.py": (
         "import os, subprocess\n"
         "subprocess.run(args=['node', 'daemon.js'], check=True)\n"
@@ -42,6 +62,19 @@ CASES = {
         "def launch():\n"
         "    from subprocess import run\n"
         "    run(['node', 'daemon.js'], check=True)\n"
+    ),
+    "variable-command.py": (
+        "import subprocess\n"
+        "command = ['node', 'daemon.js']\n"
+        "subprocess.run(command, check=True)\n"
+    ),
+    "executable-command.py": (
+        "import subprocess\n"
+        "subprocess.run(['harmless', 'daemon.js'], executable='/usr/bin/node')\n"
+    ),
+    "exec-env-command.py": (
+        "import os\n"
+        "os.execl('/usr/bin/env', 'env', 'node', 'daemon.js')\n"
     ),
 }
 
@@ -114,6 +147,29 @@ def main():
             ),
             "dynamic-continuation.sh": (
                 "#!/bin/sh\n\\\n\"$unresolved_command\"\n"
+            ),
+            "dynamic-python.py": (
+                "import subprocess\n"
+                "def choose():\n"
+                "    return input()\n"
+                "command = choose()\n"
+                "subprocess.run(command)\n"
+            ),
+            "dynamic-python-parameter.py": (
+                "import subprocess\n"
+                "command = ['true']\n"
+                "def launch(command):\n"
+                "    subprocess.run(command)\n"
+                "launch(['node'])\n"
+            ),
+            "dynamic-python-env.py": (
+                "import subprocess\n"
+                "def launch(command):\n"
+                "    subprocess.run(['env', command])\n"
+                "launch('node')\n"
+            ),
+            "dynamic-shell-reassignment.sh": (
+                "#!/bin/sh\ncmd=true\ncmd=$unresolved\n\"$cmd\"\n"
             ),
         }.items():
             dynamic = root / name

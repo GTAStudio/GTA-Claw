@@ -17,6 +17,7 @@ done
 : "${TMPDIR:?TMPDIR is required}"
 work="$(mktemp -d "$TMPDIR/gta-claw-container-trust.XXXXXXXX")"
 cleanup() {
+  sudo umount "$work/source/descendant" >/dev/null 2>&1 || true
   sudo umount "$work/bind-alias" >/dev/null 2>&1 || true
   sudo umount "$work/bind-descendant" >/dev/null 2>&1 || true
   cleanup_anchored_mounts || true
@@ -54,6 +55,10 @@ expect_overlap_failure bind-descendant \
   assert_no_path_overlap "$work/source" source "$work/bind-descendant" target
 sudo umount "$work/bind-descendant"
 assert_no_path_overlap "$work/source" source "$work/target" target
+sudo mount --bind "$work/target" "$work/source/descendant"
+expect_overlap_failure nested-source-mount \
+  assert_no_path_overlap "$work/source" source "$work/target" target
+sudo umount "$work/source/descendant"
 
 fixture="$work/crlf-repository"
 mkdir -m 0700 "$fixture"
@@ -64,11 +69,21 @@ git -C "$fixture" config user.email "lp4@example.invalid"
 mkdir -p "$fixture/packaging/linux/tests"
 cp "$SCRIPT_DIR/tests/verify-git-snapshot.py" \
   "$fixture/packaging/linux/tests/verify-git-snapshot.py"
+chmod 0755 "$fixture/packaging/linux/tests/verify-git-snapshot.py"
 printf 'embedded-line\n' >"$fixture/embedded.sql"
 git -C "$fixture" add embedded.sql packaging/linux/tests/verify-git-snapshot.py
+git -C "$fixture" update-index \
+  --chmod=+x \
+  packaging/linux/tests/verify-git-snapshot.py
 GIT_AUTHOR_DATE=1700000000 GIT_COMMITTER_DATE=1700000000 \
   git -C "$fixture" commit -q -m fixture
+original_umask="$(umask)"
+umask 077
 create_verified_source_snapshot "$fixture"
+umask "$original_umask"
+[[ -z "$(find "$SOURCE_SNAPSHOT_ROOT" -type d ! -perm 0555 -print -quit)" &&
+  -z "$(find "$SOURCE_SNAPSHOT_ROOT" -type f ! -perm 0444 ! -perm 0555 -print -quit)" ]] ||
+  die "immutable snapshot permissions depend on the caller umask"
 lf_tree_receipt="$SOURCE_TREE_RECEIPT"
 lf_archive_sha="$(sha256sum "$SOURCE_SNAPSHOT_ARCHIVE" | awk '{ print $1 }')"
 cleanup_container_trust
@@ -112,6 +127,7 @@ for fault in \
   after-output-identity; do
   if (
     export GTA_CLAW_MOUNT_FAULT="$fault"
+    trap 'cleanup_anchored_mounts' EXIT
     create_anchored_mounts \
       "/proc/$BASHPID/fd/$mount_source_fd" \
       "/proc/$BASHPID/fd/$mount_output_fd" \

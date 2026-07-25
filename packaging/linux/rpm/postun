@@ -1,25 +1,29 @@
 # shellcheck shell=sh
 set -eu
 
+status=0
 if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null
+  systemctl daemon-reload >/dev/null || status=1
   if [ "$1" -eq 0 ]; then
-    systemctl unmask --runtime gta-claw-daemon.service >/dev/null
-    rm -f \
-      /run/gta-claw-daemon.fresh-install \
-      /run/gta-claw-daemon.ready-for-replacement \
-      /run/gta-claw-daemon.remove-was-active \
-      /run/gta-claw-daemon.remove-was-enabled \
-      /run/gta-claw-daemon.remove-was-enabled-runtime \
-      /run/gta-claw-daemon.replacement \
-      /run/gta-claw-daemon.was-active \
-      /run/gta-claw-state-init/remove-was-active \
-      /run/gta-claw-state-init/remove-prepared \
-      /run/gta-claw-state-init/remove-was-package-fenced \
-      /run/gta-claw-state-init/start-authorized \
-      /run/gta-claw-state-init/initialization-failed \
-      /run/gta-claw-state-init/replacement-fenced
+    systemctl unmask --runtime gta-claw-daemon.service >/dev/null || status=1
   fi
 fi
 
-exit 0
+if [ "$1" -eq 0 ]; then
+  rm -f \
+    /run/gta-claw-daemon.fresh-install \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.remove-was-active \
+    /run/gta-claw-daemon.remove-was-enabled \
+    /run/gta-claw-daemon.remove-was-enabled-runtime \
+    /run/gta-claw-daemon.replacement \
+    /run/gta-claw-daemon.was-active \
+    /run/gta-claw-state-init/remove-was-active \
+    /run/gta-claw-state-init/remove-prepared \
+    /run/gta-claw-state-init/remove-was-package-fenced \
+    /run/gta-claw-state-init/start-authorized \
+    /run/gta-claw-state-init/initialization-failed \
+    /run/gta-claw-state-init/replacement-fenced || status=1
+fi
+
+exit "$status"

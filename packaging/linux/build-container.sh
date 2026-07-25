@@ -19,6 +19,8 @@ arch="$1"
 arch_target "$arch" >/dev/null
 
 : "${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must select a new private build root}"
+: "${GTA_CLAW_TARGET_ROOT:?GTA_CLAW_TARGET_ROOT must select a dedicated external target root}"
+: "${TMPDIR:?TMPDIR must select a dedicated external temporary root}"
 : "${CARGO_BUILD_JOBS:=4}"
 [[ "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]?$ && "$CARGO_BUILD_JOBS" -le 64 ]] ||
   die "CARGO_BUILD_JOBS must be an integer from 1 to 64"
@@ -38,8 +40,11 @@ case "$build_input_umask" in
   *) die "BUILD_INPUT_UMASK must be 000 or 002" ;;
 esac
 
+trap 'cleanup_container_resources "$?"' EXIT
+trap 'cleanup_container_resources 129' HUP
+trap 'cleanup_container_resources 130' INT
+trap 'cleanup_container_resources 143' TERM
 create_verified_source_snapshot "$REPO_ROOT"
-trap cleanup_container_trust EXIT INT TERM
 assert_no_path_overlap \
   "$SOURCE_SNAPSHOT_DIRECTORY" \
   "immutable source snapshot" \
@@ -73,7 +78,6 @@ exec {source_fd}<"$SOURCE_SNAPSHOT_DIRECTORY"
 create_anchored_mounts \
   "/proc/$BASHPID/fd/$source_fd" \
   "/proc/$BASHPID/fd/$OUTPUT_COMPONENT_FD"
-trap 'cleanup_anchored_mounts; cleanup_container_trust' EXIT INT TERM
 container_manifest="$(
   docker run --rm \
     --cap-drop ALL \
@@ -98,7 +102,7 @@ container_manifest="$(
     --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/source,target=/workspace,readonly" \
     --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/output,target=/gta-claw-output" \
     --workdir /workspace \
-    "$image_tag" \
+    "$environment_image_id" \
     /usr/local/bin/gta-claw-safeio \
     run-mounted \
     /gta-claw-output \
@@ -124,7 +128,7 @@ verify_container_transaction_receipts
 [[ "$(trust_receipt "$OUTPUT_COMPONENT_PATH" "build output")" == "$output_receipt" ]] ||
   die "build output receipt changed"
 cleanup_container_trust
-trap - EXIT INT TERM
+trap - EXIT HUP INT TERM
 
 [[ "$container_manifest" == "/proc/self/fd/"*"/build-manifest.json|"* ]] ||
   die "build container returned an unexpected manifest path: $container_manifest"

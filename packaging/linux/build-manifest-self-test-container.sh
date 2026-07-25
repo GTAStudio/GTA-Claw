@@ -20,6 +20,8 @@ arch="$1"
 manifest="$2"
 expected_key_sha="$3"
 : "${OUTPUT_ROOT:?OUTPUT_ROOT must select a new manifest test root}"
+: "${GTA_CLAW_TARGET_ROOT:?GTA_CLAW_TARGET_ROOT must select a dedicated external target root}"
+: "${TMPDIR:?TMPDIR must select a dedicated external temporary root}"
 
 target_root="$(canonical_target_root)"
 git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
@@ -37,8 +39,11 @@ validate_safe_component "$build_component" "build component"
 validate_safe_component "$output_component" "output component"
 validate_new_private_root_path "$OUTPUT_ROOT" "OUTPUT_ROOT"
 
+trap 'cleanup_container_resources "$?"' EXIT
+trap 'cleanup_container_resources 129' HUP
+trap 'cleanup_container_resources 130' INT
+trap 'cleanup_container_resources 143' TERM
 create_verified_source_snapshot "$REPO_ROOT"
-trap cleanup_container_trust EXIT INT TERM
 open_build_component "$target_root" "$build_component"
 prepare_output_component "$target_root" "$output_component"
 assert_no_path_overlap "$SOURCE_SNAPSHOT_DIRECTORY" "source snapshot" "$target_root" "target root"
@@ -50,7 +55,6 @@ create_anchored_mounts \
   "/proc/$BASHPID/fd/$source_fd" \
   "/proc/$BASHPID/fd/$OUTPUT_COMPONENT_FD" \
   "/proc/$BASHPID/fd/$BUILD_COMPONENT_FD"
-trap 'cleanup_anchored_mounts; cleanup_container_trust' EXIT INT TERM
 docker run --rm \
   --cap-drop ALL \
   --cap-add CHOWN \
@@ -69,7 +73,7 @@ docker run --rm \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/build,target=/gta-claw-build,readonly" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/output,target=/gta-claw-output" \
   --workdir /workspace \
-  "$image" \
+  "$packaging_image_id" \
   /usr/local/bin/gta-claw-safeio \
   run-mounted-package \
   /gta-claw-build \
@@ -87,4 +91,4 @@ docker run --rm \
 cleanup_anchored_mounts
 verify_container_transaction_receipts
 cleanup_container_trust
-trap - EXIT INT TERM
+trap - EXIT HUP INT TERM

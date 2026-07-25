@@ -31,6 +31,12 @@ process_start_time() {
   # shellcheck disable=SC2086
   set -- $process_fields
   [ "$#" -ge 20 ] || return 1
+  process_state="$1"
+  case "$process_state" in
+    Z | X | x) return 1 ;;
+    ?) ;;
+    *) return 1 ;;
+  esac
   start_time="${20}"
   case "$start_time" in
     '' | *[!0-9]*) return 1 ;;

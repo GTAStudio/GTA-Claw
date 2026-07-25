@@ -60,6 +60,8 @@ PREFIX_OPTIONS_WITH_VALUES = {
     "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
     "xargs": frozenset(
         {
+            "-a",
+            "--arg-file",
             "-d",
             "--delimiter",
             "-E",
@@ -95,6 +97,10 @@ PYTHON_COMMAND_CALLS = frozenset(
         "os.spawnle",
         "os.spawnlp",
         "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
         "os.system",
         "subprocess.call",
         "subprocess.check_call",
@@ -286,8 +292,20 @@ def shell_tokens(text):
 
 def command_segments(text):
     segment = []
+    test_terminator = None
     for token in shell_tokens(text):
-        if token[0] in SEPARATORS:
+        value = token[0]
+        if (
+            test_terminator is None
+            and value in {"[", "[["}
+            and all(existing[0] in RESERVED for existing in segment)
+        ):
+            test_terminator = "]" if value == "[" else "]]"
+        if test_terminator is not None:
+            segment.append(token)
+            if value == test_terminator:
+                test_terminator = None
+        elif value in SEPARATORS:
             if segment:
                 yield segment
                 segment = []
@@ -424,7 +442,7 @@ def inspect_command(
         raise ValueError("shell command recursion exceeds policy bound")
     variables = dict(STATIC_VARIABLES if variables is None else variables)
     tokens = remove_redirections(segment)
-    if tokens and tokens[0][0] in {"case", "for", "select", "until", "while"}:
+    if tokens and tokens[0][0] in {"case", "for", "select"}:
         return []
     index = 0
     while index < len(tokens) and ASSIGNMENT.match(tokens[index][0]):
@@ -432,18 +450,15 @@ def inspect_command(
         expanded = expand_static(value, variables)
         if expanded is not None:
             variables[name] = expanded
+        else:
+            variables.pop(name, None)
         index += 1
     while index < len(tokens) and tokens[index][0] in RESERVED:
         index += 1
     if index >= len(tokens):
         return []
     command_token, line = tokens[index]
-    if tokens[-1][0] in {"]", "]]"}:
-        return []
-    if any(
-        token in {"==", "!=", "=~", "-eq", "-ne", "-lt", "-le", "-gt", "-ge"}
-        for token, _ in tokens
-    ):
+    if command_name(command_token) in {"[", "[[", "test"}:
         return []
     if command_token.endswith("}") and command_token.startswith("/"):
         return []
@@ -496,6 +511,24 @@ def inspect_command(
             if option.startswith("-"):
                 option_index += 1
                 continue
+            if command_name(option) == "safeio.py":
+                try:
+                    command_index = next(
+                        candidate + 1
+                        for candidate in range(option_index + 1, len(tokens))
+                        if tokens[candidate][0] == "--"
+                    )
+                except StopIteration:
+                    return findings
+                if command_index < len(tokens):
+                    findings.extend(
+                        inspect_command(
+                            tokens[command_index:],
+                            depth + 1,
+                            variables,
+                            allow_positional,
+                        )
+                    )
             return findings
         return findings
     if command == "eval":
@@ -508,6 +541,25 @@ def inspect_command(
         findings.extend(
             inspect_env(tokens, index + 1, depth, variables, allow_positional)
         )
+        return findings
+    if command == "gta-claw-safeio":
+        try:
+            command_index = next(
+                candidate + 1
+                for candidate in range(index + 1, len(tokens))
+                if tokens[candidate][0] == "--"
+            )
+        except StopIteration:
+            return findings
+        if command_index < len(tokens):
+            findings.extend(
+                inspect_command(
+                    tokens[command_index:],
+                    depth + 1,
+                    variables,
+                    allow_positional,
+                )
+            )
         return findings
     if command == "timeout":
         index = skip_options(tokens, index + 1, command)
@@ -676,6 +728,8 @@ def inspect_shell(text, base_line=1, depth=0, variables=None, allow_positional=F
                 expanded = expand_static(value, variables)
                 if expanded is not None:
                     variables[name] = expanded
+                else:
+                    variables.pop(name, None)
         for line, command in inspect_command(
             segment,
             depth,
@@ -704,9 +758,228 @@ def literal_strings(node):
             yield from literal_strings(element)
 
 
-def inspect_python_text(text, base_line=1):
+def python_static_assignments(tree):
+    assignments = {}
+    for node in ast.walk(tree):
+        values = []
+        if isinstance(node, ast.Assign):
+            values = [
+                (target.id, node.value)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            ]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            values = [(node.target.id, node.value)]
+        for name, value in values:
+            assignments.setdefault(name, []).append(value)
+    return assignments
+
+
+class StaticCommand(list):
+    def __init__(self, values, complete=True):
+        super().__init__(values)
+        self.complete = complete
+
+
+def python_static_command(
+    node,
+    assignments,
+    resolving=frozenset(),
+    shadowed=frozenset(),
+):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "sys"
+        and node.attr == "executable"
+    ):
+        return "/usr/bin/python3"
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = []
+        complete = True
+        for element in node.elts:
+            if isinstance(element, ast.Starred):
+                complete = False
+                break
+            try:
+                value = python_static_command(
+                    element,
+                    assignments,
+                    resolving,
+                    shadowed,
+                )
+            except ValueError:
+                if not values:
+                    raise
+                complete = False
+                break
+            if not isinstance(value, str):
+                complete = False
+                break
+            values.append(value)
+        if values:
+            return StaticCommand(values, complete)
+    if isinstance(node, ast.Name):
+        if node.id in shadowed:
+            raise ValueError(
+                f"unresolved dynamic command position in Python at line {node.lineno}"
+            )
+        candidates = assignments.get(node.id, ())
+        if len(candidates) == 1 and node.id not in resolving:
+            return python_static_command(
+                candidates[0],
+                assignments,
+                resolving | {node.id},
+                shadowed,
+            )
+    raise ValueError(
+        f"unresolved dynamic command position in Python at line {node.lineno}"
+    )
+
+
+def python_command_argument(name, node):
+    if name.startswith("os.spawn"):
+        return node.args[1] if len(node.args) > 1 else None
+    if node.args:
+        return node.args[0]
+    for keyword in node.keywords:
+        if keyword.arg in {"args", "cmd", "command"}:
+            return keyword.value
+    return None
+
+
+def python_function_parameters(function):
+    if function is None:
+        return frozenset()
+    arguments = function.args
+    names = {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        )
+    }
+    if arguments.vararg is not None:
+        names.add(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.add(arguments.kwarg.arg)
+    return frozenset(names)
+
+
+def python_forwarded_command(program, arguments, skip, complete=True):
+    if not isinstance(program, str):
+        raise ValueError("Python executable path is not a static string")
+    if not isinstance(arguments, StaticCommand):
+        raise ValueError("Python command argv is not a static sequence")
+    return StaticCommand(
+        [program, *arguments[skip:]],
+        complete and arguments.complete,
+    )
+
+
+def python_nodes_command(program, nodes, resolve):
+    if not isinstance(program, str):
+        raise ValueError("Python executable path is not a static string")
+    values = [program]
+    complete = True
+    for node in nodes:
+        try:
+            value = resolve(node)
+        except ValueError:
+            complete = False
+            break
+        if not isinstance(value, str):
+            complete = False
+            break
+        values.append(value)
+    return StaticCommand(values, complete)
+
+
+def python_effective_command(name, node, resolve):
+    argument = python_command_argument(name, node)
+    if argument is None:
+        raise ValueError(
+            f"unresolved dynamic command position in Python at line {node.lineno}"
+        )
+    if name in {
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+    }:
+        program = resolve(node.args[0])
+        return python_nodes_command(program, node.args[2:], resolve)
+    if name in {"os.execv", "os.execve", "os.execvp", "os.execvpe"}:
+        program = resolve(node.args[0])
+        arguments = resolve(node.args[1])
+        return python_forwarded_command(program, arguments, 1)
+    if name in {"os.spawnl", "os.spawnle", "os.spawnlp", "os.spawnlpe"}:
+        program = resolve(node.args[1])
+        return python_nodes_command(program, node.args[3:], resolve)
+    if name in {"os.spawnv", "os.spawnve", "os.spawnvp", "os.spawnvpe"}:
+        program = resolve(node.args[1])
+        arguments = resolve(node.args[2])
+        return python_forwarded_command(program, arguments, 1)
+    command = resolve(argument)
+    if name.startswith("subprocess."):
+        executable = next(
+            (
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == "executable"
+            ),
+            None,
+        )
+        if executable is not None:
+            program = resolve(executable)
+            if isinstance(command, str):
+                return StaticCommand([program], True)
+            return python_forwarded_command(program, command, 1)
+    if name == "asyncio.create_subprocess_exec":
+        program = command
+        return python_nodes_command(program, node.args[1:], resolve)
+    return command
+
+
+def inspect_python_command(command, line):
+    if isinstance(command, str):
+        return inspect_shell(command, line)
+    findings = inspect_command([(value, line) for value in command])
+    if findings:
+        return findings
+    if not command.complete:
+        forwarded = command_name(command[0])
+        if (
+            forwarded in PREFIX_OPTIONS_WITH_VALUES
+            or forwarded
+            in {
+                "chroot",
+                "command",
+                "eval",
+                "gta-claw-safeio",
+                "nohup",
+                "setsid",
+                "time",
+            }
+        ):
+            raise ValueError(
+                f"unresolved dynamic command position in Python at line {line}"
+            )
+    return findings
+
+
+def inspect_python_text(text, base_line=1, path=None):
     findings = []
     tree = ast.parse(text)
+    assignments = python_static_assignments(tree)
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
     aliases = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -729,18 +1002,39 @@ def inspect_python_text(text, base_line=1):
             name = aliases[first] + (separator + remainder if separator else "")
         if name not in PYTHON_COMMAND_CALLS:
             continue
-        for argument in node.args:
-            for value in literal_strings(argument):
-                findings.extend(inspect_shell(value, base_line + node.lineno - 1))
-        for keyword in node.keywords:
-            for value in literal_strings(keyword.value):
-                findings.extend(inspect_shell(value, base_line + node.lineno - 1))
+        parent = parents.get(node)
+        while parent is not None and not isinstance(
+            parent, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            parent = parents.get(parent)
+        shadowed = python_function_parameters(parent)
+        resolve = lambda value: python_static_command(
+            value,
+            assignments,
+            shadowed=shadowed,
+        )
+        try:
+            command = python_effective_command(name, node, resolve)
+        except ValueError:
+            argument = python_command_argument(name, node)
+            if (
+                path is not None
+                and path.name == "safeio.py"
+                and parent is not None
+                and parent.name == "run_child"
+                and isinstance(argument, ast.Name)
+                and argument.id == "command"
+            ):
+                continue
+            raise
+        command_line = base_line + node.lineno - 1
+        findings.extend(inspect_python_command(command, command_line))
     return findings
 
 
 def inspect_python(path, text):
     try:
-        return inspect_python_text(text)
+        return inspect_python_text(text, path=path)
     except SyntaxError as error:
         error.filename = str(path)
         raise
@@ -750,25 +1044,44 @@ def inspect_systemd(text):
     findings = []
     logical = text.replace("\\\n", "")
     for number, line in enumerate(logical.splitlines(), start=1):
-        if not re.match(
-            r"^Exec(?:Condition|Reload|Start|StartPre|StartPost|Stop|StopPost)=",
+        match = re.match(
+            r"^\s*Exec(?:Condition|Reload|Start|StartPre|StartPost|Stop|StopPost)"
+            r"\s*=\s*(.*)$",
             line,
-        ):
+        )
+        if not match:
             continue
-        command = line.split("=", 1)[1]
+        command = match.group(1)
+
+        def decode_escape(escape):
+            value = escape.group(1)
+            if value.startswith("x"):
+                return chr(int(value[1:], 16))
+            if value.startswith("u") or value.startswith("U"):
+                return chr(int(value[1:], 16))
+            if value[0] in "01234567":
+                return chr(int(value, 8))
+            simple = {
+                "a": "\a",
+                "b": "\b",
+                "f": "\f",
+                "n": "\n",
+                "r": "\r",
+                "s": " ",
+                "t": "\t",
+                "v": "\v",
+                "\\": "\\",
+                '"': '"',
+                "'": "'",
+            }
+            if value not in simple:
+                raise ValueError(f"unsupported systemd escape: \\{value}")
+            return simple[value]
+
         command = re.sub(
-            r"\\x([0-9A-Fa-f]{2})",
-            lambda match: chr(int(match.group(1), 16)),
-            command,
-        )
-        command = re.sub(
-            r"\\u([0-9A-Fa-f]{4})",
-            lambda match: chr(int(match.group(1), 16)),
-            command,
-        )
-        command = re.sub(
-            r"\\U([0-9A-Fa-f]{8})",
-            lambda match: chr(int(match.group(1), 16)),
+            r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|"
+            r"[0-7]{1,3}|.)",
+            decode_escape,
             command,
         )
         findings.extend(inspect_shell(command, number))
@@ -837,8 +1150,13 @@ def inspect_yaml_value(value, line=1):
                 findings.extend(inspect_shell(child, line))
             elif key in {"command", "entrypoint"} and isinstance(child, str):
                 findings.extend(inspect_shell(child, line))
+            elif key == "entrypoint" and isinstance(child, list) and all(
+                isinstance(item, str) for item in child
+            ):
+                findings.extend(inspect_command([(item, line) for item in child]))
             elif key == "image" and isinstance(child, str):
-                image_command = command_name(child.split("@", 1)[0].split(":", 1)[0])
+                image_name = child.split("@", 1)[0].rsplit("/", 1)[-1]
+                image_command = image_name.split(":", 1)[0]
                 if image_command in FORBIDDEN:
                     findings.append((line, image_command))
             findings.extend(inspect_yaml_value(child, line))
@@ -868,6 +1186,14 @@ def shell_surface(path, text):
 
 def inspect_path(path):
     text = path.read_text(encoding="utf-8")
+    if path.name.endswith((".yaml.in", ".yml.in")):
+        rendered = text.replace(
+            "@OCI_IMAGE_REFERENCE@",
+            "example.invalid/gta-claw@sha256:"
+            "0123456789abcdef0123456789abcdef"
+            "0123456789abcdef0123456789abcdef",
+        )
+        return inspect_yaml(rendered)
     if shell_surface(path, text):
         return inspect_shell(
             text,

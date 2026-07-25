@@ -39,6 +39,44 @@ run_probe_failure() {
   fi
 }
 
+run_probe_status() {
+  local expected="$1"
+  local state_before
+  local log_before
+  local config_before
+  shift
+  state_before="$(find "$work/state" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+  log_before="$(find "$work/log" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+  config_before="$(find "$work/config" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+  set +e
+  env \
+    PATH="$work/bin:$PATH" \
+    CRI_RUNTIME_ENDPOINT=unix:///run/nonexistent-cri.sock \
+    CRI_STATE_PARENT="$work/state" \
+    CRI_LOG_PARENT="$work/log" \
+    CRI_CONFIG_PARENT="$work/config" \
+    "$@" \
+    "$SCRIPT_DIR/oci/cri-probe.sh" \
+    "$SCRIPT_DIR/oci/cri-sandbox.json" \
+    "$work/init.json" \
+    "$work/runtime.json" \
+    >/dev/null 2>&1
+  local status=$?
+  set -e
+  [[ "$status" -eq "$expected" ]] ||
+    {
+      echo "CRI signal cleanup returned $status instead of $expected" >&2
+      return 1
+    }
+  [[ "$(find "$work/state" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == "$state_before" &&
+    "$(find "$work/log" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == "$log_before" &&
+    "$(find "$work/config" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == "$config_before" ]] ||
+    {
+      echo "CRI signal cleanup changed the parent inventory" >&2
+      return 1
+    }
+}
+
 sed 's|@OCI_IMAGE_REFERENCE@|example.invalid/gta-claw@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|g' \
   "$SCRIPT_DIR/oci/cri-init.json.in" >"$work/init.json"
 sed 's|@OCI_IMAGE_REFERENCE@|example.invalid/gta-claw@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|g' \
@@ -50,12 +88,41 @@ run_probe_failure GTA_CLAW_CRI_TEST_FAIL_AFTER_STATE=1
     echo "partial CRI state creation was not cleaned exactly" >&2
     exit 1
   }
+for creation_fault in after-mkdir after-token-create after-token-write; do
+  state_before="$(find "$work/state" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+  run_probe_failure \
+    "GTA_CLAW_CRI_TEST_FAIL_DIRECTORY_STEP=$creation_fault"
+  [[ "$(find "$work/state" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == \
+    "$state_before" ]] ||
+    {
+      echo "partial CRI directory creation leaked after $creation_fault" >&2
+      exit 1
+    }
+done
 run_probe_failure GTA_CLAW_CRI_TEST_STOP_AFTER_CONFIG=1
 [[ "$(find "$work/state" -mindepth 1 -maxdepth 1 -printf '%f\n')" == "pre-existing" &&
   "$(find "$work/log" -mindepth 1 -maxdepth 1 -printf '%f\n')" == "pre-existing" &&
   -z "$(find "$work/config" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
   {
     echo "CRI invocation-owned paths were not cleaned after config creation" >&2
+    exit 1
+  }
+run_probe_failure \
+  GTA_CLAW_CRI_TEST_REPLACE_EMPTY_STATE=1 \
+  GTA_CLAW_CRI_TEST_STOP_AFTER_CONFIG=1
+empty_replacement="$(
+  find "$work/state" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    -name 'probe.*' \
+    -empty \
+    -print \
+    -quit
+)"
+[[ -n "$empty_replacement" ]] ||
+  {
+    echo "CRI cleanup removed a raced empty replacement directory" >&2
     exit 1
   }
 run_probe_failure GTA_CLAW_CRI_TEST_REPLACE_STATE=1
@@ -85,6 +152,9 @@ config_replacement="$(
     echo "CRI cleanup removed a raced config replacement directory" >&2
     exit 1
   }
+run_probe_status 129 GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CONFIG=HUP
+run_probe_status 130 GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CONFIG=INT
+run_probe_status 143 GTA_CLAW_CRI_TEST_SIGNAL_AFTER_CONFIG=TERM
 [[ "$(cat "$work/state/pre-existing/sentinel")" == "state sentinel" &&
   "$(cat "$work/log/pre-existing/sentinel")" == "log sentinel" ]] ||
   {

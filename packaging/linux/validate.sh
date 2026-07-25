@@ -293,6 +293,31 @@ cri_init_artifact="$artifact_dir/$base_name.cri-init.json"
 cri_runtime_artifact="$artifact_dir/$base_name.cri-runtime.json"
 cri_probe_artifact="$artifact_dir/$base_name.cri-probe.sh"
 
+expected_artifact_listing="$(
+  printf '%s\n' \
+    "$(basename "$tar_artifact")" \
+    "$(basename "$deb_artifact")" \
+    "$(basename "$rpm_artifact")" \
+    "$(basename "$oci_artifact")" \
+    "$(basename "$compose_artifact")" \
+    "$(basename "$kubernetes_artifact")" \
+    "$(basename "$cri_sandbox_artifact")" \
+    "$(basename "$cri_init_artifact")" \
+    "$(basename "$cri_runtime_artifact")" \
+    "$(basename "$cri_probe_artifact")" \
+    "provenance-$arch.json" \
+    SHA256SUMS |
+    LC_ALL=C sort
+)"
+actual_artifact_listing="$(
+  find "$artifact_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+    LC_ALL=C sort
+)"
+[[ "$actual_artifact_listing" == "$expected_artifact_listing" ]] ||
+  die "published artifact directory differs from the independent exact allowlist"
+[[ -z "$(find "$artifact_dir" -mindepth 2 -print -quit)" ]] ||
+  die "published artifact directory contains an unexpected nested path"
+
 for artifact in \
   "$tar_artifact" "$deb_artifact" "$rpm_artifact" "$oci_artifact" \
   "$compose_artifact" "$kubernetes_artifact" \
@@ -574,6 +599,22 @@ cmp -s "$expected_md5sums" "$deb_control_root/md5sums" ||
   "$rpm_artifact")" == \
   "$LINUX_PACKAGE_NAME|0|$VERSION|$LINUX_PACKAGE_RELEASE|$rpm_architecture" ]] ||
   die "RPM NEVRA identity differs from the exact package policy"
+case "$rpm_architecture" in
+  x86_64) rpm_isa=x86-64 ;;
+  aarch64) rpm_isa=aarch-64 ;;
+  *) die "unsupported RPM architecture for relationship policy: $rpm_architecture" ;;
+esac
+expected_rpm_provides="$(
+  {
+    printf '%s\t%s\t%s\n' \
+      "config($LINUX_PACKAGE_NAME)" "$VERSION-$LINUX_PACKAGE_RELEASE" 268435464
+    printf '%s\t%s\t%s\n' \
+      "$LINUX_PACKAGE_NAME" "$VERSION-$LINUX_PACKAGE_RELEASE" 8 \
+      "$LINUX_PACKAGE_NAME($rpm_isa)" "$VERSION-$LINUX_PACKAGE_RELEASE" 8
+  } |
+    LC_ALL=C sort
+)"
+validate_exact_rpm_relationships "$rpm_artifact" "$expected_rpm_provides"
 rpm -qpl "$rpm_artifact" | grep -Fx '/usr/bin/gta-claw-cli' >/dev/null
 rpm -qpl "$rpm_artifact" |
   grep -Fx '/usr/libexec/gta-claw/gta-claw-daemon' >/dev/null

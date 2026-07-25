@@ -92,7 +92,8 @@ if [ "$installed_count" -gt 0 ] && [ -e "$remove_prepared" ]; then
     if ! systemctl enable gta-claw-daemon.service >/dev/null; then
       fence_failed_restore
     fi
-  elif [ -e "$remove_was_enabled_runtime" ]; then
+  fi
+  if [ -e "$remove_was_enabled_runtime" ]; then
     if ! systemctl enable --runtime gta-claw-daemon.service >/dev/null; then
       fence_failed_restore
     fi

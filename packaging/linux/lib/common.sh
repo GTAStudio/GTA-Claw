@@ -947,6 +947,8 @@ validate_start_authorization_contract() {
     'authorization_marker=$runtime_directory/start-authorized' \
     'persistent_failure_marker=/var/lib/gta-claw-install/transaction-failed' \
     'process_start_time()' \
+    'process_state="$1"' \
+    'Z | X | x) return 1' \
     'authorization_valid()' \
     'arm_authorization()' \
     'clear_authorization()' \
@@ -974,7 +976,11 @@ validate_direct_lifecycle_contract() {
     'authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized' \
     'ensure_failure_fence' \
     'ensure_persistent_failure_fence' \
-    'trap cancel_incomplete_install 0 HUP INT TERM' \
+    'lifecycle_lock=/run/gta-claw-lifecycle.lock' \
+    'acquire_lifecycle_lock' \
+    '/usr/bin/sync -f "$persistent_failure_marker"' \
+    '/usr/bin/sync -f /usr/libexec/gta-claw/gta-claw-daemon' \
+    "trap 'cancel_incomplete_install 130' INT" \
     'stop_runtime_for_replacement' \
     'verify_runtime_stopped' \
     'active | activating | reloading | deactivating)' \
@@ -1005,6 +1011,9 @@ validate_direct_lifecycle_contract() {
     'marker_state()' \
     'capture_link()' \
     'rollback_removal()' \
+    'lifecycle_lock=/run/gta-claw-lifecycle.lock' \
+    'acquire_lifecycle_lock' \
+    "trap 'rollback_removal 130' INT" \
     'acquire_writer_lock' \
     'verify_held_writer_lock' \
     'main_pid="$(systemctl show -P MainPID "$unit")"' \
@@ -1156,6 +1165,32 @@ reject_forbidden_rpm_requirements() {
     grep -Eiq '(^|[[:space:]])(node|nodejs|npm|npx|pnpm|bun)([[:space:]]|$)'; then
     die "RPM declares a forbidden JavaScript runtime or package-manager dependency"
   fi
+}
+
+rpm_relationship_rows() {
+  local artifact="$1"
+  local prefix="$2"
+  local rows
+  if ! rows="$(
+    rpm -qp \
+      --qf "[%{${prefix}NAME}\t%{${prefix}VERSION}\t%{${prefix}FLAGS}\n]" \
+      "$artifact"
+  )"; then
+    die "RPM $prefix relationship arrays could not be queried"
+  fi
+  printf '%s\n' "$rows" | LC_ALL=C sort
+}
+
+validate_exact_rpm_relationships() {
+  local artifact="$1"
+  local expected_provides="$2"
+  local prefix
+  [[ "$(rpm_relationship_rows "$artifact" PROVIDE)" == "$expected_provides" ]] ||
+    die "RPM Provides arrays differ from the exact package policy"
+  for prefix in CONFLICT OBSOLETE RECOMMEND SUGGEST SUPPLEMENT ENHANCE; do
+    [[ -z "$(rpm_relationship_rows "$artifact" "$prefix")" ]] ||
+      die "RPM contains an unexpected $prefix relationship"
+  done
 }
 
 source "$LINUX_DIR/config.sh"

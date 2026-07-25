@@ -94,6 +94,7 @@ jobs:
           actionlint .github/workflows/linux-packaging.yml
           ./packaging/linux/workflow-self-test.sh
           ./packaging/linux/self-test.sh
+          TMPDIR="$RUNNER_TEMP" ./packaging/linux/tests/container-trust-self-test.sh
           sudo ./packaging/linux/tests/direct-config-self-test.sh \
             "$RUNNER_TEMP/gta-claw-direct-config-self-test"
           TMPDIR="$RUNNER_TEMP" python3 packaging/linux/safeio.py \
@@ -198,13 +199,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export GTA_CLAW_TARGET_ROOT="$RUNNER_TEMP/gta-claw-target"
+          export TMPDIR="$RUNNER_TEMP/gta-claw-tmp"
+          {
+            echo "GTA_CLAW_TARGET_ROOT=$GTA_CLAW_TARGET_ROOT"
+            echo "TMPDIR=$TMPDIR"
+          } >>"$GITHUB_ENV"
+          install -d -m 0700 "$GTA_CLAW_TARGET_ROOT" "$TMPDIR"
           first_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask000" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-x86-build-umask000" \
             BUILD_INPUT_UMASK=000 \
               ./packaging/linux/build-container.sh x86_64
           )"
           second_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask002" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-x86-build-umask002" \
             BUILD_INPUT_UMASK=002 \
               ./packaging/linux/build-container.sh x86_64
           )"
@@ -232,31 +240,33 @@ jobs:
         run: |
           set -euo pipefail
           build_root="$(dirname "$BUILD_MANIFEST")"
-          relative_root="${build_root#"$GITHUB_WORKSPACE/target/"}"
+          relative_root="${build_root#"$GTA_CLAW_TARGET_ROOT/"}"
           cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$BUILD_MANIFEST")"
           daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$BUILD_MANIFEST")"
           image='gta-claw-linux-build:rust-1.97.0-bookworm'
+          image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --volume "$GITHUB_WORKSPACE/target:/workspace/target:ro" \
-            "$image" \
+            --volume "$GTA_CLAW_TARGET_ROOT:/workspace/target:ro" \
+            "$image_id" \
             "/workspace/target/$relative_root/$cli" health |
             grep -F 'healthy runtime='
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --volume "$GITHUB_WORKSPACE/target:/workspace/target:ro" \
-            "$image" \
+            --volume "$GTA_CLAW_TARGET_ROOT:/workspace/target:ro" \
+            "$image_id" \
             "/workspace/target/$relative_root/$daemon" --probe |
             grep -F 'healthy runtime='
 
       - name: Reject forged build manifests and substituted binaries
         shell: bash
         run: |
-          OUTPUT_ROOT="$GITHUB_WORKSPACE/target/linux-build-manifest-self-test" \
+          OUTPUT_ROOT="$GTA_CLAW_TARGET_ROOT/linux-build-manifest-self-test" \
             ./packaging/linux/build-manifest-self-test-container.sh \
               x86_64 \
               "${{ steps.build.outputs.first-manifest }}" \
@@ -267,9 +277,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          first="$GITHUB_WORKSPACE/target/linux-x86_64-run1"
-          second="$GITHUB_WORKSPACE/target/linux-x86_64-run2"
-          upgrade="$GITHUB_WORKSPACE/target/linux-x86_64-upgrade"
+          first="$GTA_CLAW_TARGET_ROOT/linux-x86_64-run1"
+          second="$GTA_CLAW_TARGET_ROOT/linux-x86_64-run2"
+          upgrade="$GTA_CLAW_TARGET_ROOT/linux-x86_64-upgrade"
           umask 000
           PACKAGE_RELEASE=1 OUTPUT_ROOT="$first" \
             ./packaging/linux/package-container.sh \
@@ -299,7 +309,7 @@ jobs:
       - name: Mutate every published OCI trust edge
         shell: bash
         run: |
-          OUTPUT_ROOT="$GITHUB_WORKSPACE/target/linux-oci-mutation-tests" \
+          OUTPUT_ROOT="$GTA_CLAW_TARGET_ROOT/linux-oci-mutation-tests" \
             ./packaging/linux/oci-self-test-container.sh \
             x86_64 \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-linux-x86_64.oci.tar.gz" \
@@ -407,7 +417,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: linux-x86_64-prototype-${{ github.sha }}
-          path: target/linux-x86_64-run1/artifacts/*
+          path: ${{ runner.temp }}/gta-claw-target/linux-x86_64-run1/artifacts/*
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
@@ -435,13 +445,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export GTA_CLAW_TARGET_ROOT="$RUNNER_TEMP/gta-claw-target"
+          export TMPDIR="$RUNNER_TEMP/gta-claw-tmp"
+          {
+            echo "GTA_CLAW_TARGET_ROOT=$GTA_CLAW_TARGET_ROOT"
+            echo "TMPDIR=$TMPDIR"
+          } >>"$GITHUB_ENV"
+          install -d -m 0700 "$GTA_CLAW_TARGET_ROOT" "$TMPDIR"
           first_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask000" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-arm64-build-umask000" \
             BUILD_INPUT_UMASK=000 \
               ./packaging/linux/build-container.sh arm64
           )"
           second_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask002" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-arm64-build-umask002" \
             BUILD_INPUT_UMASK=002 \
               ./packaging/linux/build-container.sh arm64
           )"
@@ -467,8 +484,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          first="$GITHUB_WORKSPACE/target/linux-arm64-run1"
-          second="$GITHUB_WORKSPACE/target/linux-arm64-run2"
+          first="$GTA_CLAW_TARGET_ROOT/linux-arm64-run1"
+          second="$GTA_CLAW_TARGET_ROOT/linux-arm64-run2"
           umask 000
           OUTPUT_ROOT="$first" \
             ./packaging/linux/package-container.sh \
@@ -493,7 +510,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: linux-arm64-prototype-${{ github.sha }}
-          path: target/linux-arm64-run1/artifacts/*
+          path: ${{ runner.temp }}/gta-claw-target/linux-arm64-run1/artifacts/*
           if-no-files-found: error
           retention-days: 3
           compression-level: 0

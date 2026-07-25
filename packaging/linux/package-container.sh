@@ -23,6 +23,8 @@ arch_target "$arch" >/dev/null
 [[ "$expected_build_key_sha" =~ ^[0-9a-f]{64}$ ]] ||
   die "invalid expected build-key fingerprint"
 : "${OUTPUT_ROOT:?OUTPUT_ROOT must select a new private package root}"
+: "${GTA_CLAW_TARGET_ROOT:?GTA_CLAW_TARGET_ROOT must select a dedicated external target root}"
+: "${TMPDIR:?TMPDIR must select a dedicated external temporary root}"
 
 target_root="$(canonical_target_root)"
 git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
@@ -42,8 +44,11 @@ validate_safe_component "$output_component" "output component"
 [[ "$build_component" != "$output_component" ]] ||
   die "build and package output components must differ"
 
+trap 'cleanup_container_resources "$?"' EXIT
+trap 'cleanup_container_resources 129' HUP
+trap 'cleanup_container_resources 130' INT
+trap 'cleanup_container_resources 143' TERM
 create_verified_source_snapshot "$REPO_ROOT"
-trap cleanup_container_trust EXIT INT TERM
 open_build_component "$target_root" "$build_component"
 prepare_output_component "$target_root" "$output_component"
 assert_no_path_overlap \
@@ -79,7 +84,6 @@ create_anchored_mounts \
   "/proc/$BASHPID/fd/$source_fd" \
   "/proc/$BASHPID/fd/$OUTPUT_COMPONENT_FD" \
   "/proc/$BASHPID/fd/$BUILD_COMPONENT_FD"
-trap 'cleanup_anchored_mounts; cleanup_container_trust' EXIT INT TERM
 docker run --rm \
   --cap-drop ALL \
   --cap-add CHOWN \
@@ -99,7 +103,7 @@ docker run --rm \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/build,target=/gta-claw-build,readonly" \
   --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/output,target=/gta-claw-output" \
   --workdir /workspace \
-  "$image_tag" \
+  "$packaging_image_id" \
   /usr/local/bin/gta-claw-safeio \
   run-mounted-package \
   /gta-claw-build \
@@ -123,6 +127,6 @@ verify_container_transaction_receipts
 [[ "$(trust_receipt "$OUTPUT_COMPONENT_PATH" "package output")" == "$output_receipt" ]] ||
   die "package output receipt changed"
 cleanup_container_trust
-trap - EXIT INT TERM
+trap - EXIT HUP INT TERM
 
 printf '%s\n' "$OUTPUT_ROOT"

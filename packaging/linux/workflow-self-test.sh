@@ -488,7 +488,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    a429b74dcce18dc1d0269963c2da4d68a66b8f2fc3db316b4d448cc07f9b449f \
+    fbb6ea327ba44a95255f5e2f08ee460026f3953055a27539b2029fd112bf6f29 \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \
@@ -509,7 +509,7 @@ validate_workflow() {
 
   assert_required_job \
     native-x86 \
-    18293a5133aa6521e9edbda2025d8c3ed11f861104ca7e1bf71afdc213bdccdf \
+    8bc4c05b81aa2e9945424cf226c6caa5964c6fa65e324f83506473ed01977c99 \
     "$(printf '%s\n' \
       'Checkout' \
       'Install native package inspection tools' \
@@ -527,7 +527,7 @@ validate_workflow() {
 
   assert_required_job \
     cross-arm64 \
-    08e8afe33de18c9aa944d3397d3d3ef5df39efb993a4bf4edd520efe067e572c \
+    6ee3c9eec809b364d5e63be5397aaa31a36586668c83ee70b4c4928b54e4c9f2 \
     "$(printf '%s\n' \
       'Checkout' \
       'Install arm64 cross and native package tools' \

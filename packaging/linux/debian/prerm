@@ -98,28 +98,50 @@ fence_failed_restore() {
 }
 
 restore_enablement() {
+  restore_enablement_failed=0
   if [ -e "$remove_was_enabled" ]; then
-    systemctl enable gta-claw-daemon.service >/dev/null
-  elif [ -e "$remove_was_enabled_runtime" ]; then
-    systemctl enable --runtime gta-claw-daemon.service >/dev/null
+    systemctl enable gta-claw-daemon.service >/dev/null ||
+      restore_enablement_failed=1
+  fi
+  if [ -e "$remove_was_enabled_runtime" ]; then
+    systemctl enable --runtime gta-claw-daemon.service >/dev/null ||
+      restore_enablement_failed=1
+  fi
+  [ "$restore_enablement_failed" -eq 0 ]
+}
+
+capture_enablement_link() {
+  link="$1"
+  marker="$2"
+  if [ -L "$link" ]; then
+    if [ "$(readlink "$link")" != "/usr/lib/systemd/system/gta-claw-daemon.service" ]; then
+      echo "gta-claw enablement link has an unexpected target: $link" >&2
+      return 1
+    fi
+    touch "$marker" || return 1
+    chown 0:0 "$marker" || return 1
+    chmod 0600 "$marker" || return 1
+  elif [ -e "$link" ]; then
+    echo "gta-claw enablement path is not a symlink: $link" >&2
+    return 1
   fi
 }
 
-remove_enablement() {
-  link=
-  if [ -e "$remove_was_enabled" ]; then
-    link="$persistent_enable_link"
-  elif [ -e "$remove_was_enabled_runtime" ]; then
-    link="$runtime_enable_link"
-  else
-    return 0
-  fi
+remove_enablement_link() {
+  marker="$1"
+  link="$2"
+  [ -e "$marker" ] || return 0
   if [ ! -L "$link" ] ||
     [ "$(readlink "$link")" != "/usr/lib/systemd/system/gta-claw-daemon.service" ]; then
     echo "gta-claw enablement link changed during removal: $link" >&2
     return 1
   fi
   rm -f -- "$link"
+}
+
+remove_enablement() {
+  remove_enablement_link "$remove_was_enabled" "$persistent_enable_link" || return 1
+  remove_enablement_link "$remove_was_enabled_runtime" "$runtime_enable_link"
 }
 
 retire_remove_journal() {
@@ -133,7 +155,7 @@ retire_remove_journal() {
 }
 
 restore_on_failure() {
-  status=$?
+  status="${1:-$?}"
   trap - 0 HUP INT TERM
   if [ "$prepared" -eq 0 ]; then
     if [ "$package_fenced" -eq 1 ]; then
@@ -199,7 +221,10 @@ if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
         exit 1
       fi
       package_fenced=1
-      trap restore_on_failure 0 HUP INT TERM
+      trap 'restore_on_failure "$?"' 0
+      trap 'restore_on_failure 129' HUP
+      trap 'restore_on_failure 130' INT
+      trap 'restore_on_failure 143' TERM
       verify_unit_stopped gta-claw-daemon.service
       verify_writer_lock_released
       systemctl unmask --runtime gta-claw-daemon.service
@@ -210,14 +235,15 @@ if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
       ;;
   esac
   case "$enabled_state" in
-    enabled) touch "$remove_was_enabled" ;;
-    enabled-runtime) touch "$remove_was_enabled_runtime" ;;
-    disabled | indirect | static | generated | transient | not-found | '') ;;
+    enabled | enabled-runtime | disabled | indirect | static | generated | transient | \
+      not-found | '') ;;
     *) {
       echo "unexpected gta-claw enablement state before removal: $enabled_state" >&2
       exit 1
     } ;;
   esac
+  capture_enablement_link "$persistent_enable_link" "$remove_was_enabled"
+  capture_enablement_link "$runtime_enable_link" "$remove_was_enabled_runtime"
   active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
   case "$active_state" in
     inactive | failed) ;;
@@ -244,7 +270,10 @@ if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   if [ "$package_fenced" -eq 1 ]; then
     touch "$remove_was_package_fenced"
   fi
-  trap restore_on_failure 0 HUP INT TERM
+  trap 'restore_on_failure "$?"' 0
+  trap 'restore_on_failure 129' HUP
+  trap 'restore_on_failure 130' INT
+  trap 'restore_on_failure 143' TERM
   systemctl mask --runtime gta-claw-daemon.service
   deb-systemd-invoke stop gta-claw-daemon.service >/dev/null
   verify_unit_stopped gta-claw-daemon.service

@@ -11,41 +11,81 @@ mount_fault() {
     die "injected anchored-mount fault: $1"
 }
 
+cleanup_container_resources() {
+  local original_status="${1:-$?}"
+  local failed=0
+  trap - EXIT HUP INT TERM
+  cleanup_anchored_mounts || failed=1
+  cleanup_container_trust || failed=1
+  if [[ "$original_status" -eq 0 && "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  exit "$original_status"
+}
+
 cleanup_anchored_mounts() {
   local failed=0
   if [[ -n "$ANCHORED_MOUNT_ROOT" ]]; then
     if [[ "$ANCHORED_OUTPUT_MOUNTED" -eq 1 ]]; then
-      if mountpoint -q "$ANCHORED_MOUNT_ROOT/output"; then
-        sudo umount "$ANCHORED_MOUNT_ROOT/output" >/dev/null 2>&1 || failed=1
+      if sudo mountpoint -q "$ANCHORED_MOUNT_ROOT/output"; then
+        if sudo umount "$ANCHORED_MOUNT_ROOT/output" >/dev/null 2>&1; then
+          ANCHORED_OUTPUT_MOUNTED=0
+        else
+          failed=1
+        fi
+      else
+        ANCHORED_OUTPUT_MOUNTED=0
       fi
-      ANCHORED_OUTPUT_MOUNTED=0
     fi
     if [[ "$ANCHORED_ARTIFACT_MOUNTED" -eq 1 ]]; then
-      if mountpoint -q "$ANCHORED_MOUNT_ROOT/artifact"; then
-        sudo umount "$ANCHORED_MOUNT_ROOT/artifact" >/dev/null 2>&1 || failed=1
+      if sudo mountpoint -q "$ANCHORED_MOUNT_ROOT/artifact"; then
+        if sudo umount "$ANCHORED_MOUNT_ROOT/artifact" >/dev/null 2>&1; then
+          ANCHORED_ARTIFACT_MOUNTED=0
+        else
+          failed=1
+        fi
+      else
+        ANCHORED_ARTIFACT_MOUNTED=0
       fi
-      ANCHORED_ARTIFACT_MOUNTED=0
     fi
     if [[ "$ANCHORED_BUILD_MOUNTED" -eq 1 ]]; then
-      if mountpoint -q "$ANCHORED_MOUNT_ROOT/build"; then
-        sudo umount "$ANCHORED_MOUNT_ROOT/build" >/dev/null 2>&1 || failed=1
+      if sudo mountpoint -q "$ANCHORED_MOUNT_ROOT/build"; then
+        if sudo umount "$ANCHORED_MOUNT_ROOT/build" >/dev/null 2>&1; then
+          ANCHORED_BUILD_MOUNTED=0
+        else
+          failed=1
+        fi
+      else
+        ANCHORED_BUILD_MOUNTED=0
       fi
-      ANCHORED_BUILD_MOUNTED=0
     fi
     if [[ "$ANCHORED_SOURCE_MOUNTED" -eq 1 ]]; then
-      if mountpoint -q "$ANCHORED_MOUNT_ROOT/source"; then
-        sudo umount "$ANCHORED_MOUNT_ROOT/source" >/dev/null 2>&1 || failed=1
+      if sudo mountpoint -q "$ANCHORED_MOUNT_ROOT/source"; then
+        if sudo umount "$ANCHORED_MOUNT_ROOT/source" >/dev/null 2>&1; then
+          ANCHORED_SOURCE_MOUNTED=0
+        else
+          failed=1
+        fi
+      else
+        ANCHORED_SOURCE_MOUNTED=0
       fi
-      ANCHORED_SOURCE_MOUNTED=0
     fi
-    sudo rmdir \
-      "$ANCHORED_MOUNT_ROOT/output" \
-      "$ANCHORED_MOUNT_ROOT/artifact" \
-      "$ANCHORED_MOUNT_ROOT/build" \
-      "$ANCHORED_MOUNT_ROOT/source" \
-      >/dev/null 2>&1 || true
-    sudo rmdir "$ANCHORED_MOUNT_ROOT" >/dev/null 2>&1 || failed=1
-    ANCHORED_MOUNT_ROOT=""
+    if [[ "$ANCHORED_OUTPUT_MOUNTED" -eq 0 &&
+      "$ANCHORED_ARTIFACT_MOUNTED" -eq 0 &&
+      "$ANCHORED_BUILD_MOUNTED" -eq 0 &&
+      "$ANCHORED_SOURCE_MOUNTED" -eq 0 ]]; then
+      sudo rmdir \
+        "$ANCHORED_MOUNT_ROOT/output" \
+        "$ANCHORED_MOUNT_ROOT/artifact" \
+        "$ANCHORED_MOUNT_ROOT/build" \
+        "$ANCHORED_MOUNT_ROOT/source" \
+        >/dev/null 2>&1 || true
+      if sudo rmdir "$ANCHORED_MOUNT_ROOT" >/dev/null 2>&1; then
+        ANCHORED_MOUNT_ROOT=""
+      else
+        failed=1
+      fi
+    fi
   fi
   return "$failed"
 }
@@ -58,7 +98,6 @@ create_anchored_mounts() {
   ANCHORED_MOUNT_ROOT="$(
     sudo mktemp -d /run/gta-claw-packaging.XXXXXXXXXX
   )"
-  trap cleanup_anchored_mounts EXIT INT TERM
   mount_fault after-root
   sudo chmod 0700 "$ANCHORED_MOUNT_ROOT"
   sudo mkdir -m 0700 \

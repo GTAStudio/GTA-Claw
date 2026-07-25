@@ -16,6 +16,7 @@ was_active_marker=/run/gta-claw-daemon.was-active
 persistent_runtime_directory=/var/lib/gta-claw-install
 persistent_failure_marker=$persistent_runtime_directory/transaction-failed
 persistent_was_active_marker=$persistent_runtime_directory/was-active
+lifecycle_lock=/run/gta-claw-lifecycle.lock
 namespace=/var/lib/gta-claw-protected
 lock=$namespace/state.writer.lock
 persistent_enable_link=/etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service
@@ -32,6 +33,10 @@ if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
 fi
 if [ -e "$authorization_marker" ] || [ -L "$authorization_marker" ]; then
   echo "gta-claw direct removal refuses an outstanding start authorization" >&2
+  exit 1
+fi
+if [ ! -x /usr/bin/flock ] || [ ! -x /usr/bin/sync ]; then
+  echo "gta-claw direct removal requires flock and sync" >&2
   exit 1
 fi
 
@@ -98,6 +103,43 @@ ensure_runtime_directory() {
   fi
   if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
     echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+    return 1
+  fi
+}
+
+acquire_lifecycle_lock() {
+  if [ -L /run ] || [ ! -d /run ] ||
+    [ "$(stat -c '%u:%g:%a' /run)" != "0:0:755" ]; then
+    echo "gta-claw lifecycle lock parent must be a physical root:root mode 0755 directory" >&2
+    return 1
+  fi
+  if [ -L "$lifecycle_lock" ] ||
+    { [ -e "$lifecycle_lock" ] && [ ! -f "$lifecycle_lock" ]; }; then
+    echo "gta-claw lifecycle lock is not a physical regular file" >&2
+    return 1
+  fi
+  if [ ! -e "$lifecycle_lock" ]; then
+    (umask 0177; : >"$lifecycle_lock") || return 1
+    chown 0:0 "$lifecycle_lock" || return 1
+    chmod 0600 "$lifecycle_lock" || return 1
+  fi
+  [ "$(stat -c '%u:%g:%a:%h' "$lifecycle_lock")" = "0:0:600:1" ] ||
+    {
+      echo "gta-claw lifecycle lock metadata is invalid" >&2
+      return 1
+    }
+  lifecycle_identity="$(stat -Lc '%d:%i' "$lifecycle_lock")"
+  exec 8<>"$lifecycle_lock" || return 1
+  if [ "$(stat -Lc '%d:%i' /proc/self/fd/8)" != "$lifecycle_identity" ] ||
+    [ "$(stat -Lc '%d:%i' "$lifecycle_lock")" != "$lifecycle_identity" ] ||
+    [ "$(stat -Lc '%u:%g:%a:%h' /proc/self/fd/8)" != "0:0:600:1" ]; then
+    echo "gta-claw lifecycle lock identity changed while opening it" >&2
+    exec 8>&-
+    return 1
+  fi
+  if ! flock -n 8; then
+    echo "another gta-claw lifecycle transaction is already running" >&2
+    exec 8>&-
     return 1
   fi
 }
@@ -187,12 +229,15 @@ verify_held_writer_lock() {
 }
 
 fence_failed_rollback() {
+  requested_status="${1:-1}"
   failure=0
-  ensure_failure_fences ||
-    {
-      echo "gta-claw removal rollback could not retain all failure fences" >&2
-      failure=1
-    }
+  if ! ensure_failure_fences; then
+    echo "gta-claw removal rollback could not retain all failure fences" >&2
+    failure=1
+  elif ! /usr/bin/sync -f "$persistent_failure_marker"; then
+    echo "gta-claw removal rollback could not persist its failure fence" >&2
+    failure=1
+  fi
   if [ -d /run/systemd/system ]; then
     if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
       echo "gta-claw daemon could not be runtime-masked after rollback failure" >&2
@@ -211,26 +256,30 @@ fence_failed_rollback() {
         failure=1
       fi
     fi
+    if ! verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"; then
+      failure=1
+    fi
     if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
       echo "gta-claw initializer stop failed after rollback failure" >&2
       failure=1
     fi
-    if ! verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"; then
+    if ! verify_unit_stopped gta-claw-state-init.service "gta-claw initializer"; then
       failure=1
     fi
   fi
   [ "$failure" -eq 0 ] ||
     echo "gta-claw removal rollback cancellation completed with errors" >&2
-  exit 1
+  [ "$requested_status" -ne 0 ] || requested_status=1
+  exit "$requested_status"
 }
 
 rollback_removal() {
-  status=$?
+  status="${1:-$?}"
   trap - 0 HUP INT TERM
   [ "$mutation_started" -eq 1 ] || exit "$status"
   if [ "$payload_mutated" -eq 1 ]; then
     echo "gta-claw removal crossed the payload boundary and will remain fenced" >&2
-    fence_failed_rollback
+    fence_failed_rollback "$status"
   fi
 
   restore_failed=0
@@ -240,8 +289,11 @@ rollback_removal() {
   fi
   if [ -d /run/systemd/system ]; then
     daemon_needs_start=0
-    current_daemon_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
-    if [ "$old_daemon_active" -eq 1 ]; then
+    if ! current_daemon_state="$(
+      systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null
+    )"; then
+      restore_failed=1
+    elif [ "$old_daemon_active" -eq 1 ]; then
       case "$current_daemon_state" in
         active | activating | reloading | deactivating) ;;
         inactive | failed) daemon_needs_start=1 ;;
@@ -252,10 +304,11 @@ rollback_removal() {
       restore_failed=1
     fi
     initializer_needs_start=0
-    current_initializer_state="$(
-      systemctl show -P ActiveState gta-claw-state-init.service
-    )"
-    if [ "$old_initializer_active" -eq 1 ]; then
+    if ! current_initializer_state="$(
+      systemctl show -P ActiveState gta-claw-state-init.service 2>/dev/null
+    )"; then
+      restore_failed=1
+    elif [ "$old_initializer_active" -eq 1 ]; then
       case "$current_initializer_state" in
         active | activating | reloading | deactivating) ;;
         inactive | failed) initializer_needs_start=1 ;;
@@ -328,9 +381,11 @@ rollback_removal() {
       fi
     fi
   fi
-  [ "$restore_failed" -eq 0 ] || fence_failed_rollback
+  [ "$restore_failed" -eq 0 ] || fence_failed_rollback "$status"
   exit "$status"
 }
+
+acquire_lifecycle_lock || exit 1
 
 had_runtime_directory=0
 if [ -e "$runtime_directory" ]; then
@@ -354,10 +409,6 @@ old_runtime_mask="$(capture_link "$runtime_mask_link")"
 old_daemon_active=0
 old_initializer_active=0
 
-trap rollback_removal 0 HUP INT TERM
-mutation_started=1
-ensure_failure_fences
-
 if [ -d /run/systemd/system ]; then
   daemon_active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
   case "$daemon_active_state" in
@@ -377,6 +428,21 @@ if [ -d /run/systemd/system ]; then
       exit 1
     } ;;
   esac
+  if [ "$(systemctl show -P RefuseManualStop gta-claw-daemon.service)" = "yes" ]; then
+    echo "gta-claw-daemon.service refuses manual stop; refusing removal" >&2
+    exit 1
+  fi
+fi
+
+trap 'rollback_removal "$?"' 0
+trap 'rollback_removal 129' HUP
+trap 'rollback_removal 130' INT
+trap 'rollback_removal 143' TERM
+mutation_started=1
+ensure_failure_fences
+/usr/bin/sync -f "$persistent_failure_marker"
+
+if [ -d /run/systemd/system ]; then
   systemctl mask --runtime gta-claw-daemon.service
   systemctl stop gta-claw-daemon.service
   verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
@@ -447,6 +513,12 @@ verify_held_writer_lock ||
   }
 
 if [ -d /run/systemd/system ]; then
+  /usr/bin/sync -f /etc/systemd/system
+fi
+/usr/bin/sync -f /usr
+/usr/bin/sync -f "$persistent_failure_marker"
+
+if [ -d /run/systemd/system ]; then
   rm -f -- "$runtime_mask_link"
   systemctl daemon-reload
 fi
@@ -458,6 +530,7 @@ rm -f -- \
   "$was_active_marker" \
   "$persistent_failure_marker" \
   "$persistent_was_active_marker"
+/usr/bin/sync -f /var/lib
 rmdir "$persistent_runtime_directory" >/dev/null 2>&1 || true
 rmdir "$runtime_directory" >/dev/null 2>&1 || true
 

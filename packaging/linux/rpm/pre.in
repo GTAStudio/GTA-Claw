@@ -25,29 +25,29 @@ ensure_failure_fence() {
   if [ -L "$runtime_directory" ] ||
     { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
     echo "gta-claw initialization runtime path is not a physical directory" >&2
-    exit 1
+    return 1
   fi
   if [ ! -e "$runtime_directory" ]; then
-    mkdir -m 0755 -- "$runtime_directory"
+    mkdir -m 0755 -- "$runtime_directory" || return 1
   fi
   if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
     echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
-    exit 1
+    return 1
   fi
   if [ -L "$failure_marker" ] ||
     { [ -e "$failure_marker" ] && [ ! -f "$failure_marker" ]; }; then
     echo "gta-claw initialization failure marker is not a physical file" >&2
-    exit 1
+    return 1
   fi
-  touch "$failure_marker"
-  chown 0:0 "$failure_marker"
-  chmod 0644 "$failure_marker"
+  touch "$failure_marker" || return 1
+  chown 0:0 "$failure_marker" || return 1
+  chmod 0644 "$failure_marker" || return 1
 }
 
 lock_holder_pid() {
   if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
     echo "gta-claw writer-lock ownership could not be inspected" >&2
-    exit 1
+    return 1
   fi
   printf '%s\n' "$locks" |
     awk -v path="$lock" '$2 == path { print $1; exit }'
@@ -63,16 +63,16 @@ verify_unit_stopped() {
     inactive:0:0 | failed:0:0) ;;
     *) {
       echo "$label remains $active_state with MainPID $main_pid and ControlPID $control_pid" >&2
-      exit 1
+      return 1
     } ;;
   esac
 }
 
 verify_writer_lock_released() {
-  lock_pid="$(lock_holder_pid)"
+  lock_pid="$(lock_holder_pid)" || return 1
   if [ -n "$lock_pid" ]; then
     echo "gta-claw writer lock remains held by PID $lock_pid" >&2
-    exit 1
+    return 1
   fi
 }
 
@@ -93,7 +93,7 @@ stop_initializer_for_replacement() {
         inactive | failed) ;;
         *) {
           echo "unexpected gta-claw initializer state: $initializer_active_state" >&2
-          exit 1
+          return 1
         } ;;
       esac
       systemctl stop gta-claw-state-init.service
@@ -102,7 +102,7 @@ stop_initializer_for_replacement() {
     not-found) ;;
     *) {
       echo "unexpected gta-claw initializer load state: $initializer_load_state" >&2
-      exit 1
+      return 1
     } ;;
   esac
 }
@@ -177,47 +177,53 @@ fence_failed_rollback() {
 }
 
 restore_pre_failure() {
-  status=$?
+  status="${1:-$?}"
   trap - 0 HUP INT TERM
   if [ "$prepared" -eq 0 ] && [ "$runtime_touched" -eq 1 ]; then
-    restore_marker "$failure_marker" "$had_failure_marker"
-    restore_marker "$replacement_fence" "$had_replacement_fence"
-    restore_marker "$replacement" "$had_replacement"
-    restore_marker "$ready" "$had_ready"
-    restore_marker "$was_active" "$had_was_active"
-    restore_marker "$fresh_install" "$had_fresh_install"
+    restore_failed=0
+    restore_marker "$failure_marker" "$had_failure_marker" || restore_failed=1
+    restore_marker "$replacement_fence" "$had_replacement_fence" || restore_failed=1
+    restore_marker "$replacement" "$had_replacement" || restore_failed=1
+    restore_marker "$ready" "$had_ready" || restore_failed=1
+    restore_marker "$was_active" "$had_was_active" || restore_failed=1
+    restore_marker "$fresh_install" "$had_fresh_install" || restore_failed=1
     if [ -d /run/systemd/system ]; then
       if [ "$package_fenced" -eq 1 ]; then
         systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
-          fence_failed_rollback
+          restore_failed=1
         systemctl stop gta-claw-daemon.service >/dev/null 2>&1 ||
-          fence_failed_rollback
-        verify_runtime_stopped
+          restore_failed=1
+        verify_runtime_stopped || restore_failed=1
       elif [ "$created_runtime_mask" -eq 1 ]; then
         systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
-          fence_failed_rollback
+          restore_failed=1
         if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
           if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
             [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
-            fence_failed_rollback
+            restore_failed=1
           fi
         fi
-        if [ "$old_initializer_active" -eq 1 ]; then
+        if [ "$restore_failed" -eq 0 ] && [ "$old_initializer_active" -eq 1 ]; then
           systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
-            fence_failed_rollback
+            restore_failed=1
         fi
-        if [ "$old_active" -eq 1 ]; then
+        if [ "$restore_failed" -eq 0 ] && [ "$old_active" -eq 1 ]; then
           systemctl start gta-claw-daemon.service >/dev/null 2>&1 ||
-            fence_failed_rollback
-          /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 ||
-            fence_failed_rollback
-          restore_marker "$ready" "$had_ready"
+            restore_failed=1
+          if [ "$restore_failed" -eq 0 ]; then
+            /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 ||
+              restore_failed=1
+          fi
+          if [ "$restore_failed" -eq 0 ]; then
+            restore_marker "$ready" "$had_ready" || restore_failed=1
+          fi
         fi
       fi
       if [ "$had_runtime_directory" -eq 0 ]; then
-        rmdir "$runtime_directory" >/dev/null 2>&1 || fence_failed_rollback
+        rmdir "$runtime_directory" >/dev/null 2>&1 || restore_failed=1
       fi
     fi
+    [ "$restore_failed" -eq 0 ] || fence_failed_rollback
   fi
   exit "$status"
 }
@@ -250,7 +256,10 @@ had_runtime_directory=0
 if [ -e "$runtime_directory" ]; then
   had_runtime_directory=1
 fi
-trap restore_pre_failure 0 HUP INT TERM
+trap 'restore_pre_failure "$?"' 0
+trap 'restore_pre_failure 129' HUP
+trap 'restore_pre_failure 130' INT
+trap 'restore_pre_failure 143' TERM
 runtime_touched=1
 ensure_failure_fence
 if [ "$installed" -eq 1 ]; then
@@ -281,8 +290,8 @@ if [ -d /run/systemd/system ]; then
         rm -f "$was_active"
       fi
       touch "$replacement_fence"
-      systemctl mask --runtime gta-claw-daemon.service
       created_runtime_mask=1
+      systemctl mask --runtime gta-claw-daemon.service
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;
     loaded)
@@ -300,8 +309,8 @@ if [ -d /run/systemd/system ]; then
         } ;;
       esac
       touch "$replacement_fence"
-      systemctl mask --runtime gta-claw-daemon.service
       created_runtime_mask=1
+      systemctl mask --runtime gta-claw-daemon.service
       systemctl stop gta-claw-daemon.service
       verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
       ;;
@@ -313,6 +322,7 @@ if [ -d /run/systemd/system ]; then
   verify_writer_lock_released
   if [ "$package_fenced" -eq 0 ]; then
     stop_initializer_for_replacement
+    verify_writer_lock_released
   fi
 else
   touch "$replacement_fence"

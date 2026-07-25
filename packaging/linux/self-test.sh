@@ -437,6 +437,34 @@ node_requirement_rpm="$(
 if (reject_forbidden_rpm_requirements "$node_requirement_rpm"); then
   die "RPM dependency policy accepted nodejs"
 fi
+extra_provide_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-extra-provide-test \
+    "" \
+    "" \
+    'Provides: harmless-extra-capability'
+)"
+extra_provide_expected="$(
+  rpm_relationship_rows "$extra_provide_rpm" PROVIDE |
+    grep -v $'^harmless-extra-capability\t'
+)"
+if (validate_exact_rpm_relationships \
+  "$extra_provide_rpm" \
+  "$extra_provide_expected"); then
+  die "RPM relationship policy accepted an undeclared Provides capability"
+fi
+weak_dependency_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-weak-dependency-test \
+    "" \
+    "" \
+    'Recommends: harmless-optional-capability'
+)"
+if (validate_exact_rpm_relationships \
+  "$weak_dependency_rpm" \
+  "$(rpm_relationship_rows "$weak_dependency_rpm" PROVIDE)"); then
+  die "RPM relationship policy accepted an undeclared weak dependency"
+fi
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish

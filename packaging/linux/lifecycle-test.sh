@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in dpkg flock jq rpm sha256sum systemctl tar; do
+for tool in dpkg flock jq python3 rpm sha256sum systemctl tar; do
   require_tool "$tool"
 done
 [[ "$#" -eq 6 ]] ||
@@ -40,6 +40,9 @@ direct_root="$(mktemp -d)"
 policy_installed=0
 lock_gate_dir=
 lock_holder_job=
+lifecycle_gate_dir=
+lifecycle_lock_job=
+zombie_parent_job=
 
 install_policy_denial() {
   [[ ! -e /usr/sbin/policy-rc.d && ! -L /usr/sbin/policy-rc.d ]] ||
@@ -65,8 +68,21 @@ cleanup() {
   if [[ -n "$lock_holder_job" ]]; then
     wait "$lock_holder_job" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$lifecycle_gate_dir" ]]; then
+    sudo touch "$lifecycle_gate_dir/release" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$lifecycle_lock_job" ]]; then
+    wait "$lifecycle_lock_job" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$zombie_parent_job" ]]; then
+    sudo kill "$zombie_parent_job" >/dev/null 2>&1 || true
+    wait "$zombie_parent_job" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$lock_gate_dir" ]]; then
     sudo rm -rf "$lock_gate_dir"
+  fi
+  if [[ -n "$lifecycle_gate_dir" ]]; then
+    sudo rm -rf "$lifecycle_gate_dir"
   fi
   sudo rm -rf /etc/systemd/system/gta-claw-daemon.service.d
   sudo rm -rf /etc/systemd/system/gta-claw-state-init.service.d
@@ -402,6 +418,89 @@ direct_upgrade_snapshot="$(state_identity_snapshot)"
 sudo "$direct2/install.sh"
 assert_active_restart "$direct_pid"
 assert_identity_preserved "$direct_upgrade_snapshot"
+lifecycle_gate_dir="$(mktemp -d)"
+sudo sh -c '
+  exec 8<>/run/gta-claw-lifecycle.lock
+  flock -n 8
+  touch "$1/ready"
+  while [ ! -e "$1/release" ]; do sleep 0.05; done
+' _ "$lifecycle_gate_dir" &
+lifecycle_lock_job=$!
+for _ in {1..200}; do
+  [[ ! -e "$lifecycle_gate_dir/ready" ]] || break
+  kill -0 "$lifecycle_lock_job" >/dev/null 2>&1 ||
+    die "lifecycle-lock fixture exited before readiness"
+  sleep 0.05
+done
+[[ -e "$lifecycle_gate_dir/ready" ]] ||
+  die "lifecycle-lock fixture did not become ready"
+direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+if sudo "$direct2/install.sh"; then
+  die "direct install ignored a concurrent lifecycle transaction"
+fi
+if sudo "$direct2/uninstall.sh"; then
+  die "direct uninstall ignored a concurrent lifecycle transaction"
+fi
+[[ "$(systemctl show -P MainPID gta-claw-daemon.service)" == "$direct_pid" &&
+  -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
+  die "lifecycle-lock rejection mutated the active direct installation"
+sudo touch "$lifecycle_gate_dir/release"
+wait "$lifecycle_lock_job"
+lifecycle_lock_job=
+sudo rm -rf "$lifecycle_gate_dir"
+lifecycle_gate_dir=
+
+zombie_pid_file="$direct_root/zombie.pid"
+sudo python3 - "$zombie_pid_file" <<'PY' &
+import os
+import pathlib
+import sys
+import time
+
+child = os.fork()
+if child == 0:
+    os._exit(0)
+pathlib.Path(sys.argv[1]).write_text(f"{child}\n", encoding="ascii")
+time.sleep(60)
+PY
+zombie_parent_job=$!
+for _ in {1..200}; do
+  [[ ! -s "$zombie_pid_file" ]] || break
+  kill -0 "$zombie_parent_job" >/dev/null 2>&1 ||
+    die "zombie fixture exited before publishing its child PID"
+  sleep 0.05
+done
+[[ -s "$zombie_pid_file" ]] || die "zombie fixture did not publish its child PID"
+zombie_pid="$(cat "$zombie_pid_file")"
+zombie_state=
+for _ in {1..200}; do
+  zombie_state="$(
+    sudo awk \
+      '{ text=$0; sub(/^.*\) /, "", text); split(text, fields, " "); print fields[1] }' \
+      "/proc/$zombie_pid/stat" 2>/dev/null || true
+  )"
+  [[ "$zombie_state" != "Z" ]] || break
+  kill -0 "$zombie_parent_job" >/dev/null 2>&1 ||
+    die "zombie fixture parent exited before the child became a zombie"
+  sleep 0.05
+done
+[[ "$zombie_state" == "Z" ]] || die "zombie fixture did not reach zombie state"
+zombie_start="$(
+  sudo awk '{ text=$0; sub(/^.*\) /, "", text); split(text, fields, " "); print fields[20] }' \
+    "/proc/$zombie_pid/stat"
+)"
+sudo install -d -o root -g root -m 0755 /run/gta-claw-state-init
+printf '%s %s\n' "$zombie_pid" "$zombie_start" |
+  sudo tee /run/gta-claw-state-init/start-authorized >/dev/null
+sudo chown root:root /run/gta-claw-state-init/start-authorized
+sudo chmod 0600 /run/gta-claw-state-init/start-authorized
+if sudo /usr/libexec/gta-claw/gta-claw-start-authorized check; then
+  die "start authorization accepted a zombie installer process"
+fi
+sudo rm -f /run/gta-claw-state-init/start-authorized
+sudo kill "$zombie_parent_job"
+wait "$zombie_parent_job" >/dev/null 2>&1 || true
+zombie_parent_job=
 for direct_boundary in unit daemon authorization; do
   direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
   if sudo env \
@@ -708,6 +807,15 @@ systemctl is-active --quiet gta-claw-daemon.service ||
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "Debian late removal failure unlinked the daemon"
 remove_initializer_stop_denial
+sudo systemctl enable gta-claw-daemon.service
+install_initializer_stop_denial
+if sudo dpkg --remove gta-claw; then
+  die "Debian dual-enable removal ignored a late initializer-stop failure"
+fi
+[[ -L /etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service &&
+  -L /run/systemd/system/multi-user.target.wants/gta-claw-daemon.service ]] ||
+  die "Debian rollback did not restore both enablement links"
+remove_initializer_stop_denial
 deb_snapshot="$(state_identity_snapshot)"
 sudo dpkg --remove gta-claw
 assert_identity_preserved "$deb_snapshot"
@@ -946,6 +1054,15 @@ systemctl is-active --quiet gta-claw-daemon.service ||
 [[ -e /usr/libexec/gta-claw/gta-claw-daemon ]] ||
   die "RPM late removal failure unlinked the daemon"
 remove_initializer_stop_denial
+sudo systemctl enable gta-claw-daemon.service
+install_initializer_stop_denial
+if sudo rpm -e --nodeps gta-claw; then
+  die "RPM dual-enable removal ignored a late initializer-stop failure"
+fi
+[[ -L /etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service &&
+  -L /run/systemd/system/multi-user.target.wants/gta-claw-daemon.service ]] ||
+  die "RPM rollback did not restore both enablement links"
+remove_initializer_stop_denial
 for remove_marker in \
   /run/gta-claw-daemon.remove-was-active \
   /run/gta-claw-daemon.remove-was-enabled \
@@ -956,6 +1073,7 @@ for remove_marker in \
   [[ ! -e "$remove_marker" && ! -L "$remove_marker" ]] ||
     die "failed RPM erase left stale removal intent: $remove_marker"
 done
+sudo systemctl disable gta-claw-daemon.service
 sudo systemctl disable --runtime gta-claw-daemon.service
 [[ "$(systemctl is-enabled gta-claw-daemon.service)" == "disabled" ]] ||
   die "RPM failed-erase administrator change did not take effect"
