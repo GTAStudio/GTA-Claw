@@ -115,18 +115,21 @@ $LedgerSpecs = @(
         ledger_id = "gateway-core"
         classification = "gateway_core"
         expected_features = 16
+        frozen_digest = "1ed1326f8f0d1ed97e417e01ec2f9942222cb79376297c23f7eb14c4d7924c29"
     },
     [ordered]@{
         path = "ledgers/official-integration.json"
         ledger_id = "official-integration"
         classification = "official_integration"
         expected_features = 13
+        frozen_digest = "0ccabe72545c332c52120c569059a6bee9fd737f3cdc2c496445c91e7fd9308f"
     },
     [ordered]@{
         path = "ledgers/official-client-interop.json"
         ledger_id = "official-client-interop"
         classification = "official_client_interop"
         expected_features = 18
+        frozen_digest = "9d6886795df7d7c4fa327a679ec9f925dc16065cb30df4e35e1d44617607dbe8"
     }
 )
 
@@ -620,6 +623,61 @@ function Get-InventoryDigest {
 function Get-FeatureDigest {
     param([object[]]$Features)
     return Get-CanonicalArrayDigest $Features
+}
+
+# The mutable surface of a feature row. Everything else is frozen contract text.
+#
+# acceptance_evidence.required is deliberately NOT mutable. It is the row's own
+# statement of what parity means, so a claimant that could rewrite it would be
+# setting the bar it is judged against. Making the ledger digests regenerable
+# (which transitions require) exposed every descriptive field to exactly that
+# edit, because the file digest is the only thing that had been holding them.
+# Get-LedgerFrozenDigest closes it: the projection below is pinned by a constant
+# in $LedgerSpecs that -WriteLedgerDigests cannot reach, and it is verified in
+# BOTH modes, so the regeneration command cannot launder a descriptive edit
+# either.
+$MutableFeatureFields = @("status", "implementation_pointers", "known_differences")
+$MutableEvidenceFields = @("status", "artifacts")
+
+function Test-NameInSet {
+    param(
+        [string]$Name,
+        [string[]]$Set
+    )
+    foreach ($candidate in $Set) {
+        if (Test-OrdinalStringEqual $Name $candidate) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-FrozenFeatureProjection {
+    param([object]$Feature)
+    $projection = [ordered]@{}
+    foreach ($name in (Get-PropertyNames $Feature)) {
+        if (Test-NameInSet $name $MutableFeatureFields) {
+            continue
+        }
+        $value = Get-PropertyValue $Feature $name
+        if ((Test-OrdinalStringEqual $name "acceptance_evidence") -and (Test-JsonObject $value)) {
+            $frozenEvidence = [ordered]@{}
+            foreach ($evidenceName in (Get-PropertyNames $value)) {
+                if (-not (Test-NameInSet $evidenceName $MutableEvidenceFields)) {
+                    $frozenEvidence[$evidenceName] = Get-PropertyValue $value $evidenceName
+                }
+            }
+            $projection[$name] = [pscustomobject]$frozenEvidence
+            continue
+        }
+        $projection[$name] = $value
+    }
+    return [pscustomobject]$projection
+}
+
+function Get-LedgerFrozenDigest {
+    param([object[]]$Features)
+    return Get-CanonicalArrayDigest @($Features | ForEach-Object { Get-FrozenFeatureProjection $_ })
 }
 
 function Test-JsonValueEqual {
@@ -2384,6 +2442,7 @@ Assert-ManifestDeclarations $manifest
 
 $ledgerDigestPath = Join-Path $Root $LedgerDigestFileName
 $computedLedgerDigests = [ordered]@{}
+$computedFrozenDigests = [ordered]@{}
 foreach ($spec in $LedgerSpecs) {
     $ledger = $documents[$spec.path]
     Assert-JsonSchema $ledger $schema $schema '$'
@@ -2396,6 +2455,11 @@ foreach ($spec in $LedgerSpecs) {
     if ($features.Count -ne [int]$spec.expected_features) {
         Fail "$($spec.path) must contain exactly $($spec.expected_features) features"
     }
+    # Computed here but asserted after the per-feature checks and the stored
+    # digest comparison, so a mutation those catch keeps its own specific
+    # rejection reason. This check is the residual: it exists for descriptive
+    # edits that nothing else covers.
+    $computedFrozenDigests[[string]$spec.path] = Get-LedgerFrozenDigest $features
     $computedLedgerDigests[[string]$spec.path] = Get-FeatureDigest $features
 }
 
@@ -2437,6 +2501,18 @@ foreach ($spec in $LedgerSpecs) {
 }
 if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47) {
     Fail "fixed ledger totals must be 3 ledgers and 47 features"
+}
+# Runs in write mode too, so -WriteLedgerDigests cannot re-bless a ledger whose
+# frozen text was edited: the regeneration command can only ever move the file
+# digest for a status or evidence change. It fails before it writes.
+foreach ($spec in $LedgerSpecs) {
+    if (-not (Test-OrdinalStringEqual `
+                ([string]$computedFrozenDigests[[string]$spec.path]) `
+                ([string]$spec.frozen_digest))) {
+        Fail ("$($spec.path) frozen feature text changed; only status, " +
+            "acceptance_evidence.status, acceptance_evidence.artifacts, " +
+            "implementation_pointers and known_differences may change")
+    }
 }
 Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
 $missingEvidenceCount = $statusTotals["unimplemented"]
