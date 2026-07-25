@@ -10,9 +10,9 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `baseline.json` | frozen, never changes |
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
-| `enabled-test-oracle.json` (85 cases) | frozen, digest hardcoded in `validate.ps1` |
+| `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
-| `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence`, `implementation_pointers` and `known_differences` may change |
+| `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
 
 ## Validation
@@ -111,20 +111,34 @@ line matcher:
 - Line comments, doc comments, nested block comments, normal strings, byte
   strings, raw strings and char literals are discarded **before** any matching,
   so Rust-shaped text inside a comment or a string literal can never be cited.
+- A **macro invocation is consumed whole**, so a `#[test] fn` spelled inside a
+  token tree is never a test. `stringify!({} #[test] fn forged() {})`,
+  `discard! { #[test] fn forged() {} }` and the body of a `macro_rules!`
+  definition all fail, in all three delimiter forms. A malformed token tree
+  fails closed: scanning stops rather than resuming inside the tree. An
+  invocation that *is* the item — including one written `::std::thread_local!`
+  — is skipped without hiding the real test that follows it.
 - A `#[test]` attribute must attach to the **cited function itself**. An
   unrelated test attribute earlier in the file does not bless a later ordinary
   function.
 - In-file module identity is exact. A test declared in `mod real_module` must be
   cited as `real_module::the_test`; neither a bare name nor a fabricated module
   path matches it.
-- Function-level `#[ignore]`, `#[cfg(...)]` and `#[cfg_attr(...)]` disqualify the
-  test.
-- An enclosing inline module, and any `#![...]` inner attribute, may carry no
-  `cfg` at all or exactly `cfg(test)`. Every other predicate — `cfg(any())`,
-  `cfg(not(test))`, `cfg(all(test))`, feature gates — plus `cfg_attr` and
-  `ignore` disqualify the entire subtree, transitively through outer modules.
+- One rule governs `cfg` everywhere, on the function and on every enclosing
+  scope alike: an attribute may carry no `cfg` at all, or exactly `cfg(test)`.
+  Every other predicate — `cfg(any())`, `cfg(not(test))`, `cfg(all(test))`,
+  `cfg(test = "disabled")`, feature gates — plus `cfg_attr` and `ignore`
+  disqualifies. A function-level `#[cfg(test)] #[test] fn` is therefore
+  **accepted**, because such a test genuinely does run under `cargo test`;
+  disqualifying it would reject honest evidence. On an enclosing module the
+  disqualification is transitive through outer modules.
 - `#[test]` and `#[tokio::test]` are both accepted; any attribute path whose last
   segment is `test` counts, which is intentionally broad.
+- Identifiers may contain non-ASCII characters, so a macro named with a CJK or
+  other non-ASCII identifier is still recognised as a macro rather than leaking
+  its token tree out as items. An unrecognised byte is itself a token, so a
+  stray byte in front of an attribute opens an item that swallows it — also
+  fail-closed.
 
 Because carriage return is ASCII whitespace to the tokenizer, a CRLF checkout on
 Windows and an LF checkout on Linux produce identical tokens and therefore
@@ -149,9 +163,10 @@ binding in one direction only:
 #### The drift check is mechanical, not manual
 
 `enabled-test-oracle.json` is a **shared fixture corpus** that both
-implementations must classify identically. It holds 85 cases — the 22 cases of
+implementations must classify identically. It holds 120 cases — the 22 cases of
 the harness's own `evidence_requires_an_enabled_test_declaration` unit test, plus
-63 lexer, attribute, item-shape, module-identity and citation-shape cases.
+98 lexer, attribute, item-shape, module-identity, citation-shape, macro,
+function-level `cfg` and stray-byte cases.
 
 `validate.ps1` replays every case through `Test-DeclaresEnabledRustTest` on
 **every run**, before any evidence is judged, and fails with
@@ -178,47 +193,167 @@ never runs. Adding `crates/foo/src/orphan.rs`, never referencing it from any
 by code that is compiled into nothing.
 
 `validate.ps1` therefore also requires the cited path to be reached by a target
-that `cargo test` builds. The reachable set of the owning crate — the nearest
-ancestor directory whose `Cargo.toml` declares a `[package]` — is:
+that `cargo test` builds **and runs tests in**. The reachable set of the owning
+crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package]`
+— is:
 
 - `src/lib.rs` and `src/main.rs`;
-- every `*.rs` directly under `tests/`, `benches/`, `examples/` and `src/bin/`,
-  plus `<dir>/main.rs` for a subdirectory of those;
-- any target file named by an explicit `path = "..."` in the crate manifest;
+- every `*.rs` directly under `tests/` and `src/bin/`, plus `<dir>/main.rs` for a
+  subdirectory of those;
+- any target file named by an explicit `path = "..."` in a `[lib]`, `[[bin]]` or
+  `[[test]]` section of the crate manifest;
 - everything reached transitively from those roots by a `mod name;` declaration,
   resolving to `<scope>/name.rs` or `<scope>/name/mod.rs`, honouring
-  `#[path = "..."]`, and descending into inline `mod name { ... }` blocks.
+  `#[path = "..."]`, and descending into inline `mod name { ... }` blocks. A
+  restricted visibility (`pub(crate) mod name;`, `pub(super)`, `pub(in ...)`) is
+  a declaration like any other.
 
-`build.rs` is deliberately **not** a root: `cargo test` does not run tests in a
-build script, so a `#[test]` there never executes either.
+`#[path = "..."]` resolves the way `rustc` resolves it, which is **not** simply
+"relative to the module directory":
+
+- Outside an inline `mod { }` block, the path is relative to the directory
+  **holding the source file**. For `src/a/b.rs`, `#[path = "foo.rs"] mod c;`
+  names `src/a/foo.rs`, not `src/a/b/foo.rs`. The two coincide for *mod-rs*
+  files — crate roots and `mod.rs` — and differ for every other file.
+- Inside an inline `mod { }` block, the path is relative to the module directory
+  plus the inline components.
+- A path naming a `mod.rs` makes that module mod-rs, so **its** children resolve
+  beside it: `#[path = "sub/mod.rs"] mod two;` puts `two`'s children in `sub/`,
+  not in `sub/mod/`.
+- The value may be a raw string (`#[path = r"foo.rs"]`).
+- A `path` attribute whose value this reader cannot resolve resolves to
+  **nothing**. It must never fall back to resolving by module name, or an
+  attribute pointing at one file blesses another.
+
+Getting any of these wrong is a forgery vector and not merely a false rejection,
+because each wrong answer names a *specific* other file — one that nothing
+compiles — and blesses it. Each has a decoy planted at the wrong location in
+`validate-self-test.ps1`.
+
+Four kinds of target are deliberately **excluded**, because `cargo test` does not
+run `#[test]` items in any of them. Each was measured against `cargo metadata`
+rather than recalled:
+
+- `build.rs`. `cargo test` does not run tests in a build script.
+- `benches/` and `examples/`. Bench and example targets default to
+  `test = false`. The file is compiled, and the `#[test]` inside it never runs.
+  This needs no manifest edit — a file dropped in `examples/` is enough.
+- Any target with an explicit `test = false`.
+- Any target with `harness = false`, whose own `main()` replaces the libtest
+  harness and makes every `#[test]` item in the file inert.
+
+Auto-discovery is suppressed by `autotests = false` and `autobins = false`, and a
+file named by an explicit target section is governed by that section alone —
+auto-discovery must not resurrect a target the manifest disabled.
 
 Three limits, stated plainly rather than left to be discovered:
 
-- The rule catches files that **nothing references**. It does not evaluate `cfg`
-  predicates, so a module behind `#[cfg(feature = "off-by-default")]` still
-  counts as referenced even though `cargo test` would not run it by default.
-  Evaluating predicates would reject honest evidence, and the disclosed vector is
-  the unreferenced file.
-- Reachability is computed within the owning crate. A file pulled in only by a
+- The rule catches files that **nothing references**, and targets that
+  `cargo test` does not run. It does not evaluate `cfg` predicates, so a module
+  behind `#[cfg(feature = "off-by-default")]` still counts as referenced even
+  though `cargo test` would not run it by default. Nor does it resolve
+  `required-features`: a target gated on a non-default feature is still treated
+  as a root. `cargo metadata` does not filter on `required-features` either — it
+  reports such targets with `test = true` — so both implementations are
+  permissive here by the same rule. Evaluating either would reject honest
+  evidence, and the disclosed vector is the unreferenced file.
+- Reachability is computed within the owning crate: the crate that owns the
+  *cited* file must itself reach it. A file pulled in only by a
   `#[path = "..."]` from a *different* crate is not recognised; cite a test in
-  the crate that compiles it. No file in this repository is in that position —
-  the three real `#[path]` uses all resolve within their own crate.
+  the crate that compiles it. One real cross-crate `#[path]` exists —
+  `apps/gta-claw-cli/tests/gateway_health.rs` reaches into
+  `crates/claw-gateway-client/tests/support/mod.rs` — and nothing is lost by it,
+  because a `mod support;` in that crate's own `tests/gateway_client.rs` reaches
+  the same file.
 - It proves a file is compiled and a test is enabled. It does not prove the test
   passes; that is `cargo test`'s job.
 
-This rule is **locally owned**, not ported. `crates/claw-conformance` does not
-implement it yet, so this validator is currently the stricter of the two. That
-asymmetry is safe in this direction: it can only reject a citation the harness
-would have accepted, and an unreferenced file is never legitimate evidence. The
-specification above is deliberately complete enough to be mirrored; the seven
-`implemented-citing-*` cases in `validate-self-test.ps1` are its executable form —
-four that must be rejected and three that must be accepted.
+This rule is **shared, not locally owned**. `crates/claw-conformance` implements
+the same rule — "a target root, or reachable from a target root" — after a
+proposal to require the cited file to *be* a target root was put to the
+compatibility owner and then withdrawn: target-root-only left 225 tests across
+34 files in 9 crates with no legal citation at all, and the only workaround was
+widening the visibility of private items in production code, which would have
+let the ledger dictate the API surface.
+
+The two implementations are therefore intended to be **identical**, not merely
+ordered. A divergence in *either* direction is a defect and must be reported
+rather than managed: if this validator were the looser side, a row it blesses
+could be rejected by the parity report. The specification above is deliberately
+complete enough to be mirrored; the twenty-three `implemented-citing-*` cases in
+`validate-self-test.ps1` are its executable form — thirteen that must be rejected
+and ten that must be accepted.
+
+The root set is derived here by reading the manifest rather than by shelling out
+to `cargo metadata`, which keeps this trust root hermetic: it reads files and
+executes nothing. That is a deliberate trade. It costs exactness at the margins
+of cargo's auto-discovery rules, and it means the per-kind defaults above are a
+model of cargo rather than cargo's own answer — a model that was **wrong** once
+already, when `benches/` and `examples/` were treated as roots. Where the two
+differ today, this validator is the stricter side: `harness = false` cannot be
+expressed in `cargo metadata` at all, which still reports such a target as
+`test = true`.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. The three accepting cases — a `mod`-wired module, a
-`#[path]`-relocated module, and a transitive `lib.rs` → `nested/mod.rs` →
-`nested/deep.rs` chain — exist so that a later "improvement" to this rule cannot
-quietly turn it into a false-rejection engine without turning the self-test red.
+true-positive ones. Eight of the ten accepting cases pin reachability — a
+`mod`-wired module, a `#[path]`-relocated module, a transitive `lib.rs` →
+`nested/mod.rs` → `nested/deep.rs` chain, a `src/bin/` target, a top-level
+`#[path]` sibling, the child of a `#[path]`-named `mod.rs`, a raw-string
+`#[path]`, and a `pub(crate) mod` — so that a later "improvement" to this rule
+cannot quietly turn it into a false-rejection engine without turning the
+self-test red. The other two pin the enabled-test oracle. The `src/bin/` case is
+there specifically because dropping `benches/` and `examples/` from the root set
+must not take `src/bin/` with them.
+
+Four of those accepting cases were added after a peer implementation's
+adversarial review found the corresponding bugs here, each proved by execution
+against a planted tree rather than argued: a six-line file with three top-level
+`#[path]` declarations produced **two false acceptances and four false
+rejections**. A fifth, `pub(crate) mod`, was found by sweeping the real tree
+after a merge: `Get-RustSkipVisibility` takes three parameters and the module
+walk was calling it with two, so PowerShell supplied `0` for the end bound and
+the walk could not step over the visibility group. The enabled-test oracle called
+the same function correctly. **A rule verified only against a corpus cannot find
+a divergence the corpus does not exercise** — which is why the whole-tree sweep
+runs on every change and why its result is reported as a per-file verdict list
+rather than as a count.
+
+#### A row may not rewrite its own acceptance bar
+
+Each row carries `acceptance_evidence.required` — a sentence stating what parity
+means for that feature, written when the baseline was frozen and nothing was
+implemented. It is contract text, not a working field.
+
+Making the ledger digests regenerable is what transitions require, but it also
+removed the only thing that had been holding every *descriptive* field in place.
+Without a second freeze, a session recording a transition could rewrite
+`required` from "A Rust protocol constant test proves v4 negotiation and rejects
+unsupported general-client versions" to "A test exists", re-bless the digest
+through the documented command, and pass — having set the bar it was judged
+against. The same edit works on `title`, `tier`, `domain`, `profile` and
+`upstream_source.paths`, which is the surface the row is measured over.
+
+`validate.ps1` therefore pins a second digest per ledger, over the **frozen
+projection** of its rows: every field except `status`,
+`acceptance_evidence.status`, `acceptance_evidence.artifacts`,
+`implementation_pointers` and `known_differences`. Those five are the entire
+mutable surface; everything else must hash to `frozen_digest` in `$LedgerSpecs`.
+
+Two properties make this hold:
+
+- the constant lives in `validate.ps1`, so `-WriteLedgerDigests` cannot reach it,
+  exactly like the inventory, schema and corpus digests;
+- it is checked in **both** modes, so `-WriteLedgerDigests` also exits non-zero on
+  a ledger whose frozen text moved, rather than reporting success.
+
+The barrier is the constant, not the command. `ledger-digests.sha256` is an
+ordinary file that anyone can recompute and write by hand, so the self-test
+assumes an attacker has already re-blessed it — every frozen-text case runs
+`-WriteLedgerDigests` first and must still be rejected. What stops the forgery is
+that no sidecar contents can satisfy a digest hardcoded in the script.
+
+An honest transition changes only the five mutable fields, so the projection does
+not move and the command works normally.
 
 ### Implementation pointers are not evidence
 
@@ -326,9 +461,9 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 185 child
+The adversarial self-test is a separate, slower step. It spawns 193 child
 validator processes — one baseline run against the real tree, one per each of the
-117 cases, and a re-blessing pre-run for the 67 cases that model an attacker who
+121 cases, and a re-blessing pre-run for the 71 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:

@@ -1,0 +1,304 @@
+// GTA-Claw plugin ABI.
+//
+// The package version is the ABI version. It is bumped according to the
+// compatibility policy documented in `crates/claw-plugin-api/src/abi.rs`:
+//
+//   * patch  - editorial only, no signature or semantic change.
+//   * minor  - additive host imports or additive optional guest exports.
+//              Older guests keep working against a newer host.
+//   * major  - any removal or incompatible change of an existing signature.
+//              A host only loads guests whose ABI major matches its own.
+//
+// Plugins are WebAssembly components. There is deliberately no `wasi:*`
+// import anywhere in this world: the host links this world and nothing else,
+// so a guest has no ambient filesystem, process, socket, environment or
+// high-resolution clock access. Every side effect is routed through an
+// explicitly granted, host-checked import below.
+package gta-claw:plugin@1.0.0;
+
+/// Value and error types shared by every interface in this world.
+interface types {
+    /// A semantic version triple. Pre-release and build metadata are not part
+    /// of the ABI surface.
+    record semver {
+        /// Incompatible ABI generation.
+        major: u32,
+        /// Additive ABI revision.
+        minor: u32,
+        /// Editorial ABI revision.
+        patch: u32,
+    }
+
+    /// Stable, machine-readable error classes.
+    ///
+    /// `permission-denied` is reserved for capability enforcement: it is
+    /// returned (or trapped on, depending on host policy) whenever a plugin
+    /// calls a host import that its grant set does not authorise.
+    enum error-code {
+        /// The guest supplied a malformed or out-of-range argument.
+        invalid-input,
+        /// The capability required by this call was not granted, or the call
+        /// fell outside the granted scope.
+        permission-denied,
+        /// The addressed entity does not exist.
+        not-found,
+        /// The entity exists but already exists in a conflicting state.
+        conflict,
+        /// A host-side quota was exhausted (payload size, store quota, or the
+        /// bounded host-call concurrency gate).
+        resource-exhausted,
+        /// The operation is well-formed but not supported by this host build.
+        unsupported,
+        /// The host failed for a reason the guest cannot act upon.
+        internal,
+    }
+
+    /// A host-side failure returned to the guest.
+    record error {
+        /// Machine-readable class.
+        code: error-code,
+        /// Human-readable detail. Never contains host secrets or absolute
+        /// host paths for `permission-denied`.
+        message: string,
+    }
+
+    /// Kinds of typed events the host can deliver to a plugin.
+    enum event-kind {
+        /// A conversation session was created.
+        session-started,
+        /// A conversation session was closed.
+        session-ended,
+        /// A chat message was observed.
+        message,
+        /// A tool invocation produced a result.
+        tool-result,
+        /// The plugin-scoped configuration changed.
+        config-changed,
+        /// Periodic liveness tick.
+        heartbeat,
+        /// The host is shutting the plugin down.
+        shutdown,
+    }
+
+    /// A typed event delivered to, or emitted by, a plugin.
+    record event {
+        /// Discriminant of `payload`.
+        kind: event-kind,
+        /// Monotonic per-plugin sequence number assigned by the host.
+        sequence: u64,
+        /// Opaque origin identifier (for example a session id).
+        source: string,
+        /// JSON-encoded payload whose shape is determined by `kind`.
+        payload: string,
+    }
+
+    /// A plugin's answer to `handle-event`.
+    record event-response {
+        /// Whether the plugin consumed the event.
+        handled: bool,
+        /// Optional JSON-encoded annotation for the host.
+        note: option<string>,
+    }
+
+    /// Identity a component reports about itself.
+    record plugin-info {
+        /// Must equal the `id` in the plugin manifest.
+        id: string,
+        /// Must equal the `version` in the plugin manifest.
+        version: semver,
+        /// ABI version this component was built against.
+        abi-version: semver,
+    }
+}
+
+/// Capability `log`: structured diagnostics.
+interface host-log {
+    use types.{error};
+
+    /// Severity of a log record.
+    enum level {
+        /// Very fine-grained tracing.
+        trace,
+        /// Developer diagnostics.
+        debug,
+        /// Normal operational information.
+        info,
+        /// Recoverable anomaly.
+        warn,
+        /// Failure the operator should see.
+        error,
+    }
+
+    /// Emit one log record. Records are attributed to the calling plugin and
+    /// truncated by the host to its configured payload limit.
+    log: func(lvl: level, message: string) -> result<_, error>;
+}
+
+/// Capability `config`: read-only access to the plugin's own configuration.
+interface host-config {
+    use types.{error};
+
+    /// Read one plugin-scoped configuration value.
+    get: func(key: string) -> result<option<string>, error>;
+
+    /// List the keys visible to this plugin, sorted lexicographically.
+    list-keys: func() -> result<list<string>, error>;
+}
+
+/// Capability `store`: plugin-scoped key/value persistence.
+///
+/// The store is namespaced per plugin id. It is not a filesystem and it never
+/// exposes host paths.
+interface host-store {
+    use types.{error};
+
+    /// Read a value.
+    get: func(key: string) -> result<option<list<u8>>, error>;
+
+    /// Write a value. Fails with `resource-exhausted` when the plugin's byte
+    /// quota would be exceeded.
+    set: func(key: string, value: list<u8>) -> result<_, error>;
+
+    /// Delete a value, returning whether a value was present.
+    delete: func(key: string) -> result<bool, error>;
+}
+
+/// Capability `filesystem-read` / `filesystem-write`: scoped file access.
+///
+/// Every path is resolved against the grant's roots. Absolute paths, `..`
+/// segments and symlinks that escape a root are rejected with
+/// `permission-denied`; the host never opens a path it did not resolve.
+interface host-fs {
+    use types.{error};
+
+    /// Read a whole file below a granted read root.
+    read-file: func(path: string) -> result<list<u8>, error>;
+
+    /// Write a whole file below a granted write root.
+    write-file: func(path: string, contents: list<u8>) -> result<_, error>;
+
+    /// List the direct entries of a directory below a granted read root.
+    list-dir: func(path: string) -> result<list<string>, error>;
+}
+
+/// Capability `http`: outbound request/response over a host-owned transport.
+interface host-http {
+    use types.{error};
+
+    /// An outbound request.
+    record request {
+        /// Uppercase HTTP method.
+        method: string,
+        /// Absolute URL. Only `https` is accepted unless the grant opts in to
+        /// plaintext.
+        url: string,
+        /// Header name/value pairs. Hop-by-hop and authorization headers are
+        /// filtered by the host.
+        headers: list<tuple<string, string>>,
+        /// Optional request body.
+        body: option<list<u8>>,
+    }
+
+    /// An inbound response.
+    record response {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers as returned by the transport.
+        headers: list<tuple<string, string>>,
+        /// Response body.
+        body: list<u8>,
+    }
+
+    /// Perform one request. The host enforces the method allowlist, the host
+    /// allowlist and the response size limit before any transport runs.
+    send: func(req: request) -> result<response, error>;
+}
+
+/// Capability `clock`: coarse wall clock.
+///
+/// The host quantises the answer so plugins cannot build a high-resolution
+/// timer for side-channel measurements.
+interface host-clock {
+    use types.{error};
+
+    /// Milliseconds since the Unix epoch, rounded down to `resolution-ms`.
+    now-ms: func() -> result<u64, error>;
+
+    /// The quantisation step applied to `now-ms`.
+    resolution-ms: func() -> result<u64, error>;
+}
+
+/// Capability `random`: host-provided randomness.
+interface host-random {
+    use types.{error};
+
+    /// Fill `len` bytes. `len` is bounded by the host payload limit.
+    get-bytes: func(len: u32) -> result<list<u8>, error>;
+}
+
+/// Capability `tools`: tool registration and dispatch.
+interface host-tools {
+    use types.{error};
+
+    /// Metadata for a tool a plugin offers.
+    record tool-descriptor {
+        /// Tool name, unique within the plugin.
+        name: string,
+        /// One-line description.
+        summary: string,
+        /// JSON Schema for the tool input.
+        input-schema: string,
+    }
+
+    /// Register a tool. Re-registering the same name replaces it.
+    register: func(tool: tool-descriptor) -> result<_, error>;
+
+    /// Remove a tool, returning whether it was registered.
+    unregister: func(name: string) -> result<bool, error>;
+}
+
+/// Capability `events`: publish typed events back to the host.
+interface host-events {
+    use types.{error, event};
+
+    /// Emit an event. The host overwrites `sequence` with its own counter.
+    emit: func(evt: event) -> result<_, error>;
+}
+
+/// The lifecycle surface every plugin component must export.
+interface guest {
+    use types.{error, event, event-response, plugin-info};
+
+    /// Report identity. Called after instantiation and before `activate`; the
+    /// host rejects the plugin when this disagrees with the manifest.
+    describe: func() -> plugin-info;
+
+    /// Enter the active state. The plugin may register tools and read
+    /// configuration here.
+    activate: func() -> result<_, error>;
+
+    /// Leave the active state and release plugin-side resources.
+    deactivate: func() -> result<_, error>;
+
+    /// Handle one typed event.
+    handle-event: func(evt: event) -> result<event-response, error>;
+
+    /// Invoke one of this plugin's registered tools with a JSON payload.
+    invoke-tool: func(name: string, input: string) -> result<string, error>;
+}
+
+/// The GTA-Claw plugin world.
+world plugin {
+    import types;
+    import host-log;
+    import host-config;
+    import host-store;
+    import host-fs;
+    import host-http;
+    import host-clock;
+    import host-random;
+    import host-tools;
+    import host-events;
+
+    export guest;
+}

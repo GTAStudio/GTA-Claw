@@ -292,8 +292,8 @@ export component GatewayOnboardingSurface inherits FocusScope {
         spacing: 0px;
 
         Rectangle {
-            min-height: 68px;
-            max-height: 68px;
+            min-height: max(68px, Metrics.control-large + 2 * Metrics.space-3);
+            max-height: self.min-height;
             vertical-stretch: 0;
             background: DesignTokens.surface-pane;
             border-width: 1px;

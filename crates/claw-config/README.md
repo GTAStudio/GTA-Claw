@@ -1,21 +1,31 @@
 # `claw-config`
 
 `claw-config` is the strict configuration boundary for the Rust workspace. It
-loads UTF-8 JSON5 into immutable typed snapshots, emits a generated JSON Schema,
-writes snapshots atomically, classifies transactional reloads, and converts the
-frozen GTA legacy environment contract without reading process environment
-state.
+loads UTF-8 JSON5 into immutable typed snapshots, emits generated JSON Schemas,
+writes snapshots atomically, resolves layered runtime configuration, publishes
+tear-free typed reload notifications, and converts the frozen GTA legacy
+environment contract without reading process environment state.
 
-The version 1 envelope requires `schema_version` and these implemented `core`
-domains:
+`OpenClawConfig` represents all 47 top-level domains in the frozen
+`config-domains` inventory. Fixed domains reject unknown keys and
+plugin-extensible domains preserve their named extension objects. The original
+version 1 runtime envelope remains additive and requires `schema_version` plus
+these `core` domains:
 
 `auth`, `role`, `channels`, `server`, `logging`, `sessions`, `copilot`,
 `legacy`, `updates`, `admin`, and `network`.
 
-Unknown envelope, domain, and implemented-field names are rejected. This crate
-does not represent or claim the other upstream OpenClaw configuration domains.
-Secrets are persisted only as `env:NAME` references; plaintext secret values
-cannot be constructed through the public API or loaded from JSON5.
+Unknown envelope, top-level domain, and fixed-field names are rejected. Secrets
+are persisted only as validated environment or platform-store references.
+`SecretRef` and `SecretMaterial` redact Debug, Display, and direct Serde output;
+the explicit platform store port is the only API that receives borrowed
+plaintext.
+
+Layered runtime resolution uses built-in, system, user, workspace, frozen
+legacy environment, then command-line precedence. Nested objects merge
+recursively while arrays and scalars replace lower layers. File migrations keep
+exact durable backups and expose rollback. `ConfigHub` and `ConfigFileWatcher`
+publish complete immutable snapshots and ordered typed notifications.
 
 Legacy conversion supports the runtime rows in
 `compat/legacy/config/env-mapping.json`, except `COPILOT_CLI_PATH`, because the
