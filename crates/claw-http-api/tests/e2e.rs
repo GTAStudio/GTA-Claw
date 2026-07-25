@@ -1,17 +1,20 @@
 //! End-to-end contract tests over real TCP sockets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use claw_http_api::{
     ApiConfig, BearerAuthenticator, BearerCredential, DeterministicRuntime, GenerationOutput,
-    HttpApi, InputMedia, InputMediaKind, InputMediaSource, ToolCall, ToolInvocation,
-    ToolInvocationContext, Usage, WebhookRoute,
+    HTTP_ENDPOINTS, HttpApi, InputMedia, InputMediaKind, InputMediaSource, ToolCall,
+    ToolInvocation, ToolInvocationContext, Usage, WebhookRoute,
 };
 use claw_security::authorization::{Role, Scope, ScopeSet};
 use http::HeaderValue;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,6 +27,54 @@ struct Server {
     task: JoinHandle<()>,
     mcp_task: JoinHandle<()>,
     api: HttpApi,
+}
+
+#[derive(Deserialize)]
+struct EndpointInventory {
+    counts: EndpointCounts,
+    items: Vec<EndpointInventoryItem>,
+}
+
+#[derive(Deserialize)]
+struct EndpointCounts {
+    total: usize,
+}
+
+#[derive(Deserialize)]
+struct EndpointInventoryItem {
+    method: String,
+    path: String,
+}
+
+#[test]
+fn registered_endpoint_set_exactly_matches_frozen_inventory() {
+    let inventory_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("compat")
+        .join("upstream")
+        .join("inventories")
+        .join("http-sse-endpoints.json");
+    let source = fs::read_to_string(&inventory_path).expect("read frozen HTTP endpoint inventory");
+    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
+    let inventory: EndpointInventory =
+        serde_json::from_str(source).expect("parse frozen HTTP endpoint inventory");
+
+    let frozen = inventory
+        .items
+        .into_iter()
+        .map(|endpoint| (endpoint.method, endpoint.path))
+        .collect::<BTreeSet<_>>();
+    let registered = HTTP_ENDPOINTS
+        .iter()
+        .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(inventory.counts.total, 18);
+    assert_eq!(frozen.len(), 18);
+    assert_eq!(HTTP_ENDPOINTS.len(), 18);
+    assert_eq!(registered.len(), 18);
+    assert_eq!(registered, frozen);
 }
 
 impl Drop for Server {
