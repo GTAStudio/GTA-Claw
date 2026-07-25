@@ -75,7 +75,11 @@ pub enum InputMediaKind {
 /// Validated source for one multimodal input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputMediaSource {
-    /// Remote HTTP(S) source to be resolved by the application adapter.
+    /// Untrusted remote HTTP(S) source to be resolved by the application adapter.
+    ///
+    /// Parsing only proves URL syntax. Adapters that fetch this source must
+    /// enforce SSRF policy on the resolved address, connect to that validated
+    /// address, and repeat validation for every redirect.
     Url(String),
     /// Base64-encoded inline source.
     Base64 {
