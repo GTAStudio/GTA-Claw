@@ -29,7 +29,7 @@ members = [
   "crates/claw-skills",
   "crates/claw-tools",
 ]
-exclude = ["desktop"]
+exclude = ["android", "desktop", "ios"]
 resolver = "3"
 
 [workspace.dependencies]
