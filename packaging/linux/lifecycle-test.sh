@@ -526,6 +526,18 @@ assert_disabled_and_inactive
 assert_preserved "$deb_inactive_upgrade_snapshot"
 deb_inactive_snapshot="$(state_snapshot)"
 establish_package_runtime_fence
+install_initializer_stop_denial
+if sudo dpkg --remove gta-claw; then
+  die "Debian package-fenced removal ignored a late initializer-stop failure"
+fi
+case "$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)" in
+  masked | masked-runtime) ;;
+  *) die "Debian package-fenced rollback removed the runtime mask" ;;
+esac
+[[ -e /run/gta-claw-state-init/initialization-failed &&
+  -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "Debian package-fenced rollback lost its authenticated markers"
+remove_initializer_stop_denial
 sudo dpkg --remove gta-claw
 [[ ! -e /run/gta-claw-state-init/initialization-failed &&
   ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
@@ -665,6 +677,18 @@ assert_disabled_and_inactive
 assert_preserved "$rpm_inactive_upgrade_snapshot"
 rpm_inactive_snapshot="$(state_snapshot)"
 establish_package_runtime_fence
+install_initializer_stop_denial
+if sudo rpm -e --nodeps gta-claw; then
+  die "RPM package-fenced removal ignored a late initializer-stop failure"
+fi
+case "$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null || true)" in
+  masked | masked-runtime) ;;
+  *) die "RPM package-fenced rollback removed the runtime mask" ;;
+esac
+[[ -e /run/gta-claw-state-init/initialization-failed &&
+  -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "RPM package-fenced rollback lost its authenticated markers"
+remove_initializer_stop_denial
 sudo rpm -e --nodeps gta-claw
 [[ ! -e /run/gta-claw-state-init/initialization-failed &&
   ! -e /run/gta-claw-state-init/replacement-fenced ]] ||

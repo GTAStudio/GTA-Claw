@@ -14,6 +14,8 @@ runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 replacement_fence=$runtime_directory/replacement-fenced
 remove_initializer_was_active=$runtime_directory/remove-was-active
+remove_prepared=$runtime_directory/remove-prepared
+remove_was_package_fenced=$runtime_directory/remove-was-package-fenced
 lock=/var/lib/gta-claw-protected/state.writer.lock
 
 lock_holder_pid() {
@@ -36,6 +38,9 @@ ensure_failure_fence() {
     return 1
   fi
   touch "$failure_marker"
+  touch "$replacement_fence"
+  chown 0:0 "$failure_marker" "$replacement_fence"
+  chmod 0644 "$failure_marker" "$replacement_fence"
 }
 
 verify_runtime_stopped() {
@@ -70,10 +75,7 @@ fence_failed_restore() {
 installed_count="$(
   rpm -q --qf '%%{NAME}\n' gta-claw 2>/dev/null | wc -l | tr -d ' '
 )"
-if [ "$installed_count" -gt 0 ] &&
-  { [ -e "$remove_was_active" ] || [ -e "$remove_was_enabled" ] ||
-    [ -e "$remove_was_enabled_runtime" ] ||
-    [ -e "$remove_initializer_was_active" ]; }; then
+if [ "$installed_count" -gt 0 ] && [ -e "$remove_prepared" ]; then
   if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fence_failed_restore
   fi
@@ -94,24 +96,39 @@ if [ "$installed_count" -gt 0 ] &&
       fence_failed_restore
     fi
   fi
-  if [ -e "$remove_initializer_was_active" ]; then
-    if ! systemctl start gta-claw-state-init.service; then
+  if [ -e "$remove_was_package_fenced" ]; then
+    if ! ensure_failure_fence; then
       fence_failed_restore
     fi
-  fi
-  if [ -e "$remove_was_active" ]; then
-    if ! systemctl start gta-claw-daemon.service; then
+    if ! systemctl mask --runtime gta-claw-daemon.service; then
       fence_failed_restore
     fi
-    if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+    if ! systemctl stop gta-claw-daemon.service; then
       fence_failed_restore
+    fi
+    verify_runtime_stopped
+  else
+    if [ -e "$remove_initializer_was_active" ]; then
+      if ! systemctl start gta-claw-state-init.service; then
+        fence_failed_restore
+      fi
+    fi
+    if [ -e "$remove_was_active" ]; then
+      if ! systemctl start gta-claw-daemon.service; then
+        fence_failed_restore
+      fi
+      if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+        fence_failed_restore
+      fi
     fi
   fi
   rm -f \
     "$remove_was_active" \
     "$remove_was_enabled" \
     "$remove_was_enabled_runtime" \
-    "$remove_initializer_was_active"
+    "$remove_initializer_was_active" \
+    "$remove_prepared" \
+    "$remove_was_package_fenced"
 fi
 
 if [ "$installed_count" -eq 1 ]; then

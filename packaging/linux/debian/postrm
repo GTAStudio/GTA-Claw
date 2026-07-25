@@ -13,6 +13,8 @@ if [ "$1" = "remove" ] && [ -z "${DPKG_ROOT:-}" ] &&
     /run/gta-claw-daemon.ready-for-replacement \
     /run/gta-claw-daemon.was-active \
     /run/gta-claw-state-init/remove-was-active \
+    /run/gta-claw-state-init/remove-prepared \
+    /run/gta-claw-state-init/remove-was-package-fenced \
     /run/gta-claw-state-init/initialization-failed \
     /run/gta-claw-state-init/replacement-fenced
 fi

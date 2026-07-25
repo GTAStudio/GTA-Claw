@@ -13,6 +13,8 @@ remove_was_active=/run/gta-claw-daemon.remove-was-active
 remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
 remove_was_enabled_runtime=/run/gta-claw-daemon.remove-was-enabled-runtime
 remove_initializer_was_active=$runtime_directory/remove-was-active
+remove_prepared=$runtime_directory/remove-prepared
+remove_was_package_fenced=$runtime_directory/remove-was-package-fenced
 lock=/var/lib/gta-claw-protected/state.writer.lock
 
 lock_holder_pid() {
@@ -108,6 +110,9 @@ fence_failed_runtime() {
 
 fence_failed_remove_restore() {
   ensure_failure_fence
+  touch "$replacement_fence"
+  chown 0:0 "$replacement_fence"
+  chmod 0644 "$replacement_fence"
   if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
     echo "gta-claw daemon could not be runtime-masked after removal recovery failure" >&2
   fi
@@ -173,6 +178,7 @@ stop_for_idempotent_configure() {
 }
 
 restore_remove_state() {
+  [ -e "$remove_prepared" ] || return
   if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fence_failed_remove_restore
   fi
@@ -193,6 +199,27 @@ restore_remove_state() {
       fence_failed_remove_restore
     fi
   fi
+  if [ -e "$remove_was_package_fenced" ]; then
+    ensure_failure_fence
+    touch "$replacement_fence"
+    chown 0:0 "$replacement_fence"
+    chmod 0644 "$replacement_fence"
+    if ! systemctl mask --runtime gta-claw-daemon.service; then
+      fence_failed_remove_restore
+    fi
+    if ! systemctl stop gta-claw-daemon.service; then
+      fence_failed_remove_restore
+    fi
+    verify_runtime_stopped
+    rm -f \
+      "$remove_was_active" \
+      "$remove_was_enabled" \
+      "$remove_was_enabled_runtime" \
+      "$remove_initializer_was_active" \
+      "$remove_prepared" \
+      "$remove_was_package_fenced"
+    return
+  fi
   if [ -e "$remove_initializer_was_active" ]; then
     if ! systemctl start gta-claw-state-init.service; then
       fence_failed_remove_restore
@@ -210,7 +237,9 @@ restore_remove_state() {
     "$remove_was_active" \
     "$remove_was_enabled" \
     "$remove_was_enabled_runtime" \
-    "$remove_initializer_was_active"
+    "$remove_initializer_was_active" \
+    "$remove_prepared" \
+    "$remove_was_package_fenced"
 }
 
 case "$1" in
