@@ -882,3 +882,60 @@ fn codex_home_override_is_injected_without_real_environment_access() {
     assert_eq!(plan.operation_count(), 2);
     assert!(!target.exists());
 }
+
+#[test]
+fn rollback_restores_preexisting_secret_value() {
+    let root = TestDir::new("secret-restore");
+    let source = root.join("codex-home");
+    let target = root.join("target");
+    write(
+        &source.join("config.toml"),
+        "api_key = \"replacement-secret\"\n",
+    );
+    let platform_paths = paths(&root, HostPlatform::Linux);
+    let signer = signer();
+    let plan = CodexMigrationProvider
+        .plan(&PlanContext {
+            paths: &platform_paths,
+            source: Some(&source),
+            target_root: &target,
+            overwrite: false,
+            signer: &signer,
+        })
+        .expect("plan secret replacement");
+    let secret_id = "codex-config-4a2082f529e356d5";
+    let mut secrets = MemorySecretStore::default();
+    secrets
+        .values
+        .insert(secret_id.to_owned(), SecretValue::new(b"original-secret"));
+    let receipt = {
+        let mut apply = ApplyContext {
+            target_root: &target,
+            backup_root: &root.join("backup"),
+            overwrite: false,
+            secret_store: &mut secrets,
+        };
+        CodexMigrationProvider
+            .apply(&mut apply, &plan)
+            .expect("apply secret replacement")
+    };
+    assert_eq!(
+        secrets.values.get(secret_id).expect("replacement").expose(),
+        b"replacement-secret"
+    );
+    {
+        let mut rollback = ApplyContext {
+            target_root: &target,
+            backup_root: &root.join("backup"),
+            overwrite: false,
+            secret_store: &mut secrets,
+        };
+        CodexMigrationProvider
+            .rollback(&mut rollback, &receipt)
+            .expect("rollback secret replacement");
+    }
+    assert_eq!(
+        secrets.values.get(secret_id).expect("restored").expose(),
+        b"original-secret"
+    );
+}
