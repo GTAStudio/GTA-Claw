@@ -1,0 +1,17 @@
+[package]
+name = "claw-relay"
+description = "Authenticated Chrome extension relay and policy-bounded CDP bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+subtle = "=2.6.1"
+
+[lints]
+workspace = true
