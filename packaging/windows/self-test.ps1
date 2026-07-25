@@ -125,6 +125,19 @@ try {
     Test-WixSource (Join-Path $scriptRoot 'wix\GtaClaw.wxs')
     $passed++
 
+    $workflow = [System.IO.File]::ReadAllText(
+        (Join-Path $repoRoot '.github\workflows\windows-packaging.yml')
+    )
+    foreach ($fetch in @(
+        'cargo fetch --manifest-path Cargo.toml --locked',
+        'cargo fetch --manifest-path desktop\Cargo.toml --locked'
+    )) {
+        if ($workflow -notmatch "(?m)^\s*$([regex]::Escape($fetch))\s*$") {
+            throw "Windows packaging workflow lacks complete locked dependency acquisition: $fetch"
+        }
+    }
+    $passed++
+
     $fakeCargoRoot = Join-Path $testRoot 'fake-cargo'
     [System.IO.Directory]::CreateDirectory($fakeCargoRoot) | Out-Null
     $fakeCargo = Join-Path $fakeCargoRoot 'cargo.cmd'
@@ -168,8 +181,8 @@ echo gta-claw-cli v0.1.0
     & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
     $passed++
 
-    if ($passed -ne 21) {
-        throw "Expected 21 self-tests, completed $passed."
+    if ($passed -ne 22) {
+        throw "Expected 22 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

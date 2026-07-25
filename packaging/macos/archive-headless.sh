@@ -36,7 +36,7 @@ assert_output_path "$checksum"
 safe_reset_dir "$stage"
 ensure_output_directory "$archive_root"
 install -m 0755 "$binary" "$stage/$component"
-printf '%s  %s\n' "$(sha256_file "$stage/$component")" "$component" >"$stage/SHA256SUMS"
+write_sha256_manifest "$stage" "$stage/SHA256SUMS"
 chmod 0644 "$stage/SHA256SUMS"
 find "$stage" -exec touch -t "$NORMALIZED_MTIME" {} +
 assert_no_javascript_payload "$stage"

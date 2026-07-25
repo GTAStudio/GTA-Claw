@@ -109,8 +109,8 @@ jobs:
       - name: Acquire locked Cargo dependencies
         shell: pwsh
         run: |
-          cargo fetch --manifest-path Cargo.toml --locked --target '${{ matrix.target }}'
-          cargo fetch --manifest-path desktop\Cargo.toml --locked --target '${{ matrix.target }}'
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop\Cargo.toml --locked
 
       - name: Build and inspect published package bytes offline
         shell: pwsh
