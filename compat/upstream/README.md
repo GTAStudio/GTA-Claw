@@ -11,6 +11,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
+| `reachability-corpus.json` (27 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
@@ -348,9 +349,9 @@ compatibility owner and then withdrawn: target-root-only left, at the time it wa
 proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
 and the only workaround was widening the visibility of private items in
 production code, which would have let the ledger dictate the API surface.
-Re-measured on the current tree — 276 tracked `.rs` files, counting `#[test]`
+Re-measured on the current tree — 292 tracked `.rs` files, counting `#[test]`
 occurrences in files this rule accepts that are not themselves target roots — the
-cost is now **768 tests across 99 files in 17 crates**. The figure is a lower
+cost is now **822 tests across 99 files in 17 packages**. The figure is a lower
 bound on the harm and it grows with every crate the fleet adds, which is why it
 is recorded with its method and denominator rather than as a bare number.
 
@@ -373,11 +374,12 @@ expressed in `cargo metadata` at all, which still reports such a target as
 `test = true`.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. Ten of the twelve accepting cases pin reachability — a
+true-positive ones. Twelve of the fourteen accepting cases pin reachability — a
 `mod`-wired module, a `#[path]`-relocated module, a transitive `lib.rs` →
 `nested/mod.rs` → `nested/deep.rs` chain, a `src/bin/` target, a top-level
 `#[path]` sibling, the child of a `#[path]`-named `mod.rs`, a raw-string
-`#[path]`, a `pub(crate) mod`, a glob-matched workspace member, and a package
+`#[path]`, an inline `#[path] mod { … }` block, a `#[path]` module nested inside
+one, a `pub(crate) mod`, a glob-matched workspace member, and a package
 carrying its own `[workspace]` — so that a later "improvement" to this rule
 cannot quietly turn it into a false-rejection engine without turning the
 self-test red. The other two pin the enabled-test oracle. The `src/bin/` case is
@@ -396,6 +398,58 @@ the same function correctly. **A rule verified only against a corpus cannot find
 a divergence the corpus does not exercise** — which is why the whole-tree sweep
 runs on every change and why its result is reported as a per-file verdict list
 rather than as a count.
+
+#### The sweep is silent on rules the tree never exercises
+
+The converse is equally true, and it is why `reachability-corpus.json` exists.
+Both implementations agree on the real tree — 292 files, 287 accepted, 5
+rejected, **zero per-file disagreements**. That agreement proves nothing about
+the two rules both sides changed most recently, because neither construct occurs
+anywhere in either tree: scanned at the time of writing, there are **zero inline
+`#[path]` modules and zero ambiguous `foo.rs` + `foo/mod.rs` pairs** in the
+repository. Two implementations could agree 287/5 forever with both fixes never
+once compared. A whole-tree sweep is the highest-yield instrument for rules the
+tree exercises and no instrument at all for rules it does not.
+
+`reachability-corpus.json` holds 27 synthetic workspaces — 13 that must be
+accepted and 14 that must be rejected — each a complete set of files, a cited
+path and the expected verdict. It covers explicit `test = false` targets, the
+three `#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
+both directions, package boundaries, and target roots in excluded and
+self-rooted workspaces.
+
+**Neither implementation is normative here.** The `arbiter` field records that
+every expectation was produced by running `cargo` and `rustc` against the
+fixture, not by asking either resolver what it thinks. Accepting cases place
+`compile_error!` decoys at each formerly wrong path, so a successful `cargo
+build` is itself proof that cargo compiles none of them; rejecting cases that
+model a non-building crate are ones `cargo` actually fails on. One expectation
+in this corpus was **written wrong by hand and corrected by the toolchain**: a
+package that is neither a workspace member nor excluded and carries no
+`[workspace]` table of its own makes `cargo` exit 101, which is why the corpus
+distinguishes a legal standalone package from an unbuildable orphan.
+
+`validate.ps1` pins this file structurally and by digest but deliberately does
+**not** materialize and replay it during a validation run. The resolver memoizes
+per crate directory, and seeding those caches from fixtures carried in a file
+that lives in the tree under audit would turn a convenience into a forgery
+vector. Behavioural replay belongs in a harness that runs each case in its own
+process against its own root, never in the read-only trust root. What
+`validate.ps1` does enforce is that no case may cite a path it does not itself
+define — otherwise a case could name a real repository file and assert a verdict
+about something the fixture never contained — and that no path may contain a dot
+segment, so no replayer can be induced to write outside its fixture root.
+
+**This file is the single copy.** `crates/claw-conformance` is expected to load
+it from `compat/upstream/reachability-corpus.json`, exactly as it already loads
+`compat/upstream/enabled-test-oracle.json`, and to replay it against `cargo`.
+A corpus that exists twice is not shared: it is two corpora that agree until one
+is edited, and the cheapest drift detector — comparing digests — is unavailable
+the moment the copies differ in whitespace or member order, which two independent
+serializers will do immediately. The schema is deliberately additive-only for
+that reason; a reader may ignore `schema_version`, `purpose`, `rule`, `arbiter`,
+`implementations` and each case's `why` and still see `name`, `files`, `cite` and
+`expect`.
 
 #### A row may not rewrite its own acceptance bar
 
@@ -540,9 +594,9 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 245 child
+The adversarial self-test is a separate, slower step. It spawns 257 child
 validator processes — one baseline run against the real tree, one per each of the
-147 cases, and a re-blessing pre-run for the 97 cases that model an attacker who
+153 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:

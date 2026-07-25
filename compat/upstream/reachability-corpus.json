@@ -1,0 +1,376 @@
+{
+    "schema_version":  1,
+    "purpose":  "Shared module-reachability differential corpus for the two independently owned resolvers. It exists because a whole-tree sweep is silent on any rule the repository never exercises: the tracked tree contains zero inline #[path] modules and zero ambiguous module pairs, so agreeing real-tree path sets prove nothing about either rule.",
+    "rule":  "A cited evidence path must be a target root, or a source file reachable from a test-enabled target root by explicit mod, inline mod, or #[path] traversal, within the package that owns it.",
+    "arbiter":  "cargo and rustc, executed against each fixture. Neither implementation is normative for reachability: every expectation below was produced by building or listing the fixture with the real toolchain, never written by hand or copied from either resolver.",
+    "implementations":  [
+                            {
+                                "path":  "crates/claw-conformance/src/claims.rs",
+                                "entry_point":  "CargoTestTargets"
+                            },
+                            {
+                                "path":  "compat/upstream/validate.ps1",
+                                "entry_point":  "Assert-EvidenceFileIsCompiled"
+                            }
+                        ],
+    "cases":  [
+                  {
+                      "name":  "ambiguity-directory-side",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/ambig.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/ambig/mod.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "mod ambig;\n"
+                                },
+                      "cite":  "crates/p/src/ambig/mod.rs",
+                      "expect":  "reject",
+                      "why":  "the other side of the same E0761"
+                  },
+                  {
+                      "name":  "ambiguity-file-side",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/ambig.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/ambig/mod.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "mod ambig;\n"
+                                },
+                      "cite":  "crates/p/src/ambig.rs",
+                      "expect":  "reject",
+                      "why":  "rustc E0761: both files answer one mod; NEITHER is compiled"
+                  },
+                  {
+                      "name":  "compiled-file-outside-any-package",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"decoy\"]\nresolver = \"2\"\n",
+                                    "decoy/Cargo.toml":  "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "decoy/src/lib.rs":  "#[path = \"../../shared/thing.rs\"]\nmod thing;\n",
+                                    "shared/thing.rs":  "#[test]\nfn shared_test() {}\n"
+                                },
+                      "cite":  "shared/thing.rs",
+                      "expect":  "reject",
+                      "why":  "DIVERGENCE PROBE. cargo genuinely compiles and runs thing::shared_test under decoy, but shared/thing.rs has no owning Cargo package. This validator attributes a cited file to its owning package first, so it rejects. An implementation that tests membership of a global compiled-file set may accept. Verified: \u0027cargo test -p decoy --lib -- --list\u0027 lists thing::shared_test."
+                  },
+                  {
+                      "name":  "cross-package-also-own-package-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"consumer\", \"decoy\"]\nresolver = \"2\"\n",
+                                    "consumer/Cargo.toml":  "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "consumer/src/lib.rs":  "#[path = \"../../decoy/src/proof.rs\"]\nmod proof;\n",
+                                    "decoy/Cargo.toml":  "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "decoy/src/lib.rs":  "mod proof;\n",
+                                    "decoy/src/proof.rs":  "#[test]\nfn cross_package_test() {}\n"
+                                },
+                      "cite":  "decoy/src/proof.rs",
+                      "expect":  "accept",
+                      "why":  "Same cross-package pull, but the file is ALSO reachable from its own package root. Pins the false-rejection direction: a package-boundary rule must not reject a file its own package legitimately compiles. Verified: both -p consumer and -p decoy list the test."
+                  },
+                  {
+                      "name":  "cross-package-only-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"consumer\", \"decoy\"]\nresolver = \"2\"\n",
+                                    "consumer/Cargo.toml":  "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "consumer/src/lib.rs":  "#[path = \"../../decoy/src/proof.rs\"]\nmod proof;\n",
+                                    "decoy/Cargo.toml":  "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "decoy/src/lib.rs":  "",
+                                    "decoy/src/proof.rs":  "#[test]\nfn cross_package_test() {}\n"
+                                },
+                      "cite":  "decoy/src/proof.rs",
+                      "expect":  "reject",
+                      "why":  "cargo DOES run this test, but only as part of consumer. The file is not reachable from its own package\u0027s roots, so it is not evidence for decoy. Verified: \u0027cargo test -p consumer --lib -- --list\u0027 lists proof::cross_package_test; \u0027-p decoy\u0027 lists nothing."
+                  },
+                  {
+                      "name":  "inline-path-mod-rs-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/actual/proof.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    #[path = \"proof.rs\"]\n    mod proof;\n}\n",
+                                    "crates/p/src/outer/proof.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/actual/proof.rs",
+                      "expect":  "accept",
+                      "why":  "#[path] on an inline mod renames the child directory; cargo compiles actual/proof.rs"
+                  },
+                  {
+                      "name":  "inline-path-mod-rs-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/actual/proof.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    #[path = \"proof.rs\"]\n    mod proof;\n}\n",
+                                    "crates/p/src/outer/proof.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/outer/proof.rs",
+                      "expect":  "reject",
+                      "why":  "where a reader carrying the inline module NAME would look"
+                  },
+                  {
+                      "name":  "inline-path-non-mod-rs-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/carrier.rs":  "#[path = \"deep\"]\nmod inner {\n    mod leaf;\n}\n",
+                                    "crates/p/src/carrier/deep/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n",
+                                    "crates/p/src/carrier/inner/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n",
+                                    "crates/p/src/deep/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "mod carrier;\n"
+                                },
+                      "cite":  "crates/p/src/deep/leaf.rs",
+                      "expect":  "accept",
+                      "why":  "a TOP-LEVEL inline path resolves against the directory holding the file, not the module directory"
+                  },
+                  {
+                      "name":  "inline-path-non-mod-rs-module-dir-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/carrier.rs":  "#[path = \"deep\"]\nmod inner {\n    mod leaf;\n}\n",
+                                    "crates/p/src/carrier/deep/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/deep/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "mod carrier;\n"
+                                },
+                      "cite":  "crates/p/src/carrier/deep/leaf.rs",
+                      "expect":  "reject",
+                      "why":  "module-directory base is wrong for a top-level inline path"
+                  },
+                  {
+                      "name":  "inline-path-plain-child-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/actual/plain.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    mod plain;\n}\n",
+                                    "crates/p/src/outer/plain.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/actual/plain.rs",
+                      "expect":  "accept",
+                      "why":  "the renamed directory governs plain children too"
+                  },
+                  {
+                      "name":  "nested-inline-path-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/host.rs":  "mod outer {\n    #[path = \"renamed\"]\n    mod inner {\n        mod leaf;\n    }\n}\n",
+                                    "crates/p/src/host/outer/inner/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n",
+                                    "crates/p/src/host/outer/renamed/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "mod host;\n",
+                                    "crates/p/src/renamed/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/host/outer/renamed/leaf.rs",
+                      "expect":  "accept",
+                      "why":  "a NESTED inline path resolves against the enclosing module directory"
+                  },
+                  {
+                      "name":  "nested-inline-path-file-dir-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/host.rs":  "mod outer {\n    #[path = \"renamed\"]\n    mod inner {\n        mod leaf;\n    }\n}\n",
+                                    "crates/p/src/host/outer/renamed/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/lib.rs":  "mod host;\n",
+                                    "crates/p/src/renamed/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/renamed/leaf.rs",
+                      "expect":  "reject",
+                      "why":  "file-directory base is wrong for a NESTED inline path"
+                  },
+                  {
+                      "name":  "peer1-explicit-bin-test-false-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"disabled\"\npath = \"src/disabled.rs\"\ntest = false\n",
+                                    "src/disabled.rs":  "fn main() {}\n\n#[test]\nfn forged_evidence_test() {}\n",
+                                    "src/lib.rs":  ""
+                                },
+                      "cite":  "src/disabled.rs",
+                      "expect":  "reject",
+                      "why":  "cargo test -- --list lists NOTHING: test=false means libtest never runs this target\u0027s tests. Verified against cargo."
+                  },
+                  {
+                      "name":  "peer2-top-level-path-sibling",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/a.rs":  "#[path = \"b.rs\"]\nmod c;\n",
+                                    "crates/p/src/a/b.rs":  "compile_error!(\"decoy\");\n",
+                                    "crates/p/src/b.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/lib.rs":  "mod a;\n"
+                                },
+                      "cite":  "crates/p/src/b.rs",
+                      "expect":  "accept",
+                      "why":  "A top-level #[path] inside src/a.rs resolves from src/, not src/a/."
+                  },
+                  {
+                      "name":  "peer2-top-level-path-sibling-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/a.rs":  "#[path = \"b.rs\"]\nmod c;\n",
+                                    "crates/p/src/a/b.rs":  "#[test]\nfn decoy_test() {}\n",
+                                    "crates/p/src/b.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/lib.rs":  "mod a;\n"
+                                },
+                      "cite":  "crates/p/src/a/b.rs",
+                      "expect":  "reject",
+                      "why":  "The module-directory location is never compiled."
+                  },
+                  {
+                      "name":  "peer3-path-mod-rs-child",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"support/mod.rs\"]\nmod support;\n",
+                                    "crates/p/src/support/child.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/support/mod.rs":  "mod child;\n",
+                                    "crates/p/src/support/mod/child.rs":  "compile_error!(\"decoy\");\n"
+                                },
+                      "cite":  "crates/p/src/support/child.rs",
+                      "expect":  "accept",
+                      "why":  "A path-targeted mod.rs resolves children from its own directory, not from a \u0027mod\u0027 subdirectory."
+                  },
+                  {
+                      "name":  "peer3-path-mod-rs-child-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"support/mod.rs\"]\nmod support;\n",
+                                    "crates/p/src/support/child.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/support/mod.rs":  "mod child;\n",
+                                    "crates/p/src/support/mod/child.rs":  "#[test]\nfn decoy_test() {}\n"
+                                },
+                      "cite":  "crates/p/src/support/mod/child.rs",
+                      "expect":  "reject",
+                      "why":  "support/mod/child.rs is never compiled."
+                  },
+                  {
+                      "name":  "peer4-inline-path-propagates",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/actual/proof.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    #[path = \"proof.rs\"]\n    mod proof;\n}\n",
+                                    "crates/p/src/outer/proof.rs":  "compile_error!(\"decoy\");\n"
+                                },
+                      "cite":  "crates/p/src/actual/proof.rs",
+                      "expect":  "accept",
+                      "why":  "#[path] on an inline mod renames the child base directory."
+                  },
+                  {
+                      "name":  "peer4-inline-path-propagates-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/actual/proof.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    #[path = \"proof.rs\"]\n    mod proof;\n}\n",
+                                    "crates/p/src/outer/proof.rs":  "#[test]\nfn decoy_test() {}\n"
+                                },
+                      "cite":  "crates/p/src/outer/proof.rs",
+                      "expect":  "reject",
+                      "why":  "outer/proof.rs is never compiled once #[path] renames the base."
+                  },
+                  {
+                      "name":  "peer5-raw-string-path",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "#[path = r\"raw/proof.rs\"]\nmod proof;\n",
+                                    "crates/p/src/raw/proof.rs":  "#[test]\nfn evidence_test() {}\n"
+                                },
+                      "cite":  "crates/p/src/raw/proof.rs",
+                      "expect":  "accept",
+                      "why":  "Raw-string #[path] values must be read like normal strings."
+                  },
+                  {
+                      "name":  "peer6-ambiguity-directory-side",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/foo.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/foo/mod.rs":  "#[test]\nfn other_test() {}\n",
+                                    "crates/p/src/lib.rs":  "mod foo;\n"
+                                },
+                      "cite":  "crates/p/src/foo/mod.rs",
+                      "expect":  "reject",
+                      "why":  "Same ambiguity from the directory side; fail closed on both."
+                  },
+                  {
+                      "name":  "peer6-ambiguity-file-side",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/foo.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "crates/p/src/foo/mod.rs":  "#[test]\nfn other_test() {}\n",
+                                    "crates/p/src/lib.rs":  "mod foo;\n"
+                                },
+                      "cite":  "crates/p/src/foo.rs",
+                      "expect":  "reject",
+                      "why":  "rustc E0761: both candidates exist, so the crate does not build and NEITHER file is evidence."
+                  },
+                  {
+                      "name":  "peer7-excluded-workspace-root",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nexclude = [\"desktop\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "",
+                                    "desktop/app/Cargo.toml":  "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "desktop/app/src/lib.rs":  "#[test]\nfn evidence_test() {}\n",
+                                    "desktop/Cargo.toml":  "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n"
+                                },
+                      "cite":  "desktop/app/src/lib.rs",
+                      "expect":  "accept",
+                      "why":  "A workspace EXCLUDED from the root is still a real Cargo workspace; its target roots must be discovered, not skipped."
+                  },
+                  {
+                      "name":  "peer7-standalone-own-workspace-table-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "",
+                                    "trusted/policy/Cargo.toml":  "[package]\nname = \"policy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",
+                                    "trusted/policy/src/lib.rs":  "#[test]\nfn evidence_test() {}\n"
+                                },
+                      "cite":  "trusted/policy/src/lib.rs",
+                      "expect":  "accept",
+                      "why":  "A standalone package declares its own empty [workspace] table, which is how the real .github/trusted policy crate is declared. It is a real root and must be discovered. Verified: \u0027cargo test -- --list\u0027 inside it lists evidence_test."
+                  },
+                  {
+                      "name":  "peer7-unbuildable-orphan-package-reject",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "",
+                                    "trusted/policy/Cargo.toml":  "[package]\nname = \"policy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                                    "trusted/policy/src/lib.rs":  "#[test]\nfn evidence_test() {}\n"
+                                },
+                      "cite":  "trusted/policy/src/lib.rs",
+                      "expect":  "reject",
+                      "why":  "Package sits inside the workspace tree but is neither a member nor excluded and has no [workspace] table. Cargo REFUSES to build it (exit 101: \u0027current package believes it\u0027s in a workspace when it\u0027s not\u0027), so its tests can never run and it is not evidence. A directory-walking implementation would wrongly accept this."
+                  },
+                  {
+                      "name":  "unambiguous-file-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod solo;\n",
+                                    "crates/p/src/solo.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/solo.rs",
+                      "expect":  "accept",
+                      "why":  "name.rs alone is the other legitimate form"
+                  },
+                  {
+                      "name":  "unambiguous-mod-rs-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod solo;\n",
+                                    "crates/p/src/solo/mod.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/solo/mod.rs",
+                      "expect":  "accept",
+                      "why":  "mod.rs alone is the legitimate form and must NOT be caught by the ambiguity rule"
+                  }
+              ]
+}
