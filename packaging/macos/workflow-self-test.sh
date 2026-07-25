@@ -29,8 +29,8 @@ for rejected in \
   fi
 done
 
-release_policy="$(sed -n '/^  release-policy:/,/^  release-disabled:/p' "$workflow")"
-protected_release="$(sed -n '/^  protected-release:/,$p' "$workflow")"
+release_policy="$(sed -n '/^  release-policy:/,/^  protected-release-contract:/p' "$workflow")"
+protected_release="$(sed -n '/^  protected-release-contract:/,$p' "$workflow")"
 
 grep -F "github.event_name == 'workflow_dispatch' && inputs.release == true" \
   <<<"$release_policy" >/dev/null
@@ -44,15 +44,23 @@ grep -F "github.event_name == 'workflow_dispatch' && inputs.release == true" \
 grep -F 'environment: macos-release' <<<"$protected_release" >/dev/null
 grep -F 'actions/download-artifact@' <<<"$protected_release" >/dev/null
 grep -F 'if: always()' <<<"$protected_release" >/dev/null
-grep -F '"$distribution" release SHA256SUMS-macos' \
-  <<<"$protected_release" >/dev/null
-grep -F './packaging/macos/package.sh release' <<<"$protected_release" >/dev/null
-grep -F './packaging/macos/notarize.sh "$app"' <<<"$protected_release" >/dev/null
-grep -F 'Protected signing credential is missing' <<<"$protected_release" >/dev/null
-grep -F 'compression-level: 0' <<<"$protected_release" >/dev/null
 
+test "$(grep -c 'uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' <<<"$protected_release")" -eq 1
+# shellcheck disable=SC2016
+grep -F 'ref: ${{ needs.release-policy.outputs.release-sha }}' \
+  <<<"$protected_release" >/dev/null
+grep -F 'fetch-depth: 1' <<<"$protected_release" >/dev/null
+grep -F 'fetch-tags: false' <<<"$protected_release" >/dev/null
+grep -F 'persist-credentials: false' <<<"$protected_release" >/dev/null
+grep -F 'sparse-checkout: .github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh' \
+  <<<"$protected_release" >/dev/null
+grep -F 'sparse-checkout-cone-mode: false' <<<"$protected_release" >/dev/null
 if grep -E '^    env:' <<<"$protected_release" >/dev/null; then
   echo "protected release job must not define job-scoped secrets" >&2
+  exit 1
+fi
+if grep -E 'packaging/macos/.*\.sh' <<<"$protected_release" >/dev/null; then
+  echo "protected release job must not execute downloaded repository scripts" >&2
   exit 1
 fi
 if ! awk '
@@ -66,10 +74,5 @@ if ! awk '
   echo "release secrets must exist only in individual step env mappings" >&2
   exit 1
 fi
-if grep -E '(^|[[:space:]])(npm|npx|node|bun|pnpm)([[:space:]]|$)' \
-  "$workflow" >/dev/null; then
-  echo "JavaScript runtime command found in macOS workflow" >&2
-  exit 1
-fi
 
-echo "macOS workflow release-contract self-tests passed"
+echo "macOS workflow trust-boundary self-tests passed"
