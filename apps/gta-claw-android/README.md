@@ -104,9 +104,23 @@ transport itself is `cfg(unix)`-gated upstream and is not a dependency here.
 are reported as unsupported rather than retried; this client sends a token.
 
 **Pairing is not implemented.** `PairingRequired` is reported as needing another
-client. The scope set is also under revision upstream (`TalkSecrets`
-over-granted, `Pairing` missing across shared profiles); this crate requests only
-`operator.read` and has not yet been reviewed by the native-clients owner.
+client, and the frozen Android contract grants no pairing authority, so this is
+a permanent property of the surface rather than a gap to fill later.
+
+**This client requests less authority than it is allowed.** The frozen contract
+in `claw-clients` permits the Android operator UI profile
+`operator.admin`, `operator.approvals`, `operator.read`, `operator.talk.secrets`
+and `operator.write`. That is a ceiling, not a quota:
+`validate_gateway_profile` admits any subset of it. This crate requests
+`operator.read` alone, because it performs exactly four Gateway operations —
+connect, subscribe to state, shut down, and take then drop issued device tokens
+— and none of the other four scopes has a caller here. Scopes should arrive with
+the feature that needs them, so a reviewer can see the privilege and the code
+that uses it in the same diff. The tests in `src/session.rs` assert this against
+the contract itself rather than against a copy of it: one validates the real
+configuration through `validate_gateway_profile`, one confirms that adding
+`operator.pairing` is refused, and one reads the ceiling out of the surface
+contract and fails if this client ever silently widens to all of it.
 
 **No Android Keystore integration, and no SSH.** SSH is absent from this crate's
 dependency tree entirely, so its requirement for caller-provisioned key and
@@ -163,3 +177,13 @@ compilation result only.
 image or device on the machine that produced these results, and no CI job builds
 this crate for any Android target. Until a job runs against a real NDK in CI, no
 Android claim in this file should be treated as validated.
+
+**What a cross-compile does and does not prove.** A successful
+`cargo check`/`cargo clippy` for an Android target proves the Rust type-checks
+and that the NDK's target clang accepted every C dependency. It proves nothing
+about whether the application starts, whether the Gateway handshake succeeds
+over a real radio, whether reconnection survives a network change, or how any of
+this behaves under Android's process lifecycle. Those are the failures that only
+appear on hardware, and none of them is covered here. **The first person to run
+this on a device should expect to find things**, and finding them will not mean
+the checks above were wrong — it will mean they were measuring something else.
