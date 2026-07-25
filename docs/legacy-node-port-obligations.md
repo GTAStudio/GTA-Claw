@@ -10,17 +10,13 @@ the operational deletion checklist and does not relax those contracts.
 
 ## Current inventory boundary
 
-The branch base contains 18 TypeScript files. Four additional state files are already present on the
-in-flight persistence branch and are included in the coordinator-approved 22-file ceiling:
+The authoritative `origin/main` baseline contains exactly 18 TypeScript files. No `dist/` file,
+generated JavaScript output, or unmerged legacy feature path is grandfathered.
 
-- `src/state/contentScanner.ts`
-- `src/state/fileState.ts`
-- `src/state/memoryStore.ts`
-- `src/state/transcriptStore.ts`
-
-No `dist/` file is tracked, so no generated JavaScript output is grandfathered. The persistence
-branch's `tests/*.test.mjs` files are also not grandfathered; those tests must be ported to Rust or
-removed before that branch can coexist with the ratchet.
+PR #39 adds four `src/state/*.ts` modules and four `tests/*.test.mjs` files to the legacy runtime.
+Every one of those paths is intentionally outside the inventory and therefore fails this ratchet.
+If that feature is still required, it must be implemented in the assigned Rust memory/state crates
+or receive an explicit repository-policy decision; it cannot enter silently as legacy expansion.
 
 ## Module-by-module obligations
 
@@ -40,10 +36,6 @@ removed before that branch can coexist with the ratchet.
 | `src/loader/roleLoader.ts` | Bounded remote HTTP fetch, JSON/plain-text fallback, `content`/`prompt` precedence, optional model handling, and diagnostics. | No assigned runtime owner; likely shared network/config adapter | **Owner required.** `claw-config` models the URL but does not own this fetch lifecycle. |
 | `src/loader/skillLoader.ts` | Concurrent bounded remote fetch, per-skill validation, safe names, partial success, and input-order retention. | `claw-skills` | **Partial.** Legacy input is migration data only; signed Rust/WASI discovery and equivalent diagnostics must replace executable loading. |
 | `src/server.ts` | Rate limiting plus `/`, `/health`, `/auth/device`, `/chat`, `/api/messages`, WhatsApp webhook, admin reload, system, and allowlisted exec response contracts. | `claw-http-api` | **Blocked.** The Rust HTTP crate implements its frozen API surface, but these legacy routes and concrete `ApiServices` adapters are not all present. |
-| `src/state/contentScanner.ts` | NFKC normalization and rejection of invisible/bidi controls, unsafe controls, instruction override, role tags, and credential-exfiltration patterns. | `claw-memory` with a reviewed `claw-security` boundary | **Owner boundary unresolved.** The scanner must be shared by memory and transcript exposure without becoming an ad hoc security oracle. |
-| `src/state/fileState.ts` | Per-scope serialization, SHA-256 scoped paths, size-bounded JSON reads, mode-0600 atomic writes, corruption errors, and quarantine. | `claw-state` | **Blocked on in-flight persistence work.** Preserve atomicity, permissions, bounds, and quarantine behavior. |
-| `src/state/memoryStore.ts` | Scoped memory/user records, prompt snapshots, add/replace/remove/list tools, deduplication, capacity, pagination, unsafe-content blocking, and corrupt-state recovery. | `claw-memory` + `claw-state` | **Blocked on in-flight memory/state adapters and daemon/provider integration.** |
-| `src/state/transcriptStore.ts` | Bounded append/truncation, browsing, ranked search, unsafe-history blocking, retention, scoped persistence, and corrupt-state recovery. | `claw-memory` + `claw-state` | **Blocked on in-flight memory/state adapters and runtime integration.** |
 | `src/updater/sdkUpdater.ts` | Nonblocking installed/latest version reporting and optional package/CLI mutation. | No assigned signed-release updater | **Owner required.** Package-manager and curl self-mutation are deliberately forbidden; only verified signed releases may replace them. |
 | `src/utils/logger.ts` | Structured level-controlled logging used by every runtime component. | No assigned observability adapter | **Owner required.** Rust logs need not reproduce pino bytes, but lifecycle/error fields and secret redaction need acceptance coverage. |
 | `src/utils/proxy.ts` | `HTTPS_PROXY`/`HTTP_PROXY` precedence, global outbound dispatcher setup, redacted diagnostics, and continue-without-proxy failure behavior. | No assigned shared Rust HTTP transport owner | **Owner required.** Provider, role, channel, and skill transports must use one reviewed proxy policy. |
@@ -64,7 +56,7 @@ removed before that branch can coexist with the ratchet.
 
 ## Final deletion checklist
 
-1. Land the Rust provider, runtime, state, memory, tools, channels, HTTP, config, and shared network
+1. Land the Rust provider, runtime, state, tools, channels, HTTP, config, and shared network
    adapters with the exact dependency pins required by repository policy.
 2. Compose those adapters in `gta-claw-daemon`; no mock, metadata-only, or registry-only adapter
    satisfies a production obligation.

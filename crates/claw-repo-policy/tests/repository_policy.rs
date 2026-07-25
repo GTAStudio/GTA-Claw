@@ -43,10 +43,6 @@ const LEGACY_RUNTIME_INVENTORY: &[&str] = &[
     "src/loader/roleLoader.ts",
     "src/loader/skillLoader.ts",
     "src/server.ts",
-    "src/state/contentScanner.ts",
-    "src/state/fileState.ts",
-    "src/state/memoryStore.ts",
-    "src/state/transcriptStore.ts",
     "src/updater/sdkUpdater.ts",
     "src/utils/logger.ts",
     "src/utils/proxy.ts",
@@ -90,7 +86,7 @@ fn repository_legacy_javascript_surface_does_not_grow() {
             .iter()
             .filter(|path| path.ends_with(".ts") || path.ends_with(".tsx"))
             .count(),
-        22,
+        18,
         "the binding legacy TypeScript ceiling changed without an explicit ratchet update"
     );
     for required_root in [
