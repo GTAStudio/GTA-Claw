@@ -1145,7 +1145,12 @@ $cases = @(
                 "inventories/clients.json",
                 "feature-ledger.schema.json",
                 "baseline.json",
-                "manifest.json"
+                "manifest.json",
+                # git checks this out with CRLF on Windows and LF on Linux. Its
+                # digest is structural and every newline inside a case source is
+                # a \n escape, so both checkouts must reach the same digest and
+                # the same 85 verdicts.
+                "enabled-test-oracle.json"
             )
             foreach ($target in $targets) {
                 $path = Join-Path $caseRoot $target
