@@ -91,6 +91,27 @@ name = "claw-domain"
 version = "0.1.0"
 
 [[package]]
+name = "claw-gateway"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "claw-gateway-client",
+ "claw-protocol",
+ "claw-security",
+ "fastwebsockets",
+ "httparse",
+ "rand_chacha 0.10.0",
+ "ring",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha1",
+ "subtle",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "claw-gateway-client"
 version = "0.1.0"
 dependencies = [
@@ -141,6 +162,10 @@ dependencies = [
  "serde_path_to_error",
  "sha2",
 ]
+
+[[package]]
+name = "claw-repo-policy"
+version = "0.1.0"
 
 [[package]]
 name = "claw-security"

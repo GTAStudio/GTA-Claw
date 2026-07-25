@@ -42,6 +42,52 @@
         "official_client_interop"
       ]
     },
+    "feature_status": {
+      "enum": [
+        "unimplemented",
+        "partial",
+        "implemented"
+      ]
+    },
+    "acceptance_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "test"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+        },
+        "test": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*$"
+        }
+      }
+    },
+    "implementation_pointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "note"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "feature": {
       "type": "object",
       "additionalProperties": false,
@@ -115,13 +161,7 @@
           }
         },
         "status": {
-          "enum": [
-            "unimplemented",
-            "partial",
-            "implemented",
-            "blocked",
-            "not_applicable"
-          ]
+          "$ref": "#/$defs/feature_status"
         },
         "acceptance_evidence": {
           "type": "object",
@@ -141,9 +181,9 @@
             },
             "artifacts": {
               "type": "array",
+              "uniqueItems": true,
               "items": {
-                "type": "string",
-                "minLength": 1
+                "$ref": "#/$defs/acceptance_artifact"
               }
             },
             "required": {
@@ -162,6 +202,13 @@
           "items": {
             "type": "string",
             "minLength": 1
+          }
+        },
+        "implementation_pointers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/implementation_pointer"
           }
         }
       }
