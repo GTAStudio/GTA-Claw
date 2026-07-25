@@ -2,15 +2,6 @@ name: pinned upstream Gateway reference
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/upstream-gateway-reference.yml"
-      - "crates/claw-gateway-client/**"
-      - "crates/claw-protocol/**"
-      - "crates/claw-security/**"
-      - "compat/upstream/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "rust-toolchain.toml"
   workflow_dispatch:
 
 permissions:
@@ -21,164 +12,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  pinned-linux-reference:
-    name: OpenClaw b43e832 Linux reference
+  frozen-rust-reference:
+    name: Frozen OpenClaw b43e832 Rust contract
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-      npm_config_ignore_scripts: "true"
+    timeout-minutes: 30
     steps:
       - name: Checkout GTA Claw
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
 
-      - name: Verify frozen compatibility identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(jq -r .baseline_sha compat/upstream/manifest.json)" = \
-            "b43e832fcc8000ed7287c7accc54e381db607f85"
+      - name: Verify frozen compatibility snapshot
+        shell: pwsh
+        run: ./compat/upstream/validate.ps1
 
-      - name: Checkout exactly pinned official OpenClaw
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: openclaw/openclaw
-          ref: b43e832fcc8000ed7287c7accc54e381db607f85
-          path: _upstream/openclaw
-          persist-credentials: false
+      - name: Reject JavaScript toolchain artifacts
+        run: cargo test --locked --package claw-repo-policy --test repository_policy
 
-      - name: Verify checkout credential isolation
-        shell: bash
-        run: |
-          set -euo pipefail
-          for repository in "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/_upstream/openclaw"; do
-            if git -C "$repository" config --local --get-regexp \
-              '^(credential\..*|http\..*\.extraheader)$'; then
-              echo "checkout left credential configuration in $repository"
-              exit 1
-            fi
-          done
-          if git config --global --get-regexp \
-            '^(credential\..*|http\..*\.extraheader)$'; then
-            echo "runner global git configuration exposes credentials"
-            exit 1
-          fi
-
-      - name: Verify upstream checkout and lockfile
-        working-directory: _upstream/openclaw
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = \
-            "b43e832fcc8000ed7287c7accc54e381db607f85"
-          test "$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)" = \
-            "95563a2fd204c051c35b9ac4a88ce524317bc634cdca09c2afc6f44905d760fb"
-
-      - name: Install pinned Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 22.22.0
-
-      - name: Verify pinned official package identity
-        working-directory: _upstream/openclaw
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(node -p "require('./package.json').version")" = "2026.7.2"
-          test "$(node -p "require('./package.json').packageManager")" = \
-            "pnpm@11.2.2+sha512.36e6621fad506178936455e70247b8808ef4ec25797a9f437a93281a020484e2607f6a469a22e982987c3dbb8866e3071514ab10a4a1749e06edcd1ec118436f"
-
-      - name: Activate integrity-pinned pnpm
-        working-directory: _upstream/openclaw
-        shell: bash
-        run: |
-          set -euo pipefail
-          corepack enable
-          corepack install
-          pnpm_version="$(pnpm --version)"
-          printf 'pnpm=%s ignore-scripts=%s\n' "$pnpm_version" "$npm_config_ignore_scripts"
-          test "$pnpm_version" = "11.2.2"
-          test "$npm_config_ignore_scripts" = "true"
-
-      - name: Install and build pinned official Gateway
-        working-directory: _upstream/openclaw
-        shell: bash
-        run: |
-          set -euo pipefail
-          pnpm --config.ignore-scripts=true install --frozen-lockfile --ignore-scripts
-          test -d node_modules
-          if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
-            -type f -name '*.node' -print -quit 2>/dev/null | grep -q .; then
-            echo "unverified Matrix native lifecycle artifact was downloaded"
-            exit 1
-          fi
-          pnpm --config.ignore-scripts=true build
-          if find node_modules/@matrix-org/matrix-sdk-crypto-nodejs \
-            -type f -name '*.node' -print -quit 2>/dev/null | grep -q .; then
-            echo "build introduced an unverified Matrix native artifact"
-            exit 1
-          fi
-
-      - name: Start official Gateway in isolated reference boundary
-        working-directory: _upstream/openclaw
-        shell: bash
-        run: |
-          set -euo pipefail
-          token="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-          echo "::add-mask::$token"
-          echo "OPENCLAW_REFERENCE_TOKEN=$token" >> "$GITHUB_ENV"
-          echo "OPENCLAW_REFERENCE_URL=ws://127.0.0.1:18789" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/openclaw-reference-state"
-          OPENCLAW_SKIP_CHANNELS=1 \
-          OPENCLAW_STATE_DIR="$RUNNER_TEMP/openclaw-reference-state" \
-          OPENCLAW_GATEWAY_TOKEN="$token" \
-            node openclaw.mjs gateway \
-              --port 18789 \
-              --bind loopback \
-              --auth token \
-              --allow-unconfigured \
-              --ws-log compact \
-              >"$RUNNER_TEMP/openclaw-gateway.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/openclaw-gateway.pid"
-          ready=0
-          for _ in $(seq 1 120); do
-            if ! kill -0 "$(cat "$RUNNER_TEMP/openclaw-gateway.pid")" 2>/dev/null; then
-              break
-            fi
-            if node -e 'const net=require("node:net"); const s=net.connect(18789,"127.0.0.1",()=>{s.end();process.exit(0)}); s.on("error",()=>process.exit(1))'; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" = "1"
-
-      - name: Run Rust live handshake contract
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked \
-            --package claw-gateway-client \
-            --test upstream_reference \
-            -- --ignored --nocapture
-
-      - name: Show bounded redacted Gateway evidence on failure
-        if: failure()
-        shell: bash
-        run: |
-          if test -f "$RUNNER_TEMP/openclaw-gateway.log"; then
-            tail -c 65536 "$RUNNER_TEMP/openclaw-gateway.log" |
-              sed "s/${OPENCLAW_REFERENCE_TOKEN:-[unset]}/[REDACTED]/g"
-          fi
-
-      - name: Stop isolated official Gateway
-        if: always()
-        shell: bash
-        run: |
-          if test -f "$RUNNER_TEMP/openclaw-gateway.pid"; then
-            pid="$(cat "$RUNNER_TEMP/openclaw-gateway.pid")"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-          fi
+      - name: Test protocol and Gateway client against frozen contracts
+        run: >-
+          cargo test --locked
+          --package claw-protocol
+          --package claw-gateway-client

@@ -5,7 +5,7 @@ set -euo pipefail
 # GTA-Claw 一键部署脚本
 #
 # 用法:
-#   ./run.sh                          交互式部署
+#   ./run.sh                          部署原生 Rust 容器
 #   ./run.sh --config conf/gta-claw.conf  从配置文件部署
 #   ./run.sh --update                 更新镜像并重启
 #   ./run.sh --stop                   停止所有服务
@@ -343,55 +343,8 @@ do_config() {
   mv "$tmp_env" "$ENV_FILE"
   set_env_file_permissions
 
-  # 验证基础必填项
-  local has_error=0
-  for var in AGENT_ROLE_URL; do
-    if ! grep -Eq "^${var}=.+" "$ENV_FILE"; then
-      log_error "缺少必填配置: $var"
-      has_error=1
-    fi
-  done
-
-  local enable_teams
-  enable_teams="$(grep '^ENABLE_TEAMS=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'true')"
-  if [ "$enable_teams" = "true" ]; then
-    for var in MicrosoftAppId MicrosoftAppPassword; do
-      if ! grep -Eq "^${var}=.+" "$ENV_FILE"; then
-        log_error "ENABLE_TEAMS=true 时缺少必填配置: $var"
-        has_error=1
-      fi
-    done
-  fi
-
-  if [ "$has_error" -ne 0 ]; then
-    log_error "请检查配置文件并补充必填项"
-    rm -f "$ENV_FILE"
-    exit 1
-  fi
-
   validate_image_ref "$(grep '^DOCKER_IMAGE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'aizhihuxiao/gta-claw:latest')"
-  validate_positive_integer "$(grep '^RATE_LIMIT_PER_MIN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo '30')" "RATE_LIMIT_PER_MIN"
-  validate_boolean "$(grep '^AUTO_UPDATE=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "AUTO_UPDATE"
-  validate_boolean "$(grep '^TRUST_PROXY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "TRUST_PROXY"
-  validate_boolean "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" "DEVICE_FLOW_ENABLED"
-  validate_url "$(grep '^AGENT_ROLE_URL=' "$ENV_FILE" | cut -d'=' -f2-)" "AGENT_ROLE_URL"
-  validate_skills_urls "$(grep '^ENABLED_SKILLS=' "$ENV_FILE" | cut -d'=' -f2-)"
-  validate_auth_mode \
-    "$(grep '^GITHUB_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^DEVICE_FLOW_ENABLED=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
-    "$(grep '^GITHUB_CLIENT_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
-  validate_channel_mode \
-    "$(grep '^ENABLE_TEAMS=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'true')" \
-    "$(grep '^ENABLE_TELEGRAM=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
-    "$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^ENABLE_DISCORD=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
-    "$(grep '^DISCORD_BOT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^ENABLE_WHATSAPP=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || echo 'false')" \
-    "$(grep '^WHATSAPP_VERIFY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^WHATSAPP_ACCESS_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)" \
-    "$(grep '^WHATSAPP_PHONE_NUMBER_ID=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)"
-
-  log_info "配置文件验证通过"
+  log_info "容器镜像配置验证通过；旧版凭据仅保留为迁移输入"
   do_deploy
 }
 
@@ -618,7 +571,7 @@ do_deploy() {
   docker run -d \
     --name gta-claw \
     --restart unless-stopped \
-    --env-file "$ENV_FILE" \
+    --env GTA_CLAW_BIND=0.0.0.0:3978 \
     -p 3978:3978 \
     "$image" >/dev/null
 
@@ -649,7 +602,6 @@ do_deploy() {
 
   echo -e "${BOLD}═══════════════════════════════════════${NC}"
   log_info "健康检查: http://localhost:3978/health"
-  log_info "Bot 端点:  http://localhost:3978/api/messages"
   echo -e "${BOLD}═══════════════════════════════════════${NC}"
   echo ""
   log_info "查看日志: ./run.sh --logs"
@@ -730,7 +682,7 @@ do_help() {
   echo -e "${BOLD}GTA-Claw 部署脚本${NC}"
   echo ""
   echo "用法:"
-  echo "  ./run.sh                               交互式部署向导"
+  echo "  ./run.sh                               部署原生 Rust 容器"
   echo "  ./run.sh --config conf/gta-claw.conf   从配置文件部署"
   echo "  ./run.sh --update                      拉取最新镜像并重启"
   echo "  ./run.sh --stop                        停止所有服务"
@@ -782,12 +734,12 @@ case "${1:-}" in
     ;;
   *)
     check_prerequisites
-    # Auto-detect config: if conf/gta-claw.conf exists, use it; otherwise interactive
+    # Auto-detect the optional image configuration; legacy credentials remain migration input only.
     if [ -f "$SCRIPT_DIR/conf/gta-claw.conf" ]; then
       log_info "检测到配置文件 conf/gta-claw.conf，自动加载..."
       do_config "$SCRIPT_DIR/conf/gta-claw.conf"
     else
-      do_interactive
+      do_deploy
     fi
     ;;
 esac

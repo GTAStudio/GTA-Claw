@@ -1,241 +1,119 @@
-# GTA-Claw — Self-Governing AI Agent Engine
+# GTA-Claw
 
-> A pure empty-shell engine that dynamically loads roles and skills from remote URLs. Zero hardcoded intelligence.
+GTA-Claw is a Rust implementation of the OpenClaw-compatible runtime surface. The repository
+contains native headless binaries for Windows, macOS, and Linux, plus a Slint desktop application
+for Windows and macOS. Product builds, tests, packaging, and runtime paths do not require a
+JavaScript engine or package manager.
 
-📖 **Usage Guides / 使用教程**:
-- [中文使用指南](docs/usage-guide-zh.md)
-- [English Usage Guide](docs/usage-guide-en.md)
+## Workspaces
 
-## Quick Start
+The repository intentionally uses two Cargo workspaces:
 
-```bash
-# 1. Clone and configure
-cp .env.example .env
-# Edit .env with your credentials
+- The root workspace contains the headless CLI, daemon, protocol, Gateway client, security,
+  configuration, application, and platform crates.
+- `desktop/` contains the Slint application and is excluded from the root workspace so Linux
+  never resolves the Slint dependency graph.
 
-# 2. Deploy (docker-only, no compose needed)
-cd deploy
-chmod +x run.sh
-./run.sh
+Both workspaces use Rust edition 2024. The repository toolchain is pinned in
+`rust-toolchain.toml`, while workspace crates retain Rust 1.94.0 as their MSRV.
 
-# Or deploy from config file
-./run.sh --config conf/gta-claw.conf
+## Build and test
+
+```text
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
-## Architecture
+On Windows or macOS, validate the desktop workspace separately:
 
-```
-Internet → Reverse Proxy (:443 HTTPS) → GTA-Claw Engine (:3978)
-                                            │
-                                       ┌────┴───────────────────────┐
-                                       │  Multi-Channel Gateway      │
-                                       │  • Teams (Bot Framework)    │
-                                       │  • Telegram (Polling)       │
-                                       │  • Discord (Gateway/WS)     │
-                                       │  • WhatsApp (Webhook)       │
-                                       └───────────┬─────────────┘
-                                       ┌───────────┴─────────────┐
-                                       │ CopilotEngine             │
-                                       │ @github/copilot-sdk       │
-                                       └───────────┬─────────────┘
-                                       ┌───────────┴─────────────┐
-                                       │ ToolExecutor              │
-                                       │ isolated-vm sandbox       │
-                                       └─────────────────────────┘
+```text
+cargo check --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
+cargo test --manifest-path desktop/Cargo.toml --workspace --all-targets --locked
 ```
 
-**Core Principle**: The engine is an empty shell. All intelligence comes from:
-- **Role** (`AGENT_ROLE_URL`): System prompt + model selection loaded from a remote URL
-- **Skills** (`ENABLED_SKILLS`): Tool definitions + sandboxed code loaded from remote URLs
+Linux deliberately rejects the desktop application while continuing to build every headless
+target.
 
-## Configuration
+## Headless binaries
 
-### Required Environment Variables
+The root workspace provides:
 
-Authentication now supports two modes:
-- **PAT mode**: set `GITHUB_TOKEN`
-- **OAuth mode**: set `OAUTH_ENABLED=true` and OAuth variables below
+- `gta-claw-cli`: typed local health output and bounded OpenClaw Gateway diagnostics.
+- `gta-claw-daemon`: the persistent headless process with a bounded `GET /health` endpoint.
+  `--probe` checks native runtime identity and `--probe-http` checks the running endpoint.
 
-| Variable | Description |
-|----------|-------------|
-| `MicrosoftAppId` | Azure Bot Service App ID |
-| `MicrosoftAppPassword` | Azure Bot Service App Password |
-| `AGENT_ROLE_URL` | URL to role config JSON |
-| `ENABLED_SKILLS` | Comma-separated URLs to skill JSON modules |
+Examples:
 
-### Authentication Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GITHUB_TOKEN` | *(empty)* | PAT token for direct auth mode |
-| `DEVICE_FLOW_ENABLED` | `false` | Enable GitHub Device Flow authorization |
-| `GITHUB_CLIENT_ID` | *(empty)* | GitHub OAuth App Client ID (for Device Flow) |
-
-### Optional Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `COPILOT_MODEL` | `gpt-4o` | Default model (overridden by role config) |
-| `DOMAIN` | `localhost` | Domain for Caddy HTTPS |
-| `PORT` | `3978` | Internal server port |
-| `LOG_LEVEL` | `info` | Logging level |
-| `MAX_SESSIONS` | `100` | Max concurrent sessions |
-| `SESSION_TTL_MS` | `3600000` | Session idle timeout (1 hour) |
-| `SKILL_EXEC_TIMEOUT_MS` | `30000` | Skill execution timeout |
-| `SDK_REQUEST_TIMEOUT_MS` | `120000` | SDK request timeout |
-| `RATE_LIMIT_PER_MIN` | `30` | Per-IP rate limit for `/api/messages` |
-| `ALLOWED_SKILL_DOMAINS` | *(empty)* | Domain whitelist for skill HTTP calls |
-| `TRUST_PROXY` | `false` | Trust `x-forwarded-for` from upstream proxy |
-| `AUTO_UPDATE` | `false` | Auto-update SDK/CLI on startup |
-| `ADMIN_TOKEN` | *(empty)* | Token for admin endpoints |
-
-## Role Configuration
-
-Roles are hosted as JSON files at any accessible URL:
-
-```json
-{
-  "content": "You are a senior project architect. Your responsibilities include...",
-  "model": "claude-opus-4.6"
-}
+```text
+cargo run --bin gta-claw-cli -- health
+cargo run --bin gta-claw-daemon -- --probe
+cargo run --bin gta-claw-cli -- gateway health --endpoint ws://127.0.0.1:18789 --ephemeral-device
 ```
 
-- `content` (required): The system prompt defining the AI's persona and behavior
-- `model` (optional): Per-role model selection. Falls back to `COPILOT_MODEL` env var
+Use `cargo run --bin gta-claw-cli -- --help` for the complete diagnostic command contract.
 
-### Available Models
+## Desktop application
 
-| Category | Model | Multiplier |
-|----------|-------|-----------|
-| Reasoning | `claude-opus-4.6` | 3x |
-| Coding | `gpt-5.3-codex` | 1x |
-| Coding | `gpt-5.1-codex-max` | 1x |
-| Balanced | `claude-sonnet-4.6` | 1x |
-| Balanced | `gpt-5.1` | 1x |
-| Fast/Cheap | `gpt-5-mini` | 0x (free) |
-| Fast/Cheap | `claude-haiku-4.5` | 0.33x |
+The desktop application is built only on Windows and macOS:
 
-## Skill Module Format
-
-Skills are hosted as JSON files at any accessible URL:
-
-```json
-{
-  "name": "get_weather",
-  "description": "Get current weather for a location",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "city": { "type": "string", "description": "City name" }
-    },
-    "required": ["city"]
-  },
-  "executeCode": "async function(params, api) {\n  const resp = await api.httpGet('https://wttr.in/' + encodeURIComponent(params.city) + '?format=j1');\n  return JSON.parse(resp);\n}"
-}
+```text
+cargo run --manifest-path desktop/Cargo.toml --package gta-claw-desktop
 ```
 
-### Sandbox API
+The desktop workspace shares the audited Rust protocol and application crates but remains isolated
+from Linux dependency resolution.
 
-Skills execute in an isolated V8 sandbox with these bridges:
-- `api.httpGet(url)` — HTTP GET (domain whitelisted)
-- `api.httpPost(url, body, headers)` — HTTP POST (domain whitelisted)
-- `api.log(message)` — Log to host
+## Configuration and compatibility
 
-## Deployment
+`claw-config` owns strict JSON5 parsing, validation, atomic persistence, reload classification, and
+deterministic migration of audited legacy environment variables. Secrets are represented as
+references rather than serialized plaintext.
 
-`deploy/run.sh` uses docker-only mode (`docker pull` + `docker run`),
-without requiring docker compose.
+`compat/legacy/` contains inert schemas, fixtures, and ledgers describing the retired implementation
+contract. `compat/upstream/` is a frozen OpenClaw contract snapshot. These trees are data inputs for
+Rust validation only; the product does not execute fixture scripts. Legacy remotely supplied script
+skills require an explicit signed Rust/WASI port and are never evaluated by the runtime.
 
-### Interactive Mode
-```bash
-cd deploy
-./run.sh
-```
-Prompts for credentials, role URL, skills, model, channels, and advanced options.
+The frozen compatibility snapshot can be checked with:
 
-### Config File Mode
-```bash
-./run.sh --config conf/gta-claw.conf
+```text
+pwsh -File ./compat/upstream/validate.ps1
 ```
 
-### Update Image
-```bash
-./run.sh --update
+## Container image
+
+The root `Dockerfile` builds `gta-claw-daemon` with the pinned Rust toolchain and copies only the
+native release binary into the runtime image:
+
+```text
+docker build -t gta-claw .
+docker run --rm gta-claw
 ```
 
-### Stop Services
-```bash
-./run.sh --stop
-```
+The image runs as an unprivileged user, listens on port 3978, and uses
+`gta-claw-daemon --probe-http` to validate its live health endpoint.
 
-## CI/CD: Auto Push To Docker Hub
+## Repository policy
 
-This repository includes a GitHub Actions workflow at `.github/workflows/docker-publish.yml`.
+`crates/claw-repo-policy/tests/repository_policy.rs` recursively checks the checkout and rejects:
 
-It automatically builds and pushes Docker images when:
-- code is pushed to `main`
-- a tag matching `v*` is pushed
-- manually triggered from GitHub Actions (`workflow_dispatch`)
+- JavaScript and TypeScript source/module extensions, including native runtime modules.
+- Package manifests and lockfiles from JavaScript package managers.
+- Dependency-store directories such as `node_modules`.
 
-### Required GitHub Secrets
+Compatibility exceptions are exact file paths, never directory wildcards. The current compat script
+exception list is empty; the base-owned adversarial shell fixture and inert macOS policy-search lines
+have separate exact allowlists. The test suite includes planted violations and exact-allowlist
+sibling checks so the gate cannot silently degrade into a broad compatibility-tree bypass. The
+existing `Headless` jobs exercise the crate through `cargo test --workspace --all-targets --locked`;
+the always-on pull-request job in `.github/workflows/upstream-gateway-reference.yml` runs the policy
+test explicitly so forbidden-only changes cannot bypass the frozen `rust.yml` path filter.
 
-In your GitHub repo, add these secrets:
-- `DOCKERHUB_USERNAME`: your Docker Hub username
-- `DOCKERHUB_TOKEN`: Docker Hub access token (not password)
-- `DOCKERHUB_IMAGE` (recommended): full image name, e.g. `docker.io/aizhihuxiao/gta-claw`
+## Supply chain
 
-### Published Image
-
-The workflow publishes to:
-- `docker.io/<DOCKERHUB_USERNAME>/gta-claw`
-
-If `DOCKERHUB_IMAGE` is not set, the workflow defaults to `docker.io/<DOCKERHUB_USERNAME>/gta-claw` and normalizes the namespace to lowercase. Use `DOCKERHUB_IMAGE` when publishing to org namespaces.
-
-Generated tags include:
-- `latest` (default branch)
-- branch/tag based tags
-- `sha-<commit>`
-
-## Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Quick onboarding info + endpoint hints |
-| `/auth/device` | GET | Get GitHub Device Flow authorization instructions |
-| `/api/messages` | POST | Bot Framework messages (Teams) |
-| `/chat` | POST | Simple HTTP chat (no channel needed) |
-| `/health` | GET | Health check + status |
-| `/admin/reload` | POST | Hot-reload role+skills and reset active sessions (requires `ADMIN_TOKEN`) |
-
-## Channel Compatibility
-
-GTA-Claw supports four channel modes (can be enabled together):
-
-1. Teams (`ENABLE_TEAMS=true`)
-2. Telegram Polling (`ENABLE_TELEGRAM=true`) — no public webhook required
-3. Discord Gateway (`ENABLE_DISCORD=true`) — no public webhook required
-4. WhatsApp Webhook (`ENABLE_WHATSAPP=true`) — public callback usually required
-
-Recommended auth strategy:
-
-1. Enterprise/public deployment: Device Flow (`DEVICE_FLOW_ENABLED=true`) — no domain needed
-2. Internal-only deployment: PAT (`GITHUB_TOKEN`) for simplest setup
-
-## Prerequisites
-
-- Docker
-- GitHub account with Copilot access
-- Azure Bot Service registration (only if using Teams channel)
-
-## Security
-
-- Skills run in V8 isolate sandbox (`isolated-vm`) with memory limits when available
-- If `isolated-vm` is unavailable, engine falls back to Node `vm` sandbox mode (reduced isolation)
-- Domain whitelist for skill HTTP calls
-- Rate limiting on bot endpoint (30 req/min per IP)
-- Non-root Docker user
-- HTTPS via reverse proxy (Caddy/Nginx/Traefik)
-
-## ⚠️ Notice
-
-`@github/copilot-sdk` is in **Technical Preview** and may not yet be suitable for production use. Monitor the [official repository](https://github.com/github/copilot-sdk) for stability updates.
+CI runs formatting, checks, Clippy, tests, MSRV validation, `cargo deny`, `cargo audit`, platform
+packaging checks, and the repository policy. The pinned upstream workflow validates the frozen
+snapshot and exercises the Rust protocol/client tests without installing or executing an upstream
+package graph.

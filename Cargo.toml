@@ -8,6 +8,7 @@ members = [
   "crates/claw-gateway-client",
   "crates/claw-platform",
   "crates/claw-protocol",
+  "crates/claw-repo-policy",
   "crates/claw-security",
 ]
 exclude = ["desktop"]

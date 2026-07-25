@@ -7,7 +7,7 @@
       "action": {
         "type": "string",
         "enum": ["system_info", "uptime", "disk", "memory", "top", "docker_ps", "docker_stats", "docker_images", "docker_logs", "netstat", "who", "hostname", "date"],
-        "description": "The server command to execute. 'system_info' returns Node.js/OS details via API; others run actual shell commands."
+        "description": "The server command to execute. 'system_info' returns native process/OS details via API; others run actual shell commands."
       },
       "target": {
         "type": "string",
