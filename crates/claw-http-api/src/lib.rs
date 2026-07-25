@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use axum::Router;
 use axum::http::{HeaderName, HeaderValue, Method, header};
 use axum::middleware;
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -48,6 +48,82 @@ pub use watch::WatchNodeHandle;
 use crate::auth::{AuthMiddlewareState, require_bearer};
 use crate::state::ApiState;
 
+macro_rules! method_router {
+    (GET, $handler:path) => {
+        get($handler)
+    };
+    (POST, $handler:path) => {
+        post($handler)
+    };
+}
+
+macro_rules! http_api_endpoints {
+    ($consumer:ident) => {
+        $consumer! {
+            public {
+                (GET, "/health", probes::live),
+                (GET, "/healthz", probes::live),
+                (GET, "/ready", probes::ready),
+                (GET, "/readyz", probes::ready),
+                (GET, "/api/nodes/watch/challenge", watch::challenge),
+                (POST, "/api/nodes/watch/connect", watch::connect),
+                (POST, "/api/nodes/watch/disconnect", watch::disconnect),
+                (POST, "/api/nodes/watch/poll", watch::poll),
+                (POST, "/api/nodes/watch/result", watch::result),
+                (POST, "/plugins/webhooks/{routeId}", webhooks::invoke),
+            }
+            protected {
+                (GET, "/v1/models", openai::models),
+                (GET, "/v1/models/{id}", openai::model),
+                (POST, "/v1/embeddings", openai::embeddings),
+                (POST, "/v1/chat/completions", openai::chat),
+                (POST, "/v1/responses", openai::responses),
+                (POST, "/tools/invoke", tools::invoke),
+                (POST, "/api/v1/admin/rpc", admin::rpc),
+            }
+            mcp {
+                (POST, "/mcp", mcp::handle),
+            }
+        }
+    };
+}
+
+macro_rules! build_route_groups {
+    (
+        public { $(($public_method:ident, $public_path:literal, $public_handler:path),)* }
+        protected { $(($protected_method:ident, $protected_path:literal, $protected_handler:path),)* }
+        mcp { $(($mcp_method:ident, $mcp_path:literal, $mcp_handler:path),)* }
+    ) => {{
+        let public = Router::new()
+            $(.route($public_path, method_router!($public_method, $public_handler)))*;
+        let protected = Router::new()
+            $(.route(
+                $protected_path,
+                method_router!($protected_method, $protected_handler),
+            ))*;
+        let mcp = Router::new()
+            $(.route($mcp_path, method_router!($mcp_method, $mcp_handler)))*;
+        (public, protected, mcp)
+    }};
+}
+
+macro_rules! collect_registered_endpoints {
+    (
+        public { $(($public_method:ident, $public_path:literal, $public_handler:path),)* }
+        protected { $(($protected_method:ident, $protected_path:literal, $protected_handler:path),)* }
+        mcp { $(($mcp_method:ident, $mcp_path:literal, $mcp_handler:path),)* }
+    ) => {
+        &[
+            $((stringify!($public_method), $public_path),)*
+            $((stringify!($protected_method), $protected_path),)*
+            $((stringify!($mcp_method), $mcp_path),)*
+        ]
+    };
+}
+
+/// Explicit method and path identities registered across the main and MCP routers.
+pub const HTTP_ENDPOINTS: &[(&str, &str)] = http_api_endpoints!(collect_registered_endpoints);
+
 /// Fully configured Axum HTTP application.
 #[derive(Clone)]
 pub struct HttpApi {
@@ -65,15 +141,8 @@ impl HttpApi {
         };
         let cors_origins = config.cors_origins.clone();
         let state = ApiState::new(config, services);
-        let protected = Router::new()
-            .route("/v1/models", get(openai::models))
-            .route("/v1/models/{id}", get(openai::model))
-            .route("/v1/embeddings", post(openai::embeddings))
-            .route("/v1/chat/completions", post(openai::chat))
-            .route("/v1/responses", post(openai::responses))
-            .route("/tools/invoke", post(tools::invoke))
-            .route("/api/v1/admin/rpc", post(admin::rpc))
-            .layer(middleware::from_fn_with_state(auth_state, require_bearer));
+        let (router, protected, mcp_router) = http_api_endpoints!(build_route_groups);
+        let protected = protected.layer(middleware::from_fn_with_state(auth_state, require_bearer));
         let cors = CorsLayer::new()
             .allow_methods([Method::GET, Method::HEAD, Method::POST, Method::DELETE])
             .allow_headers([
@@ -93,17 +162,7 @@ impl HttpApi {
         } else {
             cors
         };
-        let router = Router::new()
-            .route("/health", get(probes::live))
-            .route("/healthz", get(probes::live))
-            .route("/ready", get(probes::ready))
-            .route("/readyz", get(probes::ready))
-            .route("/api/nodes/watch/challenge", get(watch::challenge))
-            .route("/api/nodes/watch/connect", post(watch::connect))
-            .route("/api/nodes/watch/disconnect", post(watch::disconnect))
-            .route("/api/nodes/watch/poll", post(watch::poll))
-            .route("/api/nodes/watch/result", post(watch::result))
-            .route("/plugins/webhooks/{route_id}", post(webhooks::invoke))
+        let router = router
             .merge(protected)
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("x-content-type-options"),
@@ -119,8 +178,7 @@ impl HttpApi {
             ))
             .layer(cors)
             .with_state(state.clone());
-        let mcp_router = Router::new()
-            .route("/mcp", any(mcp::handle))
+        let mcp_router = mcp_router
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("x-content-type-options"),
                 HeaderValue::from_static("nosniff"),
