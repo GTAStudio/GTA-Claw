@@ -208,8 +208,8 @@ pub struct SurfaceContract {
 /// Honest client exercise status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExerciseStatus {
-    /// GTA-Claw owns and tests the client-facing Rust surface.
-    RustHostExercised,
+    /// The Rust host contract is tested, but no production session path uses it yet.
+    ContractOnlyHostSurface,
     /// Only the host contract is exercised; the upstream application is not shipped.
     ContractOnlyThirdPartyClient,
 }
@@ -339,7 +339,7 @@ pub const SURFACES: [SurfaceContract; 10] = [
         connection: ConnectionContract::GatewayV4(CLI_PROFILE),
         capabilities: READ_WRITE_CAPABILITIES,
         events: READ_WRITE_EVENTS,
-        exercise: ExerciseStatus::RustHostExercised,
+        exercise: ExerciseStatus::ContractOnlyHostSurface,
     },
     SurfaceContract {
         descriptor: SurfaceDescriptor {
@@ -351,7 +351,7 @@ pub const SURFACES: [SurfaceContract; 10] = [
         connection: ConnectionContract::GatewayV4(TUI_PROFILE),
         capabilities: READ_WRITE_CAPABILITIES,
         events: READ_WRITE_EVENTS,
-        exercise: ExerciseStatus::RustHostExercised,
+        exercise: ExerciseStatus::ContractOnlyHostSurface,
     },
     SurfaceContract {
         descriptor: SurfaceDescriptor {
@@ -447,7 +447,7 @@ pub const SURFACES: [SurfaceContract; 10] = [
         connection: ConnectionContract::GatewayV4(NODE_HOST_PROFILE),
         capabilities: &[ClientCapability::NodeCommands],
         events: &[SessionEventKind::NodePresence],
-        exercise: ExerciseStatus::RustHostExercised,
+        exercise: ExerciseStatus::ContractOnlyHostSurface,
     },
 ];
 
@@ -785,7 +785,19 @@ mod tests {
 
     #[test]
     fn gateway_profiles_require_exact_v4_identity_and_device_policy() {
-        let profile = MOBILE_PROFILES_ANDROID[0];
+        let profile = GatewayProfile {
+            client_id: ClientId::Android,
+            mode: ClientMode::Ui,
+            role: Role::Operator,
+            scopes: &[
+                OperatorScope::Admin,
+                OperatorScope::Approvals,
+                OperatorScope::Read,
+                OperatorScope::TalkSecrets,
+                OperatorScope::Write,
+            ],
+            requires_device_identity: true,
+        };
         assert_eq!(
             validate_gateway_profile(SurfaceId::Android, profile, 4),
             Ok(())
@@ -812,20 +824,150 @@ mod tests {
     }
 
     #[test]
-    fn every_gateway_surface_accepts_its_frozen_profiles_with_scope_set_semantics() {
-        for surface_id in [
-            SurfaceId::Cli,
-            SurfaceId::Tui,
-            SurfaceId::ControlUi,
-            SurfaceId::Android,
-            SurfaceId::Ios,
-            SurfaceId::MacOs,
-            SurfaceId::NodeHost,
-        ] {
+    fn gateway_surface_profiles_match_independent_frozen_candidates() {
+        let expected: &[(SurfaceId, &[GatewayProfile])] = &[
+            (
+                SurfaceId::Cli,
+                &[GatewayProfile {
+                    client_id: ClientId::Cli,
+                    mode: ClientMode::Cli,
+                    role: Role::Operator,
+                    scopes: &[
+                        OperatorScope::Admin,
+                        OperatorScope::Approvals,
+                        OperatorScope::Read,
+                        OperatorScope::TalkSecrets,
+                        OperatorScope::Write,
+                    ],
+                    requires_device_identity: true,
+                }],
+            ),
+            (
+                SurfaceId::Tui,
+                &[GatewayProfile {
+                    client_id: ClientId::Tui,
+                    mode: ClientMode::Ui,
+                    role: Role::Operator,
+                    scopes: &[
+                        OperatorScope::Admin,
+                        OperatorScope::Approvals,
+                        OperatorScope::Read,
+                        OperatorScope::TalkSecrets,
+                        OperatorScope::Write,
+                    ],
+                    requires_device_identity: true,
+                }],
+            ),
+            (
+                SurfaceId::ControlUi,
+                &[GatewayProfile {
+                    client_id: ClientId::ControlUi,
+                    mode: ClientMode::Webchat,
+                    role: Role::Operator,
+                    scopes: &[
+                        OperatorScope::Admin,
+                        OperatorScope::Approvals,
+                        OperatorScope::Pairing,
+                        OperatorScope::Read,
+                        OperatorScope::TalkSecrets,
+                        OperatorScope::Write,
+                    ],
+                    requires_device_identity: true,
+                }],
+            ),
+            (
+                SurfaceId::Android,
+                &[
+                    GatewayProfile {
+                        client_id: ClientId::Android,
+                        mode: ClientMode::Ui,
+                        role: Role::Operator,
+                        scopes: &[
+                            OperatorScope::Admin,
+                            OperatorScope::Approvals,
+                            OperatorScope::Read,
+                            OperatorScope::TalkSecrets,
+                            OperatorScope::Write,
+                        ],
+                        requires_device_identity: true,
+                    },
+                    GatewayProfile {
+                        client_id: ClientId::Android,
+                        mode: ClientMode::Node,
+                        role: Role::Node,
+                        scopes: &[],
+                        requires_device_identity: true,
+                    },
+                ],
+            ),
+            (
+                SurfaceId::Ios,
+                &[
+                    GatewayProfile {
+                        client_id: ClientId::Ios,
+                        mode: ClientMode::Ui,
+                        role: Role::Operator,
+                        scopes: &[
+                            OperatorScope::Admin,
+                            OperatorScope::Approvals,
+                            OperatorScope::Read,
+                            OperatorScope::TalkSecrets,
+                            OperatorScope::Write,
+                        ],
+                        requires_device_identity: true,
+                    },
+                    GatewayProfile {
+                        client_id: ClientId::Ios,
+                        mode: ClientMode::Node,
+                        role: Role::Node,
+                        scopes: &[],
+                        requires_device_identity: true,
+                    },
+                ],
+            ),
+            (
+                SurfaceId::MacOs,
+                &[
+                    GatewayProfile {
+                        client_id: ClientId::MacOs,
+                        mode: ClientMode::Ui,
+                        role: Role::Operator,
+                        scopes: &[
+                            OperatorScope::Admin,
+                            OperatorScope::Approvals,
+                            OperatorScope::Read,
+                            OperatorScope::TalkSecrets,
+                            OperatorScope::Write,
+                        ],
+                        requires_device_identity: true,
+                    },
+                    GatewayProfile {
+                        client_id: ClientId::MacOs,
+                        mode: ClientMode::Node,
+                        role: Role::Node,
+                        scopes: &[],
+                        requires_device_identity: true,
+                    },
+                ],
+            ),
+            (
+                SurfaceId::NodeHost,
+                &[GatewayProfile {
+                    client_id: ClientId::NodeHost,
+                    mode: ClientMode::Node,
+                    role: Role::Node,
+                    scopes: &[],
+                    requires_device_identity: true,
+                }],
+            ),
+        ];
+
+        for &(surface_id, expected_profiles) in expected {
             let ConnectionContract::GatewayV4(profiles) = surface(surface_id).connection else {
                 panic!("expected Gateway profile");
             };
-            for profile in profiles {
+            assert_eq!(profiles, expected_profiles, "surface {surface_id:?}");
+            for profile in expected_profiles {
                 assert_eq!(
                     validate_gateway_profile(surface_id, *profile, 4),
                     Ok(()),
@@ -847,13 +989,37 @@ mod tests {
                 }
             }
         }
-        assert_eq!(TUI_PROFILE[0].mode, ClientMode::Ui);
-        assert_eq!(CONTROL_UI_PROFILE[0].mode, ClientMode::Webchat);
-        assert!(
-            CONTROL_UI_PROFILE[0]
-                .scopes
-                .contains(&OperatorScope::Pairing)
+    }
+
+    #[test]
+    fn exercise_statuses_do_not_claim_unwired_end_to_end_clients() {
+        assert_eq!(
+            surface(SurfaceId::Cli).exercise,
+            ExerciseStatus::ContractOnlyHostSurface
         );
+        assert_eq!(
+            surface(SurfaceId::Tui).exercise,
+            ExerciseStatus::ContractOnlyHostSurface
+        );
+        assert_eq!(
+            surface(SurfaceId::NodeHost).exercise,
+            ExerciseStatus::ContractOnlyHostSurface
+        );
+        for surface_id in [
+            SurfaceId::ControlUi,
+            SurfaceId::Android,
+            SurfaceId::Ios,
+            SurfaceId::MacOs,
+            SurfaceId::MacOsMlxTts,
+            SurfaceId::Swabble,
+            SurfaceId::ChromeExtension,
+        ] {
+            assert_eq!(
+                surface(surface_id).exercise,
+                ExerciseStatus::ContractOnlyThirdPartyClient,
+                "surface {surface_id:?}"
+            );
+        }
     }
 
     #[test]
