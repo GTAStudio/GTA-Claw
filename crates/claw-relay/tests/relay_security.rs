@@ -366,6 +366,744 @@ fn fixture_cdp_server_discovers_attaches_dispatches_and_streams() {
 }
 
 #[test]
+fn child_sessions_route_real_ids_enforce_ownership_and_reap_descendants() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::new();
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(first).expect("first client");
+    bridge.connect_cdp(second).expect("second client");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![tab()],
+            },
+        )
+        .expect("hello");
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 1,
+                    method: "Target.attachToTarget".to_owned(),
+                    params: Some(json!({ "targetId": "tab-41" })),
+                    session_id: None,
+                },
+            )
+            .expect("root attach"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 1,
+            tab_id: 41,
+        })]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("root attached");
+
+    let worker_params = json!({
+        "sessionId": "chrome-worker-1",
+        "targetInfo": {
+            "targetId": "worker-1",
+            "type": "worker",
+            "title": "fixture worker",
+            "url": "https://example.test/worker.js",
+            "attached": true
+        },
+        "waitingForDebugger": false
+    });
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: None,
+                    method: "Target.attachedToTarget".to_owned(),
+                    params: Some(worker_params.clone()),
+                },
+            )
+            .expect("worker attached"),
+        vec![BridgeEffect::EventToCdp {
+            connection: first,
+            event: claw_relay::CdpEvent {
+                session_id: Some("gta-claw-tab-1".to_owned()),
+                method: "Target.attachedToTarget".to_owned(),
+                params: worker_params,
+            },
+        }]
+    );
+
+    let frame_params = json!({
+        "sessionId": "chrome-frame-1",
+        "targetInfo": {
+            "targetId": "frame-1",
+            "type": "iframe",
+            "title": "fixture frame",
+            "url": "https://frame.example.test/",
+            "attached": true
+        },
+        "waitingForDebugger": false
+    });
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: Some("chrome-worker-1".to_owned()),
+                    method: "Target.attachedToTarget".to_owned(),
+                    params: Some(frame_params.clone()),
+                },
+            )
+            .expect("nested frame attached"),
+        vec![BridgeEffect::EventToCdp {
+            connection: first,
+            event: claw_relay::CdpEvent {
+                session_id: Some("chrome-worker-1".to_owned()),
+                method: "Target.attachedToTarget".to_owned(),
+                params: frame_params,
+            },
+        }]
+    );
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 2,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "document.title" })),
+                    session_id: Some("chrome-frame-1".to_owned()),
+                },
+            )
+            .expect("child command"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
+            seq: 2,
+            tab_id: 41,
+            session_id: Some("chrome-frame-1".to_owned()),
+            method: "Runtime.evaluate".to_owned(),
+            params: Some(json!({ "expression": "document.title" })),
+        })]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 3,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "document.cookie" })),
+                    session_id: Some("chrome-frame-1".to_owned()),
+                },
+            )
+            .expect("cross-owner denial"),
+        vec![BridgeEffect::ToCdp {
+            connection: second,
+            response: claw_relay::CdpResponse {
+                id: 3,
+                session_id: Some("chrome-frame-1".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq: 2,
+                    result: Some(json!({ "result": { "type": "string", "value": "Fixture" } })),
+                },
+            )
+            .expect("child result"),
+        vec![BridgeEffect::ToCdp {
+            connection: first,
+            response: claw_relay::CdpResponse {
+                id: 2,
+                session_id: Some("chrome-frame-1".to_owned()),
+                result: Some(json!({ "result": { "type": "string", "value": "Fixture" } })),
+                error: None,
+            },
+        }]
+    );
+
+    let detached_params = json!({ "sessionId": "chrome-worker-1", "targetId": "worker-1" });
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: None,
+                    method: "Target.detachedFromTarget".to_owned(),
+                    params: Some(detached_params.clone()),
+                },
+            )
+            .expect("worker detached"),
+        vec![BridgeEffect::EventToCdp {
+            connection: first,
+            event: claw_relay::CdpEvent {
+                session_id: Some("gta-claw-tab-1".to_owned()),
+                method: "Target.detachedFromTarget".to_owned(),
+                params: detached_params,
+            },
+        }]
+    );
+    let late_frame_detach = json!({ "sessionId": "chrome-frame-1", "targetId": "frame-1" });
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: Some("chrome-worker-1".to_owned()),
+                    method: "Target.detachedFromTarget".to_owned(),
+                    params: Some(late_frame_detach.clone()),
+                },
+            )
+            .expect("late descendant detach is idempotent"),
+        vec![BridgeEffect::EventToCdp {
+            connection: first,
+            event: claw_relay::CdpEvent {
+                session_id: Some("chrome-worker-1".to_owned()),
+                method: "Target.detachedFromTarget".to_owned(),
+                params: late_frame_detach,
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 4,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "1" })),
+                    session_id: Some("chrome-frame-1".to_owned()),
+                },
+            )
+            .expect("descendant was reaped"),
+        vec![BridgeEffect::ToCdp {
+            connection: first,
+            response: claw_relay::CdpResponse {
+                id: 4,
+                session_id: Some("chrome-frame-1".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+}
+
+#[test]
+fn child_sessions_reject_reserved_ids_and_contain_untracked_traffic() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let cdp = endpoint.accept(&cdp_upgrade()).expect("CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive bound");
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(cdp).expect("client");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![tab()],
+            },
+        )
+        .expect("hello");
+    bridge
+        .receive_cdp(
+            cdp,
+            CdpRequest {
+                id: 1,
+                method: "Target.attachToTarget".to_owned(),
+                params: Some(json!({ "targetId": "tab-41" })),
+                session_id: None,
+            },
+        )
+        .expect("root attach");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("root attached");
+
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: Some("unknown-child".to_owned()),
+                    method: "Runtime.consoleAPICalled".to_owned(),
+                    params: Some(json!({ "type": "log", "args": [] })),
+                },
+            )
+            .expect("unknown child traffic is contained"),
+        Vec::new()
+    );
+    assert_eq!(
+        bridge.receive_extension(
+            extension,
+            ExtensionMessage::CdpEvent {
+                tab_id: 41,
+                session_id: None,
+                method: "Target.attachedToTarget".to_owned(),
+                params: Some(json!({
+                    "sessionId": "gta-claw-tab-999",
+                    "targetInfo": { "targetId": "worker-reserved", "type": "worker" }
+                })),
+            },
+        ),
+        Err(BridgeError::InvalidChildSessionId)
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::CdpEvent {
+                tab_id: 41,
+                session_id: None,
+                method: "Target.attachedToTarget".to_owned(),
+                params: Some(json!({
+                    "sessionId": "chrome-child-1",
+                    "targetInfo": { "targetId": "worker-1", "type": "worker" }
+                })),
+            },
+        )
+        .expect("first bounded child");
+    let overflow_params = json!({
+        "sessionId": "chrome-child-2",
+        "targetInfo": { "targetId": "worker-2", "type": "worker" }
+    });
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: None,
+                    method: "Target.attachedToTarget".to_owned(),
+                    params: Some(overflow_params.clone()),
+                },
+            )
+            .expect("overflow is contained to the untracked child"),
+        vec![BridgeEffect::EventToCdp {
+            connection: cdp,
+            event: claw_relay::CdpEvent {
+                session_id: Some("gta-claw-tab-1".to_owned()),
+                method: "Target.attachedToTarget".to_owned(),
+                params: overflow_params,
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::CdpEvent {
+                    tab_id: 41,
+                    session_id: Some("chrome-child-2".to_owned()),
+                    method: "Runtime.consoleAPICalled".to_owned(),
+                    params: Some(json!({ "type": "log", "args": [] })),
+                },
+            )
+            .expect("overflow child event is contained"),
+        Vec::new()
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                cdp,
+                CdpRequest {
+                    id: 2,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "1" })),
+                    session_id: Some("chrome-child-2".to_owned()),
+                },
+            )
+            .expect("untracked overflow child fails locally"),
+        vec![BridgeEffect::ToCdp {
+            connection: cdp,
+            response: claw_relay::CdpResponse {
+                id: 2,
+                session_id: Some("chrome-child-2".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+}
+
+#[test]
+fn root_detach_disconnect_and_tab_death_reap_child_session_generations() {
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let first = endpoint.accept(&cdp_upgrade()).expect("first CDP");
+    let second = endpoint.accept(&cdp_upgrade()).expect("second CDP");
+    let mut bridge = CdpBridge::new();
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(first).expect("first client");
+    bridge.connect_cdp(second).expect("second client");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: vec![tab()],
+            },
+        )
+        .expect("hello");
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 1,
+                    method: "Target.attachToTarget".to_owned(),
+                    params: Some(json!({ "targetId": "tab-41" })),
+                    session_id: None,
+                },
+            )
+            .expect("first root attach"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 1,
+            tab_id: 41,
+        })]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 1,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("first root attached");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::CdpEvent {
+                tab_id: 41,
+                session_id: None,
+                method: "Target.attachedToTarget".to_owned(),
+                params: Some(json!({
+                    "sessionId": "chrome-child-reused",
+                    "targetInfo": { "targetId": "worker-1", "type": "worker" },
+                    "waitingForDebugger": false
+                })),
+            },
+        )
+        .expect("first child attached");
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 2,
+                    method: "Target.detachFromTarget".to_owned(),
+                    params: Some(json!({ "sessionId": "gta-claw-tab-1" })),
+                    session_id: None,
+                },
+            )
+            .expect("root detach"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Detach {
+            seq: 2,
+            tab_id: 41,
+        })]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq: 2,
+                    result: None,
+                },
+            )
+            .expect("root detached"),
+        vec![BridgeEffect::ToCdp {
+            connection: first,
+            response: claw_relay::CdpResponse {
+                id: 2,
+                session_id: None,
+                result: Some(json!({})),
+                error: None,
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 3,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "1" })),
+                    session_id: Some("chrome-child-reused".to_owned()),
+                },
+            )
+            .expect("detached child rejected"),
+        vec![BridgeEffect::ToCdp {
+            connection: first,
+            response: claw_relay::CdpResponse {
+                id: 3,
+                session_id: Some("chrome-child-reused".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 4,
+                    method: "Target.attachToTarget".to_owned(),
+                    params: Some(json!({ "targetId": "chrome-target-41" })),
+                    session_id: None,
+                },
+            )
+            .expect("second root attach"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 3,
+            tab_id: 41,
+        })]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 3,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("second root attached");
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                first,
+                CdpRequest {
+                    id: 5,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "1" })),
+                    session_id: Some("chrome-child-reused".to_owned()),
+                },
+            )
+            .expect("stale generation rejected"),
+        vec![BridgeEffect::ToCdp {
+            connection: first,
+            response: claw_relay::CdpResponse {
+                id: 5,
+                session_id: Some("chrome-child-reused".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::CdpEvent {
+                tab_id: 41,
+                session_id: None,
+                method: "Target.attachedToTarget".to_owned(),
+                params: Some(json!({
+                    "sessionId": "chrome-child-reused",
+                    "targetInfo": { "targetId": "worker-2", "type": "worker" },
+                    "waitingForDebugger": false
+                })),
+            },
+        )
+        .expect("child ID may be reused only after a new announcement");
+
+    assert_eq!(
+        bridge.disconnect_cdp(first),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Detach {
+            seq: 4,
+            tab_id: 41,
+        })]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 6,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "document.cookie" })),
+                    session_id: Some("chrome-child-reused".to_owned()),
+                },
+            )
+            .expect("disconnected owner's child rejected"),
+        vec![BridgeEffect::ToCdp {
+            connection: second,
+            response: claw_relay::CdpResponse {
+                id: 6,
+                session_id: Some("chrome-child-reused".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq: 4,
+                    result: None,
+                },
+            )
+            .expect("disconnect cleanup"),
+        Vec::new()
+    );
+
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 7,
+                    method: "Target.attachToTarget".to_owned(),
+                    params: Some(json!({ "targetId": "chrome-target-41" })),
+                    session_id: None,
+                },
+            )
+            .expect("third root attach"),
+        vec![BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            seq: 5,
+            tab_id: 41,
+        })]
+    );
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Result {
+                seq: 5,
+                result: Some(json!({ "targetId": "chrome-target-41" })),
+            },
+        )
+        .expect("third root attached");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::CdpEvent {
+                tab_id: 41,
+                session_id: None,
+                method: "Target.attachedToTarget".to_owned(),
+                params: Some(json!({
+                    "sessionId": "chrome-child-reused",
+                    "targetInfo": { "targetId": "worker-3", "type": "worker" },
+                    "waitingForDebugger": false
+                })),
+            },
+        )
+        .expect("third child attached");
+    assert_eq!(
+        bridge
+            .receive_extension(extension, ExtensionMessage::Tabs { tabs: Vec::new() })
+            .expect("tab death"),
+        vec![BridgeEffect::EventToCdp {
+            connection: second,
+            event: claw_relay::CdpEvent {
+                session_id: None,
+                method: "Target.detachedFromTarget".to_owned(),
+                params: json!({
+                    "sessionId": "gta-claw-tab-3",
+                    "targetId": "chrome-target-41"
+                }),
+            },
+        }]
+    );
+    assert_eq!(
+        bridge
+            .receive_cdp(
+                second,
+                CdpRequest {
+                    id: 8,
+                    method: "Runtime.evaluate".to_owned(),
+                    params: Some(json!({ "expression": "1" })),
+                    session_id: Some("chrome-child-reused".to_owned()),
+                },
+            )
+            .expect("dead tab child rejected"),
+        vec![BridgeEffect::ToCdp {
+            connection: second,
+            response: claw_relay::CdpResponse {
+                id: 8,
+                session_id: Some("chrome-child-reused".to_owned()),
+                result: None,
+                error: Some(CdpErrorObject {
+                    code: -32001,
+                    message: "session not found".to_owned(),
+                }),
+            },
+        }]
+    );
+}
+
+#[test]
 fn unauthorized_commands_and_cross_connection_session_hijacks_are_denied() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint

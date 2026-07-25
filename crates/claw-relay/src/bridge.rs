@@ -50,6 +50,14 @@ struct SessionState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ChildSessionState {
+    tab_id: u64,
+    owner: ConnectionId,
+    root_attach_seq: u64,
+    parent_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingKind {
     Attach { tab_id: u64, respond: bool },
     Cdp { tab_id: u64 },
@@ -189,6 +197,7 @@ pub struct CdpBridge {
     targets: BTreeMap<u64, TargetState>,
     clients: BTreeSet<ConnectionId>,
     browser_sessions: BTreeMap<String, ConnectionId>,
+    child_sessions: BTreeMap<String, ChildSessionState>,
     auto_attach: BTreeSet<ConnectionId>,
     pending: BTreeMap<u64, PendingCommand>,
     abandoned: BTreeMap<u64, Option<u64>>,
@@ -216,6 +225,7 @@ impl CdpBridge {
             targets: BTreeMap::new(),
             clients: BTreeSet::new(),
             browser_sessions: BTreeMap::new(),
+            child_sessions: BTreeMap::new(),
             auto_attach: BTreeSet::new(),
             pending: BTreeMap::new(),
             abandoned: BTreeMap::new(),
@@ -226,7 +236,7 @@ impl CdpBridge {
         }
     }
 
-    /// Creates a disconnected bridge with an explicit in-flight command bound.
+    /// Creates a disconnected bridge with explicit pending-work and child-session bounds.
     pub fn with_pending_limit(pending_limit: usize) -> Result<Self, BridgeError> {
         if pending_limit == 0 {
             return Err(BridgeError::InvalidPendingLimit);
@@ -335,6 +345,7 @@ impl CdpBridge {
         let pending = std::mem::take(&mut self.pending);
         self.abandoned.clear();
         self.cleanup_detaches.clear();
+        self.child_sessions.clear();
         let mut effects = pending
             .into_values()
             .filter(|pending| {
@@ -377,6 +388,8 @@ impl CdpBridge {
         self.auto_attach.remove(&connection);
         self.browser_sessions
             .retain(|_, owner| *owner != connection);
+        self.child_sessions
+            .retain(|_, session| session.owner != connection);
         let abandoned = self
             .pending
             .iter()
@@ -508,30 +521,55 @@ impl CdpBridge {
         session_id: &str,
         request: CdpRequest,
     ) -> Result<Vec<BridgeEffect>, BridgeError> {
-        let Some((tab_id, _)) = self.targets.iter().find(|(_, target)| {
-            target.session.is_some_and(|session| {
-                session.owner == connection && session_name(session.id) == session_id
-            })
-        }) else {
-            return Ok(vec![error_effect(
-                connection,
-                &request,
-                CdpError::SessionNotFound,
-            )]);
-        };
+        let (tab_id, chrome_session_id) =
+            if let Some(child) = self.child_sessions.get(session_id).cloned() {
+                let valid_root = self.targets.get(&child.tab_id).is_some_and(|target| {
+                    target.session.is_some_and(|root| {
+                        root.owner == child.owner && root.attach_seq == child.root_attach_seq
+                    })
+                });
+                if !valid_root {
+                    self.remove_child_session_tree(session_id);
+                    return Ok(vec![error_effect(
+                        connection,
+                        &request,
+                        CdpError::SessionNotFound,
+                    )]);
+                }
+                if child.owner != connection {
+                    return Ok(vec![error_effect(
+                        connection,
+                        &request,
+                        CdpError::SessionNotFound,
+                    )]);
+                }
+                (child.tab_id, Some(session_id.to_owned()))
+            } else {
+                let Some((tab_id, _)) = self.targets.iter().find(|(_, target)| {
+                    target.session.is_some_and(|session| {
+                        session.owner == connection && session_name(session.id) == session_id
+                    })
+                }) else {
+                    return Ok(vec![error_effect(
+                        connection,
+                        &request,
+                        CdpError::SessionNotFound,
+                    )]);
+                };
+                (*tab_id, None)
+            };
         if !allowed_session_command(&request.method) {
             return Ok(vec![error_effect(
                 connection,
                 &request,
                 CdpError::MethodNotAllowed,
             )]);
-        }
-        let tab_id = *tab_id;
+        };
         let seq = self.reserve_pending(connection, &request, PendingKind::Cdp { tab_id })?;
         Ok(vec![BridgeEffect::ToExtension(ExtensionCommand::Cdp {
             seq,
             tab_id,
-            session_id: None,
+            session_id: chrome_session_id,
             method: request.method,
             params: request.params,
         })])
@@ -920,6 +958,7 @@ impl CdpBridge {
                         .next_session
                         .checked_add(1)
                         .ok_or(BridgeError::SequenceExhausted)?;
+                    self.remove_child_sessions_for_tab(tab_id);
                     let target = self
                         .targets
                         .get_mut(&tab_id)
@@ -969,6 +1008,7 @@ impl CdpBridge {
                     error: None,
                 },
                 PendingKind::Detach { tab_id } => {
+                    self.remove_child_sessions_for_tab(tab_id);
                     if let Some(target) = self.targets.get_mut(&tab_id) {
                         target.session = None;
                     }
@@ -1189,6 +1229,7 @@ impl CdpBridge {
     fn promote_detach_to_cleanup(&mut self, seq: u64, tab_id: u64) -> Result<(), &'static str> {
         self.ensure_cleanup_capacity(false)?;
         self.cleanup_detaches.insert(seq, tab_id);
+        self.remove_child_sessions_for_tab(tab_id);
         if let Some(target) = self.targets.get_mut(&tab_id) {
             target.session = None;
         }
@@ -1231,7 +1272,7 @@ impl CdpBridge {
     }
 
     fn forward_event(
-        &self,
+        &mut self,
         tab_id: u64,
         child_session_id: Option<String>,
         method: String,
@@ -1242,17 +1283,129 @@ impl CdpBridge {
         }
         let target = self.targets.get(&tab_id).ok_or(BridgeError::UnknownTab)?;
         let session = target.session.ok_or(BridgeError::TabNotAttached)?;
+        let is_detach_event =
+            method == "Target.detachedFromTarget" || method == "Inspector.detached";
+        if let Some(source_session_id) = child_session_id.as_deref() {
+            if self.child_sessions.contains_key(source_session_id) {
+                self.validate_child_session(source_session_id, tab_id, session)?;
+            } else if !is_detach_event {
+                return Ok(Vec::new());
+            }
+        }
+        let params = params.unwrap_or_else(|| json!({}));
+        if method == "Target.attachedToTarget" {
+            let announced_session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or(BridgeError::InvalidChildSessionId)?;
+            self.register_child_session(
+                announced_session_id,
+                tab_id,
+                session,
+                child_session_id.clone(),
+            )?;
+        } else if method == "Target.detachedFromTarget" {
+            let detached_session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or(BridgeError::InvalidChildSessionId)?;
+            if self.child_sessions.contains_key(detached_session_id) {
+                self.validate_child_session(detached_session_id, tab_id, session)?;
+                self.remove_child_session_tree(detached_session_id);
+            }
+        } else if method == "Inspector.detached"
+            && let Some(detached_session_id) = child_session_id.as_deref()
+        {
+            self.remove_child_session_tree(detached_session_id);
+        }
         Ok(vec![BridgeEffect::EventToCdp {
             connection: session.owner,
             event: CdpEvent {
                 session_id: Some(child_session_id.unwrap_or_else(|| session_name(session.id))),
                 method,
-                params: params.unwrap_or_else(|| json!({})),
+                params,
             },
         }])
     }
 
+    fn register_child_session(
+        &mut self,
+        child_session_id: &str,
+        tab_id: u64,
+        root: SessionState,
+        parent_session_id: Option<String>,
+    ) -> Result<(), BridgeError> {
+        if child_session_id.is_empty() || child_session_id.starts_with("gta-claw-") {
+            return Err(BridgeError::InvalidChildSessionId);
+        }
+        let state = ChildSessionState {
+            tab_id,
+            owner: root.owner,
+            root_attach_seq: root.attach_seq,
+            parent_session_id,
+        };
+        if let Some(existing) = self.child_sessions.get(child_session_id) {
+            return if *existing == state {
+                Ok(())
+            } else {
+                Err(BridgeError::ChildSessionCollision)
+            };
+        }
+        if self.child_sessions.len() >= self.pending_limit {
+            return Ok(());
+        }
+        self.child_sessions
+            .insert(child_session_id.to_owned(), state);
+        Ok(())
+    }
+
+    fn validate_child_session(
+        &self,
+        child_session_id: &str,
+        tab_id: u64,
+        root: SessionState,
+    ) -> Result<(), BridgeError> {
+        let child = self
+            .child_sessions
+            .get(child_session_id)
+            .ok_or(BridgeError::ChildSessionNotFound)?;
+        if child.tab_id != tab_id
+            || child.owner != root.owner
+            || child.root_attach_seq != root.attach_seq
+        {
+            return Err(BridgeError::ChildSessionNotFound);
+        }
+        Ok(())
+    }
+
+    fn remove_child_sessions_for_tab(&mut self, tab_id: u64) {
+        self.child_sessions
+            .retain(|_, child| child.tab_id != tab_id);
+    }
+
+    fn remove_child_session_tree(&mut self, child_session_id: &str) {
+        let mut removed = BTreeSet::from([child_session_id.to_owned()]);
+        loop {
+            let previous_len = removed.len();
+            for (session_id, child) in &self.child_sessions {
+                if child
+                    .parent_session_id
+                    .as_ref()
+                    .is_some_and(|parent| removed.contains(parent))
+                {
+                    removed.insert(session_id.clone());
+                }
+            }
+            if removed.len() == previous_len {
+                break;
+            }
+        }
+        self.child_sessions
+            .retain(|session_id, _| !removed.contains(session_id));
+    }
+
     fn detach_tab(&mut self, tab_id: u64) -> Vec<BridgeEffect> {
+        self.remove_child_sessions_for_tab(tab_id);
         let Some(target) = self.targets.get_mut(&tab_id) else {
             return Vec::new();
         };
@@ -1490,6 +1643,12 @@ pub enum BridgeError {
     UnknownTab,
     /// Extension referenced a tab with no debugger session.
     TabNotAttached,
+    /// Extension referenced a child session outside the target's current root session.
+    ChildSessionNotFound,
+    /// Extension announced an empty or relay-reserved child session identifier.
+    InvalidChildSessionId,
+    /// Extension reused a child session identifier for a different root session.
+    ChildSessionCollision,
 }
 
 impl Display for BridgeError {
@@ -1510,6 +1669,9 @@ impl Display for BridgeError {
             Self::ExtensionEventNotAllowed => "extension CDP event is not allowed",
             Self::UnknownTab => "extension referenced an unknown tab",
             Self::TabNotAttached => "extension referenced an unattached tab",
+            Self::ChildSessionNotFound => "extension referenced an unknown child session",
+            Self::InvalidChildSessionId => "extension sent an invalid child session identifier",
+            Self::ChildSessionCollision => "extension reused a child session identifier",
         })
     }
 }
