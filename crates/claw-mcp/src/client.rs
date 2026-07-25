@@ -55,6 +55,15 @@ pub type SamplingFuture<'a> =
 
 /// GTA-Claw port used when an MCP server requests client-side sampling.
 pub trait SamplingPort: Send + Sync + 'static {
+    /// Whether initialize negotiation may advertise client-side sampling.
+    ///
+    /// This defaults to `false` so a sampling adapter must explicitly opt in.
+    /// Implementations returning `true` must service [`Self::create_message`]
+    /// requests rather than rejecting the method as unsupported.
+    fn supports_sampling(&self) -> bool {
+        false
+    }
+
     /// Creates a model response for an MCP sampling request.
     fn create_message<'a>(&'a self, request: CreateMessageRequestParams) -> SamplingFuture<'a>;
 }
@@ -113,8 +122,13 @@ struct GtaClientHandler {
 
 impl ClientHandler for GtaClientHandler {
     fn get_info(&self) -> ClientInfo {
+        let capabilities = if self.sampling.supports_sampling() {
+            ClientCapabilities::builder().enable_sampling().build()
+        } else {
+            ClientCapabilities::default()
+        };
         ClientInfo::new(
-            ClientCapabilities::builder().enable_sampling().build(),
+            capabilities,
             Implementation::new("gta-claw", env!("CARGO_PKG_VERSION")),
         )
     }

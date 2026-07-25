@@ -108,6 +108,21 @@ impl McpBackend for FixtureBackend {
                     .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(response)]))
             }
+            "client-capabilities" => {
+                let capabilities = context
+                    .peer
+                    .peer_info()
+                    .ok_or_else(|| {
+                        ErrorData::internal_error("client handshake info is unavailable", None)
+                    })?
+                    .capabilities
+                    .clone();
+                let capabilities = serde_json::to_string(&capabilities)
+                    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    capabilities,
+                )]))
+            }
             "notify" => {
                 GtaMcpServer::<Self>::notify_tools_changed(&context)
                     .await

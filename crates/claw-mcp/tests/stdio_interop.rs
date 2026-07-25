@@ -29,6 +29,10 @@ struct RecordingSampling {
 }
 
 impl SamplingPort for RecordingSampling {
+    fn supports_sampling(&self) -> bool {
+        true
+    }
+
     fn create_message<'a>(&'a self, request: CreateMessageRequestParams) -> SamplingFuture<'a> {
         let request = serde_json::to_value(request).expect("sampling request must serialize");
         self.requests
@@ -67,6 +71,39 @@ fn fixture(arguments: Vec<String>) -> StdioClientConfig {
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_millis(150),
     }
+}
+
+async fn negotiated_client_capabilities(sampling: Arc<dyn SamplingPort>) -> Value {
+    let client = McpClient::connect_stdio(fixture(Vec::new()), sampling, Arc::new(DiscardEvents))
+        .await
+        .expect("fixture must initialize");
+    let result = client
+        .call_tool(CallToolRequestParams::new("client-capabilities"))
+        .await
+        .expect("fixture must expose negotiated client capabilities");
+    client.close().await.expect("fixture must close");
+    serde_json::to_value(result).expect("capability result must serialize")
+}
+
+#[tokio::test]
+async fn sampling_capability_matches_the_installed_sampling_port() {
+    let rejected = negotiated_client_capabilities(Arc::new(RejectSampling)).await;
+    assert_eq!(
+        rejected,
+        json!({
+            "content": [{"type": "text", "text": "{}"}],
+            "isError": false
+        })
+    );
+
+    let enabled = negotiated_client_capabilities(Arc::new(RecordingSampling::default())).await;
+    assert_eq!(
+        enabled,
+        json!({
+            "content": [{"type": "text", "text": "{\"sampling\":{}}"}],
+            "isError": false
+        })
+    );
 }
 
 #[tokio::test]
