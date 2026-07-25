@@ -15,8 +15,15 @@
 //! [`Subsystem::quiesce`], [`Subsystem::drain`] and [`Subsystem::shutdown`]
 //! calls even if an earlier one failed, because a subsystem that refuses to stop
 //! must not be able to keep the ones behind it alive.
+//!
+//! Both lifecycle methods are cancellation-safe in the only sense Rust allows.
+//! `Drop` cannot run asynchronous teardown, so instead of pretending it can,
+//! [`SubsystemHost::start`] and [`SubsystemHost::shutdown`] guarantee that a
+//! dropped future leaves the host in a state a later [`SubsystemHost::shutdown`]
+//! can finish from. See [`InterruptGuard`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::error::{CompositionError, SubsystemError};
 use super::graph::CompositionPlan;
@@ -68,6 +75,60 @@ impl ShutdownReport {
     }
 }
 
+/// Records that a lifecycle future was dropped part way through, so a later
+/// [`SubsystemHost::shutdown`] can finish the teardown it abandoned.
+///
+/// Both `start` and `shutdown` mutate state that outlives them — the phase, and
+/// the record of which subsystems have been touched — and then await. An async
+/// future can be dropped at any await point, so without this guard a cancelled
+/// caller leaves the phase at `Initializing`, `Starting` or `Draining`. None of
+/// those can reach `Draining` or `Stopping`, which means every subsystem that
+/// had already run `initialize` keeps its resources and *no* code path can
+/// release them: `shutdown` is refused by the phase check before `stop_all`
+/// runs, and `start` is refused because the phase is no longer `Created`.
+///
+/// `Drop` cannot await, so this guard does not attempt teardown. It does the one
+/// thing it can do synchronously: it flags the composition as interrupted.
+/// [`SubsystemHost::shutdown`] reads that flag and tears down through the
+/// `Failed` edges, which exist precisely for a composition that stopped
+/// somewhere it cannot continue from.
+///
+/// The flag is shared through an [`Arc`] rather than borrowed from the host so
+/// that arming it does not borrow `self`, which lets the guard stay alive across
+/// the whole of `start` while the loop still uses `self`.
+struct InterruptGuard {
+    interrupted: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl InterruptGuard {
+    fn arm(interrupted: &Arc<AtomicBool>) -> Self {
+        Self {
+            interrupted: Arc::clone(interrupted),
+            armed: true,
+        }
+    }
+
+    /// Cancels the guard, because the operation reached a phase it can be
+    /// resumed from deliberately.
+    ///
+    /// Call this only once every `await` that could leave torn state is behind
+    /// you. In particular `start` disarms *after* its own `abort` has finished,
+    /// not before, so that a caller dropped during the rollback is still
+    /// recorded as interrupted.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.interrupted.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Holds the subsystems of one daemon and moves them through the lifecycle
 /// together.
 pub struct SubsystemHost {
@@ -76,6 +137,7 @@ pub struct SubsystemHost {
     lifecycle: Lifecycle,
     initialized: Vec<usize>,
     started: Vec<usize>,
+    interrupted: Arc<AtomicBool>,
 }
 
 impl SubsystemHost {
@@ -118,6 +180,7 @@ impl SubsystemHost {
             lifecycle,
             initialized: Vec::new(),
             started: Vec::new(),
+            interrupted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -158,11 +221,20 @@ impl SubsystemHost {
     ///
     /// Returns each subsystem's [`ServiceHandle`] in start order.
     ///
+    /// Dropping the returned future does not abandon the subsystems it already
+    /// touched: the composition is flagged as interrupted, and a later
+    /// [`shutdown`](Self::shutdown) tears them down. It cannot tear them down
+    /// from `Drop` itself, because teardown is asynchronous.
+    ///
     /// # Errors
     ///
     /// Returns [`CompositionError::SubsystemFailed`] carrying the first failure.
     /// Everything already brought up has been torn down by the time this
     /// returns.
+    ///
+    /// Returns [`CompositionError::PhaseTransition`] when a previous lifecycle
+    /// future was dropped part way through and the resulting teardown has not
+    /// been finished by a call to [`shutdown`](Self::shutdown) yet.
     pub async fn start(
         &mut self,
         context: &StartContext,
@@ -170,6 +242,11 @@ impl SubsystemHost {
         let start_order = self.order(self.plan.start_order());
 
         self.lifecycle.transition_to(LifecyclePhase::Initializing)?;
+
+        // Armed for the whole of both loops. Every `await` below is a point the
+        // caller can be cancelled at, and each one is past a mutation of
+        // `initialized` or `started` that teardown depends on.
+        let mut guard = InterruptGuard::arm(&self.interrupted);
 
         for position in &start_order {
             let subsystem = Arc::clone(&self.subsystems[*position]);
@@ -182,6 +259,9 @@ impl SubsystemHost {
 
             if let Err(error) = subsystem.initialize(&scoped).await {
                 self.abort().await;
+                // Disarmed only now: `abort` awaits, so a caller dropped during
+                // the rollback must still be recorded as interrupted.
+                guard.disarm();
                 return Err(CompositionError::SubsystemFailed(error));
             }
         }
@@ -203,11 +283,13 @@ impl SubsystemHost {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     self.abort().await;
+                    guard.disarm();
                     return Err(CompositionError::SubsystemFailed(error));
                 }
             }
         }
 
+        guard.disarm();
         self.lifecycle.transition_to(LifecyclePhase::Running)?;
 
         Ok(handles)
@@ -215,13 +297,24 @@ impl SubsystemHost {
 
     /// Tears down everything brought up so far, after a startup failure.
     async fn abort(&mut self) {
-        self.lifecycle
-            .transition_to(LifecyclePhase::Failed)
-            .expect("every non-terminal phase may fail");
+        self.fail_and_tear_down(&mut ShutdownReport::default())
+            .await;
+    }
 
-        let mut report = ShutdownReport::default();
-        self.quiesce_and_drain(&mut report).await;
-        self.stop_all(&mut report).await;
+    /// Moves to [`LifecyclePhase::Failed`] and stops everything recorded as
+    /// touched, ending in [`LifecyclePhase::Stopped`].
+    ///
+    /// Used both for a startup failure and for finishing a teardown that an
+    /// earlier dropped future abandoned, so both paths behave identically.
+    async fn fail_and_tear_down(&mut self, report: &mut ShutdownReport) {
+        if self.lifecycle.phase() != LifecyclePhase::Failed {
+            self.lifecycle
+                .transition_to(LifecyclePhase::Failed)
+                .expect("every phase this is reachable from may fail");
+        }
+
+        self.quiesce_and_drain(report).await;
+        self.stop_all(report).await;
 
         self.lifecycle
             .transition_to(LifecyclePhase::Stopping)
@@ -247,6 +340,11 @@ impl SubsystemHost {
                 continue;
             }
 
+            // Struck off before the await rather than after, so a teardown
+            // dropped at this point does not drain the same subsystem twice
+            // when it is resumed.
+            self.started.retain(|recorded| *recorded != position);
+
             match self.subsystems[position].drain().await {
                 Ok(drained) => report.drains.push(drained),
                 Err(error) => report.errors.push(error),
@@ -259,6 +357,11 @@ impl SubsystemHost {
             if !self.initialized.contains(&position) {
                 continue;
             }
+
+            // `Subsystem::shutdown` is documented as the last call a subsystem
+            // receives, so it must happen exactly once even if this future is
+            // dropped mid-teardown and a later `shutdown` resumes the work.
+            self.initialized.retain(|recorded| *recorded != position);
 
             if let Err(error) = self.subsystems[position].shutdown().await {
                 report.errors.push(error);
@@ -276,18 +379,40 @@ impl SubsystemHost {
     /// quiesce. Every capability minted during the run is therefore dead before
     /// teardown begins, not merely once it has finished.
     ///
+    /// If an earlier lifecycle future — this one or [`start`](Self::start) — was
+    /// dropped part way through, this finishes the teardown it abandoned,
+    /// calling `shutdown` exactly once on every subsystem that still holds
+    /// resources, and ends in [`LifecyclePhase::Stopped`].
+    ///
     /// # Errors
     ///
     /// Returns the [`CompositionError`] produced by an illegal phase change,
     /// which can only happen if the host was not running.
     pub async fn shutdown(&mut self) -> Result<ShutdownReport, CompositionError> {
+        let mut report = ShutdownReport::default();
+
+        // Taken, not merely read: if this teardown is itself dropped, the guard
+        // below sets the flag again so the next caller still sees it.
+        if self.interrupted.swap(false, Ordering::AcqRel) {
+            if self.lifecycle.phase() == LifecyclePhase::Stopped {
+                return Ok(report);
+            }
+
+            let mut guard = InterruptGuard::arm(&self.interrupted);
+            self.fail_and_tear_down(&mut report).await;
+            guard.disarm();
+            return Ok(report);
+        }
+
         self.lifecycle.transition_to(LifecyclePhase::Draining)?;
 
-        let mut report = ShutdownReport::default();
+        let mut guard = InterruptGuard::arm(&self.interrupted);
         self.quiesce_and_drain(&mut report).await;
 
         self.lifecycle.transition_to(LifecyclePhase::Stopping)?;
         self.stop_all(&mut report).await;
+        guard.disarm();
+
         self.lifecycle.transition_to(LifecyclePhase::Stopped)?;
 
         Ok(report)
@@ -363,6 +488,7 @@ mod tests {
         dependencies: Vec<SubsystemId>,
         journal: Journal,
         fail_at: Option<&'static str>,
+        park_at: Option<&'static str>,
         completed: u32,
     }
 
@@ -377,6 +503,7 @@ mod tests {
                     .collect(),
                 journal: Arc::clone(journal),
                 fail_at: None,
+                park_at: None,
                 completed: 0,
             }
         }
@@ -391,16 +518,32 @@ mod tests {
             self
         }
 
+        /// Makes `step` never resolve, so a test can reach that await and then
+        /// drop the lifecycle future there.
+        const fn parking_at(mut self, step: &'static str) -> Self {
+            self.park_at = Some(step);
+            self
+        }
+
         const fn completing(mut self, completed: u32) -> Self {
             self.completed = completed;
             self
         }
 
-        fn note(&self, step: &str) -> Result<(), SubsystemError> {
+        /// Records the call, then parks or fails if this step was configured to.
+        ///
+        /// The journal entry is written before parking so a test can prove the
+        /// await was reached, and distinguish "never called" from "called and
+        /// still running".
+        async fn note(&self, step: &'static str) -> Result<(), SubsystemError> {
             self.journal
                 .lock()
                 .expect("uncontended")
                 .push(format!("{}/{step}", self.id));
+
+            if self.park_at == Some(step) {
+                std::future::pending::<()>().await;
+            }
 
             if self.fail_at == Some(step) {
                 return Err(SubsystemError::unavailable(
@@ -428,7 +571,7 @@ mod tests {
             &'a self,
             _context: &'a StartContext,
         ) -> BoxFuture<'a, Result<(), SubsystemError>> {
-            Box::pin(async move { self.note("initialize") })
+            Box::pin(async move { self.note("initialize").await })
         }
 
         fn start<'a>(
@@ -436,25 +579,34 @@ mod tests {
             _context: &'a StartContext,
         ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
             Box::pin(async move {
-                self.note("start")?;
+                self.note("start").await?;
                 Ok(ServiceHandle::inert(self.id.clone()))
             })
         }
 
         fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
-            Box::pin(async move { self.note("quiesce") })
+            Box::pin(async move { self.note("quiesce").await })
         }
 
         fn drain<'a>(&'a self) -> BoxFuture<'a, Result<DrainReport, SubsystemError>> {
             Box::pin(async move {
-                self.note("drain")?;
+                self.note("drain").await?;
                 Ok(DrainReport::clean(self.id.clone(), self.completed))
             })
         }
 
         fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
-            Box::pin(async move { self.note("shutdown") })
+            Box::pin(async move { self.note("shutdown").await })
         }
+    }
+
+    /// Polls `future` once with a waker that does nothing, leaving it parked at
+    /// its first unresolved await so the caller can drop it there.
+    fn poll_once<F: std::future::Future>(
+        future: &mut std::pin::Pin<Box<F>>,
+    ) -> std::task::Poll<F::Output> {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        future.as_mut().poll(&mut context)
     }
 
     fn context() -> StartContext {
@@ -664,6 +816,330 @@ mod tests {
         }
 
         assert!(entries(&log).is_empty());
+    }
+
+    /// The composition layer commits `initialized` and the phase, then awaits.
+    /// If the caller is cancelled there, `abort` never runs, so the only thing
+    /// that can still release those resources is a later `shutdown`. Every test
+    /// above drives the future to completion, which is exactly why this needed
+    /// its own test.
+    #[tokio::test]
+    async fn a_start_dropped_while_initializing_is_finished_by_a_later_shutdown() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "engine", &["store"]).parking_at("initialize")),
+            Arc::new(Recorder::new(&log, "gateway", &["engine"]).ingress()),
+        ])
+        .expect("the composition is orderable");
+
+        let started = context();
+        let mut starting = Box::pin(host.start(&started));
+        assert!(
+            poll_once(&mut starting).is_pending(),
+            "engine parks inside initialize"
+        );
+        assert_eq!(
+            entries(&log),
+            vec!["store/initialize", "engine/initialize"],
+            "store finished initializing and engine reached its await"
+        );
+
+        drop(starting);
+        assert_eq!(host.phase(), LifecyclePhase::Initializing);
+
+        let report = host
+            .shutdown()
+            .await
+            .expect("an interrupted startup can still be stopped");
+
+        assert_eq!(host.phase(), LifecyclePhase::Stopped);
+        assert!(report.is_clean());
+        assert_eq!(
+            entries(&log),
+            vec![
+                "store/initialize",
+                "engine/initialize",
+                "engine/shutdown",
+                "store/shutdown",
+            ],
+            "both subsystems that were touched are stopped, in reverse order, and \
+             gateway is never touched because initialize never reached it"
+        );
+        assert!(
+            report.drains().is_empty(),
+            "nothing had started, so nothing is drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_dropped_while_starting_is_finished_by_a_later_shutdown() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "engine", &["store"]).parking_at("start")),
+            Arc::new(Recorder::new(&log, "gateway", &["engine"]).ingress()),
+        ])
+        .expect("the composition is orderable");
+
+        let started = context();
+        let mut starting = Box::pin(host.start(&started));
+        assert!(
+            poll_once(&mut starting).is_pending(),
+            "engine parks inside start"
+        );
+
+        drop(starting);
+        assert_eq!(host.phase(), LifecyclePhase::Starting);
+
+        let report = host
+            .shutdown()
+            .await
+            .expect("an interrupted startup can still be stopped");
+
+        assert_eq!(host.phase(), LifecyclePhase::Stopped);
+        assert_eq!(
+            entries(&log),
+            vec![
+                "store/initialize",
+                "engine/initialize",
+                "gateway/initialize",
+                "store/start",
+                "engine/start",
+                "engine/drain",
+                "store/drain",
+                "gateway/shutdown",
+                "engine/shutdown",
+                "store/shutdown",
+            ],
+            "store and engine were recorded as started so they are drained; gateway \
+             initialized but never started, so it is only shut down"
+        );
+        assert_eq!(
+            report
+                .drains()
+                .iter()
+                .map(|drain| drain.subsystem().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["engine", "store"]
+        );
+    }
+
+    /// `shutdown` has the same shape as `start`: it commits a phase change and
+    /// then awaits. A teardown dropped mid-drain must be resumable, and resuming
+    /// must not call `shutdown` on a subsystem that already received it, because
+    /// the trait documents it as the last call a subsystem ever gets.
+    #[tokio::test]
+    async fn a_shutdown_dropped_mid_drain_is_resumed_without_stopping_anything_twice() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "engine", &["store"]).parking_at("drain")),
+            Arc::new(Recorder::new(&log, "gateway", &["engine"]).ingress()),
+        ])
+        .expect("the composition is orderable");
+
+        host.start(&context()).await.expect("startup succeeds");
+        log.lock().expect("uncontended").clear();
+
+        let mut stopping = Box::pin(host.shutdown());
+        assert!(
+            poll_once(&mut stopping).is_pending(),
+            "engine parks inside drain"
+        );
+        assert_eq!(
+            entries(&log),
+            vec!["gateway/quiesce", "gateway/drain", "engine/drain"],
+            "gateway is the only ingress so it is the only one quiesced; the drain \
+             reached engine and stopped there"
+        );
+
+        drop(stopping);
+        assert_eq!(host.phase(), LifecyclePhase::Draining);
+
+        // Polled rather than awaited, because the failure mode of striking a
+        // subsystem off *after* its await instead of before is that the resumed
+        // teardown re-enters engine's parked drain and never returns. Nothing in
+        // this composition yields once engine is struck off, so a correct
+        // teardown completes in a single poll and a regression is a clean
+        // `Pending` rather than a hung suite.
+        let mut resuming = Box::pin(host.shutdown());
+        let resolved = poll_once(&mut resuming);
+        drop(resuming);
+
+        let report = match resolved {
+            std::task::Poll::Ready(outcome) => {
+                outcome.expect("an interrupted teardown can be finished")
+            }
+            std::task::Poll::Pending => {
+                panic!("the resumed teardown re-entered a subsystem it had already drained")
+            }
+        };
+
+        assert_eq!(host.phase(), LifecyclePhase::Stopped);
+        assert_eq!(
+            entries(&log),
+            vec![
+                "gateway/quiesce",
+                "gateway/drain",
+                "engine/drain",
+                "store/drain",
+                "gateway/shutdown",
+                "engine/shutdown",
+                "store/shutdown",
+            ],
+            "engine is not drained again because it was struck off before its await, \
+             and every subsystem is shut down exactly once"
+        );
+
+        let shutdowns = entries(&log)
+            .into_iter()
+            .filter(|entry| entry.ends_with("/shutdown"))
+            .count();
+        assert_eq!(shutdowns, 3, "one shutdown per subsystem, no more");
+        assert!(report.is_clean());
+    }
+
+    /// The interrupted composition must not be restartable, because its
+    /// subsystems still hold the resources the abandoned startup gave them.
+    ///
+    /// `Subsystem::shutdown` is documented as the last call a subsystem
+    /// receives. A teardown dropped *inside* one subsystem's `shutdown` must
+    /// therefore not call it again when it resumes, which is why the position is
+    /// struck off `initialized` before the await rather than after it.
+    #[tokio::test]
+    async fn a_teardown_dropped_inside_a_shutdown_does_not_call_that_shutdown_again() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "engine", &["store"]).parking_at("shutdown")),
+            Arc::new(Recorder::new(&log, "gateway", &["engine"]).ingress()),
+        ])
+        .expect("the composition is orderable");
+
+        host.start(&context()).await.expect("startup succeeds");
+        log.lock().expect("uncontended").clear();
+
+        let mut stopping = Box::pin(host.shutdown());
+        assert!(
+            poll_once(&mut stopping).is_pending(),
+            "engine parks inside shutdown"
+        );
+        assert_eq!(
+            entries(&log),
+            vec![
+                "gateway/quiesce",
+                "gateway/drain",
+                "engine/drain",
+                "store/drain",
+                "gateway/shutdown",
+                "engine/shutdown",
+            ],
+            "teardown reached engine's shutdown and stopped there"
+        );
+
+        drop(stopping);
+
+        let mut resuming = Box::pin(host.shutdown());
+        let resolved = poll_once(&mut resuming);
+        drop(resuming);
+
+        let report = match resolved {
+            std::task::Poll::Ready(outcome) => {
+                outcome.expect("an interrupted teardown can be finished")
+            }
+            std::task::Poll::Pending => {
+                panic!("the resumed teardown called shutdown on engine a second time")
+            }
+        };
+
+        assert_eq!(host.phase(), LifecyclePhase::Stopped);
+        assert_eq!(
+            entries(&log),
+            vec![
+                "gateway/quiesce",
+                "gateway/drain",
+                "engine/drain",
+                "store/drain",
+                "gateway/shutdown",
+                "engine/shutdown",
+                "store/shutdown",
+            ],
+            "store is the only subsystem left to stop, and engine is never revisited"
+        );
+        assert!(report.is_clean());
+    }
+
+    /// The interrupted composition must not be restartable, because its
+    /// subsystems still hold the resources the abandoned startup gave them.
+    #[tokio::test]
+    async fn an_interrupted_startup_cannot_be_started_again_before_it_is_stopped() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "engine", &["store"]).parking_at("initialize")),
+        ])
+        .expect("the composition is orderable");
+
+        let started = context();
+        let mut starting = Box::pin(host.start(&started));
+        assert!(poll_once(&mut starting).is_pending());
+        drop(starting);
+
+        let error = host
+            .start(&context())
+            .await
+            .expect_err("a half-started composition cannot be started again");
+
+        match error {
+            CompositionError::Phase(transition) => {
+                assert_eq!(transition.from(), LifecyclePhase::Initializing);
+                assert_eq!(transition.to(), LifecyclePhase::Initializing);
+            }
+            other => panic!("expected an illegal phase change, got {other}"),
+        }
+
+        assert_eq!(
+            entries(&log),
+            vec!["store/initialize", "engine/initialize"],
+            "the refused restart touched nothing"
+        );
+    }
+
+    /// Once the interrupted teardown has been finished, the flag must be spent:
+    /// a further `shutdown` has to go back to being refused by the state
+    /// machine rather than silently succeeding forever.
+    #[tokio::test]
+    async fn the_interrupted_flag_is_spent_by_the_shutdown_that_acts_on_it() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "engine", &["store"]).parking_at("initialize")),
+        ])
+        .expect("the composition is orderable");
+
+        let started = context();
+        let mut starting = Box::pin(host.start(&started));
+        assert!(poll_once(&mut starting).is_pending());
+        drop(starting);
+
+        host.shutdown()
+            .await
+            .expect("the interrupted startup stops");
+        assert_eq!(host.phase(), LifecyclePhase::Stopped);
+
+        let error = host
+            .shutdown()
+            .await
+            .expect_err("a stopped composition cannot be stopped again");
+
+        match error {
+            CompositionError::Phase(transition) => {
+                assert_eq!(transition.from(), LifecyclePhase::Stopped);
+                assert_eq!(transition.to(), LifecyclePhase::Draining);
+            }
+            other => panic!("expected an illegal phase change, got {other}"),
+        }
     }
 
     #[test]
