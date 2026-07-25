@@ -296,3 +296,113 @@ async fn plaintext_loopback_is_only_reachable_under_the_relaxed_policy() {
         "the refusal must happen before any socket is opened"
     );
 }
+
+#[tokio::test]
+async fn an_https_url_really_negotiates_tls_rather_than_falling_back_to_plaintext() {
+    // The connector is hand-written on tokio-rustls, so the one thing that must
+    // be proven on a live socket is that `https` genuinely enters a TLS
+    // handshake. This server accepts the connection and answers with plaintext
+    // HTTP; a client that had silently fallen back to cleartext would parse
+    // that as a successful 200.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback listener");
+    let port = listener
+        .local_addr()
+        .expect("read the bound address")
+        .port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&accepted);
+    let first_bytes = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&first_bytes);
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut buffer = [0_u8; 64];
+        if let Ok(read) = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await {
+            recorded.lock().await.extend_from_slice(&buffer[..read]);
+        }
+        let _ = tokio::io::AsyncWriteExt::write_all(
+            &mut socket,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+        )
+        .await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+    });
+
+    let url = url::Url::parse(&format!("https://127.0.0.1:{port}/v1/models"))
+        .expect("build the https URL");
+    let error = transport()
+        .send(
+            "test",
+            Operation::ListModels,
+            HttpRequest::new(Method::Get, url),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("a plaintext answer cannot satisfy a TLS handshake");
+    assert_eq!(error.kind(), ErrorKind::Transport);
+
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the client must have opened exactly one TCP connection"
+    );
+    let opening = first_bytes.lock().await.clone();
+    assert_eq!(
+        opening.first().copied(),
+        Some(0x16),
+        "the first record must be a TLS handshake, not an HTTP request line"
+    );
+    assert_eq!(
+        opening.get(1..3),
+        Some(&[0x03, 0x01][..]),
+        "the handshake must open with the TLS 1.0 legacy record version"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_is_returned_to_the_caller_instead_of_replaying_the_credential() {
+    // The transport does not follow redirects. That is deliberate: following a
+    // 3xx would resend the `authorization` header to whatever host the response
+    // named, defeating the origin binding that guards every stored credential.
+    let server = TestServer::start(vec![Reply::status_with_header(
+        302,
+        "location",
+        "https://attacker.example/v1/chat/completions",
+        "",
+    )])
+    .await;
+
+    let response = transport()
+        .send(
+            "test",
+            Operation::Complete,
+            HttpRequest::new(Method::Post, server.url("v1/chat/completions"))
+                .secret_header("authorization", SecretString::new("sk-live-redirect"))
+                .body(Body::Json(r#"{"model":"m"}"#.to_owned())),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("the redirect must be surfaced, not followed");
+
+    assert_eq!(response.status(), 302);
+    assert_eq!(
+        response.header("location"),
+        Some("https://attacker.example/v1/chat/completions")
+    );
+
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the credential must be sent exactly once, to the origin the caller named"
+    );
+    assert_eq!(
+        requests[0].header("authorization"),
+        Some("sk-live-redirect")
+    );
+    assert_eq!(requests[0].target, "/v1/chat/completions");
+}

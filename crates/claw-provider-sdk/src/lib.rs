@@ -15,7 +15,7 @@
 //! * Secret material is confined to [`secret::ApiKey`] and
 //!   [`secret::SecretString`]. Neither type implements `serde::Serialize`, and
 //!   both redact themselves in `Debug` and `Display`.
-//! * Transport is pure Rust: `reqwest` over `rustls`. No OpenSSL, no Node.js.
+//! * Transport is pure Rust: `hyper` over `rustls`. No OpenSSL, no Node.js.
 
 pub mod cancel;
 pub mod circuit;

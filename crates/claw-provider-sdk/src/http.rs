@@ -1,18 +1,31 @@
-//! Pure-Rust HTTP transport built on `reqwest` over `rustls`.
+//! Pure-Rust HTTP transport built on `hyper` over `rustls`.
 //!
 //! The transport is deliberately small: it owns TLS policy, header redaction,
 //! cancellation and the mapping from wire failures to [`ProviderError`]. It
 //! never interprets provider payloads.
+//!
+//! `hyper` is driven directly rather than through `reqwest` because every
+//! rustls feature `reqwest` 0.13 exposes hard-depends on
+//! `rustls-platform-verifier`, which pulls a CDLA-Permissive-2.0 crate and a
+//! second `windows-sys` major line into the graph. See [`tls`] for the detail.
+
+mod tls;
 
 use std::fmt::{self, Debug, Formatter};
+use std::future::Future;
 use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
-use futures_util::StreamExt;
+use http_body_util::{BodyExt as _, Full};
+use hyper::body::{Body as _, Incoming};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
 use url::Url;
 
+use self::tls::{TlsConnectorService, TlsSetupError};
 use crate::cancel::CancelToken;
 use crate::error::{ErrorKind, Operation, ProviderError, parse_retry_after};
 use crate::origin::{BoundApiKey, BoundSecret, OriginError};
@@ -476,10 +489,23 @@ impl Default for TransportConfig {
 }
 
 /// Pure-Rust HTTP client shared by every provider.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpTransport {
-    client: reqwest::Client,
+    client: HyperClient<TlsConnectorService, Full<Bytes>>,
     tls_policy: TlsPolicy,
+    user_agent: String,
+    request_timeout: Duration,
+}
+
+impl Debug for HttpTransport {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpTransport")
+            .field("tls_policy", &self.tls_policy)
+            .field("user_agent", &self.user_agent)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 impl HttpTransport {
@@ -497,28 +523,29 @@ impl HttpTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Transport`] when the TLS stack cannot be
-    /// initialized.
+    /// Returns [`ErrorKind::Transport`] when the platform trust store yields no
+    /// usable root certificate, or when the RING provider rejects the
+    /// requested TLS versions.
     pub fn with_config(config: &TransportConfig) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .user_agent(config.user_agent.clone())
-            .timeout(config.request_timeout)
-            .connect_timeout(config.connect_timeout)
+        let connector = TlsConnectorService::new(config.connect_timeout).map_err(|error| {
+            let detail = match error {
+                TlsSetupError::NoRoots => {
+                    "the platform trust store contains no usable root certificate"
+                }
+                TlsSetupError::Provider => {
+                    "the TLS provider rejected the required protocol versions"
+                }
+            };
+            ProviderError::new(ErrorKind::Transport, "http", Operation::Transport, detail)
+        })?;
+        let client = HyperClient::builder(TokioExecutor::new())
             .pool_idle_timeout(config.pool_idle_timeout)
-            .https_only(matches!(config.tls_policy, TlsPolicy::RequireHttps))
-            .use_rustls_tls()
-            .build()
-            .map_err(|_| {
-                ProviderError::new(
-                    ErrorKind::Transport,
-                    "http",
-                    Operation::Transport,
-                    "the TLS client could not be initialized",
-                )
-            })?;
+            .build(connector);
         Ok(Self {
             client,
             tls_policy: config.tls_policy,
+            user_agent: config.user_agent.clone(),
+            request_timeout: config.request_timeout,
         })
     }
 
@@ -543,35 +570,25 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpResponse, ProviderError> {
-        let builder = self.build(provider, operation, &request)?;
-        let response = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(ProviderError::new(
-                    ErrorKind::Cancelled,
-                    provider,
-                    operation,
-                    "the request was cancelled before a response arrived",
-                ));
-            }
-            result = builder.send() => result.map_err(|error| classify(provider, operation, &error))?,
-        };
-
+        let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let response = self
+            .dispatch(provider, operation, &request, deadline, cancel)
+            .await?;
         let status = response.status().as_u16();
         let headers = collect_headers(response.headers());
-        let body = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(ProviderError::new(
-                    ErrorKind::Cancelled,
-                    provider,
-                    operation,
-                    "the request was cancelled while the body was being read",
-                ));
-            }
-            result = response.bytes() => result.map_err(|error| classify(provider, operation, &error))?,
-        };
-        Ok(HttpResponse::new(status, headers, body.to_vec()))
+        // The whole exchange shares one deadline, so reading the body cannot
+        // extend a request past the timeout the caller asked for.
+        let body = with_deadline(
+            provider,
+            operation,
+            deadline,
+            cancel,
+            "the request was cancelled while the body was being read",
+            response.into_body().collect(),
+        )
+        .await?
+        .map_err(|error| classify_hyper(provider, operation, &error))?;
+        Ok(HttpResponse::new(status, headers, body.to_bytes().to_vec()))
     }
 
     /// Sends a request and returns the response body as a chunk stream.
@@ -586,32 +603,19 @@ impl HttpTransport {
         request: HttpRequest,
         cancel: &CancelToken,
     ) -> Result<HttpStream, ProviderError> {
-        let builder = self.build(provider, operation, &request)?;
-        let response = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(ProviderError::new(
-                    ErrorKind::Cancelled,
-                    provider,
-                    operation,
-                    "the request was cancelled before a response arrived",
-                ));
-            }
-            result = builder.send() => result.map_err(|error| classify(provider, operation, &error))?,
-        };
-
+        // A streamed response has no overall deadline: the point of streaming
+        // is that the body arrives over an open-ended window. The headers still
+        // must arrive within one.
+        let deadline = request.timeout.unwrap_or(self.request_timeout);
+        let response = self
+            .dispatch(provider, operation, &request, deadline, cancel)
+            .await?;
         let status = response.status().as_u16();
         let headers = collect_headers(response.headers());
-        let stream_provider = provider.to_owned();
-        let chunk_provider = provider.to_owned();
-        let cancel = cancel.clone();
-        let chunks = response
-            .bytes_stream()
-            .map(move |chunk| chunk.map_err(|error| classify(&chunk_provider, operation, &error)));
         let chunks = CancellableChunks {
-            inner: Box::pin(chunks),
-            cancel,
-            provider: stream_provider,
+            inner: response.into_body(),
+            cancel: cancel.clone(),
+            provider: provider.to_owned(),
             operation,
         };
         Ok(HttpStream {
@@ -621,35 +625,65 @@ impl HttpTransport {
         })
     }
 
+    /// Sends the request and awaits response headers under a deadline.
+    async fn dispatch(
+        &self,
+        provider: &str,
+        operation: Operation,
+        request: &HttpRequest,
+        deadline: Duration,
+        cancel: &CancelToken,
+    ) -> Result<http::Response<Incoming>, ProviderError> {
+        let wire = self.build(provider, operation, request)?;
+        with_deadline(
+            provider,
+            operation,
+            deadline,
+            cancel,
+            "the request was cancelled before a response arrived",
+            self.client.request(wire),
+        )
+        .await?
+        .map_err(|error| classify_legacy(provider, operation, &error))
+    }
+
     fn build(
         &self,
         provider: &str,
         operation: Operation,
         request: &HttpRequest,
-    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+    ) -> Result<http::Request<Full<Bytes>>, ProviderError> {
         self.check_scheme(provider, operation, request.url())?;
-        let method = match request.method {
-            Method::Get => reqwest::Method::GET,
-            Method::Post => reqwest::Method::POST,
-            Method::Delete => reqwest::Method::DELETE,
+        let invalid = |detail: &str| {
+            ProviderError::new(ErrorKind::InvalidRequest, provider, operation, detail)
         };
-        let mut builder = self.client.request(method, request.url.clone());
+        let uri: http::Uri = request
+            .url
+            .as_str()
+            .parse()
+            .map_err(|_| invalid("the request URL is not a valid URI"))?;
+        let mut builder = http::Request::builder()
+            .method(request.method.as_str())
+            .uri(uri)
+            .header("user-agent", self.user_agent.as_str());
         if let Some(content_type) = request.body.content_type() {
             builder = builder.header("content-type", content_type);
         }
         for header in &request.headers {
-            builder = builder.header(header.name.as_str(), header.value.expose());
+            let mut value = http::HeaderValue::from_str(header.value.expose())
+                .map_err(|_| invalid("a header value contains bytes a header cannot carry"))?;
+            // `hyper` will not print a sensitive value even with its most
+            // verbose tracing enabled.
+            value.set_sensitive(header.sensitive);
+            builder = builder.header(header.name.as_str(), value);
         }
-        if let Some(timeout) = request.timeout {
-            builder = builder.timeout(timeout);
-        }
-        match &request.body {
-            Body::Empty => {}
-            Body::Json(text) | Body::Form(text) => {
-                builder = builder.body(text.clone().into_bytes());
-            }
-        }
-        Ok(builder)
+        let body = match &request.body {
+            Body::Empty => Full::new(Bytes::new()),
+            Body::Json(text) | Body::Form(text) => Full::new(Bytes::from(text.clone())),
+        };
+        builder
+            .body(body)
+            .map_err(|_| invalid("the request could not be assembled"))
     }
 
     fn check_scheme(
@@ -676,8 +710,42 @@ impl HttpTransport {
     }
 }
 
+/// Races a future against the cancel token and a deadline.
+///
+/// Cancellation wins over the deadline, and both win over the future, so a
+/// cancelled request never reports a timeout it did not have. Dropping the
+/// future is what actually aborts the in-flight exchange and closes the socket.
+async fn with_deadline<F>(
+    provider: &str,
+    operation: Operation,
+    deadline: Duration,
+    cancel: &CancelToken,
+    cancelled_detail: &str,
+    future: F,
+) -> Result<F::Output, ProviderError>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(ProviderError::new(
+            ErrorKind::Cancelled,
+            provider,
+            operation,
+            cancelled_detail,
+        )),
+        () = tokio::time::sleep(deadline) => Err(ProviderError::new(
+            ErrorKind::Timeout,
+            provider,
+            operation,
+            "the request exceeded its deadline",
+        )),
+        output = future => Ok(output),
+    }
+}
+
 struct CancellableChunks {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>,
+    inner: Incoming,
     cancel: CancelToken,
     provider: String,
     operation: Operation,
@@ -689,17 +757,33 @@ impl Stream for CancellableChunks {
     fn poll_next(
         self: Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if this.cancel.is_cancelled() {
-            return std::task::Poll::Ready(Some(Err(ProviderError::new(
+            return Poll::Ready(Some(Err(ProviderError::new(
                 ErrorKind::Cancelled,
                 &this.provider,
                 this.operation,
                 "the response body was cancelled",
             ))));
         }
-        this.inner.as_mut().poll_next(context)
+        loop {
+            return match Pin::new(&mut this.inner).poll_frame(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(classify_hyper(
+                    &this.provider,
+                    this.operation,
+                    &error,
+                )))),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(chunk) => Poll::Ready(Some(Ok(chunk))),
+                    // Trailers carry no body bytes, so keep polling rather than
+                    // ending the stream early on a trailing metadata frame.
+                    Err(_) => continue,
+                },
+            };
+        }
     }
 }
 
@@ -717,7 +801,7 @@ pub fn is_loopback(url: &Url) -> bool {
     }
 }
 
-fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+fn collect_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .filter_map(|(name, value)| {
@@ -729,15 +813,12 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
         .collect()
 }
 
-fn classify(provider: &str, operation: Operation, error: &reqwest::Error) -> ProviderError {
-    if error.is_timeout() {
-        return ProviderError::new(
-            ErrorKind::Timeout,
-            provider,
-            operation,
-            "the request exceeded its deadline",
-        );
-    }
+/// Classifies a failure raised while establishing or driving a connection.
+fn classify_legacy(
+    provider: &str,
+    operation: Operation,
+    error: &hyper_util::client::legacy::Error,
+) -> ProviderError {
     if error.is_connect() {
         return ProviderError::new(
             ErrorKind::Transport,
@@ -746,7 +827,40 @@ fn classify(provider: &str, operation: Operation, error: &reqwest::Error) -> Pro
             "the connection could not be established",
         );
     }
-    if error.is_body() || error.is_decode() {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(current) = source {
+        if let Some(hyper_error) = current.downcast_ref::<hyper::Error>() {
+            return classify_hyper(provider, operation, hyper_error);
+        }
+        source = std::error::Error::source(current);
+    }
+    ProviderError::new(
+        ErrorKind::Transport,
+        provider,
+        operation,
+        "the HTTP exchange failed",
+    )
+}
+
+/// Classifies a failure raised by the HTTP protocol layer itself.
+fn classify_hyper(provider: &str, operation: Operation, error: &hyper::Error) -> ProviderError {
+    if error.is_timeout() {
+        return ProviderError::new(
+            ErrorKind::Timeout,
+            provider,
+            operation,
+            "the request exceeded its deadline",
+        );
+    }
+    if error.is_parse() || error.is_parse_status() {
+        return ProviderError::new(
+            ErrorKind::Protocol,
+            provider,
+            operation,
+            "the response was not valid HTTP",
+        );
+    }
+    if error.is_body_write_aborted() || error.is_incomplete_message() || error.is_canceled() {
         return ProviderError::new(
             ErrorKind::Transport,
             provider,
@@ -754,7 +868,7 @@ fn classify(provider: &str, operation: Operation, error: &reqwest::Error) -> Pro
             "the response body could not be read",
         );
     }
-    if error.is_builder() || error.is_request() {
+    if error.is_user() {
         return ProviderError::new(
             ErrorKind::InvalidRequest,
             provider,

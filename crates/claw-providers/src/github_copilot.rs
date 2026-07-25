@@ -2,7 +2,7 @@
 //!
 //! Neither `github-copilot-sdk` nor the Copilot CLI appears anywhere in this
 //! crate's dependency graph. Authentication is an RFC 8628 OAuth 2.0 device
-//! authorization grant spoken directly over `reqwest`/`rustls`, followed by the
+//! authorization grant spoken directly over `hyper`/`rustls`, followed by the
 //! Copilot token exchange; the chat surface is the OpenAI dialect with the
 //! editor headers Copilot requires.
 //!
