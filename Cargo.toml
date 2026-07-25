@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/gta-claw-android",
   "apps/gta-claw-cli",
   "apps/gta-claw-daemon",
   "crates/claw-application",

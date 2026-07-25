@@ -600,7 +600,7 @@ fn validate_policy_execution_workflows(root: &SafeRoot) -> PolicyResult<()> {
         if policy_positions != [1]
             || job.len() != 4
             || job_keys != BTreeSet::from(["name", "runs-on", "steps", "timeout-minutes"])
-            || yaml_string(job.get(yaml_key("runs-on"))).is_none_or(str::is_empty)
+            || yaml_string(job.get(yaml_key("runs-on"))) != Some("windows-latest")
             || timeout.is_none_or(|timeout| !(1..=45).contains(&timeout))
             || steps.len() < 2
         {

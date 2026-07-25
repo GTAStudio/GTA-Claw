@@ -297,7 +297,7 @@ fn validate_manifest(manifest: &Manifest, transition_schema: bool) -> Result<(),
         }
     }
     let expected_counts = [
-        ("artifact_json_files", 16),
+        ("artifact_json_files", 17),
         ("ledgers", 3),
         ("feature_rows", 47),
         ("inventory_files", 10),
