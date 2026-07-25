@@ -192,7 +192,7 @@ ancestor directory whose `Cargo.toml` declares a `[package]` — is:
 `build.rs` is deliberately **not** a root: `cargo test` does not run tests in a
 build script, so a `#[test]` there never executes either.
 
-Two limits, stated plainly rather than left to be discovered:
+Three limits, stated plainly rather than left to be discovered:
 
 - The rule catches files that **nothing references**. It does not evaluate `cfg`
   predicates, so a module behind `#[cfg(feature = "off-by-default")]` still
@@ -210,8 +210,15 @@ This rule is **locally owned**, not ported. `crates/claw-conformance` does not
 implement it yet, so this validator is currently the stricter of the two. That
 asymmetry is safe in this direction: it can only reject a citation the harness
 would have accepted, and an unreferenced file is never legitimate evidence. The
-specification above is deliberately complete enough to be mirrored; the six
-`implemented-citing-*` cases in `validate-self-test.ps1` are its executable form.
+specification above is deliberately complete enough to be mirrored; the seven
+`implemented-citing-*` cases in `validate-self-test.ps1` are its executable form —
+four that must be rejected and three that must be accepted.
+
+A tightening rule needs its false-positive cases pinned as much as its
+true-positive ones. The three accepting cases — a `mod`-wired module, a
+`#[path]`-relocated module, and a transitive `lib.rs` → `nested/mod.rs` →
+`nested/deep.rs` chain — exist so that a later "improvement" to this rule cannot
+quietly turn it into a false-rejection engine without turning the self-test red.
 
 ### Implementation pointers are not evidence
 
@@ -319,9 +326,10 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns about 139 child
-validator processes — one per case, plus a second run for the 44 cases that first
-re-bless the ledger digests, plus one baseline run — and takes several minutes,
+The adversarial self-test is a separate, slower step. It spawns 185 child
+validator processes — one baseline run against the real tree, one per each of the
+117 cases, and a re-blessing pre-run for the 67 cases that model an attacker who
+had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:
 
