@@ -64,15 +64,21 @@ output_receipt="$(trust_receipt "$OUTPUT_COMPONENT_PATH" "build output")"
 
 recipe_sha="$(sha256_file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build")"
 image_tag="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
+image_iid_file="$OUTPUT_COMPONENT_PATH/.build-image-id"
+[[ ! -e "$image_iid_file" && ! -L "$image_iid_file" ]] ||
+  die "build image ID receipt path already exists"
 docker build \
   --provenance=false \
+  --iidfile "$image_iid_file" \
   --file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build" \
   --build-arg "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
   --tag "$image_tag" \
   "$SOURCE_SNAPSHOT_DIRECTORY"
-environment_image_id="$(docker image inspect --format '{{.Id}}' "$image_tag")"
+assert_regular_unaliased "$image_iid_file" "build image ID receipt"
+environment_image_id="$(cat "$image_iid_file")"
 [[ "$environment_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "pinned build environment produced an invalid image ID"
+rm -f "$image_iid_file"
 
 exec {source_fd}<"$SOURCE_SNAPSHOT_DIRECTORY"
 create_anchored_mounts \

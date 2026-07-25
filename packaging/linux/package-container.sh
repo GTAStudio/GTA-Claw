@@ -7,11 +7,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/worktree-git.sh"
 bootstrap_windows_worktree_git "$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/build-manifest.sh"
 source "$SCRIPT_DIR/lib/container-trust.sh"
 source "$SCRIPT_DIR/lib/container-mount.sh"
 
 require_linux
-for tool in docker findmnt git id python3 realpath stat tar; do
+for tool in docker dpkg-query findmnt git id jq openssl python3 readelf realpath sha256sum stat tar; do
   require_tool "$tool"
 done
 [[ "$#" -eq 3 ]] ||
@@ -74,10 +75,17 @@ git_receipt="$(trust_receipt "$git_common_dir" "Git common directory")"
 build_receipt="$(trust_receipt "$BUILD_COMPONENT_PATH" "build component")"
 output_receipt="$(trust_receipt "$OUTPUT_COMPONENT_PATH" "package output")"
 
-image_tag="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
-packaging_image_id="$(docker image inspect --format '{{.Id}}' "$image_tag")"
+IMMUTABLE_SOURCE_SNAPSHOT=1 \
+SOURCE_COMMIT="$SOURCE_COMMIT" \
+SOURCE_TREE="$SOURCE_TREE" \
+SOURCE_TREE_RECEIPT="$SOURCE_TREE_RECEIPT" \
+  verify_build_manifest "$host_manifest" "$arch" "$expected_build_key_sha"
+packaging_image_id="$(jq -er '.builder.environmentImageId' "$host_manifest")"
 [[ "$packaging_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "packaging image ID is invalid"
+[[ "$(docker image inspect --format '{{.Id}}' "$packaging_image_id")" == \
+  "$packaging_image_id" ]] ||
+  die "authenticated packaging image is not available locally"
 
 exec {source_fd}<"$SOURCE_SNAPSHOT_DIRECTORY"
 create_anchored_mounts \
