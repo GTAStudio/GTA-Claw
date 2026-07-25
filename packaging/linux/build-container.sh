@@ -19,6 +19,9 @@ arch="$1"
 arch_target "$arch" >/dev/null
 
 : "${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must select a new private build root}"
+: "${CARGO_BUILD_JOBS:=4}"
+[[ "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]?$ && "$CARGO_BUILD_JOBS" -le 64 ]] ||
+  die "CARGO_BUILD_JOBS must be an integer from 1 to 64"
 target_root="$(canonical_target_root)"
 git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
 assert_isolated_target_root "$REPO_ROOT" "$git_common_dir" "$target_root"
@@ -81,6 +84,7 @@ container_manifest="$(
     --env "BUILD_INPUT_UMASK=$build_input_umask" \
     --env "BUILD_ENVIRONMENT_IMAGE_ID=$environment_image_id" \
     --env "BUILD_RECIPE_SHA256=$recipe_sha" \
+    --env "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS" \
     --env "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
     --env IMMUTABLE_SOURCE_SNAPSHOT=1 \
     --env "SOURCE_COMMIT=$SOURCE_COMMIT" \
