@@ -1,0 +1,526 @@
+{
+  "schema_version": 1,
+  "purpose": "Shared fixture corpus for the enabled-test oracle. crates/claw-conformance declares_enabled_test is normative; compat/upstream/validate.ps1 Test-DeclaresEnabledRustTest is a follower port. Both implementations MUST classify every case below identically, and both replay this corpus on every run, so a divergence fails a build instead of silently allowing a forged parity claim.",
+  "normative_implementation": {
+    "path": "crates/claw-conformance/src/claims.rs",
+    "function": "declares_enabled_test",
+    "ported_at_commit": "fe76d3ae27ca6871360af47c5f03e8a5736b0227"
+  },
+  "follower_implementation": {
+    "path": "compat/upstream/validate.ps1",
+    "function": "Test-DeclaresEnabledRustTest"
+  },
+  "expected_is_authoritative_from": "the normative Rust implementation; expectations were produced by running it, never written by hand",
+  "cases": [
+    {
+      "name": "normative-plain-test",
+      "source": "#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "normative-tokio-test",
+      "source": "#[tokio::test]\nasync fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "normative-ignored",
+      "source": "#[test]\n#[ignore]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-cfg-gated",
+      "source": "#[test]\n#[cfg(target_os = \"none\")]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-plain-fn",
+      "source": "fn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-line-comment",
+      "source": "// #[test]\n// fn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-block-comment",
+      "source": "/* #[test]\nfn exact_name() {} */",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-different-name",
+      "source": "#[test]\nfn different_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-detached-attribute",
+      "source": "#[test]\nfn real_test() {}\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-nested-qualified",
+      "source": "mod actual_module {\n#[test]\nfn exact_name() {}\n}",
+      "test": "actual_module::exact_name",
+      "expected": true
+    },
+    {
+      "name": "normative-nested-fabricated",
+      "source": "mod actual_module {\n#[test]\nfn exact_name() {}\n}",
+      "test": "fabricated_module::exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-nested-unqualified",
+      "source": "mod actual_module {\n#[test]\nfn exact_name() {}\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-cfg-test-module",
+      "source": "#[cfg(test)]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": true
+    },
+    {
+      "name": "normative-cfg-any-module",
+      "source": "#[cfg(any())]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-feature-gated-module",
+      "source": "#[cfg(feature = \"off\")]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-disabled-outer-module",
+      "source": "#[cfg(any())]\nmod outer {\nmod tests {\n#[test]\nfn exact_name() {}\n}\n}",
+      "test": "outer::tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-inner-disabled-module",
+      "source": "mod tests {\n#![cfg(any())]\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-inner-feature-gated-file",
+      "source": "#![cfg(feature = \"off\")]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-inner-cfg-attr-module",
+      "source": "mod tests {\n#![cfg_attr(all(), allow(dead_code))]\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-inner-cfg-test-module",
+      "source": "mod tests {\n#![cfg(test)]\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": true
+    },
+    {
+      "name": "normative-string-literal",
+      "source": "const SOURCE: &str = \"#[test] fn exact_name() {}\";\nfn ordinary() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "normative-raw-string",
+      "source": "const SOURCE: &str = r#\"#[test] fn exact_name() {}\"#;",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-crlf-source",
+      "source": "#[test]\r\nfn exact_name() {}\r\n",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-utf8-bom",
+      "source": "\ufeff#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-nested-block-comment",
+      "source": "/* /* #[test] fn exact_name() {} */ */\nfn other() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-doc-comment",
+      "source": "/// #[test]\n/// fn exact_name() {}\nfn other() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-inner-doc-comment",
+      "source": "//! #[test] fn exact_name() {}\nfn other() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-hashed-raw-string",
+      "source": "const S: &str = r###\"#[test] fn exact_name() {}\"###;",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-byte-string",
+      "source": "const S: &[u8] = b\"#[test] fn exact_name() {}\";",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-raw-byte-string",
+      "source": "const S: &[u8] = br#\"#[test] fn exact_name() {}\"#;",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-quote-in-char-literal",
+      "source": "const Q: char = '\"';\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-lifetime-is-not-a-literal",
+      "source": "fn helper<'a>(x: &'a str) -> &'a str { x }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-escaped-quote-char",
+      "source": "const C: char = '\\'';\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-escaped-backslash-char",
+      "source": "const C: char = '\\\\';\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-block-comment-end-in-string",
+      "source": "const S: &str = \"*/\";\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-unterminated-block-comment",
+      "source": "/* unterminated\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-unterminated-string",
+      "source": "const S: &str = \"unterminated\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-unterminated-raw-string",
+      "source": "const S: &str = r#\"unterminated\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-non-ascii-comment",
+      "source": "// crab \ud83e\udd80 #[test] fn exact_name() {}\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-non-ascii-string",
+      "source": "const S: &str = \"\ud83e\udd80 #[test] fn exact_name() {}\";",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-empty-source",
+      "source": "",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-attribute-only",
+      "source": "#[test]",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-unclosed-attribute",
+      "source": "#[test\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "lexer-raw-identifier",
+      "source": "#[test]\nfn r#type() {}",
+      "test": "type",
+      "expected": false
+    },
+    {
+      "name": "attribute-whitespace-inside",
+      "source": "#[ test ]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "attribute-deep-path-test",
+      "source": "#[a::b::test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "attribute-test-lookalike",
+      "source": "#[test_case]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "attribute-ignore-with-reason",
+      "source": "#[ignore = \"flaky\"]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "attribute-cfg-attr-test",
+      "source": "#[cfg_attr(feature = \"x\", test)]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "attribute-third-party-macro",
+      "source": "#[rstest::rstest]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "attribute-comment-between",
+      "source": "#[test]\n/* c */\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "attribute-line-comment-between",
+      "source": "#[test]\n// c\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "attribute-duplicate-declaration",
+      "source": "#[test]\nfn exact_name() {}\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "attribute-ignored-sibling",
+      "source": "#[ignore]\n#[test]\nfn other() {}\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-pub-fn",
+      "source": "#[test]\npub fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-pub-crate-fn",
+      "source": "#[test]\npub(crate) fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-pub-in-path-fn",
+      "source": "#[test]\npub(in crate::a) fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-unsafe-fn",
+      "source": "#[test]\nunsafe fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-const-fn",
+      "source": "#[test]\nconst fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-extern-abi-fn",
+      "source": "#[test]\nextern \"C\" fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-async-unsafe-fn",
+      "source": "#[test]\nasync unsafe fn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-generic-where-fn",
+      "source": "#[test]\nfn exact_name<T: Clone>() where T: Send {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-inside-impl-block",
+      "source": "struct Foo;\nimpl Foo {\n#[test]\nfn exact_name() {}\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "item-inside-fn-body",
+      "source": "fn wrapper() {\n#[test]\nfn exact_name() {}\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "item-inside-macro-rules",
+      "source": "macro_rules! m {\n() => {\n#[test]\nfn exact_name() {}\n};\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "item-module-declaration-only",
+      "source": "mod other;\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-empty-module-before-test",
+      "source": "mod tests { }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-enum-before-test",
+      "source": "enum E { A }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "item-use-of-test-symbol",
+      "source": "use a::b::test;\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-three-levels-exact",
+      "source": "mod a {\nmod b {\nmod c {\n#[test]\nfn exact_name() {}\n}\n}\n}",
+      "test": "a::b::c::exact_name",
+      "expected": true
+    },
+    {
+      "name": "module-three-levels-truncated",
+      "source": "mod a {\nmod b {\nmod c {\n#[test]\nfn exact_name() {}\n}\n}\n}",
+      "test": "b::c::exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-three-levels-skipped",
+      "source": "mod a {\nmod b {\nmod c {\n#[test]\nfn exact_name() {}\n}\n}\n}",
+      "test": "a::c::exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-three-levels-bare",
+      "source": "mod a {\nmod b {\nmod c {\n#[test]\nfn exact_name() {}\n}\n}\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-cfg-test-plus-allow",
+      "source": "#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": true
+    },
+    {
+      "name": "module-ignored",
+      "source": "#[ignore]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-nested-cfg-test",
+      "source": "#[cfg(test)]\nmod tests {\n#[cfg(test)]\nmod inner {\n#[test]\nfn exact_name() {}\n}\n}",
+      "test": "tests::inner::exact_name",
+      "expected": true
+    },
+    {
+      "name": "module-cfg-all-test",
+      "source": "#[cfg(all(test))]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-cfg-not-test",
+      "source": "#[cfg(not(test))]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-inner-allow",
+      "source": "mod tests {\n#![allow(dead_code)]\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": true
+    },
+    {
+      "name": "module-inner-ignore",
+      "source": "mod tests {\n#![ignore]\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": false
+    },
+    {
+      "name": "module-file-inner-cfg-test",
+      "source": "#![cfg(test)]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "citation-empty-name",
+      "source": "#[test]\nfn exact_name() {}",
+      "test": "",
+      "expected": false
+    },
+    {
+      "name": "citation-leading-separator",
+      "source": "#[test]\nfn exact_name() {}",
+      "test": "::exact_name",
+      "expected": false
+    },
+    {
+      "name": "citation-trailing-separator",
+      "source": "#[test]\nfn exact_name() {}",
+      "test": "exact_name::",
+      "expected": false
+    },
+    {
+      "name": "citation-case-mismatch",
+      "source": "#[test]\nfn exact_name() {}",
+      "test": "EXACT_NAME",
+      "expected": false
+    }
+  ]
+}
