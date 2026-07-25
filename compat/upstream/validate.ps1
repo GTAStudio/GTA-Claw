@@ -1777,7 +1777,7 @@ function Join-RepositoryRelativePath {
 }
 
 function Get-RustModReferencesInRange {
-    param([string[]]$Tokens, [int]$Start, [int]$End, [string[]]$Segments, [object]$Sink)
+    param([string[]]$Tokens, [int]$Start, [int]$End, [object[]]$Segments, [object]$Sink)
     $index = $Start
     while ($index -lt $End) {
         $attributeResult = Get-RustAttributes $Tokens $index $End
@@ -1792,26 +1792,30 @@ function Get-RustModReferencesInRange {
             ($index + 1) -lt $Tokens.Length -and $Tokens[$index + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
             $name = $Tokens[$index + 1].Substring(2)
             $after = $index + 2
-            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
-                $close = Get-RustMatchingDelimiter $Tokens $after $End
-                if ($close -lt 0) { $close = $End }
-                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($name)) $Sink
-                $index = $close + 1
-                $matched = $true
-            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
-                $pathAttribute = $null
-                $hasPathAttribute = $false
-                foreach ($attribute in $outer) {
-                    if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
-                        $hasPathAttribute = $true
-                        foreach ($token in $attribute.tokens) {
-                            if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
-                                $pathAttribute = $token.Substring(2)
-                                break
-                            }
+            # A path attribute governs an inline 'mod name { }' exactly as it
+            # governs 'mod name;', so it has to be read before the two forms are
+            # told apart rather than inside the semicolon branch only.
+            $pathAttribute = $null
+            $hasPathAttribute = $false
+            foreach ($attribute in $outer) {
+                if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
+                    $hasPathAttribute = $true
+                    foreach ($token in $attribute.tokens) {
+                        if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
+                            $pathAttribute = $token.Substring(2)
+                            break
                         }
                     }
                 }
+            }
+            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
+                $close = Get-RustMatchingDelimiter $Tokens $after $End
+                if ($close -lt 0) { $close = $End }
+                $segment = [ordered]@{ name = $name; path = $pathAttribute; hasPath = $hasPathAttribute }
+                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($segment)) $Sink
+                $index = $close + 1
+                $matched = $true
+            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
                 [void]$Sink.Add([ordered]@{
                     segments = $Segments
                     name = $name
@@ -2092,6 +2096,15 @@ function Get-CrateTargetRootFiles {
     return ,$roots.ToArray()
 }
 
+function Get-AmbiguousModuleKey {
+    # Ambiguity markers share the reachable-set hashtable, so they need a prefix
+    # no repository-relative path can ever produce. This is a function rather
+    # than a variable so that any harness which lifts the reachability rule out
+    # of this file fails loudly instead of silently keying on the bare path.
+    param([string]$Path)
+    return ("!ambiguous-module:" + $Path)
+}
+
 function Get-CrateCompiledFileSet {
     param([string]$CrateDirectory, [string]$ManifestText)
     if ($script:CrateReachabilityCache.ContainsKey($CrateDirectory)) {
@@ -2111,10 +2124,29 @@ function Get-CrateCompiledFileSet {
         if ($null -eq $absolute) { continue }
         foreach ($reference in (Get-RustModuleReferences (Get-RepositoryFileText $absolute))) {
             $scope = $current.directory
+            $fileDirectory = Join-RepositoryRelativePath $current.file ".."
+            # A path attribute on an INLINE module renames the directory its
+            # children live in, so the enclosing scopes cannot be a list of plain
+            # module names. Cargo compiles
+            #   #[path = "actual"] mod outer { #[path = "proof.rs"] mod proof; }
+            # as actual/proof.rs and never as outer/proof.rs, and it resolves a
+            # top-level inline path against the directory holding the source file
+            # exactly as it does for 'mod name;'.
+            $scopeFailed = $false
+            $depth = 0
             foreach ($segment in $reference.segments) {
-                $scope = Join-RepositoryRelativePath $scope $segment
-                if ($null -eq $scope) { break }
+                if ($segment.hasPath) {
+                    if ($null -eq $segment.path) { $scopeFailed = $true; break }
+                    if ($depth -eq 0) { $base = $fileDirectory } else { $base = $scope }
+                    if ($null -eq $base) { $scopeFailed = $true; break }
+                    $scope = Join-RepositoryRelativePath $base $segment.path
+                } else {
+                    $scope = Join-RepositoryRelativePath $scope $segment.name
+                }
+                if ($null -eq $scope) { $scopeFailed = $true; break }
+                $depth = $depth + 1
             }
+            if ($scopeFailed) { continue }
             if ($null -eq $scope) { continue }
             $candidates = @()
             $childDirectory = $null
@@ -2132,7 +2164,7 @@ function Get-CrateCompiledFileSet {
                 # same-named file one directory deeper.
                 $base = $scope
                 if (@($reference.segments).Count -eq 0) {
-                    $base = Join-RepositoryRelativePath $current.file ".."
+                    $base = $fileDirectory
                 }
                 if ($null -eq $base) { continue }
                 $target = Join-RepositoryRelativePath $base $reference.path
@@ -2148,10 +2180,21 @@ function Get-CrateCompiledFileSet {
                     }
                 }
             } else {
-                $candidates = @(
-                    (Join-RepositoryRelativePath $scope ($reference.name + ".rs")),
-                    (Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs"))
-                )
+                $fileCandidate = Join-RepositoryRelativePath $scope ($reference.name + ".rs")
+                $directoryCandidate = Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs")
+                $fileExists = ($null -ne $fileCandidate) -and ($null -ne (Resolve-RepositoryFilePath $fileCandidate))
+                $directoryExists = ($null -ne $directoryCandidate) -and ($null -ne (Resolve-RepositoryFilePath $directoryCandidate))
+                if ($fileExists -and $directoryExists) {
+                    # rustc refuses this outright (E0761: file for module found at
+                    # both paths) and compiles NEITHER file, so blessing either
+                    # one would cite a test out of a crate that does not build.
+                    # Fail closed and remember both sides so the citation gets the
+                    # specific reason instead of a misleading 'not wired in'.
+                    $reachable[(Get-AmbiguousModuleKey $fileCandidate)] = $directoryCandidate
+                    $reachable[(Get-AmbiguousModuleKey $directoryCandidate)] = $fileCandidate
+                    continue
+                }
+                $candidates = @($fileCandidate, $directoryCandidate)
                 $childDirectory = Join-RepositoryRelativePath $scope $reference.name
             }
             foreach ($candidate in $candidates) {
@@ -2192,6 +2235,13 @@ function Assert-EvidenceFileIsCompiled {
             "is already built.")
     }
     $reachable = Get-CrateCompiledFileSet ([string]$crate.directory) ([string]$crate.text)
+    $ambiguityKey = Get-AmbiguousModuleKey $RelativePath
+    if ($reachable.ContainsKey($ambiguityKey)) {
+        Fail ("$Context acceptance evidence '$RelativePath' and '" + [string]$reachable[$ambiguityKey] + "' both " +
+            "answer the same 'mod' declaration. rustc rejects that ambiguity outright (E0761: file for module " +
+            "found at both paths) and compiles NEITHER file, so the crate does not build and the cited test can " +
+            "never run. Delete or rename one of the two files, then cite the survivor.")
+    }
     if (-not $reachable.ContainsKey($RelativePath)) {
         $crateLabel = $(if ([string]::IsNullOrEmpty([string]$crate.directory)) { "the repository root crate" } else { [string]$crate.directory })
         Fail ("$Context acceptance evidence '$RelativePath' is not reached by any cargo test target of $crateLabel. " +
