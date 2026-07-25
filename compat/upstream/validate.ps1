@@ -1,10 +1,71 @@
+<#
+.SYNOPSIS
+    Validates the frozen OpenClaw upstream compatibility contract under compat/upstream.
+
+.DESCRIPTION
+    Enforces the frozen baseline (upstream provenance, inventories, canonical counts)
+    and the audited feature-ledger lifecycle. A feature row may be unimplemented,
+    partial or implemented; anything other than unimplemented must cite typed
+    acceptance evidence whose paths exist in the working tree and whose named test,
+    symbol or job actually appears inside the cited file.
+
+.PARAMETER WriteLedgerDigests
+    Runs every check except the stored ledger digest comparison, then rewrites
+    compat/upstream/ledger-digests.sha256 from the current ledgers and prints the
+    digests for review. This is the ONLY supported way to change ledger digests.
+    It never touches inventory digests, the schema digest or baseline.json.
+
+.PARAMETER RepositoryRoot
+    Repository working tree used to resolve acceptance-evidence paths. Defaults to
+    the parent of compat/. The validator self-test passes the real tree explicitly
+    because it runs mutated copies of this contract from a temporary directory.
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1
+
+.EXAMPLE
+    powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
+#>
 [CmdletBinding()]
-param()
+param(
+    [switch]$WriteLedgerDigests,
+    [string]$RepositoryRoot
+)
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
-$ExpectedSchemaDigest = "ce2399751e5f990bcf5074435a6e3159e1a5bce2266402c3d1665da1971e9a44"
+$ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f441e8de396"
+
+# Frozen like the inventories and the schema: the shared enabled-test corpus is a
+# contract artifact, NOT a regenerable one. -WriteLedgerDigests cannot reach this
+# constant, so weakening a case to let a forged citation through requires a
+# reviewed edit to this script.
+$ExpectedOracleCorpusDigest = "30d6163e8f84c29c60354a947c2ed6dd1974f91478c38d0f45830218e89239c0"
+$ExpectedOracleCorpusCases = 85
+$ExpectedOracleCorpusTrue = 35
+$LedgerDigestFileName = "ledger-digests.sha256"
+$LedgerDigestHeader = @(
+    "# GTA-Claw frozen upstream compatibility ledger digests.",
+    "# Only the three mutable ledgers are covered here; inventory digests, the feature",
+    "# schema digest and baseline.json stay hardcoded in validate.ps1 and are frozen.",
+    "# Regenerate ONLY through the reviewed command, never by hand:",
+    "#   powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests",
+    "# Format: <sha256>  <ledger path>"
+)
+$AllowedFeatureStatuses = @("unimplemented", "partial", "implemented")
+$BaselineKnownDifference =
+    "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+$ArtifactFields = @("path", "test")
+$LegacyScriptExtensions = @(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+$LegacyPathPrefixes = @(
+    "src/",
+    "compat/legacy/",
+    "node_modules/",
+    "_upstream/",
+    "packages/"
+)
+$SelfReferentialPathPrefixes = @("compat/upstream/")
 $AllowedClassifications = @(
     "gateway_core",
     "official_integration",
@@ -23,6 +84,7 @@ $AllowedOperatorScopes = @(
 
 $ExpectedJsonPaths = @(
     "baseline.json",
+    "enabled-test-oracle.json",
     "feature-ledger.schema.json",
     "manifest.json",
     "inventories/channels.json",
@@ -40,27 +102,34 @@ $ExpectedJsonPaths = @(
     "ledgers/official-integration.json"
 )
 
+$ExpectedNonJsonPaths = @(
+    "README.md",
+    "ledger-digests.sha256",
+    "validate-self-test.ps1",
+    "validate.ps1"
+)
+
 $LedgerSpecs = @(
     [ordered]@{
         path = "ledgers/gateway-core.json"
         ledger_id = "gateway-core"
         classification = "gateway_core"
         expected_features = 16
-        digest = "4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d"
+        frozen_digest = "1ed1326f8f0d1ed97e417e01ec2f9942222cb79376297c23f7eb14c4d7924c29"
     },
     [ordered]@{
         path = "ledgers/official-integration.json"
         ledger_id = "official-integration"
         classification = "official_integration"
         expected_features = 13
-        digest = "01ac641cdcb208343bdbafa119ac6c2089c03a6ac23064351c5dae628eba1c47"
+        frozen_digest = "0ccabe72545c332c52120c569059a6bee9fd737f3cdc2c496445c91e7fd9308f"
     },
     [ordered]@{
         path = "ledgers/official-client-interop.json"
         ledger_id = "official-client-interop"
         classification = "official_client_interop"
         expected_features = 18
-        digest = "e2ba9299748d42d24f7b5d84a7a18af34a470ce260f40d5d3a20a9cddf288406"
+        frozen_digest = "9d6886795df7d7c4fa327a679ec9f925dc16065cb30df4e35e1d44617607dbe8"
     }
 )
 
@@ -168,7 +237,7 @@ $InventorySpecs = [ordered]@{
 }
 
 $ExpectedCanonicalCounts = [ordered]@{
-    artifact_json_files = 16
+    artifact_json_files = 17
     ledgers = 3
     feature_rows = 47
     inventory_files = 10
@@ -199,7 +268,11 @@ function Fail {
 function Read-Json {
     param([string]$Path)
     try {
-        return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        # Deliberately not Get-Content -Raw: Windows PowerShell 5.1 decodes a
+        # BOM-less file with the system ANSI codepage while PowerShell Core
+        # decodes it as UTF-8, so the same bytes would parse differently on the
+        # two platforms. ReadAllText is UTF-8 with BOM detection everywhere.
+        return (ConvertFrom-Json ([System.IO.File]::ReadAllText($Path)))
     } catch {
         Fail "invalid JSON in $Path`: $($_.Exception.Message)"
     }
@@ -320,8 +393,103 @@ function Get-Sha256Text {
 
 function Get-ObjectDigest {
     param([object]$Value)
-    $json = ConvertTo-Json -InputObject $Value -Compress -Depth 50
-    return Get-Sha256Text $json
+    return Get-Sha256Text (ConvertTo-CanonicalJson $Value)
+}
+
+# --- Cross-platform determinism -------------------------------------------
+#
+# Windows PowerShell 5.1 and PowerShell Core disagree about JSON in two ways
+# that silently corrupt a trust root:
+#
+#   1. ConvertFrom-Json in PowerShell Core coerces ISO-8601-looking strings into
+#      [datetime], and [string] then renders them with the current culture. The
+#      same document therefore yields "2026-07-13T03:29:58Z" on Windows and
+#      "07/13/2026 03:29:58" on Linux.
+#   2. ConvertTo-Json in Windows PowerShell escapes < > & ' as \uXXXX because it
+#      uses JavaScriptSerializer; PowerShell Core emits them raw. Any digest
+#      taken over its output is therefore platform dependent.
+#
+# Everything canonical below is hand-encoded so neither difference can reach a
+# digest or a comparison. Assert-PortabilityInvariants pins the behaviour.
+
+$ContractTimestampFormat = "yyyy-MM-ddTHH:mm:ssZ"
+
+function ConvertTo-ContractString {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) {
+        return ""
+    }
+    if ($Value -is [datetime]) {
+        return ([datetime]$Value).ToUniversalTime().ToString(
+            $ContractTimestampFormat, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.DateTimeOffset]) {
+        return ([System.DateTimeOffset]$Value).ToUniversalTime().ToString(
+            $ContractTimestampFormat, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.IFormattable]) {
+        return ([System.IFormattable]$Value).ToString(
+            $null, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$Value
+}
+
+function ConvertTo-CanonicalJsonString {
+    param([string]$Value)
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int]$character
+        if ($character -eq '"') {
+            [void]$builder.Append('\"')
+        } elseif ($character -eq '\') {
+            [void]$builder.Append('\\')
+        } elseif ($code -eq 8) {
+            [void]$builder.Append('\b')
+        } elseif ($code -eq 9) {
+            [void]$builder.Append('\t')
+        } elseif ($code -eq 10) {
+            [void]$builder.Append('\n')
+        } elseif ($code -eq 12) {
+            [void]$builder.Append('\f')
+        } elseif ($code -eq 13) {
+            [void]$builder.Append('\r')
+        } elseif ($code -lt 32) {
+            [void]$builder.Append('\u' + $code.ToString(
+                "x4", [System.Globalization.CultureInfo]::InvariantCulture))
+        } else {
+            [void]$builder.Append($character)
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-CanonicalJsonScalar {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) {
+        return "null"
+    }
+    if ($Value -is [bool]) {
+        if ($Value) { return "true" }
+        return "false"
+    }
+    if ($Value -is [datetime] -or $Value -is [System.DateTimeOffset]) {
+        return ConvertTo-CanonicalJsonString (ConvertTo-ContractString $Value)
+    }
+    if ($Value -is [string] -or $Value -is [char]) {
+        return ConvertTo-CanonicalJsonString ([string]$Value)
+    }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int] -or $Value -is [uint32] -or
+        $Value -is [long] -or $Value -is [uint64] -or $Value -is [bigint]) {
+        return ConvertTo-ContractString $Value
+    }
+    if ($Value -is [decimal] -or $Value -is [double] -or $Value -is [single]) {
+        return ([System.IFormattable]$Value).ToString(
+            "R", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    Fail "canonical JSON encountered an unsupported scalar of type $($Value.GetType().FullName)"
 }
 
 function ConvertTo-CanonicalJson {
@@ -341,14 +509,14 @@ function ConvertTo-CanonicalJson {
         [Array]::Sort($names, [StringComparer]::Ordinal)
         [string[]]$members = @(
             $names | ForEach-Object {
-                $encodedName = ConvertTo-Json -InputObject $_ -Compress
+                $encodedName = ConvertTo-CanonicalJsonString $_
                 $encodedValue = ConvertTo-CanonicalJson (Get-PropertyValue $Value $_)
                 "${encodedName}:${encodedValue}"
             }
         )
         return "{" + ($members -join ",") + "}"
     }
-    return ConvertTo-Json -InputObject $Value -Compress
+    return ConvertTo-CanonicalJsonScalar $Value
 }
 
 function Get-CanonicalArrayDigest {
@@ -356,6 +524,80 @@ function Get-CanonicalArrayDigest {
     [string[]]$elements = @($Items | ForEach-Object { ConvertTo-CanonicalJson $_ })
     [Array]::Sort($elements, [StringComparer]::Ordinal)
     return Get-Sha256Text ("[" + ($elements -join ",") + "]")
+}
+
+# Pins every behaviour that has to be identical under Windows PowerShell 5.1 and
+# PowerShell Core on Linux and macOS. This runs on every invocation, in both
+# verify and write mode, before any contract file is read, so a host whose
+# globalisation or JSON behaviour differs fails loudly here instead of silently
+# computing a different digest. Each vector below corresponds to a real observed
+# divergence between the two engines.
+function Assert-PortabilityInvariants {
+    $expectations = @(
+        # JSON string escaping. Windows PowerShell's ConvertTo-Json emits
+        # \u003c \u003e \u0026 \u0027 for these; PowerShell Core emits them raw.
+        @{ actual = (ConvertTo-CanonicalJsonString "a<b"); expected = '"a<b"'; case = "less-than is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a>b"); expected = '"a>b"'; case = "greater-than is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a&b"); expected = '"a&b"'; case = "ampersand is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a'b"); expected = '"a''b"'; case = "apostrophe is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a/b"); expected = '"a/b"'; case = "solidus is not escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString ("caf" + [char]0x00E9)); expected = ('"caf' + [char]0x00E9 + '"'); case = "non-ASCII is emitted literally" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a`"b\c"); expected = '"a\"b\\c"'; case = "quote and backslash are escaped" },
+        @{ actual = (ConvertTo-CanonicalJsonString "a`tb`nc`rd"); expected = '"a\tb\nc\rd"'; case = "control characters use short escapes" },
+        @{ actual = (ConvertTo-CanonicalJsonString ([string][char]1)); expected = '"\u0001"'; case = "other control characters use \u escapes" },
+        # Scalar rendering must never pick up the ambient culture.
+        @{ actual = (ConvertTo-CanonicalJsonScalar $true); expected = "true"; case = "booleans render as JSON literals" },
+        @{ actual = (ConvertTo-CanonicalJsonScalar 47); expected = "47"; case = "integers render invariantly" },
+        @{ actual = (ConvertTo-CanonicalJsonScalar $null); expected = "null"; case = "null renders as null" },
+        # Windows PowerShell parses JSON integers as Int32, PowerShell Core as
+        # Int64, so integer recognition must not be tied to one concrete type.
+        @{
+            actual = [string](Test-JsonInteger ((ConvertFrom-Json '{"n":47}').n))
+            expected = "True"
+            case = "parsed JSON integers are recognised regardless of width"
+        },
+        @{
+            actual = (ConvertTo-CanonicalJsonScalar ((ConvertFrom-Json '{"n":47}').n))
+            expected = "47"
+            case = "parsed JSON integers canonicalise identically"
+        },
+        # PowerShell Core's ConvertFrom-Json turns this string into [datetime];
+        # Windows PowerShell leaves it a [string]. Both must canonicalise the same.
+        @{
+            actual = (ConvertTo-CanonicalJson (ConvertFrom-Json '{"b":"2026-07-13T03:29:58Z","a":1}'))
+            expected = '{"a":1,"b":"2026-07-13T03:29:58Z"}'
+            case = "ISO-8601 strings survive JSON round-tripping unchanged"
+        },
+        @{
+            actual = (ConvertTo-ContractString ((ConvertFrom-Json '{"t":"2026-07-13T03:29:58Z"}').t))
+            expected = "2026-07-13T03:29:58Z"
+            case = "ISO-8601 strings compare as their original text"
+        },
+        # Object member order is ordinal, not linguistic; ICU and NLS disagree
+        # about culture-sensitive ordering of punctuation and case.
+        @{
+            actual = (ConvertTo-CanonicalJson (ConvertFrom-Json '{"b":1,"C":2,"a_b":3,"aD":4,"_a":5}'))
+            expected = '{"C":2,"_a":5,"aD":4,"a_b":3,"b":1}'
+            case = "object members are ordered ordinally"
+        },
+        # Digests must not depend on how git checked the file out.
+        @{
+            actual = (Get-Sha256Text ("x`r`ny`r`n".Replace("`r`n", "`n")))
+            expected = (Get-Sha256Text "x`ny`n")
+            case = "CRLF and LF hash identically after normalisation"
+        },
+        # The comparison primitives the whole validator is built on.
+        @{ actual = [string](Test-OrdinalStringEqual "abc" "ABC"); expected = "False"; case = "ordinal equality is case sensitive" },
+        @{ actual = [string](Test-OrdinalStringEqual "abc" ("abc" + [char]0x00AD)); expected = "False"; case = "ordinal equality is not linguistic" },
+        @{ actual = [string](Test-OrdinalContains @("abc") "ABC"); expected = "False"; case = "ordinal membership is case sensitive" },
+        @{ actual = [string]("a`r`nb".IndexOf("`n", [System.StringComparison]::Ordinal)); expected = "2"; case = "ordinal IndexOf finds a lone newline inside CRLF" }
+    )
+    foreach ($expectation in $expectations) {
+        if (-not (Test-OrdinalStringEqual ([string]$expectation.actual) ([string]$expectation.expected))) {
+            Fail ("host portability invariant violated ({0}): expected '{1}', got '{2}'; this host does not compute contract digests the same way as a conforming host, refusing to validate" -f
+                $expectation.case, $expectation.expected, $expectation.actual)
+        }
+    }
 }
 
 function Get-InventoryDigest {
@@ -383,6 +625,61 @@ function Get-FeatureDigest {
     return Get-CanonicalArrayDigest $Features
 }
 
+# The mutable surface of a feature row. Everything else is frozen contract text.
+#
+# acceptance_evidence.required is deliberately NOT mutable. It is the row's own
+# statement of what parity means, so a claimant that could rewrite it would be
+# setting the bar it is judged against. Making the ledger digests regenerable
+# (which transitions require) exposed every descriptive field to exactly that
+# edit, because the file digest is the only thing that had been holding them.
+# Get-LedgerFrozenDigest closes it: the projection below is pinned by a constant
+# in $LedgerSpecs that -WriteLedgerDigests cannot reach, and it is verified in
+# BOTH modes, so the regeneration command cannot launder a descriptive edit
+# either.
+$MutableFeatureFields = @("status", "implementation_pointers", "known_differences")
+$MutableEvidenceFields = @("status", "artifacts")
+
+function Test-NameInSet {
+    param(
+        [string]$Name,
+        [string[]]$Set
+    )
+    foreach ($candidate in $Set) {
+        if (Test-OrdinalStringEqual $Name $candidate) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-FrozenFeatureProjection {
+    param([object]$Feature)
+    $projection = [ordered]@{}
+    foreach ($name in (Get-PropertyNames $Feature)) {
+        if (Test-NameInSet $name $MutableFeatureFields) {
+            continue
+        }
+        $value = Get-PropertyValue $Feature $name
+        if ((Test-OrdinalStringEqual $name "acceptance_evidence") -and (Test-JsonObject $value)) {
+            $frozenEvidence = [ordered]@{}
+            foreach ($evidenceName in (Get-PropertyNames $value)) {
+                if (-not (Test-NameInSet $evidenceName $MutableEvidenceFields)) {
+                    $frozenEvidence[$evidenceName] = Get-PropertyValue $value $evidenceName
+                }
+            }
+            $projection[$name] = [pscustomobject]$frozenEvidence
+            continue
+        }
+        $projection[$name] = $value
+    }
+    return [pscustomobject]$projection
+}
+
+function Get-LedgerFrozenDigest {
+    param([object[]]$Features)
+    return Get-CanonicalArrayDigest @($Features | ForEach-Object { Get-FrozenFeatureProjection $_ })
+}
+
 function Test-JsonValueEqual {
     param(
         [object]$Left,
@@ -397,6 +694,18 @@ function Test-JsonObject {
         -not ($Value -is [string]) -and
         -not ($Value -is [System.Array]) -and
         ($Value -is [pscustomobject] -or $Value -is [System.Collections.IDictionary])
+}
+
+# Windows PowerShell parses JSON integers as Int32 and PowerShell Core as Int64,
+# so no caller may test against one concrete numeric type.
+function Test-JsonInteger {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value -or $Value -is [bool]) {
+        return $false
+    }
+    return ($Value -is [byte]) -or ($Value -is [sbyte]) -or ($Value -is [int16]) -or
+        ($Value -is [uint16]) -or ($Value -is [int32]) -or ($Value -is [uint32]) -or
+        ($Value -is [int64]) -or ($Value -is [uint64])
 }
 
 function Resolve-LocalSchemaReference {
@@ -572,6 +881,1101 @@ function Assert-RelativeSourcePath {
         -not ($Path -cmatch '^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$')) {
         Fail "$Context has invalid upstream-relative source path '$Path'"
     }
+}
+
+function Resolve-RepositoryRoot {
+    param([AllowNull()][string]$Requested)
+    if ([string]::IsNullOrWhiteSpace($Requested)) {
+        $candidate = Split-Path -Parent (Split-Path -Parent $Root)
+    } else {
+        $candidate = $Requested
+    }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        Fail "repository root '$candidate' does not exist; acceptance evidence cannot be verified"
+    }
+    $resolved = (Resolve-Path -LiteralPath $candidate).ProviderPath
+    foreach ($marker in @("Cargo.toml", "crates")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $resolved $marker))) {
+            Fail "repository root '$resolved' is not a GTA-Claw working tree (missing $marker)"
+        }
+    }
+    return $resolved
+}
+
+$script:DirectoryEntryCache = @{}
+$script:RepositoryFileTextCache = @{}
+$script:CrateReachabilityCache = @{}
+
+function Get-DirectoryEntryNames {
+    param([string]$AbsoluteDirectory)
+    if ($script:DirectoryEntryCache.ContainsKey($AbsoluteDirectory)) {
+        return $script:DirectoryEntryCache[$AbsoluteDirectory]
+    }
+    [string[]]$names = @()
+    if (Test-Path -LiteralPath $AbsoluteDirectory -PathType Container) {
+        $names = @(Get-ChildItem -LiteralPath $AbsoluteDirectory -Force | ForEach-Object { [string]$_.Name })
+    }
+    $script:DirectoryEntryCache[$AbsoluteDirectory] = $names
+    return $names
+}
+
+function Resolve-RepositoryFilePath {
+    param([string]$RelativePath)
+    $current = $script:RepositoryRootFull
+    foreach ($segment in $RelativePath.Split("/")) {
+        if (-not (Test-OrdinalContains (Get-DirectoryEntryNames $current) $segment)) {
+            return $null
+        }
+        $current = Join-Path $current $segment
+        # A reparse point (symlink or junction) can resolve outside the repository,
+        # which the Rust parity harness rejects through canonicalisation. Refuse it
+        # here too so the two trust roots cannot disagree about the same citation.
+        $entry = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -eq $entry) {
+            return $null
+        }
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $null
+        }
+    }
+    if (-not (Test-Path -LiteralPath $current -PathType Leaf)) {
+        return $null
+    }
+    return $current
+}
+
+function Get-RepositoryFileText {
+    param([string]$AbsolutePath)
+    if ($script:RepositoryFileTextCache.ContainsKey($AbsolutePath)) {
+        return $script:RepositoryFileTextCache[$AbsolutePath]
+    }
+    $text = [System.IO.File]::ReadAllText($AbsolutePath)
+    $script:RepositoryFileTextCache[$AbsolutePath] = $text
+    return $text
+}
+
+function Test-PathHasExtension {
+    param(
+        [string]$RelativePath,
+        [string[]]$Extensions
+    )
+    $lowered = $RelativePath.ToLowerInvariant()
+    foreach ($extension in $Extensions) {
+        if ($lowered.EndsWith($extension, [StringComparison]::Ordinal)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-PathHasPrefix {
+    param(
+        [string]$RelativePath,
+        [string[]]$Prefixes
+    )
+    foreach ($prefix in $Prefixes) {
+        if ($RelativePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Assert-EvidencePathShape {
+    param(
+        [string]$RelativePath,
+        [string]$Context
+    )
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+        -not ($RelativePath -cmatch '\A[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\z')) {
+        Fail "$Context acceptance evidence path '$RelativePath' must be a repository-relative forward-slash path"
+    }
+    foreach ($segment in $RelativePath.Split("/")) {
+        if ((Test-OrdinalStringEqual $segment ".") -or (Test-OrdinalStringEqual $segment "..")) {
+            Fail "$Context acceptance evidence path '$RelativePath' must not contain relative segments"
+        }
+    }
+    if (Test-PathHasExtension $RelativePath $LegacyScriptExtensions) {
+        Fail "$Context acceptance evidence path '$RelativePath' is a legacy TypeScript/JavaScript file and is never Rust acceptance evidence"
+    }
+    if (Test-PathHasPrefix $RelativePath $LegacyPathPrefixes) {
+        Fail "$Context acceptance evidence path '$RelativePath' lives in a legacy JavaScript/TypeScript tree and is never Rust acceptance evidence"
+    }
+    if (Test-PathHasPrefix $RelativePath $SelfReferentialPathPrefixes) {
+        Fail "$Context acceptance evidence path '$RelativePath' is self-referential compatibility contract data, not acceptance evidence"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Enabled-test oracle.
+#
+# This is a FOLLOWER port of declares_enabled_test in
+# crates/claw-conformance/src/claims.rs, which is the NORMATIVE implementation.
+# When the Rust function changes, this must be re-ported in the same cycle; this
+# script has no independent authority to decide what counts as a real test.
+# Agreement is not asserted by hand: enabled-test-oracle.json is a shared,
+# frozen fixture corpus that both implementations must classify identically, and
+# Assert-EnabledTestOracle below replays every case on every run.
+#
+# The oracle is a tokenizer plus an item-tree walker, not a line matcher. It
+# operates on UTF-8 BYTES because the Rust original indexes bytes. Comments,
+# strings, byte strings, raw strings and char literals are discarded BEFORE any
+# matching, so Rust-shaped text inside a comment or a string literal can never
+# be cited as evidence. A #[test] attribute must attach to the CITED function
+# itself, and the in-file module path must match exactly.
+# ---------------------------------------------------------------------------
+
+function Get-RustBlockCommentEnd {
+    param([byte[]]$Bytes, [int]$Index)
+    # Nesting aware: /* is checked before */ so a nested comment cannot end early.
+    $length = $Bytes.Length
+    $depth = 0
+    $index = $Index
+    while ($index -lt $length) {
+        if (($index + 2) -le $length -and $Bytes[$index] -eq 47 -and $Bytes[$index + 1] -eq 42) {
+            $depth += 1
+            $index += 2
+        } elseif (($index + 2) -le $length -and $Bytes[$index] -eq 42 -and $Bytes[$index + 1] -eq 47) {
+            $depth -= 1
+            $index += 2
+            if ($depth -eq 0) {
+                return $index
+            }
+        } else {
+            $index += 1
+        }
+    }
+    return $index
+}
+
+function Get-RustRawStringEnd {
+    param([byte[]]$Bytes, [int]$Index)
+    # Handles r"..", r#".."#, br".." and br#".."#. Returns -1 (Rust None) when the
+    # prefix is not a raw string, and the end of input when it is unterminated.
+    $length = $Bytes.Length
+    $cursor = $Index
+    if ($cursor -lt $length -and $Bytes[$cursor] -eq 98) {
+        $cursor += 1
+    }
+    if ($cursor -ge $length -or $Bytes[$cursor] -ne 114) {
+        return -1
+    }
+    $cursor += 1
+    $hashes = 0
+    while (($cursor + $hashes) -lt $length -and $Bytes[$cursor + $hashes] -eq 35) {
+        $hashes += 1
+    }
+    $cursor += $hashes
+    if ($cursor -ge $length -or $Bytes[$cursor] -ne 34) {
+        return -1
+    }
+    $cursor += 1
+    while ($cursor -lt $length) {
+        if ($Bytes[$cursor] -eq 34) {
+            $suffixEnd = $cursor + 1 + $hashes
+            if ($suffixEnd -le $length) {
+                $allHashes = $true
+                for ($probe = $cursor + 1; $probe -lt $suffixEnd; $probe += 1) {
+                    if ($Bytes[$probe] -ne 35) {
+                        $allHashes = $false
+                        break
+                    }
+                }
+                if ($allHashes) {
+                    return $suffixEnd
+                }
+            }
+        }
+        $cursor += 1
+    }
+    return $length
+}
+
+function Get-RustQuotedEnd {
+    param([byte[]]$Bytes, [int]$Quote)
+    $length = $Bytes.Length
+    $cursor = $Quote + 1
+    while ($cursor -lt $length) {
+        if ($Bytes[$cursor] -eq 92) {
+            $cursor = [Math]::Min($cursor + 2, $length)
+        } elseif ($Bytes[$cursor] -eq 34) {
+            return $cursor + 1
+        } else {
+            $cursor += 1
+        }
+    }
+    return $cursor
+}
+
+function Get-RustCharLiteralEnd {
+    param([byte[]]$Bytes, [int]$Quote)
+    # Returns -1 (Rust None) when the quote is not a char literal, which is how a
+    # lifetime such as &'a str stays a lifetime instead of opening a literal.
+    $length = $Bytes.Length
+    $cursor = $Quote + 1
+    if ($cursor -lt $length -and $Bytes[$cursor] -eq 92) {
+        $cursor += 2
+    } else {
+        $cursor += 1
+    }
+    if ($cursor -lt $length -and $Bytes[$cursor] -eq 39) {
+        return $cursor + 1
+    }
+    return -1
+}
+
+function Get-RustTokens {
+    param([string]$Source, [switch]$WithStrings)
+    # Token encoding: identifiers become "i:<name>", punctuation is its own text
+    # and :: becomes "::". Rust identifiers are ASCII [A-Za-z0-9_] here, so no
+    # identifier can ever collide with a punctuation marker.
+    #
+    # -WithStrings is a LOCAL extension with no counterpart in the normative Rust
+    # tokenizer. It additionally emits "s:<value>" for quoted strings and "=", so
+    # the locally owned Cargo reachability rule below can read a #[path = "..."]
+    # attribute value. The oracle never passes it, so the token stream the oracle
+    # sees stays byte-identical to the Rust original; the 1269-case differential
+    # is run against the default path to keep that honest.
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
+    $length = $bytes.Length
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $index = 0
+    while ($index -lt $length) {
+        $byte = $bytes[$index]
+        # Rust is_ascii_whitespace: space, tab, newline, form feed, carriage
+        # return. Carriage return being whitespace is what makes the oracle
+        # produce identical tokens for CRLF and LF checkouts.
+        if ($byte -eq 32 -or $byte -eq 9 -or $byte -eq 10 -or $byte -eq 12 -or $byte -eq 13) {
+            $index += 1
+            continue
+        }
+        if (($index + 2) -le $length -and $byte -eq 47 -and $bytes[$index + 1] -eq 47) {
+            $index += 2
+            while ($index -lt $length -and $bytes[$index] -ne 10) {
+                $index += 1
+            }
+            continue
+        }
+        if (($index + 2) -le $length -and $byte -eq 47 -and $bytes[$index + 1] -eq 42) {
+            $index = Get-RustBlockCommentEnd $bytes $index
+            continue
+        }
+        $rawEnd = Get-RustRawStringEnd $bytes $index
+        if ($rawEnd -ge 0) {
+            $index = $rawEnd
+            continue
+        }
+        if ($byte -eq 34 -or ($byte -eq 98 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 34)) {
+            $quote = if ($byte -eq 34) { $index } else { $index + 1 }
+            $quotedEnd = Get-RustQuotedEnd $bytes $quote
+            if ($WithStrings) {
+                $inner = $quotedEnd - $quote - 2
+                if ($inner -ge 0) {
+                    [void]$tokens.Add("s:" + [System.Text.Encoding]::UTF8.GetString($bytes, $quote + 1, $inner))
+                }
+            }
+            $index = $quotedEnd
+            continue
+        }
+        if ($byte -eq 39) {
+            $charEnd = Get-RustCharLiteralEnd $bytes $index
+            if ($charEnd -ge 0) {
+                $index = $charEnd
+            } else {
+                $index += 1
+            }
+            continue
+        }
+        if (($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -eq 95) {
+            $start = $index
+            $index += 1
+            while ($index -lt $length) {
+                $next = $bytes[$index]
+                if (($next -ge 48 -and $next -le 57) -or ($next -ge 65 -and $next -le 90) -or
+                    ($next -ge 97 -and $next -le 122) -or $next -eq 95) {
+                    $index += 1
+                } else {
+                    break
+                }
+            }
+            [void]$tokens.Add("i:" + [System.Text.Encoding]::ASCII.GetString($bytes, $start, $index - $start))
+            continue
+        }
+        if ($byte -eq 35) { [void]$tokens.Add("#") }
+        elseif ($byte -eq 33) { [void]$tokens.Add("!") }
+        elseif ($byte -eq 91) { [void]$tokens.Add("[") }
+        elseif ($byte -eq 93) { [void]$tokens.Add("]") }
+        elseif ($byte -eq 123) { [void]$tokens.Add("{") }
+        elseif ($byte -eq 125) { [void]$tokens.Add("}") }
+        elseif ($byte -eq 40) { [void]$tokens.Add("(") }
+        elseif ($byte -eq 41) { [void]$tokens.Add(")") }
+        elseif ($byte -eq 59) { [void]$tokens.Add(";") }
+        elseif ($byte -eq 61 -and $WithStrings) { [void]$tokens.Add("=") }
+        elseif ($byte -eq 58 -and ($index + 1) -lt $length -and $bytes[$index + 1] -eq 58) {
+            [void]$tokens.Add("::")
+            $index += 1
+        }
+        $index += 1
+    }
+    return ,$tokens.ToArray()
+}
+
+function Get-RustMatchingDelimiter {
+    param([string[]]$Tokens, [int]$Open, [int]$End)
+    if ($Open -lt 0 -or $Open -ge $Tokens.Length) {
+        return -1
+    }
+    $opening = $Tokens[$Open]
+    if (Test-OrdinalStringEqual $opening "[") { $closing = "]" }
+    elseif (Test-OrdinalStringEqual $opening "{") { $closing = "}" }
+    elseif (Test-OrdinalStringEqual $opening "(") { $closing = ")" }
+    else { return -1 }
+    $limit = [Math]::Min($End, $Tokens.Length)
+    $depth = 0
+    for ($index = $Open; $index -lt $limit; $index += 1) {
+        $token = $Tokens[$index]
+        if (Test-OrdinalStringEqual $token $opening) {
+            $depth += 1
+        } elseif (Test-OrdinalStringEqual $token $closing) {
+            $depth -= 1
+            if ($depth -eq 0) {
+                return $index
+            }
+        }
+    }
+    return -1
+}
+
+function Get-RustAttributes {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    $attributes = New-Object System.Collections.Generic.List[object]
+    $index = $Index
+    while ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "#")) {
+        $inner = (($index + 1) -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index + 1] "!"))
+        $bracket = $index + $(if ($inner) { 2 } else { 1 })
+        if ($bracket -ge $Tokens.Length -or -not (Test-OrdinalStringEqual $Tokens[$bracket] "[")) {
+            break
+        }
+        $close = Get-RustMatchingDelimiter $Tokens $bracket $End
+        if ($close -lt 0) {
+            $close = $End
+        }
+        $path = New-Object System.Collections.Generic.List[string]
+        $cursor = $bracket + 1
+        if ($cursor -lt $Tokens.Length -and $Tokens[$cursor].StartsWith("i:", [StringComparison]::Ordinal)) {
+            [void]$path.Add($Tokens[$cursor].Substring(2))
+            $cursor += 1
+            while ($cursor -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$cursor] "::")) {
+                if (($cursor + 1) -ge $Tokens.Length -or
+                    -not $Tokens[$cursor + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
+                    break
+                }
+                [void]$path.Add($Tokens[$cursor + 1].Substring(2))
+                $cursor += 2
+            }
+        }
+        $bodyStart = $bracket + 1
+        $bodyCount = [Math]::Max(0, [Math]::Min($close, $Tokens.Length) - $bodyStart)
+        [string[]]$body = @()
+        if ($bodyCount -gt 0) {
+            $body = $Tokens[$bodyStart..($bodyStart + $bodyCount - 1)]
+        }
+        [void]$attributes.Add([ordered]@{
+            inner = $inner
+            path = $path.ToArray()
+            tokens = $body
+        })
+        $index = $close + 1
+    }
+    return [ordered]@{ attributes = $attributes.ToArray(); next = $index }
+}
+
+function Test-RustAttributesDeclareEnabledTest {
+    param([object[]]$Attributes)
+    # has_test && !ignored && !cfg_gated. Any cfg or cfg_attr on the function
+    # disqualifies it, and the trailing path segment is matched so that both
+    # #[test] and #[tokio::test] count.
+    $hasTest = $false
+    $ignored = $false
+    $cfgGated = $false
+    foreach ($attribute in $Attributes) {
+        [string[]]$path = $attribute.path
+        if ($path.Length -eq 0) {
+            continue
+        }
+        if (Test-OrdinalStringEqual $path[$path.Length - 1] "test") {
+            $hasTest = $true
+        }
+        if (Test-OrdinalStringEqual $path[0] "ignore") {
+            $ignored = $true
+        }
+        if ((Test-OrdinalStringEqual $path[0] "cfg") -or (Test-OrdinalStringEqual $path[0] "cfg_attr")) {
+            $cfgGated = $true
+        }
+    }
+    return ($hasTest -and -not $ignored -and -not $cfgGated)
+}
+
+function Test-RustModuleAttributesEnableTests {
+    param([object[]]$Attributes)
+    # Enclosing modules and file/module inner attributes may carry no cfg at all,
+    # or exactly the token sequence cfg ( test ). Every other cfg predicate,
+    # every cfg_attr and every ignore disqualifies the whole subtree.
+    foreach ($attribute in $Attributes) {
+        [string[]]$path = $attribute.path
+        if ($path.Length -eq 0) {
+            continue
+        }
+        $first = $path[0]
+        if ((Test-OrdinalStringEqual $first "ignore") -or (Test-OrdinalStringEqual $first "cfg_attr")) {
+            return $false
+        }
+        if (-not (Test-OrdinalStringEqual $first "cfg")) {
+            continue
+        }
+        [string[]]$body = $attribute.tokens
+        if ($body.Length -ne 4) {
+            return $false
+        }
+        if (-not ((Test-OrdinalStringEqual $body[0] "i:cfg") -and
+                (Test-OrdinalStringEqual $body[1] "(") -and
+                (Test-OrdinalStringEqual $body[2] "i:test") -and
+                (Test-OrdinalStringEqual $body[3] ")"))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-RustTestIdentityMatches {
+    param([string[]]$Modules, [string]$Function, [string[]]$Target)
+    # Exact in-file module identity: a nested test must be cited with its real
+    # module path, so neither a fabricated module nor a bare name can match it.
+    if ($Target.Length -ne ($Modules.Length + 1)) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Modules.Length; $index += 1) {
+        if (-not (Test-OrdinalStringEqual $Modules[$index] $Target[$index])) {
+            return $false
+        }
+    }
+    return (Test-OrdinalStringEqual $Target[$Target.Length - 1] $Function)
+}
+
+function Get-RustSkipVisibility {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    $index = $Index
+    if ($index -ge $Tokens.Length -or -not (Test-OrdinalStringEqual $Tokens[$index] "i:pub")) {
+        return $index
+    }
+    $index += 1
+    if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "(")) {
+        $close = Get-RustMatchingDelimiter $Tokens $index $End
+        if ($close -lt 0) {
+            $close = $End
+        }
+        $index = $close + 1
+    }
+    return $index
+}
+
+function Get-RustSkipItem {
+    param([string[]]$Tokens, [int]$Index, [int]$End)
+    $index = $Index
+    while ($index -lt $End) {
+        $token = $Tokens[$index]
+        if (Test-OrdinalStringEqual $token ";") {
+            return $index + 1
+        }
+        if (Test-OrdinalStringEqual $token "{") {
+            $close = Get-RustMatchingDelimiter $Tokens $index $End
+            if ($close -lt 0) {
+                $close = $End
+            }
+            return $close + 1
+        }
+        $index += 1
+    }
+    return $End
+}
+
+$RustItemModifiers = @{ "i:async" = $true; "i:const" = $true; "i:default" = $true; "i:extern" = $true; "i:unsafe" = $true }
+
+function Test-RustDeclaresInItems {
+    param(
+        [string[]]$Tokens,
+        [int]$Start,
+        [int]$End,
+        [string[]]$Modules,
+        [string[]]$Target
+    )
+    $index = $Start
+    while ($index -lt $End) {
+        $itemStart = $index
+        $parsed = Get-RustAttributes $Tokens $index $End
+        $outer = New-Object System.Collections.Generic.List[object]
+        $inner = New-Object System.Collections.Generic.List[object]
+        foreach ($attribute in $parsed.attributes) {
+            if ($attribute.inner) { [void]$inner.Add($attribute) } else { [void]$outer.Add($attribute) }
+        }
+        # An inner attribute such as #![cfg(any())] disables the entire enclosing
+        # scope, so it is checked before anything in that scope is considered.
+        if (-not (Test-RustModuleAttributesEnableTests $inner.ToArray())) {
+            return $false
+        }
+        $index = $parsed.next
+        if ($index -ge $End) {
+            break
+        }
+        $index = Get-RustSkipVisibility $Tokens $index $End
+        while ($index -lt $Tokens.Length -and $RustItemModifiers.ContainsKey($Tokens[$index])) {
+            $index += 1
+        }
+        $keyword = if ($index -lt $Tokens.Length) { $Tokens[$index] } else { $null }
+        $nameToken = if (($index + 1) -lt $Tokens.Length) { $Tokens[$index + 1] } else { $null }
+        $isIdentPair = ($null -ne $keyword -and $null -ne $nameToken -and
+            $keyword.StartsWith("i:", [StringComparison]::Ordinal) -and
+            $nameToken.StartsWith("i:", [StringComparison]::Ordinal))
+        if ($isIdentPair -and (Test-OrdinalStringEqual $keyword "i:mod")) {
+            $name = $nameToken.Substring(2)
+            if (($index + 2) -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index + 2] "{")) {
+                $open = $index + 2
+                $close = Get-RustMatchingDelimiter $Tokens $open $End
+                if ($close -lt 0) {
+                    $close = $End
+                }
+                if (Test-RustModuleAttributesEnableTests $outer.ToArray()) {
+                    [string[]]$nested = @($Modules) + @($name)
+                    if (Test-RustDeclaresInItems $Tokens ($open + 1) $close $nested $Target) {
+                        return $true
+                    }
+                }
+                $index = $close + 1
+            } else {
+                $index = Get-RustSkipItem $Tokens $index $End
+            }
+        } elseif ($isIdentPair -and (Test-OrdinalStringEqual $keyword "i:fn")) {
+            $name = $nameToken.Substring(2)
+            if ((Test-RustTestIdentityMatches $Modules $name $Target) -and
+                (Test-RustAttributesDeclareEnabledTest $outer.ToArray())) {
+                return $true
+            }
+            $index = Get-RustSkipItem $Tokens ($index + 2) $End
+        } else {
+            $index = Get-RustSkipItem $Tokens $index $End
+        }
+        if ($index -le $itemStart) {
+            $index = $itemStart + 1
+        }
+    }
+    return $false
+}
+
+function Test-DeclaresEnabledRustTest {
+    param(
+        [string]$Source,
+        [string]$TestName
+    )
+    [string[]]$target = $TestName.Split(@("::"), [System.StringSplitOptions]::None)
+    [string[]]$tokens = Get-RustTokens $Source
+    return (Test-RustDeclaresInItems $tokens 0 $tokens.Length @() $target)
+}
+
+function Assert-EnabledTestOracle {
+    param([object]$Corpus)
+    # Replays the shared fixture corpus on every run. This is the drift detector
+    # between the two independently owned trust roots: crates/claw-conformance
+    # owns the normative rule, this script owns a port of it, and both must
+    # classify all of these cases identically. A re-port that silently changes
+    # behaviour fails here, on the auditor's machine as well as in CI, instead of
+    # quietly accepting or rejecting a parity claim the other side disagrees with.
+    Assert-ExactPropertySet $Corpus @(
+        "schema_version", "purpose", "normative_implementation",
+        "follower_implementation", "expected_is_authoritative_from", "cases"
+    ) "enabled-test-oracle"
+    if ($Corpus.schema_version -ne 1) {
+        Fail "enabled-test-oracle schema_version must be 1"
+    }
+    Assert-ExactPropertySet $Corpus.normative_implementation @("path", "function", "ported_at_commit") "enabled-test-oracle.normative_implementation"
+    Assert-ExactPropertySet $Corpus.follower_implementation @("path", "function") "enabled-test-oracle.follower_implementation"
+    if (-not (Test-OrdinalStringEqual ([string]$Corpus.normative_implementation.path) "crates/claw-conformance/src/claims.rs") -or
+        -not (Test-OrdinalStringEqual ([string]$Corpus.normative_implementation.function) "declares_enabled_test") -or
+        -not (Test-OrdinalStringEqual ([string]$Corpus.follower_implementation.path) "compat/upstream/validate.ps1") -or
+        -not (Test-OrdinalStringEqual ([string]$Corpus.follower_implementation.function) "Test-DeclaresEnabledRustTest")) {
+        Fail "enabled-test-oracle must record claw-conformance declares_enabled_test as normative and validate.ps1 Test-DeclaresEnabledRustTest as the follower"
+    }
+    $cases = @($Corpus.cases)
+    # The case count and the true/false split are pinned so that a case cannot be
+    # deleted or flipped to hide a disagreement.
+    if ($cases.Count -ne $ExpectedOracleCorpusCases) {
+        Fail ("enabled-test-oracle must contain exactly {0} cases; found {1}" -f $ExpectedOracleCorpusCases, $cases.Count)
+    }
+    $names = @{}
+    $trueCases = 0
+    foreach ($case in $cases) {
+        Assert-ExactPropertySet $case @("name", "source", "test", "expected") "enabled-test-oracle case"
+        $name = [string]$case.name
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            Fail "enabled-test-oracle case name must not be empty"
+        }
+        if ($names.ContainsKey($name)) {
+            Fail "enabled-test-oracle case name '$name' is duplicated"
+        }
+        $names[$name] = $true
+        if ($case.expected -isnot [bool]) {
+            Fail "enabled-test-oracle case '$name' expected must be a boolean"
+        }
+        if ($case.expected) {
+            $trueCases += 1
+        }
+        $actual = Test-DeclaresEnabledRustTest ([string]$case.source) ([string]$case.test)
+        if ($actual -ne $case.expected) {
+            Fail ("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
+                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus." -f
+                $name, $case.expected, $actual)
+        }
+    }
+    if ($trueCases -ne $ExpectedOracleCorpusTrue) {
+        Fail ("enabled-test-oracle must record exactly {0} accepting cases; found {1}" -f $ExpectedOracleCorpusTrue, $trueCases)
+    }
+    $digest = Get-ObjectDigest $Corpus
+    if (-not (Test-OrdinalStringEqual $digest $ExpectedOracleCorpusDigest)) {
+        Fail ("enabled-test-oracle digest mismatch; expected {0}, found {1}" -f $ExpectedOracleCorpusDigest, $digest)
+    }
+}
+
+function Assert-RustTestSymbol {
+    param(
+        [string]$Text,
+        [string]$Symbol,
+        [string]$RelativePath,
+        [string]$Context
+    )
+    if (-not (Test-DeclaresEnabledRustTest $Text $Symbol)) {
+        Fail "$Context cites test '$Symbol' that is not declared as an enabled #[test] in '$RelativePath'"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Cargo target reachability.
+#
+# LOCALLY OWNED rule. This is NOT part of the ported enabled-test oracle and has
+# no counterpart in crates/claw-conformance yet; see README.md.
+#
+# A structurally perfect, enabled #[test] in a .rs file that no Cargo target
+# compiles never runs. An author could add crates/foo/src/orphan.rs, never
+# reference it from any mod, and cite a test inside it: the oracle would accept
+# it, cargo test would never execute it, and the parity claim would be pure
+# fiction. This rule closes that by requiring the cited file to be part of some
+# target that cargo test actually builds.
+#
+# The reachable set is built from the auto-discovered target roots of the owning
+# crate and then followed through mod declarations, honouring #[path = "..."].
+# build.rs is deliberately NOT a root: cargo test does not run tests in a build
+# script, so a #[test] there never executes either.
+#
+# Scope, stated honestly: this catches files that nothing references. It does
+# not evaluate cfg predicates, so a module behind #[cfg(never)] still counts as
+# referenced. Reachability is deliberately permissive wherever a false rejection
+# would block honest evidence, because the disclosed vector is the unreferenced
+# file, not the unreachable-under-all-configurations one.
+# ---------------------------------------------------------------------------
+
+function Join-RepositoryRelativePath {
+    param([string]$Base, [string]$Relative)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrEmpty($Base)) {
+        foreach ($part in $Base.Split("/")) {
+            if (-not [string]::IsNullOrEmpty($part)) { [void]$parts.Add($part) }
+        }
+    }
+    foreach ($part in $Relative.Split("/")) {
+        if ([string]::IsNullOrEmpty($part) -or (Test-OrdinalStringEqual $part ".")) { continue }
+        if (Test-OrdinalStringEqual $part "..") {
+            if ($parts.Count -eq 0) { return $null }
+            $parts.RemoveAt($parts.Count - 1)
+            continue
+        }
+        [void]$parts.Add($part)
+    }
+    return ($parts -join "/")
+}
+
+function Get-RustModReferencesInRange {
+    param([string[]]$Tokens, [int]$Start, [int]$End, [string[]]$Segments, [object]$Sink)
+    $index = $Start
+    while ($index -lt $End) {
+        $attributeResult = Get-RustAttributes $Tokens $index $End
+        $outer = @($attributeResult.attributes | Where-Object { -not $_.inner })
+        $index = [int]$attributeResult.next
+        if ($index -ge $End) { break }
+        $itemStart = $index
+        $index = Get-RustSkipVisibility $Tokens $index
+        while ($index -lt $Tokens.Length -and $RustItemModifiers.ContainsKey($Tokens[$index])) {
+            $index += 1
+        }
+        $matched = $false
+        if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "i:mod") -and
+            ($index + 1) -lt $Tokens.Length -and $Tokens[$index + 1].StartsWith("i:", [StringComparison]::Ordinal)) {
+            $name = $Tokens[$index + 1].Substring(2)
+            $after = $index + 2
+            if ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] "{")) {
+                $close = Get-RustMatchingDelimiter $Tokens $after $End
+                if ($close -lt 0) { $close = $End }
+                Get-RustModReferencesInRange $Tokens ($after + 1) ([Math]::Min($close, $End)) ($Segments + @($name)) $Sink
+                $index = $close + 1
+                $matched = $true
+            } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
+                $pathAttribute = $null
+                foreach ($attribute in $outer) {
+                    if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
+                        foreach ($token in $attribute.tokens) {
+                            if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
+                                $pathAttribute = $token.Substring(2)
+                                break
+                            }
+                        }
+                    }
+                }
+                [void]$Sink.Add([ordered]@{ segments = $Segments; name = $name; path = $pathAttribute })
+                $index = $after + 1
+                $matched = $true
+            }
+        }
+        if (-not $matched) {
+            $index = Get-RustSkipItem $Tokens $index $End
+        }
+        if ($index -le $itemStart) { $index = $itemStart + 1 }
+    }
+}
+
+function Get-RustModuleReferences {
+    param([string]$Source)
+    $tokens = Get-RustTokens $Source -WithStrings
+    $sink = New-Object System.Collections.Generic.List[object]
+    Get-RustModReferencesInRange $tokens 0 $tokens.Length @() $sink
+    return ,$sink.ToArray()
+}
+
+function Get-CrateDirectoryForPath {
+    param([string]$RelativePath)
+    # Nearest ancestor holding a Cargo.toml that declares a [package]. A virtual
+    # workspace manifest owns no sources and must not be treated as a crate.
+    $segments = @($RelativePath.Split("/"))
+    for ($i = $segments.Length - 1; $i -ge 0; $i -= 1) {
+        $candidate = ($segments[0..([Math]::Max(0, $i - 1))] -join "/")
+        if ($i -eq 0) { $candidate = "" }
+        $manifest = Join-RepositoryRelativePath $candidate "Cargo.toml"
+        $absolute = Resolve-RepositoryFilePath $manifest
+        if ($null -ne $absolute) {
+            $text = Get-RepositoryFileText $absolute
+            if ($text -cmatch '(?m)^\s*\[package\]\s*$') {
+                return [ordered]@{ directory = $candidate; manifest = $manifest; text = $text }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-CrateTargetRootFiles {
+    param([string]$CrateDirectory, [string]$ManifestText)
+    $roots = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @("src/lib.rs", "src/main.rs")) {
+        $candidate = Join-RepositoryRelativePath $CrateDirectory $entry
+        if ($null -ne (Resolve-RepositoryFilePath $candidate)) {
+            [void]$roots.Add([ordered]@{ file = $candidate; directory = (Join-RepositoryRelativePath $CrateDirectory "src") })
+        }
+    }
+    # Auto-discovered target directories. cargo test compiles and runs these.
+    foreach ($directory in @("tests", "benches", "examples", "src/bin")) {
+        $relative = Join-RepositoryRelativePath $CrateDirectory $directory
+        $absolute = $script:RepositoryRootFull
+        foreach ($segment in $relative.Split("/")) {
+            if (-not [string]::IsNullOrEmpty($segment)) { $absolute = Join-Path $absolute $segment }
+        }
+        foreach ($name in (Get-DirectoryEntryNames $absolute)) {
+            $child = Join-RepositoryRelativePath $relative $name
+            if ($name.EndsWith(".rs", [StringComparison]::Ordinal)) {
+                if ($null -ne (Resolve-RepositoryFilePath $child)) {
+                    [void]$roots.Add([ordered]@{ file = $child; directory = $relative })
+                }
+                continue
+            }
+            $nested = Join-RepositoryRelativePath $child "main.rs"
+            if ($null -ne (Resolve-RepositoryFilePath $nested)) {
+                [void]$roots.Add([ordered]@{ file = $nested; directory = $child })
+            }
+        }
+    }
+    # Explicitly declared target paths. Only a target section may name one: a
+    # bare `path = "..."` also appears under [dependencies.<name>], and honouring
+    # that would let an author bless an orphan file by adding one line to a
+    # manifest instead of wiring the file into the crate.
+    $section = ""
+    foreach ($line in ($ManifestText -split "`n")) {
+        $trimmed = $line.Trim()
+        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
+        if ($header.Success) {
+            $section = $header.Groups[1].Value
+            continue
+        }
+        if (-not (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $section)) {
+            continue
+        }
+        $declared = [regex]::Match($trimmed, '\Apath\s*=\s*"([^"]+)"\z')
+        if (-not $declared.Success) { continue }
+        $candidate = Join-RepositoryRelativePath $CrateDirectory $declared.Groups[1].Value
+        if ($null -ne $candidate -and $null -ne (Resolve-RepositoryFilePath $candidate)) {
+            [void]$roots.Add([ordered]@{ file = $candidate; directory = ($candidate -replace '/[^/]+\z', '') })
+        }
+    }
+    return ,$roots.ToArray()
+}
+
+function Get-CrateCompiledFileSet {
+    param([string]$CrateDirectory, [string]$ManifestText)
+    if ($script:CrateReachabilityCache.ContainsKey($CrateDirectory)) {
+        return $script:CrateReachabilityCache[$CrateDirectory]
+    }
+    $reachable = @{}
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    foreach ($root in (Get-CrateTargetRootFiles $CrateDirectory $ManifestText)) {
+        if (-not $reachable.ContainsKey($root.file)) {
+            $reachable[$root.file] = $true
+            $queue.Enqueue($root)
+        }
+    }
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        $absolute = Resolve-RepositoryFilePath $current.file
+        if ($null -eq $absolute) { continue }
+        foreach ($reference in (Get-RustModuleReferences (Get-RepositoryFileText $absolute))) {
+            $scope = $current.directory
+            foreach ($segment in $reference.segments) {
+                $scope = Join-RepositoryRelativePath $scope $segment
+                if ($null -eq $scope) { break }
+            }
+            if ($null -eq $scope) { continue }
+            $candidates = @()
+            $childDirectory = $null
+            if ($null -ne $reference.path) {
+                $target = Join-RepositoryRelativePath $scope $reference.path
+                if ($null -ne $target) {
+                    $candidates = @($target)
+                    $childDirectory = ($target -replace '\.rs\z', '')
+                }
+            } else {
+                $candidates = @(
+                    (Join-RepositoryRelativePath $scope ($reference.name + ".rs")),
+                    (Join-RepositoryRelativePath $scope ($reference.name + "/mod.rs"))
+                )
+                $childDirectory = Join-RepositoryRelativePath $scope $reference.name
+            }
+            foreach ($candidate in $candidates) {
+                if ($null -eq $candidate -or $reachable.ContainsKey($candidate)) { continue }
+                if ($null -eq (Resolve-RepositoryFilePath $candidate)) { continue }
+                $reachable[$candidate] = $true
+                $queue.Enqueue([ordered]@{ file = $candidate; directory = $childDirectory })
+            }
+        }
+    }
+    $script:CrateReachabilityCache[$CrateDirectory] = $reachable
+    return $reachable
+}
+
+function Assert-EvidenceFileIsCompiled {
+    param([string]$RelativePath, [string]$Context)
+    $crate = Get-CrateDirectoryForPath $RelativePath
+    if ($null -eq $crate) {
+        Fail ("$Context acceptance evidence '$RelativePath' is not inside a Cargo package, " +
+            "so no cargo test target compiles it and the cited test can never run")
+    }
+    $reachable = Get-CrateCompiledFileSet ([string]$crate.directory) ([string]$crate.text)
+    if (-not $reachable.ContainsKey($RelativePath)) {
+        $crateLabel = $(if ([string]::IsNullOrEmpty([string]$crate.directory)) { "the repository root crate" } else { [string]$crate.directory })
+        Fail ("$Context acceptance evidence '$RelativePath' is not reached by any cargo test target of $crateLabel. " +
+            "It is not an auto-discovered target under tests/, benches/, examples/ or src/bin/, and no mod chain from " +
+            "that crate's roots declares it, so the cited test is never compiled or run. Wire the file into the crate, " +
+            "or cite a test in a file that is.")
+    }
+}
+
+function Assert-EvidenceArtifact {
+    param(
+        [object]$Artifact,
+        [string]$Context
+    )
+    # Every acceptance evidence artifact is a proof obligation: an existing file
+    # plus the name of an ENABLED #[test] inside it. There is deliberately no
+    # weaker artifact shape. A source file, a fixture, a workflow or a test file
+    # with no test name proves nothing on its own and would not satisfy the Rust
+    # parity harness either, so such pointers belong in the separate,
+    # explicitly non-evidential implementation_pointers field.
+    Assert-ExactPropertySet $Artifact @("path", "test") $Context
+    $relativePath = [string](Get-PropertyValue $Artifact "path")
+    $test = [string](Get-PropertyValue $Artifact "test")
+    Assert-EvidencePathShape $relativePath $Context
+    $absolutePath = Resolve-RepositoryFilePath $relativePath
+    if ($null -eq $absolutePath) {
+        Fail "$Context cites acceptance evidence path '$relativePath' that does not exist in the working tree"
+    }
+    if (-not (Test-PathHasExtension $relativePath @(".rs"))) {
+        Fail "$Context acceptance evidence '$relativePath' must be a Rust source file containing the cited test"
+    }
+    if (-not ($test -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
+        Fail "$Context acceptance evidence test '$test' must be a Rust test path"
+    }
+    $text = Get-RepositoryFileText $absolutePath
+    # The full module-qualified path is handed to the oracle, not just the last
+    # segment: in-file module identity is part of the citation, so a test nested
+    # in a module cannot be cited by a bare name or under a fabricated module.
+    # There is deliberately no cheaper pre-check in front of the oracle; a second,
+    # weaker rule would be a place for the two trust roots to disagree.
+    Assert-RustTestSymbol $text $test $relativePath $Context
+    # A structurally enabled test in a file no cargo target compiles never runs.
+    Assert-EvidenceFileIsCompiled $relativePath $Context
+}
+
+function Assert-ImplementationPointer {
+    param(
+        [object]$Pointer,
+        [string]$Context
+    )
+    # Never acceptance evidence. Still validated, so a pointer cannot be used to
+    # smuggle a fabricated or legacy-JavaScript path into the ledger.
+    Assert-ExactPropertySet $Pointer @("path", "note") $Context
+    $relativePath = [string](Get-PropertyValue $Pointer "path")
+    $note = [string](Get-PropertyValue $Pointer "note")
+    Assert-EvidencePathShape $relativePath $Context
+    if ($null -eq (Resolve-RepositoryFilePath $relativePath)) {
+        Fail "$Context cites implementation pointer path '$relativePath' that does not exist in the working tree"
+    }
+    if ([string]::IsNullOrWhiteSpace($note)) {
+        Fail "$Context implementation pointer must explain what the path contributes"
+    }
+}
+
+function Assert-FeatureLifecycle {
+    param(
+        [object]$Feature,
+        [string]$Context
+    )
+    $status = [string]$Feature.status
+    $evidence = $Feature.acceptance_evidence
+    $evidenceStatus = [string]$evidence.status
+    $artifacts = @($evidence.artifacts)
+    $differences = @($Feature.known_differences)
+    $pointers = @()
+    if (Has-Property $Feature "implementation_pointers") {
+        $pointers = @($Feature.implementation_pointers)
+    }
+
+    if (-not (Test-OrdinalContains $AllowedFeatureStatuses $status)) {
+        Fail "$Context has unsupported lifecycle status '$status'"
+    }
+
+    if (Test-OrdinalStringEqual $status "unimplemented") {
+        if (-not (Test-OrdinalStringEqual $evidenceStatus "missing") -or $artifacts.Count -ne 0) {
+            Fail "$Context must start unimplemented with an empty evidence placeholder"
+        }
+        if ($pointers.Count -ne 0) {
+            Fail "$Context is unimplemented and must not record implementation pointers"
+        }
+        if ($differences.Count -ne 1 -or
+            -not (Test-OrdinalStringEqual ([string]$differences[0]) $BaselineKnownDifference)) {
+            Fail "$Context is unimplemented and must keep the frozen baseline known_differences placeholder"
+        }
+        return
+    }
+
+    $expectedEvidenceStatus = if (Test-OrdinalStringEqual $status "implemented") { "accepted" } else { "partial" }
+    if (-not (Test-OrdinalStringEqual $evidenceStatus $expectedEvidenceStatus)) {
+        Fail "$Context status '$status' requires acceptance_evidence.status '$expectedEvidenceStatus', got '$evidenceStatus'"
+    }
+    if ($artifacts.Count -eq 0) {
+        Fail "$Context status '$status' requires at least one acceptance evidence artifact naming an enabled Rust test"
+    }
+    foreach ($difference in $differences) {
+        if (Test-OrdinalStringEqual ([string]$difference) $BaselineKnownDifference) {
+            Fail "$Context status '$status' must not keep the baseline no-implementation known_differences placeholder"
+        }
+    }
+
+    $identities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $artifacts.Count; $index += 1) {
+        $artifact = $artifacts[$index]
+        if (-not (Test-JsonObject $artifact)) {
+            Fail "$Context acceptance evidence artifact $index must be a typed object"
+        }
+        if (-not $identities.Add((ConvertTo-CanonicalJson $artifact))) {
+            Fail "$Context repeats the same acceptance evidence artifact"
+        }
+        Assert-EvidenceArtifact $artifact "$Context.acceptance_evidence.artifacts[$index]"
+    }
+
+    $pointerIdentities = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $pointers.Count; $index += 1) {
+        $pointer = $pointers[$index]
+        if (-not (Test-JsonObject $pointer)) {
+            Fail "$Context implementation pointer $index must be a typed object"
+        }
+        if (-not $pointerIdentities.Add((ConvertTo-CanonicalJson $pointer))) {
+            Fail "$Context repeats the same implementation pointer"
+        }
+        Assert-ImplementationPointer $pointer "$Context.implementation_pointers[$index]"
+    }
+}
+
+function Format-LedgerDigestFile {
+    param([System.Collections.IDictionary]$DigestsByPath)
+    [string[]]$lines = @($LedgerDigestHeader)
+    foreach ($spec in $LedgerSpecs) {
+        $lines += ("{0}  {1}" -f [string]$DigestsByPath[[string]$spec.path], [string]$spec.path)
+    }
+    return (($lines -join "`n") + "`n")
+}
+
+function Read-LedgerDigestFile {
+    param([string]$AbsolutePath)
+    if (-not (Test-Path -LiteralPath $AbsolutePath -PathType Leaf)) {
+        Fail "$LedgerDigestFileName is missing; regenerate it with validate.ps1 -WriteLedgerDigests"
+    }
+    $text = [System.IO.File]::ReadAllText($AbsolutePath).Replace("`r`n", "`n")
+    $digests = [ordered]@{}
+    foreach ($line in $text.Split("`n")) {
+        if ($line.Length -eq 0 -or $line.StartsWith("#", [StringComparison]::Ordinal)) {
+            continue
+        }
+        if (-not ($line -cmatch '\A([0-9a-f]{64})  ([A-Za-z0-9._/-]+)\z')) {
+            Fail "$LedgerDigestFileName contains a malformed entry; regenerate it with validate.ps1 -WriteLedgerDigests"
+        }
+        $entryPath = $Matches[2]
+        if ($digests.Contains($entryPath)) {
+            Fail "$LedgerDigestFileName declares '$entryPath' more than once"
+        }
+        $digests[$entryPath] = $Matches[1]
+    }
+    foreach ($spec in $LedgerSpecs) {
+        if (-not $digests.Contains([string]$spec.path)) {
+            Fail "$LedgerDigestFileName does not declare a digest for $($spec.path)"
+        }
+    }
+    if ($digests.Count -ne $LedgerSpecs.Count) {
+        Fail "$LedgerDigestFileName must declare exactly $($LedgerSpecs.Count) ledger digests"
+    }
+    if (-not (Test-OrdinalStringEqual $text (Format-LedgerDigestFile $digests))) {
+        Fail "$LedgerDigestFileName is not in canonical form; regenerate it with validate.ps1 -WriteLedgerDigests"
+    }
+    return $digests
+}
+
+function Write-LedgerDigestFile {
+    param(
+        [string]$AbsolutePath,
+        [System.Collections.IDictionary]$DigestsByPath
+    )
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($AbsolutePath, (Format-LedgerDigestFile $DigestsByPath), $encoding)
 }
 
 function Assert-ExactCounts {
@@ -884,17 +2288,44 @@ function Assert-ManifestDeclarations {
     Assert-ExactPropertySet $Manifest.evidence_policy @(
         "initial_status",
         "acceptance_evidence_state",
-        "legacy_typescript_is_not_rust_acceptance_evidence"
+        "legacy_typescript_is_not_rust_acceptance_evidence",
+        "allowed_statuses",
+        "artifact_fields",
+        "every_artifact_names_an_enabled_rust_test",
+        "implementation_pointers_are_not_acceptance_evidence",
+        "status_totals"
     ) "manifest.evidence_policy"
     if (-not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.initial_status) "unimplemented") -or
         -not (Test-OrdinalStringEqual ([string]$Manifest.evidence_policy.acceptance_evidence_state) "missing") -or
         $Manifest.evidence_policy.legacy_typescript_is_not_rust_acceptance_evidence -ne $true) {
         Fail "manifest evidence policy mismatch"
     }
+    if (-not (Test-JsonValueEqual $Manifest.evidence_policy.allowed_statuses $AllowedFeatureStatuses) -or
+        -not (Test-JsonValueEqual $Manifest.evidence_policy.artifact_fields $ArtifactFields) -or
+        $Manifest.evidence_policy.every_artifact_names_an_enabled_rust_test -ne $true -or
+        $Manifest.evidence_policy.implementation_pointers_are_not_acceptance_evidence -ne $true) {
+        Fail "manifest evidence lifecycle policy mismatch"
+    }
+    Assert-ExactPropertySet $Manifest.evidence_policy.status_totals $AllowedFeatureStatuses "manifest.evidence_policy.status_totals"
+    foreach ($status in $AllowedFeatureStatuses) {
+        $declaredTotal = Get-PropertyValue $Manifest.evidence_policy.status_totals $status
+        # PowerShell Core parses JSON integers as Int64 while Windows PowerShell
+        # produces Int32, so never test against a single concrete numeric type.
+        if (-not (Test-JsonInteger $declaredTotal) -or [long]$declaredTotal -lt 0) {
+            Fail "manifest.evidence_policy.status_totals.$status must be a non-negative integer"
+        }
+    }
 }
 
-$actualJsonPaths = @(
-    Get-ChildItem -LiteralPath $Root -Recurse -File -Filter "*.json" | ForEach-Object {
+$script:RepositoryRootFull = Resolve-RepositoryRoot $RepositoryRoot
+
+# Runs before any contract file is read, in both verify and write mode, so a host
+# whose globalisation or JSON behaviour differs from a conforming host fails
+# loudly instead of silently computing a different digest.
+Assert-PortabilityInvariants
+
+$actualFilePaths = @(
+    Get-ChildItem -LiteralPath $Root -Recurse -File -Force | ForEach-Object {
         $relative = $_.FullName.Substring($Root.Length)
         while ($relative.StartsWith("\", [StringComparison]::Ordinal) -or
             $relative.StartsWith("/", [StringComparison]::Ordinal)) {
@@ -903,9 +2334,24 @@ $actualJsonPaths = @(
         $relative.Replace("\", "/")
     }
 )
+$actualJsonPaths = @($actualFilePaths | Where-Object { $_.EndsWith(".json", [StringComparison]::Ordinal) })
+$expectedFilePaths = @($ExpectedJsonPaths + $ExpectedNonJsonPaths)
+if ($WriteLedgerDigests -and
+    -not (Test-Path -LiteralPath (Join-Path $Root $LedgerDigestFileName) -PathType Leaf)) {
+    $expectedFilePaths = @(
+        $expectedFilePaths | Where-Object { -not (Test-OrdinalStringEqual $_ $LedgerDigestFileName) }
+    )
+}
+$missingFiles = @($expectedFilePaths | Where-Object { -not (Test-OrdinalContains $actualFilePaths $_) })
+$unexpectedFiles = @($actualFilePaths | Where-Object { -not (Test-OrdinalContains $expectedFilePaths $_) })
+if ($actualFilePaths.Count -ne $expectedFilePaths.Count -or
+    $missingFiles.Count -gt 0 -or
+    $unexpectedFiles.Count -gt 0) {
+    Fail "fixed artifact topology mismatch; missing=[$($missingFiles -join ',')], unexpected=[$($unexpectedFiles -join ',')]"
+}
 $missingJsonFiles = @($ExpectedJsonPaths | Where-Object { -not (Test-OrdinalContains $actualJsonPaths $_) })
 $unexpectedJsonFiles = @($actualJsonPaths | Where-Object { -not (Test-OrdinalContains $ExpectedJsonPaths $_) })
-if ($actualJsonPaths.Count -ne 16 -or
+if ($actualJsonPaths.Count -ne 17 -or
     $missingJsonFiles.Count -gt 0 -or
     $unexpectedJsonFiles.Count -gt 0) {
     Fail "fixed JSON topology mismatch; missing=[$($missingJsonFiles -join ',')], unexpected=[$($unexpectedJsonFiles -join ',')]"
@@ -915,6 +2361,11 @@ $documents = @{}
 foreach ($relativePath in $ExpectedJsonPaths) {
     $documents[$relativePath] = Read-Json (Join-Path $Root $relativePath)
 }
+
+# Prove the enabled-test oracle still agrees with the normative Rust rule BEFORE
+# any evidence is judged with it. A drifted oracle must never get the chance to
+# accept or reject a parity claim.
+Assert-EnabledTestOracle $documents["enabled-test-oracle.json"]
 
 $baseline = $documents["baseline.json"]
 Assert-ExactPropertySet $baseline @("schema_version", "upstream", "stable_release", "gateway_protocol", "licensing") "baseline"
@@ -930,7 +2381,7 @@ if ($baseline.schema_version -ne 1 -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_sha) $ExpectedSha) -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.tree_sha) "ba3177d3dd666b702d59c4daab74f62a9f7a84fb") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.parent_sha) "a674ce5e0d1ab0774546086fa7b2730516eca176") -or
-    -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_timestamp) "2026-07-13T03:29:58Z") -or
+    -not (Test-OrdinalStringEqual (ConvertTo-ContractString $baseline.upstream.commit_timestamp) "2026-07-13T03:29:58Z") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.commit_url) "https://github.com/openclaw/openclaw/commit/b43e832fcc8000ed7287c7accc54e381db607f85") -or
     $baseline.upstream.commit_signature_verified -ne $true -or
     -not (Test-OrdinalStringEqual ([string]$baseline.upstream.package_name) "openclaw") -or
@@ -945,7 +2396,7 @@ if (-not (Test-OrdinalStringEqual ([string]$baseline.stable_release.tag) "v2026.
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.name) "openclaw 2026.6.11") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.tag_object_sha) "08d1bbad1bd6ee5700082e1c0f65f63f07600d1f") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.commit_sha) "e085fa1a3ffd32d0ea6917e1e6fb4ecbffbb77d2") -or
-    -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.published_at) "2026-06-30T16:06:39Z") -or
+    -not (Test-OrdinalStringEqual (ConvertTo-ContractString $baseline.stable_release.published_at) "2026-06-30T16:06:39Z") -or
     -not (Test-OrdinalStringEqual ([string]$baseline.stable_release.release_url) "https://github.com/openclaw/openclaw/releases/tag/v2026.6.11")) {
     Fail "stable release provenance mismatch"
 }
@@ -982,15 +2433,16 @@ $schema = $documents["feature-ledger.schema.json"]
 if (-not (Test-OrdinalStringEqual ([string]$schema.'$schema') "https://json-schema.org/draft/2020-12/schema") -or
     -not (Test-OrdinalStringEqual ([string]$schema.'$id') "https://github.com/GTAStudio/GTA-Claw/compat/upstream/feature-ledger.schema.json") -or
     -not (Test-OrdinalStringEqual (Get-ObjectDigest $schema) $ExpectedSchemaDigest)) {
-    Fail "feature ledger schema is not the frozen Draft 2020-12 contract"
+    Fail ("feature ledger schema is not the frozen Draft 2020-12 contract (expected digest {0}, computed {1})" -f
+        $ExpectedSchemaDigest, (Get-ObjectDigest $schema))
 }
 
 $manifest = $documents["manifest.json"]
 Assert-ManifestDeclarations $manifest
 
-$featureIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-$featureCount = 0
-$missingEvidenceCount = 0
+$ledgerDigestPath = Join-Path $Root $LedgerDigestFileName
+$computedLedgerDigests = [ordered]@{}
+$computedFrozenDigests = [ordered]@{}
 foreach ($spec in $LedgerSpecs) {
     $ledger = $documents[$spec.path]
     Assert-JsonSchema $ledger $schema $schema '$'
@@ -1003,10 +2455,36 @@ foreach ($spec in $LedgerSpecs) {
     if ($features.Count -ne [int]$spec.expected_features) {
         Fail "$($spec.path) must contain exactly $($spec.expected_features) features"
     }
-    if (-not (Test-OrdinalStringEqual (Get-FeatureDigest $features) ([string]$spec.digest))) {
-        Fail "$($spec.path) canonical feature/source evidence fingerprint mismatch"
+    # Computed here but asserted after the per-feature checks and the stored
+    # digest comparison, so a mutation those catch keeps its own specific
+    # rejection reason. This check is the residual: it exists for descriptive
+    # edits that nothing else covers.
+    $computedFrozenDigests[[string]$spec.path] = Get-LedgerFrozenDigest $features
+    $computedLedgerDigests[[string]$spec.path] = Get-FeatureDigest $features
+}
+
+if ($WriteLedgerDigests) {
+    Write-LedgerDigestFile $ledgerDigestPath $computedLedgerDigests
+} else {
+    $storedLedgerDigests = Read-LedgerDigestFile $ledgerDigestPath
+    foreach ($spec in $LedgerSpecs) {
+        if (-not (Test-OrdinalStringEqual `
+                    ([string]$computedLedgerDigests[[string]$spec.path]) `
+                    ([string]$storedLedgerDigests[[string]$spec.path]))) {
+            Fail "$($spec.path) canonical feature/source evidence fingerprint mismatch"
+        }
     }
-    foreach ($feature in $features) {
+}
+
+$featureIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$featureCount = 0
+$statusTotals = [ordered]@{}
+foreach ($status in $AllowedFeatureStatuses) {
+    $statusTotals[$status] = 0
+}
+foreach ($spec in $LedgerSpecs) {
+    $ledger = $documents[$spec.path]
+    foreach ($feature in @($ledger.features)) {
         $featureCount += 1
         if (-not $featureIds.Add([string]$feature.feature_id)) {
             Fail "duplicate feature_id '$($feature.feature_id)'"
@@ -1014,24 +2492,34 @@ foreach ($spec in $LedgerSpecs) {
         if (-not (Test-OrdinalStringEqual ([string]$feature.classification) ([string]$ledger.classification))) {
             Fail "$($feature.feature_id) classification does not match its ledger"
         }
-        if (-not (Test-OrdinalStringEqual ([string]$feature.status) "unimplemented") -or
-            -not (Test-OrdinalStringEqual ([string]$feature.acceptance_evidence.status) "missing") -or
-            @($feature.acceptance_evidence.artifacts).Count -ne 0) {
-            Fail "$($feature.feature_id) must start unimplemented with an empty evidence placeholder"
-        }
+        Assert-FeatureLifecycle $feature ([string]$feature.feature_id)
         if (-not (Test-OrdinalStringEqual ([string]$feature.last_verified_sha) $ExpectedSha)) {
             Fail "$($feature.feature_id) last_verified_sha mismatch"
         }
-        $missingEvidenceCount += 1
+        $statusTotals[[string]$feature.status] += 1
     }
 }
-if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47 -or $missingEvidenceCount -ne 47) {
-    Fail "fixed ledger totals must be 3 ledgers, 47 features, and 47 missing evidence placeholders"
+if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47) {
+    Fail "fixed ledger totals must be 3 ledgers and 47 features"
 }
+# Runs in write mode too, so -WriteLedgerDigests cannot re-bless a ledger whose
+# frozen text was edited: the regeneration command can only ever move the file
+# digest for a status or evidence change. It fails before it writes.
+foreach ($spec in $LedgerSpecs) {
+    if (-not (Test-OrdinalStringEqual `
+                ([string]$computedFrozenDigests[[string]$spec.path]) `
+                ([string]$spec.frozen_digest))) {
+        Fail ("$($spec.path) frozen feature text changed; only status, " +
+            "acceptance_evidence.status, acceptance_evidence.artifacts, " +
+            "implementation_pointers and known_differences may change")
+    }
+}
+Assert-ExactCounts $manifest.evidence_policy.status_totals $statusTotals "manifest.evidence_policy.status_totals"
+$missingEvidenceCount = $statusTotals["unimplemented"]
 
 $globalRecordIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $inventoryRowCount = 0
-$derivedByInventory = @{}
+$derivedByInventory = [ordered]@{}
 foreach ($inventoryId in $InventorySpecs.Keys) {
     $spec = $InventorySpecs[$inventoryId]
     $inventory = $documents[$spec.path]
@@ -1131,13 +2619,24 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
     }
 }
 
+if ($WriteLedgerDigests) {
+    Write-Host "Recorded ledger digests in $LedgerDigestFileName; review every line before committing:"
+    foreach ($spec in $LedgerSpecs) {
+        Write-Host ("  {0}  {1}" -f [string]$computedLedgerDigests[[string]$spec.path], [string]$spec.path)
+    }
+}
+
 [ordered]@{
     status = "ok"
+    mode = if ($WriteLedgerDigests) { "write-ledger-digests" } else { "verify" }
     baseline_sha = $ExpectedSha
+    repository_root = $script:RepositoryRootFull
     artifact_json_files = $actualJsonPaths.Count
     ledgers = $LedgerSpecs.Count
     feature_rows = $featureCount
+    feature_status_totals = $statusTotals
     missing_acceptance_evidence = $missingEvidenceCount
+    ledger_digests = $computedLedgerDigests
     inventory_files = $InventorySpecs.Count
     inventory_rows = $inventoryRowCount
     canonical_counts = $derivedCanonicalCounts
