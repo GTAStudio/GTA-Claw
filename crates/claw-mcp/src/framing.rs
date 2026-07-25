@@ -373,16 +373,33 @@ mod tests {
             "method": "tools/list",
             "params": {}
         });
-        let encoded = encode(&expected).expect("encode frame");
+        let encoded = br#"{"id":7,"jsonrpc":"2.0","method":"tools/list","params":{}}
+"#;
         let mut decoder = JsonLineDecoder::new(1024);
         let mut actual = Vec::new();
 
         for byte in encoded {
-            actual.extend(decoder.push(&[byte]).expect("decode split byte"));
+            actual.extend(decoder.push(&[*byte]).expect("decode split byte"));
         }
 
         assert_eq!(actual, vec![expected]);
         decoder.finish().expect("no buffered tail");
+    }
+
+    #[test]
+    fn encoder_emits_one_exact_newline_delimited_frame() {
+        let value = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        assert_eq!(
+            encode(&value).expect("encode frame"),
+            br#"{"id":7,"jsonrpc":"2.0","method":"tools/list","params":{}}
+"#
+        );
     }
 
     #[test]
