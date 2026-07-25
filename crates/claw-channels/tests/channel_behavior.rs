@@ -1,19 +1,23 @@
 //! Executable channel behavior against local fixtures.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::thread;
+use std::time::Duration;
 
 use claw_channel_sdk::{
-    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialBindingError,
-    CredentialKind, CredentialRequest, DeliveryAcknowledgement, DeliveryState, InboundMessage,
-    OutboundMessage, UnsupportedOperation,
+    BackoffSleeper, Channel, ChannelCredential, ChannelError, CredentialBinding,
+    CredentialBindingError, CredentialKind, CredentialRequest, DeliveryAcknowledgement,
+    DeliveryState, InboundMessage, OutboundMessage, OutboundRetrySafety, RetryPolicy,
+    TransportErrorKind, UnsupportedOperation, send_with_retry,
 };
 use claw_channels::{
-    AuthMode, ImplementationStatus, LoopbackHttpTransport, QaChannel, RedirectPolicy, UnixClock,
-    WebhookChannel, WebhookRequest, WebhookResponse, WebhookTransport, registry,
+    AuthMode, ChannelCapability, ImplementationStatus, LoopbackHttpTransport, QaChannel,
+    RedirectPolicy, UnixClock, WebhookChannel, WebhookRequest, WebhookResponse, WebhookTransport,
+    registry,
 };
 
 const FIXTURE_WEBHOOK_CASES: [(&str, &[u8]); 4] = [
@@ -94,7 +98,7 @@ fn fixture_server(status: u16) -> (String, thread::JoinHandle<CapturedRequest>) 
 
 fn outbound() -> OutboundMessage {
     OutboundMessage {
-        idempotency_key: "delivery-1".to_owned(),
+        correlation_key: "delivery-1".to_owned(),
         account_id: "primary".to_owned(),
         conversation_id: "room-1".to_owned(),
         text: Some("hello fixture".to_owned()),
@@ -129,6 +133,27 @@ impl WebhookTransport for InspectingTransport {
     }
 }
 
+#[derive(Clone)]
+struct FailingTransport {
+    calls: Rc<Cell<usize>>,
+}
+
+impl WebhookTransport for FailingTransport {
+    fn post_json(&self, _request: &WebhookRequest<'_>) -> Result<WebhookResponse, ChannelError> {
+        self.calls.set(self.calls.get() + 1);
+        Err(ChannelError::Transport(TransportErrorKind::Timeout))
+    }
+}
+
+#[derive(Default)]
+struct RecordingSleeper(Vec<Duration>);
+
+impl BackoffSleeper for RecordingSleeper {
+    fn sleep(&mut self, delay: Duration) {
+        self.0.push(delay);
+    }
+}
+
 #[test]
 fn discord_webhook_posts_exact_payload_to_local_fixture_server() {
     let (endpoint, server) = fixture_server(204);
@@ -136,6 +161,7 @@ fn discord_webhook_posts_exact_payload_to_local_fixture_server() {
     let mut channel = WebhookChannel::new(
         "discord",
         "primary",
+        "room-1",
         LoopbackHttpTransport,
         FixedClock(1_234),
     )
@@ -144,7 +170,7 @@ fn discord_webhook_posts_exact_payload_to_local_fixture_server() {
     assert_eq!(
         channel.send_outbound(&outbound(), Some(&credential)),
         Ok(DeliveryAcknowledgement {
-            idempotency_key: "delivery-1".to_owned(),
+            correlation_key: "delivery-1".to_owned(),
             remote_message_id: None,
             state: DeliveryState::Accepted,
             accepted_at_unix_ms: 1_234,
@@ -187,7 +213,7 @@ fn qa_channel_round_trips_inbound_and_records_outbound() {
     assert_eq!(
         channel.send_outbound(&outbound, None),
         Ok(DeliveryAcknowledgement {
-            idempotency_key: "delivery-1".to_owned(),
+            correlation_key: "delivery-1".to_owned(),
             remote_message_id: Some("qa-1".to_owned()),
             state: DeliveryState::Delivered,
             accepted_at_unix_ms: 200,
@@ -200,8 +226,14 @@ fn qa_channel_round_trips_inbound_and_records_outbound() {
 fn webhook_authentication_failure_is_typed_and_body_free() {
     let (endpoint, server) = fixture_server(401);
     let credential = webhook_credential("slack", endpoint);
-    let mut channel = WebhookChannel::new("slack", "primary", LoopbackHttpTransport, FixedClock(5))
-        .expect("valid adapter");
+    let mut channel = WebhookChannel::new(
+        "slack",
+        "primary",
+        "room-1",
+        LoopbackHttpTransport,
+        FixedClock(5),
+    )
+    .expect("valid adapter");
     assert_eq!(
         channel.send_outbound(&outbound(), Some(&credential)),
         Err(ChannelError::Authentication)
@@ -229,6 +261,7 @@ fn every_partial_webhook_adapter_completes_against_a_local_server() {
         let mut channel = WebhookChannel::new(
             channel_id,
             "primary",
+            "room-1",
             LoopbackHttpTransport,
             FixedClock(900),
         )
@@ -236,7 +269,7 @@ fn every_partial_webhook_adapter_completes_against_a_local_server() {
         assert_eq!(
             channel.send_outbound(&outbound(), Some(&credential)),
             Ok(DeliveryAcknowledgement {
-                idempotency_key: "delivery-1".to_owned(),
+                correlation_key: "delivery-1".to_owned(),
                 remote_message_id: None,
                 state: DeliveryState::Accepted,
                 accepted_at_unix_ms: 900,
@@ -246,8 +279,18 @@ fn every_partial_webhook_adapter_completes_against_a_local_server() {
     }
 }
 
+fn assert_retry_capability_matches_runtime(
+    capabilities: &[ChannelCapability],
+    channel: &impl Channel,
+) {
+    assert_eq!(
+        capabilities.contains(&ChannelCapability::SafeOutboundRetry),
+        channel.outbound_retry_safety() == OutboundRetrySafety::SafeToRepeat
+    );
+}
+
 #[test]
-fn outbound_webhook_auth_advertisement_matches_executable_credential_policy() {
+fn executable_channel_advertisements_match_runtime_controls() {
     let rendered = Rc::new(RefCell::new(Vec::new()));
     for entry in registry()
         .iter()
@@ -257,8 +300,10 @@ fn outbound_webhook_auth_advertisement_matches_executable_credential_policy() {
         let transport = InspectingTransport {
             rendered: Rc::clone(&rendered),
         };
-        let mut channel = WebhookChannel::new(entry.id, "primary", transport, FixedClock(42))
-            .expect("advertised webhook adapter");
+        let mut channel =
+            WebhookChannel::new(entry.id, "primary", "room-1", transport, FixedClock(42))
+                .expect("advertised webhook adapter");
+        assert_retry_capability_matches_runtime(entry.capabilities, &channel);
         let credential = webhook_credential(
             entry.id,
             format!("https://{0}.example/hooks/fixture-secret", entry.id),
@@ -266,7 +311,7 @@ fn outbound_webhook_auth_advertisement_matches_executable_credential_policy() {
         assert_eq!(
             channel.send_outbound(&outbound(), Some(&credential)),
             Ok(DeliveryAcknowledgement {
-                idempotency_key: "delivery-1".to_owned(),
+                correlation_key: "delivery-1".to_owned(),
                 remote_message_id: None,
                 state: DeliveryState::Accepted,
                 accepted_at_unix_ms: 42,
@@ -297,7 +342,92 @@ fn outbound_webhook_auth_advertisement_matches_executable_credential_policy() {
             );
         }
     }
+    let qa_entry = registry()
+        .iter()
+        .find(|entry| entry.id == "qa-channel")
+        .expect("QA registry entry");
+    let qa_channel = QaChannel::new("qa", FixedClock(42)).expect("valid QA adapter");
+    assert_eq!(qa_entry.auth_modes, &[AuthMode::None]);
+    assert_retry_capability_matches_runtime(qa_entry.capabilities, &qa_channel);
     assert_eq!(rendered.borrow().len(), FIXTURE_WEBHOOK_CASES.len());
+}
+
+#[test]
+fn outbound_webhook_rejects_a_conversation_mismatch_before_transport() {
+    let rendered = Rc::new(RefCell::new(Vec::new()));
+    for entry in registry()
+        .iter()
+        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
+    {
+        let transport = InspectingTransport {
+            rendered: Rc::clone(&rendered),
+        };
+        let credential = webhook_credential(
+            entry.id,
+            format!("https://{0}.example/hooks/fixture-secret", entry.id),
+        );
+        let mut channel = WebhookChannel::new(
+            entry.id,
+            "primary",
+            "private-room",
+            transport,
+            FixedClock(42),
+        )
+        .expect("valid adapter");
+        let message = OutboundMessage {
+            conversation_id: "public-room".to_owned(),
+            ..outbound()
+        };
+
+        assert_eq!(
+            channel.send_outbound(&message, Some(&credential)),
+            Err(ChannelError::Configuration(
+                claw_channel_sdk::ConfigurationError::ConversationScopeMismatch
+            ))
+        );
+    }
+    assert!(rendered.borrow().is_empty());
+}
+
+#[test]
+fn outbound_webhooks_do_not_retry_ambiguous_failures() {
+    let policy = RetryPolicy::new(
+        NonZeroU32::new(3).expect("non-zero"),
+        Duration::from_millis(1),
+        Duration::from_millis(4),
+        NonZeroU32::new(2).expect("non-zero"),
+    )
+    .expect("valid retry policy");
+    for entry in registry()
+        .iter()
+        .filter(|entry| entry.implementation == ImplementationStatus::OutboundWebhook)
+    {
+        let calls = Rc::new(Cell::new(0));
+        let transport = FailingTransport {
+            calls: Rc::clone(&calls),
+        };
+        let credential = webhook_credential(
+            entry.id,
+            format!("https://{0}.example/hooks/fixture-secret", entry.id),
+        );
+        let mut channel =
+            WebhookChannel::new(entry.id, "primary", "room-1", transport, FixedClock(42))
+                .expect("valid adapter");
+        let mut sleeper = RecordingSleeper::default();
+
+        assert_eq!(
+            send_with_retry(
+                &mut channel,
+                &outbound(),
+                Some(&credential),
+                policy,
+                &mut sleeper,
+            ),
+            Err(ChannelError::Transport(TransportErrorKind::Timeout))
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(sleeper.0.is_empty());
+    }
 }
 
 #[test]
@@ -310,12 +440,13 @@ fn credential_bearing_request_debug_is_redacted_and_redirects_are_rejected() {
         "discord",
         "https://discord.example/hooks/super-secret-token".to_owned(),
     );
-    let mut channel = WebhookChannel::new("discord", "primary", transport, FixedClock(42))
-        .expect("valid adapter");
+    let mut channel =
+        WebhookChannel::new("discord", "primary", "room-1", transport, FixedClock(42))
+            .expect("valid adapter");
     assert_eq!(
         channel.send_outbound(&outbound(), Some(&credential)),
         Ok(DeliveryAcknowledgement {
-            idempotency_key: "delivery-1".to_owned(),
+            correlation_key: "delivery-1".to_owned(),
             remote_message_id: None,
             state: DeliveryState::Accepted,
             accepted_at_unix_ms: 42,
@@ -333,9 +464,14 @@ fn credential_bearing_request_debug_is_redacted_and_redirects_are_rejected() {
 fn redirect_response_is_not_treated_as_delivery() {
     let (endpoint, server) = fixture_server(302);
     let credential = webhook_credential("discord", endpoint);
-    let mut channel =
-        WebhookChannel::new("discord", "primary", LoopbackHttpTransport, FixedClock(42))
-            .expect("valid adapter");
+    let mut channel = WebhookChannel::new(
+        "discord",
+        "primary",
+        "room-1",
+        LoopbackHttpTransport,
+        FixedClock(42),
+    )
+    .expect("valid adapter");
     assert_eq!(
         channel.send_outbound(&outbound(), Some(&credential)),
         Err(ChannelError::RemoteRejected { status: 302 })

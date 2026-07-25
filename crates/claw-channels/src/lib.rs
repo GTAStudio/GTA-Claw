@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use claw_channel_sdk::{
     Channel, ChannelCredential, ChannelError, ConfigurationError, CredentialBindingError,
     DeliveryAcknowledgement, DeliveryState, InboundMessage, InvalidMessageReason, OutboundMessage,
-    ProtocolErrorKind, SecretStoreError, TransportErrorKind, UnsupportedOperation,
+    OutboundRetrySafety, ProtocolErrorKind, SecretStoreError, TransportErrorKind,
+    UnsupportedOperation,
 };
 
 const CATALOG_PATH: &str = "scripts/lib/official-external-channel-catalog.json";
@@ -47,6 +48,8 @@ pub enum ChannelCapability {
     InboundText,
     /// Normalized text can be sent.
     OutboundText,
+    /// Failed outbound attempts are positively safe to repeat.
+    SafeOutboundRetry,
 }
 
 /// Credential mode declared by this crate for configuration routing.
@@ -558,6 +561,7 @@ fn parse_status(response: &[u8]) -> Result<u16, ChannelError> {
 pub struct WebhookChannel<T, C> {
     channel_id: &'static str,
     account_id: String,
+    conversation_id: String,
     payload_field: &'static str,
     transport: T,
     clock: C,
@@ -568,6 +572,7 @@ impl<T, C> WebhookChannel<T, C> {
     pub fn new(
         channel_id: &'static str,
         account_id: impl Into<String>,
+        conversation_id: impl Into<String>,
         transport: T,
         clock: C,
     ) -> Result<Self, ChannelError> {
@@ -581,7 +586,8 @@ impl<T, C> WebhookChannel<T, C> {
             }
         };
         let account_id = account_id.into();
-        if account_id.is_empty() {
+        let conversation_id = conversation_id.into();
+        if invalid_routing_identifier(&account_id) || invalid_routing_identifier(&conversation_id) {
             return Err(ChannelError::Configuration(
                 ConfigurationError::InvalidAdapterConfiguration,
             ));
@@ -589,6 +595,7 @@ impl<T, C> WebhookChannel<T, C> {
         Ok(Self {
             channel_id,
             account_id,
+            conversation_id,
             payload_field,
             transport,
             clock,
@@ -602,6 +609,7 @@ impl<T: Debug, C: Debug> Debug for WebhookChannel<T, C> {
             .debug_struct("WebhookChannel")
             .field("channel_id", &self.channel_id)
             .field("account_id", &self.account_id)
+            .field("conversation_id", &self.conversation_id)
             .field("payload_field", &self.payload_field)
             .field("transport", &self.transport)
             .field("clock", &self.clock)
@@ -622,6 +630,10 @@ where
         Err(ChannelError::Unsupported(UnsupportedOperation::Inbound))
     }
 
+    fn outbound_retry_safety(&self) -> OutboundRetrySafety {
+        OutboundRetrySafety::NotSafeToRepeat
+    }
+
     fn send_outbound(
         &mut self,
         message: &OutboundMessage,
@@ -631,6 +643,11 @@ where
         if message.account_id != self.account_id {
             return Err(ChannelError::Configuration(
                 ConfigurationError::CredentialScopeMismatch,
+            ));
+        }
+        if message.conversation_id != self.conversation_id {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::ConversationScopeMismatch,
             ));
         }
         if !message.attachments.is_empty() {
@@ -656,7 +673,7 @@ where
             .map_err(map_credential_binding)??;
         match response.status {
             200..=299 => Ok(DeliveryAcknowledgement {
-                idempotency_key: message.idempotency_key.clone(),
+                correlation_key: message.correlation_key.clone(),
                 remote_message_id: None,
                 state: DeliveryState::Accepted,
                 accepted_at_unix_ms: self.clock.now_unix_ms(),
@@ -672,6 +689,13 @@ where
 
 fn map_credential_binding(error: CredentialBindingError) -> ChannelError {
     ChannelError::CredentialBinding(error)
+}
+
+fn invalid_routing_identifier(value: &str) -> bool {
+    value.is_empty()
+        || value.len() > 256
+        || value.trim() != value
+        || value.chars().any(char::is_control)
 }
 
 /// Fully local QA channel used by acceptance and lifecycle tests.
@@ -741,7 +765,7 @@ impl<C: UnixClock> Channel for QaChannel<C> {
         }
         self.outbound.push(message.clone());
         Ok(DeliveryAcknowledgement {
-            idempotency_key: message.idempotency_key.clone(),
+            correlation_key: message.correlation_key.clone(),
             remote_message_id: Some(format!("qa-{}", self.outbound.len())),
             state: DeliveryState::Delivered,
             accepted_at_unix_ms: self.clock.now_unix_ms(),

@@ -109,8 +109,11 @@ impl InboundMessage {
 /// A normalized message to be sent through a channel.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutboundMessage {
-    /// Caller-assigned idempotency identifier.
-    pub idempotency_key: String,
+    /// Caller-assigned correlation identifier.
+    ///
+    /// This value supports tracing only. It does not imply provider-side
+    /// deduplication or make delivery safe to retry.
+    pub correlation_key: String,
     /// Configured account identifier.
     pub account_id: String,
     /// Provider conversation, room, or peer identifier.
@@ -128,7 +131,7 @@ impl OutboundMessage {
     pub fn validate(&self) -> Result<(), InvalidMessageReason> {
         validate_message_fields(
             [
-                self.idempotency_key.as_str(),
+                self.correlation_key.as_str(),
                 self.account_id.as_str(),
                 self.conversation_id.as_str(),
             ],
@@ -172,8 +175,11 @@ fn invalid_identifier(value: &str) -> bool {
 /// Confirmation returned after an outbound delivery attempt is accepted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeliveryAcknowledgement {
-    /// Idempotency key supplied by the caller.
-    pub idempotency_key: String,
+    /// Correlation key copied verbatim from the outbound message.
+    ///
+    /// Its presence confirms request/response correlation only, not that the
+    /// channel or provider deduplicated this delivery.
+    pub correlation_key: String,
     /// Provider-assigned message identifier when one is available.
     pub remote_message_id: Option<String>,
     /// Provider delivery state.
@@ -194,6 +200,19 @@ pub enum DeliveryState {
     Delivered,
 }
 
+/// Whether an outbound delivery operation is safe to repeat after failure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutboundRetrySafety {
+    /// Retrying may duplicate delivery.
+    ///
+    /// This is the default because an omitted declaration must cost a delivery
+    /// rather than silently duplicate one.
+    #[default]
+    NotSafeToRepeat,
+    /// The channel positively guarantees repeated attempts are deduplicated.
+    SafeToRepeat,
+}
+
 /// Core inbound and outbound behavior implemented by a channel adapter.
 pub trait Channel {
     /// Returns the exact registered channel identifier.
@@ -201,6 +220,14 @@ pub trait Channel {
 
     /// Polls one normalized inbound message.
     fn poll_inbound(&mut self) -> Result<Option<InboundMessage>, ChannelError>;
+
+    /// Declares whether failed outbound attempts are safe to repeat.
+    ///
+    /// Implementations must override this only when they positively enforce
+    /// deduplication across repeated attempts. The default fails closed.
+    fn outbound_retry_safety(&self) -> OutboundRetrySafety {
+        OutboundRetrySafety::NotSafeToRepeat
+    }
 
     /// Sends one normalized outbound message with an optional scoped credential.
     fn send_outbound(
@@ -734,7 +761,11 @@ pub trait BackoffSleeper {
     fn sleep(&mut self, delay: Duration);
 }
 
-/// Sends an outbound message and retries only errors classified as retryable.
+/// Sends an outbound message and retries only when the channel declares it safe.
+///
+/// A retryable error alone is insufficient: it may have happened after a
+/// provider accepted the message. The channel must positively guarantee that
+/// repeating the operation cannot duplicate delivery.
 pub fn send_with_retry<C, S>(
     channel: &mut C,
     message: &OutboundMessage,
@@ -747,10 +778,15 @@ where
     S: BackoffSleeper,
 {
     let mut delay = policy.initial_delay;
+    let retry_safety = channel.outbound_retry_safety();
     for attempt in 1..=policy.max_attempts.get() {
         match channel.send_outbound(message, credential) {
             Ok(acknowledgement) => return Ok(acknowledgement),
-            Err(error) if error.is_retryable() && attempt < policy.max_attempts.get() => {
+            Err(error)
+                if error.is_retryable()
+                    && attempt < policy.max_attempts.get()
+                    && retry_safety == OutboundRetrySafety::SafeToRepeat =>
+            {
                 let requested_delay = error.retry_after().unwrap_or(delay);
                 sleeper.sleep(requested_delay.min(policy.max_delay));
                 delay = delay
@@ -831,6 +867,8 @@ pub enum InvalidMessageReason {
 pub enum ConfigurationError {
     /// Credential scope does not match channel or account routing.
     CredentialScopeMismatch,
+    /// Message conversation does not match the adapter's bound destination.
+    ConversationScopeMismatch,
     /// Retry parameters are inconsistent.
     InvalidRetryPolicy,
     /// Rate limit window is zero.
@@ -982,7 +1020,7 @@ mod tests {
 
     fn message() -> OutboundMessage {
         OutboundMessage {
-            idempotency_key: "request-1".to_owned(),
+            correlation_key: "request-1".to_owned(),
             account_id: "primary".to_owned(),
             conversation_id: "room-7".to_owned(),
             text: Some("hello".to_owned()),
@@ -1037,6 +1075,30 @@ mod tests {
                 self.credentials.push(value);
             }
             self.results.pop_front().expect("configured result")
+        }
+    }
+
+    struct SafeRetryChannel(TestChannel);
+
+    impl Channel for SafeRetryChannel {
+        fn id(&self) -> &str {
+            self.0.id()
+        }
+
+        fn poll_inbound(&mut self) -> Result<Option<InboundMessage>, ChannelError> {
+            self.0.poll_inbound()
+        }
+
+        fn outbound_retry_safety(&self) -> OutboundRetrySafety {
+            OutboundRetrySafety::SafeToRepeat
+        }
+
+        fn send_outbound(
+            &mut self,
+            message: &OutboundMessage,
+            credential: Option<&ChannelCredential>,
+        ) -> Result<DeliveryAcknowledgement, ChannelError> {
+            self.0.send_outbound(message, credential)
         }
     }
 
@@ -1098,7 +1160,7 @@ mod tests {
     fn store_delivery_scope_checks_and_does_not_leak_secret() {
         let request = token_request();
         let acknowledgement = DeliveryAcknowledgement {
-            idempotency_key: "request-1".to_owned(),
+            correlation_key: "request-1".to_owned(),
             remote_message_id: Some("remote-4".to_owned()),
             state: DeliveryState::Accepted,
             accepted_at_unix_ms: 42,
@@ -1263,12 +1325,12 @@ mod tests {
     #[test]
     fn retry_uses_provider_delay_then_stops_on_success() {
         let acknowledgement = DeliveryAcknowledgement {
-            idempotency_key: "request-1".to_owned(),
+            correlation_key: "request-1".to_owned(),
             remote_message_id: None,
             state: DeliveryState::Queued,
             accepted_at_unix_ms: 9,
         };
-        let mut channel = TestChannel {
+        let mut channel = SafeRetryChannel(TestChannel {
             results: VecDeque::from([
                 Err(ChannelError::RateLimited {
                     retry_after: Duration::from_secs(3),
@@ -1277,7 +1339,7 @@ mod tests {
                 Ok(acknowledgement.clone()),
             ]),
             credentials: Vec::new(),
-        };
+        });
         let policy = RetryPolicy::new(
             NonZeroU32::new(3).expect("non-zero"),
             Duration::from_secs(1),
@@ -1294,6 +1356,38 @@ mod tests {
             sleeper.0,
             vec![Duration::from_secs(3), Duration::from_secs(2)]
         );
+    }
+
+    #[test]
+    fn retry_defaults_closed_when_delivery_is_not_declared_safe_to_repeat() {
+        let failure = ChannelError::Transport(TransportErrorKind::Timeout);
+        let mut channel = TestChannel {
+            results: VecDeque::from([
+                Err(failure.clone()),
+                Ok(DeliveryAcknowledgement {
+                    correlation_key: "request-1".to_owned(),
+                    remote_message_id: None,
+                    state: DeliveryState::Accepted,
+                    accepted_at_unix_ms: 9,
+                }),
+            ]),
+            credentials: Vec::new(),
+        };
+        let policy = RetryPolicy::new(
+            NonZeroU32::new(2).expect("non-zero"),
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            NonZeroU32::new(2).expect("non-zero"),
+        )
+        .expect("valid");
+        let mut sleeper = Sleeper::default();
+
+        assert_eq!(
+            send_with_retry(&mut channel, &message(), None, policy, &mut sleeper),
+            Err(failure)
+        );
+        assert!(sleeper.0.is_empty());
+        assert_eq!(channel.results.len(), 1);
     }
 
     #[test]
