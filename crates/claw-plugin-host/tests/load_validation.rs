@@ -38,7 +38,7 @@ fn a_component_that_imports_wasi_is_refused_before_it_is_instantiated() {
         "wasi:random/random@0.2.0",
     ];
     for interface in attempts {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = support::tempdir();
         let component = probe_component_importing_wasi(interface);
         let manifest = manifest_for(&component);
         let dir = install(root.path(), "probe", &component, &manifest);
@@ -64,7 +64,7 @@ fn a_component_that_imports_wasi_is_refused_before_it_is_instantiated() {
 fn the_unmodified_component_still_loads() {
     // The counterweight to the test above: the only difference between the two
     // fixtures is the extra import, so the rejection cannot be incidental.
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let manifest = manifest_for(&component);
     let dir = install(root.path(), "probe", &component, &manifest);
@@ -76,7 +76,7 @@ fn the_unmodified_component_still_loads() {
 
 #[test]
 fn a_component_without_the_guest_export_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component_without_guest_export();
     let manifest = manifest_for(&component);
     let dir = install(root.path(), "probe", &component, &manifest);
@@ -91,7 +91,7 @@ fn a_component_without_the_guest_export_is_refused() {
 
 #[test]
 fn bytes_that_do_not_match_the_pinned_digest_are_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     let honest = manifest.component.sha256.clone();
@@ -112,7 +112,7 @@ fn bytes_that_do_not_match_the_pinned_digest_are_refused() {
 
 #[test]
 fn a_component_whose_size_was_misdeclared_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     manifest.component.size_bytes = component.len() as u64 + 1;
@@ -131,7 +131,7 @@ fn a_component_whose_size_was_misdeclared_is_refused() {
 
 #[test]
 fn a_manifest_that_declares_a_component_above_its_own_ceiling_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     manifest.limits.max_component_bytes = (component.len() - 1) as u64;
@@ -153,7 +153,7 @@ fn a_manifest_that_declares_a_component_above_its_own_ceiling_is_refused() {
 
 #[test]
 fn a_component_file_larger_than_the_ceiling_is_refused_before_it_is_read() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     // The manifest under-declares the size so it passes its own schema check;
@@ -175,7 +175,7 @@ fn a_component_file_larger_than_the_ceiling_is_refused_before_it_is_read() {
 
 #[test]
 fn a_manifest_declaring_a_future_abi_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     manifest.abi_version = "2.0.0".to_owned();
@@ -196,7 +196,7 @@ fn a_manifest_declaring_a_future_abi_is_refused() {
 
 #[test]
 fn a_manifest_declaring_a_newer_minor_abi_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     manifest.abi_version = "1.1.0".to_owned();
@@ -220,7 +220,7 @@ fn a_manifest_declaring_a_newer_minor_abi_is_refused() {
 
 #[test]
 fn a_manifest_that_lies_about_the_component_identity_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     // The bytes really report `gta-claw-fixture-probe`; the manifest claims a
     // different, same-length id.
     let component = probe_component();
@@ -246,7 +246,7 @@ fn a_manifest_that_lies_about_the_component_identity_is_refused() {
 
 #[test]
 fn a_manifest_that_lies_about_the_component_version_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     manifest.version = "9.9.9".to_owned();
@@ -270,8 +270,8 @@ fn a_manifest_that_lies_about_the_component_version_is_refused() {
 
 #[test]
 fn a_plugin_outside_every_trusted_root_is_refused() {
-    let trusted = tempfile::tempdir().expect("trusted root");
-    let elsewhere = tempfile::tempdir().expect("other root");
+    let trusted = support::tempdir();
+    let elsewhere = support::tempdir();
     let component = probe_component();
     let manifest = manifest_for(&component);
     let dir = install(elsewhere.path(), "probe", &component, &manifest);
@@ -289,7 +289,7 @@ fn a_plugin_outside_every_trusted_root_is_refused() {
 
 #[test]
 fn a_delivery_class_that_was_not_enabled_is_refused() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let mut manifest = manifest_for(&component);
     manifest.delivery_class = DeliveryClass::OfficialExternal;
@@ -308,7 +308,7 @@ fn a_delivery_class_that_was_not_enabled_is_refused() {
 
 #[test]
 fn an_unsigned_plugin_is_refused_when_the_policy_demands_a_signature() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let manifest = manifest_for(&component);
     let dir = install(root.path(), "probe", &component, &manifest);
@@ -347,7 +347,7 @@ fn a_signed_plugin_loads_and_a_tampered_one_does_not() {
         }
     };
 
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let signed = sign(&manifest_for(&component));
     let good = install(root.path(), "good", &component, &signed);
@@ -386,7 +386,7 @@ fn a_signed_plugin_loads_and_a_tampered_one_does_not() {
 
 #[test]
 fn the_same_plugin_cannot_be_loaded_twice() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
     let manifest = manifest_for(&component);
     let first = install(root.path(), "first", &component, &manifest);
@@ -403,7 +403,7 @@ fn the_same_plugin_cannot_be_loaded_twice() {
 
 #[test]
 fn discovery_reports_every_directory_including_the_broken_ones() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let component = probe_component();
 
     let good = manifest_for(&component);

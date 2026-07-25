@@ -54,7 +54,7 @@ fn recording_services(recorder: &RecordingSink) -> HostServices {
 
 #[test]
 fn a_plugin_with_no_grants_is_refused_every_single_host_call() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let recorder = RecordingSink::new();
     let mut host = PluginHost::builder()
@@ -114,7 +114,7 @@ fn a_plugin_with_no_grants_is_refused_every_single_host_call() {
 
 #[test]
 fn granting_one_capability_does_not_open_any_other() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(
         root.path(),
         "probe",
@@ -146,7 +146,7 @@ fn granting_one_capability_does_not_open_any_other() {
 
 #[test]
 fn filesystem_reads_are_confined_to_the_granted_root() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("create the data dir");
     std::fs::write(data.join("probe.txt"), b"hello").expect("seed the file");
@@ -199,7 +199,7 @@ fn filesystem_reads_are_confined_to_the_granted_root() {
 
 #[test]
 fn a_guest_cannot_climb_out_of_its_granted_root() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let data = root.path().join("data");
     std::fs::create_dir_all(&data).expect("create the data dir");
     std::fs::write(root.path().join("escape.txt"), b"secret").expect("seed the secret");
@@ -255,7 +255,7 @@ fn a_guest_cannot_climb_out_of_its_granted_root() {
 
 #[test]
 fn a_filesystem_grant_for_the_wrong_root_is_out_of_scope() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let elsewhere = root.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).expect("create the other dir");
 
@@ -294,7 +294,7 @@ fn a_filesystem_grant_for_the_wrong_root_is_out_of_scope() {
 
 #[test]
 fn http_grants_are_scoped_to_host_and_method() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let wrong_host = install_probe(
         root.path(),
         "wrong-host",
@@ -357,7 +357,7 @@ fn http_grants_are_scoped_to_host_and_method() {
 
 #[test]
 fn config_reads_are_scoped_to_the_granted_keys() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let config = InMemoryConfig::new();
     config.set(PROBE_ID, "k", "v");
 
@@ -392,7 +392,7 @@ fn config_reads_are_scoped_to_the_granted_keys() {
 
 #[test]
 fn a_store_grant_with_no_room_refuses_writes_but_still_allows_reads() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(
         root.path(),
         "probe",
@@ -438,7 +438,7 @@ fn a_store_grant_with_no_room_refuses_writes_but_still_allows_reads() {
 
 #[test]
 fn log_grants_filter_by_level() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let recorder = RecordingSink::new();
     // The probe logs at `info`; a grant that starts at `warn` must refuse it.
     let dir = install_probe(
@@ -476,7 +476,7 @@ fn log_grants_filter_by_level() {
 
 #[test]
 fn event_grants_are_scoped_to_the_granted_kinds() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let recorder = RecordingSink::new();
     // The probe emits `heartbeat`; grant only `message`.
     let kinds: BTreeSet<EventKind> = [EventKind::Message].into_iter().collect();
@@ -517,7 +517,7 @@ fn event_grants_are_scoped_to_the_granted_kinds() {
 
 #[test]
 fn granted_calls_actually_reach_the_host_services() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let recorder = RecordingSink::new();
     let kinds: BTreeSet<EventKind> = [EventKind::Heartbeat].into_iter().collect();
     let dir = install_probe(
@@ -582,7 +582,7 @@ fn granted_calls_actually_reach_the_host_services() {
 
 #[test]
 fn the_trap_violation_policy_kills_the_call_instead_of_returning_an_error() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
@@ -623,7 +623,7 @@ fn the_trap_violation_policy_kills_the_call_instead_of_returning_an_error() {
 
 #[test]
 fn two_plugins_never_share_a_grant() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let privileged = install_probe(
         root.path(),
         "privileged",

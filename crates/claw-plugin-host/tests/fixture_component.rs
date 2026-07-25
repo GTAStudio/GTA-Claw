@@ -17,7 +17,7 @@ fn the_probe_fixture_assembles_into_a_component() {
 
 #[test]
 fn the_probe_fixture_loads_activates_and_answers() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))

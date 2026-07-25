@@ -873,6 +873,42 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
+    /// A self-deleting directory, replacing the `tempfile` crate.
+    ///
+    /// `tempfile` seeds its name generator from a newer `getrandom` line than
+    /// the one already resolved in the root dependency graph, and the frozen
+    /// root `deny.toml` denies duplicate crate versions.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let path = std::env::temp_dir().join(format!(
+                "claw-plugin-unit-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("the temporary directory must be writable");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn truncation_never_splits_a_character() {
         assert_eq!(truncate_utf8("hello", 5), "hello");
@@ -924,7 +960,7 @@ mod tests {
 
     #[test]
     fn resolution_only_succeeds_inside_a_root() {
-        let temp = tempfile::tempdir().expect("temp dir");
+        let temp = TempDir::new();
         let root = std::fs::canonicalize(temp.path()).expect("canonical root");
         std::fs::create_dir_all(root.join("nested")).expect("nested");
         std::fs::write(root.join("nested").join("file.txt"), b"data").expect("write");
@@ -942,7 +978,7 @@ mod tests {
 
     #[test]
     fn a_write_target_needs_an_existing_parent_inside_a_root() {
-        let temp = tempfile::tempdir().expect("temp dir");
+        let temp = TempDir::new();
         let root = std::fs::canonicalize(temp.path()).expect("canonical root");
         std::fs::create_dir_all(root.join("out")).expect("out dir");
 

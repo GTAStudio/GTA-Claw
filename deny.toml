@@ -5,18 +5,7 @@ all-features = true
 ignore = []
 
 [licenses]
-# `Apache-2.0 WITH LLVM-exception` covers the Wasmtime and Cranelift crates that
-# implement the plugin sandbox. The exception only widens Apache-2.0 for object
-# code linking, so it is no more restrictive than the plain Apache-2.0 entry.
-allow = [
-  "Apache-2.0",
-  "Apache-2.0 WITH LLVM-exception",
-  "BSD-3-Clause",
-  "ISC",
-  "MIT",
-  "Unicode-3.0",
-  "Zlib",
-]
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.8
 
 [bans]
@@ -66,26 +55,6 @@ version = "=0.16.1"
 [[bans.skip]]
 name = "sha2"
 version = "=0.10.9"
-
-# Wasmtime 46 brings proc-macro crates that have already moved to syn 3
-# (async-trait, thiserror-impl 2.x) while the rest of the workspace is still on
-# syn 2. Both are build-time only and neither is linked into a shipped binary,
-# and there is no version of Wasmtime 46 that resolves to syn 2.
-[[bans.skip]]
-name = "syn"
-version = "=2.0.118"
-
-# The 0.2 line of getrandom is reached only through the legacy `ring` 0.17 and
-# `rand` 0.8 stack that `claw-gateway-client` already depends on - the same
-# stack that forces the `rand_core =0.6.4` and `windows-sys =0.52.0` skips
-# above. `claw-plugin-host` needs an operating-system entropy source for the
-# `random` capability, and every current API for that (getrandom 0.4,
-# rand_core 0.10 `os_rng`) resolves to the 0.4 line. Downgrading the plugin
-# host would reintroduce the unmaintained 0.2 interface rather than remove a
-# duplicate.
-[[bans.skip]]
-name = "getrandom"
-version = "=0.2.17"
 
 [sources]
 unknown-registry = "deny"

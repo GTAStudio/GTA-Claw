@@ -21,7 +21,7 @@ fn host_for(root: &std::path::Path) -> PluginHost {
 
 #[test]
 fn an_infinite_loop_runs_out_of_fuel() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let limits = ResourceLimits {
         fuel: 2_000_000,
         // Long enough that the epoch deadline cannot be what stops the guest.
@@ -47,7 +47,7 @@ fn an_infinite_loop_runs_out_of_fuel() {
 
 #[test]
 fn an_infinite_loop_runs_out_of_wall_clock_time() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let limits = ResourceLimits {
         // Far more fuel than 150ms of spinning can burn, so only the epoch
         // deadline can stop this guest.
@@ -79,7 +79,7 @@ fn an_infinite_loop_runs_out_of_wall_clock_time() {
 
 #[test]
 fn a_memory_bomb_is_refused_by_the_limiter() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let limits = ResourceLimits {
         // Two megabytes: the probe grows in 16 page (1 MiB) steps, so it hits
         // the ceiling after a couple of iterations.
@@ -121,7 +121,7 @@ fn a_memory_bomb_is_refused_by_the_limiter() {
 
 #[test]
 fn unbounded_recursion_hits_the_stack_guard() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let limits = ResourceLimits {
         fuel: u64::MAX,
         wall_clock_timeout_ms: 30_000,
@@ -148,7 +148,7 @@ fn unbounded_recursion_hits_the_stack_guard() {
 
 #[test]
 fn a_faulted_plugin_refuses_further_calls_until_it_is_reloaded() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe_with(root.path(), "probe", Vec::new(), ResourceLimits::default());
     let mut host = host_for(root.path());
     let id = host.load(&dir).expect("load");
@@ -188,7 +188,7 @@ fn a_faulted_plugin_refuses_further_calls_until_it_is_reloaded() {
 
 #[test]
 fn a_bystander_keeps_working_while_its_neighbour_keeps_running_away() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let limits = ResourceLimits {
         fuel: 2_000_000,
         wall_clock_timeout_ms: 30_000,

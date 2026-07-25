@@ -1,5 +1,7 @@
 //! Trust policy and signature verification against a real filesystem.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -54,7 +56,7 @@ fn permissive_policy(root: &Path) -> TrustPolicy {
 
 #[test]
 fn the_default_policy_denies_everything() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let plugin_dir = write_plugin(&temp.path().join("plugin"));
     let manifest = parse(&manifest_value("core"));
 
@@ -71,7 +73,7 @@ fn the_default_policy_denies_everything() {
 
 #[test]
 fn a_policy_with_no_roots_refuses_even_an_allowed_delivery_class() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let plugin_dir = write_plugin(&temp.path().join("plugin"));
     let manifest = parse(&manifest_value("core"));
 
@@ -86,7 +88,7 @@ fn a_policy_with_no_roots_refuses_even_an_allowed_delivery_class() {
 
 #[test]
 fn an_unsigned_plugin_under_a_trusted_root_is_authorised() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     let plugin_dir = write_plugin(&root.join("trust-fixture"));
     let manifest = parse(&manifest_value("core"));
@@ -108,7 +110,7 @@ fn an_unsigned_plugin_under_a_trusted_root_is_authorised() {
 
 #[test]
 fn a_plugin_directory_outside_every_root_is_refused() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     fs::create_dir_all(&root).expect("create root");
     let outside = write_plugin(&temp.path().join("elsewhere"));
@@ -127,7 +129,7 @@ fn a_plugin_directory_outside_every_root_is_refused() {
 
 #[test]
 fn a_parent_traversal_into_a_sibling_directory_is_resolved_and_refused() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     fs::create_dir_all(&root).expect("create root");
     let sibling = write_plugin(&temp.path().join("sibling"));
@@ -148,7 +150,7 @@ fn a_parent_traversal_into_a_sibling_directory_is_resolved_and_refused() {
 
 #[test]
 fn a_missing_component_file_is_refused_before_any_read() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     let plugin_dir = root.join("trust-fixture");
     fs::create_dir_all(&plugin_dir).expect("create plugin dir");
@@ -171,7 +173,7 @@ fn a_missing_component_file_is_refused_before_any_read() {
 
 #[test]
 fn each_delivery_class_must_be_enabled_explicitly() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     let plugin_dir = write_plugin(&root.join("trust-fixture"));
 
@@ -197,7 +199,7 @@ fn each_delivery_class_must_be_enabled_explicitly() {
 
 #[test]
 fn an_unsigned_plugin_is_refused_when_signatures_are_required() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     let plugin_dir = write_plugin(&root.join("trust-fixture"));
     let manifest = parse(&manifest_value("core"));
@@ -213,7 +215,7 @@ fn an_unsigned_plugin_is_refused_when_signatures_are_required() {
 
 #[test]
 fn a_signature_from_an_untrusted_key_id_is_refused() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = support::tempdir();
     let root = temp.path().join("plugins");
     let plugin_dir = write_plugin(&root.join("trust-fixture"));
 

@@ -198,7 +198,7 @@ pub struct OsRandom;
 
 impl RandomSource for OsRandom {
     fn fill(&self, buffer: &mut [u8]) -> Result<(), String> {
-        getrandom::fill(buffer).map_err(|error| error.to_string())
+        getrandom::getrandom(buffer).map_err(|error| error.to_string())
     }
 }
 

@@ -20,7 +20,7 @@ fn event(kind: EventKind, sequence: u64) -> HostEvent {
 
 #[test]
 fn the_states_follow_discover_load_activate_deactivate_unload() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
@@ -62,7 +62,7 @@ fn the_states_follow_discover_load_activate_deactivate_unload() {
 
 #[test]
 fn operations_are_refused_in_the_wrong_state() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
@@ -140,7 +140,7 @@ fn an_unknown_plugin_is_reported_by_name() {
 
 #[test]
 fn events_reach_the_guest_and_its_answer_comes_back() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
@@ -179,7 +179,7 @@ fn events_reach_the_guest_and_its_answer_comes_back() {
 
 #[test]
 fn a_guest_error_is_surfaced_without_faulting_the_plugin() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
@@ -212,7 +212,7 @@ fn a_guest_error_is_surfaced_without_faulting_the_plugin() {
 
 #[test]
 fn reload_picks_up_new_bytes_from_disk() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
@@ -245,7 +245,7 @@ fn reload_picks_up_new_bytes_from_disk() {
 
 #[test]
 fn unloading_forgets_everything_about_a_plugin() {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = support::tempdir();
     let dir = install_probe(root.path(), "probe", Vec::new());
     let mut host = PluginHost::builder()
         .trust_policy(unsigned_core_policy(root.path()))
