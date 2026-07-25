@@ -24,23 +24,48 @@ unused-allowed-license = "allow"
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
-# Gateway onboarding adds getrandom 0.4 directly while ring retains 0.2.
-# Ed25519/fastwebsockets retain rand_core 0.6 while getrandom uses 0.10.
-# Slint retains thiserror 1 while the Gateway transport graph uses thiserror 2.
 skip = [
+  # core-graphics 0.23 and core-graphics-types 0.1 require bitflags 1.x;
+  # the current Slint/winit platform graph also requires bitflags 2.x.
   { name = "bitflags", version = "=1.3.2" },
+  # winit and the objc2 0.2 bindings require block2 0.5, while Slint's
+  # objc2 0.3 bindings require block2 0.6.
   { name = "block2", version = "=0.5.1" },
+  # core-graphics 0.23 and winit require core-foundation 0.9, while
+  # security-framework 3.7 and webbrowser 1.2 require 0.10.
   { name = "core-foundation", version = "=0.9.4" },
+  # ring requires getrandom 0.2; fastwebsockets also reaches it through
+  # rand 0.8 and rand_core 0.6, while the desktop app pins getrandom 0.4.
   { name = "getrandom", version = "=0.2.17" },
+  # rowan 0.16 requires hashbrown 0.14, alongside the AccessKit/clru
+  # hashbrown 0.16 graph and the fontique/indexmap 0.17 graph.
   { name = "hashbrown", version = "=0.14.5" },
+  # AccessKit and clru require hashbrown 0.16, while current text-layout
+  # and indexmap dependencies require hashbrown 0.17.
   { name = "hashbrown", version = "=0.16.1" },
+  # winit and AccessKit retain objc2 0.5 through their older Apple bindings,
+  # while the current Slint/glutin Apple graph requires objc2 0.6.
   { name = "objc2", version = "=0.5.2" },
+  # winit, AccessKit, and copypasta require objc2-app-kit 0.2, while
+  # Slint and glutin require objc2-app-kit 0.3.
   { name = "objc2-app-kit", version = "=0.2.2" },
+  # winit, AccessKit, and copypasta require objc2-foundation 0.2, while
+  # Slint and glutin require objc2-foundation 0.3.
   { name = "objc2-foundation", version = "=0.2.2" },
+  # fastwebsockets reaches rand_core 0.6 through rand 0.8; the image stack
+  # uses rand_core 0.9 and current crypto/getrandom dependencies use 0.10.
   { name = "rand_core", version = "=0.6.4" },
+  # winit requires smol_str 0.2, while the current Slint compiler requires
+  # smol_str 0.3.
   { name = "smol_str", version = "=0.2.2" },
+  # fastwebsockets, calloop 0.13, and ndk require thiserror 1, while newer
+  # Slint transitive dependencies such as rav1e and muda require thiserror 2.
   { name = "thiserror", version = "=1.0.69" },
+  # thiserror pins its matching procedural macro exactly, so the retained
+  # thiserror 1 dependency necessarily retains thiserror-impl 1.
   { name = "thiserror-impl", version = "=1.0.69" },
+  # ring, glutin, and winit require windows-sys 0.52, while the current
+  # async I/O and Tokio graph requires windows-sys 0.61.
   { name = "windows-sys", version = "=0.52.0" },
 ]
 skip-tree = []
