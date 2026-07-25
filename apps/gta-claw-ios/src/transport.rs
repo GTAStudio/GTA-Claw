@@ -73,8 +73,11 @@ impl ClientTransport {
                  requires the com.apple.developer.networking.multicast entitlement that Apple \
                  grants case by case on request, so no build made from source has it. The system \
                  DNS-SD path avoids that entitlement for declared service types but needs C \
-                 interop this workspace's unsafe_code setting forbids. See the host_app module, \
-                 which turns each missing facility into a reported condition.",
+                 interop this workspace's unsafe_code setting forbids. Separately, claw-nodes \
+                 compiles mdns-sd, the Hickory resolver and MdnsBrowser only for Windows, macOS \
+                 and Linux, so on iOS the raw-multicast browser does not exist at all rather \
+                 than merely lacking permission. See the host_app module, which turns each \
+                 missing facility into a reported condition.",
             ),
             Self::TailscaleLocalApi => (
                 IosTransportStatus::BelievedUnavailable,

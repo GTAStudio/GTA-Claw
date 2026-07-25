@@ -4,7 +4,7 @@
   "normative_implementation": {
     "path": "crates/claw-conformance/src/claims.rs",
     "function": "declares_enabled_test",
-    "ported_at_commit": "fe76d3ae27ca6871360af47c5f03e8a5736b0227"
+    "ported_at_commit": "18774a2c4c71a602f85b578f8e8abd47de3e16aa"
   },
   "follower_implementation": {
     "path": "compat/upstream/validate.ps1",
@@ -521,6 +521,216 @@
       "source": "#[test]\nfn exact_name() {}",
       "test": "EXACT_NAME",
       "expected": false
+    },
+    {
+      "name": "macro-stringify-paren-forgery",
+      "source": "const _D: &str = stringify!({} #[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-stringify-brace-forgery",
+      "source": "const _D: &str = stringify! { #[test] fn exact_name() {} };",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-stringify-bracket-forgery",
+      "source": "const _D: &str = stringify![#[test] fn exact_name() {}];",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-stringify-item-position",
+      "source": "stringify!(#[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-discarding-invocation",
+      "source": "macro_rules! discard { ($($t:tt)*) => {}; }\ndiscard! {\n#[test]\nfn exact_name() {}\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-rules-dormant-definition",
+      "source": "macro_rules! dormant {\n() => {\n#[test]\nfn exact_name() {}\n};\n}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-static-initialiser",
+      "source": "static _S: &str = stringify!(#[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-let-initialiser",
+      "source": "let _x = stringify!(#[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-qualified-path-name",
+      "source": "foo::bar!(#[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-absolute-path-name",
+      "source": "::foo::bar!(#[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-absolute-then-real-test",
+      "source": "::std::thread_local! { static V: u32 = 1; }\n\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "macro-plain-then-real-test",
+      "source": "thread_local! { static V: u32 = 1; }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "macro-qualified-then-real-test",
+      "source": "std::thread_local! { static V: u32 = 1; }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "macro-semicolon-then-real-test",
+      "source": "vec![1, 2, 3];\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "macro-rules-then-real-test",
+      "source": "macro_rules! m { () => {}; }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "macro-inside-module-then-test",
+      "source": "mod tests {\nstringify!(#[test] fn other() {});\n#[test]\nfn exact_name() {}\n}",
+      "test": "tests::exact_name",
+      "expected": true
+    },
+    {
+      "name": "macro-unicode-name-forgery",
+      "source": "macro_rules! \u5b8f { ($($t:tt)*) => {}; }\n\u5b8f!(const _: () = (); #[test] fn exact_name() {});",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-unicode-name-then-real-test",
+      "source": "macro_rules! \u5b8f { ($($t:tt)*) => {}; }\n\u5b8f!(const _: () = (););\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "lexer-unicode-function-name",
+      "source": "#[test]\nfn \u5b8f() {}",
+      "test": "\u5b8f",
+      "expected": true
+    },
+    {
+      "name": "macro-malformed-mismatched-delims",
+      "source": "m!([); #[test] fn exact_name() {}])",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-malformed-unclosed",
+      "source": "m!( #[test] fn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "macro-bang-not-invocation",
+      "source": "const X: bool = a != b;\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "delimiter-crossed-braces",
+      "source": "{ ( }\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "cfg-fn-exact-cfg-test",
+      "source": "#[cfg(test)]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "cfg-fn-cfg-test-spaced",
+      "source": "#[cfg( test )]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": true
+    },
+    {
+      "name": "cfg-fn-cfg-test-key-value",
+      "source": "#[cfg(test = \"disabled\")]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "cfg-fn-cfg-all-test",
+      "source": "#[cfg(all(test))]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "cfg-fn-cfg-not-test",
+      "source": "#[cfg(not(test))]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "cfg-fn-cfg-feature",
+      "source": "#[cfg(feature = \"x\")]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "cfg-fn-cfg-attr-test",
+      "source": "#[cfg_attr(test, test)]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "cfg-fn-cfg-test-plus-ignore",
+      "source": "#[cfg(test)]\n#[ignore]\n#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "stray-nul-before-attribute",
+      "source": "\u0000#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "stray-at-sign-before-attribute",
+      "source": "@#[test]\nfn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "stray-nul-after-attribute",
+      "source": "#[test]\n\u0000fn exact_name() {}",
+      "test": "exact_name",
+      "expected": false
+    },
+    {
+      "name": "stray-byte-after-test",
+      "source": "#[test]\nfn exact_name() {}\n@",
+      "test": "exact_name",
+      "expected": true
     }
   ]
 }
