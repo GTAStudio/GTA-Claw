@@ -493,20 +493,39 @@ fn resolve_cargo_executable(
     configured: Option<&OsStr>,
     search_path: Option<&OsStr>,
 ) -> Result<PathBuf, String> {
+    resolve_external_executable(
+        repository_root,
+        "CARGO",
+        configured,
+        &format!("cargo{}", env::consts::EXE_SUFFIX),
+        search_path,
+    )
+}
+
+fn resolve_external_executable(
+    repository_root: &Path,
+    variable: &str,
+    configured: Option<&OsStr>,
+    default_name: &str,
+    search_path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
     let configured = configured.map(PathBuf::from);
     if let Some(path) = configured
         .as_ref()
         .filter(|path| path.components().count() > 1)
     {
         if !path.is_absolute() {
-            return Err(format!("CARGO names a relative path '{}'", path.display()));
+            return Err(format!(
+                "{variable} names a relative path '{}'",
+                path.display()
+            ));
         }
         return trusted_executable(repository_root, path);
     }
 
     let executable_name = configured
         .and_then(|path| path.file_name().map(OsString::from))
-        .unwrap_or_else(|| OsString::from(format!("cargo{}", env::consts::EXE_SUFFIX)));
+        .unwrap_or_else(|| OsString::from(default_name));
     let search_path = search_path.ok_or_else(|| "PATH is not set".to_owned())?;
     for directory in env::split_paths(search_path).filter(|directory| directory.is_absolute()) {
         let candidate = directory.join(&executable_name);
@@ -1778,7 +1797,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        CargoTestTargets, cargo_executable, declares_enabled_test, resolve_cargo_executable,
+        CargoTestTargets, cargo_executable, declares_enabled_test, normalized_api_path,
+        resolve_cargo_executable, resolve_external_executable,
     };
     use crate::ViolationCode;
 
@@ -1927,6 +1947,66 @@ mod tests {
             )
         );
         fs::remove_dir_all(root).expect("remove Cargo resolution fixture");
+    }
+
+    #[test]
+    fn tracked_rust_sources_match_the_reviewed_reachability_boundary() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("canonical repository root");
+        let configured = env::var_os("GIT");
+        let search_path = env::var_os("PATH");
+        let git = resolve_external_executable(
+            &root,
+            "GIT",
+            configured.as_deref(),
+            &format!("git{}", env::consts::EXE_SUFFIX),
+            search_path.as_deref(),
+        )
+        .expect("resolve trusted Git");
+        let output = Command::new(git)
+            .current_dir(&root)
+            .args(["ls-files", "-z", "--", "*.rs"])
+            .output()
+            .expect("list tracked Rust sources");
+        assert_command_succeeded(&output);
+        let tracked = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                std::str::from_utf8(path)
+                    .expect("tracked path is UTF-8")
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(!tracked.is_empty(), "Git must report tracked Rust sources");
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        let rejected = tracked
+            .into_iter()
+            .filter(|path| {
+                let canonical = root
+                    .join(path)
+                    .canonicalize()
+                    .expect("canonical tracked Rust source");
+                !targets.contains(&canonical)
+            })
+            .map(|path| normalized_api_path(PathBuf::from(path)))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rejected,
+            BTreeSet::from([
+                ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+                "crates/claw-config/build.rs".to_owned(),
+                "crates/claw-protocol/build.rs".to_owned(),
+                "desktop/apps/gta-claw-desktop/build.rs".to_owned(),
+                "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+            ])
+        );
     }
 
     #[test]
