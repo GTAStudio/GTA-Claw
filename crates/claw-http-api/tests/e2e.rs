@@ -414,6 +414,37 @@ async fn auth_models_embeddings_and_json_generation_match_contracts() {
         model.json(),
         json!({"id":"openclaw/main","object":"model","created":0,"owned_by":"openclaw","permission":[]})
     );
+    let invalid_model = request(
+        &server,
+        "GET",
+        "/v1/models/not-openclaw",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(invalid_model.status, 400);
+    assert_eq!(
+        invalid_model.json(),
+        json!({"error":{"message":"Invalid model id.","type":"invalid_request_error"}})
+    );
+    let missing_model = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw%2Fmissing",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(missing_model.status, 404);
+    assert_eq!(
+        missing_model.json(),
+        json!({"error":{
+            "message":"Model 'openclaw/missing' not found.",
+            "type":"invalid_request_error"
+        }})
+    );
 
     let embeddings = request(
         &server,
@@ -845,6 +876,80 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
 }
 
 #[tokio::test]
+async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime).await;
+    let unauthenticated = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        None,
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"name":"echo","args":{}})),
+    )
+    .await;
+    assert_eq!(unauthenticated.status, 401);
+    assert_eq!(
+        unauthenticated.json(),
+        json!({"error":{"message":"Unauthorized","type":"unauthorized"}})
+    );
+
+    let scope_denied = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("read-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"name":"echo","args":{}})),
+    )
+    .await;
+    assert_eq!(scope_denied.status, 403);
+    assert_eq!(
+        scope_denied.json(),
+        json!({
+            "ok":false,
+            "error":{"type":"forbidden","message":"missing scope: operator.write"}
+        })
+    );
+
+    let invalid = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"args":{}})),
+    )
+    .await;
+    assert_eq!(invalid.status, 400);
+    assert_eq!(
+        invalid.json(),
+        json!({"error":{
+            "message":"tools.invoke requires name",
+            "type":"invalid_request"
+        }})
+    );
+
+    let missing_tool = request(
+        &server,
+        "POST",
+        "/tools/invoke",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"name":"missing","args":{"value":7}})),
+    )
+    .await;
+    assert_eq!(missing_tool.status, 404);
+    assert_eq!(
+        missing_tool.json(),
+        json!({"ok":false,"error":{
+            "type":"not_found",
+            "message":"Tool not available: missing"
+        }})
+    );
+}
+
+#[tokio::test]
 async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
     let runtime = DeterministicRuntime::new();
     let mut limited = config();
@@ -878,6 +983,23 @@ async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
         oversized.json(),
         json!({"error":{"message":"Payload too large","type":"invalid_request_error"}})
     );
+    let invalid_embedding = request(
+        &server,
+        "POST",
+        "/v1/embeddings",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"model":"openclaw","input":["valid",7]})),
+    )
+    .await;
+    assert_eq!(invalid_embedding.status, 400);
+    assert_eq!(
+        invalid_embedding.json(),
+        json!({"error":{
+            "message":"`input` must be a string or an array of strings.",
+            "type":"invalid_request_error"
+        }})
+    );
 
     runtime.set_delay(Duration::from_millis(100));
     let timed_out = request(
@@ -895,6 +1017,20 @@ async fn malformed_oversized_timeout_and_disconnect_fail_safely() {
     assert_eq!(timed_out.status, 504);
     assert_eq!(
         timed_out.json(),
+        json!({"error":{"message":"request timed out","type":"api_error"}})
+    );
+    let embedding_timeout = request(
+        &server,
+        "POST",
+        "/v1/embeddings",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({"model":"openclaw","input":"hello"})),
+    )
+    .await;
+    assert_eq!(embedding_timeout.status, 504);
+    assert_eq!(
+        embedding_timeout.json(),
         json!({"error":{"message":"request timed out","type":"api_error"}})
     );
 
