@@ -451,6 +451,7 @@ generate_provenance \
 generate_spdx "$archive_stage" "$archive_stage/sbom.spdx.json" "native-tar"
 write_sha256_manifest "$archive_stage" "$archive_stage/SHA256SUMS"
 normalize_tree "$archive_stage"
+chmod 0700 "$archive_stage/etc/gta-claw/credentials"
 chmod 0755 \
   "$archive_stage/bin/$LINUX_DAEMON_NAME" \
   "$archive_stage/bin/$LINUX_CLI_NAME" \
@@ -539,6 +540,7 @@ write_sha256_manifest \
   "$rootfs" \
   "$rootfs/usr/share/doc/gta-claw/SHA256SUMS"
 normalize_tree "$rootfs"
+chmod 0700 "$rootfs/etc/gta-claw/credentials"
 chmod 0755 "$rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
@@ -606,6 +608,7 @@ open_output_file "$deb_root/DEBIAN/md5sums" 0644
 ) >&"$OPEN_OUTPUT_FD"
 finish_output_file
 normalize_tree "$deb_root"
+chmod 0700 "$deb_root/etc/gta-claw/credentials"
 chmod 0755 "$deb_root/DEBIAN"
 chmod 0755 \
   "$deb_root/DEBIAN/preinst" \
@@ -713,6 +716,7 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 
 %files
 %defattr(-,root,root,-)
+%dir %attr(0700,root,root) /etc/gta-claw/credentials
 %config(noreplace) %attr(0640,root,root) /etc/gta-claw/gta-claw.env
 %config(noreplace) %attr(0600,root,root) /etc/gta-claw/credentials/daemon.conf
 /usr/bin/gta-claw-cli

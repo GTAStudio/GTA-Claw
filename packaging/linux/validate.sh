@@ -258,7 +258,10 @@ validate_published_native_root() {
   done <<<"$expected_files"
   while IFS= read -r directory; do
     [[ -d "$root/$directory" ]] || continue
-    assert_mode "$root" "$directory" 755
+    case "$directory" in
+      etc/gta-claw/credentials) assert_mode "$root" "$directory" 700 ;;
+      *) assert_mode "$root" "$directory" 755 ;;
+    esac
   done < <(expected_tree_entries <<<"$expected_files")
   validate_service_contract "$root/usr/lib/systemd/system/gta-claw-daemon.service"
   validate_initializer_service_contract \
@@ -398,7 +401,10 @@ while IFS= read -r file; do
 done <<<"$tar_files"
 while IFS= read -r directory; do
   [[ -d "$archive_root/$directory" ]] || continue
-  assert_mode "$archive_root" "$directory" 755
+  case "$directory" in
+    etc/gta-claw/credentials) assert_mode "$archive_root" "$directory" 700 ;;
+    *) assert_mode "$archive_root" "$directory" 755 ;;
+  esac
 done < <(expected_tree_entries <<<"$tar_files")
 verify_sha256_manifest "$archive_root" "$archive_root/SHA256SUMS"
 validate_generated_metadata \
@@ -576,7 +582,7 @@ assert_no_protected_payload_path "RPM package" "$rpm_file_listing"
 expected_rpm_file_listing="$(
   {
     native_rootfs_files
-    printf '%s\n' usr/share/doc/gta-claw
+    printf '%s\n' etc/gta-claw/credentials usr/share/doc/gta-claw
   } | LC_ALL=C sort -u
 )"
 [[ "$rpm_file_listing" == "$expected_rpm_file_listing" ]] ||
@@ -758,6 +764,8 @@ validate_start_authorization_contract \
   die "environment file mode is not 0640"
 [[ "$(stat -c '%a' "$rootfs/etc/gta-claw/credentials/daemon.conf")" == "600" ]] ||
   die "credential file mode is not 0600"
+[[ "$(stat -c '%a:%u:%g' "$rootfs/etc/gta-claw/credentials")" == "700:0:0" ]] ||
+  die "credential directory is not root-owned mode 0700"
 for directory in var/lib/gta-claw var/cache/gta-claw var/log/gta-claw run/gta-claw; do
   [[ ! -e "$rootfs/$directory" && ! -L "$rootfs/$directory" ]] ||
     die "native package stages systemd-managed directory: $directory"
