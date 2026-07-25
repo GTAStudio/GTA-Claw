@@ -4,6 +4,8 @@
 mod controller;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod onboarding;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod product_state;
 #[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 mod test_gateway;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -26,6 +28,11 @@ use controller::{
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use onboarding::{ConnectRequest, UiStatusKind, UserError, ViewSnapshot};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+use product_state::{
+    ChangeKind, DiffMode, OnboardingStage, PrimaryDestination, ProductState, RunState,
+    SemanticTone, TranscriptRole, render_side_by_side, render_unified,
+};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use slint::{CloseRequestResponse, ComponentHandle};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use ui_adapter::{UiTheme, VisualPreferencesState};
@@ -37,7 +44,10 @@ mod generated_ui {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use generated_ui::{AppWindow, StatusKind, ThemeMode, VisualPreferences};
+use generated_ui::{
+    ActivityItem, AppWindow, DeliverableItem, DiffItem, ExtensionItem, FileItem, RunItem,
+    ScheduleItem, StatusKind, ThemeMode, TranscriptItem, VisualPreferences, WorkspaceItem,
+};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
@@ -59,10 +69,244 @@ fn apply_snapshot(window: &AppWindow, snapshot: &ViewSnapshot) {
     window.set_can_cancel(snapshot.can_cancel());
     window.set_can_disconnect(snapshot.can_disconnect());
     window.set_can_retry(snapshot.can_retry());
+    window.set_workspace_ready(snapshot.can_disconnect());
     if let Some(error) = snapshot.error() {
         apply_error(window, error);
     } else {
         clear_error(window);
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn model<T: Clone + 'static>(rows: Vec<T>) -> slint::ModelRc<T> {
+    Rc::new(slint::VecModel::from(rows)).into()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const fn tone_index(tone: SemanticTone) -> i32 {
+    match tone {
+        SemanticTone::Neutral => 0,
+        SemanticTone::Info => 1,
+        SemanticTone::Warning => 2,
+        SemanticTone::Danger => 3,
+        SemanticTone::Success => 4,
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const fn change_kind_index(kind: ChangeKind) -> i32 {
+    match kind {
+        ChangeKind::Context => 0,
+        ChangeKind::Added => 1,
+        ChangeKind::Removed => 2,
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn line_number(number: Option<u32>) -> slint::SharedString {
+    number.map_or_else(slint::SharedString::default, |value| {
+        value.to_string().into()
+    })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn apply_product_state(window: &AppWindow, state: &ProductState) {
+    debug_assert_eq!(state.keyboard_order().len(), 10);
+    debug_assert_eq!(state.accessibility_nodes().len(), 4);
+    window.set_onboarding_stage(state.onboarding_stage().index());
+    window.set_selected_screen(state.surface().screen_index());
+    window.set_selected_settings_section(
+        i32::try_from(state.selected_settings_section()).unwrap_or(i32::MAX),
+    );
+    window.set_palette_open(state.palette_open());
+    window.set_diff_mode(match state.diff_mode() {
+        DiffMode::Unified => 0,
+        DiffMode::SideBySide => 1,
+    });
+    let selected_run = state.selected_run();
+    window.set_session_title(selected_run.title.clone().into());
+    window.set_session_state(selected_run.state.label().into());
+    window
+        .set_session_detail(format!("{} · {}", selected_run.workspace, selected_run.detail).into());
+    window.set_session_tone(tone_index(selected_run.state.tone()));
+    window.set_can_approve(selected_run.state == RunState::WaitingForApproval);
+    window.set_can_answer(selected_run.state == RunState::WaitingForAnswer);
+    window.set_approval_prompt(state.approval_prompt().into());
+    window.set_approval_scope(state.approval_scope().into());
+    window.set_question(state.question().into());
+
+    let runs = state
+        .runs()
+        .visible()
+        .iter()
+        .map(|run| RunItem {
+            id: run.id.clone().into(),
+            title: run.title.clone().into(),
+            workspace: run.workspace.clone().into(),
+            state: run.state.label().into(),
+            detail: run.detail.clone().into(),
+            updated: run.updated.clone().into(),
+            tone: tone_index(run.state.tone()),
+        })
+        .collect();
+    window.set_runs(model(runs));
+
+    let workspaces = state
+        .workspaces()
+        .iter()
+        .map(|workspace| WorkspaceItem {
+            name: workspace.name.clone().into(),
+            location: workspace.location.clone().into(),
+            kind: workspace.kind.clone().into(),
+            branch: workspace.branch.clone().into(),
+            active_runs: i32::try_from(workspace.active_runs).unwrap_or(i32::MAX),
+        })
+        .collect();
+    window.set_workspaces(model(workspaces));
+
+    let schedules = state
+        .schedules()
+        .iter()
+        .map(|schedule| ScheduleItem {
+            name: schedule.name.clone().into(),
+            cadence: schedule.cadence.clone().into(),
+            next_run: schedule.next_run.clone().into(),
+            enabled: schedule.enabled,
+            can_toggle: schedule.enabled || schedule.next_run != "Not scheduled",
+            workspace: schedule.workspace.clone().into(),
+        })
+        .collect();
+    window.set_schedules(model(schedules));
+
+    let deliverables = state
+        .deliverables()
+        .iter()
+        .map(|deliverable| DeliverableItem {
+            name: deliverable.name.clone().into(),
+            kind: deliverable.kind.clone().into(),
+            source: deliverable.source.clone().into(),
+            size: deliverable.size.clone().into(),
+            pinned: deliverable.pinned,
+        })
+        .collect();
+    window.set_deliverables(model(deliverables));
+    let selected_deliverable = state.selected_deliverable();
+    window.set_selected_deliverable_index(
+        i32::try_from(state.selected_deliverable_index()).unwrap_or(i32::MAX),
+    );
+    window.set_selected_deliverable_name(selected_deliverable.name.clone().into());
+    window.set_selected_deliverable_kind(selected_deliverable.kind.clone().into());
+    window.set_selected_deliverable_source(selected_deliverable.source.clone().into());
+    window.set_selected_deliverable_size(selected_deliverable.size.clone().into());
+    window.set_selected_deliverable_content(state.selected_deliverable_content().into());
+    window.set_selected_deliverable_pinned(selected_deliverable.pinned);
+
+    let extensions = state
+        .extensions()
+        .iter()
+        .map(|extension| ExtensionItem {
+            name: extension.name.clone().into(),
+            category: extension.category.clone().into(),
+            detail: extension.detail.clone().into(),
+            permission: extension.permission.clone().into(),
+            enabled: extension.enabled,
+        })
+        .collect();
+    window.set_extensions(model(extensions));
+
+    let transcript = state
+        .transcript()
+        .iter()
+        .map(|entry| TranscriptItem {
+            role: entry.role.label().into(),
+            text: entry.text.clone().into(),
+            detail: entry.detail.clone().into(),
+            timestamp: entry.timestamp.clone().into(),
+            tone: match entry.role {
+                TranscriptRole::User | TranscriptRole::Activity => 0,
+                TranscriptRole::Assistant => 1,
+                TranscriptRole::System => 2,
+            },
+        })
+        .collect();
+    window.set_transcript(model(transcript));
+
+    let activity = state
+        .activity()
+        .iter()
+        .map(|entry| ActivityItem {
+            title: entry.title.clone().into(),
+            detail: entry.detail.clone().into(),
+            state: entry.state.label().into(),
+            duration: entry.duration.clone().into(),
+            tone: tone_index(entry.state.tone()),
+        })
+        .collect();
+    window.set_activity(model(activity));
+
+    let session_files = state
+        .session_files()
+        .iter()
+        .map(|file| FileItem {
+            name: file.name.clone().into(),
+            status: file.status.clone().into(),
+        })
+        .collect();
+    window.set_session_files(model(session_files));
+    window.set_selected_file_index(i32::try_from(state.selected_file_index()).unwrap_or(i32::MAX));
+    window.set_selected_file_name(state.selected_file_name().into());
+
+    let diff = match state.diff_mode() {
+        DiffMode::Unified => state
+            .diff()
+            .iter()
+            .zip(render_unified(state.diff()))
+            .map(|(line, text)| DiffItem {
+                old_line: line_number(line.old_line),
+                new_line: line_number(line.new_line),
+                text: text.into(),
+                old_text: line.text.clone().into(),
+                new_text: line.text.clone().into(),
+                kind: change_kind_index(line.kind),
+            })
+            .collect(),
+        DiffMode::SideBySide => render_side_by_side(state.diff())
+            .into_iter()
+            .map(|line| DiffItem {
+                old_line: line_number(line.old_line),
+                new_line: line_number(line.new_line),
+                text: slint::SharedString::default(),
+                old_text: line.old_text.into(),
+                new_text: line.new_text.into(),
+                kind: change_kind_index(line.kind),
+            })
+            .collect(),
+    };
+    window.set_diff_lines(model(diff));
+
+    let page_count = state.runs().page_count();
+    window.set_run_page_label(
+        format!(
+            "Page {} of {} · {} runs per page",
+            state.runs().page() + 1,
+            page_count,
+            state.runs().page_size()
+        )
+        .into(),
+    );
+    window.set_can_previous_run_page(state.runs().page() > 0);
+    window.set_can_next_run_page(state.runs().page() + 1 < page_count);
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn mutate_product(
+    weak_window: &slint::Weak<AppWindow>,
+    state: &Rc<RefCell<ProductState>>,
+    update: impl FnOnce(&mut ProductState),
+) {
+    update(&mut state.borrow_mut());
+    if let Some(window) = weak_window.upgrade() {
+        apply_product_state(&window, &state.borrow());
     }
 }
 
@@ -155,6 +399,7 @@ fn wire_callbacks(
     window: &AppWindow,
     sender: ControllerSender,
     preferences: Rc<RefCell<VisualPreferencesState>>,
+    product_state: Rc<RefCell<ProductState>>,
 ) {
     let weak_window = window.as_weak();
     let callback_sender = sender.clone();
@@ -229,6 +474,230 @@ fn wire_callbacks(
     });
 
     let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_onboarding_stage_requested(move |index| {
+        let stage = OnboardingStage::from_index(index)
+            .expect("Slint onboarding stages must use a known index");
+        mutate_product(&weak_window, &state, |product| {
+            product.select_onboarding_stage(stage);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_navigate_requested(move |index| {
+        let destination = PrimaryDestination::from_index(index)
+            .expect("Slint navigation must use a known destination index");
+        mutate_product(&weak_window, &state, |product| {
+            product.select_destination(destination);
+            product.close_palette();
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_palette_toggle_requested(move || {
+        mutate_product(&weak_window, &state, ProductState::toggle_palette);
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_palette_dismiss_requested(move || {
+        mutate_product(&weak_window, &state, ProductState::close_palette);
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_open_session_requested(move |index| {
+        let index = usize::try_from(index).expect("Slint run indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            product.open_session(index);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_open_workspace_requested(move |index| {
+        let index = usize::try_from(index).expect("Slint workspace indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            if !product.open_workspace(index) {
+                product.record_message(
+                    TranscriptRole::System,
+                    "Workspace could not be opened",
+                    "The selected workspace has no associated run.",
+                );
+            }
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_settings_section_requested(move |index| {
+        let index = usize::try_from(index).expect("Slint settings indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            product.select_settings_section(index);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_update_requested(move || {
+        mutate_product(&weak_window, &state, ProductState::open_update);
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_diagnostics_requested(move || {
+        mutate_product(&weak_window, &state, ProductState::open_diagnostics);
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_back_requested(move || {
+        mutate_product(&weak_window, &state, ProductState::return_from_auxiliary);
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_diff_mode_requested(move |mode| {
+        let mode = match mode {
+            0 => DiffMode::Unified,
+            1 => DiffMode::SideBySide,
+            _ => panic!("Slint diff modes must use a known index"),
+        };
+        mutate_product(&weak_window, &state, |product| {
+            product.set_diff_mode(mode);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_previous_run_page_requested(move || {
+        mutate_product(&weak_window, &state, |product| {
+            product.previous_run_page();
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_next_run_page_requested(move || {
+        mutate_product(&weak_window, &state, |product| {
+            product.next_run_page();
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_approval_requested(move |approved| {
+        mutate_product(&weak_window, &state, |product| {
+            match product.resolve_approval(approved) {
+                Ok(run_state) => product.record_message(
+                    TranscriptRole::System,
+                    if approved {
+                        "Approval granted"
+                    } else {
+                        "Approval denied"
+                    },
+                    format!("The run moved to {run_state}."),
+                ),
+                Err(error) => product.record_message(
+                    TranscriptRole::System,
+                    "Approval decision rejected",
+                    error.to_string(),
+                ),
+            }
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_answer_requested(move |answer| {
+        mutate_product(&weak_window, &state, |product| {
+            match product.answer_question(answer.as_str()) {
+                Ok(run_state) => {
+                    product.record_message(
+                        TranscriptRole::User,
+                        answer.to_string(),
+                        "Answer to the agent question",
+                    );
+                    product.record_message(
+                        TranscriptRole::System,
+                        "Answer recorded",
+                        format!("The run moved to {run_state}."),
+                    );
+                }
+                Err(error) => product.record_message(
+                    TranscriptRole::System,
+                    "Answer rejected",
+                    error.to_string(),
+                ),
+            }
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_message_submitted(move |message| {
+        mutate_product(&weak_window, &state, |product| {
+            product.record_message(
+                TranscriptRole::User,
+                message.to_string(),
+                "Submitted from the session composer",
+            );
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_file_selected(move |index| {
+        let index = usize::try_from(index).expect("Slint file indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            product.select_session_file(index);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_schedule_create_requested(move || {
+        mutate_product(&weak_window, &state, ProductState::create_schedule);
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_schedule_toggled(move |index| {
+        let index = usize::try_from(index).expect("Slint schedule indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            product.toggle_schedule(index);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_extension_toggled(move |index| {
+        let index = usize::try_from(index).expect("Slint extension indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            product.toggle_extension(index);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_deliverable_selected(move |index| {
+        let index = usize::try_from(index).expect("Slint deliverable indexes must be non-negative");
+        mutate_product(&weak_window, &state, |product| {
+            product.select_deliverable(index);
+        });
+    });
+
+    let weak_window = window.as_weak();
+    let state = Rc::clone(&product_state);
+    window.on_deliverable_pin_toggle_requested(move || {
+        mutate_product(&weak_window, &state, |product| {
+            product.toggle_selected_deliverable_pin();
+        });
+    });
+
+    let weak_window = window.as_weak();
     let close_sender = sender;
     window
         .window()
@@ -249,8 +718,10 @@ fn main() -> Result<(), DesktopError> {
     })
     .map_err(DesktopError::ControllerStart)?;
     let preferences = Rc::new(RefCell::new(VisualPreferencesState::default()));
+    let product_state = Rc::new(RefCell::new(ProductState::default()));
     apply_preferences(&window, *preferences.borrow());
-    wire_callbacks(&window, controller.sender(), preferences);
+    apply_product_state(&window, &product_state.borrow());
+    wire_callbacks(&window, controller.sender(), preferences, product_state);
     window.run().map_err(DesktopError::Platform)?;
     controller
         .shutdown()
@@ -313,7 +784,11 @@ mod tests {
         preferences: Rc<RefCell<VisualPreferencesState>>,
     ) {
         apply_snapshot(window, &OnboardingModel::default().snapshot());
-        wire_callbacks(window, sender, preferences);
+        let mut initial_product = ProductState::default();
+        initial_product.select_onboarding_stage(OnboardingStage::GatewayConnection);
+        let product_state = Rc::new(RefCell::new(initial_product));
+        apply_product_state(window, &product_state.borrow());
+        wire_callbacks(window, sender, preferences, product_state);
 
         window.set_layout_width(1080.0);
         assert!(!window.get_narrow_layout());
