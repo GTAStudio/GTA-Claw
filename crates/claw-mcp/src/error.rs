@@ -14,7 +14,7 @@ pub enum McpError {
     Json(#[from] serde_json::Error),
     /// An HTTP request failed.
     #[error("MCP HTTP failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] crate::HttpClientError),
     /// A URL was invalid.
     #[error("MCP URL failed: {0}")]
     Url(#[from] url::ParseError),

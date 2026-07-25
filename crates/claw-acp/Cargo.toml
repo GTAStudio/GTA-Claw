@@ -23,7 +23,6 @@ serde_json.workspace = true
 thiserror = "=2.0.18"
 tokio = { version = "=1.52.3", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.18", features = ["rt"] }
-uuid = { version = "=1.18.1", features = ["v4"] }
 
 [[bin]]
 name = "claw-acp-fixture"

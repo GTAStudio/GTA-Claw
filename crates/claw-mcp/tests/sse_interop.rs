@@ -21,7 +21,7 @@ use claw_mcp::{
     sse::LegacySseConfig,
 };
 use futures_util::{Stream, StreamExt, stream};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use http::header::{AUTHORIZATION, HeaderValue};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

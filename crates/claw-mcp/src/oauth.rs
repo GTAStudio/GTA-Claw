@@ -7,16 +7,21 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use http::{
+    HeaderMap, HeaderValue, Method, StatusCode,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
-use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::error::{McpError, Result};
+use crate::{
+    error::{McpError, Result},
+    http_client::HttpClient,
+};
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPIRY_SKEW: Duration = Duration::from_secs(30);
@@ -217,16 +222,17 @@ pub struct PkcePair {
 
 impl PkcePair {
     /// Generates a high-entropy S256 PKCE pair from operating-system randomness.
-    #[must_use]
-    pub fn generate() -> Self {
-        let mut verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    pub fn generate() -> Result<Self> {
+        let mut random = crate::secure_random::bytes::<48>()?;
+        let mut verifier = URL_SAFE_NO_PAD.encode(random);
+        random.zeroize();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let secret = SecretString::from(verifier.clone());
         verifier.zeroize();
-        Self {
+        Ok(Self {
             verifier: secret,
             challenge,
-        }
+        })
     }
 
     /// Returns the public S256 code challenge.
@@ -445,21 +451,63 @@ impl TokenStore for MemoryTokenStore {
     }
 }
 
+/// Buffered response from an origin-authorized HTTP request.
+pub struct AuthorizedHttpResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+impl Debug for AuthorizedHttpResponse {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedHttpResponse")
+            .field("status", &self.status)
+            .field("headers", &"[REDACTED]")
+            .field("body", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl AuthorizedHttpResponse {
+    /// Returns the HTTP status.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Returns the response headers.
+    #[must_use]
+    pub const fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Returns the bounded response body.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
 /// MCP OAuth 2.1 client with bounded local-only-testable HTTP operations.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OAuthClient {
-    http: reqwest::Client,
+    http: HttpClient,
     refresh_locks: Arc<AsyncMutex<HashMap<CredentialBinding, Arc<AsyncMutex<()>>>>>,
+}
+
+impl Debug for OAuthClient {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthClient")
+            .finish_non_exhaustive()
+    }
 }
 
 impl OAuthClient {
     /// Creates an OAuth client with redirects disabled and a bounded timeout.
     pub fn new(timeout: Duration) -> Result<Self> {
-        crate::install_tls_provider();
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let http = HttpClient::new(timeout)?;
         Ok(Self {
             http,
             refresh_locks: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -469,14 +517,17 @@ impl OAuthClient {
     /// Reads protected-resource metadata from an explicit URL.
     pub async fn discover_resource(&self, metadata_url: &Url) -> Result<ProtectedResourceMetadata> {
         validate_secure_endpoint(metadata_url, "OAuth resource metadata")?;
-        let response = self.http.get(metadata_url.clone()).send().await?;
-        if !response.status().is_success() {
+        let response = self
+            .http
+            .request(Method::GET, metadata_url, HeaderMap::new(), Vec::new())
+            .await?;
+        if !response.status.is_success() {
             return Err(McpError::Protocol(format!(
                 "OAuth resource metadata returned HTTP {}",
-                response.status()
+                response.status
             )));
         }
-        Ok(response.json().await?)
+        response.json().await
     }
 
     /// Reads authorization-server metadata from an issuer.
@@ -486,11 +537,14 @@ impl OAuthClient {
     ) -> Result<DiscoveredAuthorizationServer> {
         validate_secure_endpoint(issuer, "OAuth issuer")?;
         let metadata_url = authorization_server_metadata_url(issuer)?;
-        let response = self.http.get(metadata_url).send().await?;
-        if !response.status().is_success() {
+        let response = self
+            .http
+            .request(Method::GET, &metadata_url, HeaderMap::new(), Vec::new())
+            .await?;
+        if !response.status.is_success() {
             return Err(McpError::Protocol(format!(
                 "OAuth server metadata returned HTTP {}",
-                response.status()
+                response.status
             )));
         }
         let metadata: AuthorizationServerMetadata = response.json().await?;
@@ -539,16 +593,21 @@ impl OAuthClient {
         let registration_endpoint = server.registration_endpoint().ok_or_else(|| {
             McpError::Protocol("OAuth server does not advertise dynamic registration".into())
         })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let response = self
             .http
-            .post(registration_endpoint.clone())
-            .json(metadata)
-            .send()
+            .request(
+                Method::POST,
+                registration_endpoint,
+                headers,
+                serde_json::to_vec(metadata)?,
+            )
             .await?;
-        if !response.status().is_success() {
+        if !response.status.is_success() {
             return Err(McpError::Protocol(format!(
                 "OAuth client registration returned HTTP {}",
-                response.status()
+                response.status
             )));
         }
         let wire: RegisteredClientWire = response.json().await?;
@@ -567,8 +626,8 @@ impl OAuthClient {
         scope: Option<&str>,
         resource: Option<&Url>,
     ) -> Result<AuthorizationRequest> {
-        let pkce = PkcePair::generate();
-        let state = Uuid::new_v4().simple().to_string();
+        let pkce = PkcePair::generate()?;
+        let state = URL_SAFE_NO_PAD.encode(crate::secure_random::bytes::<24>()?);
         let mut url = server.authorization_endpoint().clone();
         {
             let mut query = url.query_pairs_mut();
@@ -690,23 +749,22 @@ impl OAuthClient {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(fields.iter().copied())
             .finish();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
         let response = self
             .http
-            .post(endpoint.clone())
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(body)
-            .send()
+            .request(Method::POST, endpoint, headers, body.into_bytes())
             .await?;
-        if !response.status().is_success() {
+        if !response.status.is_success() {
             return Err(McpError::Protocol(format!(
                 "OAuth token endpoint returned HTTP {}",
-                response.status()
+                response.status
             )));
         }
-        Ok(response.json().await?)
+        response.json().await
     }
 
     /// Returns a bearer header, refreshing first when required.
@@ -745,22 +803,29 @@ impl OAuthClient {
     /// Injects a sensitive bearer header into one HTTP request.
     pub async fn send_authorized(
         &self,
-        request: reqwest::RequestBuilder,
+        method: Method,
+        request_url: Url,
+        mut headers: HeaderMap,
+        body: Vec<u8>,
         bearer: BoundBearerHeader,
-    ) -> Result<reqwest::Response> {
-        let request_url = request
-            .try_clone()
-            .ok_or_else(|| McpError::Protocol("authorized HTTP request cannot be cloned".into()))?
-            .build()?
-            .url()
-            .clone();
+    ) -> Result<AuthorizedHttpResponse> {
         validate_secure_endpoint(&request_url, "authorized HTTP endpoint")?;
         if endpoint_origin(&request_url)? != bearer.binding.resource_origin {
             return Err(McpError::Protocol(
                 "OAuth credential is not authorized for the request origin".into(),
             ));
         }
-        Ok(request.header(AUTHORIZATION, bearer.value).send().await?)
+        headers.insert(AUTHORIZATION, bearer.value);
+        let response = self
+            .http
+            .request(method, &request_url, headers, body)
+            .await?;
+        let (status, headers, body) = response.buffered().await?;
+        Ok(AuthorizedHttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// Removes credentials for one origin-bound OAuth profile.
@@ -928,7 +993,13 @@ mod tests {
             binding,
             value: HeaderValue::from_static("Bearer header-secret"),
         };
-        let rendered = format!("{client:?}\n{tokens:?}\n{pkce:?}\n{bound_header:?}");
+        let authorized_response = AuthorizedHttpResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: b"response-secret".to_vec(),
+        };
+        let rendered =
+            format!("{client:?}\n{tokens:?}\n{pkce:?}\n{bound_header:?}\n{authorized_response:?}");
 
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("registration-secret"));
@@ -936,6 +1007,7 @@ mod tests {
         assert!(!rendered.contains("refresh-secret"));
         assert!(!rendered.contains("verifier-secret"));
         assert!(!rendered.contains("header-secret"));
+        assert!(!rendered.contains("response-secret"));
     }
 
     #[test]
@@ -1224,7 +1296,13 @@ mod tests {
             .await
             .expect("first-origin bearer");
         let cross_origin = oauth
-            .send_authorized(oauth.http.get(second_resource), bearer)
+            .send_authorized(
+                Method::GET,
+                second_resource,
+                HeaderMap::new(),
+                Vec::new(),
+                bearer,
+            )
             .await
             .expect_err("bound bearer must not be attached cross-origin");
         assert_eq!(

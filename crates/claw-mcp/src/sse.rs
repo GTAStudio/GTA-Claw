@@ -3,9 +3,9 @@
 use std::{collections::VecDeque, fmt, time::Duration};
 
 use futures_util::StreamExt;
-use reqwest::{
-    Client, StatusCode, Url,
-    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
+    header::{ACCEPT, CONTENT_TYPE},
 };
 use rmcp::{
     RoleClient,
@@ -15,9 +15,12 @@ use rmcp::{
     },
 };
 use serde_json::Value;
-use sse_stream::{Sse, SseStream};
+use sse_stream::Sse;
 use thiserror::Error;
 use tokio::time::{sleep, timeout};
+use url::Url;
+
+use crate::http_client::{HttpClient, HttpClientError, HttpResponse};
 
 const MAX_PENDING_MESSAGES: usize = 64;
 
@@ -68,10 +71,10 @@ impl LegacySseConfig {
 pub enum LegacySseError {
     /// The HTTP client could not be constructed.
     #[error("failed to construct the HTTP client: {0}")]
-    Client(#[source] reqwest::Error),
+    Client(#[source] HttpClientError),
     /// An HTTP operation failed.
     #[error("legacy SSE HTTP request failed: {0}")]
-    Http(#[source] reqwest::Error),
+    Http(#[source] HttpClientError),
     /// An HTTP response had a non-success status.
     #[error("legacy SSE endpoint returned HTTP {0}")]
     HttpStatus(StatusCode),
@@ -107,43 +110,37 @@ pub enum LegacySseError {
 /// Legacy MCP transport that receives JSON-RPC over SSE and sends it over POST.
 pub struct LegacySseTransport {
     config: LegacySseConfig,
-    client: Client,
+    client: HttpClient,
 }
 
 impl LegacySseTransport {
     /// Creates a legacy SSE transport without starting network work.
     pub fn new(config: LegacySseConfig) -> Result<Self, LegacySseError> {
-        crate::install_tls_provider();
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(LegacySseError::Client)?;
+        let client = HttpClient::new(config.request_timeout).map_err(LegacySseError::Client)?;
         Ok(Self { config, client })
     }
 }
 
 impl LegacySseTransport {
-    async fn connect(
-        &self,
-        last_event_id: Option<&str>,
-    ) -> Result<reqwest::Response, LegacySseError> {
-        let mut request = self
-            .client
-            .get(self.config.endpoint.clone())
-            .headers(self.config.headers.clone())
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    async fn connect(&self, last_event_id: Option<&str>) -> Result<HttpResponse, LegacySseError> {
+        let mut headers = self.config.headers.clone();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if let Some(id) = last_event_id {
-            request = request.header(
+            headers.insert(
                 HeaderName::from_static("last-event-id"),
                 HeaderValue::from_str(id).map_err(|_| LegacySseError::Endpoint)?,
             );
         }
-        let response = timeout(self.config.request_timeout, request.send())
-            .await
-            .map_err(|_| LegacySseError::Timeout)?
-            .map_err(LegacySseError::Http)?;
-        if !response.status().is_success() {
-            return Err(LegacySseError::HttpStatus(response.status()));
+        let response = timeout(
+            self.config.request_timeout,
+            self.client
+                .request(Method::GET, &self.config.endpoint, headers, Vec::new()),
+        )
+        .await
+        .map_err(|_| LegacySseError::Timeout)?
+        .map_err(LegacySseError::Http)?;
+        if !response.status.is_success() {
+            return Err(LegacySseError::HttpStatus(response.status));
         }
         Ok(response)
     }
@@ -153,20 +150,18 @@ impl LegacySseTransport {
         endpoint: &Url,
         message: &rmcp::service::TxJsonRpcMessage<RoleClient>,
     ) -> Result<(), LegacySseError> {
+        let mut headers = self.config.headers.clone();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let body = serde_json::to_vec(message).map_err(LegacySseError::Json)?;
         let response = timeout(
             self.config.request_timeout,
-            self.client
-                .post(endpoint.clone())
-                .headers(self.config.headers.clone())
-                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-                .json(&message)
-                .send(),
+            self.client.request(Method::POST, endpoint, headers, body),
         )
         .await
         .map_err(|_| LegacySseError::Timeout)?
         .map_err(LegacySseError::Http)?;
-        if !response.status().is_success() {
-            return Err(LegacySseError::HttpStatus(response.status()));
+        if !response.status.is_success() {
+            return Err(LegacySseError::HttpStatus(response.status));
         }
         Ok(())
     }
@@ -240,7 +235,7 @@ impl LegacySseTransport {
                         "connecting legacy SSE stream",
                     ))?,
             };
-            let mut stream = Box::pin(SseStream::from_bytes_stream(response.bytes_stream()));
+            let mut stream = response.into_sse_stream();
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
@@ -346,9 +341,7 @@ mod tests {
             LegacySseConfig::new(Url::parse("http://127.0.0.1:43210/sse").expect("valid test URL"));
         let mut header = HeaderValue::from_static("test-bearer-value");
         header.set_sensitive(true);
-        config
-            .headers
-            .insert(reqwest::header::AUTHORIZATION, header);
+        config.headers.insert(http::header::AUTHORIZATION, header);
 
         let output = format!("{config:?}");
 

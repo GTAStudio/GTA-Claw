@@ -6,12 +6,12 @@ use std::{
     process::Stdio, sync::Arc, time::Duration,
 };
 
+use http::header::AUTHORIZATION;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
-use reqwest::{Url, header::AUTHORIZATION};
 use rmcp::{
     ClientHandler, RoleClient, ServiceError, ServiceExt,
     model::{
@@ -36,10 +36,12 @@ use rmcp::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use tokio::{io::sink, process::Command, task::JoinHandle, time::timeout};
+use url::Url;
 
 use crate::{
     error::McpError,
     framing::BoundedIoTransport,
+    http_client::HttpClient,
     sse::{LegacySseConfig, LegacySseTransport},
 };
 
@@ -382,13 +384,13 @@ impl McpClient {
                 "authenticated MCP URLs must use HTTPS unless they are loopback HTTP URLs".into(),
             ));
         }
-        crate::install_tls_provider();
         let mut transport_config =
             StreamableHttpClientTransportConfig::with_uri(config.endpoint.as_str().to_owned());
         if let Some(token) = config.bearer_token.as_ref() {
             transport_config = transport_config.auth_header(token.expose_secret().to_owned());
         }
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let http = HttpClient::new(config.request_timeout)?;
+        let transport = StreamableHttpClientTransport::with_client(http, transport_config);
         let service = connect_transport(
             transport,
             config.connect_timeout,

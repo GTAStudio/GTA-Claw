@@ -11,14 +11,12 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{
-    Url,
-    header::{AUTHORIZATION, HeaderValue},
-};
+use http::header::{AUTHORIZATION, HeaderValue};
 use rmcp::model::{ListToolsResult, ServerInfo};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use url::Url;
 
 use crate::{
     client::{ClientEventSink, HttpClientConfig, McpClient, SamplingPort, StdioClientConfig},

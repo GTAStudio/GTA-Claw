@@ -7,17 +7,16 @@
 pub mod client;
 pub mod error;
 pub mod framing;
+mod http_client;
 pub mod oauth;
 pub mod projection;
 pub mod registry;
+mod secure_random;
 pub mod server;
 pub mod sse;
 
+pub use http_client::HttpClientError;
 pub use rmcp::model;
-
-pub(crate) fn install_tls_provider() {
-    let _already_installed = rustls::crypto::ring::default_provider().install_default();
-}
 
 pub(crate) fn endpoint_allows_credentials(url: &url::Url) -> bool {
     url.scheme() == "https"

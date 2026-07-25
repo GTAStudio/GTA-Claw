@@ -19,7 +19,6 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
-use uuid::Uuid;
 
 use crate::{
     error::{McpError, Result},
@@ -375,7 +374,7 @@ impl ConversationProjection {
             ("sessionKey".into(), Value::String(conversation.session_key)),
             (
                 "idempotencyKey".into(),
-                Value::String(Uuid::new_v4().to_string()),
+                Value::String(crate::secure_random::uuid_v4()?),
             ),
         ]);
         if let Some(account_id) = conversation.account_id {
@@ -1543,7 +1542,17 @@ mod tests {
             .remove("idempotencyKey")
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .expect("send idempotency key");
-        Uuid::parse_str(&idempotency_key).expect("idempotency key UUID");
+        let key = idempotency_key.as_bytes();
+        assert_eq!(key.len(), 36);
+        assert_eq!(
+            (&key[8], &key[13], &key[18], &key[23]),
+            (&b'-', &b'-', &b'-', &b'-')
+        );
+        assert_eq!(key[14], b'4');
+        assert!(matches!(key[19], b'8' | b'9' | b'a' | b'b'));
+        assert!(key.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit()
+        }));
         assert_eq!(
             (&requests[4].0, send_params),
             (
