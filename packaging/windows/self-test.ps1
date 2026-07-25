@@ -139,11 +139,12 @@ echo gta-claw-cli v0.1.0
     try {
         $env:PATH = "$fakeCargoRoot;$priorPath"
         $env:GTA_CLAW_TEST_CARGO_ARGUMENTS = $cargoArguments
-        $target = 'x86_64-pc-windows-msvc'
-        Assert-HeadlessGraph -RepoRoot $repoRoot -TargetTriple $target
-        $arguments = [System.IO.File]::ReadAllText($cargoArguments)
-        if ($arguments -notmatch "(^|\s)--target\s+$([regex]::Escape($target))(\s|$)") {
-            throw "Headless Cargo graph proof omitted target '$target': $arguments"
+        foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            Assert-HeadlessGraph -RepoRoot $repoRoot -TargetTriple $target
+            $arguments = [System.IO.File]::ReadAllText($cargoArguments)
+            if ($arguments -notmatch "(^|\s)--target\s+$([regex]::Escape($target))(\s|$)") {
+                throw "Headless Cargo graph proof omitted target '$target': $arguments"
+            }
         }
         $passed++
     } finally {
