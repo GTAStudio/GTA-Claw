@@ -5,14 +5,17 @@
 //! produces deterministic parity reports.
 //!
 //! Evidence verification proves that a cited Rust test is literally declared in
-//! a standard-libtest Cargo target root or a source file reachable through
-//! explicit `mod` declarations from one. The resolver follows nested inline
-//! modules and exact string-literal `#[path]` overrides within the owning Cargo
-//! package while rejecting unreadable overrides without falling back to a
-//! same-named module. It also rejects orphan files, cross-package paths,
-//! test-disabled targets, and targets with `harness = false`. It deliberately
-//! does not evaluate parent-module `cfg` predicates. It cannot prove that the
-//! test ran or is semantically sufficient for the claim.
+//! a standard-libtest Cargo target root in a package admitted by the repository's
+//! workspace topology, or a source file reachable through explicit `mod`
+//! declarations from one. The resolver follows nested inline modules and exact
+//! string-literal `#[path]` overrides within the owning Cargo package while
+//! rejecting unreadable overrides without falling back to a same-named module.
+//! It also rejects orphan files, unlisted and excluded packages, implicit
+//! path-dependency members, cross-package paths, test-disabled targets, and
+//! targets with `harness = false`, while retaining standalone build roots outside
+//! any declared workspace. Parent-module `cfg` predicates are deliberately not
+//! evaluated. This cannot prove that the test ran or is semantically sufficient
+//! for the claim.
 //! Automated citation integrity therefore composes with independent review:
 //! the harness rejects fabricated evidence, while reviewers judge sufficiency.
 //! The verifier recognizes literal test declarations only; macro-generated
