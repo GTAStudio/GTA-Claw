@@ -1368,6 +1368,125 @@ fn dynamic_and_matrix_workflow_identities_cannot_spoof_reserved_checks() {
     );
 }
 
+fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
+    format!(
+        "name: \"{name}\"\n\
+         \n\
+         on:\n\
+         \x20 pull_request:\n\
+         \x20   branches:\n\
+         \x20     - main\n\
+         \n\
+         permissions:\n\
+         \x20 contents: read\n\
+         \n\
+         jobs:\n\
+         \x20 {job_id}:\n\
+         \x20   name: \"{job_name}\"\n\
+         \x20   runs-on: ubuntu-latest\n\
+         \x20   steps:\n\
+         \x20     - name: Placeholder\n\
+         \x20       run: echo packaging\n"
+    )
+}
+
+#[test]
+fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
+    let base = copy_repo("mobile-inventory-baseline");
+    let identities = validate_inventory(&SafeRoot::new(&base.path).expect("open baseline tree"))
+        .expect("the eight required workflows are a valid inventory");
+    assert_eq!(identities.len(), 8);
+
+    for (label, added) in [
+        ("ios", &[".github/workflows/ios-packaging.yml"][..]),
+        ("android", &[".github/workflows/android-packaging.yml"][..]),
+        (
+            "both",
+            &[
+                ".github/workflows/android-packaging.yml",
+                ".github/workflows/ios-packaging.yml",
+            ][..],
+        ),
+    ] {
+        let tree = copy_repo(&format!("mobile-inventory-{label}"));
+        for (index, path) in added.iter().enumerate() {
+            fs::write(
+                tree.join(path),
+                mobile_workflow_stub(
+                    &format!("mobile packaging {index}"),
+                    &format!("package{index}"),
+                    &format!("Mobile package {index}"),
+                ),
+            )
+            .expect("write admitted mobile workflow");
+        }
+        let identities =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open admitted mobile tree"))
+                .expect("admitted mobile workflows pass the inventory");
+        assert_eq!(identities.len(), 8 + added.len(), "{label}");
+    }
+
+    for (label, path) in [
+        ("unknown-name", ".github/workflows/linux-mobile.yml"),
+        (
+            "near-miss-extension",
+            ".github/workflows/ios-packaging.yaml",
+        ),
+        ("nested", ".github/workflows/mobile/ios-packaging.yml"),
+    ] {
+        let tree = copy_repo(&format!("mobile-inventory-{label}"));
+        let destination = tree.join(path);
+        fs::create_dir_all(destination.parent().expect("workflow parent"))
+            .expect("create workflow parent");
+        fs::write(
+            &destination,
+            mobile_workflow_stub("unadmitted packaging", "package", "Unadmitted package"),
+        )
+        .expect("write unadmitted workflow");
+        let error =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open unadmitted mobile tree"))
+                .expect_err("unadmitted workflow unexpectedly passed the inventory");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow directory inventory changed"),
+            "{label} failed for the wrong reason: {error}"
+        );
+    }
+
+    let removed = copy_repo("mobile-inventory-missing-required");
+    fs::write(
+        removed.join(".github/workflows/ios-packaging.yml"),
+        mobile_workflow_stub("ios packaging", "package", "iOS package"),
+    )
+    .expect("write admitted iOS workflow");
+    fs::remove_file(removed.join(".github/workflows/windows-packaging.yml"))
+        .expect("remove required workflow");
+    let error = validate_inventory(&SafeRoot::new(&removed.path).expect("open reduced tree"))
+        .expect_err("missing required workflow unexpectedly passed the inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("workflow directory inventory changed"),
+        "removed required workflow failed for the wrong reason: {error}"
+    );
+
+    let spoof = copy_repo("mobile-inventory-spoof");
+    fs::write(
+        spoof.join(".github/workflows/android-packaging.yml"),
+        mobile_workflow_stub("android packaging", "package", AUTHORITATIVE_JOB_NAME),
+    )
+    .expect("write spoofing admitted workflow");
+    let error = validate_inventory(&SafeRoot::new(&spoof.path).expect("open spoofing tree"))
+        .expect_err("admitted workflow spoofed the authoritative identity");
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative workflow identity is spoofed"),
+        "admitted spoof failed for the wrong reason: {error}"
+    );
+}
+
 #[test]
 fn authoritative_workflow_checkout_and_event_controls_are_exact() {
     let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))
