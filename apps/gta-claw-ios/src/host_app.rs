@@ -485,6 +485,12 @@ pub enum ServiceTypeError {
     EdgeHyphen,
     /// The service name held no letter.
     NoLetter,
+    /// The browsed type was not exactly one `.local.`-qualified service type.
+    ///
+    /// Produced only when deriving an `NSBonjourServices` entry from a
+    /// [`LocalDiscoveryBackend::DNS_SD_SERVICE_TYPE`], never by
+    /// [`BonjourServiceType::parse`], whose input is already a plist form.
+    NotFullyQualifiedLocal,
 }
 
 impl Display for ServiceTypeError {
@@ -516,6 +522,10 @@ impl Display for ServiceTypeError {
                 formatter.write_str("service name must not start or end with a hyphen")
             }
             Self::NoLetter => formatter.write_str("service name must contain at least one letter"),
+            Self::NotFullyQualifiedLocal => formatter.write_str(
+                "browsed service type must be a single .local.-qualified type, such as \
+                 _example._tcp.local.",
+            ),
         }
     }
 }
@@ -745,13 +755,21 @@ pub trait LocalDiscoveryBackend {
     /// # Errors
     ///
     /// Returns [`ServiceTypeError`] if the declared type has no representable
-    /// `NSBonjourServices` form.
+    /// `NSBonjourServices` form. The transformation is deliberately strict:
+    /// the browsed type must carry exactly one terminal `.local.`, because a
+    /// descriptor that forgot to qualify its type, applied the domain twice, or
+    /// consists of nothing but the domain is a mistake, and accepting any of
+    /// them would mint a permit naming an entry the backend never browses.
     fn bonjour_service_type() -> Result<BonjourServiceType, ServiceTypeError> {
-        let trimmed = Self::DNS_SD_SERVICE_TYPE
-            .strip_suffix('.')
-            .unwrap_or(Self::DNS_SD_SERVICE_TYPE);
-        let trimmed = trimmed.strip_suffix(".local").unwrap_or(trimmed);
-        BonjourServiceType::parse(trimmed)
+        const DOMAIN: &str = ".local.";
+
+        let Some(remainder) = Self::DNS_SD_SERVICE_TYPE.strip_suffix(DOMAIN) else {
+            return Err(ServiceTypeError::NotFullyQualifiedLocal);
+        };
+        if remainder.is_empty() || remainder.ends_with(".local") {
+            return Err(ServiceTypeError::NotFullyQualifiedLocal);
+        }
+        BonjourServiceType::parse(remainder)
     }
 }
 
@@ -1125,6 +1143,33 @@ mod tests {
         const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.example.com.";
     }
 
+    /// A descriptor that forgot to fully qualify its type.
+    ///
+    /// Deliberately [`DiscoveryMechanism::SystemDnsSd`]: that path needs no
+    /// entitlement, so nothing downstream would have caught the bad type.
+    enum TestUnqualifiedBackend {}
+
+    impl LocalDiscoveryBackend for TestUnqualifiedBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::SystemDnsSd;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp";
+    }
+
+    /// A descriptor whose domain suffix was applied twice.
+    enum TestRepeatedDomainBackend {}
+
+    impl LocalDiscoveryBackend for TestRepeatedDomainBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::InProcessMulticast;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.local.local.";
+    }
+
+    /// A descriptor that is nothing but the domain.
+    enum TestBareDomainBackend {}
+
+    impl LocalDiscoveryBackend for TestBareDomainBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::InProcessMulticast;
+        const DNS_SD_SERVICE_TYPE: &'static str = ".local.";
+    }
+
     fn service_type(text: &str) -> BonjourServiceType {
         BonjourServiceType::parse(text)
             .unwrap_or_else(|error| panic!("{text:?} should parse, but failed with {error}"))
@@ -1475,6 +1520,48 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_that_is_not_a_fully_qualified_local_type_is_refused() {
+        for (label, derived) in [
+            (
+                "missing domain",
+                TestUnqualifiedBackend::bonjour_service_type(),
+            ),
+            (
+                "repeated domain",
+                TestRepeatedDomainBackend::bonjour_service_type(),
+            ),
+            ("bare domain", TestBareDomainBackend::bonjour_service_type()),
+        ] {
+            let rendered = format!("{derived:?}");
+            let error = derived.expect_err(&format!(
+                "a {label} descriptor must not derive a plist form, but it produced {rendered}"
+            ));
+            assert_eq!(
+                error,
+                ServiceTypeError::NotFullyQualifiedLocal,
+                "a {label} descriptor was refused with {error}, which does not name the \
+                 qualification problem"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unqualified_descriptor_cannot_obtain_a_permit() {
+        let error = fully_declared()
+            .discovery_precondition::<TestUnqualifiedBackend>()
+            .expect_err("a descriptor missing the .local. domain must not be permitted");
+
+        assert_eq!(
+            error,
+            DiscoveryUnavailable::BackendServiceTypeInvalid {
+                service_type: "_gtaclaw._tcp",
+                error: ServiceTypeError::NotFullyQualifiedLocal,
+            },
+            "an unqualified descriptor must be refused against its own constant"
+        );
+    }
+
+    #[test]
     fn a_backend_type_with_no_plist_form_is_reported_rather_than_truncated() {
         let error = fully_declared()
             .discovery_precondition::<TestUnrepresentableBackend>()
@@ -1484,7 +1571,7 @@ mod tests {
             error,
             DiscoveryUnavailable::BackendServiceTypeInvalid {
                 service_type: "_gtaclaw._tcp.example.com.",
-                error: ServiceTypeError::MissingTransportSuffix,
+                error: ServiceTypeError::NotFullyQualifiedLocal,
             },
             "an underivable plist entry must be reported against the backend constant"
         );
