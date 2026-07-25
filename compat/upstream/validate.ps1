@@ -1178,7 +1178,30 @@ function Get-RustTokens {
         }
         $rawEnd = Get-RustRawStringEnd $bytes $index
         if ($rawEnd -ge 0) {
-            [void]$tokens.Add("lit")
+            if ($WithStrings) {
+                # A raw string carries a value like any other string literal, and
+                # #[path = r"..."] is legal Rust. Tokenising it as an opaque
+                # literal made the attribute invisible, so the declaration was
+                # resolved by module name and a file cargo never compiles was
+                # blessed instead. Raw strings have no escapes, so the bytes
+                # between the quotes are the value.
+                $prefix = $index
+                if ($bytes[$prefix] -eq 98) { $prefix += 1 }
+                $prefix += 1
+                $hashCount = 0
+                while (($prefix + $hashCount) -lt $length -and $bytes[$prefix + $hashCount] -eq 35) {
+                    $hashCount += 1
+                }
+                $contentStart = $prefix + $hashCount + 1
+                $contentLength = $rawEnd - $hashCount - 1 - $contentStart
+                if ($contentLength -ge 0 -and ($contentStart + $contentLength) -le $length) {
+                    [void]$tokens.Add("s:" + [System.Text.Encoding]::UTF8.GetString($bytes, $contentStart, $contentLength))
+                } else {
+                    [void]$tokens.Add("lit")
+                }
+            } else {
+                [void]$tokens.Add("lit")
+            }
             $index = $rawEnd
             continue
         }
@@ -1762,7 +1785,7 @@ function Get-RustModReferencesInRange {
         $index = [int]$attributeResult.next
         if ($index -ge $End) { break }
         $itemStart = $index
-        $index = Get-RustSkipVisibility $Tokens $index
+        $index = Get-RustSkipVisibility $Tokens $index $End
         $index = Get-RustSkipItemModifiers $Tokens $index
         $matched = $false
         if ($index -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$index] "i:mod") -and
@@ -1777,8 +1800,10 @@ function Get-RustModReferencesInRange {
                 $matched = $true
             } elseif ($after -lt $Tokens.Length -and (Test-OrdinalStringEqual $Tokens[$after] ";")) {
                 $pathAttribute = $null
+                $hasPathAttribute = $false
                 foreach ($attribute in $outer) {
                     if ($attribute.path.Length -eq 1 -and (Test-OrdinalStringEqual $attribute.path[0] "path")) {
+                        $hasPathAttribute = $true
                         foreach ($token in $attribute.tokens) {
                             if ($token.StartsWith("s:", [StringComparison]::Ordinal)) {
                                 $pathAttribute = $token.Substring(2)
@@ -1787,7 +1812,12 @@ function Get-RustModReferencesInRange {
                         }
                     }
                 }
-                [void]$Sink.Add([ordered]@{ segments = $Segments; name = $name; path = $pathAttribute })
+                [void]$Sink.Add([ordered]@{
+                    segments = $Segments
+                    name = $name
+                    path = $pathAttribute
+                    hasPath = $hasPathAttribute
+                })
                 $index = $after + 1
                 $matched = $true
             }
@@ -1973,11 +2003,34 @@ function Get-CrateCompiledFileSet {
             if ($null -eq $scope) { continue }
             $candidates = @()
             $childDirectory = $null
-            if ($null -ne $reference.path) {
-                $target = Join-RepositoryRelativePath $scope $reference.path
+            if ($reference.hasPath) {
+                # A path attribute this reader cannot resolve to a string value
+                # resolves to nothing at all. Falling back to name-based lookup
+                # would bless '<scope>/<name>.rs' -- a file cargo never compiles
+                # -- on the strength of an attribute that points somewhere else.
+                if ($null -eq $reference.path) { continue }
+                # Outside an inline module block a path attribute is relative to
+                # the directory holding the source file, not to the module
+                # directory. The two coincide for mod-rs files (crate roots and
+                # mod.rs) and differ for every other file, so resolving against
+                # the module directory both missed the real target and blessed a
+                # same-named file one directory deeper.
+                $base = $scope
+                if (@($reference.segments).Count -eq 0) {
+                    $base = Join-RepositoryRelativePath $current.file ".."
+                }
+                if ($null -eq $base) { continue }
+                $target = Join-RepositoryRelativePath $base $reference.path
                 if ($null -ne $target) {
                     $candidates = @($target)
-                    $childDirectory = ($target -replace '\.rs\z', '')
+                    # A path naming a mod.rs makes that module mod-rs, so its own
+                    # children live beside it rather than under a 'mod/' directory
+                    # named after the file.
+                    if ($target -cmatch '(?:\A|/)mod\.rs\z') {
+                        $childDirectory = Join-RepositoryRelativePath $target ".."
+                    } else {
+                        $childDirectory = ($target -replace '\.rs\z', '')
+                    }
                 }
             } else {
                 $candidates = @(
