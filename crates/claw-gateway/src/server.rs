@@ -1,0 +1,447 @@
+//! Accept loop, connection admission control, and graceful shutdown.
+//!
+//! The listener owns exactly three bounded resources: a hard cap on
+//! simultaneously served connections (enforced with a semaphore *before* the
+//! WebSocket upgrade is attempted, so a flood cannot allocate handshake
+//! buffers), a monotonic connection-identity counter, and a single broadcast
+//! `tick` publisher shared by every subscriber.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use claw_protocol::gateway::{
+    AuthenticationPort, Name, NonNegativeInteger, ShutdownEvent, TickEvent,
+};
+use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
+
+use crate::clock::{Clock, SystemClock};
+use crate::config::{GatewayServerConfig, ValidatedConfig};
+use crate::connection::{self, ConnectionServices};
+use crate::directory::ConnectionDirectory;
+use crate::dispatch::MethodRegistry;
+use crate::error::ServerError;
+use crate::events::{ConnectionId, EventBus, EventDraft};
+use crate::methods;
+use crate::store::{GatewayStore, InMemoryGatewayStore};
+
+/// Maximum UTF-8 byte length of the shutdown reason placed on the wire.
+const MAX_SHUTDOWN_REASON_BYTES: usize = 128;
+/// Reason announced by the broadcast `shutdown` event.
+const SHUTDOWN_REASON: &str = "gateway is shutting down";
+
+/// An unbound Gateway server and its collaborators.
+pub struct GatewayServer {
+    config: Arc<ValidatedConfig>,
+    registry: Arc<MethodRegistry>,
+    store: Arc<dyn GatewayStore>,
+    events: EventBus,
+    clock: Arc<dyn Clock>,
+    directory: ConnectionDirectory,
+    authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
+}
+
+impl std::fmt::Debug for GatewayServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayServer")
+            .field("config", &self.config)
+            .field("methods", &self.registry.len())
+            .field("connections", &self.directory.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewayServer {
+    /// Creates a server with the in-memory persistence adapter and system clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::Configuration`] when a limit or timeout is
+    /// outside its proven bound, or [`ServerError::Registry`] when a handler
+    /// cannot be installed on the frozen catalog.
+    pub fn new(
+        config: GatewayServerConfig,
+        authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
+    ) -> Result<Self, ServerError> {
+        let config = config.validate()?;
+        let limits = *config.limits();
+        let store = InMemoryGatewayStore::new(limits.max_sessions, limits.max_pending_per_node);
+        Ok(Self {
+            registry: Arc::new(methods::registry()?),
+            store: Arc::new(store),
+            events: EventBus::new(limits.event_queue_capacity, limits.event_queue_bytes),
+            clock: Arc::new(SystemClock),
+            directory: ConnectionDirectory::new(),
+            config: Arc::new(config),
+            authenticator,
+        })
+    }
+
+    /// Replaces the persistence adapter behind the narrow store port.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Replaces the wall-clock port.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Returns the event bus so embedders can publish catalogued events.
+    #[must_use]
+    pub const fn events(&self) -> &EventBus {
+        &self.events
+    }
+
+    /// Returns the live authenticated connection directory.
+    #[must_use]
+    pub const fn directory(&self) -> &ConnectionDirectory {
+        &self.directory
+    }
+
+    /// Returns the installed method registry.
+    #[must_use]
+    pub fn registry(&self) -> &MethodRegistry {
+        &self.registry
+    }
+
+    fn services(&self) -> ConnectionServices {
+        ConnectionServices {
+            config: Arc::clone(&self.config),
+            registry: Arc::clone(&self.registry),
+            store: Arc::clone(&self.store),
+            events: self.events.clone(),
+            clock: Arc::clone(&self.clock),
+            directory: self.directory.clone(),
+            authenticator: Arc::clone(&self.authenticator),
+        }
+    }
+
+    /// Binds the listener without accepting yet, so tests can learn the port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::Bind`] or [`ServerError::LocalAddress`] when the
+    /// operating system refuses the socket.
+    pub async fn bind(self, address: SocketAddr) -> Result<BoundServer, ServerError> {
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(ServerError::Bind)?;
+        let local_address = listener.local_addr().map_err(ServerError::LocalAddress)?;
+        Ok(BoundServer {
+            listener,
+            local_address,
+            server: self,
+        })
+    }
+}
+
+/// A listener that is bound but not yet accepting.
+#[derive(Debug)]
+pub struct BoundServer {
+    listener: TcpListener,
+    local_address: SocketAddr,
+    server: GatewayServer,
+}
+
+impl BoundServer {
+    /// Returns the address the listener actually bound to.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.local_address
+    }
+
+    /// Returns the event bus of the server about to start.
+    #[must_use]
+    pub const fn events(&self) -> &EventBus {
+        self.server.events()
+    }
+
+    /// Returns the connection directory of the server about to start.
+    #[must_use]
+    pub const fn directory(&self) -> &ConnectionDirectory {
+        self.server.directory()
+    }
+
+    /// Starts the accept loop and the broadcast tick publisher.
+    #[must_use]
+    pub fn start(self) -> ServerHandle {
+        let Self {
+            listener,
+            local_address,
+            server,
+        } = self;
+        let limits = *server.config.limits();
+        let timeouts = *server.config.timeouts();
+        let services = server.services();
+        let events = server.events.clone();
+        let directory = server.directory.clone();
+        let permits = Arc::new(Semaphore::new(limits.max_connections));
+        let (shutdown, shutdown_rx) = watch::channel(false);
+
+        let tick_clock = Arc::clone(&server.clock);
+        let tick_events = events.clone();
+        let mut tick_shutdown = shutdown_rx.clone();
+        let ticker = tokio::spawn(async move {
+            let mut timer = interval_at(
+                Instant::now() + timeouts.tick_interval,
+                timeouts.tick_interval,
+            );
+            timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = tick_shutdown.changed() => {
+                        if changed.is_err() || *tick_shutdown.borrow() {
+                            return;
+                        }
+                    }
+                    _ = timer.tick() => {
+                        let payload = TickEvent {
+                            ts: NonNegativeInteger::new(tick_clock.unix_millis()),
+                        };
+                        if let Ok(draft) = EventDraft::broadcast("tick", &payload) {
+                            tick_events.publish(draft);
+                        }
+                    }
+                }
+            }
+        });
+
+        let accept_permits = Arc::clone(&permits);
+        let accept_shutdown = shutdown_rx.clone();
+        let acceptor = tokio::spawn(accept_loop(
+            listener,
+            services,
+            accept_permits,
+            accept_shutdown,
+            timeouts.close,
+        ));
+
+        ServerHandle {
+            local_address,
+            shutdown,
+            events,
+            directory,
+            permits,
+            max_connections: limits.max_connections,
+            acceptor,
+            ticker,
+        }
+    }
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    services: ConnectionServices,
+    permits: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
+    grace: std::time::Duration,
+) {
+    let next_id = AtomicU64::new(1);
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept() => {
+                let Ok((stream, _peer)) = accepted else {
+                    // A per-connection accept failure must not kill the listener.
+                    continue;
+                };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    // At the cap: drop the socket immediately, before any
+                    // handshake buffer is allocated for it.
+                    drop(stream);
+                    continue;
+                };
+                let id = ConnectionId::new(next_id.fetch_add(1, Ordering::Relaxed));
+                let services = services.clone();
+                let connection_shutdown = shutdown.clone();
+                connections.spawn(async move {
+                    let outcome =
+                        connection::serve(stream, id, services, connection_shutdown).await;
+                    drop(permit);
+                    outcome
+                });
+            }
+        }
+    }
+    drop(listener);
+    let drain = async { while connections.join_next().await.is_some() {} };
+    if timeout(grace, drain).await.is_err() {
+        connections.shutdown().await;
+    }
+}
+
+/// A running server with graceful shutdown.
+#[derive(Debug)]
+pub struct ServerHandle {
+    local_address: SocketAddr,
+    shutdown: watch::Sender<bool>,
+    events: EventBus,
+    directory: ConnectionDirectory,
+    permits: Arc<Semaphore>,
+    max_connections: usize,
+    acceptor: JoinHandle<()>,
+    ticker: JoinHandle<()>,
+}
+
+impl ServerHandle {
+    /// Returns the address the listener bound to.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.local_address
+    }
+
+    /// Returns the event bus so embedders can publish catalogued events.
+    #[must_use]
+    pub const fn events(&self) -> &EventBus {
+        &self.events
+    }
+
+    /// Returns the live authenticated connection directory.
+    #[must_use]
+    pub const fn directory(&self) -> &ConnectionDirectory {
+        &self.directory
+    }
+
+    /// Returns how many connection slots are currently occupied.
+    #[must_use]
+    pub fn connection_count(&self) -> usize {
+        self.max_connections
+            .saturating_sub(self.permits.available_permits())
+    }
+
+    /// Announces shutdown, stops accepting, and waits for the accept loop.
+    ///
+    /// The broadcast `shutdown` event is published *before* the cancellation
+    /// signal so subscribers that are still keeping up observe it, then every
+    /// live connection closes with RFC 6455 code 1001.
+    pub async fn shutdown(self) {
+        if let Ok(reason) = Name::new(SHUTDOWN_REASON, MAX_SHUTDOWN_REASON_BYTES) {
+            let payload = ShutdownEvent {
+                reason,
+                restart_expected_ms: None,
+            };
+            if let Ok(draft) = EventDraft::broadcast("shutdown", &payload) {
+                self.events.publish(draft);
+            }
+        }
+        let _ = self.shutdown.send(true);
+        let _ = self.ticker.await;
+        let _ = self.acceptor.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use claw_protocol::gateway::Role;
+
+    use super::*;
+    use crate::auth::{CredentialPolicy, StaticAuthenticator};
+    use crate::clock::ManualClock;
+
+    fn server(max_connections: usize) -> GatewayServer {
+        let mut config = GatewayServerConfig::default();
+        config.limits.max_connections = max_connections;
+        let clock = Arc::new(ManualClock::new(1_700_000_000_000));
+        let authenticator = StaticAuthenticator::new(CredentialPolicy::None, clock.clone());
+        GatewayServer::new(config, Arc::new(authenticator))
+            .expect("the default configuration is valid")
+            .with_clock(clock)
+    }
+
+    #[tokio::test]
+    async fn binding_to_port_zero_reports_the_assigned_port() {
+        let bound = server(4)
+            .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+            .await
+            .expect("loopback bind succeeds");
+        assert_ne!(bound.local_address().port(), 0);
+        assert!(bound.local_address().ip().is_loopback());
+        let handle = bound.start();
+        assert_eq!(handle.connection_count(), 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_started_server_advertises_the_whole_frozen_method_catalog() {
+        let server = server(2);
+        assert_eq!(server.registry().len(), 278);
+        assert_eq!(server.directory().len(), 0);
+        assert_eq!(server.events().subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_publishes_the_catalogued_shutdown_event_to_live_subscribers() {
+        let bound = server(2)
+            .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+            .await
+            .expect("loopback bind succeeds");
+        let events = bound.events().clone();
+        let handle = bound.start();
+        let filter = Arc::new(std::sync::Mutex::new(crate::events::TopicFilter::default()));
+        let mut subscription = events.subscribe(
+            ConnectionId::new(9_001),
+            Role::Operator,
+            vec![claw_protocol::gateway::OperatorScope::Read],
+            filter,
+        );
+        handle.shutdown().await;
+        match subscription.recv().await {
+            crate::events::Delivery::Event(envelope) => {
+                assert_eq!(envelope.name(), "shutdown");
+            }
+            other => panic!("expected the shutdown event, observed {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connection_cap_refuses_sockets_past_the_configured_limit() {
+        let bound = server(1)
+            .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+            .await
+            .expect("loopback bind succeeds");
+        let address = bound.local_address();
+        let handle = bound.start();
+
+        let first = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the first connection is admitted");
+        // Wait until the accept loop has taken the only permit.
+        for _ in 0..200 {
+            if handle.connection_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(handle.connection_count(), 1);
+
+        let mut second = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the kernel still completes the TCP handshake");
+        let mut buffer = [0_u8; 1];
+        let read = tokio::io::AsyncReadExt::read(&mut second, &mut buffer).await;
+        assert_eq!(read.expect("the refused socket reports EOF"), 0);
+        assert_eq!(handle.connection_count(), 1);
+
+        drop(first);
+        handle.shutdown().await;
+    }
+}
