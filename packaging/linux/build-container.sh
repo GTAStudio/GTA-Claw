@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/lib/container-trust.sh"
 source "$SCRIPT_DIR/lib/container-mount.sh"
 
 require_linux
-for tool in docker findmnt git id python3 realpath sha256sum stat tar; do
+for tool in docker findmnt git id jq python3 realpath sha256sum stat tar; do
   require_tool "$tool"
 done
 [[ "$#" -eq 1 ]] || die "usage: build-container.sh ARCH"
@@ -64,21 +64,23 @@ output_receipt="$(trust_receipt "$OUTPUT_COMPONENT_PATH" "build output")"
 
 recipe_sha="$(sha256_file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build")"
 image_tag="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
-image_iid_file="$OUTPUT_COMPONENT_PATH/.build-image-id"
-[[ ! -e "$image_iid_file" && ! -L "$image_iid_file" ]] ||
-  die "build image ID receipt path already exists"
+image_metadata_file="$OUTPUT_COMPONENT_PATH/.build-image-metadata.json"
+[[ ! -e "$image_metadata_file" && ! -L "$image_metadata_file" ]] ||
+  die "build image metadata receipt path already exists"
 docker build \
   --provenance=false \
-  --iidfile "$image_iid_file" \
+  --metadata-file "$image_metadata_file" \
   --file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build" \
   --build-arg "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
   --tag "$image_tag" \
   "$SOURCE_SNAPSHOT_DIRECTORY"
-assert_regular_unaliased "$image_iid_file" "build image ID receipt"
-environment_image_id="$(cat "$image_iid_file")"
+assert_regular_unaliased "$image_metadata_file" "build image metadata receipt"
+environment_image_id="$(
+  jq -er '."containerimage.digest"' "$image_metadata_file"
+)"
 [[ "$environment_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "pinned build environment produced an invalid image ID"
-rm -f "$image_iid_file"
+rm -f "$image_metadata_file"
 
 exec {source_fd}<"$SOURCE_SNAPSHOT_DIRECTORY"
 create_anchored_mounts \
