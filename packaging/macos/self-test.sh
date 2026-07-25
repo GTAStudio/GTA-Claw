@@ -54,13 +54,31 @@ assert_sentinel() {
   [[ "$(cat "$1")" == "outside sentinel" ]] || die "self-test modified outside bytes: $1"
 }
 
-[[ "$(distribution_app_archive_label)" == "universal2" ]] ||
-  die "default app archive label changed"
-[[ "$(distribution_expected_arches)" == "arm64 x86_64" ]] ||
-  die "default distribution architecture set changed"
-[[ "$(distribution_app_archive_name unsigned-non-release)" == \
-  "gta-claw-$VERSION-macos-universal2-unsigned-non-release.app.zip" ]] ||
-  die "default app archive name changed"
+default_profile="$work/default-distribution-profile"
+legacy_profile="$work/legacy-distribution-profile"
+explicit_profile="$work/explicit-distribution-profile"
+{
+  distribution_app_archive_label
+  distribution_expected_arches
+  distribution_app_archive_name unsigned-non-release
+  distribution_app_archive_name signed-notarized
+} >"$default_profile"
+{
+  distribution_app_archive_label universal2
+  distribution_expected_arches "arm64 x86_64"
+  distribution_app_archive_name unsigned-non-release universal2
+  distribution_app_archive_name signed-notarized universal2
+} >"$explicit_profile"
+printf '%s\n' \
+  universal2 \
+  "arm64 x86_64" \
+  "gta-claw-$VERSION-macos-universal2-unsigned-non-release.app.zip" \
+  "gta-claw-$VERSION-macos-universal2-signed-notarized.app.zip" \
+  >"$legacy_profile"
+cmp -s "$default_profile" "$explicit_profile" ||
+  die "omitted distribution arguments differ from explicit legacy values"
+cmp -s "$default_profile" "$legacy_profile" ||
+  die "default distribution profile bytes changed from the legacy contract"
 tests=$((tests + 1))
 [[ "$(distribution_app_archive_label arm64)" == "arm64" ]] ||
   die "arm64 app archive label override failed"
