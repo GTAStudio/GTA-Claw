@@ -236,20 +236,17 @@
                                                                "src/gateway/openai-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/openai.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::auth_models_embeddings_and_json_generation_match_contracts",
-                                                                   "crates/claw-http-api/tests/e2e.rs::chat_and_responses_sse_have_exact_framing_and_terminal_events",
-                                                                   "crates/claw-http-api/tests/e2e.rs::constrained_streams_fail_without_leaking_text_and_response_timeouts_fail"
+
                                                                    ],
                                                      "required":  "JSON and SSE /v1/chat/completions golden tests match pinned request, stream, usage, and error contracts."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
@@ -266,20 +263,17 @@
                                                                "src/gateway/open-responses.schema.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/openai.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::chat_and_responses_sse_have_exact_framing_and_terminal_events",
-                                                                   "crates/claw-http-api/tests/e2e.rs::constrained_streams_fail_without_leaking_text_and_response_timeouts_fail",
-                                                                   "crates/claw-http-api/tests/e2e.rs::responses_continuity_is_scoped_to_authenticated_subject_and_model"
+
                                                                    ],
                                                      "required":  "JSON and SSE /v1/responses golden tests match pinned item, event, tool, usage, and error contracts."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
@@ -295,18 +289,17 @@
                                                                "src/gateway/models-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/openai.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::auth_models_embeddings_and_json_generation_match_contracts"
+
                                                                    ],
                                                      "required":  "List and retrieve model endpoint tests match pinned filtering, identifiers, and errors."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
@@ -322,18 +315,17 @@
                                                                "src/gateway/embeddings-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/openai.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::auth_models_embeddings_and_json_generation_match_contracts"
+
                                                                    ],
                                                      "required":  "Embedding request, provider policy, dimensions, usage, and error fixtures pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
@@ -349,18 +341,17 @@
                                                                "src/gateway/tools-invoke-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/tools.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::tools_admin_mcp_and_webhooks_enforce_and_map_contracts"
+
                                                                    ],
                                                      "required":  "Authenticated /tools/invoke schema, policy, result, and error tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {

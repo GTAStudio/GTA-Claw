@@ -179,18 +179,17 @@
                                                                "src/gateway/server-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/probes.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::probes_reflect_real_dependency_state_and_hide_details_without_auth"
+
                                                                    ],
                                                      "required":  "HTTP tests prove /health, /healthz, /ready, and /readyz status and draining behavior."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
@@ -206,19 +205,17 @@
                                                                "src/gateway/watch-node-http.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/watch.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::watch_transport_covers_challenge_connect_queue_poll_result_and_disconnect",
-                                                                   "crates/claw-http-api/tests/e2e.rs::watch_transport_consumes_challenges_times_out_polls_and_closes_overflowed_queues"
+
                                                                    ],
                                                      "required":  "Transport tests cover challenge, connect, disconnect, long poll, result, authentication, and queue limits."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
@@ -371,18 +368,17 @@
                                                                "extensions/admin-http-rpc/src/handler.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                   "crates/claw-http-api/src/admin.rs",
-                                                                   "crates/claw-http-api/tests/e2e.rs::tools_admin_mcp_and_webhooks_enforce_and_map_contracts"
+
                                                                    ],
                                                      "required":  "Authenticated POST /api/v1/admin/rpc dispatch tests prove method policy and error mapping."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known differences from the frozen upstream contract."
+                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
                                                ]
                      },
                      {
