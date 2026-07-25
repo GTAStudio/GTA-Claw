@@ -339,6 +339,26 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{ print $1 }'
 }
 
+write_spdx_package_inventory() {
+  local normalized_packages="$1"
+  local name
+  local version
+  local spdx_id
+  while IFS=' ' read -r name version; do
+    [[ -n "$name" && -n "$version" ]] || continue
+    spdx_id="$(printf '%s-%s' "$name" "$version" | tr -c 'A-Za-z0-9.-' '-')"
+    printf '\nPackageName: %s\n' "$name"
+    printf 'SPDXID: SPDXRef-Package-%s\n' "$spdx_id"
+    printf 'PackageVersion: %s\n' "$version"
+    printf 'PackageDownloadLocation: NOASSERTION\n'
+    printf 'FilesAnalyzed: false\n'
+    printf 'PackageLicenseConcluded: NOASSERTION\n'
+    printf 'PackageLicenseDeclared: NOASSERTION\n'
+    printf 'PackageCopyrightText: NOASSERTION\n'
+    printf 'ExternalRef: PACKAGE-MANAGER purl pkg:cargo/%s@%s\n' "$name" "$version"
+  done < <(LC_ALL=C sort -u <<<"$normalized_packages")
+}
+
 write_artifact_supply_chain() {
   local artifact="$1"
   local component_set="$2"
@@ -424,19 +444,7 @@ write_artifact_supply_chain() {
       version="${BASH_REMATCH[2]}"
       normalized_packages+="$name $version"$'\n'
     done <<<"$tree"
-    while read -r name version; do
-      [[ -n "$name" && -n "$version" ]] || continue
-      spdx_id="$(printf '%s-%s' "$name" "$version" | tr -c 'A-Za-z0-9.-' '-')"
-      printf '\nPackageName: %s\n' "$name"
-      printf 'SPDXID: SPDXRef-Package-%s\n' "$spdx_id"
-      printf 'PackageVersion: %s\n' "$version"
-      printf 'PackageDownloadLocation: NOASSERTION\n'
-      printf 'FilesAnalyzed: false\n'
-      printf 'PackageLicenseConcluded: NOASSERTION\n'
-      printf 'PackageLicenseDeclared: NOASSERTION\n'
-      printf 'PackageCopyrightText: NOASSERTION\n'
-      printf 'ExternalRef: PACKAGE-MANAGER purl pkg:cargo/%s@%s\n' "$name" "$version"
-    done < <(LC_ALL=C sort -u <<<"$normalized_packages")
+    write_spdx_package_inventory "$normalized_packages"
   } >"$sbom"
 
   printf '%s\n' \

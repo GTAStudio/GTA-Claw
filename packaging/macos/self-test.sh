@@ -77,6 +77,15 @@ expect_failure invalid-app-archive-label \
 expect_failure invalid-distribution-architectures \
   bash -c "source '$common'; distribution_expected_arches 'arm64 riscv64'"
 
+package_inventory="$(write_spdx_package_inventory $'alpha 1.0.0\nbeta 2.0.0\nalpha 1.0.0')"
+[[ "$(grep -c '^PackageName:' <<<"$package_inventory")" -eq 2 ]] ||
+  die "SPDX package inventory did not deduplicate package rows"
+grep -F 'PackageName: alpha' <<<"$package_inventory" >/dev/null ||
+  die "SPDX package inventory omitted alpha"
+grep -F 'PackageVersion: 2.0.0' <<<"$package_inventory" >/dev/null ||
+  die "SPDX package inventory omitted beta version"
+tests=$((tests + 1))
+
 expect_failure invalid-bundle-id env BUNDLE_ID=invalid bash -c "source '$common'"
 expect_failure invalid-version env VERSION=1.2-beta bash -c "source '$common'"
 expect_failure invalid-build-version env BUILD_VERSION=1.beta bash -c "source '$common'"

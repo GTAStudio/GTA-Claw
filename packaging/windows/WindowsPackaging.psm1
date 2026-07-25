@@ -265,9 +265,10 @@ function Initialize-MsvcEnvironment {
     if ($Architecture -eq 'arm64') {
         $component = 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
     }
-    $installationPath = (& $vswhere -latest -products '*' -requires $component -property installationPath |
-        Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
+    $installationPaths = @(& $vswhere -latest -products '*' -requires $component -property installationPath)
+    $vswhereExitCode = $LASTEXITCODE
+    $installationPath = $installationPaths | Select-Object -First 1
+    if ($vswhereExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
         throw "Visual Studio MSVC tools for '$Architecture' are not installed."
     }
     $developerCommand = Join-Path $installationPath 'Common7\Tools\VsDevCmd.bat'
