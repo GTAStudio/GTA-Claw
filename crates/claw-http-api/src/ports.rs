@@ -131,6 +131,8 @@ pub struct GenerationRequest {
     pub tool_choice: ToolChoice,
     /// Optional output token limit.
     pub max_tokens: Option<u64>,
+    /// Optional upper bound on emitted tool calls.
+    pub max_tool_calls: Option<u64>,
     /// Optional sampling temperature.
     pub temperature: Option<f64>,
     /// Optional top-p value.

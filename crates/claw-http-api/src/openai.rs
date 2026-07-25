@@ -29,6 +29,7 @@ use crate::ports::{
 use crate::state::ApiState;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatBody {
     model: Option<Value>,
     stream: Option<Value>,
@@ -281,6 +282,7 @@ pub(crate) async fn chat(
         tools,
         tool_choice: tool_choice.clone(),
         max_tokens,
+        max_tool_calls: None,
         temperature: body.temperature.as_ref().and_then(Value::as_f64),
         top_p: body.top_p.as_ref().and_then(Value::as_f64),
         frequency_penalty: body.frequency_penalty.as_ref().and_then(Value::as_f64),
@@ -310,7 +312,7 @@ pub(crate) async fn chat(
     }
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop::new(&cancellation);
-    let output = timeout(
+    let mut output = timeout(
         limits.operation_timeout,
         state
             .inner
@@ -321,7 +323,8 @@ pub(crate) async fn chat(
     .await
     .map_err(|_| provider_api_error(PortError::new(PortErrorKind::Timeout, "request timed out")))?
     .map_err(provider_api_error)?;
-    enforce_tool_choice(&tool_choice, &output.tool_calls)?;
+    enforce_tool_choice(&tool_choice, &generation.tools, &output.tool_calls)?;
+    enforce_output_constraints(&generation, &mut output)?;
     Ok(json_response(
         StatusCode::OK,
         chat_completion(&generation, output, state.unix_seconds()),
@@ -381,6 +384,7 @@ pub(crate) async fn responses(
         tools,
         tool_choice: tool_choice.clone(),
         max_tokens: body.max_output_tokens,
+        max_tool_calls: body.max_tool_calls,
         temperature: body.temperature,
         top_p: body.top_p,
         frequency_penalty: None,
@@ -398,7 +402,6 @@ pub(crate) async fn responses(
         session_id,
     )?;
     let _compat_fields = (
-        body.max_tool_calls,
         body.user,
         body.metadata,
         body.store,
@@ -424,7 +427,7 @@ pub(crate) async fn responses(
             .generate(generation.clone(), cancellation),
     )
     .await;
-    let output = match output {
+    let mut output = match output {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             return Ok(response_failure(
@@ -443,22 +446,23 @@ pub(crate) async fn responses(
             ));
         }
     };
-    if let Err(error) = enforce_tool_choice(&tool_choice, &output.tool_calls) {
-        let resource = response_resource(
+    if let Err(error) = enforce_tool_choice(&tool_choice, &generation.tools, &output.tool_calls) {
+        return Ok(constrained_response_failure(
+            &state,
             &response_id,
             &generation.model,
-            "failed",
-            Vec::new(),
             output.usage,
-            Some((
-                "api_error",
-                error.body["error"]["message"]
-                    .as_str()
-                    .unwrap_or("api error"),
-            )),
-            state.unix_seconds(),
-        );
-        return Ok(json_response(StatusCode::BAD_GATEWAY, resource));
+            &error,
+        ));
+    }
+    if let Err(error) = enforce_output_constraints(&generation, &mut output) {
+        return Ok(constrained_response_failure(
+            &state,
+            &response_id,
+            &generation.model,
+            output.usage,
+            &error,
+        ));
     }
     let items = response_items(&state, &output_item_id, &output);
     let status = if output.tool_calls.is_empty() {
@@ -516,20 +520,31 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
         }
         let mut tool_calls = Vec::new();
         let mut buffered_text = Vec::new();
-        let buffer_until_choice = tool_choice_requires_validation(&request.tool_choice);
+        let buffer_until_validation = generation_requires_output_validation(&request);
         while let Some(event) = provider_rx.recv().await {
             let value = match event {
                 GenerationEvent::Text(text) => {
-                    if buffer_until_choice {
+                    if buffer_until_validation {
                         buffered_text.push(text);
                         continue;
                     }
                     chat_chunk(&request, created, json!({"content": text}), Value::Null)
                 }
                 GenerationEvent::ToolCall(call) => {
+                    if let Err(error) = enforce_tool_choice(
+                        &request.tool_choice,
+                        &request.tools,
+                        std::slice::from_ref(&call),
+                    ) {
+                        cancellation.cancel();
+                        if send_event(&sse_tx, json_event(error.body), &cancellation).await {
+                            let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        }
+                        return;
+                    }
                     let index = tool_calls.len();
                     tool_calls.push(call.clone());
-                    if buffer_until_choice {
+                    if buffer_until_validation {
                         continue;
                     }
                     if !send_chat_tool_call(&sse_tx, &request, created, index, &call, &cancellation)
@@ -552,30 +567,42 @@ fn chat_stream(state: ApiState, request: GenerationRequest, include_usage: bool)
         };
         match provider_result {
             Ok(usage) => {
-                if let Err(error) = enforce_tool_choice(&request.tool_choice, &tool_calls) {
+                if let Err(error) =
+                    enforce_tool_choice(&request.tool_choice, &request.tools, &tool_calls)
+                {
                     if send_event(&sse_tx, json_event(error.body), &cancellation).await {
                         let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
                     }
                     return;
                 }
-                if buffer_until_choice {
-                    for text in buffered_text {
-                        if !send_event(
+                let mut output = GenerationOutput {
+                    text: buffered_text.concat(),
+                    tool_calls: tool_calls.clone(),
+                    usage,
+                };
+                if let Err(error) = enforce_output_constraints(&request, &mut output) {
+                    if send_event(&sse_tx, json_event(error.body), &cancellation).await {
+                        let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    }
+                    return;
+                }
+                if buffer_until_validation {
+                    if !output.text.is_empty()
+                        && !send_event(
                             &sse_tx,
                             json_event(chat_chunk(
                                 &request,
                                 created,
-                                json!({"content":text}),
+                                json!({"content":output.text}),
                                 Value::Null,
                             )),
                             &cancellation,
                         )
                         .await
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
-                    for (index, call) in tool_calls.iter().enumerate() {
+                    for (index, call) in output.tool_calls.iter().enumerate() {
                         if !send_chat_tool_call(
                             &sse_tx,
                             &request,
@@ -708,12 +735,12 @@ fn responses_stream(
         });
         let mut text = String::new();
         let mut calls = Vec::new();
-        let buffer_until_choice = tool_choice_requires_validation(&request.tool_choice);
+        let buffer_until_validation = generation_requires_output_validation(&request);
         while let Some(event) = provider_rx.recv().await {
             match event {
                 GenerationEvent::Text(delta) => {
                     text.push_str(&delta);
-                    if buffer_until_choice {
+                    if buffer_until_validation {
                         continue;
                     }
                     let event = named_event(
@@ -730,7 +757,48 @@ fn responses_stream(
                         return;
                     }
                 }
-                GenerationEvent::ToolCall(call) => calls.push(call),
+                GenerationEvent::ToolCall(call) => {
+                    if let Err(error) = enforce_tool_choice(
+                        &request.tool_choice,
+                        &request.tools,
+                        std::slice::from_ref(&call),
+                    ) {
+                        cancellation.cancel();
+                        send_response_failure(
+                            &sse_tx,
+                            &response_id,
+                            &request.model,
+                            PortError::new(
+                                PortErrorKind::Unavailable,
+                                constraint_error_message(&error).to_owned(),
+                            ),
+                            Usage::default(),
+                            created,
+                        )
+                        .await;
+                        return;
+                    }
+                    calls.push(call);
+                    if request
+                        .max_tool_calls
+                        .is_some_and(|limit| calls.len() as u64 > limit)
+                    {
+                        cancellation.cancel();
+                        send_response_failure(
+                            &sse_tx,
+                            &response_id,
+                            &request.model,
+                            PortError::new(
+                                PortErrorKind::Unavailable,
+                                "The provider exceeded the requested tool call limit.",
+                            ),
+                            Usage::default(),
+                            created,
+                        )
+                        .await;
+                        return;
+                    }
+                }
             }
         }
         let provider_result = match provider_task.await {
@@ -754,7 +822,7 @@ fn responses_stream(
                 return;
             }
         };
-        if let Err(error) = enforce_tool_choice(&request.tool_choice, &calls) {
+        if let Err(error) = enforce_tool_choice(&request.tool_choice, &request.tools, &calls) {
             send_response_failure(
                 &sse_tx,
                 &response_id,
@@ -771,7 +839,32 @@ fn responses_stream(
             .await;
             return;
         }
-        if buffer_until_choice
+        let mut output = GenerationOutput {
+            text,
+            tool_calls: calls,
+            usage,
+        };
+        if let Err(error) = enforce_output_constraints(&request, &mut output) {
+            send_response_failure(
+                &sse_tx,
+                &response_id,
+                &request.model,
+                PortError::new(
+                    PortErrorKind::Unavailable,
+                    constraint_error_message(&error).to_owned(),
+                ),
+                output.usage,
+                created,
+            )
+            .await;
+            return;
+        }
+        let GenerationOutput {
+            text,
+            tool_calls: calls,
+            usage,
+        } = output;
+        if buffer_until_validation
             && !text.is_empty()
             && !send_event(
                 &sse_tx,
@@ -1627,8 +1720,11 @@ fn validate_responses_body(value: &Value) -> Result<(), ApiError> {
     }
     if object
         .get("truncation")
-        .is_some_and(|value| !matches!(value.as_str(), Some("auto" | "disabled")))
+        .is_some_and(|value| value.as_str() != Some("auto"))
     {
+        return Err(invalid_responses());
+    }
+    if object.get("store").and_then(Value::as_bool) == Some(false) {
         return Err(invalid_responses());
     }
     if let Some(tools) = object.get("tools") {
@@ -1866,11 +1962,12 @@ fn parse_response_format(value: Option<&Value>) -> Result<Option<Value>, ApiErro
     })?;
     if !matches!(
         object.get("type").and_then(Value::as_str),
-        Some("text" | "json_object" | "json_schema")
-    ) {
+        Some("text" | "json_object")
+    ) || object.len() != 1
+    {
         return Err(ApiError::openai(
             StatusCode::BAD_REQUEST,
-            "Invalid response_format: response_format.type must be text, json_object, or json_schema",
+            "Invalid response_format: only text and json_object are supported",
             "invalid_request_error",
         ));
     }
@@ -1923,6 +2020,12 @@ fn parse_chat_tools(value: Option<&Value>) -> Result<Vec<ClientTool>, ApiError> 
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or_else(invalid_tools)?;
+            if function
+                .get("strict")
+                .is_some_and(|strict| !strict.is_null() && strict.as_bool() != Some(false))
+            {
+                return Err(invalid_tools());
+            }
             Ok(ClientTool {
                 name: name.to_owned(),
                 description: function
@@ -1940,10 +2043,9 @@ fn parse_response_tools(tools: Option<Vec<ResponseTool>>) -> Result<Vec<ClientTo
         .unwrap_or_default()
         .into_iter()
         .map(|tool| {
-            if tool.kind != "function" || tool.name.trim().is_empty() {
+            if tool.kind != "function" || tool.name.trim().is_empty() || tool.strict == Some(true) {
                 return Err(invalid_tools());
             }
-            let _strict = tool.strict;
             Ok(ClientTool {
                 name: tool.name,
                 description: tool.description,
@@ -1984,26 +2086,133 @@ fn parse_tool_choice(value: Option<&Value>, tools: &[ClientTool]) -> Result<Tool
     Ok(ToolChoice::Function(name.to_owned()))
 }
 
-fn enforce_tool_choice(choice: &ToolChoice, calls: &[ToolCall]) -> Result<(), ApiError> {
+fn enforce_tool_choice(
+    choice: &ToolChoice,
+    tools: &[ClientTool],
+    calls: &[ToolCall],
+) -> Result<(), ApiError> {
+    if matches!(choice, ToolChoice::None) && !calls.is_empty() {
+        return Err(output_constraint_error(
+            "The provider called a tool despite tool_choice being none.",
+        ));
+    }
+    if calls
+        .iter()
+        .any(|call| !tools.iter().any(|tool| tool.name == call.name))
+    {
+        return Err(output_constraint_error(
+            "The provider called a tool that was not supplied by the client.",
+        ));
+    }
     let satisfied = match choice {
         ToolChoice::Auto => true,
-        ToolChoice::None => calls.is_empty(),
+        ToolChoice::None => true,
         ToolChoice::Required => !calls.is_empty(),
         ToolChoice::Function(name) => calls.iter().any(|call| call.name == *name),
     };
     if satisfied {
         Ok(())
     } else {
-        Err(ApiError::openai(
-            StatusCode::BAD_GATEWAY,
-            "The model did not call the required tool.",
-            "api_error",
-        ))
+        let message = match choice {
+            ToolChoice::None => "The provider called a tool despite tool_choice being none.",
+            ToolChoice::Required | ToolChoice::Function(_) => {
+                "The model did not call the required tool."
+            }
+            ToolChoice::Auto => "The provider violated the requested tool policy.",
+        };
+        Err(output_constraint_error(message))
     }
 }
 
 fn tool_choice_requires_validation(choice: &ToolChoice) -> bool {
     !matches!(choice, ToolChoice::Auto)
+}
+
+fn generation_requires_output_validation(request: &GenerationRequest) -> bool {
+    tool_choice_requires_validation(&request.tool_choice)
+        || request.max_tokens.is_some()
+        || request.max_tool_calls.is_some()
+        || request.stop.is_some()
+        || request.response_format.is_some()
+}
+
+fn enforce_output_constraints(
+    request: &GenerationRequest,
+    output: &mut GenerationOutput,
+) -> Result<(), ApiError> {
+    if request
+        .max_tokens
+        .is_some_and(|limit| output.usage.output_tokens > limit)
+    {
+        return Err(output_constraint_error(
+            "The provider exceeded the requested output token limit.",
+        ));
+    }
+    if request
+        .max_tool_calls
+        .is_some_and(|limit| output.tool_calls.len() as u64 > limit)
+    {
+        return Err(output_constraint_error(
+            "The provider exceeded the requested tool call limit.",
+        ));
+    }
+    if let Some(stop) = &request.stop
+        && let Some(index) = stop
+            .iter()
+            .filter_map(|sequence| output.text.find(sequence))
+            .min()
+    {
+        output.text.truncate(index);
+    }
+    if output.tool_calls.is_empty()
+        && request
+            .response_format
+            .as_ref()
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str)
+            == Some("json_object")
+    {
+        let value = serde_json::from_str::<Value>(&output.text).map_err(|_| {
+            output_constraint_error("The provider did not return the requested JSON object.")
+        })?;
+        if !value.is_object() {
+            return Err(output_constraint_error(
+                "The provider did not return the requested JSON object.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn output_constraint_error(message: &str) -> ApiError {
+    ApiError::openai(StatusCode::BAD_GATEWAY, message, "api_error")
+}
+
+fn constraint_error_message(error: &ApiError) -> &str {
+    error.body["error"]["message"]
+        .as_str()
+        .unwrap_or("The provider violated an output constraint.")
+}
+
+fn constrained_response_failure(
+    state: &ApiState,
+    response_id: &str,
+    model: &str,
+    usage: Usage,
+    error: &ApiError,
+) -> Response {
+    json_response(
+        StatusCode::BAD_GATEWAY,
+        response_resource(
+            response_id,
+            model,
+            "failed",
+            Vec::new(),
+            usage,
+            Some(("api_error", constraint_error_message(error))),
+            state.unix_seconds(),
+        ),
+    )
 }
 
 fn tools_for_choice(mut tools: Vec<ClientTool>, choice: &ToolChoice) -> Vec<ClientTool> {
