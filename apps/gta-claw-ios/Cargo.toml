@@ -1,0 +1,27 @@
+[package]
+name = "gta-claw-ios"
+description = "UI-independent iOS client core for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+claw-application.workspace = true
+claw-gateway-client.workspace = true
+claw-platform.workspace = true
+claw-protocol.workspace = true
+claw-security.workspace = true
+secrecy = "=0.10.3"
+url = "=2.5.8"
+
+[dev-dependencies]
+claw-clients.workspace = true
+rand_chacha = "=0.10.0"
+serde_json.workspace = true
+tokio = { version = "=1.52.3", features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

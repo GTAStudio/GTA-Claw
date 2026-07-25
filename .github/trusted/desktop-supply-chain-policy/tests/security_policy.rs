@@ -2906,6 +2906,35 @@ fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
 }
 
 #[test]
+fn repository_policy_activation_rejects_self_hosted_runners() {
+    let trusted = final_tree("repository-policy-runner-base");
+    deactivate_repository_policy(&trusted);
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open inactive policy base");
+
+    for runner in ["self-hosted", "[self-hosted, windows]"] {
+        let candidate = final_tree("repository-policy-runner-candidate");
+        deactivate_repository_policy(&candidate);
+        activate_repository_policy(&candidate);
+        replace(
+            &candidate.join(".github/workflows/upstream-gateway-reference.yml"),
+            "runs-on: windows-latest",
+            &format!("runs-on: {runner}"),
+        );
+
+        let error = validate_repository_policy_transition(
+            &trusted_root,
+            &SafeRoot::new(&candidate.path).expect("open self-hosted runner candidate"),
+        )
+        .expect_err("candidate-controlled repository-policy runner unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error, "repository-policy test job shape or execution order changed",
+            "self-hosted runner {runner:?} failed through the wrong rule"
+        );
+    }
+}
+
+#[test]
 fn root_workspace_growth_rejects_orphans_nested_locks_sources_and_gui() {
     let cases = [
         "orphan",
