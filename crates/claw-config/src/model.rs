@@ -1,4 +1,7 @@
-use std::fmt::{self, Display, Formatter};
+use std::error::Error;
+use std::fmt::{self, Debug, Display, Formatter};
+
+use serde::{Serialize, Serializer};
 
 /// The only configuration schema version currently implemented.
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -31,7 +34,7 @@ pub enum ConfigDomain {
 }
 
 /// A non-secret reference to secret material.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SecretRef(String);
 
 impl SecretRef {
@@ -47,10 +50,13 @@ impl SecretRef {
     /// Parses a persisted reference. Plaintext values are rejected.
     pub fn parse(value: impl Into<String>) -> Result<Self, &'static str> {
         let value = value.into();
-        let Some(name) = value.strip_prefix("env:") else {
-            return Err("only env:<NAME> secret references are supported");
-        };
-        Self::environment(name)
+        if let Some(name) = value.strip_prefix("env:") {
+            return Self::environment(name);
+        }
+        if valid_platform_secret_reference(&value) {
+            return Ok(Self(value));
+        }
+        Err("only env:<NAME> secret references are supported")
     }
 
     /// Returns the reference string, never the referenced secret.
@@ -62,7 +68,22 @@ impl SecretRef {
 
 impl Display for SecretRef {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str("secret-ref:[REDACTED]")
+    }
+}
+
+impl Debug for SecretRef {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretRef([REDACTED])")
+    }
+}
+
+impl Serialize for SecretRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("secret-ref:[REDACTED]")
     }
 }
 
@@ -70,6 +91,134 @@ fn is_environment_name(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
         && chars.all(|character| matches!(character, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
+}
+
+fn valid_platform_secret_reference(value: &str) -> bool {
+    let Some((scheme, identifier)) = value.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "keyring" | "service" | "fd")
+        || identifier.is_empty()
+        || value.contains(['?', '#', '@', '%'])
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    if scheme == "fd" {
+        return identifier.bytes().all(|byte| byte.is_ascii_digit())
+            && (identifier == "0" || !identifier.starts_with('0'));
+    }
+    let mut parts = identifier.split('/');
+    let first = parts.next();
+    let second = parts.next();
+    first.is_some_and(valid_secret_identifier)
+        && second.is_some_and(valid_secret_identifier)
+        && parts.next().is_none()
+}
+
+fn valid_secret_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
+/// Borrowed secret bytes passed directly to a platform secret store.
+///
+/// Formatting and serialization are always redacted. Only secret-store
+/// implementations can request the plaintext through [`Self::expose`].
+pub struct SecretMaterial<'a>(&'a str);
+
+impl<'a> SecretMaterial<'a> {
+    /// Wraps plaintext for immediate transfer to a secret store.
+    #[must_use]
+    pub const fn new(value: &'a str) -> Self {
+        Self(value)
+    }
+
+    /// Exposes plaintext to the platform store implementation.
+    #[must_use]
+    pub const fn expose(&self) -> &'a str {
+        self.0
+    }
+}
+
+impl Debug for SecretMaterial<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretMaterial([REDACTED])")
+    }
+}
+
+impl Display for SecretMaterial<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for SecretMaterial<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("[REDACTED]")
+    }
+}
+
+/// Platform adapter that persists plaintext and returns only a reference.
+pub trait PlatformSecretStore {
+    /// Backend error that must not include the secret bytes.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Stores one value under a non-secret logical label.
+    fn store(&mut self, label: &str, secret: SecretMaterial<'_>) -> Result<SecretRef, Self::Error>;
+}
+
+/// Stores secret material without retaining it in configuration.
+pub fn store_secret<S: PlatformSecretStore>(
+    store: &mut S,
+    label: &str,
+    plaintext: &str,
+) -> Result<SecretRef, SecretStoreError<S::Error>> {
+    if label.is_empty()
+        || label.len() > 128
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(SecretStoreError::InvalidLabel);
+    }
+    store
+        .store(label, SecretMaterial::new(plaintext))
+        .map_err(SecretStoreError::Backend)
+}
+
+/// Failure to route secret material to a platform store.
+#[derive(Debug)]
+pub enum SecretStoreError<E> {
+    /// The logical label was empty, too long, or malformed.
+    InvalidLabel,
+    /// The platform backend rejected the write.
+    Backend(E),
+}
+
+impl<E: Display> Display for SecretStoreError<E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLabel => formatter.write_str("invalid platform secret label"),
+            Self::Backend(error) => write!(formatter, "platform secret store failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for SecretStoreError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidLabel => None,
+            Self::Backend(error) => Some(error),
+        }
+    }
 }
 
 /// A fully parsed and validated immutable configuration.

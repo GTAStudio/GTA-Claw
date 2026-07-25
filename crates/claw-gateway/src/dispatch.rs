@@ -297,14 +297,26 @@ mod tests {
         }
     }
 
+    /// Consistency check between two production surfaces, NOT frozen-file
+    /// conformance.
+    ///
+    /// `MethodRegistry::with_dynamic_resolver` builds itself from
+    /// `core_methods()`, so comparing the registry against `core_methods()`
+    /// can only prove the constructor neither drops nor duplicates an entry
+    /// while transferring it into the map. It would stay green if
+    /// `core_methods()` itself drifted away from the frozen inventory.
+    ///
+    /// Conformance against `compat/upstream/inventories/gateway-protocol.json`
+    /// is proved independently, by reading that file from disk, in
+    /// `tests/frozen_catalog.rs::the_registry_holds_exactly_the_frozen_method_set`.
     #[test]
-    fn registry_key_set_equals_the_frozen_catalog() {
+    fn registry_key_set_equals_its_own_descriptor_table() {
         let registry = MethodRegistry::new();
-        let mut frozen: Vec<&'static str> =
+        let mut descriptors: Vec<&'static str> =
             core_methods().iter().map(|method| method.name()).collect();
-        frozen.sort_unstable();
-        assert_eq!(registry.names(), frozen);
-        assert_eq!(registry.len(), frozen.len());
+        descriptors.sort_unstable();
+        assert_eq!(registry.names(), descriptors);
+        assert_eq!(registry.len(), descriptors.len());
     }
 
     #[test]
@@ -444,8 +456,19 @@ mod tests {
         assert_eq!(registry.canonical_name("sessions.List"), None);
     }
 
+    /// Consistency check between two production surfaces, NOT frozen-file
+    /// conformance.
+    ///
+    /// Both sides originate in `core_methods()`, so this only proves the
+    /// registry carries each descriptor's `advertised` flag across
+    /// construction unchanged. The frozen inventory never enters the
+    /// comparison.
+    ///
+    /// The advertised set is checked against the frozen `advertised` flags,
+    /// read from disk, in
+    /// `tests/frozen_catalog.rs::the_advertised_set_matches_the_frozen_advertised_flags`.
     #[test]
-    fn advertised_and_catalogued_counts_match_the_frozen_descriptors() {
+    fn advertised_names_mirror_their_own_descriptor_flags() {
         let registry = MethodRegistry::new();
         let advertised = core_methods()
             .iter()
