@@ -41,6 +41,8 @@ pub struct FeatureReport {
     pub title: String,
     /// Measured implementation state.
     pub status: ParityStatus,
+    /// Whether any metadata or implementation claim is registered.
+    pub registered: bool,
     /// Number of verified evidence records.
     pub evidence_count: usize,
 }
@@ -58,6 +60,8 @@ pub struct LedgerReport {
     pub partial: usize,
     /// Unimplemented row count.
     pub unimplemented: usize,
+    /// Rows with any metadata or implementation registration.
+    pub registered: usize,
 }
 
 /// Coverage summary for one inventory.
@@ -67,7 +71,7 @@ pub struct InventoryCoverage {
     pub inventory_id: String,
     /// Rows with verified complete claims.
     pub fully_implemented: usize,
-    /// Rows with any verified partial or complete claim.
+    /// Rows with any metadata, partial, or complete registration.
     pub registered: usize,
     /// Frozen row count.
     pub total: usize,
@@ -84,6 +88,8 @@ pub struct ParityTotals {
     pub unimplemented: usize,
     /// Total frozen feature rows.
     pub total: usize,
+    /// Feature rows with any metadata or implementation registration.
+    pub registered: usize,
 }
 
 /// Complete machine-readable parity report.
@@ -109,19 +115,20 @@ impl ParityReport {
         writeln!(output).expect("writing to String cannot fail");
         writeln!(
             output,
-            "{:<25} {:<45} {:<14} Evidence",
-            "Ledger", "Feature", "Status"
+            "{:<25} {:<45} {:<14} {:<10} Evidence",
+            "Ledger", "Feature", "Status", "Registered"
         )
         .expect("writing to String cannot fail");
-        writeln!(output, "{}", "-".repeat(100)).expect("writing to String cannot fail");
+        writeln!(output, "{}", "-".repeat(111)).expect("writing to String cannot fail");
         for ledger in &self.ledgers {
             for feature in &ledger.features {
                 writeln!(
                     output,
-                    "{:<25} {:<45} {:<14} {}",
+                    "{:<25} {:<45} {:<14} {:<10} {}",
                     ledger.ledger_id,
                     feature.feature_id,
                     feature.status.as_str(),
+                    if feature.registered { "yes" } else { "no" },
                     feature.evidence_count
                 )
                 .expect("writing to String cannot fail");
@@ -130,11 +137,12 @@ impl ParityReport {
         writeln!(output).expect("writing to String cannot fail");
         writeln!(
             output,
-            "Feature rows: {} of {} implemented, {} partial, {} unimplemented",
+            "Feature rows: {} of {} implemented, {} partial, {} unimplemented, {} registered",
             self.totals.implemented,
             self.totals.total,
             self.totals.partial,
-            self.totals.unimplemented
+            self.totals.unimplemented,
+            self.totals.registered
         )
         .expect("writing to String cannot fail");
         writeln!(output).expect("writing to String cannot fail");
@@ -186,7 +194,9 @@ pub fn generate_report(
                 "feature ID is not present in the frozen ledgers".to_owned(),
             ));
         }
-        validate_evidence(repository_root, feature_id, &claim.evidence)?;
+        if claim.level != ClaimLevel::Registered || !claim.evidence.is_empty() {
+            validate_evidence(repository_root, feature_id, &claim.evidence)?;
+        }
     }
 
     let known_inventory = contract
@@ -206,11 +216,13 @@ pub fn generate_report(
                 "inventory record is not present in the frozen inventories".to_owned(),
             ));
         }
-        validate_evidence(
-            repository_root,
-            &format!("{inventory_id}:{record_id}"),
-            &claim.evidence,
-        )?;
+        if claim.level != ClaimLevel::Registered || !claim.evidence.is_empty() {
+            validate_evidence(
+                repository_root,
+                &format!("{inventory_id}:{record_id}"),
+                &claim.evidence,
+            )?;
+        }
     }
 
     let ledgers = contract
@@ -224,6 +236,7 @@ pub fn generate_report(
                     let claim = registry.features.get(feature.id());
                     let status =
                         claim.map_or(ParityStatus::Unimplemented, |claim| match claim.level {
+                            ClaimLevel::Registered => ParityStatus::Unimplemented,
                             ClaimLevel::Partial => ParityStatus::Partial,
                             ClaimLevel::Implemented => ParityStatus::Implemented,
                         });
@@ -231,6 +244,7 @@ pub fn generate_report(
                         feature_id: feature.id().to_owned(),
                         title: feature.title().to_owned(),
                         status,
+                        registered: claim.is_some(),
                         evidence_count: claim.map_or(0, |claim| claim.evidence.len()),
                     }
                 })
@@ -238,12 +252,14 @@ pub fn generate_report(
             let implemented = count_status(&features, ParityStatus::Implemented);
             let partial = count_status(&features, ParityStatus::Partial);
             let unimplemented = count_status(&features, ParityStatus::Unimplemented);
+            let registered = features.iter().filter(|feature| feature.registered).count();
             LedgerReport {
                 ledger_id: ledger.id().to_owned(),
                 features,
                 implemented,
                 partial,
                 unimplemented,
+                registered,
             }
         })
         .collect::<Vec<_>>();
@@ -275,6 +291,7 @@ pub fn generate_report(
         partial: ledgers.iter().map(|ledger| ledger.partial).sum(),
         unimplemented: ledgers.iter().map(|ledger| ledger.unimplemented).sum(),
         total: ledgers.iter().map(|ledger| ledger.features.len()).sum(),
+        registered: ledgers.iter().map(|ledger| ledger.registered).sum(),
     };
 
     Ok(ParityReport {

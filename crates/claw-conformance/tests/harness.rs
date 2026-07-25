@@ -152,6 +152,7 @@ fn zero_registry_reports_the_honest_baseline() {
     assert_eq!(report.totals.partial, 0);
     assert_eq!(report.totals.unimplemented, 47);
     assert_eq!(report.totals.total, 47);
+    assert_eq!(report.totals.registered, 0);
     assert_eq!(
         report
             .ledgers
@@ -160,6 +161,15 @@ fn zero_registry_reports_the_honest_baseline() {
             .map(|feature| feature.status)
             .collect::<Vec<_>>(),
         vec![ParityStatus::Unimplemented; 47]
+    );
+    assert_eq!(
+        report
+            .ledgers
+            .iter()
+            .flat_map(|ledger| ledger.features.iter())
+            .filter(|feature| feature.registered)
+            .count(),
+        0
     );
     assert_eq!(
         report
@@ -204,6 +214,41 @@ fn fabricated_evidence_free_claim_is_rejected() {
     assert_eq!(error.subject(), Some("gateway.protocol.v4"));
     assert_eq!(error.json_path(), None);
     assert_eq!(error.message(), "claim has no recorded evidence");
+}
+
+#[test]
+fn metadata_registration_never_inflates_implementation() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::registered("gateway.protocol.v4"))
+        .expect("register feature metadata");
+    registry
+        .register_inventory(InventoryClaim::registered("providers", "provider:qianfan"))
+        .expect("register inventory metadata");
+
+    let report = generate_report(&contract, &registry, repository_root()).expect("generate report");
+    assert_eq!(report.totals.implemented, 0);
+    assert_eq!(report.totals.partial, 0);
+    assert_eq!(report.totals.unimplemented, 47);
+    assert_eq!(report.totals.registered, 1);
+    let feature = report
+        .ledgers
+        .iter()
+        .flat_map(|ledger| ledger.features.iter())
+        .find(|feature| feature.feature_id == "gateway.protocol.v4")
+        .expect("feature report");
+    assert_eq!(feature.status, ParityStatus::Unimplemented);
+    assert!(feature.registered);
+    assert_eq!(feature.evidence_count, 0);
+    let providers = report
+        .inventories
+        .iter()
+        .find(|inventory| inventory.inventory_id == "providers")
+        .expect("providers report");
+    assert_eq!(providers.fully_implemented, 0);
+    assert_eq!(providers.registered, 1);
+    assert_eq!(providers.total, 78);
 }
 
 #[test]
@@ -268,6 +313,7 @@ fn verified_feature_and_inventory_claims_are_counted() {
     assert_eq!(report.totals.implemented, 1);
     assert_eq!(report.totals.partial, 0);
     assert_eq!(report.totals.unimplemented, 46);
+    assert_eq!(report.totals.registered, 1);
     let providers = report
         .inventories
         .iter()

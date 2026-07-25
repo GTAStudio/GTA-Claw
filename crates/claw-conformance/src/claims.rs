@@ -12,6 +12,8 @@ use crate::error::{ConformanceError, ViolationCode};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimLevel {
+    /// Metadata registration only; no implementation behavior is claimed.
+    Registered,
     /// Some, but not all, frozen behavior is implemented.
     Partial,
     /// The complete frozen contract is implemented.
@@ -62,6 +64,12 @@ impl FeatureClaim {
         }
     }
 
+    /// Registers a feature's ownership or metadata without claiming behavior.
+    #[must_use]
+    pub fn registered(feature_id: impl Into<String>) -> Self {
+        Self::new(feature_id, ClaimLevel::Registered, Vec::new())
+    }
+
     /// Creates a fully implemented feature claim.
     #[must_use]
     pub fn implemented(feature_id: impl Into<String>, evidence: Vec<Evidence>) -> Self {
@@ -104,6 +112,12 @@ impl InventoryClaim {
             level,
             evidence,
         }
+    }
+
+    /// Registers an inventory record's ownership or metadata without claiming behavior.
+    #[must_use]
+    pub fn registered(inventory_id: impl Into<String>, record_id: impl Into<String>) -> Self {
+        Self::new(inventory_id, record_id, ClaimLevel::Registered, Vec::new())
     }
 
     /// Creates a fully implemented inventory claim.
