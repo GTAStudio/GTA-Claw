@@ -373,11 +373,17 @@ impl Sandbox {
     /// Writes a whole file, refusing links, escapes, and oversized content.
     ///
     /// Ordering is the security property. The target is opened with no
-    /// destructive flag, the opened handle and the pinned ancestor chain are
-    /// re-verified, and only then is the file truncated. A process that wins a
-    /// race to swap a directory therefore never gets a file truncated or
-    /// written: the worst it achieves is an empty file it must already have
-    /// been able to create, which is removed again on the failure path.
+    /// destructive flag, then the opened handle itself is re-verified against
+    /// the validated path and the pinned ancestor chain, and only then is the
+    /// file truncated. A process that wins a race to swap a directory therefore
+    /// never gets a file truncated or written.
+    ///
+    /// The residual on Unix is bounded and non-destructive: an ancestor swapped
+    /// and restored inside the window can cause an empty file to be created
+    /// outside the root, at a location the racing process already had the
+    /// access to create for itself. It is refused before any content is
+    /// written, but the cleanup path removes the in-root name rather than the
+    /// file that was actually created, so that empty file can persist.
     pub fn write_file(
         &self,
         path: &RelativePath,
@@ -402,7 +408,8 @@ impl Sandbox {
         let mut file = options.open(&prepared.absolute).map_err(map_io)?;
         let verified = verify_handle_is_not_reparse_point(&file)
             .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
-            .and_then(|()| prepared.pin.verify());
+            .and_then(|()| prepared.pin.verify())
+            .and_then(|()| verify_handle_matches_path(&file, &prepared.absolute));
         if let Err(error) = verified {
             drop(file);
             if !prepared.existed {
@@ -492,6 +499,9 @@ impl Sandbox {
         verify_handle_is_not_reparse_point(&file)?;
         self.verify_canonical(&absolute, components)?;
         pin.verify()?;
+        // Last, because it is the only check that can see an ancestor swap
+        // which was reverted before the checks above ran.
+        verify_handle_matches_path(&file, &absolute)?;
         Ok(file)
     }
 
@@ -792,6 +802,43 @@ fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
     } else {
         Ok(())
     }
+}
+
+/// Confirms the opened handle really is the file the validated path names.
+///
+/// This closes the last "validate a name, then act on the name" gap in the
+/// write and read paths. `O_NOFOLLOW` protects only the final component, so an
+/// ancestor directory swapped for a link between validation and open redirects
+/// the open to a file outside the root. Re-canonicalising the path cannot see
+/// that, because an attacker who restores the honest directory before the check
+/// leaves the name resolving exactly where it should, and the ancestor identity
+/// comparison cannot see it either because the restored directory is the same
+/// object it always was.
+///
+/// The handle is the only witness of what was actually opened, so it is what is
+/// compared: if the validated path now names a different object from the one
+/// held open, the open went somewhere else and the operation is refused before
+/// anything is truncated or read.
+#[cfg(unix)]
+fn verify_handle_matches_path(file: &File, absolute: &Path) -> Result<(), SandboxError> {
+    let opened = identity_of(&file.metadata().map_err(map_io)?);
+    let named = identity_of(&std::fs::symlink_metadata(absolute).map_err(map_io)?);
+    if opened == named {
+        Ok(())
+    } else {
+        Err(SandboxError::RaceDetected)
+    }
+}
+
+/// Windows counterpart, where the swap this guards against cannot happen.
+///
+/// Pinned ancestors are held without `FILE_SHARE_DELETE`, so the kernel refuses
+/// to rename or delete them while the pin lives. That is prevention rather than
+/// detection, and it is why no identity comparison is needed here; Windows also
+/// exposes no stable file identity on stable Rust.
+#[cfg(not(unix))]
+fn verify_handle_matches_path(_file: &File, _absolute: &Path) -> Result<(), SandboxError> {
+    Ok(())
 }
 
 /// Strips the Windows `\\?\` verbatim prefix from a drive path.
@@ -1186,5 +1233,35 @@ mod tests {
             strip_verbatim_prefix(Path::new("relative/a.txt")),
             PathBuf::from("relative/a.txt")
         );
+    }
+
+    /// The race test that found this hole is timing dependent, so the primitive
+    /// closing it is also proved deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn a_handle_is_refused_when_the_validated_name_resolves_elsewhere() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("claw-handle-identity-{nanos}"));
+        std::fs::create_dir_all(&root).expect("create the scratch directory");
+        let held = root.join("held.txt");
+        let other = root.join("other.txt");
+        std::fs::write(&held, b"held").expect("write the held file");
+        std::fs::write(&other, b"other").expect("write the other file");
+
+        let file = File::open(&held).expect("open the held file");
+        assert_eq!(verify_handle_matches_path(&file, &held), Ok(()));
+        assert_eq!(
+            verify_handle_matches_path(&file, &other),
+            Err(SandboxError::RaceDetected),
+            "a handle on one file passed validation against a different file"
+        );
+
+        // A name that no longer resolves at all is equally not the open handle.
+        std::fs::remove_file(&other).expect("remove the other file");
+        assert!(verify_handle_matches_path(&file, &other).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
