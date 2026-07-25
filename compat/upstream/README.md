@@ -246,6 +246,55 @@ Auto-discovery is suppressed by `autotests = false` and `autobins = false`, and 
 file named by an explicit target section is governed by that section alone —
 auto-discovery must not resurrect a target the manifest disabled.
 
+##### The owning package must itself be built
+
+Reachability from a target root proves cargo would compile the file **within its
+package**. It says nothing about whether anything builds that package. A package
+that no workspace lists is never compiled by `cargo test` at the repository root,
+so a `#[test]` inside it never runs — and adding one is a two-file change needing
+no unusual Rust and no manifest trickery, which makes it the cheapest forgery in
+the pipeline if membership is not checked.
+
+`validate.ps1` therefore also requires the owning package to be built. Walking up
+from the package directory, the **first** ancestor `Cargo.toml` carrying a
+`[workspace]` table decides, exactly as cargo does:
+
+- a manifest carrying its own `[workspace]` table is a separate build root and is
+  built on its own terms;
+- otherwise the package must match an entry of that workspace's `members`, where
+  entries may be globs (`crates/*` matches `crates/foo` but not
+  `crates/foo/bar`; `**` crosses separators);
+- an `exclude` entry removes the named directory and everything beneath it, and
+  is checked before `members`;
+- `members` and `exclude` are read from the `[workspace]` table only. Neither
+  `[workspace.package]` nor `[workspace.dependencies]` confers membership —
+  honouring a path there would repeat the mistake of treating a bare `path =`
+  under `[dependencies.<name>]` as a target.
+
+Two deliberate limits, both disclosed rather than left to be found:
+
+- Cargo also treats a **path dependency of a member** as a member. This validator
+  does not, so it is the stricter side: a package cargo builds but the workspace
+  manifest does not list is rejected. The repository lists all twenty-five root
+  members explicitly, so this costs nothing today, and the remedy when it does
+  cost something is one line in the workspace manifest rather than a change to
+  any production source.
+- A manifest carrying its own `[workspace]` is accepted as built. Whether CI
+  actually invokes that workspace is not statically knowable — the workflow files
+  are outside this contract and are themselves unpinned — so tightening here
+  would be a guess that falsely rejects real evidence. Two such roots exist
+  (`desktop/` and `.github/trusted/desktop-supply-chain-policy/`) and both are
+  built by named CI jobs. This is pinned in the **accepting** direction by
+  `implemented-citing-self-rooted-workspace-package-passes` so it cannot change
+  silently.
+
+Verified against cargo itself rather than reasoned: on a planted workspace,
+`cargo test --workspace` compiles only the listed member and never touches an
+unlisted or excluded package, and expands a `crates/*` member glob. On the real
+tree the rule changes **no** verdict — all twenty-seven packages are accounted
+for by twenty-five root members, one `desktop/` member and one self-rooted
+workspace.
+
 Three limits, stated plainly rather than left to be discovered:
 
 - The rule catches files that **nothing references**, and targets that
@@ -280,9 +329,9 @@ The two implementations are therefore intended to be **identical**, not merely
 ordered. A divergence in *either* direction is a defect and must be reported
 rather than managed: if this validator were the looser side, a row it blesses
 could be rejected by the parity report. The specification above is deliberately
-complete enough to be mirrored; the twenty-three `implemented-citing-*` cases in
-`validate-self-test.ps1` are its executable form — thirteen that must be rejected
-and ten that must be accepted.
+complete enough to be mirrored; the twenty-seven `implemented-citing-*` cases in
+`validate-self-test.ps1` are its executable form — fifteen that must be rejected
+and twelve that must be accepted.
 
 The root set is derived here by reading the manifest rather than by shelling out
 to `cargo metadata`, which keeps this trust root hermetic: it reads files and
@@ -295,11 +344,12 @@ expressed in `cargo metadata` at all, which still reports such a target as
 `test = true`.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. Eight of the ten accepting cases pin reachability — a
+true-positive ones. Ten of the twelve accepting cases pin reachability — a
 `mod`-wired module, a `#[path]`-relocated module, a transitive `lib.rs` →
 `nested/mod.rs` → `nested/deep.rs` chain, a `src/bin/` target, a top-level
 `#[path]` sibling, the child of a `#[path]`-named `mod.rs`, a raw-string
-`#[path]`, and a `pub(crate) mod` — so that a later "improvement" to this rule
+`#[path]`, a `pub(crate) mod`, a glob-matched workspace member, and a package
+carrying its own `[workspace]` — so that a later "improvement" to this rule
 cannot quietly turn it into a false-rejection engine without turning the
 self-test red. The other two pin the enabled-test oracle. The `src/bin/` case is
 there specifically because dropping `benches/` and `examples/` from the root set
@@ -461,9 +511,9 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 193 child
+The adversarial self-test is a separate, slower step. It spawns 233 child
 validator processes — one baseline run against the real tree, one per each of the
-121 cases, and a re-blessing pre-run for the 71 cases that model an attacker who
+141 cases, and a re-blessing pre-run for the 91 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:

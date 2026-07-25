@@ -42,7 +42,12 @@ $SyntheticTestName = "parity_is_proven_here"
 function New-SyntheticRepositoryRoot {
     param([string]$Root)
     $files = [ordered]@{
-        "Cargo.toml" = "[workspace]`nmembers = [`"crates/synthetic`"]`n"
+        "Cargo.toml" = ("[workspace]`nmembers = [`n" +
+            "  `"crates/synthetic`",`n" +
+            "  `"crates/decoy`",`n" +
+            "  `"crates/nonrunning`",`n" +
+            "  `"globbed/*`",`n" +
+            "]`nexclude = [`"vendored`"]`n")
         "crates/synthetic/Cargo.toml" = "[package]`nname = `"synthetic`"`n"
         "crates/synthetic/tests/enabled.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
@@ -194,6 +199,31 @@ function New-SyntheticRepositoryRoot {
             "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/tests/autodiscovered.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # Workspace membership. Reachability proves cargo would compile a file
+        # within its package; it says nothing about whether anything builds the
+        # package. Each of these four is a real cargo outcome, measured against
+        # cargo itself rather than recalled.
+        # Not listed in members and not excluded: cargo test --workspace never
+        # touches it, so its #[test] items never run.
+        "crates/orphanpkg/Cargo.toml" = "[package]`nname = `"orphanpkg`"`n"
+        "crates/orphanpkg/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # Named in the workspace exclude list -- a deliberate, reviewed statement
+        # that this directory is not part of the build.
+        "vendored/Cargo.toml" = "[package]`nname = `"vendored`"`n"
+        "vendored/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # The accepting direction, twice, because a membership rule that only
+        # pins its rejections becomes a false-rejection engine on the next edit.
+        # A glob member must expand.
+        "globbed/member/Cargo.toml" = "[package]`nname = `"globbed-member`"`n"
+        "globbed/member/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # A manifest carrying its own [workspace] table is a separate build root
+        # and cargo builds it on its own terms. The real tree has two.
+        "standalone/Cargo.toml" = "[package]`nname = `"standalone`"`n`n[workspace]`n"
+        "standalone/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $separator = [string][System.IO.Path]::DirectorySeparatorChar
@@ -1065,6 +1095,69 @@ $cases = @(
             # the file is never built into a target.
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/nonrunning/tests/autodiscovered.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-non-member-package"
+        expected_message = "belongs to a Cargo package that nothing builds"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # crates/orphanpkg is a well-formed package whose src/lib.rs is a
+            # target root and whose test is a genuine enabled #[test]. Every
+            # file-level rule passes. It is simply not in the workspace members
+            # list, so cargo test at the repository root never builds it and the
+            # test never runs. Two new files and no unusual construct anywhere:
+            # the cheapest forgery in the pipeline until membership is checked.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/orphanpkg/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-workspace-excluded-package"
+        expected_message = "exclude list"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Sharper than merely unlisted: the workspace manifest names this
+            # directory in exclude, which is an explicit reviewed statement that
+            # it is not part of the build.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "vendored/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-glob-member-package-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The accepting direction. members entries may be globs, and a rule
+            # that compared them literally would reject every crate in a
+            # repository that uses `crates/*` -- a false-rejection engine with a
+            # green self-test.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "globbed/member/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-self-rooted-workspace-package-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A manifest carrying its own [workspace] table is a separate build
+            # root that cargo builds on its own terms, and this repository has
+            # two of them. Pinned in the accepting direction because it is the
+            # documented residual of this rule: a static check cannot tell which
+            # workspaces CI invokes, so tightening here would be a guess that
+            # falsely rejects real evidence.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "standalone/src/lib.rs" "tests::$SyntheticTestName")
             )
         }
     },    [ordered]@{

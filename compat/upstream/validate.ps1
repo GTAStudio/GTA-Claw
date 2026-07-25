@@ -1857,6 +1857,121 @@ function Get-CrateDirectoryForPath {
     return $null
 }
 
+function Convert-CargoGlobToRegex {
+    param([string]$Pattern)
+    # cargo accepts glob patterns in workspace member and exclude lists. `*` and
+    # `?` do not cross a directory separator; `**` does.
+    $placeholder = [string][char]1
+    $escaped = [regex]::Escape($Pattern)
+    $escaped = $escaped.Replace('\*\*', $placeholder)
+    $escaped = $escaped.Replace('\*', '[^/]*')
+    $escaped = $escaped.Replace('\?', '[^/]')
+    $escaped = $escaped.Replace($placeholder, '.*')
+    return ('\A' + $escaped + '\z')
+}
+
+function Get-CargoWorkspaceSpec {
+    param([string]$ManifestText)
+    # `members` and `exclude` read from the [workspace] table itself. The
+    # sub-tables [workspace.package], [workspace.dependencies] and
+    # [workspace.lints.*] are deliberately NOT the workspace table: reading an
+    # array of paths out of one of those would let an author claim membership in
+    # a place cargo never consults, which is the same mistake as honouring a
+    # bare `path =` under [dependencies.<name>] as a target.
+    $inWorkspace = $false
+    $hasWorkspace = $false
+    $collecting = $null
+    $members = New-Object System.Collections.Generic.List[string]
+    $exclude = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($ManifestText -split "`n")) {
+        $trimmed = $line.Trim()
+        $header = [regex]::Match($trimmed, '\A\[\[?([A-Za-z0-9_.-]+)\]?\]\z')
+        if ($header.Success) {
+            $inWorkspace = (Test-OrdinalStringEqual $header.Groups[1].Value "workspace")
+            if ($inWorkspace) { $hasWorkspace = $true }
+            $collecting = $null
+            continue
+        }
+        if (-not $inWorkspace) { continue }
+        if ($null -eq $collecting) {
+            $open = [regex]::Match($trimmed, '\A(members|exclude)\s*=\s*\[')
+            if (-not $open.Success) { continue }
+            $collecting = $open.Groups[1].Value
+            $trimmed = $trimmed.Substring($open.Length)
+        }
+        # A plain assignment, never $(if ...): a subexpression writes to the
+        # pipeline, and PowerShell enumerates a List there, so $sink would
+        # become a detached array copy and every Add would be lost.
+        $sink = $exclude
+        if (Test-OrdinalStringEqual $collecting "members") { $sink = $members }
+        foreach ($match in [regex]::Matches($trimmed, '"([^"]*)"')) {
+            $value = $match.Groups[1].Value.Trim().TrimEnd("/")
+            if (-not [string]::IsNullOrEmpty($value)) { [void]$sink.Add($value) }
+        }
+        if ($trimmed.Contains("]")) { $collecting = $null }
+    }
+    return [ordered]@{
+        workspace = $hasWorkspace
+        members = $members.ToArray()
+        exclude = $exclude.ToArray()
+    }
+}
+
+function Test-CargoPatternCoversPath {
+    param([string]$Pattern, [string]$RelativeDirectory)
+    # An exclude entry removes the named directory and everything beneath it, so
+    # the pattern is tested against the directory and each of its ancestors.
+    $expression = Convert-CargoGlobToRegex $Pattern
+    $segments = @($RelativeDirectory.Split("/") | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    for ($i = 0; $i -lt $segments.Length; $i += 1) {
+        $prefix = ($segments[0..$i] -join "/")
+        if ([regex]::IsMatch($prefix, $expression)) { return $true }
+    }
+    return $false
+}
+
+function Test-CratePackageIsBuilt {
+    param([string]$CrateDirectory, [string]$ManifestText)
+    # Reachability from a target root proves cargo would compile a file WITHIN
+    # its package. It says nothing about whether anything builds that package.
+    # A package that no workspace lists is never built by `cargo test` at the
+    # repository root, so a #[test] inside it never runs, and citing it is a
+    # claim about code the repository does not execute. Adding one is a two-file
+    # change that needs no unusual Rust and no manifest trickery, which makes it
+    # the cheapest forgery available if membership is not checked.
+    if ((Get-CargoWorkspaceSpec $ManifestText).workspace) {
+        return [ordered]@{ built = $true; workspace = $CrateDirectory; reason = "root" }
+    }
+    $segments = @($CrateDirectory.Split("/") | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    for ($i = $segments.Length - 1; $i -ge 0; $i -= 1) {
+        $directory = $(if ($i -eq 0) { "" } else { ($segments[0..($i - 1)] -join "/") })
+        $manifest = Join-RepositoryRelativePath $directory "Cargo.toml"
+        $absolute = Resolve-RepositoryFilePath $manifest
+        if ($null -eq $absolute) { continue }
+        $spec = Get-CargoWorkspaceSpec (Get-RepositoryFileText $absolute)
+        if (-not $spec.workspace) { continue }
+        # cargo stops at the FIRST [workspace] ancestor and that manifest alone
+        # decides membership, so neither does this.
+        $relative = $(if ([string]::IsNullOrEmpty($directory)) {
+            $CrateDirectory
+        } else {
+            $CrateDirectory.Substring($directory.Length + 1)
+        })
+        foreach ($pattern in $spec.exclude) {
+            if (Test-CargoPatternCoversPath $pattern $relative) {
+                return [ordered]@{ built = $false; workspace = $directory; reason = "excluded" }
+            }
+        }
+        foreach ($pattern in $spec.members) {
+            if ([regex]::IsMatch($relative, (Convert-CargoGlobToRegex $pattern))) {
+                return [ordered]@{ built = $true; workspace = $directory; reason = "member" }
+            }
+        }
+        return [ordered]@{ built = $false; workspace = $directory; reason = "unlisted" }
+    }
+    return [ordered]@{ built = $true; workspace = $null; reason = "standalone" }
+}
+
 function Get-CargoManifestTargetSections {
     param([string]$ManifestText)
     # Every [lib] / [[bin]] / [[test]] / [[bench]] / [[example]] block, with the
@@ -2057,6 +2172,24 @@ function Assert-EvidenceFileIsCompiled {
     if ($null -eq $crate) {
         Fail ("$Context acceptance evidence '$RelativePath' is not inside a Cargo package, " +
             "so no cargo test target compiles it and the cited test can never run")
+    }
+    $membership = Test-CratePackageIsBuilt ([string]$crate.directory) ([string]$crate.text)
+    if (-not $membership.built) {
+        $workspaceLabel = $(if ([string]::IsNullOrEmpty([string]$membership.workspace)) {
+            "the repository root workspace"
+        } else {
+            "the workspace at " + [string]$membership.workspace
+        })
+        $why = $(if (Test-OrdinalStringEqual ([string]$membership.reason) "excluded") {
+            "its package is in that workspace's exclude list"
+        } else {
+            "its package is not in that workspace's members list"
+        })
+        Fail ("$Context acceptance evidence '$RelativePath' belongs to a Cargo package that nothing builds: " +
+            "$why, so cargo test never compiles or runs it and the cited test proves nothing about the " +
+            "shipped product. Reachability from a target root only establishes that cargo would compile the " +
+            "file WITHIN its package. Add the package to $workspaceLabel, or cite a test in a package that " +
+            "is already built.")
     }
     $reachable = Get-CrateCompiledFileSet ([string]$crate.directory) ([string]$crate.text)
     if (-not $reachable.ContainsKey($RelativePath)) {
