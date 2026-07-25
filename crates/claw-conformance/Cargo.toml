@@ -1,0 +1,21 @@
+[package]
+name = "claw-conformance"
+description = "Automated OpenClaw upstream-parity conformance harness for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_path_to_error = "0.1.20"
+sha2 = "0.11.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "claw-conformance"
+path = "src/main.rs"
