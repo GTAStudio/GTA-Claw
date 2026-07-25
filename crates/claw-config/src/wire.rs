@@ -17,7 +17,16 @@ pub(crate) struct EnvelopeWire {
     pub(crate) core: CoreWire,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+impl Default for EnvelopeWire {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            core: CoreWire::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoreWire {
     pub(crate) auth: AuthWire,

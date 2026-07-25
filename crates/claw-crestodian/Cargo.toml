@@ -1,0 +1,17 @@
+[package]
+name = "claw-crestodian"
+description = "Backup-first first-run setup and deterministic rescue for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claw-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+
+[lints]
+workspace = true
