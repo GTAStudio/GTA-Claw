@@ -6,6 +6,18 @@
 - [中文使用指南](docs/usage-guide-zh.md)
 - [English Usage Guide](docs/usage-guide-en.md)
 
+## Rust migration ratchet
+
+The root Node service remains the load-bearing container runtime while its Rust replacement is
+completed. Repository policy permits only the exact audited legacy paths and rejects every new
+JavaScript/TypeScript source, package manifest, lockfile, dependency directory, or repository-owned
+Node workflow. The allowed surface may shrink but may not grow.
+
+See [Legacy Node port obligations](docs/legacy-node-port-obligations.md) for the per-module deletion
+checklist and current Rust ownership. In particular, `@github/copilot-sdk` is temporary legacy
+production code; the final provider must use pure-Rust HTTPS/OAuth and must not carry that package
+architecture into the Rust dependency graph.
+
 ## Quick Start
 
 ```bash

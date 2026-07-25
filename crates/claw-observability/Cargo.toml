@@ -1,0 +1,17 @@
+[package]
+name = "claw-observability"
+description = "Shared telemetry, metrics, audit, and redaction primitives for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "registry"] }
+
+[lints]
+workspace = true
