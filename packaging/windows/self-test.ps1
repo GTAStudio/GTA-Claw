@@ -8,6 +8,7 @@ $ProgressPreference = 'SilentlyContinue'
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
 Import-Module (Join-Path $scriptRoot 'WindowsPackaging.psm1') -Force
+Import-Module (Join-Path $scriptRoot 'SupplyChain.psm1') -Force
 
 $ownedRoot = Join-Path $scriptRoot '.work\self-tests'
 [System.IO.Directory]::CreateDirectory($ownedRoot) | Out-Null
@@ -47,6 +48,17 @@ try {
     Write-Utf8File -Path (Join-Path $hashRoot 'payload.txt') -Content 'after'
     Assert-Throws { Test-HashManifest $hashRoot } 'hash mismatch'
 
+    $artifactSet = Join-Path $testRoot 'artifact-set'
+    [System.IO.Directory]::CreateDirectory($artifactSet) | Out-Null
+    Write-Utf8File -Path (Join-Path $artifactSet 'artifact.bin') -Content 'published'
+    Write-ArtifactSetChecksums $artifactSet | Out-Null
+    Test-ArtifactSetChecksums $artifactSet
+    $passed++
+    Write-Utf8File -Path (Join-Path $artifactSet 'unexpected.bin') -Content 'not listed'
+    Assert-Throws {
+        Test-ArtifactSetChecksums $artifactSet
+    } 'incomplete artifact checksum coverage'
+
     $junctionTarget = Join-Path $testRoot 'junction-target'
     $junctionRoot = Join-Path $testRoot 'junction-root'
     [System.IO.Directory]::CreateDirectory($junctionTarget) | Out-Null
@@ -70,7 +82,8 @@ try {
             -TemplatePath (Join-Path $scriptRoot 'AppxManifest.template.xml') `
             -OutputPath $manifestPath `
             -MsixVersion $version.Msix `
-            -Architecture $architecture
+            -Architecture $architecture `
+            -Publisher 'CN=GTAStudio Windows Signing Placeholder'
         Test-AppxManifest -Path $manifestPath -Version $version.Msix -Architecture $architecture
         $passed++
     }
@@ -116,17 +129,20 @@ try {
         & (Join-Path $scriptRoot 'package.ps1') -Architecture x64 -ReleaseMode
     } 'release without signing'
 
-    $fakeMsi = Join-Path $testRoot 'fake-unsigned.msi'
+    $fakeMsi = Join-Path $testRoot 'fake-release-candidate-unsigned.msi'
     Write-Utf8File -Path $fakeMsi -Content 'not an installer'
     Assert-Throws {
         & (Join-Path $scriptRoot 'sign.ps1') `
             -PackagePath $fakeMsi `
             -CertificateThumbprint ('0' * 40) `
             -TimestampUrl 'https://timestamp.invalid'
-    } 'MSI signing without database attestation'
+    } 'MSI signing without a provisioned certificate'
 
-    if ($passed -ne 17) {
-        throw "Expected 17 self-tests, completed $passed."
+    & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
+    $passed++
+
+    if ($passed -ne 20) {
+        throw "Expected 20 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

@@ -23,6 +23,7 @@ esac
 assert_binary_arches "$binary" "$expected_arch"
 assert_macho_minimum_version "$binary"
 validate_macho_dependencies "$binary" "$OUTPUT_ROOT"
+assert_binary_has_no_forbidden_markers "$binary"
 
 archive_root="$OUTPUT_ROOT/headless/$arch_label"
 stage="$OUTPUT_ROOT/staging/$component-$VERSION-macos-$arch_label"
@@ -38,6 +39,7 @@ install -m 0755 "$binary" "$stage/$component"
 printf '%s  %s\n' "$(sha256_file "$stage/$component")" "$component" >"$stage/SHA256SUMS"
 chmod 0644 "$stage/SHA256SUMS"
 find "$stage" -exec touch -t "$NORMALIZED_MTIME" {} +
+assert_no_javascript_payload "$stage"
 
 remove_output_file "$archive"
 assert_output_file_slot "$archive"
@@ -54,4 +56,6 @@ assert_output_file_slot "$archive"
 ) | gzip -n -9 >"$archive"
 assert_output_file_slot "$checksum"
 printf '%s  %s\n' "$(sha256_file "$archive")" "$(basename "$archive")" >"$checksum"
+validate_headless_archive "$archive" "$component" "$arch_label" "$expected_arch"
+write_artifact_supply_chain "$archive" headless "$expected_arch"
 note "created $archive"

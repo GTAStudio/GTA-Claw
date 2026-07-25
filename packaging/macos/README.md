@@ -1,47 +1,72 @@
-# macOS packaging prototype
+# macOS release packaging
 
-This directory is the isolated P04c prototype for packaging the native Rust/Slint desktop app and the two headless Rust executables. It targets macOS 14.0 or newer and uses only Cargo plus tools shipped with macOS/Xcode. It does not invoke or embed Node.js, npm, Bun, pnpm, or a JavaScript runtime.
+This directory builds GTA Claw for macOS 14 or newer using Cargo and
+Apple/Xcode tooling only. It produces a native Slint application and separate
+headless Rust archives without JavaScript, Node.js, or Slint in the headless
+dependency graph.
 
-## Outputs and guarantees
+## Architecture and artifact matrix
 
-`build.sh` uses both committed Cargo lockfiles with `--locked`, sets `MACOSX_DEPLOYMENT_TARGET=14.0` for every slice, and supports native, `arm64`, `x86_64`, and `universal2` builds. Universal assembly compares each slice's dylibs, rpaths, and deployment metadata before `lipo`, then verifies the result contains exactly `arm64` and `x86_64`. A cross-built slice is a build validation only; runtime validation is claimed only by the matching native GitHub runner.
+The workflow executes arm64 binaries on `macos-15` and x86_64 binaries on an
+Intel macOS 15 runner before assembling a universal2 application. Release
+outputs are:
 
-The app has the canonical `Contents/MacOS` and `Contents/Resources` layout. `Contents/Frameworks` is created only if a future explicitly declared non-system dependency requires it. With Slint 1.17.1's selected `backend-winit` and `renderer-femtovg` features, no non-system dylib is expected: `dependencies.allowlist` permits Apple system frameworks and `/usr/lib` only, and validation rejects undeclared dylibs, unsafe rpaths, symlinks, or absolute build paths.
+- a universal2 `GTA Claw.app` preserved in an `.app.zip`;
+- a Developer ID signed and Apple-notarized DMG;
+- a Developer ID Installer signed and Apple-notarized PKG;
+- separate CLI and daemon archives for arm64 and x86_64;
+- an SPDX 2.3 SBOM and SLSA/in-toto provenance statement for every artifact;
+- one complete `SHA256SUMS-macos` manifest over the exact publication bytes.
 
-The source icon is `icon/render.swift`; Xcode's Swift, `sips`, and `iconutil` reproducibly render the committed source into `GTAClaw.icns`. Generated icons, apps, archives, DMGs, PKGs, certificates, screenshots, and secrets stay under ignored `target/` paths and are never committed.
+The GUI app has bundle identifier `com.gtastudio.gta-claw`, minimum system
+version 14.0, a source-generated icon, the committed empty entitlement set, and
+the hardened runtime. Universal assembly compares dependencies, rpaths, and
+deployment targets between slices before `lipo`.
 
 ```sh
-# Native app and separate CLI/daemon tar.gz archives
-./packaging/macos/build.sh native
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo fetch --manifest-path Cargo.toml --locked
+cargo fetch --manifest-path desktop/Cargo.toml --locked
 
-# Both slices plus a universal2 app
-./packaging/macos/build.sh universal2
-
-# Unsigned prototype DMG and PKG from the validated universal app
+GTA_CLAW_OFFLINE=1 ./packaging/macos/build.sh universal2
 ./packaging/macos/package.sh prototype \
   "target/macos-package/apps/universal2/GTA Claw.app"
-
-# Built-in self-tests
-./packaging/macos/self-test.sh
 ```
 
-Each staging tree receives a sorted SHA-256 manifest, and each emitted artifact receives a checksum. Inputs, paths, permissions, archive timestamps, gzip headers, and tar ownership (`root:wheel`) are normalized. Apple container tools may encode tool-version-specific filesystem metadata, so the prototype proves deterministic staged content and records the exact final artifact checksum; it does not claim DMG/PKG byte identity across different Xcode or macOS versions.
+`GTA_CLAW_OFFLINE=1` requires all Rust targets and locked dependencies to be
+present and then forbids Cargo network access. Paths, tar ownership, gzip
+headers, source paths, and staged timestamps are normalized. Signed timestamps,
+notarization tickets, DMG filesystem metadata, and PKG metadata are issued by
+Apple tools and are therefore checksum-recorded rather than falsely claimed to
+be byte-identical across signing times or Xcode versions.
 
-## Signing and notarization contract
+## Published-byte validation
 
-CI validation uses an ad-hoc signature with the source-controlled empty entitlement set. Release mode is fail-closed:
+`validate-artifacts.sh` validates emitted files rather than staging:
 
-1. `sign.sh release APP` requires a valid `Developer ID Application` identity already available in the selected temporary keychain, signs nested code inside-out, applies hardened runtime and a secure timestamp, and verifies the designated requirement, signature, and entitlements.
-2. `notarize.sh` requires either a `notarytool` keychain profile or App Store Connect API credentials, submits with `--wait`, requires exact `Accepted` status, staples the app/DMG/PKG, and validates the ticket.
-3. `package.sh release APP` requires both a Developer ID Application and a distinct `Developer ID Installer` identity. It signs the UDZO DMG and uses `pkgbuild` plus `productbuild` for a flat PKG with no installer scripts.
-4. The workflow's protected `macos-release` environment imports certificates only into an ephemeral keychain and writes App Store Connect keys only to step-local temporary files. Step traps and an unconditional cleanup step remove the keychain and credential files. The prototype release job validates artifacts but intentionally does not publish or upload release artifacts.
+- CLI archives are path-checked, extracted, hash-verified, architecture-checked,
+  dependency-allowlisted, and scanned for Slint and JavaScript markers.
+- App ZIPs are link/path-checked and extracted before full bundle validation.
+- DMGs are verified, mounted read-only, checked against the root allowlist, and
+  their embedded app is revalidated.
+- PKGs are expanded in full, installer scripts are forbidden, payload paths are
+  inspected, and the embedded app is revalidated.
+- Release mode requires Developer ID authority, secure timestamps, hardened
+  runtime, Installer identity, accepted notarization staples, and Gatekeeper
+  assessment. Prototype mode rejects claims of release signatures.
+- Every SBOM and provenance statement must hash its exact artifact, and
+  `SHA256SUMS-macos` must verify the complete publication directory.
 
-No `--deep` signing shortcut is used. Frameworks and dylibs, when present and declared, are signed before the outer app. Missing identity, timestamp, hardened runtime, matching entitlement, accepted notarization, staple, or validation is fatal.
+## Signing and notarization
 
-Release dispatch additionally requires an annotated `vX.Y.Z` tag, a matching full `release_commit` input, a Cargo version equal to the tag, and proof that the immutable commit is reachable from the protected default `main` branch. Repository policy must protect `main`, protect the `v*` tag namespace from mutation, and require reviewers on the `macos-release` environment. Build, test, and release-input creation occur without signing secrets. The protected job downloads the immutable GitHub artifact, verifies both the artifact-service digest and an exact payload SHA-256 plus source metadata, and never checks out or executes repository scripts or Rust build scripts. Certificate and App Store Connect secrets exist only on the individual signing or notarization step that needs them; an `always()` step removes the temporary keychain and every credential file.
+`sign.sh release` requires a real `Developer ID Application` identity and signs
+nested code before the app with hardened runtime and a secure timestamp.
+`notarize.sh` accepts only an explicit keychain profile or complete App Store
+Connect API credentials, waits for exact `Accepted` status, staples, and
+validates the ticket. `package.sh release` requires both Application and
+Installer identities, signs and notarizes the DMG and PKG, creates the app ZIP,
+generates supply-chain companions, and runs published-byte validation.
 
-## Prototype boundaries
-
-Real Developer ID certificates, App Store Connect credentials, release publication, custom DMG appearance, and clean-machine installation testing are deployment work. The current daemon does not implement a complete macOS service lifecycle, so this prototype deliberately adds no launchd plist, privileged helper, installer script, or automatic service registration. Headless tar archives are native command-line artifacts, not notarized release deliverables. App Store sandboxing and Mac App Store submission are also out of scope.
-
-The implementation follows Apple's current guidance for [bundle structure](https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/BundleArchitectures/BundleArchitectures.html), [universal binaries](https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary), [distribution signing](https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac), [packaging](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution), [hardened runtime and notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution), and `notarytool` migration in [TN3147](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool). Slint 1.17.1 provides the Rust build integration and native winit/femtovg backend used here, but no complete Apple signing/notarization pipeline; this repository therefore owns and validates that distribution layer explicitly.
+Missing credentials fail the protected release. Normal pull requests still
+produce clearly labeled unsigned/ad-hoc prototype artifacts and never claim a
+signature or notarization result.

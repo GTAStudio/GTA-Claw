@@ -178,6 +178,15 @@ expect_success manifest-republication \
 [[ -f "$manifest" && ! -L "$manifest" && ! -e "$manifest_temp" ]] ||
   die "manifest replacement did not atomically publish a regular file"
 
+complete_root="$work/complete-manifest"
+mkdir -p "$complete_root"
+printf 'complete content\n' >"$complete_root/artifact.bin"
+expect_success complete-manifest \
+  bash -c "source '$common'; write_artifact_set_checksums '$complete_root'; verify_sha256_manifest '$complete_root' '$complete_root/SHA256SUMS'"
+printf 'not listed\n' >"$complete_root/unexpected.bin"
+expect_failure incomplete-manifest \
+  bash -c "source '$common'; verify_sha256_manifest '$complete_root' '$complete_root/SHA256SUMS'"
+
 printf 'content\n' >"$work/hash.txt"
 printf '%s  ./hash.txt\n' "$(sha256_file "$work/hash.txt")" >"$work/hash.sha256"
 printf 'tampered\n' >"$work/hash.txt"
