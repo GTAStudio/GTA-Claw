@@ -425,15 +425,13 @@
                                                                "docs/install/migrating-claude.md"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                       "crates/claw-migrate/src/providers.rs",
-                                                                       "crates/claw-migrate/tests/providers.rs#claude_plan_apply_and_rollback_are_side_effect_free_then_reversible",
-                                                                       "crates/claw-migrate/tests/legacy_fixtures.rs"
+
                                                                    ],
-                                                     "required":  "Accepted: plan/apply/rollback tests cover instructions, MCP servers, skills, commands, secrets, conflicts, and safe config."
+                                                     "required":  "Plan/apply fixtures cover instructions, MCP servers, skills, memory, credentials, and safe config."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
@@ -453,15 +451,13 @@
                                                                "extensions/codex/src/migration/provider.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                       "crates/claw-migrate/src/providers.rs",
-                                                                       "crates/claw-migrate/tests/providers.rs#codex_imports_config_auth_sessions_skills_and_sidecars",
-                                                                       "crates/claw-migrate/tests/providers.rs#codex_default_discovery_imports_cli_and_desktop_config_together"
+
                                                                    ],
-                                                     "required":  "Accepted: plan/apply/rollback tests cover auth, CLI and desktop discovery, sessions, skills, targets, and sidecars."
+                                                     "required":  "Plan/apply fixtures cover auth, session bindings, source discovery, targets, and sidecars."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
@@ -482,15 +478,13 @@
                                                                "docs/install/migrating-hermes.md"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "unimplemented",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "missing",
                                                      "artifacts":  [
-                                                                       "crates/claw-migrate/src/providers.rs",
-                                                                       "crates/claw-migrate/tests/providers.rs#hermes_imports_config_memory_skills_sessions_and_secrets",
-                                                                       "crates/claw-migrate/tests/providers.rs#corrupted_backup_never_replaces_current_target"
+
                                                                    ],
-                                                     "required":  "Accepted: plan/apply/rollback tests cover config, models, MCP, memory, skills, sessions, secrets, credentials, and safe exclusions."
+                                                     "required":  "Plan/apply fixtures cover config, models, memory, skills, secrets, credentials, and safe exclusions."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
