@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -230,8 +231,64 @@ struct CargoPackage {
 
 #[derive(Debug, Deserialize)]
 struct CargoTarget {
+    kind: Vec<String>,
+    name: String,
     src_path: PathBuf,
     test: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CargoManifestTargets {
+    #[serde(rename = "lib")]
+    library: Option<CargoManifestTarget>,
+    #[serde(rename = "bin")]
+    binaries: Vec<CargoManifestTarget>,
+    #[serde(rename = "test")]
+    tests: Vec<CargoManifestTarget>,
+    #[serde(rename = "bench")]
+    benches: Vec<CargoManifestTarget>,
+    #[serde(rename = "example")]
+    examples: Vec<CargoManifestTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoManifestTarget {
+    name: Option<String>,
+    path: Option<PathBuf>,
+    harness: Option<bool>,
+}
+
+impl CargoManifestTargets {
+    fn uses_standard_test_harness(&self, package_directory: &Path, target: &CargoTarget) -> bool {
+        let declaration = if target.kind.iter().any(|kind| kind == "bin") {
+            matching_manifest_target(&self.binaries, package_directory, target)
+        } else if target.kind.iter().any(|kind| kind == "test") {
+            matching_manifest_target(&self.tests, package_directory, target)
+        } else if target.kind.iter().any(|kind| kind == "bench") {
+            matching_manifest_target(&self.benches, package_directory, target)
+        } else if target.kind.iter().any(|kind| kind == "example") {
+            matching_manifest_target(&self.examples, package_directory, target)
+        } else {
+            self.library.as_ref()
+        };
+        declaration.is_none_or(|declaration| declaration.harness != Some(false))
+    }
+}
+
+fn matching_manifest_target<'a>(
+    declarations: &'a [CargoManifestTarget],
+    package_directory: &Path,
+    target: &CargoTarget,
+) -> Option<&'a CargoManifestTarget> {
+    declarations.iter().find(|declaration| {
+        declaration.name.as_deref() == Some(target.name.as_str())
+            || declaration.path.as_ref().is_some_and(|path| {
+                let declared = package_directory.join(path).canonicalize();
+                let metadata = target.src_path.canonicalize();
+                declared.is_ok_and(|declared| metadata.is_ok_and(|metadata| declared == metadata))
+            })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -278,10 +335,33 @@ impl CargoTestTargets {
                 processed_manifests.insert(path);
             }
             for package in metadata.packages {
-                if let Ok(path) = package.manifest_path.canonicalize() {
-                    processed_manifests.insert(path);
-                }
-                for target in package.targets.into_iter().filter(|target| target.test) {
+                let package_manifest = package.manifest_path.canonicalize().map_err(|error| {
+                    ConformanceError::new(
+                        code,
+                        Some("Cargo.toml".to_owned()),
+                        format!(
+                            "cannot resolve Cargo package manifest '{}': {error}",
+                            package.manifest_path.display()
+                        ),
+                    )
+                })?;
+                processed_manifests.insert(package_manifest.clone());
+                let manifest_targets =
+                    load_manifest_targets(&canonical_root, &package_manifest, code)?;
+                let package_directory = package_manifest.parent().ok_or_else(|| {
+                    ConformanceError::new(
+                        code,
+                        Some("Cargo.toml".to_owned()),
+                        format!(
+                            "Cargo package manifest '{}' has no parent directory",
+                            package_manifest.display()
+                        ),
+                    )
+                })?;
+                for target in package.targets.into_iter().filter(|target| {
+                    target.test
+                        && manifest_targets.uses_standard_test_harness(package_directory, target)
+                }) {
                     let source_path = target.src_path.canonicalize().map_err(|error| {
                         ConformanceError::new(
                             code,
@@ -292,8 +372,8 @@ impl CargoTestTargets {
                             ),
                         )
                     })?;
-                    if source_path.starts_with(&canonical_root) {
-                        target_roots.insert(source_path);
+                    if source_path.starts_with(package_directory) {
+                        target_roots.insert((source_path, package_directory.to_path_buf()));
                     }
                 }
             }
@@ -316,12 +396,39 @@ impl CargoTestTargets {
     }
 }
 
+fn load_manifest_targets(
+    repository_root: &Path,
+    manifest_path: &Path,
+    code: ViolationCode,
+) -> Result<CargoManifestTargets, ConformanceError> {
+    let subject = normalized_api_path(
+        manifest_path
+            .strip_prefix(repository_root)
+            .unwrap_or(manifest_path)
+            .to_path_buf(),
+    );
+    let source = fs::read_to_string(manifest_path).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject.clone()),
+            format!("cannot read Cargo manifest: {error}"),
+        )
+    })?;
+    toml::from_str(&source).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject),
+            format!("cannot parse Cargo manifest: {error}"),
+        )
+    })
+}
+
 fn load_cargo_metadata(
     repository_root: &Path,
     manifest_path: &Path,
     code: ViolationCode,
 ) -> Result<CargoMetadata, ConformanceError> {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let cargo = cargo_executable(repository_root, code)?;
     let output = Command::new(cargo)
         .current_dir(repository_root)
         .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
@@ -361,6 +468,74 @@ fn load_cargo_metadata(
     })
 }
 
+fn cargo_executable(
+    repository_root: &Path,
+    code: ViolationCode,
+) -> Result<PathBuf, ConformanceError> {
+    let configured = env::var_os("CARGO");
+    let search_path = env::var_os("PATH");
+    resolve_cargo_executable(
+        repository_root,
+        configured.as_deref(),
+        search_path.as_deref(),
+    )
+    .map_err(|message| {
+        ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!("cannot resolve trusted Cargo executable: {message}"),
+        )
+    })
+}
+
+fn resolve_cargo_executable(
+    repository_root: &Path,
+    configured: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    let configured = configured.map(PathBuf::from);
+    if let Some(path) = configured
+        .as_ref()
+        .filter(|path| path.components().count() > 1)
+    {
+        if !path.is_absolute() {
+            return Err(format!("CARGO names a relative path '{}'", path.display()));
+        }
+        return trusted_executable(repository_root, path);
+    }
+
+    let executable_name = configured
+        .and_then(|path| path.file_name().map(OsString::from))
+        .unwrap_or_else(|| OsString::from(format!("cargo{}", env::consts::EXE_SUFFIX)));
+    let search_path = search_path.ok_or_else(|| "PATH is not set".to_owned())?;
+    for directory in env::split_paths(search_path).filter(|directory| directory.is_absolute()) {
+        let candidate = directory.join(&executable_name);
+        if candidate.is_file() {
+            return trusted_executable(repository_root, &candidate);
+        }
+    }
+    Err(format!(
+        "'{}' was not found in an absolute PATH directory",
+        Path::new(&executable_name).display()
+    ))
+}
+
+fn trusted_executable(repository_root: &Path, candidate: &Path) -> Result<PathBuf, String> {
+    let executable = candidate
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve '{}': {error}", candidate.display()))?;
+    let repository_root = repository_root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve repository root: {error}"))?;
+    if executable.starts_with(repository_root) {
+        return Err(format!(
+            "resolved executable '{}' is inside the repository under validation",
+            executable.display()
+        ));
+    }
+    Ok(executable)
+}
+
 fn discover_cargo_manifests(repository_root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut manifests = Vec::new();
     let mut directories = VecDeque::from([repository_root.to_path_buf()]);
@@ -397,21 +572,27 @@ fn discover_cargo_manifests(repository_root: &Path) -> Result<Vec<PathBuf>, std:
 struct ReachableRustSource {
     path: PathBuf,
     module_directory: PathBuf,
+    package_directory: PathBuf,
 }
 
 fn reachable_rust_sources(
     repository_root: &Path,
-    target_roots: BTreeSet<PathBuf>,
+    target_roots: BTreeSet<(PathBuf, PathBuf)>,
     code: ViolationCode,
 ) -> Result<BTreeSet<PathBuf>, ConformanceError> {
-    let mut reachable = target_roots.clone();
+    let mut reachable = target_roots
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut visited = target_roots.clone();
     let mut queue = target_roots
         .into_iter()
-        .filter_map(|path| {
+        .filter_map(|(path, package_directory)| {
             let module_directory = path.parent()?.to_path_buf();
             Some(ReachableRustSource {
                 path,
                 module_directory,
+                package_directory,
             })
         })
         .collect::<VecDeque<_>>();
@@ -460,8 +641,8 @@ fn reachable_rust_sources(
             };
             let mut resolved = Vec::new();
             for candidate in candidates {
-                let Some(path) =
-                    resolve_module_file(repository_root, &candidate).map_err(|error| {
+                let Some(path) = resolve_module_file(&current.package_directory, &candidate)
+                    .map_err(|error| {
                         ConformanceError::new(
                             code,
                             Some("Cargo.toml".to_owned()),
@@ -493,11 +674,13 @@ fn reachable_rust_sources(
                 ));
             }
             for path in resolved {
-                if reachable.insert(path.clone()) {
+                if visited.insert((path.clone(), current.package_directory.clone())) {
+                    reachable.insert(path.clone());
                     let module_directory = module_directory_for_source(&path);
                     queue.push_back(ReachableRustSource {
                         path,
                         module_directory,
+                        package_directory: current.package_directory.clone(),
                     });
                 }
             }
@@ -1588,13 +1771,15 @@ mod tests {
     use std::collections::BTreeSet;
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde::Deserialize;
 
-    use super::{CargoTestTargets, declares_enabled_test};
+    use super::{
+        CargoTestTargets, cargo_executable, declares_enabled_test, resolve_cargo_executable,
+    };
     use crate::ViolationCode;
 
     static NEXT_COMPILER_ORACLE: AtomicU64 = AtomicU64::new(0);
@@ -1641,7 +1826,8 @@ mod tests {
         }
 
         fn cargo_test_list(&self, ignored_only: bool) -> BTreeSet<String> {
-            let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let cargo = cargo_executable(&self.root, ViolationCode::ClaimEvidence)
+                .expect("resolve trusted Cargo");
             let mut command = Command::new(cargo);
             command
                 .current_dir(&self.root)
@@ -1687,6 +1873,60 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn cargo_resolution_rejects_repository_controlled_executables() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-cargo-resolution-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let repository = root.join("repository");
+        let trusted = root.join("trusted");
+        fs::create_dir_all(&repository).expect("create repository executable directory");
+        fs::create_dir_all(&trusted).expect("create trusted executable directory");
+        let executable_name = format!("cargo{}", env::consts::EXE_SUFFIX);
+        let planted = repository.join(&executable_name);
+        let trusted_cargo = trusted.join(&executable_name);
+        fs::write(&planted, "candidate controlled").expect("write planted Cargo executable");
+        fs::write(&trusted_cargo, "trusted").expect("write trusted Cargo executable");
+
+        let search_path =
+            env::join_paths([repository.as_path(), trusted.as_path()]).expect("join search path");
+        let error = resolve_cargo_executable(&repository, None, Some(&search_path))
+            .expect_err("repository Cargo must be rejected");
+        let canonical_planted = planted.canonicalize().expect("canonical planted Cargo");
+        assert_eq!(
+            error,
+            format!(
+                "resolved executable '{}' is inside the repository under validation",
+                canonical_planted.display()
+            )
+        );
+
+        let relative_then_trusted =
+            env::join_paths([Path::new("."), trusted.as_path()]).expect("join safe search path");
+        let resolved = resolve_cargo_executable(&repository, None, Some(&relative_then_trusted))
+            .expect("relative PATH entries must be ignored");
+        assert_eq!(
+            resolved,
+            trusted_cargo
+                .canonicalize()
+                .expect("canonical trusted Cargo")
+        );
+
+        let configured_error =
+            resolve_cargo_executable(&repository, Some(planted.as_os_str()), Some(&search_path))
+                .expect_err("configured repository Cargo must be rejected");
+        assert_eq!(
+            configured_error,
+            format!(
+                "resolved executable '{}' is inside the repository under validation",
+                canonical_planted.display()
+            )
+        );
+        fs::remove_dir_all(root).expect("remove Cargo resolution fixture");
     }
 
     #[test]
@@ -1992,7 +2232,8 @@ mod nested {
         )
         .expect("write test-disabled target");
 
-        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
         let output = Command::new(cargo)
             .current_dir(&root)
             .env("CARGO_TARGET_DIR", root.join("target"))
@@ -2073,6 +2314,212 @@ mod nested {
     }
 
     #[test]
+    fn cargo_test_listing_matches_target_harness_policy() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-target-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for directory in ["src", "tests", "examples", "benches"] {
+            fs::create_dir_all(root.join(directory)).expect("create target oracle directory");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-target-oracle\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [[bin]]\n\
+             name = \"disabled-bin\"\n\
+             path = \"src/disabled-bin.rs\"\n\
+             test = false\n\n\
+             [[test]]\n\
+             name = \"enabled-test\"\n\
+             path = \"tests/enabled.rs\"\n\n\
+             [[test]]\n\
+             name = \"harnessless-test\"\n\
+             path = \"tests/harnessless.rs\"\n\
+             harness = false\n\n\
+             [[example]]\n\
+             name = \"inert-example\"\n\
+             path = \"examples/inert.rs\"\n\n\
+             [[bench]]\n\
+             name = \"inert-bench\"\n\
+             path = \"benches/inert.rs\"\n",
+        )
+        .expect("write target oracle manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-target-oracle\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write target oracle lockfile");
+        for (path, source) in [
+            ("src/lib.rs", "#[test]\nfn library_test() {}\n"),
+            (
+                "src/disabled-bin.rs",
+                "#[test]\nfn disabled_bin_test() {}\nfn main() {}\n",
+            ),
+            ("tests/enabled.rs", "#[test]\nfn enabled_test() {}\n"),
+            (
+                "tests/harnessless.rs",
+                "#[test]\nfn harnessless_test() {}\nfn main() {}\n",
+            ),
+            (
+                "examples/inert.rs",
+                "#[test]\nfn example_test() {}\nfn main() {}\n",
+            ),
+            ("benches/inert.rs", "#[test]\nfn bench_test() {}\n"),
+        ] {
+            fs::write(root.join(path), source).expect("write target oracle source");
+        }
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = Command::new(cargo)
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run target compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout)
+            .expect("target oracle output is UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from(["enabled_test".to_owned(), "library_test".to_owned()])
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        for (path, expected) in [
+            ("src/lib.rs", true),
+            ("src/disabled-bin.rs", false),
+            ("tests/enabled.rs", true),
+            ("tests/harnessless.rs", false),
+            ("examples/inert.rs", false),
+            ("benches/inert.rs", false),
+        ] {
+            let canonical = root.join(path).canonicalize().expect("canonical source");
+            assert_eq!(
+                targets.contains(&canonical),
+                expected,
+                "target admission diverged from Cargo for {path}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove target compiler oracle");
+    }
+
+    #[test]
+    fn cross_package_module_is_compiled_but_not_accepted_as_evidence() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-package-boundary-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for package in ["consumer", "decoy"] {
+            fs::create_dir_all(root.join(package).join("src"))
+                .expect("create package boundary oracle directory");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"consumer\", \"decoy\"]\nresolver = \"3\"\n",
+        )
+        .expect("write package boundary workspace");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"consumer\"\n\
+             version = \"0.0.0\"\n\n\
+             [[package]]\n\
+             name = \"decoy\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write package boundary lockfile");
+        for package in ["consumer", "decoy"] {
+            fs::write(
+                root.join(package).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n"
+                ),
+            )
+            .expect("write package boundary manifest");
+        }
+        fs::write(
+            root.join("consumer").join("src").join("lib.rs"),
+            "#[path = \"../../decoy/src/proof.rs\"]\nmod proof;\n",
+        )
+        .expect("write cross-package module declaration");
+        fs::write(root.join("decoy").join("src").join("lib.rs"), "")
+            .expect("write decoy crate root");
+        fs::write(
+            root.join("decoy").join("src").join("proof.rs"),
+            "#[test]\nfn cross_package_test() {}\n",
+        )
+        .expect("write cross-package test");
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = Command::new(cargo)
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "-p",
+                "consumer",
+                "--lib",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run package boundary compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout).expect("package boundary output is UTF-8");
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            ["proof::cross_package_test: test"]
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        let canonical = root
+            .join("decoy")
+            .join("src")
+            .join("proof.rs")
+            .canonicalize()
+            .expect("canonical cross-package source");
+        assert!(
+            !targets.contains(&canonical),
+            "evidence reachability must remain inside its owning package"
+        );
+        fs::remove_dir_all(root).expect("remove package boundary compiler oracle");
+    }
+
+    #[test]
     fn ambiguous_module_sources_fail_closed_like_rustc() {
         let root = env::temp_dir().join(format!(
             "claw-conformance-ambiguous-module-{}-{}",
@@ -2112,7 +2559,8 @@ mod nested {
         )
         .expect("write second ambiguous module");
 
-        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
         let output = Command::new(cargo)
             .current_dir(&root)
             .env("CARGO_TARGET_DIR", root.join("target"))

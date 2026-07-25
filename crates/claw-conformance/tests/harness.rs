@@ -892,6 +892,103 @@ fn cargo_target_disabled_for_testing_cannot_supply_acceptance_evidence() {
 }
 
 #[test]
+fn cargo_target_without_standard_harness_cannot_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let crate_root = fixture.root.join("crates").join("demo");
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("tests")
+        .join("harnessless.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[test]\nfn inert_harnessless_test() {}\nfn main() {}\n",
+    )
+    .expect("write harnessless target");
+    let manifest_path = crate_root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).expect("read fixture manifest");
+    fs::write(
+        manifest_path,
+        format!(
+            "{manifest}\n[[test]]\nname = \"harnessless\"\npath = \"tests/harnessless.rs\"\nharness = false\n"
+        ),
+    )
+    .expect("disable standard test harness");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "inert_harnessless_test")],
+        ))
+        .expect("register harnessless-target claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("harnessless Cargo target must not count as evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence path 'crates/demo/tests/harnessless.rs' is not reachable from a test-enabled Cargo target"
+    );
+}
+
+#[test]
+fn cross_package_path_module_cannot_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/demo\", \"crates/decoy\"]\nresolver = \"3\"\n",
+    )
+    .expect("add decoy package to fixture workspace");
+    let decoy_root = fixture.root.join("crates").join("decoy");
+    fs::create_dir_all(decoy_root.join("src")).expect("create decoy package");
+    fs::write(
+        decoy_root.join("Cargo.toml"),
+        "[package]\nname = \"decoy\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write decoy manifest");
+    fs::write(decoy_root.join("src").join("lib.rs"), "").expect("write decoy crate root");
+    let evidence_path = Path::new("crates")
+        .join("decoy")
+        .join("src")
+        .join("forged.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[test]\nfn cross_package_test() {}\n",
+    )
+    .expect("write cross-package evidence");
+    fs::write(
+        fixture
+            .root
+            .join("crates")
+            .join("demo")
+            .join("src")
+            .join("lib.rs"),
+        "#[path = \"../../decoy/src/forged.rs\"]\nmod forged;\n",
+    )
+    .expect("wire cross-package module");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "cross_package_test")],
+        ))
+        .expect("register cross-package claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("cross-package module must not count as evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence path 'crates/decoy/src/forged.rs' is not reachable from a test-enabled Cargo target"
+    );
+}
+
+#[test]
 fn fabricated_module_qualification_is_rejected() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
     let fixture = Fixture::empty();
