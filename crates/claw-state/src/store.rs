@@ -1948,7 +1948,11 @@ impl StateStore {
                                 )
                             })
                             .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        verify_sqlite_connection_identity(connection).await?;
+                        if sqlite_main_database_drifted(connection).await? {
+                            return Err(sqlx::Error::Protocol(
+                                "SQLite main database identity changed after open".to_owned(),
+                            ));
+                        }
                         if ready.load(std::sync::atomic::Ordering::Acquire) {
                             claw_sqlite_file_control::set_busy_timeout(
                                 connection,
@@ -2136,7 +2140,11 @@ impl StateStore {
                             }
                         };
                         verified.map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
-                        verify_sqlite_connection_identity(connection).await?;
+                        if sqlite_main_database_drifted(connection).await? {
+                            return Err(sqlx::Error::Protocol(
+                                "SQLite main database identity changed after open".to_owned(),
+                            ));
+                        }
                         Ok(true)
                     })
                 })
@@ -6637,14 +6645,18 @@ impl<'store> StoreOperationConnection<'store> {
                     .unwrap_or(claw_sqlite_file_control::TerminalCloseOutcome::Quarantined);
             return Err(compose_terminal_close(operation, error, close));
         }
-        let verified =
-            tokio::time::timeout_at(deadline, verify_sqlite_connection_identity(&mut connection))
-                .await;
+        let verified = tokio::time::timeout_at(
+            deadline,
+            verify_sqlite_connection_identity(
+                &mut connection,
+                "verify state operation SQLite identity",
+                identity.database_path,
+            ),
+        )
+        .await;
         if let Err(primary) = verified
             .map_err(|_| deadline_state.timeout_error())
-            .and_then(|result| {
-                result.map_err(|error| database("verify state operation SQLite identity", error))
-            })
+            .and_then(|result| result)
         {
             let close =
                 tokio::time::timeout_at(deadline + identity.cleanup_timeout, connection.discard())
@@ -6716,15 +6728,18 @@ impl<'store> StoreOperationConnection<'store> {
                 close,
             ));
         }
+        let database_path = self.identity.database_path;
         let verified = tokio::time::timeout_at(
             self.deadline,
-            verify_sqlite_connection_identity(&mut connection),
+            verify_sqlite_connection_identity(
+                &mut connection,
+                "reverify state operation SQLite identity",
+                database_path,
+            ),
         )
         .await;
         let verified = match verified {
-            Ok(result) => {
-                result.map_err(|error| database("reverify state operation SQLite identity", error))
-            }
+            Ok(result) => result,
             Err(_) => Err(self.expire()),
         };
         if let Err(error) = verified {
@@ -8843,16 +8858,28 @@ fn verify_store_lock_binding(
 }
 
 #[cfg(unix)]
+async fn sqlite_main_database_drifted(
+    connection: &mut SqliteConnection,
+) -> Result<bool, sqlx::Error> {
+    claw_sqlite_file_control::main_database_has_moved(connection)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+}
+
+#[cfg(unix)]
 async fn verify_sqlite_connection_identity(
     connection: &mut SqliteConnection,
-) -> Result<(), sqlx::Error> {
-    let moved = claw_sqlite_file_control::main_database_has_moved(connection)
+    operation: &'static str,
+    database_path: &Path,
+) -> Result<(), StateError> {
+    if sqlite_main_database_drifted(connection)
         .await
-        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-    if moved {
-        Err(sqlx::Error::Protocol(
-            "SQLite main database identity changed after open".to_owned(),
-        ))
+        .map_err(|error| database(operation, error))?
+    {
+        Err(StateError::InvalidPath {
+            path: database_path.to_owned(),
+            reason: "SQLite main database path changed after its identity was verified",
+        })
     } else {
         Ok(())
     }
@@ -8920,9 +8947,18 @@ async fn install_store_commit_guard(
 }
 
 #[cfg(not(unix))]
+async fn sqlite_main_database_drifted(
+    _connection: &mut SqliteConnection,
+) -> Result<bool, sqlx::Error> {
+    Ok(false)
+}
+
+#[cfg(not(unix))]
 async fn verify_sqlite_connection_identity(
     _connection: &mut SqliteConnection,
-) -> Result<(), sqlx::Error> {
+    _operation: &'static str,
+    _database_path: &Path,
+) -> Result<(), StateError> {
     Ok(())
 }
 
@@ -12262,9 +12298,12 @@ async fn backup_pool(
             );
         }
     };
-    let sqlite_identity = verify_sqlite_connection_identity(&mut connection)
-        .await
-        .map_err(|error| database("reverify backup source SQLite identity", error));
+    let sqlite_identity = verify_sqlite_connection_identity(
+        &mut connection,
+        "reverify backup source SQLite identity",
+        operational_identity.map_or(destination, |identity| identity.database_path),
+    )
+    .await;
     let source_identity = sqlite_identity.and_then(|()| {
         operational_identity
             .map(OperationalIdentity::verify)
@@ -13177,7 +13216,7 @@ pub(crate) mod test_support {
     use sqlx::SqlitePool;
 
     #[cfg(unix)]
-    use super::verify_sqlite_connection_identity;
+    use super::sqlite_main_database_drifted;
     use super::{
         EXPIRE_OUTPUT_CREATION_DEADLINE, EXPIRE_PUBLICATION_DEADLINE, FAIL_AFTER_PUBLICATION,
         PinnedSnapshot, STALL_HEALTH_PROGRESS, StateStore, create_trusted_backup_seal,
@@ -13810,6 +13849,8 @@ pub(crate) mod test_support {
 
     #[cfg(unix)]
     pub(crate) async fn sqlite_identity_is_valid(connection: &mut SqliteConnection) -> bool {
-        verify_sqlite_connection_identity(connection).await.is_ok()
+        !sqlite_main_database_drifted(connection)
+            .await
+            .unwrap_or(true)
     }
 }

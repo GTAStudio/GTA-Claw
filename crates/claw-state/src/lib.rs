@@ -3477,13 +3477,16 @@ mod tests {
             .expect("backup parent replacement remains bounded")
             .expect("backup parent replacement task joins")
             .expect_err("backup rejects replaced destination parent");
-        assert!(matches!(
-            error,
-            StateError::InvalidPath {
-                reason: "state directory path changed after its identity was verified",
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                StateError::InvalidPath {
+                    reason: "state directory path changed after its identity was verified",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         assert!(!destination.exists());
         for artifact in [
             temporary.clone(),
@@ -4129,7 +4132,7 @@ mod tests {
             release.store(true, std::sync::atomic::Ordering::Release);
         });
         let error = backup.expect_err("post-capture source replacement fails closed");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(matches!(error, StateError::InvalidPath { .. }), "{error:?}");
         assert!(!destination.exists());
         fs::remove_file(&source_path).expect("remove replacement source");
         fs::rename(&detached, &source_path).expect("restore original source identity");
@@ -4357,7 +4360,10 @@ mod tests {
         let error = StateStore::restore_backup(&alias, &destination)
             .await
             .expect_err("detached WAL alias without snapshot provenance is rejected");
-        assert!(matches!(error, StateError::InvalidBackup { .. }));
+        assert!(
+            matches!(error, StateError::InvalidBackup { .. }),
+            "{error:?}"
+        );
         assert!(!destination.exists());
         reader
             .execute("ROLLBACK")
@@ -4585,13 +4591,17 @@ mod tests {
         );
         let store = std::sync::Arc::try_unwrap(store)
             .unwrap_or_else(|_| panic!("writer retained missing-WAL store"));
-        assert!(matches!(
-            store.close().await,
-            Err(StateError::CloseDegraded {
-                os_lock_released: true,
-                ..
-            })
-        ));
+        let close = store.close().await;
+        assert!(
+            matches!(
+                close,
+                Err(StateError::CloseDegraded {
+                    os_lock_released: true,
+                    ..
+                })
+            ),
+            "{close:?}"
+        );
     }
 
     #[tokio::test]
@@ -6170,7 +6180,7 @@ mod tests {
             .await
             .expect("checkpoint task joins")
             .expect_err("post-operation replacement fails closed");
-        assert!(matches!(error, StateError::InvalidPath { .. }));
+        assert!(matches!(error, StateError::InvalidPath { .. }), "{error:?}");
         fs::remove_file(&path).expect("remove replacement database name");
         fs::rename(&detached, &path).expect("restore database identity for clean close");
         std::sync::Arc::try_unwrap(owner)
@@ -6449,7 +6459,10 @@ mod tests {
             .create(&record)
             .await
             .expect_err("commit-boundary logical drift is rejected");
-        assert!(matches!(error, StateError::InvalidMigrationHistory { .. }));
+        assert!(
+            matches!(error, StateError::InvalidMigrationHistory { .. }),
+            "{error:?}"
+        );
         assert!(
             store
                 .sessions()

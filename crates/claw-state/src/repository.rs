@@ -1515,16 +1515,18 @@ async fn apply_commit_test_tamper(
         .expect("commit test tampers lock poisoned")
         .remove(owner);
     if tamper {
-        sqlx::raw_sql(
+        for statement in [
             "UPDATE claw_writer_lock
              SET owner = 'commit-boundary-attacker'
-             WHERE singleton = 1;
-             PRAGMA application_id = 0;
-             CREATE TABLE commit_boundary_rogue(value TEXT) STRICT;",
-        )
-        .execute(transaction.executor())
-        .await
-        .map_err(|error| database("apply commit-boundary test tamper", error))?;
+             WHERE singleton = 1",
+            "PRAGMA application_id = 0",
+            "CREATE TABLE commit_boundary_rogue(value TEXT) STRICT",
+        ] {
+            sqlx::raw_sql(statement)
+                .execute(transaction.executor())
+                .await
+                .map_err(|error| database("apply commit-boundary test tamper", error))?;
+        }
     }
     Ok(())
 }
