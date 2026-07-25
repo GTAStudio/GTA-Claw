@@ -150,3 +150,19 @@ pub(crate) fn try_junction(original: &Path, link: &Path) -> bool {
 pub(crate) fn try_junction(_original: &Path, _link: &Path) -> bool {
     false
 }
+
+/// Removes a directory link without following it.
+///
+/// Windows junctions and directory symlinks are directory entries and need
+/// `remove_dir`; a unix symlink to a directory is not a directory and needs
+/// `remove_file`. Either way the target is left untouched.
+pub(crate) fn remove_dir_link(link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        fs::remove_dir(link)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(link)
+    }
+}

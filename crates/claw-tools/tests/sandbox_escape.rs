@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use claw_tools::sandbox::{Sandbox, SandboxError, SandboxLimits, WriteMode};
 
-use common::{TempTree, try_junction, try_symlink_dir, try_symlink_file};
+use common::{TempTree, remove_dir_link, try_junction, try_symlink_dir, try_symlink_file};
 
 /// Builds a workspace root with a sibling directory holding a secret file.
 ///
@@ -572,7 +572,7 @@ fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
     if !linkable {
         return;
     }
-    fs::remove_dir(&parent).expect("link is removable");
+    remove_dir_link(&parent).expect("link is removable");
     fs::create_dir(&parent).expect("honest parent is recreatable");
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -597,10 +597,10 @@ fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
                 flipper_count.fetch_add(1, Ordering::Relaxed);
             }
             // Removing a directory link removes the link, never its target.
-            let _ = fs::remove_dir(&flip_target);
+            let _ = remove_dir_link(&flip_target);
             let _ = fs::rename(&flip_stash, &flip_target);
         }
-        let _ = fs::remove_dir(&flip_target);
+        let _ = remove_dir_link(&flip_target);
         let _ = fs::rename(&flip_stash, &flip_target);
     });
 
