@@ -60,6 +60,7 @@ output_receipt="$(trust_receipt "$OUTPUT_COMPONENT_PATH" "build output")"
 recipe_sha="$(sha256_file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build")"
 image_tag="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
 docker build \
+  --provenance=false \
   --file "$SOURCE_SNAPSHOT_DIRECTORY/packaging/linux/Dockerfile.build" \
   --build-arg "DEBIAN_SNAPSHOT=$LINUX_DEBIAN_SNAPSHOT" \
   --tag "$image_tag" \
