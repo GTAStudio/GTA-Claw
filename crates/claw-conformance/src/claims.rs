@@ -2677,7 +2677,7 @@ mod nested {
             "../../../compat/upstream/enabled-test-oracle.json"
         ))
         .expect("parse shared enabled-test oracle");
-        assert_eq!(corpus.cases.len(), 85);
+        assert_eq!(corpus.cases.len(), 120);
         for case in corpus.cases {
             assert_eq!(
                 declares_enabled_test(&case.source, &case.test),
