@@ -53,32 +53,22 @@ authorization is part of the caller's security contract.
 
 The local suite includes authenticated integration and regression cases,
 deterministic injected clock/jitter/barrier coverage, and a static
-reference-workflow policy test. One ignored live contract test is run only by
-the isolated upstream workflow.
+reference-workflow policy test. One ignored live contract test remains available
+for operators who explicitly supply an external Gateway endpoint.
 
 ## Pinned upstream reference
 
-`.github/workflows/upstream-gateway-reference.yml` checks out official
-`openclaw/openclaw` at exactly
-`b43e832fcc8000ed7287c7accc54e381db607f85` (package `2026.7.2`), verifies the
-checkout and pinned `pnpm-lock.yaml` digest, installs the package-declared
-`pnpm@11.2.2` with lifecycle scripts disabled, proves the known downloaded
-Matrix native artifact is absent, and starts:
+`.github/workflows/upstream-gateway-reference.yml` validates the immutable data
+under `compat/upstream/` and runs the `claw-protocol` and
+`claw-gateway-client` suites against that frozen contract. The workflow does not
+checkout, install, build, or execute the upstream implementation.
 
-```text
-OPENCLAW_SKIP_CHANNELS=1 OPENCLAW_STATE_DIR=<isolated> OPENCLAW_GATEWAY_TOKEN=<redacted> node openclaw.mjs gateway --port 18789 --bind loopback --auth token --allow-unconfigured --ws-log compact
-```
+The ignored `pinned_official_gateway_live_contract` test can still perform a
+real authenticated v4 handshake, safe `health` interaction, negative token
+case, negative protocol-version case, and clean disconnect when an operator
+provides `OPENCLAW_REFERENCE_URL` and `OPENCLAW_REFERENCE_TOKEN` for an external
+Gateway. No external implementation is provisioned by this repository.
 
-The Rust client performs a real authenticated v4 handshake, safe `health`
-interaction, negative token case, negative protocol-version case, and clean
-disconnect. The official Node/npm toolchain exists only in that authoritative
-Linux reference job; normal CI, product builds, releases, Cargo build scripts,
-and runtime stay Node/npm-free. Linux is authoritative because this check starts
-the official host Gateway, while normal Rust transport compile/tests remain the
-cross-platform Windows/macOS/Linux gate.
-
-It does **not** provide a Rust Gateway server, RPC/business handlers, provider or
-model sessions, a GUI, or behavioral parity for the 278 registered methods.
-Node.js and npm are absent from this crate and every normal product build. The
-only Node.js boundary is the separately triggered pinned-upstream reference CI
-workflow.
+This crate does **not** provide a Gateway server, RPC/business handlers,
+provider or model sessions, a GUI, or behavioral parity for all registered
+methods.
