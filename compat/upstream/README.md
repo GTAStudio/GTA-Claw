@@ -222,12 +222,12 @@ Three limits, stated plainly rather than left to be discovered:
   passes; that is `cargo test`'s job.
 
 This rule is **shared, not locally owned**. `crates/claw-conformance` implements
-the same rule — "a target root, or reachable from a target root" — after the
-compatibility owner's target-root-only proposal was withdrawn: requiring the
-cited file to *be* a target root left 225 tests across 34 files in 9 crates with
-no legal citation at all, and the only workaround was widening the visibility of
-private items in production code, which would have let the ledger dictate the
-API surface.
+the same rule — "a target root, or reachable from a target root" — after a
+proposal to require the cited file to *be* a target root was put to the
+compatibility owner and then withdrawn: target-root-only left 225 tests across
+34 files in 9 crates with no legal citation at all, and the only workaround was
+widening the visibility of private items in production code, which would have
+let the ledger dictate the API surface.
 
 The two implementations are therefore intended to be **identical**, not merely
 ordered. A divergence in *either* direction is a defect and must be reported
@@ -235,10 +235,7 @@ rather than managed: if this validator were the looser side, a row it blesses
 could be rejected by the parity report. The specification above is deliberately
 complete enough to be mirrored; the seven `implemented-citing-*` cases in
 `validate-self-test.ps1` are its executable form — four that must be rejected and
-three that must be accepted. The three accepting cases are load bearing: a
-tightening rule needs its false-positive cases pinned as much as its true-positive
-ones, or a later change quietly converts a correct rejecter into a false-rejection
-engine with the self-test still green.
+three that must be accepted.
 
 A tightening rule needs its false-positive cases pinned as much as its
 true-positive ones. The three accepting cases — a `mod`-wired module, a
