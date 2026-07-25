@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
 use crate::identity::canonical_caseless;
-use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
+use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot, require_plain_path};
 use crate::ownership::{CODEOWNERS_PATH, is_codeowners_path_or_alias, validate_codeowners};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -1646,7 +1646,8 @@ fn read_existing_bootstrap_snapshot(output: &Path) -> PolicyResult<Option<Vec<u8
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(cause) => return Err(error("inspect existing Bootstrap snapshot", cause)),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    require_plain_path(output)?;
+    if !metadata.is_file() {
         return Err(PolicyError::new(format!(
             "existing Bootstrap snapshot is not a regular file: {}",
             output.display()
@@ -1677,6 +1678,15 @@ fn read_existing_bootstrap_snapshot(output: &Path) -> PolicyResult<Option<Vec<u8
 
 fn stage_bootstrap_snapshot(output: &Path, bytes: &[u8]) -> PolicyResult<std::path::PathBuf> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    require_plain_path(parent)?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|cause| error("inspect Bootstrap snapshot output directory", cause))?;
+    if !parent_metadata.is_dir() {
+        return Err(PolicyError::new(format!(
+            "Bootstrap snapshot output parent is not a directory: {}",
+            parent.display()
+        )));
+    }
     for _ in 0..32 {
         let unique = NEXT_BOOTSTRAP_SNAPSHOT_TEMP.fetch_add(1, Ordering::Relaxed);
         let staged = parent.join(format!(
