@@ -47,7 +47,7 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 54 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 59 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
@@ -135,6 +135,60 @@ was preferred to redacting a `Debug`.
 
 Discovery itself is not implemented in this crate and is not this crate's to
 implement; only the precondition is.
+
+#### The plist keys are not the whole gate: multicast is an Apple-granted entitlement
+
+Verified against Apple's primary documentation — TN3179 *Understanding local
+network privacy* and the entitlement reference for
+`com.apple.developer.networking.multicast`, which records `introducedAt: 14.0`
+for iOS.
+
+On iOS, **sending or receiving UDP multicast requires the
+`com.apple.developer.networking.multicast` entitlement**, and that entitlement
+is not a key a developer may add. Apple's own text: *"This entitlement requires
+permission from Apple before you can use it in your app"*, requested at
+`https://developer.apple.com/contact/request/networking-multicast`. It is a
+decision by a third party for a specific application identifier, so **a build
+made from source does not have it**, and its failure mode is the worst one
+available: the sockets bind, the calls report success, and no packet moves.
+
+The requirement depends on **how** discovery is implemented, which is why
+`DiscoveryMechanism` exists rather than a single flag:
+
+| Mechanism | Multicast entitlement | Why |
+| --- | --- | --- |
+| `SystemDnsSd` — system DNS-SD, declared service types only | not required | the platform daemon performs the multicast outside this process |
+| `InProcessMulticast` — any pure-Rust mDNS stack, `mdns-sd` included | **required** | it binds its own sockets and sends UDP multicast directly |
+
+Per TN3179's own tables, only *"working with arbitrary Bonjour service types"*
+and *"browsing for all advertised service types"* pull the entitlement into the
+system DNS-SD path. Registering, browsing and resolving a specific declared
+service type does not.
+
+This is a genuine architectural fork rather than a flat gap, and it is recorded
+as one. It is **not** a route this crate can take today: the system DNS-SD APIs
+are C, reaching them needs FFI, and the workspace sets `unsafe_code = "forbid"`.
+Recording `SystemDnsSd` is a statement about what iOS permits, not a claim that
+this crate can use it.
+
+`DiscoveryUnavailable::awaits_apple_approval` separates the conditions a
+developer can fix from the one that waits on Apple, because a user should not be
+told to check a setting that does not exist on their machine.
+
+#### Two conditions deliberately left ungated
+
+*The runtime Local Network privilege.* TN3179 gives it three states —
+undetermined, allowed, denied — and the alert that resolves it is raised **by**
+the first local-network operation. Gating on it would block the call that
+produces the prompt, so it is documented as a distinct silent-failure mode
+rather than modelled as a precondition. A caller that gets an empty result after
+passing every check here should report a possible denial, not an absence of
+peers.
+
+*The simulator.* TN3179 states that the simulator does not support local network
+privacy and that this behaviour must be tested on a real device. No simulator
+run — and therefore no CI job this project could plausibly build — can validate
+any of it.
 
 ### Tailscale — believed structurally unavailable on iOS
 

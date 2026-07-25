@@ -68,8 +68,13 @@ impl ClientTransport {
                 IosTransportStatus::NeedsHostAppFacilities,
                 "iOS requires NSLocalNetworkUsageDescription and NSBonjourServices in the host \
                  application bundle, which this crate cannot read or supply, and it suspends \
-                 polling discovery when the application leaves the foreground. See the host_app \
-                 module, which turns a missing declaration into a reported condition.",
+                 polling discovery when the application leaves the foreground. A pure-Rust mDNS \
+                 stack binds its own multicast sockets, which per Apple TN3179 additionally \
+                 requires the com.apple.developer.networking.multicast entitlement that Apple \
+                 grants case by case on request, so no build made from source has it. The system \
+                 DNS-SD path avoids that entitlement for declared service types but needs C \
+                 interop this workspace's unsafe_code setting forbids. See the host_app module, \
+                 which turns each missing facility into a reported condition.",
             ),
             Self::TailscaleLocalApi => (
                 IosTransportStatus::BelievedUnavailable,
