@@ -5,10 +5,11 @@
 //! produces deterministic parity reports.
 //!
 //! Evidence verification proves that a cited Rust test is literally declared in
-//! a test-enabled Cargo target root; it cannot prove that the test ran or is
-//! semantically sufficient for the claim. Requiring the exact `src_path`
-//! reported by `cargo metadata` rejects orphan source files without guessing
-//! Rust module reachability.
+//! a test-enabled Cargo target root or a source file reachable through explicit
+//! `mod` declarations from one. The resolver follows nested inline modules and
+//! `#[path]` overrides while rejecting orphan files. It deliberately does not
+//! evaluate parent-module `cfg` predicates. It cannot prove that the test ran or
+//! is semantically sufficient for the claim.
 //! Automated citation integrity therefore composes with independent review:
 //! the harness rejects fabricated evidence, while reviewers judge sufficiency.
 //! The verifier recognizes literal test declarations only; macro-generated
@@ -24,8 +25,7 @@
 //! and result. Both the Rust and PowerShell validators must consume those same
 //! attestation bytes. The current frozen workflow runs this conformance check
 //! inside the workspace test command, so it cannot consume that command's
-//! completed output. Existing module-file citations must migrate to target
-//! roots before such attestations can become mandatory.
+//! completed output.
 
 mod claims;
 mod error;

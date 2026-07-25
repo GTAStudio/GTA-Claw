@@ -1,6 +1,6 @@
 //! Typed implementation claims and evidence registration.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -219,10 +219,12 @@ pub struct Registry {
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
+    workspace_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
+    manifest_path: PathBuf,
     targets: Vec<CargoTarget>,
 }
 
@@ -240,38 +242,6 @@ pub(crate) struct CargoTestTargets {
 
 impl CargoTestTargets {
     fn load(repository_root: &Path, code: ViolationCode) -> Result<Self, ConformanceError> {
-        let manifest_path = repository_root.join("Cargo.toml");
-        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = Command::new(cargo)
-            .current_dir(repository_root)
-            .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
-            .arg("--manifest-path")
-            .arg(&manifest_path)
-            .output()
-            .map_err(|error| {
-                ConformanceError::new(
-                    code,
-                    Some("Cargo.toml".to_owned()),
-                    format!("cannot run cargo metadata: {error}"),
-                )
-            })?;
-        if !output.status.success() {
-            return Err(ConformanceError::new(
-                code,
-                Some("Cargo.toml".to_owned()),
-                format!(
-                    "cargo metadata failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ));
-        }
-        let metadata: CargoMetadata = serde_json::from_slice(&output.stdout).map_err(|error| {
-            ConformanceError::new(
-                code,
-                Some("Cargo.toml".to_owned()),
-                format!("cannot parse cargo metadata: {error}"),
-            )
-        })?;
         let canonical_root = repository_root.canonicalize().map_err(|error| {
             ConformanceError::new(
                 code,
@@ -279,27 +249,56 @@ impl CargoTestTargets {
                 format!("cannot resolve repository root: {error}"),
             )
         })?;
-        let mut source_paths = BTreeSet::new();
-        for target in metadata
-            .packages
-            .into_iter()
-            .flat_map(|package| package.targets)
-            .filter(|target| target.test)
-        {
-            let source_path = target.src_path.canonicalize().map_err(|error| {
+        let manifests = discover_cargo_manifests(&canonical_root).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!("cannot discover Cargo manifests: {error}"),
+            )
+        })?;
+        let mut processed_manifests = BTreeSet::new();
+        let mut target_roots = BTreeSet::new();
+        for manifest_path in manifests {
+            let canonical_manifest = manifest_path.canonicalize().map_err(|error| {
                 ConformanceError::new(
                     code,
                     Some("Cargo.toml".to_owned()),
                     format!(
-                        "cannot resolve test-enabled Cargo target '{}': {error}",
-                        target.src_path.display()
+                        "cannot resolve Cargo manifest '{}': {error}",
+                        manifest_path.display()
                     ),
                 )
             })?;
-            if source_path.starts_with(&canonical_root) {
-                source_paths.insert(source_path);
+            if processed_manifests.contains(&canonical_manifest) {
+                continue;
+            }
+            let metadata = load_cargo_metadata(&canonical_root, &canonical_manifest, code)?;
+            let workspace_manifest = metadata.workspace_root.join("Cargo.toml");
+            if let Ok(path) = workspace_manifest.canonicalize() {
+                processed_manifests.insert(path);
+            }
+            for package in metadata.packages {
+                if let Ok(path) = package.manifest_path.canonicalize() {
+                    processed_manifests.insert(path);
+                }
+                for target in package.targets.into_iter().filter(|target| target.test) {
+                    let source_path = target.src_path.canonicalize().map_err(|error| {
+                        ConformanceError::new(
+                            code,
+                            Some("Cargo.toml".to_owned()),
+                            format!(
+                                "cannot resolve test-enabled Cargo target '{}': {error}",
+                                target.src_path.display()
+                            ),
+                        )
+                    })?;
+                    if source_path.starts_with(&canonical_root) {
+                        target_roots.insert(source_path);
+                    }
+                }
             }
         }
+        let source_paths = reachable_rust_sources(&canonical_root, target_roots, code)?;
         Ok(Self {
             repository_root: canonical_root,
             source_paths,
@@ -315,6 +314,209 @@ impl CargoTestTargets {
             .canonicalize()
             .is_ok_and(|root| root == self.repository_root)
     }
+}
+
+fn load_cargo_metadata(
+    repository_root: &Path,
+    manifest_path: &Path,
+    code: ViolationCode,
+) -> Result<CargoMetadata, ConformanceError> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(repository_root)
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .output()
+        .map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!(
+                    "cannot run cargo metadata for '{}': {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!(
+                "cargo metadata failed for '{}': {}",
+                manifest_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!(
+                "cannot parse cargo metadata for '{}': {error}",
+                manifest_path.display()
+            ),
+        )
+    })
+}
+
+fn discover_cargo_manifests(repository_root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut manifests = Vec::new();
+    let mut directories = VecDeque::from([repository_root.to_path_buf()]);
+    while let Some(directory) = directories.pop_front() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_symlink_or_reparse(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                if !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "target" | "node_modules")
+                ) {
+                    directories.push_back(path);
+                }
+            } else if metadata.is_file() && entry.file_name() == "Cargo.toml" {
+                manifests.push(path);
+            }
+        }
+    }
+    manifests.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(manifests)
+}
+
+#[derive(Debug)]
+struct ReachableRustSource {
+    path: PathBuf,
+    module_directory: PathBuf,
+}
+
+fn reachable_rust_sources(
+    repository_root: &Path,
+    target_roots: BTreeSet<PathBuf>,
+    code: ViolationCode,
+) -> Result<BTreeSet<PathBuf>, ConformanceError> {
+    let mut reachable = target_roots.clone();
+    let mut queue = target_roots
+        .into_iter()
+        .filter_map(|path| {
+            let module_directory = path.parent()?.to_path_buf();
+            Some(ReachableRustSource {
+                path,
+                module_directory,
+            })
+        })
+        .collect::<VecDeque<_>>();
+
+    while let Some(current) = queue.pop_front() {
+        let source = fs::read_to_string(&current.path).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some(normalized_api_path(
+                    current
+                        .path
+                        .strip_prefix(repository_root)
+                        .unwrap_or(&current.path)
+                        .to_path_buf(),
+                )),
+                format!(
+                    "cannot read test-enabled Cargo source '{}': {error}",
+                    current.path.display()
+                ),
+            )
+        })?;
+        for reference in rust_module_references(&source) {
+            let mut scope = current.module_directory.clone();
+            for segment in &reference.inline_modules {
+                scope.push(segment);
+            }
+            let candidates = if let Some(path) = &reference.path {
+                let base = if reference.inline_modules.is_empty() {
+                    current.path.parent().unwrap_or(&scope)
+                } else {
+                    &scope
+                };
+                vec![base.join(path)]
+            } else {
+                let child_directory = scope.join(&reference.name);
+                vec![
+                    scope.join(format!("{}.rs", reference.name)),
+                    child_directory.join("mod.rs"),
+                ]
+            };
+            for candidate in candidates {
+                let Some(path) =
+                    resolve_module_file(repository_root, &candidate).map_err(|error| {
+                        ConformanceError::new(
+                            code,
+                            Some("Cargo.toml".to_owned()),
+                            format!(
+                                "cannot resolve Rust module source '{}': {error}",
+                                candidate.display()
+                            ),
+                        )
+                    })?
+                else {
+                    continue;
+                };
+                if reachable.insert(path.clone()) {
+                    let module_directory = module_directory_for_source(&path);
+                    queue.push_back(ReachableRustSource {
+                        path,
+                        module_directory,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(reachable)
+}
+
+fn module_directory_for_source(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(|name| name == "mod.rs") {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else if path.extension().is_some_and(|extension| extension == "rs") {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn resolve_module_file(
+    repository_root: &Path,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    let Some(relative) = normalized_repository_relative(repository_root, candidate) else {
+        return Ok(None);
+    };
+    resolve_ordinal_file(repository_root, &normalized_api_path(relative))
+}
+
+fn normalized_repository_relative(repository_root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(repository_root).ok()?;
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(normalized)
 }
 
 impl Registry {
@@ -592,7 +794,7 @@ pub(crate) fn validate_evidence_as(
                 code,
                 Some(subject.to_owned()),
                 format!(
-                    "evidence path '{}' is not a test-enabled Cargo target source",
+                    "evidence path '{}' is not reachable from a test-enabled Cargo target",
                     item.path
                 ),
             ));
@@ -804,6 +1006,7 @@ enum RustToken {
     ColonColon,
     Semi,
     Literal,
+    StringLiteral(String),
     Other,
 }
 
@@ -812,6 +1015,13 @@ struct RustAttribute {
     inner: bool,
     path: Vec<String>,
     tokens: Vec<RustToken>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustModuleReference {
+    inline_modules: Vec<String>,
+    name: String,
+    path: Option<String>,
 }
 
 // This is the normative enabled-test decision. The transition validator ports
@@ -850,22 +1060,7 @@ fn declares_in_items(
             break;
         }
         index = skip_visibility(tokens, index, end);
-        loop {
-            match tokens.get(index) {
-                Some(RustToken::Ident(value)) if value == "extern" => {
-                    index += 1;
-                    if tokens.get(index) == Some(&RustToken::Literal) {
-                        index += 1;
-                    }
-                }
-                Some(RustToken::Ident(value))
-                    if matches!(value.as_str(), "async" | "const" | "default" | "unsafe") =>
-                {
-                    index += 1;
-                }
-                _ => break,
-            }
-        }
+        index = skip_item_modifiers(tokens, index);
         match (tokens.get(index), tokens.get(index + 1)) {
             (Some(RustToken::Ident(keyword)), Some(RustToken::Ident(name))) if keyword == "mod" => {
                 if tokens.get(index + 2) == Some(&RustToken::OpenBrace) {
@@ -936,6 +1131,70 @@ fn parse_attributes(
     (attributes, index)
 }
 
+fn rust_module_references(source: &str) -> Vec<RustModuleReference> {
+    let tokens = rust_tokens(source);
+    let mut references = Vec::new();
+    collect_rust_module_references(&tokens, 0, tokens.len(), &[], &mut references);
+    references
+}
+
+fn collect_rust_module_references(
+    tokens: &[RustToken],
+    start: usize,
+    end: usize,
+    inline_modules: &[String],
+    references: &mut Vec<RustModuleReference>,
+) {
+    let mut index = start;
+    while index < end {
+        let item_start = index;
+        let (attributes, after_attributes) = parse_attributes(tokens, index, end);
+        let outer_attributes = attributes
+            .into_iter()
+            .filter(|attribute| !attribute.inner)
+            .collect::<Vec<_>>();
+        index = skip_visibility(tokens, after_attributes, end);
+        index = skip_item_modifiers(tokens, index);
+
+        match (tokens.get(index), tokens.get(index + 1)) {
+            (Some(RustToken::Ident(keyword)), Some(RustToken::Ident(name))) if keyword == "mod" => {
+                if tokens.get(index + 2) == Some(&RustToken::OpenBrace) {
+                    let open = index + 2;
+                    let close = matching_delimiter(tokens, open, end).unwrap_or(end);
+                    let mut nested = inline_modules.to_vec();
+                    nested.push(name.clone());
+                    collect_rust_module_references(tokens, open + 1, close, &nested, references);
+                    index = close.saturating_add(1);
+                } else if tokens.get(index + 2) == Some(&RustToken::Semi) {
+                    references.push(RustModuleReference {
+                        inline_modules: inline_modules.to_vec(),
+                        name: name.clone(),
+                        path: path_attribute_value(&outer_attributes),
+                    });
+                    index += 3;
+                } else {
+                    index = skip_item(tokens, index, end);
+                }
+            }
+            _ => index = skip_item(tokens, index, end),
+        }
+        if index <= item_start {
+            index = item_start + 1;
+        }
+    }
+}
+
+fn path_attribute_value(attributes: &[RustAttribute]) -> Option<String> {
+    attributes.iter().find_map(|attribute| {
+        (attribute.path.as_slice() == ["path"]).then(|| {
+            attribute.tokens.iter().find_map(|token| match token {
+                RustToken::StringLiteral(value) => Some(value.clone()),
+                _ => None,
+            })
+        })?
+    })
+}
+
 fn attributes_declare_enabled_test(attributes: &[RustAttribute]) -> bool {
     let has_test = attributes.iter().any(|attribute| {
         attribute
@@ -989,6 +1248,28 @@ fn skip_visibility(tokens: &[RustToken], mut index: usize, end: usize) -> usize 
             .saturating_add(1);
     }
     index
+}
+
+fn skip_item_modifiers(tokens: &[RustToken], mut index: usize) -> usize {
+    loop {
+        match tokens.get(index) {
+            Some(RustToken::Ident(value)) if value == "extern" => {
+                index += 1;
+                if matches!(
+                    tokens.get(index),
+                    Some(RustToken::Literal | RustToken::StringLiteral(_))
+                ) {
+                    index += 1;
+                }
+            }
+            Some(RustToken::Ident(value))
+                if matches!(value.as_str(), "async" | "const" | "default" | "unsafe") =>
+            {
+                index += 1;
+            }
+            _ => return index,
+        }
+    }
 }
 
 fn skip_item(tokens: &[RustToken], mut index: usize, end: usize) -> usize {
@@ -1102,18 +1383,30 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
         } else if bytes.get(index..index + 2) == Some(b"/*") {
             index = skip_block_comment(bytes, index);
         } else if let Some(end) = raw_string_end(bytes, index) {
-            tokens.push(RustToken::Literal);
+            if let Some(value) = raw_string_value(source, index, end) {
+                tokens.push(RustToken::StringLiteral(value));
+            } else {
+                tokens.push(RustToken::Literal);
+            }
             index = end;
         } else if bytes[index] == b'"'
             || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"'))
         {
-            tokens.push(RustToken::Literal);
+            let is_byte = bytes[index] == b'b';
             let quote = if bytes[index] == b'"' {
                 index
             } else {
                 index + 1
             };
-            index = quoted_end(bytes, quote, b'"');
+            let end = quoted_end(bytes, quote, b'"');
+            if !is_byte && bytes.get(end.saturating_sub(1)) == Some(&b'"') {
+                tokens.push(RustToken::StringLiteral(
+                    source[quote + 1..end - 1].to_owned(),
+                ));
+            } else {
+                tokens.push(RustToken::Literal);
+            }
+            index = end;
         } else if bytes[index] == b'\'' {
             tokens.push(RustToken::Literal);
             index = char_literal_end(bytes, index).unwrap_or(index + 1);
@@ -1211,6 +1504,26 @@ fn raw_string_end(bytes: &[u8], index: usize) -> Option<usize> {
     Some(bytes.len())
 }
 
+fn raw_string_value(source: &str, index: usize, end: usize) -> Option<String> {
+    let bytes = source.as_bytes();
+    if bytes.get(index) != Some(&b'r') {
+        return None;
+    }
+    let hashes = bytes[index + 1..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    let content_start = index + 2 + hashes;
+    let content_end = end.checked_sub(1 + hashes)?;
+    if bytes.get(index + 1 + hashes) != Some(&b'"')
+        || bytes.get(content_end) != Some(&b'"')
+        || content_end < content_start
+    {
+        return None;
+    }
+    source.get(content_start..content_end).map(str::to_owned)
+}
+
 fn quoted_end(bytes: &[u8], quote: usize, delimiter: u8) -> usize {
     let mut cursor = quote + 1;
     while cursor < bytes.len() {
@@ -1246,7 +1559,8 @@ mod tests {
 
     use serde::Deserialize;
 
-    use super::declares_enabled_test;
+    use super::{CargoTestTargets, declares_enabled_test};
+    use crate::ViolationCode;
 
     static NEXT_COMPILER_ORACLE: AtomicU64 = AtomicU64::new(0);
 
@@ -1507,6 +1821,184 @@ mod nested {
                 "detector diverged from Cargo for {identity}"
             );
         }
+    }
+
+    #[test]
+    fn cargo_test_listing_matches_module_reachability() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-reachability-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src").join("outer").join("nested"))
+            .expect("create nested module directory");
+        fs::create_dir_all(root.join("src").join("custom"))
+            .expect("create custom module directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-reachability-oracle\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [[bin]]\n\
+             name = \"disabled\"\n\
+             path = \"src/disabled.rs\"\n\
+             test = false\n",
+        )
+        .expect("write reachability manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-reachability-oracle\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write reachability lockfile");
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "#[test]\nfn root_test() {}\n\
+             mod outer;\n\
+             #[path = \"support/mod.rs\"]\nmod support;\n\
+             #[path = r\"raw/raw_module.rs\"]\nmod raw;\n",
+        )
+        .expect("write reachability crate root");
+        fs::write(
+            root.join("src").join("outer.rs"),
+            "mod nested {\n    mod proof;\n}\n\
+             #[path = \"custom/from_outer.rs\"]\nmod from_outer;\n",
+        )
+        .expect("write outer module");
+        fs::write(
+            root.join("src")
+                .join("outer")
+                .join("nested")
+                .join("proof.rs"),
+            "#[test]\nfn deep_test() {}\n",
+        )
+        .expect("write deep module");
+        fs::write(
+            root.join("src").join("custom").join("from_outer.rs"),
+            "#[test]\nfn outer_path_test() {}\n",
+        )
+        .expect("write path-attributed module from name.rs");
+        fs::create_dir_all(root.join("src").join("outer").join("custom"))
+            .expect("create path decoy directory");
+        fs::write(
+            root.join("src")
+                .join("outer")
+                .join("custom")
+                .join("from_outer.rs"),
+            "#[test]\nfn outer_path_decoy_test() {}\n",
+        )
+        .expect("write path-attributed decoy");
+        fs::create_dir_all(root.join("src").join("support").join("mod"))
+            .expect("create mod.rs decoy directory");
+        fs::write(
+            root.join("src").join("support").join("mod.rs"),
+            "#[test]\nfn mod_rs_root_test() {}\nmod child;\n",
+        )
+        .expect("write path-attributed mod.rs");
+        fs::write(
+            root.join("src").join("support").join("child.rs"),
+            "#[test]\nfn mod_rs_child_test() {}\n",
+        )
+        .expect("write mod.rs child");
+        fs::write(
+            root.join("src")
+                .join("support")
+                .join("mod")
+                .join("child.rs"),
+            "#[test]\nfn mod_rs_child_decoy_test() {}\n",
+        )
+        .expect("write mod.rs child decoy");
+        fs::create_dir_all(root.join("src").join("raw")).expect("create raw path directory");
+        fs::write(
+            root.join("src").join("raw").join("raw_module.rs"),
+            "#[test]\nfn raw_path_test() {}\n",
+        )
+        .expect("write raw path module");
+        fs::write(
+            root.join("src").join("orphan.rs"),
+            "#[test]\nfn orphan_test() {}\n",
+        )
+        .expect("write orphan module");
+        fs::write(
+            root.join("src").join("disabled.rs"),
+            "#[test]\nfn disabled_test() {}\nfn main() {}\n",
+        )
+        .expect("write test-disabled target");
+
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = Command::new(cargo)
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--lib",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run reachability compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout)
+            .expect("reachability oracle output is UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([
+                "outer::nested::proof::deep_test".to_owned(),
+                "outer::from_outer::outer_path_test".to_owned(),
+                "raw::raw_path_test".to_owned(),
+                "root_test".to_owned(),
+                "support::child::mod_rs_child_test".to_owned(),
+                "support::mod_rs_root_test".to_owned(),
+            ])
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        for (path, test) in [
+            ("src/lib.rs", "root_test"),
+            (
+                "src/outer/nested/proof.rs",
+                "outer::nested::proof::deep_test",
+            ),
+            (
+                "src/custom/from_outer.rs",
+                "outer::from_outer::outer_path_test",
+            ),
+            (
+                "src/outer/custom/from_outer.rs",
+                "outer::from_outer::outer_path_decoy_test",
+            ),
+            ("src/support/mod.rs", "support::mod_rs_root_test"),
+            ("src/support/child.rs", "support::child::mod_rs_child_test"),
+            (
+                "src/support/mod/child.rs",
+                "support::child::mod_rs_child_decoy_test",
+            ),
+            ("src/raw/raw_module.rs", "raw::raw_path_test"),
+            ("src/orphan.rs", "orphan_test"),
+            ("src/disabled.rs", "disabled_test"),
+        ] {
+            let canonical = root.join(path).canonicalize().expect("canonical source");
+            assert_eq!(
+                targets.contains(&canonical),
+                listed.contains(test),
+                "reachability diverged from Cargo for {path}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove reachability compiler oracle");
     }
 
     #[test]

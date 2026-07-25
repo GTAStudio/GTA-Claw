@@ -583,8 +583,107 @@ fn orphan_source_file_cannot_supply_acceptance_evidence() {
     assert_eq!(error.json_path(), None);
     assert_eq!(
         error.message(),
-        "evidence path 'crates/demo/src/orphan.rs' is not a test-enabled Cargo target source"
+        "evidence path 'crates/demo/src/orphan.rs' is not reachable from a test-enabled Cargo target"
     );
+}
+
+#[test]
+fn nested_reachable_module_can_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let crate_root = fixture.root.join("crates").join("demo");
+    fs::write(crate_root.join("src").join("lib.rs"), "mod security;\n")
+        .expect("write fixture crate root");
+    fs::write(
+        crate_root.join("src").join("security.rs"),
+        "mod nested {\n    mod proof;\n}\n",
+    )
+    .expect("write reachable outer module");
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("src")
+        .join("security")
+        .join("nested")
+        .join("proof.rs");
+    fs::create_dir_all(
+        fixture
+            .root
+            .join(&evidence_path)
+            .parent()
+            .expect("evidence parent"),
+    )
+    .expect("create nested module directory");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[test]\nfn security_invariant_holds() {}\n",
+    )
+    .expect("write reachable evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "security_invariant_holds")],
+        ))
+        .expect("register reachable-module claim");
+
+    let report = generate_report(&contract, &registry, &fixture.root)
+        .expect("reachable module must count as evidence");
+    assert_eq!(report.totals.implemented, 1);
+    assert_eq!(report.totals.partial, 0);
+    assert_eq!(report.totals.unimplemented, 46);
+}
+
+#[test]
+fn path_attribute_module_can_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let crate_root = fixture.root.join("crates").join("demo");
+    fs::write(crate_root.join("src").join("lib.rs"), "mod outer;\n")
+        .expect("write path-attributed module root");
+    fs::write(
+        crate_root.join("src").join("outer.rs"),
+        "#[path = \"custom/proof.rs\"]\nmod proof;\n",
+    )
+    .expect("write path attribute in name.rs module");
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("src")
+        .join("custom")
+        .join("proof.rs");
+    fs::create_dir_all(
+        fixture
+            .root
+            .join(&evidence_path)
+            .parent()
+            .expect("evidence parent"),
+    )
+    .expect("create custom module directory");
+    let decoy = crate_root
+        .join("src")
+        .join("outer")
+        .join("custom")
+        .join("proof.rs");
+    fs::create_dir_all(decoy.parent().expect("decoy parent"))
+        .expect("create path-attributed decoy directory");
+    fs::write(decoy, "#[test]\nfn decoy_test() {}\n").expect("write path-attributed decoy");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[test]\nfn custom_module_runs() {}\n",
+    )
+    .expect("write path-attributed evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "custom_module_runs")],
+        ))
+        .expect("register path-attributed claim");
+
+    let report = generate_report(&contract, &registry, &fixture.root)
+        .expect("path-attributed module must count as evidence");
+    assert_eq!(report.totals.implemented, 1);
+    assert_eq!(report.totals.partial, 0);
+    assert_eq!(report.totals.unimplemented, 46);
 }
 
 #[test]
@@ -723,6 +822,34 @@ fn cfg_key_value_cannot_forge_acceptance_evidence() {
 }
 
 #[test]
+fn exact_cfg_test_function_can_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    let evidence_path = Path::new("crates")
+        .join("demo")
+        .join("tests")
+        .join("protocol.rs");
+    fs::write(
+        fixture.root.join(&evidence_path),
+        "#[cfg(test)]\n#[test]\nfn genuine_evidence_test() {}\n",
+    )
+    .expect("write cfg(test) evidence");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "genuine_evidence_test")],
+        ))
+        .expect("register cfg(test) claim");
+
+    let report = generate_report(&contract, &registry, &fixture.root)
+        .expect("exact cfg(test) function must count as evidence");
+    assert_eq!(report.totals.implemented, 1);
+    assert_eq!(report.totals.partial, 0);
+    assert_eq!(report.totals.unimplemented, 46);
+}
+
+#[test]
 fn cargo_target_disabled_for_testing_cannot_supply_acceptance_evidence() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
     let fixture = Fixture::empty();
@@ -760,7 +887,7 @@ fn cargo_target_disabled_for_testing_cannot_supply_acceptance_evidence() {
     assert_eq!(error.json_path(), None);
     assert_eq!(
         error.message(),
-        "evidence path 'crates/demo/src/disabled.rs' is not a test-enabled Cargo target source"
+        "evidence path 'crates/demo/src/disabled.rs' is not reachable from a test-enabled Cargo target"
     );
 }
 
