@@ -94,9 +94,10 @@ pub use credential::{CredentialError, IosCredential, IosCredentialKind};
 pub use device::{DeclaredDeviceProbe, IosDeviceProbe, UnobservedDeviceProbe};
 pub use endpoint::{EndpointError, EndpointSummary, GatewayEndpoint};
 pub use host_app::{
-    BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryUnavailable,
-    EntitlementStatus, HostAppDeclaration, HostAppDeclarations, HostAppEntitlement,
-    RawMulticastDiscoveryPermitted, ServiceTypeError, SystemDnsSdDiscoveryPermitted,
+    AppRunState, BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryPermit,
+    DiscoveryUnavailable, EmptyResultDiagnosis, EntitlementStatus, GatewayMdnsBackend,
+    HostAppDeclaration, HostAppDeclarations, HostAppEntitlement, LocalDiscoveryBackend,
+    LocalNetworkPrivacy, ServiceTypeError, diagnose_empty_result,
 };
 pub use identity::{IdentityError, IosClientIdentity};
 pub use profile::{IosClientCore, IosGatewayProfile};

@@ -25,13 +25,15 @@
 //! developer writes.
 //!
 //! Whether that entitlement is required depends on *how* discovery is
-//! implemented, which is why there are two gates returning two **different
-//! witness types**:
+//! implemented, and "how" is a property of the backend rather than a choice the
+//! caller makes. [`HostAppDeclarations::discovery_precondition`] is therefore
+//! generic over a [`LocalDiscoveryBackend`], and reads both the mechanism and
+//! the service type from that backend's own descriptor:
 //!
-//! | Backend | Gate | Requires |
-//! | --- | --- | --- |
-//! | system DNS-SD | [`HostAppDeclarations::system_dns_sd_precondition`] | both plist keys, and the requested service type among the declared entries |
-//! | in-process mDNS | [`HostAppDeclarations::raw_multicast_precondition`] | the above, **and** a confirmed multicast entitlement |
+//! | Backend mechanism | Requires |
+//! | --- | --- |
+//! | [`DiscoveryMechanism::SystemDnsSd`] | both plist keys, and the backend's service type among the declared entries |
+//! | [`DiscoveryMechanism::InProcessMulticast`] | the above, **and** a confirmed multicast entitlement |
 //!
 //! Per TN3179's own tables, registering, browsing and resolving a **specific,
 //! declared** Bonjour service type through the system's DNS-SD APIs does not
@@ -41,13 +43,15 @@
 //! mDNS implementation that binds its own multicast sockets is squarely the
 //! entitlement-requiring case, whatever service types it browses.
 //!
-//! The two witnesses are separate types rather than one type carrying a mode
-//! field so that a raw-socket backend is *unable* to accept the weaker
-//! permission. A runtime field would leave that to a reviewer to notice.
+//! The returned [`DiscoveryPermit`] is parameterised by the backend it was
+//! issued for, rather than carrying a mode field, so a permit obtained for a
+//! system-DNS-SD backend cannot be spent starting a raw-socket one. A runtime
+//! field would leave that to a reviewer to notice; a type parameter makes it
+//! unsayable.
 //!
 //! # This crate does not own the service type
 //!
-//! Both gates take the required [`BonjourServiceType`] as an argument. The
+//! It is read from [`LocalDiscoveryBackend::DNS_SD_SERVICE_TYPE`]. The
 //! Gateway's DNS-SD service type belongs to the discovery contract and is
 //! owned by the discovery backend, not by an iOS application crate. Declaring
 //! it here would create a second copy that can drift from the first silently,
@@ -56,25 +60,38 @@
 //! Note also that the plist entry and the browsed type are not the same
 //! string: `NSBonjourServices` carries the application-label form such as
 //! `_example._tcp`, while the fully qualified `_example._tcp.local.` belongs
-//! inside the discovery implementation.
+//! inside the discovery implementation. Only the fully qualified form is
+//! declared, and the plist form is *derived* from it, for the same
+//! no-second-copy reason.
 //!
 //! # Two conditions this module deliberately does not gate
 //!
 //! *The runtime Local Network privilege.* TN3179 gives it three states —
 //! undetermined, allowed, denied — and the alert that resolves it is raised
 //! **by** the first local-network operation. Gating on it would block the very
-//! call that produces the prompt, so it is not modelled as a precondition.
-//! It remains a distinct silent-failure mode and a caller that sees an empty
-//! result after passing every check here should report it as a possible denial
-//! rather than as an absence of peers.
+//! call that produces the prompt, so it is not modelled as a precondition. It
+//! is modelled *after the fact* instead: [`diagnose_empty_result`] turns an
+//! empty peer list plus the privilege state into a reason, so that a caller
+//! never reports "no Gateways found" when the truthful answer is "we were not
+//! allowed to look". The background-and-undetermined case is called out
+//! separately, because TN3179 records that iOS then denies the operation
+//! without showing an alert and without recording a decision.
 //!
 //! *The simulator.* TN3179 states plainly that the simulator does not support
 //! local network privacy and that this behaviour must be tested on a real
-//! device. No simulator run, and therefore no CI job that this project could
-//! plausibly build, can validate anything in this module.
+//! device.
+//!
+//! # Acceptance boundary
+//!
+//! A simulator run, or any CI job this project could plausibly build, can prove
+//! that this crate compiles and that the policy logic here behaves as written.
+//! It cannot prove anything about local network privacy or discovery behaviour.
+//! **Only a physical iOS device on a real local network can do that**, and no
+//! such run has happened.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::marker::PhantomData;
 
 /// Maximum accepted service type text, in UTF-8 bytes.
 const MAX_SERVICE_TYPE_BYTES: usize = 64;
@@ -201,12 +218,11 @@ impl Display for HostAppEntitlement {
 
 /// How local-network discovery would be implemented.
 ///
-/// Each variant has its own gate returning its own witness type —
-/// [`HostAppDeclarations::system_dns_sd_precondition`] and
-/// [`HostAppDeclarations::raw_multicast_precondition`]. This enum is the
-/// descriptor those gates report against; it is not itself the gate, because a
-/// mode passed as an argument can be passed wrongly whereas two types cannot be
-/// confused by a caller.
+/// A backend declares its mechanism as a `const` on
+/// [`LocalDiscoveryBackend`], and [`HostAppDeclarations::discovery_precondition`]
+/// reads it from there. It is deliberately not an argument: how packets leave
+/// the process is a property of the backend being started, and a value passed
+/// alongside a backend can be passed wrongly.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DiscoveryMechanism {
     /// The system's DNS-SD service, browsing only declared service types.
@@ -579,8 +595,8 @@ impl HostAppDeclarations {
     /// Returns the recorded status of a declaration.
     ///
     /// A user interface must render from this method, because it is the same
-    /// record the two gates decide from — see
-    /// [`HostAppDeclarations::system_dns_sd_precondition`].
+    /// record the gate decides from — see
+    /// [`HostAppDeclarations::discovery_precondition`].
     #[must_use]
     pub const fn status(&self, declaration: HostAppDeclaration) -> DeclarationStatus {
         match declaration {
@@ -606,78 +622,63 @@ impl HostAppDeclarations {
         &self.service_types
     }
 
-    /// Decides whether the **system DNS-SD** backend may browse a service type.
+    /// Decides whether a specific discovery backend may browse its service type.
     ///
-    /// This is the weaker of the two gates. Per Apple's TN3179 the system
-    /// DNS-SD path needs the two `Info.plist` keys and no entitlement, because
-    /// the multicast happens in the platform daemon rather than in this
-    /// process. It must not be used to authorise a backend that binds its own
-    /// sockets — see [`HostAppDeclarations::raw_multicast_precondition`], which
-    /// returns a different type for exactly that reason.
+    /// The backend is named by **type**, not chosen by argument. Both the
+    /// mechanism and the service type come from the backend's own descriptor,
+    /// so a caller cannot ask for the weaker system-DNS-SD check and then start
+    /// a raw-socket browser: the returned [`DiscoveryPermit`] is parameterised
+    /// by `B`, and a permit for one backend will not type-check against
+    /// another.
     ///
-    /// `required` is supplied by the caller rather than held here, because the
-    /// service type belongs to the discovery contract and this crate is not its
-    /// owner. Hardcoding it here would let the two drift apart silently.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DiscoveryUnavailable`] naming the exact `Info.plist` key or
-    /// the service type at fault. Callers must surface that text instead of
-    /// reporting that no Gateway was found, because the two look identical
-    /// from the outside.
-    pub fn system_dns_sd_precondition<'a>(
-        &'a self,
-        required: &BonjourServiceType,
-    ) -> Result<SystemDnsSdDiscoveryPermitted<'a>, DiscoveryUnavailable> {
-        let matched = self.declaration_precondition(required)?;
-        Ok(SystemDnsSdDiscoveryPermitted {
-            service_type: matched,
-        })
-    }
-
-    /// Decides whether a **raw-multicast** backend may browse a service type.
-    ///
-    /// This is the stricter gate, and the one that must be consulted before
-    /// starting any in-process mDNS implementation — every pure-Rust mDNS crate
-    /// is one. It requires both `Info.plist` keys, the requested service type
-    /// among the declared entries, **and** a confirmed
-    /// `com.apple.developer.networking.multicast` grant in the shipped signing
-    /// profile.
+    /// This crate does not name the service type. It is read from
+    /// [`LocalDiscoveryBackend::DNS_SD_SERVICE_TYPE`], which belongs to the
+    /// discovery contract, and the `Info.plist` form is *derived* from it rather
+    /// than written down a second time — a second copy is a thing that can
+    /// drift with nothing able to notice.
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryUnavailable`] naming the exact key, service type or
-    /// entitlement at fault. When the entitlement is the cause,
+    /// Returns [`DiscoveryUnavailable`] naming the exact `Info.plist` key,
+    /// service type or entitlement at fault. Callers must surface that text
+    /// instead of reporting that no Gateway was found, because the two look
+    /// identical from the outside. When the entitlement is the cause,
     /// [`DiscoveryUnavailable::awaits_apple_approval`] is `true`, because that
     /// is not a condition the person reading the message can fix.
-    pub fn raw_multicast_precondition<'a>(
-        &'a self,
-        required: &BonjourServiceType,
-    ) -> Result<RawMulticastDiscoveryPermitted<'a>, DiscoveryUnavailable> {
-        let matched = self.declaration_precondition(required)?;
-        for entitlement in DiscoveryMechanism::InProcessMulticast.required_entitlements() {
+    pub fn discovery_precondition<B: LocalDiscoveryBackend>(
+        &self,
+    ) -> Result<DiscoveryPermit<'_, B>, DiscoveryUnavailable> {
+        let required = B::bonjour_service_type().map_err(|error| {
+            DiscoveryUnavailable::BackendServiceTypeInvalid {
+                service_type: B::DNS_SD_SERVICE_TYPE,
+                error,
+            }
+        })?;
+        let matched = self.declaration_precondition(&required)?;
+        for entitlement in B::MECHANISM.required_entitlements() {
             match self.entitlement_status(*entitlement) {
                 EntitlementStatus::Granted => {}
                 EntitlementStatus::NotGranted => {
                     return Err(DiscoveryUnavailable::EntitlementNotGranted {
                         entitlement: *entitlement,
-                        mechanism: DiscoveryMechanism::InProcessMulticast,
+                        mechanism: B::MECHANISM,
                     });
                 }
                 EntitlementStatus::Unknown => {
                     return Err(DiscoveryUnavailable::EntitlementUndetermined {
                         entitlement: *entitlement,
-                        mechanism: DiscoveryMechanism::InProcessMulticast,
+                        mechanism: B::MECHANISM,
                     });
                 }
             }
         }
-        Ok(RawMulticastDiscoveryPermitted {
+        Ok(DiscoveryPermit {
             service_type: matched,
+            backend: PhantomData,
         })
     }
 
-    /// Checks the declarations both backends need, returning the matched entry.
+    /// Checks the declarations every backend needs, returning the matched entry.
     fn declaration_precondition(
         &self,
         required: &BonjourServiceType,
@@ -705,44 +706,126 @@ impl HostAppDeclarations {
     }
 }
 
-/// Proof that the **system DNS-SD** gate was consulted and passed.
+/// A local-discovery backend, described at the type level.
 ///
-/// Discovery code takes a witness rather than a bare service type, so the check
-/// cannot be skipped by a caller that forgot it exists. This witness and
-/// [`RawMulticastDiscoveryPermitted`] are deliberately **different types**
-/// rather than one type carrying a mode field: a backend that binds its own
-/// multicast sockets must be unable to accept this one, and a runtime field
-/// would leave that to a reviewer to notice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SystemDnsSdDiscoveryPermitted<'a> {
-    service_type: &'a BonjourServiceType,
+/// This mirrors the backend contract agreed with the `claw-nodes` owner. It is
+/// **not** yet present in that crate: as of PR #57 head `237b386e`,
+/// `crates/claw-nodes/src/dns_sd.rs` exports `GATEWAY_SERVICE_TYPE` and
+/// `MdnsBrowser` but no descriptor trait. This is therefore a deliberate
+/// private mirror rather than a re-export, kept here so that iOS does not
+/// create a cross-PR dependency, and shaped so that replacing it with the real
+/// trait is mechanical.
+///
+/// Both associated items are `const`, so a caller cannot override them for a
+/// backend it is about to construct. That is the whole point: the mechanism
+/// describes how packets leave the process, which is what decides the platform
+/// prerequisites, so it must travel with the backend rather than be chosen
+/// alongside it.
+///
+/// The `Info.plist` form is derived by [`LocalDiscoveryBackend::bonjour_service_type`]
+/// rather than declared separately, because two hand-written copies of the same
+/// name can disagree and nothing would notice.
+pub trait LocalDiscoveryBackend {
+    /// How this backend puts packets on the network.
+    const MECHANISM: DiscoveryMechanism;
+
+    /// The fully qualified DNS-SD type this backend browses.
+    ///
+    /// This is the value the discovery crate uses on the wire, for example
+    /// `_openclaw-gw._tcp.local.`. It is **not** the string that goes into
+    /// `NSBonjourServices`.
+    const DNS_SD_SERVICE_TYPE: &'static str;
+
+    /// Derives the `NSBonjourServices` entry this backend requires.
+    ///
+    /// The plist carries the application-label form, so the mDNS domain is
+    /// stripped. A type in some other domain will not narrow to
+    /// [`BonjourServiceType`] and is reported rather than silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceTypeError`] if the declared type has no representable
+    /// `NSBonjourServices` form.
+    fn bonjour_service_type() -> Result<BonjourServiceType, ServiceTypeError> {
+        let trimmed = Self::DNS_SD_SERVICE_TYPE
+            .strip_suffix('.')
+            .unwrap_or(Self::DNS_SD_SERVICE_TYPE);
+        let trimmed = trimmed.strip_suffix(".local").unwrap_or(trimmed);
+        BonjourServiceType::parse(trimmed)
+    }
 }
 
-impl SystemDnsSdDiscoveryPermitted<'_> {
-    /// Returns the exact declared entry that matched the request.
+/// The pure-Rust mDNS backend `claw-nodes` browses the Gateway with.
+///
+/// Uninhabited: it exists only as a type-level descriptor, and there is no
+/// reason to hold a value of it.
+///
+/// `DNS_SD_SERVICE_TYPE` mirrors `claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE`
+/// (PR #57 head `237b386e`), which is documented there as the frozen local
+/// Gateway service type. `MECHANISM` is [`DiscoveryMechanism::InProcessMulticast`]
+/// because that browser is built on `mdns-sd`, which binds its own UDP
+/// multicast sockets in this process.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GatewayMdnsBackend {}
+
+impl LocalDiscoveryBackend for GatewayMdnsBackend {
+    const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::InProcessMulticast;
+    const DNS_SD_SERVICE_TYPE: &'static str = "_openclaw-gw._tcp.local.";
+}
+
+/// Proof that the gate was consulted and passed, **for one backend**.
+///
+/// Discovery code takes a permit rather than a bare service type, so the check
+/// cannot be skipped by a caller that forgot it exists. The permit is
+/// parameterised by the backend it was issued for, rather than carrying a mode
+/// field, because a field would leave "this is the wrong kind of permission" to
+/// a reviewer to notice, whereas a type parameter makes it unsayable.
+///
+/// The field is private and there is no public constructor, so
+/// [`HostAppDeclarations::discovery_precondition`] is the only source.
+pub struct DiscoveryPermit<'a, B: LocalDiscoveryBackend> {
+    service_type: &'a BonjourServiceType,
+    backend: PhantomData<fn() -> B>,
+}
+
+impl<B: LocalDiscoveryBackend> DiscoveryPermit<'_, B> {
+    /// Returns the exact declared entry that matched the backend's requirement.
     #[must_use]
     pub const fn service_type(&self) -> &BonjourServiceType {
         self.service_type
     }
-}
 
-/// Proof that the **raw-multicast** gate was consulted and passed.
-///
-/// Obtaining this requires both `Info.plist` keys, the requested service type
-/// among the declared entries, and a confirmed multicast entitlement. It is the
-/// witness an in-process mDNS browser must be handed before it starts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RawMulticastDiscoveryPermitted<'a> {
-    service_type: &'a BonjourServiceType,
-}
-
-impl RawMulticastDiscoveryPermitted<'_> {
-    /// Returns the exact declared entry that matched the request.
+    /// Returns the mechanism this permit was checked against.
     #[must_use]
-    pub const fn service_type(&self) -> &BonjourServiceType {
-        self.service_type
+    pub const fn mechanism(&self) -> DiscoveryMechanism {
+        B::MECHANISM
     }
 }
+
+impl<B: LocalDiscoveryBackend> Clone for DiscoveryPermit<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B: LocalDiscoveryBackend> Copy for DiscoveryPermit<'_, B> {}
+
+impl<B: LocalDiscoveryBackend> fmt::Debug for DiscoveryPermit<'_, B> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscoveryPermit")
+            .field("mechanism", &B::MECHANISM)
+            .field("service_type", &self.service_type)
+            .finish()
+    }
+}
+
+impl<B: LocalDiscoveryBackend> PartialEq for DiscoveryPermit<'_, B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.service_type == other.service_type
+    }
+}
+
+impl<B: LocalDiscoveryBackend> Eq for DiscoveryPermit<'_, B> {}
 
 /// Why local-network discovery must not be attempted.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -777,6 +860,18 @@ pub enum DiscoveryUnavailable {
         /// The service type the caller asked to browse.
         requested: BonjourServiceType,
     },
+    /// The backend's DNS-SD type has no representable `NSBonjourServices` form.
+    ///
+    /// This is a defect in the backend descriptor rather than in the host
+    /// bundle, so it names the offending constant. The stored value is a
+    /// compile-time `const` from a [`LocalDiscoveryBackend`] impl, which cannot
+    /// be produced from runtime data and therefore cannot carry a credential.
+    BackendServiceTypeInvalid {
+        /// The backend's declared `DNS_SD_SERVICE_TYPE`.
+        service_type: &'static str,
+        /// Why no `NSBonjourServices` entry could be derived from it.
+        error: ServiceTypeError,
+    },
 }
 
 impl DiscoveryUnavailable {
@@ -794,7 +889,8 @@ impl DiscoveryUnavailable {
             Self::NotDeclared(_)
             | Self::Undetermined(_)
             | Self::NoDeclaredServiceTypes
-            | Self::ServiceTypeNotDeclared { .. } => false,
+            | Self::ServiceTypeNotDeclared { .. }
+            | Self::BackendServiceTypeInvalid { .. } => false,
         }
     }
 }
@@ -848,19 +944,173 @@ impl Display for DiscoveryUnavailable {
                  {requested}, and iOS browses only the service types a bundle declares, so a \
                  browse for it returns nothing rather than failing"
             ),
+            Self::BackendServiceTypeInvalid {
+                service_type,
+                error,
+            } => write!(
+                formatter,
+                "local network discovery is unavailable: the discovery backend browses \
+                 {service_type:?}, which has no NSBonjourServices form ({error}), so no bundle \
+                 declaration could authorise it"
+            ),
         }
     }
 }
 
 impl Error for DiscoveryUnavailable {}
 
+/// The runtime Local Network privilege, as iOS decides it per install.
+///
+/// This is **not** a gate and must never be used as one. Per Apple's TN3179 the
+/// privilege is tri-state, there is no API to query it, and the consent alert is
+/// raised *by* the first local-network operation — so refusing to make that
+/// operation is refusing to produce the prompt that would grant it.
+///
+/// It is instead an input to [`diagnose_empty_result`], consulted **after** a
+/// browse comes back empty, so that "nobody is there" and "we were not allowed
+/// to look" are distinguishable to whoever is reading the screen.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LocalNetworkPrivacy {
+    /// The user has not been asked yet, or was asked and did not answer.
+    #[default]
+    Undetermined,
+    /// The user refused, or refused earlier and has not changed it.
+    Denied,
+    /// The user allowed it.
+    Granted,
+}
+
+/// Whether the host app was in the foreground when discovery ran.
+///
+/// This matters only in combination with [`LocalNetworkPrivacy::Undetermined`],
+/// where iOS declines the operation without showing an alert and without
+/// recording a decision.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AppRunState {
+    /// The app is frontmost and can present the consent alert.
+    #[default]
+    Foreground,
+    /// The app is backgrounded or suspended.
+    Background,
+}
+
+/// Why a discovery browse returned nothing.
+///
+/// An empty peer list is the one result that must never be reported bare on
+/// this platform, because every unavailable condition here produces exactly the
+/// same empty list as a quiet network.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EmptyResultDiagnosis {
+    /// The privilege is granted and the app was frontmost: nothing was found.
+    ///
+    /// This is the only case where an empty list may be reported as an empty
+    /// network, and even then only if the preconditions were also met.
+    NoResponders,
+    /// The consent alert is expected but has not been answered yet.
+    AwaitingConsentPrompt,
+    /// Undetermined **and** backgrounded: denied silently, nothing recorded.
+    ///
+    /// TN3179 states the operation is denied, no alert is shown, and the
+    /// decision is not recorded — so a retry in the foreground is the correct
+    /// next step and the user has not in fact refused anything.
+    SilentlyDeniedInBackground,
+    /// The user refused the Local Network privilege.
+    DeniedByUser,
+}
+
+impl EmptyResultDiagnosis {
+    /// Returns whether the empty list may be reported as an empty network.
+    #[must_use]
+    pub const fn means_nothing_was_there(self) -> bool {
+        matches!(self, Self::NoResponders)
+    }
+
+    /// Returns what to tell the person looking at the empty list.
+    #[must_use]
+    pub const fn explanation(self) -> &'static str {
+        match self {
+            Self::NoResponders => {
+                "no Gateway answered on this network. The local network privilege is granted, so \
+                 this result means nothing responded rather than that discovery was blocked."
+            }
+            Self::AwaitingConsentPrompt => {
+                "discovery has not been permitted yet. iOS raises the local network consent alert \
+                 from the first browse rather than in advance, so this empty result is expected \
+                 until that alert is answered. It is not evidence that the network is empty."
+            }
+            Self::SilentlyDeniedInBackground => {
+                "discovery was denied without asking. iOS refuses local network access while the \
+                 app is backgrounded and the privilege is still undetermined, and it neither \
+                 shows an alert nor records a decision, so this empty result says nothing about \
+                 the network. Retry with the app in the foreground."
+            }
+            Self::DeniedByUser => {
+                "discovery is not permitted. The local network privilege was refused, so no \
+                 responses can arrive; this empty result says nothing about the network. It is \
+                 changed in Settings under Privacy & Security > Local Network."
+            }
+        }
+    }
+}
+
+impl Display for EmptyResultDiagnosis {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.explanation())
+    }
+}
+
+/// Explains an empty discovery result from the runtime privilege state.
+///
+/// Call this **after** a browse returns nothing, never before starting one.
+/// Gating on the privilege would suppress the very operation that raises the
+/// consent alert.
+#[must_use]
+pub const fn diagnose_empty_result(
+    privacy: LocalNetworkPrivacy,
+    run_state: AppRunState,
+) -> EmptyResultDiagnosis {
+    match privacy {
+        LocalNetworkPrivacy::Granted => EmptyResultDiagnosis::NoResponders,
+        LocalNetworkPrivacy::Denied => EmptyResultDiagnosis::DeniedByUser,
+        LocalNetworkPrivacy::Undetermined => match run_state {
+            AppRunState::Foreground => EmptyResultDiagnosis::AwaitingConsentPrompt,
+            AppRunState::Background => EmptyResultDiagnosis::SilentlyDeniedInBackground,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BonjourServiceType, DeclarationStatus, DiscoveryMechanism, DiscoveryUnavailable,
-        EntitlementStatus, HostAppDeclaration, HostAppDeclarations, HostAppEntitlement,
-        ServiceTypeError,
+        AppRunState, BonjourServiceType, DeclarationStatus, DiscoveryMechanism,
+        DiscoveryUnavailable, EmptyResultDiagnosis, EntitlementStatus, GatewayMdnsBackend,
+        HostAppDeclaration, HostAppDeclarations, HostAppEntitlement, LocalDiscoveryBackend,
+        LocalNetworkPrivacy, ServiceTypeError, diagnose_empty_result,
     };
+
+    /// Stands in for the `claw-nodes` browser: raw sockets, test service type.
+    enum TestMdnsBackend {}
+
+    impl LocalDiscoveryBackend for TestMdnsBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::InProcessMulticast;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.local.";
+    }
+
+    /// Stands in for a future system-DNS-SD adapter browsing the same type.
+    enum TestSystemBackend {}
+
+    impl LocalDiscoveryBackend for TestSystemBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::SystemDnsSd;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.local.";
+    }
+
+    /// A backend whose browsed type has no `NSBonjourServices` form.
+    enum TestUnrepresentableBackend {}
+
+    impl LocalDiscoveryBackend for TestUnrepresentableBackend {
+        const MECHANISM: DiscoveryMechanism = DiscoveryMechanism::SystemDnsSd;
+        const DNS_SD_SERVICE_TYPE: &'static str = "_gtaclaw._tcp.example.com.";
+    }
 
     fn service_type(text: &str) -> BonjourServiceType {
         BonjourServiceType::parse(text)
@@ -882,7 +1132,7 @@ mod tests {
         let declarations = HostAppDeclarations::new();
 
         let error = declarations
-            .system_dns_sd_precondition(&gateway_service())
+            .discovery_precondition::<TestSystemBackend>()
             .expect_err("an undeclared bundle must not permit discovery");
 
         assert_eq!(
@@ -919,7 +1169,7 @@ mod tests {
         let declarations = fully_declared().with_local_network_usage(DeclarationStatus::Absent);
 
         let error = declarations
-            .system_dns_sd_precondition(&gateway_service())
+            .discovery_precondition::<TestSystemBackend>()
             .expect_err("an absent declaration must not permit discovery");
 
         assert_eq!(
@@ -941,7 +1191,7 @@ mod tests {
             .with_bonjour_services(DeclarationStatus::Declared, []);
 
         let error = declarations
-            .system_dns_sd_precondition(&gateway_service())
+            .discovery_precondition::<TestSystemBackend>()
             .expect_err("an empty service type list must not permit discovery");
 
         assert_eq!(
@@ -959,7 +1209,7 @@ mod tests {
         let wanted = gateway_service();
 
         let error = declarations
-            .system_dns_sd_precondition(&wanted)
+            .discovery_precondition::<TestSystemBackend>()
             .expect_err("a non-empty list of the wrong types must not permit discovery");
 
         assert_eq!(
@@ -986,7 +1236,7 @@ mod tests {
             );
 
         let permitted = declarations
-            .system_dns_sd_precondition(&gateway_service())
+            .discovery_precondition::<TestSystemBackend>()
             .expect("a bundle declaring the requested type must permit discovery");
 
         assert_eq!(
@@ -999,9 +1249,8 @@ mod tests {
     #[test]
     fn a_plist_complete_bundle_still_blocks_raw_multicast_without_the_entitlement() {
         let declarations = fully_declared();
-        let wanted = gateway_service();
 
-        let permitted = declarations.system_dns_sd_precondition(&wanted);
+        let permitted = declarations.discovery_precondition::<TestSystemBackend>();
         assert!(
             permitted.is_ok(),
             "the system DNS-SD path needs no entitlement, but was refused with {:?}",
@@ -1009,7 +1258,7 @@ mod tests {
         );
 
         let error = declarations
-            .raw_multicast_precondition(&wanted)
+            .discovery_precondition::<TestMdnsBackend>()
             .expect_err("a raw-socket mDNS backend must not run without the entitlement");
 
         assert_eq!(
@@ -1030,7 +1279,7 @@ mod tests {
         );
 
         let error = declarations
-            .raw_multicast_precondition(&gateway_service())
+            .discovery_precondition::<TestMdnsBackend>()
             .expect_err("an ungranted entitlement must not permit raw multicast");
 
         let text = error.to_string();
@@ -1056,16 +1305,15 @@ mod tests {
 
     #[test]
     fn not_granted_and_unknown_are_reported_as_different_conditions() {
-        let wanted = gateway_service();
         let not_granted = fully_declared()
             .with_entitlement(
                 HostAppEntitlement::MulticastNetworking,
                 EntitlementStatus::NotGranted,
             )
-            .raw_multicast_precondition(&wanted)
+            .discovery_precondition::<TestMdnsBackend>()
             .expect_err("NotGranted must block");
         let unknown = fully_declared()
-            .raw_multicast_precondition(&wanted)
+            .discovery_precondition::<TestMdnsBackend>()
             .expect_err("Unknown must block");
 
         assert_ne!(
@@ -1088,7 +1336,7 @@ mod tests {
         );
 
         let permitted = declarations
-            .raw_multicast_precondition(&gateway_service())
+            .discovery_precondition::<TestMdnsBackend>()
             .expect("a granted entitlement plus complete declarations must permit discovery");
 
         assert_eq!(
@@ -1134,6 +1382,178 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn the_mirrored_backend_carries_the_frozen_gateway_service_type() {
+        assert_eq!(
+            GatewayMdnsBackend::DNS_SD_SERVICE_TYPE,
+            "_openclaw-gw._tcp.local.",
+            "the mirror must match claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE"
+        );
+
+        let derived = GatewayMdnsBackend::bonjour_service_type()
+            .expect("the frozen gateway type must have an NSBonjourServices form");
+
+        assert_eq!(
+            derived.as_str(),
+            "_openclaw-gw._tcp",
+            "the plist entry is the application-label form, without the mDNS domain"
+        );
+        assert_eq!(
+            format!("{derived}.local."),
+            GatewayMdnsBackend::DNS_SD_SERVICE_TYPE,
+            "the plist form must be the browsed form minus the domain; if this fails the two \
+             names have drifted and the plist entry would silently not match"
+        );
+    }
+
+    #[test]
+    fn the_gateway_backend_binds_its_own_sockets_so_it_needs_the_entitlement() {
+        assert_eq!(
+            GatewayMdnsBackend::MECHANISM,
+            DiscoveryMechanism::InProcessMulticast,
+            "claw-nodes browses with mdns-sd, which binds its own multicast sockets"
+        );
+
+        let gateway = GatewayMdnsBackend::bonjour_service_type().expect("must derive");
+        let declarations = HostAppDeclarations::new()
+            .with_local_network_usage(DeclarationStatus::Declared)
+            .with_bonjour_services(DeclarationStatus::Declared, [gateway]);
+
+        let error = declarations
+            .discovery_precondition::<GatewayMdnsBackend>()
+            .expect_err("declaring the plist keys alone must not authorise a raw-socket browser");
+
+        assert_eq!(
+            error,
+            DiscoveryUnavailable::EntitlementUndetermined {
+                entitlement: HostAppEntitlement::MulticastNetworking,
+                mechanism: DiscoveryMechanism::InProcessMulticast,
+            },
+            "the mechanism must be read from the backend descriptor, not chosen by the caller"
+        );
+    }
+
+    #[test]
+    fn declaring_the_test_type_does_not_authorise_the_real_gateway_backend() {
+        let declarations = fully_declared().with_entitlement(
+            HostAppEntitlement::MulticastNetworking,
+            EntitlementStatus::Granted,
+        );
+
+        let permitted = declarations.discovery_precondition::<TestMdnsBackend>();
+        assert!(
+            permitted.is_ok(),
+            "the declared test type must be permitted, but was refused with {:?}",
+            permitted.err()
+        );
+
+        let error = declarations
+            .discovery_precondition::<GatewayMdnsBackend>()
+            .expect_err("a bundle declaring only _gtaclaw._tcp must not permit _openclaw-gw._tcp");
+
+        let requested = GatewayMdnsBackend::bonjour_service_type().expect("must derive");
+        assert_eq!(
+            error,
+            DiscoveryUnavailable::ServiceTypeNotDeclared { requested },
+            "the gate must compare against the backend's own type, not any declared type"
+        );
+    }
+
+    #[test]
+    fn a_backend_type_with_no_plist_form_is_reported_rather_than_truncated() {
+        let error = fully_declared()
+            .discovery_precondition::<TestUnrepresentableBackend>()
+            .expect_err("a type outside the mDNS domain has no NSBonjourServices form");
+
+        assert_eq!(
+            error,
+            DiscoveryUnavailable::BackendServiceTypeInvalid {
+                service_type: "_gtaclaw._tcp.example.com.",
+                error: ServiceTypeError::MissingTransportSuffix,
+            },
+            "an underivable plist entry must be reported against the backend constant"
+        );
+        assert!(
+            error.to_string().contains("_gtaclaw._tcp.example.com."),
+            "the reason must name the offending constant, but read {error}"
+        );
+    }
+
+    #[test]
+    fn a_permit_names_the_mechanism_it_was_checked_against() {
+        let declarations = fully_declared();
+        let permitted = declarations
+            .discovery_precondition::<TestSystemBackend>()
+            .expect("the system path needs no entitlement");
+
+        assert_eq!(
+            permitted.mechanism(),
+            DiscoveryMechanism::SystemDnsSd,
+            "a permit must report the mechanism it was issued for, but read {permitted:?}"
+        );
+        assert!(
+            format!("{permitted:?}").contains("_gtaclaw._tcp"),
+            "the permit debug must show the matched entry, but read {permitted:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_is_only_an_empty_network_when_the_privilege_was_granted() {
+        for run_state in [AppRunState::Foreground, AppRunState::Background] {
+            for privacy in [
+                LocalNetworkPrivacy::Undetermined,
+                LocalNetworkPrivacy::Denied,
+                LocalNetworkPrivacy::Granted,
+            ] {
+                let diagnosis = diagnose_empty_result(privacy, run_state);
+                let expected = privacy == LocalNetworkPrivacy::Granted;
+                assert_eq!(
+                    diagnosis.means_nothing_was_there(),
+                    expected,
+                    "privacy {privacy:?} in {run_state:?} produced {diagnosis:?}, which reports \
+                     an empty network as {}",
+                    diagnosis.means_nothing_was_there()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_undetermined_privilege_in_the_background_is_a_distinct_silent_denial() {
+        let foreground =
+            diagnose_empty_result(LocalNetworkPrivacy::Undetermined, AppRunState::Foreground);
+        let background =
+            diagnose_empty_result(LocalNetworkPrivacy::Undetermined, AppRunState::Background);
+
+        assert_eq!(
+            foreground,
+            EmptyResultDiagnosis::AwaitingConsentPrompt,
+            "a frontmost app raises the consent alert from the browse itself, but reported \
+             {foreground:?}"
+        );
+        assert_eq!(
+            background,
+            EmptyResultDiagnosis::SilentlyDeniedInBackground,
+            "per TN3179 a backgrounded app is denied with no alert and no recorded decision, but \
+             reported {background:?}"
+        );
+        assert!(
+            background.explanation().contains("foreground"),
+            "the background denial must say what to do next, but read {background}"
+        );
+    }
+
+    #[test]
+    fn the_default_privacy_state_does_not_claim_an_empty_network() {
+        let diagnosis =
+            diagnose_empty_result(LocalNetworkPrivacy::default(), AppRunState::default());
+
+        assert!(
+            !diagnosis.means_nothing_was_there(),
+            "the default state must not license reporting zero peers, but produced {diagnosis:?}"
+        );
     }
 
     #[test]

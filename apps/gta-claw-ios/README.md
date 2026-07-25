@@ -47,7 +47,7 @@ Case 5 is this crate. Landing a Slint UI needs three changes inside
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p gta-claw-ios --all-targets` | 63 passed, 0 failed |
+| `cargo test -p gta-claw-ios --all-targets` | 71 passed, 0 failed |
 | `cargo clippy -p gta-claw-ios --all-targets -- -D warnings` | clean |
 | `cargo fmt -p gta-claw-ios -- --check` | clean |
 | `RUSTDOCFLAGS=-D warnings cargo doc -p gta-claw-ios --no-deps` | clean |
@@ -167,15 +167,31 @@ decision by a third party for a specific application identifier, so **a build
 made from source does not have it**, and its failure mode is the worst one
 available: the sockets bind, the calls report success, and no packet moves.
 
-The requirement depends on **how** discovery is implemented, which is why there
-are two gates returning two **different witness types** rather than one type
-carrying a mode field — a raw-socket backend must be *unable* to accept the
-weaker permission, and a runtime field would leave that to a reviewer to notice:
+The requirement depends on **how** discovery is implemented, and "how" is a
+property of the backend rather than a choice the caller makes.
+`HostAppDeclarations::discovery_precondition` is therefore generic over a
+`LocalDiscoveryBackend`, and reads both the mechanism and the service type from
+that backend's own descriptor:
 
-| Backend | Gate | Requires |
-| --- | --- | --- |
-| system DNS-SD, declared service types only | `system_dns_sd_precondition` | both plist keys, and the requested service type among the declared entries |
-| any pure-Rust mDNS stack, `mdns-sd` included | `raw_multicast_precondition` | the above, **and** a confirmed multicast entitlement |
+| Backend mechanism | Requires |
+| --- | --- |
+| `SystemDnsSd` — system DNS-SD, declared service types only | both plist keys, and the backend's service type among the declared entries |
+| `InProcessMulticast` — any pure-Rust mDNS stack, `mdns-sd` included | the above, **and** a confirmed multicast entitlement |
+
+The returned `DiscoveryPermit<'_, B>` is parameterised by the backend it was
+issued for, so a permit obtained for a system-DNS-SD adapter **cannot be spent**
+starting a raw-socket browser. A mode field would have left that to a reviewer
+to notice; a type parameter makes it unsayable. The permit's field is private
+and it has no public constructor, so the gate is its only source.
+
+`LocalDiscoveryBackend` mirrors the backend contract agreed with the `claw-nodes`
+owner and is documented as a mirror: as of PR #57 head `237b386e` that crate
+exports `GATEWAY_SERVICE_TYPE` and `MdnsBrowser` but no descriptor trait, so a
+re-export would be a cross-PR dependency. `GatewayMdnsBackend` carries
+`"_openclaw-gw._tcp.local."` and `InProcessMulticast`, and the `NSBonjourServices`
+form is **derived** from the browsed form rather than written down a second time
+— with a test asserting the derivation round-trips, because two hand-written
+copies of one name can disagree silently.
 
 Entitlement state is tracked by its own `EntitlementStatus` (`Granted` /
 `NotGranted` / `Unknown`, fail-closed on `Unknown`) rather than by
@@ -206,15 +222,35 @@ told to check a setting that does not exist on their machine.
 *The runtime Local Network privilege.* TN3179 gives it three states —
 undetermined, allowed, denied — and the alert that resolves it is raised **by**
 the first local-network operation. Gating on it would block the call that
-produces the prompt, so it is documented as a distinct silent-failure mode
-rather than modelled as a precondition. A caller that gets an empty result after
-passing every check here should report a possible denial, not an absence of
-peers.
+produces the prompt, so it is not a precondition. It is modelled *after the
+fact* instead: `diagnose_empty_result(privacy, run_state)` turns an empty peer
+list into a reason, so a caller never reports "no Gateways found" when the
+truthful answer is "we were not allowed to look".
+
+| Privilege | App state | Diagnosis |
+| --- | --- | --- |
+| granted | either | `NoResponders` — the only case that may be reported as an empty network |
+| undetermined | foreground | `AwaitingConsentPrompt` — the browse itself raises the alert |
+| undetermined | background | `SilentlyDeniedInBackground` |
+| denied | either | `DeniedByUser` |
+
+The background case is called out separately because TN3179 records that iOS
+then denies the operation **without showing an alert and without recording a
+decision** — so the user has not refused anything, and a foreground retry is the
+correct next step. Only `NoResponders` returns `means_nothing_was_there()`, and
+the default privilege state is `Undetermined`, so the fail-closed reading is the
+one you get by not thinking about it.
 
 *The simulator.* TN3179 states that the simulator does not support local network
-privacy and that this behaviour must be tested on a real device. No simulator
-run — and therefore no CI job this project could plausibly build — can validate
-any of it.
+privacy and that this behaviour must be tested on a real device.
+
+#### Acceptance boundary
+
+A simulator run, or any CI job this project could plausibly build, can prove
+that this crate compiles and that the policy logic behaves as written. It cannot
+prove anything about local network privacy or discovery behaviour. **Only a
+physical iOS device on a real local network can do that**, and no such run has
+happened.
 
 ### Tailscale — believed structurally unavailable on iOS
 
