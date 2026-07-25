@@ -1,14 +1,19 @@
 //! Executable channel behavior against local fixtures.
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::rc::Rc;
 use std::thread;
 
 use claw_channel_sdk::{
-    Channel, ChannelCredential, ChannelError, DeliveryAcknowledgement, DeliveryState,
-    InboundMessage, OutboundMessage, UnsupportedOperation,
+    Channel, ChannelCredential, ChannelError, CredentialBinding, CredentialKind, CredentialRequest,
+    DeliveryAcknowledgement, DeliveryState, InboundMessage, OutboundMessage, UnsupportedOperation,
 };
-use claw_channels::{LoopbackHttpTransport, QaChannel, UnixClock, WebhookChannel};
+use claw_channels::{
+    LoopbackHttpTransport, QaChannel, RedirectPolicy, UnixClock, WebhookChannel, WebhookRequest,
+    WebhookResponse, WebhookTransport,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct FixedClock(u64);
@@ -90,10 +95,36 @@ fn outbound() -> OutboundMessage {
     }
 }
 
+fn webhook_credential(channel_id: &str, endpoint: String) -> ChannelCredential {
+    ChannelCredential::bind(
+        endpoint,
+        CredentialRequest {
+            channel_id: channel_id.to_owned(),
+            account_id: "primary".to_owned(),
+            kind: CredentialKind::WebhookUrl,
+            binding: CredentialBinding::EmbeddedEndpoint,
+        },
+    )
+    .expect("valid embedded-endpoint binding")
+}
+
+#[derive(Clone)]
+struct InspectingTransport {
+    rendered: Rc<RefCell<Vec<String>>>,
+}
+
+impl WebhookTransport for InspectingTransport {
+    fn post_json(&self, request: &WebhookRequest<'_>) -> Result<WebhookResponse, ChannelError> {
+        assert_eq!(request.redirect_policy(), RedirectPolicy::Reject);
+        self.rendered.borrow_mut().push(format!("{request:?}"));
+        Ok(WebhookResponse { status: 204 })
+    }
+}
+
 #[test]
 fn discord_webhook_posts_exact_payload_to_local_fixture_server() {
     let (endpoint, server) = fixture_server(204);
-    let credential = ChannelCredential::new(endpoint);
+    let credential = webhook_credential("discord", endpoint);
     let mut channel = WebhookChannel::new(
         "discord",
         "primary",
@@ -160,7 +191,7 @@ fn qa_channel_round_trips_inbound_and_records_outbound() {
 #[test]
 fn webhook_authentication_failure_is_typed_and_body_free() {
     let (endpoint, server) = fixture_server(401);
-    let credential = ChannelCredential::new(endpoint);
+    let credential = webhook_credential("slack", endpoint);
     let mut channel = WebhookChannel::new("slack", "primary", LoopbackHttpTransport, FixedClock(5))
         .expect("valid adapter");
     assert_eq!(
@@ -181,7 +212,7 @@ fn every_partial_webhook_adapter_completes_against_a_local_server() {
     ];
     for (channel_id, expected_body) in cases {
         let (endpoint, server) = fixture_server(200);
-        let credential = ChannelCredential::new(endpoint);
+        let credential = webhook_credential(channel_id, endpoint);
         let mut channel = WebhookChannel::new(
             channel_id,
             "primary",
@@ -200,4 +231,50 @@ fn every_partial_webhook_adapter_completes_against_a_local_server() {
         );
         assert_eq!(server.join().expect("fixture server").body, expected_body);
     }
+}
+
+#[test]
+fn credential_bearing_request_debug_is_redacted_and_redirects_are_rejected() {
+    let rendered = Rc::new(RefCell::new(Vec::new()));
+    let transport = InspectingTransport {
+        rendered: Rc::clone(&rendered),
+    };
+    let credential = webhook_credential(
+        "discord",
+        "https://discord.example/hooks/super-secret-token".to_owned(),
+    );
+    let mut channel = WebhookChannel::new("discord", "primary", transport, FixedClock(42))
+        .expect("valid adapter");
+    assert_eq!(
+        channel.send_outbound(&outbound(), Some(&credential)),
+        Ok(DeliveryAcknowledgement {
+            idempotency_key: "delivery-1".to_owned(),
+            remote_message_id: None,
+            state: DeliveryState::Accepted,
+            accepted_at_unix_ms: 42,
+        })
+    );
+    assert_eq!(
+        rendered.borrow().as_slice(),
+        &[
+            "WebhookRequest { endpoint: \"[REDACTED]\", body: [REDACTED; 27 bytes], redirect_policy: Reject }"
+        ]
+    );
+}
+
+#[test]
+fn redirect_response_is_not_treated_as_delivery() {
+    let (endpoint, server) = fixture_server(302);
+    let credential = webhook_credential("discord", endpoint);
+    let mut channel =
+        WebhookChannel::new("discord", "primary", LoopbackHttpTransport, FixedClock(42))
+            .expect("valid adapter");
+    assert_eq!(
+        channel.send_outbound(&outbound(), Some(&credential)),
+        Err(ChannelError::RemoteRejected { status: 302 })
+    );
+    assert_eq!(
+        server.join().expect("fixture server").body,
+        br#"{"content":"hello fixture"}"#
+    );
 }

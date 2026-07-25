@@ -11,9 +11,9 @@ use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use claw_channel_sdk::{
-    Channel, ChannelCredential, ChannelError, ConfigurationError, DeliveryAcknowledgement,
-    DeliveryState, InboundMessage, InvalidMessageReason, OutboundMessage, ProtocolErrorKind,
-    SecretStoreError, TransportErrorKind, UnsupportedOperation,
+    Channel, ChannelCredential, ChannelError, ConfigurationError, CredentialBindingError,
+    DeliveryAcknowledgement, DeliveryState, InboundMessage, InvalidMessageReason, OutboundMessage,
+    ProtocolErrorKind, SecretStoreError, TransportErrorKind, UnsupportedOperation,
 };
 
 const CATALOG_PATH: &str = "scripts/lib/official-external-channel-catalog.json";
@@ -385,10 +385,68 @@ pub struct WebhookResponse {
     pub status: u16,
 }
 
+/// Redirect policy carried by every outbound webhook request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RedirectPolicy {
+    /// Do not follow redirects.
+    ///
+    /// A future transport that supports redirects must introduce a distinct
+    /// policy requiring origin validation on every hop. It must never forward
+    /// credentials across origins.
+    Reject,
+}
+
+/// Credential-bearing webhook request with redacted formatting.
+pub struct WebhookRequest<'a> {
+    endpoint: &'a str,
+    body: &'a [u8],
+    redirect_policy: RedirectPolicy,
+}
+
+impl WebhookRequest<'_> {
+    /// Returns the complete secret endpoint for immediate transport use.
+    ///
+    /// Implementations must not log, persist, or include this value in errors.
+    #[must_use]
+    pub const fn endpoint(&self) -> &str {
+        self.endpoint
+    }
+
+    /// Returns the JSON body.
+    #[must_use]
+    pub const fn body(&self) -> &[u8] {
+        self.body
+    }
+
+    /// Returns the mandatory redirect behavior.
+    #[must_use]
+    pub const fn redirect_policy(&self) -> RedirectPolicy {
+        self.redirect_policy
+    }
+}
+
+impl Debug for WebhookRequest<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebhookRequest")
+            .field("endpoint", &"[REDACTED]")
+            .field(
+                "body",
+                &format_args!("[REDACTED; {} bytes]", self.body.len()),
+            )
+            .field("redirect_policy", &self.redirect_policy)
+            .finish()
+    }
+}
+
 /// HTTP transport port for outgoing webhook adapters.
 pub trait WebhookTransport {
-    /// Posts one JSON document to a credential-bearing endpoint.
-    fn post_json(&self, endpoint: &str, body: &[u8]) -> Result<WebhookResponse, ChannelError>;
+    /// Posts one request without logging credentials or following redirects.
+    ///
+    /// Implementations must return a 3xx response to the caller rather than
+    /// following it. This prevents a trusted webhook origin from forwarding
+    /// credential-bearing request state to another origin.
+    fn post_json(&self, request: &WebhookRequest<'_>) -> Result<WebhookResponse, ChannelError>;
 }
 
 /// Plain HTTP transport restricted to loopback fixture servers.
@@ -400,8 +458,13 @@ pub trait WebhookTransport {
 pub struct LoopbackHttpTransport;
 
 impl WebhookTransport for LoopbackHttpTransport {
-    fn post_json(&self, endpoint: &str, body: &[u8]) -> Result<WebhookResponse, ChannelError> {
-        let parsed = ParsedLoopbackEndpoint::parse(endpoint)?;
+    fn post_json(&self, request: &WebhookRequest<'_>) -> Result<WebhookResponse, ChannelError> {
+        if request.redirect_policy() != RedirectPolicy::Reject {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
+        let parsed = ParsedLoopbackEndpoint::parse(request.endpoint())?;
         let mut stream = TcpStream::connect((&*parsed.host, parsed.port))
             .map_err(|_| ChannelError::Transport(TransportErrorKind::Connection))?;
         stream
@@ -410,16 +473,16 @@ impl WebhookTransport for LoopbackHttpTransport {
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .map_err(|_| ChannelError::Transport(TransportErrorKind::Io))?;
-        let request = format!(
+        let wire_request = format!(
             "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             parsed.target,
             parsed.host,
             parsed.port,
-            body.len()
+            request.body().len()
         );
         stream
-            .write_all(request.as_bytes())
-            .and_then(|()| stream.write_all(body))
+            .write_all(wire_request.as_bytes())
+            .and_then(|()| stream.write_all(request.body()))
             .map_err(|_| ChannelError::Transport(TransportErrorKind::Io))?;
         let mut response = Vec::new();
         stream
@@ -578,8 +641,15 @@ where
         let credential = credential.ok_or(ChannelError::Credential(SecretStoreError::NotFound))?;
         let body = serde_json::to_vec(&serde_json::json!({ self.payload_field: text }))
             .map_err(|_| ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
-        let response =
-            credential.expose_to(|endpoint| self.transport.post_json(endpoint, &body))?;
+        let response = credential
+            .expose_embedded_endpoint(self.channel_id, &self.account_id, |endpoint| {
+                self.transport.post_json(&WebhookRequest {
+                    endpoint,
+                    body: &body,
+                    redirect_policy: RedirectPolicy::Reject,
+                })
+            })
+            .map_err(map_credential_binding)??;
         match response.status {
             200..=299 => Ok(DeliveryAcknowledgement {
                 idempotency_key: message.idempotency_key.clone(),
@@ -594,6 +664,10 @@ where
             status => Err(ChannelError::RemoteRejected { status }),
         }
     }
+}
+
+fn map_credential_binding(error: CredentialBindingError) -> ChannelError {
+    ChannelError::CredentialBinding(error)
 }
 
 /// Fully local QA channel used by acceptance and lifecycle tests.

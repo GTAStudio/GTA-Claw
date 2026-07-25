@@ -7,6 +7,7 @@
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -218,6 +219,12 @@ pub struct CredentialRequest {
     pub account_id: String,
     /// Credential purpose.
     pub kind: CredentialKind,
+    /// Destination capability this credential is authorized for.
+    ///
+    /// Secret stores must include this binding in their lookup key. Changing a
+    /// network origin therefore selects a different credential rather than
+    /// silently reusing the old one.
+    pub binding: CredentialBinding,
 }
 
 /// Closed set of channel credential purposes.
@@ -235,23 +242,362 @@ pub enum CredentialKind {
     PrivateKey,
 }
 
-/// Secret channel credential with redacted formatting.
-///
-/// The value is not serializable. Adapters can inspect it only inside
-/// [`ChannelCredential::expose_to`], which discourages retaining borrowed bytes.
-#[derive(Clone)]
-pub struct ChannelCredential(SecretString);
+/// Approved destination bound to a stored credential.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CredentialBinding {
+    /// Credential may be attached only to this exact HTTPS origin.
+    Origin(ApprovedOrigin),
+    /// Credential is itself a complete endpoint, such as a webhook URL.
+    ///
+    /// Because destination and secret are one value, no independent base URL
+    /// can be swapped while retaining the credential.
+    EmbeddedEndpoint,
+    /// Credential may be consumed only by a local, non-network operation.
+    LocalOnly,
+}
 
-impl ChannelCredential {
-    /// Wraps owned secret material returned by a secret store.
-    #[must_use]
-    pub fn new(secret: impl Into<String>) -> Self {
-        Self(SecretString::from(secret.into()))
+/// Canonical HTTPS origin parsed from configuration but not yet trusted.
+///
+/// The origin contains only scheme, host, and optional port. Paths, queries,
+/// fragments, user information, and plaintext HTTP are not representable.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct NetworkOrigin {
+    host: String,
+    port: Option<u16>,
+}
+
+impl NetworkOrigin {
+    /// Parses an HTTPS host and optional non-zero port.
+    pub fn https(host: &str, port: Option<u16>) -> Result<Self, NetworkOriginError> {
+        if port == Some(0) {
+            return Err(NetworkOriginError::InvalidPort);
+        }
+        let canonical_host = canonical_host(host)?;
+        Ok(Self {
+            host: canonical_host,
+            port,
+        })
     }
 
-    /// Exposes the value only for the duration of one adapter operation.
-    pub fn expose_to<T>(&self, operation: impl FnOnce(&str) -> T) -> T {
-        operation(self.0.expose_secret())
+    /// Returns the canonical HTTPS origin.
+    #[must_use]
+    pub fn as_str(&self) -> String {
+        match self.port {
+            Some(port) => format!("https://{}:{port}", display_host(&self.host)),
+            None => format!("https://{}", display_host(&self.host)),
+        }
+    }
+
+    /// Returns the canonical host without brackets.
+    ///
+    /// Trust policy implementations should use this value for DNS and address
+    /// classification rather than reparsing [`Self::as_str`].
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Returns the explicitly enrolled port.
+    #[must_use]
+    pub const fn port(&self) -> Option<u16> {
+        self.port
+    }
+}
+
+impl Debug for NetworkOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("NetworkOrigin")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+impl Display for NetworkOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.as_str())
+    }
+}
+
+fn canonical_host(host: &str) -> Result<String, NetworkOriginError> {
+    if host.is_empty()
+        || host.len() > 253
+        || host.trim() != host
+        || host.chars().any(char::is_control)
+        || host.contains(['/', '\\', '@', '?', '#', '[', ']'])
+    {
+        return Err(NetworkOriginError::InvalidHost);
+    }
+    if let Ok(address) = std::net::IpAddr::from_str(host) {
+        return Ok(match address {
+            std::net::IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map_or_else(|| address.to_string(), |mapped| mapped.to_string()),
+            std::net::IpAddr::V4(address) => address.to_string(),
+        });
+    }
+    let labels = host.split('.').collect::<Vec<_>>();
+    let ambiguous_ipv4 = labels
+        .iter()
+        .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
+        || labels.iter().any(|label| {
+            label
+                .strip_prefix("0x")
+                .or_else(|| label.strip_prefix("0X"))
+                .is_some_and(|hex| {
+                    !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        });
+    if ambiguous_ipv4 {
+        return Err(NetworkOriginError::AmbiguousIpLiteral);
+    }
+    if host.ends_with('.')
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(NetworkOriginError::InvalidHost);
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn display_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
+/// Invalid network-origin syntax.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkOriginError {
+    /// Host syntax is malformed or includes URL components.
+    InvalidHost,
+    /// Host uses a non-canonical decimal, octal, or hexadecimal IP spelling.
+    AmbiguousIpLiteral,
+    /// Explicit port is zero.
+    InvalidPort,
+}
+
+impl Display for NetworkOriginError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidHost => "network origin host is invalid",
+            Self::AmbiguousIpLiteral => "network origin uses an ambiguous IP literal",
+            Self::InvalidPort => "network origin port is invalid",
+        })
+    }
+}
+
+impl Error for NetworkOriginError {}
+
+/// Policy port for explicit channel-origin trust enrollment.
+///
+/// Implementations own durable enrollment and SSRF policy, including decisions
+/// about private, loopback, link-local, and DNS-resolved addresses. A parsed
+/// [`NetworkOrigin`] cannot bind a credential until this port authorizes the
+/// exact channel and account.
+pub trait OriginTrustStore {
+    /// Returns whether the exact scope and origin were explicitly enrolled.
+    fn is_enrolled(
+        &self,
+        channel_id: &str,
+        account_id: &str,
+        origin: &NetworkOrigin,
+    ) -> Result<bool, OriginTrustError>;
+}
+
+/// Origin trust lookup failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OriginTrustError {
+    /// Exact channel, account, and origin were not enrolled.
+    NotEnrolled,
+    /// Trust policy denied this origin.
+    PolicyDenied,
+    /// Trust enrollment backend is unavailable.
+    Unavailable,
+}
+
+impl Display for OriginTrustError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotEnrolled => "channel origin is not enrolled",
+            Self::PolicyDenied => "channel origin is denied by policy",
+            Self::Unavailable => "channel origin trust store is unavailable",
+        })
+    }
+}
+
+impl Error for OriginTrustError {}
+
+/// Unforgeable proof that one exact channel/account origin was enrolled.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ApprovedOrigin {
+    channel_id: String,
+    account_id: String,
+    origin: NetworkOrigin,
+}
+
+impl ApprovedOrigin {
+    /// Returns the canonical HTTPS origin.
+    #[must_use]
+    pub fn as_str(&self) -> String {
+        self.origin.as_str()
+    }
+}
+
+impl Debug for ApprovedOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovedOrigin")
+            .field("channel_id", &self.channel_id)
+            .field("account_id", &self.account_id)
+            .field("origin", &self.origin)
+            .finish()
+    }
+}
+
+impl Display for ApprovedOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.origin, formatter)
+    }
+}
+
+/// Authorizes a parsed origin through explicit durable enrollment.
+pub fn authorize_origin<T: OriginTrustStore>(
+    trust: &T,
+    channel_id: &str,
+    account_id: &str,
+    origin: &NetworkOrigin,
+) -> Result<ApprovedOrigin, OriginTrustError> {
+    if channel_id.is_empty() || account_id.is_empty() {
+        return Err(OriginTrustError::PolicyDenied);
+    }
+    if !trust.is_enrolled(channel_id, account_id, origin)? {
+        return Err(OriginTrustError::NotEnrolled);
+    }
+    Ok(ApprovedOrigin {
+        channel_id: channel_id.to_owned(),
+        account_id: account_id.to_owned(),
+        origin: origin.clone(),
+    })
+}
+
+/// Secret channel credential with redacted formatting.
+///
+/// The value is not serializable. Its enrollment scope is inseparable from the
+/// secret, and each exposure method verifies channel, account, purpose, and
+/// destination before lending the bytes to an adapter operation.
+#[derive(Clone)]
+pub struct ChannelCredential {
+    secret: SecretString,
+    scope: CredentialRequest,
+}
+
+impl ChannelCredential {
+    /// Binds owned secret material to the exact request used as its store key.
+    pub fn bind(
+        secret: impl Into<String>,
+        scope: CredentialRequest,
+    ) -> Result<Self, CredentialBindingError> {
+        if invalid_identifier(&scope.channel_id) || invalid_identifier(&scope.account_id) {
+            return Err(CredentialBindingError::ScopeMismatch);
+        }
+        match (&scope.kind, &scope.binding) {
+            (CredentialKind::WebhookUrl, CredentialBinding::EmbeddedEndpoint) => {}
+            (CredentialKind::WebhookUrl, _) | (_, CredentialBinding::EmbeddedEndpoint) => {
+                return Err(CredentialBindingError::InvalidBinding);
+            }
+            (_, CredentialBinding::Origin(origin))
+                if origin.channel_id != scope.channel_id
+                    || origin.account_id != scope.account_id =>
+            {
+                return Err(CredentialBindingError::ScopeMismatch);
+            }
+            _ => {}
+        }
+        Ok(Self {
+            secret: SecretString::from(secret.into()),
+            scope,
+        })
+    }
+
+    /// Returns whether this credential came from the exact requested store key.
+    #[must_use]
+    pub fn matches_request(&self, request: &CredentialRequest) -> bool {
+        &self.scope == request
+    }
+
+    /// Exposes an origin-bound credential only to its approved HTTPS origin.
+    pub fn expose_for_origin<T>(
+        &self,
+        channel_id: &str,
+        account_id: &str,
+        kind: CredentialKind,
+        origin: &ApprovedOrigin,
+        operation: impl FnOnce(&str) -> T,
+    ) -> Result<T, CredentialBindingError> {
+        self.require_scope(
+            channel_id,
+            account_id,
+            kind,
+            &CredentialBinding::Origin(origin.clone()),
+        )?;
+        Ok(operation(self.secret.expose_secret()))
+    }
+
+    /// Exposes a credential that embeds its own endpoint.
+    pub fn expose_embedded_endpoint<T>(
+        &self,
+        channel_id: &str,
+        account_id: &str,
+        operation: impl FnOnce(&str) -> T,
+    ) -> Result<T, CredentialBindingError> {
+        self.require_scope(
+            channel_id,
+            account_id,
+            CredentialKind::WebhookUrl,
+            &CredentialBinding::EmbeddedEndpoint,
+        )?;
+        Ok(operation(self.secret.expose_secret()))
+    }
+
+    /// Exposes a local-only credential to a matching local operation.
+    pub fn expose_local<T>(
+        &self,
+        channel_id: &str,
+        account_id: &str,
+        kind: CredentialKind,
+        operation: impl FnOnce(&str) -> T,
+    ) -> Result<T, CredentialBindingError> {
+        self.require_scope(channel_id, account_id, kind, &CredentialBinding::LocalOnly)?;
+        Ok(operation(self.secret.expose_secret()))
+    }
+
+    fn require_scope(
+        &self,
+        channel_id: &str,
+        account_id: &str,
+        kind: CredentialKind,
+        binding: &CredentialBinding,
+    ) -> Result<(), CredentialBindingError> {
+        if self.scope.channel_id != channel_id
+            || self.scope.account_id != account_id
+            || self.scope.kind != kind
+        {
+            return Err(CredentialBindingError::ScopeMismatch);
+        }
+        if &self.scope.binding != binding {
+            return Err(CredentialBindingError::DestinationMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -266,6 +612,29 @@ impl Display for ChannelCredential {
         formatter.write_str("channel-credential:[REDACTED]")
     }
 }
+
+/// Credential exposure denied before secret bytes reach a transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialBindingError {
+    /// Channel, account, or credential purpose does not match enrollment.
+    ScopeMismatch,
+    /// Destination does not match the enrolled origin or endpoint form.
+    DestinationMismatch,
+    /// Credential purpose and binding form are incompatible.
+    InvalidBinding,
+}
+
+impl Display for CredentialBindingError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ScopeMismatch => "channel credential scope does not match",
+            Self::DestinationMismatch => "channel credential destination does not match",
+            Self::InvalidBinding => "channel credential binding form is invalid",
+        })
+    }
+}
+
+impl Error for CredentialBindingError {}
 
 /// Port for retrieving credentials from platform-owned secure storage.
 pub trait SecretStore {
@@ -316,6 +685,11 @@ where
         ));
     }
     let credential = store.get(request).map_err(ChannelError::Credential)?;
+    if !credential.matches_request(request) {
+        return Err(ChannelError::CredentialBinding(
+            CredentialBindingError::ScopeMismatch,
+        ));
+    }
     channel.send_outbound(message, Some(&credential))
 }
 
@@ -513,6 +887,8 @@ pub enum ChannelError {
     Configuration(ConfigurationError),
     /// Credential retrieval failed.
     Credential(SecretStoreError),
+    /// Credential is not enrolled for the requested scope or destination.
+    CredentialBinding(CredentialBindingError),
     /// Remote authentication failed.
     Authentication,
     /// Local or remote rate limit was reached.
@@ -549,6 +925,7 @@ impl ChannelError {
             Self::InvalidMessage(_)
             | Self::Configuration(_)
             | Self::Credential(_)
+            | Self::CredentialBinding(_)
             | Self::Authentication
             | Self::Transport(TransportErrorKind::Tls)
             | Self::Protocol(_)
@@ -576,6 +953,9 @@ impl Display for ChannelError {
                 write!(formatter, "invalid channel configuration: {reason:?}")
             }
             Self::Credential(error) => write!(formatter, "channel credential failed: {error}"),
+            Self::CredentialBinding(error) => {
+                write!(formatter, "channel credential binding failed: {error}")
+            }
             Self::Authentication => formatter.write_str("channel authentication failed"),
             Self::RateLimited { retry_after } => {
                 write!(formatter, "channel rate limited for {retry_after:?}")
@@ -611,6 +991,20 @@ mod tests {
         }
     }
 
+    fn approved_origin() -> ApprovedOrigin {
+        let origin = NetworkOrigin::https("API.Example.test", None).expect("valid origin");
+        authorize_origin(&AllowTrust, "test", "primary", &origin).expect("enrolled origin")
+    }
+
+    fn token_request() -> CredentialRequest {
+        CredentialRequest {
+            channel_id: "test".to_owned(),
+            account_id: "primary".to_owned(),
+            kind: CredentialKind::Token,
+            binding: CredentialBinding::Origin(approved_origin()),
+        }
+    }
+
     struct TestChannel {
         results: VecDeque<Result<DeliveryAcknowledgement, ChannelError>>,
         credentials: Vec<String>,
@@ -631,7 +1025,16 @@ mod tests {
             credential: Option<&ChannelCredential>,
         ) -> Result<DeliveryAcknowledgement, ChannelError> {
             if let Some(credential) = credential {
-                self.credentials.push(credential.expose_to(str::to_owned));
+                let value = credential
+                    .expose_for_origin(
+                        "test",
+                        "primary",
+                        CredentialKind::Token,
+                        &approved_origin(),
+                        str::to_owned,
+                    )
+                    .map_err(ChannelError::CredentialBinding)?;
+                self.credentials.push(value);
             }
             self.results.pop_front().expect("configured result")
         }
@@ -648,15 +1051,43 @@ mod tests {
 
     struct Store;
 
+    struct AllowTrust;
+
+    impl OriginTrustStore for AllowTrust {
+        fn is_enrolled(
+            &self,
+            _channel_id: &str,
+            _account_id: &str,
+            _origin: &NetworkOrigin,
+        ) -> Result<bool, OriginTrustError> {
+            Ok(true)
+        }
+    }
+
+    struct DenyTrust;
+
+    impl OriginTrustStore for DenyTrust {
+        fn is_enrolled(
+            &self,
+            _channel_id: &str,
+            _account_id: &str,
+            _origin: &NetworkOrigin,
+        ) -> Result<bool, OriginTrustError> {
+            Ok(false)
+        }
+    }
+
     impl SecretStore for Store {
-        fn get(&self, _request: &CredentialRequest) -> Result<ChannelCredential, SecretStoreError> {
-            Ok(ChannelCredential::new("super-secret-token"))
+        fn get(&self, request: &CredentialRequest) -> Result<ChannelCredential, SecretStoreError> {
+            ChannelCredential::bind("super-secret-token", request.clone())
+                .map_err(|_| SecretStoreError::InvalidCredential)
         }
     }
 
     #[test]
     fn credential_formatting_is_fully_redacted() {
-        let credential = ChannelCredential::new("super-secret-token");
+        let credential =
+            ChannelCredential::bind("super-secret-token", token_request()).expect("valid binding");
         assert_eq!(format!("{credential:?}"), "ChannelCredential([REDACTED])");
         assert_eq!(credential.to_string(), "channel-credential:[REDACTED]");
         assert!(!format!("{credential:?}").contains("super-secret-token"));
@@ -665,11 +1096,7 @@ mod tests {
 
     #[test]
     fn store_delivery_scope_checks_and_does_not_leak_secret() {
-        let request = CredentialRequest {
-            channel_id: "test".to_owned(),
-            account_id: "primary".to_owned(),
-            kind: CredentialKind::Token,
-        };
+        let request = token_request();
         let acknowledgement = DeliveryAcknowledgement {
             idempotency_key: "request-1".to_owned(),
             remote_message_id: Some("remote-4".to_owned()),
@@ -686,6 +1113,151 @@ mod tests {
         );
         assert_eq!(channel.credentials, vec!["super-secret-token".to_owned()]);
         assert!(!format!("{request:?}").contains("super-secret-token"));
+    }
+
+    #[test]
+    fn origin_bound_credential_cannot_be_reused_after_endpoint_change() {
+        let credential =
+            ChannelCredential::bind("super-secret-token", token_request()).expect("valid binding");
+        let attacker = NetworkOrigin::https("attacker.example", None).expect("valid origin");
+        let attacker = authorize_origin(&AllowTrust, "test", "primary", &attacker)
+            .expect("separately enrolled origin");
+        assert_eq!(
+            credential.expose_for_origin(
+                "test",
+                "primary",
+                CredentialKind::Token,
+                &attacker,
+                str::to_owned,
+            ),
+            Err(CredentialBindingError::DestinationMismatch)
+        );
+        let rendered = ChannelError::CredentialBinding(CredentialBindingError::DestinationMismatch)
+            .to_string();
+        assert_eq!(
+            rendered,
+            "channel credential binding failed: channel credential destination does not match"
+        );
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(!rendered.contains("attacker.example"));
+    }
+
+    #[test]
+    fn embedded_endpoint_credential_cannot_be_exposed_as_a_token() {
+        let scope = CredentialRequest {
+            channel_id: "discord".to_owned(),
+            account_id: "primary".to_owned(),
+            kind: CredentialKind::WebhookUrl,
+            binding: CredentialBinding::EmbeddedEndpoint,
+        };
+        let credential = ChannelCredential::bind("https://discord.example/secret-hook", scope)
+            .expect("valid binding");
+        assert_eq!(
+            credential.expose_for_origin(
+                "discord",
+                "primary",
+                CredentialKind::Token,
+                &approved_origin(),
+                str::to_owned,
+            ),
+            Err(CredentialBindingError::ScopeMismatch)
+        );
+        assert_eq!(
+            credential.expose_embedded_endpoint("discord", "other-account", str::to_owned,),
+            Err(CredentialBindingError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn approved_origin_rejects_url_components_and_canonicalizes_host() {
+        let origin = approved_origin();
+        assert_eq!(origin.as_str(), "https://api.example.test");
+        assert_eq!(
+            NetworkOrigin::https("api.example.test/path", None),
+            Err(NetworkOriginError::InvalidHost)
+        );
+        assert_eq!(
+            NetworkOrigin::https("user@api.example.test", None),
+            Err(NetworkOriginError::InvalidHost)
+        );
+        assert_eq!(
+            NetworkOrigin::https("api.example.test", Some(0)),
+            Err(NetworkOriginError::InvalidPort)
+        );
+    }
+
+    #[test]
+    fn parsed_origin_cannot_bind_credentials_without_explicit_enrollment() {
+        let private_origin =
+            NetworkOrigin::https("192.168.1.7", Some(8443)).expect("valid private origin syntax");
+        assert_eq!(
+            authorize_origin(&DenyTrust, "test", "primary", &private_origin),
+            Err(OriginTrustError::NotEnrolled)
+        );
+        assert_eq!(
+            authorize_origin(&AllowTrust, "test", "primary", &private_origin)
+                .expect("explicit enterprise enrollment")
+                .as_str(),
+            "https://192.168.1.7:8443"
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_and_ipv4_share_one_origin_identity() {
+        assert_eq!(
+            NetworkOrigin::https("::ffff:192.168.1.7", Some(8443)),
+            NetworkOrigin::https("192.168.1.7", Some(8443))
+        );
+    }
+
+    #[test]
+    fn ambiguous_ipv4_spellings_are_never_treated_as_dns_hosts() {
+        for host in [
+            "2130706433",
+            "127.1",
+            "0177.0.0.1",
+            "0x7f.0.0.1",
+            "0x7f000001",
+        ] {
+            assert_eq!(
+                NetworkOrigin::https(host, None),
+                Err(NetworkOriginError::AmbiguousIpLiteral),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn inconsistent_origin_scope_and_binding_form_are_rejected_at_construction() {
+        let network = NetworkOrigin::https("api.example.test", None).expect("valid origin");
+        let approved =
+            authorize_origin(&AllowTrust, "slack", "primary", &network).expect("enrolled origin");
+        assert_eq!(
+            ChannelCredential::bind(
+                "discord-token",
+                CredentialRequest {
+                    channel_id: "discord".to_owned(),
+                    account_id: "primary".to_owned(),
+                    kind: CredentialKind::Token,
+                    binding: CredentialBinding::Origin(approved),
+                },
+            )
+            .expect_err("inconsistent scope"),
+            CredentialBindingError::ScopeMismatch
+        );
+        assert_eq!(
+            ChannelCredential::bind(
+                "not-a-webhook",
+                CredentialRequest {
+                    channel_id: "discord".to_owned(),
+                    account_id: "primary".to_owned(),
+                    kind: CredentialKind::Token,
+                    binding: CredentialBinding::EmbeddedEndpoint,
+                },
+            )
+            .expect_err("incompatible binding"),
+            CredentialBindingError::InvalidBinding
+        );
     }
 
     #[test]
