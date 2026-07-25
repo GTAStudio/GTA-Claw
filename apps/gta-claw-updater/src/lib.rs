@@ -921,9 +921,9 @@ mod unit_tests {
 
     #[test]
     fn second_rename_failure_rolls_back_exactly() {
-        let target = PathBuf::from("C:\\app\\gta-claw.exe");
-        let staged = PathBuf::from("C:\\app\\.gta-claw.exe.gta-claw.verified");
-        let backup = PathBuf::from("C:\\app\\.gta-claw.exe.gta-claw.rollback");
+        let target = PathBuf::from("app").join("gta-claw");
+        let staged = PathBuf::from("app").join(".gta-claw.gta-claw.verified");
+        let backup = PathBuf::from("app").join(".gta-claw.gta-claw.rollback");
         let operations = MockOps::default();
         operations
             .existing
@@ -954,8 +954,8 @@ mod unit_tests {
 
     #[test]
     fn windows_locked_target_preserves_verified_staging() {
-        let target = PathBuf::from("C:\\app\\gta-claw.exe");
-        let staged = PathBuf::from("C:\\app\\.gta-claw.exe.gta-claw.verified");
+        let target = PathBuf::from("app").join("gta-claw");
+        let staged = PathBuf::from("app").join(".gta-claw.gta-claw.verified");
         let operations = MockOps::default();
         operations
             .existing
