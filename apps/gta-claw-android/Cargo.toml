@@ -20,5 +20,8 @@ tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi
 tokio-util = { version = "=0.7.18", features = ["rt"] }
 url = "=2.5.8"
 
+[dev-dependencies]
+claw-clients.workspace = true
+
 [lints]
 workspace = true
