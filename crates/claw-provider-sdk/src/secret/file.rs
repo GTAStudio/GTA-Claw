@@ -147,6 +147,55 @@ impl SecretStore for FileSecretStore {
             }),
         }
     }
+
+    fn insert_if_absent(
+        &self,
+        key: &CredentialKey,
+        secret: &SecretString,
+    ) -> Result<bool, SecretStoreError> {
+        create_private_dir(&self.root)?;
+        let path = self.path_for(key);
+        if create_new_private_file(&path, secret.expose().as_bytes())? {
+            check_private_file(&path)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn accounts(&self, service: &str) -> Result<Vec<String>, SecretStoreError> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(SecretStoreError::AccessDenied { backend: BACKEND });
+            }
+            Err(_) => {
+                return Err(SecretStoreError::Backend {
+                    backend: BACKEND,
+                    detail: "the credential directory could not be listed",
+                });
+            }
+        };
+
+        let mut accounts = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| SecretStoreError::Backend {
+                backend: BACKEND,
+                detail: "the credential directory could not be listed",
+            })?;
+            // A crashed `set` can leave a `.tmp` file behind; it is not a
+            // credential and must never be reported as one.
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some((found, account)) = decode_key(&name)
+                && found == service
+            {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    }
 }
 
 /// Encodes a credential key into a single filesystem-safe file name.
@@ -180,6 +229,50 @@ const fn hex_digit(value: u8) -> u8 {
     match value {
         0..=9 => b'0' + value,
         _ => b'A' + (value - 10),
+    }
+}
+
+/// Reverses [`encode_key`], returning the service and account it encoded.
+///
+/// Returns `None` for any name [`encode_key`] could not have produced, which is
+/// how stray files such as the `.tmp` written during a replace are ignored.
+#[must_use]
+pub fn decode_key(name: &str) -> Option<(String, String)> {
+    let body = name.strip_suffix(".cred")?;
+    let (service, account) = body.split_once('~')?;
+    // `~` is percent-encoded, so exactly one separator can ever appear.
+    if account.contains('~') {
+        return None;
+    }
+    Some((decode_component(service)?, decode_component(account)?))
+}
+
+fn decode_component(part: &str) -> Option<String> {
+    let bytes = part.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+            decoded.push(byte);
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -318,6 +411,49 @@ fn map_write_error(error: &io::Error) -> SecretStoreError {
             detail: "credential file could not be written",
         }
     }
+}
+
+/// Creates a credential file, failing instead of overwriting when it already exists.
+///
+/// `create_new` maps to `O_EXCL` on Unix and `CREATE_NEW` on Windows, so exactly one
+/// caller wins even when the racing callers are separate processes. That is what makes
+/// [`FileSecretStore::insert_if_absent`] a usable mutual-exclusion primitive.
+#[cfg(unix)]
+fn create_new_private_file(path: &Path, bytes: &[u8]) -> Result<bool, SecretStoreError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(map_write_error(&error)),
+    };
+    file.write_all(bytes)
+        .map_err(|error| map_write_error(&error))?;
+    file.sync_all().map_err(|error| map_write_error(&error))?;
+    Ok(true)
+}
+
+/// Creates a credential file, failing instead of overwriting when it already exists.
+#[cfg(not(unix))]
+fn create_new_private_file(path: &Path, bytes: &[u8]) -> Result<bool, SecretStoreError> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(map_write_error(&error)),
+    };
+    file.write_all(bytes)
+        .map_err(|error| map_write_error(&error))?;
+    file.sync_all().map_err(|error| map_write_error(&error))?;
+    Ok(true)
 }
 
 #[cfg(test)]

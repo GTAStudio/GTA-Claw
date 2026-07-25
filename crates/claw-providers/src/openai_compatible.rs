@@ -21,8 +21,9 @@ use claw_provider_sdk::model::{
     FinishReason, ImageSource, ModelDescriptor, ModelId, ProviderId, ResponseFormat, ToolArguments,
     ToolCall, ToolChoice, Usage,
 };
+use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval, OriginError};
 use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
-use claw_provider_sdk::secret::{ApiKey, SecretString};
+use claw_provider_sdk::secret::ApiKey;
 use claw_provider_sdk::sse::{SseDecoder, SseEvent};
 use claw_provider_sdk::stream::{CompletionStream, StreamEvent, ToolCallAssembler};
 use futures_core::Stream;
@@ -59,7 +60,12 @@ pub struct OpenAiConfig {
     /// Base URL that `chat/completions` is appended to.
     pub base_url: Url,
     /// Credential, when the service requires one.
-    pub api_key: Option<ApiKey>,
+    ///
+    /// The credential carries the origin it was authorised for.
+    /// [`OpenAiCompatible::new`] rejects a configuration whose `base_url` is on
+    /// a different origin, so changing the endpoint cannot silently redirect a
+    /// stored key to another host.
+    pub api_key: Option<BoundApiKey>,
     /// How the credential is presented.
     pub auth: AuthStyle,
     /// Extra non-secret headers sent with every request.
@@ -82,7 +88,7 @@ pub struct OpenAiConfig {
 pub struct OpenAiCompatible {
     id: ProviderId,
     base_url: Url,
-    api_key: Option<ApiKey>,
+    api_key: Option<BoundApiKey>,
     auth: AuthStyle,
     extra_headers: Vec<(String, String)>,
     capabilities: CapabilitySet,
@@ -100,13 +106,30 @@ impl OpenAiCompatible {
     /// cannot be initialized.
     pub fn new(config: OpenAiConfig) -> Result<Self, ProviderError> {
         if matches!(config.auth, AuthStyle::Bearer | AuthStyle::Header(_))
-            && config.api_key.as_ref().is_none_or(ApiKey::is_empty)
+            && config
+                .api_key
+                .as_ref()
+                .is_none_or(|key| key.for_url(&config.base_url).is_ok_and(ApiKey::is_empty))
         {
             return Err(ProviderError::new(
                 ErrorKind::Authentication,
                 config.provider.as_str(),
                 Operation::Authorize,
                 "this provider requires an API key",
+            ));
+        }
+        // Credential and destination must agree here, not at send time, so a
+        // mismatched pair can never become a live client.
+        if let Some(key) = config.api_key.as_ref()
+            && let Err(error) = key.for_url(&config.base_url)
+        {
+            return Err(ProviderError::new(
+                ErrorKind::Authentication,
+                config.provider.as_str(),
+                Operation::Authorize,
+                format!(
+                    "the configured endpoint is not the one this credential authorises: {error}"
+                ),
             ));
         }
         let tls_policy = if config.base_url.scheme() == "http" {
@@ -142,10 +165,45 @@ impl OpenAiCompatible {
     /// Returns [`ErrorKind::Unsupported`] for an unknown provider or one that
     /// does not speak this dialect, and [`ErrorKind::InvalidRequest`] when no
     /// endpoint is available.
+    ///
+    /// Returns [`ErrorKind::Authentication`] when `base_url` names an origin
+    /// other than the registered default. Overriding the endpoint of a
+    /// registered provider is how a tampered configuration would redirect a
+    /// stored credential, so it is refused here and must go through
+    /// [`OpenAiCompatible::from_registry_with_enrolled_origin`] instead.
     pub fn from_registry(
         id: &str,
         api_key: Option<ApiKey>,
         base_url: Option<Url>,
+    ) -> Result<Self, ProviderError> {
+        Self::from_registry_inner(id, api_key, base_url, None)
+    }
+
+    /// Builds a client for a registered provider at an operator-enrolled origin.
+    ///
+    /// This is the deliberate path for self-hosted and enterprise deployments.
+    /// The [`OriginApproval`] must be produced where a human chose to trust the
+    /// endpoint; deriving one from the same configuration field that supplies
+    /// `base_url` reintroduces the very redirect this guards against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Authentication`] when `base_url` is not on the
+    /// enrolled origin, plus the errors of [`OpenAiCompatible::from_registry`].
+    pub fn from_registry_with_enrolled_origin(
+        id: &str,
+        api_key: Option<ApiKey>,
+        base_url: Url,
+        approval: &OriginApproval,
+    ) -> Result<Self, ProviderError> {
+        Self::from_registry_inner(id, api_key, Some(base_url), Some(approval))
+    }
+
+    fn from_registry_inner(
+        id: &str,
+        api_key: Option<ApiKey>,
+        base_url: Option<Url>,
+        approval: Option<&OriginApproval>,
     ) -> Result<Self, ProviderError> {
         let descriptor = ProviderRegistry::global().get(id).ok_or_else(|| {
             ProviderError::new(
@@ -163,16 +221,22 @@ impl OpenAiCompatible {
                 "this provider does not speak the OpenAI chat-completions dialect",
             ));
         }
-        let base_url = match (base_url, descriptor.base_url) {
+        let registered = descriptor
+            .base_url
+            .map(|default| {
+                default.parse::<Url>().map_err(|_| {
+                    ProviderError::new(
+                        ErrorKind::InvalidRequest,
+                        id,
+                        Operation::Authorize,
+                        "the registered base URL is not a valid URL",
+                    )
+                })
+            })
+            .transpose()?;
+        let base_url = match (base_url, registered.clone()) {
             (Some(url), _) => url,
-            (None, Some(default)) => default.parse::<Url>().map_err(|_| {
-                ProviderError::new(
-                    ErrorKind::InvalidRequest,
-                    id,
-                    Operation::Authorize,
-                    "the registered base URL is not a valid URL",
-                )
-            })?,
+            (None, Some(default)) => default,
             (None, None) => {
                 return Err(ProviderError::new(
                     ErrorKind::InvalidRequest,
@@ -182,6 +246,55 @@ impl OpenAiCompatible {
                 ));
             }
         };
+
+        // The set of origins this provider may present its credential to: the
+        // registered default, plus whatever the operator explicitly enrolled.
+        let mut trusted = Vec::new();
+        if let Some(default) = registered.as_ref() {
+            trusted.push(Origin::of(default).map_err(|error| {
+                ProviderError::new(
+                    ErrorKind::InvalidRequest,
+                    id,
+                    Operation::Authorize,
+                    format!("the registered base URL names no usable origin: {error}"),
+                )
+            })?);
+        }
+        if let Some(approval) = approval {
+            trusted.push(approval.origin().clone());
+        }
+        let origin = Origin::of(&base_url).map_err(|error| {
+            ProviderError::new(
+                ErrorKind::Authentication,
+                id,
+                Operation::Authorize,
+                format!("the endpoint names no usable origin: {error}"),
+            )
+        })?;
+        if !trusted.contains(&origin) {
+            let known = if trusted.is_empty() {
+                "this provider ships no default endpoint".to_owned()
+            } else {
+                format!(
+                    "the trusted origins are {}",
+                    trusted
+                        .iter()
+                        .map(Origin::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            return Err(ProviderError::new(
+                ErrorKind::Authentication,
+                id,
+                Operation::Authorize,
+                format!(
+                    "refusing to send this provider's credential to {origin}: {known}, so the \
+                     endpoint must be enrolled explicitly",
+                ),
+            ));
+        }
+
         let auth = if descriptor.is_credential_free() && api_key.is_none() {
             AuthStyle::None
         } else {
@@ -198,7 +311,7 @@ impl OpenAiCompatible {
         Self::new(OpenAiConfig {
             provider,
             base_url,
-            api_key,
+            api_key: api_key.map(|key| BoundApiKey::new(origin, key)),
             auth,
             extra_headers: Vec::new(),
             capabilities: descriptor.capabilities,
@@ -247,21 +360,34 @@ impl OpenAiCompatible {
         })
     }
 
-    fn request(&self, method: Method, url: Url) -> HttpRequest {
+    fn request(&self, method: Method, url: Url) -> Result<HttpRequest, ProviderError> {
         let mut request = HttpRequest::new(method, url).header("accept", "application/json");
-        match (&self.auth, self.api_key.as_ref()) {
-            (AuthStyle::Bearer, Some(key)) => {
-                request = request.secret_header("authorization", key.bearer_header());
-            }
-            (AuthStyle::Header(name), Some(key)) => {
-                request = request.secret_header(name.clone(), SecretString::new(key.expose()));
-            }
-            _ => {}
-        }
+        // A bound credential can only be read back out for a URL on its own
+        // origin, so a base URL pointing elsewhere fails here instead of
+        // shipping the key to that host.
+        request = match (&self.auth, self.api_key.as_ref()) {
+            (AuthStyle::Header(name), Some(key)) => request
+                .credential_header(name.clone(), key)
+                .map_err(|error| self.origin_error(&error))?,
+            (AuthStyle::None | AuthStyle::Header(_), _) | (_, None) => request,
+            (_, Some(key)) => request
+                .bearer(key)
+                .map_err(|error| self.origin_error(&error))?,
+        };
         for (name, value) in &self.extra_headers {
             request = request.header(name.clone(), value.clone());
         }
-        request
+        Ok(request)
+    }
+
+    /// Reports a credential that is not authorised for the endpoint in use.
+    fn origin_error(&self, error: &OriginError) -> ProviderError {
+        ProviderError::new(
+            ErrorKind::Authentication,
+            self.id.as_str(),
+            Operation::Authorize,
+            format!("the credential is not authorised for this endpoint: {error}"),
+        )
     }
 
     fn check_capability(
@@ -304,7 +430,7 @@ impl Provider for OpenAiCompatible {
                 .runtime
                 .execute(Operation::Complete, context.cancel(), || {
                     Ok(self
-                        .request(Method::Post, url.clone())
+                        .request(Method::Post, url.clone())?
                         .body(Body::Json(body.clone())))
                 })
                 .await?;
@@ -327,7 +453,7 @@ impl Provider for OpenAiCompatible {
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
-                        .request(Method::Post, url.clone())
+                        .request(Method::Post, url.clone())?
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
@@ -361,7 +487,7 @@ impl Provider for OpenAiCompatible {
                 .runtime
                 .execute(Operation::Embed, context.cancel(), || {
                     Ok(self
-                        .request(Method::Post, url.clone())
+                        .request(Method::Post, url.clone())?
                         .body(Body::Json(body.clone())))
                 })
                 .await?;
@@ -379,7 +505,7 @@ impl Provider for OpenAiCompatible {
             let response = self
                 .runtime
                 .execute(Operation::ListModels, context.cancel(), || {
-                    Ok(self.request(Method::Get, url.clone()))
+                    self.request(Method::Get, url.clone())
                 })
                 .await?;
             decode_models(self.id.as_str(), response.body())
@@ -1874,10 +2000,19 @@ mod tests {
             "this provider ships no default endpoint, so a base URL is required"
         );
 
-        let client = OpenAiCompatible::from_registry(
+        let base_url: Url = "https://api.moonshot.cn/v1".parse().expect("url");
+        let unapproved =
+            OpenAiCompatible::from_registry("kimi", Some(ApiKey::new("k")), Some(base_url.clone()))
+                .expect_err("an endpoint-required provider still needs an enrolled origin");
+        assert_eq!(unapproved.kind(), ErrorKind::Authentication);
+        assert_eq!(unapproved.operation(), Operation::Authorize);
+
+        let approval = OriginApproval::enroll(Origin::of(&base_url).expect("origin"));
+        let client = OpenAiCompatible::from_registry_with_enrolled_origin(
             "kimi",
             Some(ApiKey::new("k")),
-            Some("https://api.moonshot.cn/v1".parse().expect("url")),
+            base_url,
+            &approval,
         )
         .expect("explicit endpoint");
         assert_eq!(client.base_url().as_str(), "https://api.moonshot.cn/v1");
@@ -1909,10 +2044,13 @@ mod tests {
 
     #[test]
     fn endpoints_are_joined_without_duplicating_the_separator() {
-        let client = OpenAiCompatible::from_registry(
+        let base_url: Url = "https://example.invalid/v1/".parse().expect("url");
+        let approval = OriginApproval::enroll(Origin::of(&base_url).expect("origin"));
+        let client = OpenAiCompatible::from_registry_with_enrolled_origin(
             "groq",
             Some(ApiKey::new("k")),
-            Some("https://example.invalid/v1/".parse().expect("url")),
+            base_url,
+            &approval,
         )
         .expect("build");
         assert_eq!(
@@ -1930,12 +2068,14 @@ mod tests {
         let client =
             OpenAiCompatible::from_registry("openai", Some(ApiKey::new("sk-super-secret")), None)
                 .expect("build");
-        let request = client.request(
-            Method::Post,
-            "https://api.openai.com/v1/chat/completions"
-                .parse()
-                .expect("url"),
-        );
+        let request = client
+            .request(
+                Method::Post,
+                "https://api.openai.com/v1/chat/completions"
+                    .parse()
+                    .expect("url"),
+            )
+            .expect("request");
         let rendered = format!("{request:?}");
         assert!(
             !rendered.contains("sk-super-secret"),

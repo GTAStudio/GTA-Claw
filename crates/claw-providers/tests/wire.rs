@@ -18,6 +18,7 @@ use claw_provider_sdk::model::{
     AssistantMessage, CapabilitySet, ChatMessage, CompletionRequest, ContentPart, FinishReason,
     ModelId, ProviderId, ToolArguments, ToolCall, ToolDefinition, ToolParameters, Usage,
 };
+use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval};
 use claw_provider_sdk::provider::{Provider as _, RequestContext};
 use claw_provider_sdk::retry::{JitterMode, RetryPolicy};
 use claw_provider_sdk::secret::{ApiKey, SecretString};
@@ -65,11 +66,22 @@ fn manual_runtime(provider: &str, clock: &Arc<ManualClock>, retry: RetryPolicy) 
     )
 }
 
+/// Enrolls the loopback test server as an operator-approved origin.
+///
+/// A test owns its own server, so this is exactly the "a human decided"
+/// situation [`OriginApproval::enroll`] exists for.
+fn approve(server: &TestServer) -> OriginApproval {
+    OriginApproval::enroll(Origin::of(&server.base_url()).expect("loopback origin"))
+}
+
 fn openai_client(server: &TestServer) -> OpenAiCompatible {
+    let base_url = server.base_url();
     OpenAiCompatible::new(OpenAiConfig {
         provider: provider_id("openai"),
-        base_url: server.base_url(),
-        api_key: Some(ApiKey::new(OPENAI_KEY)),
+        api_key: Some(
+            BoundApiKey::for_endpoint(&base_url, ApiKey::new(OPENAI_KEY)).expect("bind key"),
+        ),
+        base_url,
         auth: AuthStyle::Bearer,
         extra_headers: Vec::new(),
         capabilities: OPENAI_CAPABILITIES,
@@ -80,8 +92,12 @@ fn openai_client(server: &TestServer) -> OpenAiCompatible {
 }
 
 fn anthropic_client(server: &TestServer) -> Anthropic {
-    let mut config = AnthropicConfig::new(ApiKey::new(ANTHROPIC_KEY)).expect("config");
-    config.base_url = server.base_url();
+    let config = AnthropicConfig::for_enrolled_origin(
+        ApiKey::new(ANTHROPIC_KEY),
+        server.base_url(),
+        &approve(server),
+    )
+    .expect("config");
     Anthropic::new(config).expect("build client")
 }
 
@@ -793,6 +809,7 @@ async fn the_copilot_device_flow_polls_until_the_grant_is_approved() {
         scope: "read:user".to_owned(),
         device_code_url: server.url("login/device/code"),
         access_token_url: server.url("login/oauth/access_token"),
+        approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
     })
     .expect("build flow")
@@ -856,6 +873,7 @@ async fn a_denied_device_grant_stops_polling_immediately() {
         scope: "read:user".to_owned(),
         device_code_url: server.url("login/device/code"),
         access_token_url: server.url("login/oauth/access_token"),
+        approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
     })
     .expect("build flow")
@@ -883,6 +901,7 @@ async fn a_cancelled_device_flow_stops_before_polling() {
         scope: "read:user".to_owned(),
         device_code_url: server.url("login/device/code"),
         access_token_url: server.url("login/oauth/access_token"),
+        approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
     })
     .expect("build flow")
@@ -915,6 +934,7 @@ async fn the_device_poll_reports_a_pending_grant_without_erroring() {
         scope: "read:user".to_owned(),
         device_code_url: server.url("login/device/code"),
         access_token_url: server.url("login/oauth/access_token"),
+        approved_origins: vec![approve(&server)],
         reliability: ReliabilityConfig::default(),
     })
     .expect("build flow")
@@ -949,6 +969,7 @@ async fn copilot_exchanges_the_github_token_once_and_reuses_it() {
     let mut config = GitHubCopilotConfig::new(SecretString::new(GITHUB_TOKEN)).expect("config");
     config.token_exchange_url = server.url("copilot_internal/v2/token");
     config.api_base_url = Some(server.base_url());
+    config.approved_origins = vec![approve(&server)];
     let client = GitHubCopilot::new(config).expect("build client");
 
     let request = CompletionRequest::new(model("gpt-4o"), vec![ChatMessage::user_text("hei")]);
@@ -1023,6 +1044,7 @@ async fn copilot_re_exchanges_an_expired_token() {
     let mut config = GitHubCopilotConfig::new(SecretString::new(GITHUB_TOKEN)).expect("config");
     config.token_exchange_url = server.url("copilot_internal/v2/token");
     config.api_base_url = Some(server.base_url());
+    config.approved_origins = vec![approve(&server)];
     let client = GitHubCopilot::new(config)
         .expect("build client")
         .with_runtime(manual_runtime(
@@ -1079,6 +1101,7 @@ async fn copilot_streams_and_lists_models_over_the_wire() {
     let mut config = GitHubCopilotConfig::new(SecretString::new(GITHUB_TOKEN)).expect("config");
     config.token_exchange_url = server.url("copilot_internal/v2/token");
     config.api_base_url = Some(server.base_url());
+    config.approved_origins = vec![approve(&server)];
     let client = GitHubCopilot::new(config).expect("build client");
     let context = RequestContext::new();
 
@@ -1140,6 +1163,7 @@ async fn copilot_sends_the_vision_header_only_for_image_prompts() {
     let mut config = GitHubCopilotConfig::new(SecretString::new(GITHUB_TOKEN)).expect("config");
     config.token_exchange_url = server.url("copilot_internal/v2/token");
     config.api_base_url = Some(server.base_url());
+    config.approved_origins = vec![approve(&server)];
     let client = GitHubCopilot::new(config).expect("build client");
 
     let request = CompletionRequest::new(
@@ -1179,6 +1203,7 @@ async fn a_failed_copilot_token_exchange_is_typed_and_leaks_nothing() {
     let mut config = GitHubCopilotConfig::new(SecretString::new(GITHUB_TOKEN)).expect("config");
     config.token_exchange_url = server.url("copilot_internal/v2/token");
     config.api_base_url = Some(server.base_url());
+    config.approved_origins = vec![approve(&server)];
     let client = GitHubCopilot::new(config)
         .expect("build client")
         .with_runtime(manual_runtime(

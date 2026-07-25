@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::cancel::CancelToken;
 use crate::error::{ErrorKind, Operation, ProviderError, parse_retry_after};
+use crate::origin::{BoundApiKey, BoundSecret, OriginError};
 use crate::secret::{REDACTED, SecretString, is_sensitive_header};
 
 /// HTTP methods used by provider APIs.
@@ -41,7 +42,11 @@ impl Method {
 }
 
 /// A request body.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// The `Debug` rendering reports the variant and byte length only. Bodies carry
+/// OAuth device codes, refresh tokens and prompt text, so printing one is a
+/// disclosure regardless of which provider produced it.
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum Body {
     /// No body.
     #[default]
@@ -50,6 +55,21 @@ pub enum Body {
     Json(String),
     /// A percent-encoded form sent as `application/x-www-form-urlencoded`.
     Form(String),
+}
+
+impl Debug for Body {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Empty => "Empty",
+            Self::Json(_) => "Json",
+            Self::Form(_) => "Form",
+        };
+        formatter
+            .debug_struct("Body")
+            .field("kind", &variant)
+            .field("bytes", &self.as_bytes().len())
+            .finish()
+    }
 }
 
 impl Body {
@@ -75,15 +95,27 @@ impl Body {
 
 /// One outbound HTTP request.
 ///
-/// Header values that name a credential are stored as [`SecretString`], so the
-/// `Debug` rendering of a request can never leak one.
+/// No header value is ever rendered. An earlier version redacted only a fixed
+/// list of well-known credential header names, which leaked the key of any
+/// provider that authenticates through a header outside that list — and
+/// [`AuthStyle`](crate::model::AuthStyle) lets a provider name any header it
+/// likes. Header *names* are still shown because they are what makes a request
+/// log useful, and they are not secret.
 #[derive(Clone)]
 pub struct HttpRequest {
     method: Method,
     url: Url,
-    headers: Vec<(String, SecretString)>,
+    headers: Vec<Header>,
     body: Body,
     timeout: Option<Duration>,
+}
+
+/// A header and whether its value is credential material.
+#[derive(Clone)]
+struct Header {
+    name: String,
+    value: SecretString,
+    sensitive: bool,
 }
 
 impl Debug for HttpRequest {
@@ -91,14 +123,7 @@ impl Debug for HttpRequest {
         let headers: Vec<(&str, &str)> = self
             .headers
             .iter()
-            .map(|(name, value)| {
-                let rendered = if is_sensitive_header(name) {
-                    REDACTED
-                } else {
-                    value.expose()
-                };
-                (name.as_str(), rendered)
-            })
+            .map(|header| (header.name.as_str(), REDACTED))
             .collect();
         formatter
             .debug_struct("HttpRequest")
@@ -127,16 +152,83 @@ impl HttpRequest {
     /// Adds a non-secret header.
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers
-            .push((name.into(), SecretString::new(value.into())));
+        let name = name.into();
+        let sensitive = is_sensitive_header(&name);
+        self.headers.push(Header {
+            name,
+            value: SecretString::new(value.into()),
+            sensitive,
+        });
         self
     }
 
     /// Adds a header whose value is credential material.
+    ///
+    /// The value is marked sensitive for the whole life of the request, so
+    /// [`HttpRequest::is_sensitive`] reports it as such even when the header
+    /// name is one no redaction list would recognise.
+    ///
+    /// Prefer [`HttpRequest::bearer`] or [`HttpRequest::credential_header`] for
+    /// anything a provider stores: those check the credential against this
+    /// request's origin, and this method cannot.
     #[must_use]
     pub fn secret_header(mut self, name: impl Into<String>, value: SecretString) -> Self {
-        self.headers.push((name.into(), value));
+        self.headers.push(Header {
+            name: name.into(),
+            value,
+            sensitive: true,
+        });
         self
+    }
+
+    /// Attaches a bound API key as an `Authorization: Bearer` header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::Mismatch`] when this request's URL is not on the
+    /// origin the credential is bound to. That check is the reason a
+    /// configuration-controlled base URL can no longer redirect a stored key to
+    /// an attacker's host: the authenticated request simply does not build.
+    pub fn bearer(self, credential: &BoundApiKey) -> Result<Self, OriginError> {
+        let header = credential.for_url(&self.url)?.bearer_header();
+        Ok(self.secret_header("authorization", header))
+    }
+
+    /// Attaches a bound API key as `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::Mismatch`] when this request's URL is not on the
+    /// origin the credential is bound to.
+    pub fn credential_header(
+        self,
+        name: impl Into<String>,
+        credential: &BoundApiKey,
+    ) -> Result<Self, OriginError> {
+        let value = SecretString::new(credential.for_url(&self.url)?.expose());
+        Ok(self.secret_header(name, value))
+    }
+
+    /// Attaches a bound secret as `name`, prefixed by `prefix`.
+    ///
+    /// `prefix` covers schemes such as `Bearer ` and `token `. Pass an empty
+    /// string for a bare value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OriginError::Mismatch`] when this request's URL is not on the
+    /// origin the secret is bound to.
+    pub fn bound_secret_header(
+        self,
+        name: impl Into<String>,
+        prefix: &str,
+        credential: &BoundSecret,
+    ) -> Result<Self, OriginError> {
+        let value = SecretString::new(format!(
+            "{prefix}{}",
+            credential.expose_for(&self.url)?.expose()
+        ));
+        Ok(self.secret_header(name, value))
     }
 
     /// Sets a non-secret header, dropping any header of the same name first.
@@ -149,8 +241,13 @@ impl HttpRequest {
     pub fn replace_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         let name = name.into();
         self.headers
-            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
-        self.headers.push((name, SecretString::new(value.into())));
+            .retain(|header| !header.name.eq_ignore_ascii_case(&name));
+        let sensitive = is_sensitive_header(&name);
+        self.headers.push(Header {
+            name,
+            value: SecretString::new(value.into()),
+            sensitive,
+        });
         self
     }
 
@@ -183,7 +280,35 @@ impl HttpRequest {
     /// Returns the header names in insertion order.
     #[must_use]
     pub fn header_names(&self) -> Vec<&str> {
-        self.headers.iter().map(|(name, _)| name.as_str()).collect()
+        self.headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect()
+    }
+
+    /// Returns the values of every header named `name`, case-insensitively.
+    ///
+    /// Test-only: header values can be credentials, so production code has no
+    /// reason to read them back out of a request.
+    #[cfg(test)]
+    pub(crate) fn header_values_for_test(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.expose())
+            .collect()
+    }
+
+    /// Reports whether the named header carries credential material.
+    ///
+    /// A header counts as sensitive when it was added through
+    /// [`HttpRequest::secret_header`] or when its name is on the shared
+    /// sensitive-header list.
+    #[must_use]
+    pub fn is_sensitive(&self, name: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case(name) && header.sensitive)
     }
 
     /// Returns the body.
@@ -194,11 +319,27 @@ impl HttpRequest {
 }
 
 /// A buffered HTTP response.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The `Debug` rendering never includes the body or any header value. Token
+/// exchange and OAuth polling responses arrive through this type, so a derived
+/// `Debug` would print a bearer token into any log that formats a response.
+#[derive(Clone, Eq, PartialEq)]
 pub struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl Debug for HttpResponse {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        formatter
+            .debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_names", &names)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl HttpResponse {
@@ -255,10 +396,11 @@ pub struct HttpStream {
 
 impl Debug for HttpStream {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         formatter
             .debug_struct("HttpStream")
             .field("status", &self.status)
-            .field("headers", &self.headers)
+            .field("header_names", &names)
             .finish()
     }
 }
@@ -495,8 +637,8 @@ impl HttpTransport {
         if let Some(content_type) = request.body.content_type() {
             builder = builder.header("content-type", content_type);
         }
-        for (name, value) in &request.headers {
-            builder = builder.header(name.as_str(), value.expose());
+        for header in &request.headers {
+            builder = builder.header(header.name.as_str(), header.value.expose());
         }
         if let Some(timeout) = request.timeout {
             builder = builder.timeout(timeout);
@@ -733,7 +875,12 @@ mod tests {
         let rendered = format!("{request:?}");
         assert!(!rendered.contains("sk-live-4f9a2c7e0b1d"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(rendered.contains("req-42"), "{rendered}");
+        // Even the non-secret header value stays out of the rendering. The
+        // audit showed that a per-name allowlist cannot work when providers
+        // choose their own header names, so every value is redacted and only
+        // the names survive.
+        assert!(!rendered.contains("req-42"), "{rendered}");
+        assert!(rendered.contains("x-request-id"), "{rendered}");
         assert!(rendered.contains("body_bytes: 19"), "{rendered}");
         assert_eq!(
             request.header_names(),
@@ -749,18 +896,25 @@ mod tests {
             .header("accept", "application/json")
             .header("accept", "text/event-stream");
         assert_eq!(appended.header_names(), vec!["accept", "accept"]);
-        let rendered = format!("{appended:?}");
-        assert!(rendered.contains("application/json"), "{rendered}");
-        assert!(rendered.contains("text/event-stream"), "{rendered}");
+        assert_eq!(
+            appended.header_values_for_test("accept"),
+            vec!["application/json", "text/event-stream"]
+        );
 
         let replaced = HttpRequest::new(Method::Post, url("https://api.example.test/v1/chat"))
             .header("accept", "application/json")
             .header("x-keep", "yes")
             .replace_header("Accept", "text/event-stream");
         assert_eq!(replaced.header_names(), vec!["x-keep", "Accept"]);
-        let rendered = format!("{replaced:?}");
-        assert!(!rendered.contains("application/json"), "{rendered}");
-        assert!(rendered.contains("text/event-stream"), "{rendered}");
+        assert_eq!(
+            replaced.header_values_for_test("Accept"),
+            vec!["text/event-stream"]
+        );
+        assert!(
+            !replaced
+                .header_values_for_test("accept")
+                .contains(&"application/json")
+        );
     }
 
     #[test]

@@ -16,8 +16,9 @@ use claw_provider_sdk::model::{
     ContentPart, FinishReason, ImageSource, ModelDescriptor, ModelId, ProviderId, ResponseFormat,
     ToolArguments, ToolCall, ToolChoice, Usage,
 };
+use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval};
 use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
-use claw_provider_sdk::secret::{ApiKey, SecretString};
+use claw_provider_sdk::secret::ApiKey;
 use claw_provider_sdk::sse::{SseDecoder, SseEvent};
 use claw_provider_sdk::stream::{CompletionStream, StreamEvent, ToolCallAssembler};
 use futures_util::StreamExt as _;
@@ -50,7 +51,12 @@ pub struct AnthropicConfig {
     /// Base URL that `/v1/messages` is appended to.
     pub base_url: Url,
     /// Anthropic API key.
-    pub api_key: ApiKey,
+    ///
+    /// The credential carries the origin it was authorised for.
+    /// [`Anthropic::new`] rejects a configuration whose `base_url` is on a
+    /// different origin, so pointing this client elsewhere cannot silently
+    /// reuse a stored Anthropic key.
+    pub api_key: BoundApiKey,
     /// Value of the `anthropic-version` header.
     pub version: String,
     /// `max_tokens` used when the request does not set one.
@@ -69,16 +75,70 @@ impl AnthropicConfig {
     /// Returns [`ErrorKind::InvalidRequest`] if [`DEFAULT_BASE_URL`] ever stops
     /// parsing, which the accompanying test rules out.
     pub fn new(api_key: ApiKey) -> Result<Self, ProviderError> {
+        let base_url: Url = DEFAULT_BASE_URL.parse().map_err(|_| {
+            ProviderError::new(
+                ErrorKind::InvalidRequest,
+                "anthropic",
+                Operation::Authorize,
+                "the default base URL is not a valid URL",
+            )
+        })?;
+        let api_key = BoundApiKey::for_endpoint(&base_url, api_key).map_err(|error| {
+            ProviderError::new(
+                ErrorKind::InvalidRequest,
+                "anthropic",
+                Operation::Authorize,
+                format!("the default base URL names no usable origin: {error}"),
+            )
+        })?;
         Ok(Self {
-            base_url: DEFAULT_BASE_URL.parse().map_err(|_| {
-                ProviderError::new(
-                    ErrorKind::InvalidRequest,
-                    "anthropic",
-                    Operation::Authorize,
-                    "the default base URL is not a valid URL",
-                )
-            })?,
+            base_url,
             api_key,
+            version: ANTHROPIC_VERSION.to_owned(),
+            default_max_tokens: DEFAULT_MAX_TOKENS,
+            extra_headers: Vec::new(),
+            reliability: ReliabilityConfig::default(),
+        })
+    }
+
+    /// Builds a configuration for an operator-enrolled Anthropic-compatible
+    /// endpoint.
+    ///
+    /// This is the deliberate path for a gateway or proxy. The
+    /// [`OriginApproval`] must come from a human decision, never from the same
+    /// configuration field that supplies `base_url`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Authentication`] when `base_url` is not on the
+    /// enrolled origin.
+    pub fn for_enrolled_origin(
+        api_key: ApiKey,
+        base_url: Url,
+        approval: &OriginApproval,
+    ) -> Result<Self, ProviderError> {
+        let origin = Origin::of(&base_url).map_err(|error| {
+            ProviderError::new(
+                ErrorKind::Authentication,
+                "anthropic",
+                Operation::Authorize,
+                format!("the endpoint names no usable origin: {error}"),
+            )
+        })?;
+        if approval.origin() != &origin {
+            return Err(ProviderError::new(
+                ErrorKind::Authentication,
+                "anthropic",
+                Operation::Authorize,
+                format!(
+                    "the endpoint {origin} was not the origin enrolled ({})",
+                    approval.origin()
+                ),
+            ));
+        }
+        Ok(Self {
+            base_url,
+            api_key: BoundApiKey::new(origin, api_key),
             version: ANTHROPIC_VERSION.to_owned(),
             default_max_tokens: DEFAULT_MAX_TOKENS,
             extra_headers: Vec::new(),
@@ -92,7 +152,7 @@ impl AnthropicConfig {
 pub struct Anthropic {
     id: ProviderId,
     base_url: Url,
-    api_key: ApiKey,
+    api_key: BoundApiKey,
     version: String,
     default_max_tokens: u32,
     extra_headers: Vec<(String, String)>,
@@ -104,10 +164,23 @@ impl Anthropic {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Authentication`] when the key is empty and
-    /// [`ErrorKind::Transport`] when the TLS stack cannot be initialized.
+    /// Returns [`ErrorKind::Authentication`] when the key is empty or is bound
+    /// to an origin other than `base_url`'s, and [`ErrorKind::Transport`] when
+    /// the TLS stack cannot be initialized.
     pub fn new(config: AnthropicConfig) -> Result<Self, ProviderError> {
-        if config.api_key.is_empty() {
+        // Credential and destination must agree before the client exists, so a
+        // redirected endpoint can never reach the send path with this key.
+        let key = config.api_key.for_url(&config.base_url).map_err(|error| {
+            ProviderError::new(
+                ErrorKind::Authentication,
+                "anthropic",
+                Operation::Authorize,
+                format!(
+                    "the configured endpoint is not the one this credential authorises: {error}"
+                ),
+            )
+        })?;
+        if key.is_empty() {
             return Err(ProviderError::new(
                 ErrorKind::Authentication,
                 "anthropic",
@@ -182,15 +255,23 @@ impl Anthropic {
         })
     }
 
-    fn request(&self, method: Method, url: Url) -> HttpRequest {
+    fn request(&self, method: Method, url: Url) -> Result<HttpRequest, ProviderError> {
         let mut request = HttpRequest::new(method, url)
             .header("accept", "application/json")
             .header("anthropic-version", self.version.clone())
-            .secret_header("x-api-key", SecretString::new(self.api_key.expose()));
+            .credential_header("x-api-key", &self.api_key)
+            .map_err(|error| {
+                ProviderError::new(
+                    ErrorKind::Authentication,
+                    self.id.as_str(),
+                    Operation::Authorize,
+                    format!("the credential is not authorised for this endpoint: {error}"),
+                )
+            })?;
         for (name, value) in &self.extra_headers {
             request = request.header(name.clone(), value.clone());
         }
-        request
+        Ok(request)
     }
 }
 
@@ -215,7 +296,7 @@ impl Provider for Anthropic {
                 .runtime
                 .execute(Operation::Complete, context.cancel(), || {
                     Ok(self
-                        .request(Method::Post, url.clone())
+                        .request(Method::Post, url.clone())?
                         .body(Body::Json(body.clone())))
                 })
                 .await?;
@@ -236,7 +317,7 @@ impl Provider for Anthropic {
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
-                        .request(Method::Post, url.clone())
+                        .request(Method::Post, url.clone())?
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
@@ -258,7 +339,7 @@ impl Provider for Anthropic {
             let response = self
                 .runtime
                 .execute(Operation::ListModels, context.cancel(), || {
-                    Ok(self.request(Method::Get, url.clone()))
+                    self.request(Method::Get, url.clone())
                 })
                 .await?;
             decode_models(self.id.as_str(), response.body())
@@ -1661,10 +1742,12 @@ mod tests {
         assert_eq!(client.capabilities(), CAPABILITIES);
         assert!(!client.capabilities().contains(Capability::Embeddings));
 
-        let request = client.request(
-            Method::Post,
-            client.endpoint("v1/messages").expect("endpoint"),
-        );
+        let request = client
+            .request(
+                Method::Post,
+                client.endpoint("v1/messages").expect("endpoint"),
+            )
+            .expect("request");
         assert_eq!(
             request.url().as_str(),
             "https://api.anthropic.com/v1/messages"

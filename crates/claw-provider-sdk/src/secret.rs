@@ -13,7 +13,12 @@ use std::sync::{Mutex, PoisonError};
 use zeroize::Zeroize;
 
 mod file;
-pub use file::{FileSecretStore, encode_key};
+pub use file::{FileSecretStore, decode_key, encode_key};
+
+mod transaction;
+pub use transaction::{
+    RecoveredTransaction, RecoveryOutcome, TRANSACTION_SERVICE, TransactionId, TransactionState,
+};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
@@ -261,6 +266,31 @@ pub enum SecretStoreError {
         /// Stable, non-sensitive description of the failure class.
         detail: &'static str,
     },
+    /// The backend cannot list the accounts in a service namespace.
+    EnumerationUnsupported {
+        /// Backend that cannot enumerate.
+        backend: &'static str,
+    },
+    /// The backend cannot provide transactions, because it cannot enumerate.
+    ///
+    /// Callers must handle this rather than assume a transaction happened.
+    TransactionUnsupported {
+        /// Backend without transaction support.
+        backend: &'static str,
+    },
+    /// No transaction with that identifier is in flight.
+    UnknownTransaction,
+    /// Another in-flight transaction already holds one of these keys.
+    TransactionConflict,
+    /// The transaction is past its commit point and can no longer be changed.
+    TransactionCommitted,
+    /// The transaction is rolling back and can no longer be changed.
+    TransactionAborted,
+    /// Transaction bookkeeping in the backend is unreadable or inconsistent.
+    TransactionCorrupt {
+        /// Backend holding the bookkeeping.
+        backend: &'static str,
+    },
 }
 
 impl Display for SecretStoreError {
@@ -283,6 +313,23 @@ impl Display for SecretStoreError {
                 )
             }
             Self::Backend { backend, detail } => write!(formatter, "{backend} failed: {detail}"),
+            Self::EnumerationUnsupported { backend } => {
+                write!(formatter, "{backend} cannot list credentials")
+            }
+            Self::TransactionUnsupported { backend } => {
+                write!(formatter, "{backend} does not support transactions")
+            }
+            Self::UnknownTransaction => formatter.write_str("no such transaction is in flight"),
+            Self::TransactionConflict => {
+                formatter.write_str("another transaction already holds this credential")
+            }
+            Self::TransactionCommitted => {
+                formatter.write_str("the transaction is already committed")
+            }
+            Self::TransactionAborted => formatter.write_str("the transaction is rolling back"),
+            Self::TransactionCorrupt { backend } => {
+                write!(formatter, "{backend} holds unreadable transaction records")
+            }
         }
     }
 }
@@ -316,6 +363,155 @@ pub trait SecretStore: Send + Sync + Debug {
     ///
     /// Returns [`SecretStoreError`] when the backend fails.
     fn delete(&self, key: &CredentialKey) -> Result<bool, SecretStoreError>;
+
+    /// Lists the account names stored under `service`.
+    ///
+    /// Enumeration is what makes crash recovery possible, so a backend that can
+    /// implement it gets transactions for free. The default refuses, which in
+    /// turn makes [`SecretStore::begin_transaction`] report
+    /// [`SecretStoreError::TransactionUnsupported`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError::EnumerationUnsupported`] by default, or any
+    /// backend failure.
+    fn accounts(&self, service: &str) -> Result<Vec<String>, SecretStoreError> {
+        let _ = service;
+        Err(SecretStoreError::EnumerationUnsupported {
+            backend: self.backend(),
+        })
+    }
+
+    /// Stores `secret` under `key` only when no value is present yet, reporting
+    /// whether this call is the one that created it.
+    ///
+    /// This is the mutual-exclusion primitive the transaction engine builds its
+    /// lock on. The default implementation is a read followed by a write, which
+    /// is *not* atomic; a backend that can create-or-fail in one step should
+    /// override it. [`MemorySecretStore`] does so under its own mutex and
+    /// [`FileSecretStore`](file::FileSecretStore) does so with `O_EXCL` /
+    /// `CREATE_NEW`, which also serialises separate processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError`] when the backend fails.
+    fn insert_if_absent(
+        &self,
+        key: &CredentialKey,
+        secret: &SecretString,
+    ) -> Result<bool, SecretStoreError> {
+        if self.get(key)?.is_some() {
+            return Ok(false);
+        }
+        self.set(key, secret)?;
+        Ok(true)
+    }
+
+    /// Starts a transaction and returns its opaque identifier.
+    ///
+    /// The identifier is the only part of a transaction that is safe to write to
+    /// a caller-owned journal or receipt; see the [`transaction`] module for the
+    /// durability and non-disclosure rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError::TransactionUnsupported`] when the backend
+    /// cannot enumerate, or any backend failure.
+    fn begin_transaction(&self) -> Result<TransactionId, SecretStoreError> {
+        transaction::begin(self)
+    }
+
+    /// Records a key's current value in the transaction without changing it.
+    ///
+    /// Calling this twice for the same key in the same transaction is a no-op,
+    /// so the first recorded value is always the one rollback restores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError::UnknownTransaction`] for an unknown or
+    /// finished transaction, [`SecretStoreError::TransactionConflict`] when
+    /// another in-flight transaction holds `key`, or
+    /// [`SecretStoreError::InvalidKey`] for a key in [`TRANSACTION_SERVICE`].
+    fn snapshot(
+        &self,
+        transaction: &TransactionId,
+        key: &CredentialKey,
+    ) -> Result<(), SecretStoreError> {
+        transaction::snapshot(self, transaction, key)
+    }
+
+    /// Creates or replaces a credential inside a transaction.
+    ///
+    /// Snapshots `key` first, so the change is undone by
+    /// [`SecretStore::rollback`] or by recovery after a crash.
+    ///
+    /// # Errors
+    ///
+    /// As [`SecretStore::snapshot`], plus any failure writing the value.
+    fn put(
+        &self,
+        transaction: &TransactionId,
+        key: &CredentialKey,
+        secret: &SecretString,
+    ) -> Result<(), SecretStoreError> {
+        transaction::put(self, transaction, key, secret)
+    }
+
+    /// Removes a credential inside a transaction.
+    ///
+    /// Returns `false` when the credential was already absent.
+    ///
+    /// # Errors
+    ///
+    /// As [`SecretStore::snapshot`], plus any failure deleting the value.
+    fn remove(
+        &self,
+        transaction: &TransactionId,
+        key: &CredentialKey,
+    ) -> Result<bool, SecretStoreError> {
+        transaction::remove(self, transaction, key)
+    }
+
+    /// Commits a transaction, making its changes permanent.
+    ///
+    /// The manifest is marked committed before any cleanup, so a crash during
+    /// cleanup is completed by recovery rather than undone. Committing an
+    /// already-committed transaction finishes that cleanup and succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError::UnknownTransaction`] when nothing is in
+    /// flight under that identifier, or [`SecretStoreError::TransactionAborted`]
+    /// when it is already rolling back.
+    fn commit(&self, transaction: &TransactionId) -> Result<(), SecretStoreError> {
+        transaction::commit(self, transaction)
+    }
+
+    /// Restores every key the transaction touched to its previous value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError::UnknownTransaction`] when nothing is in
+    /// flight under that identifier, or
+    /// [`SecretStoreError::TransactionCommitted`] when it is past its commit
+    /// point and can no longer be undone.
+    fn rollback(&self, transaction: &TransactionId) -> Result<(), SecretStoreError> {
+        transaction::rollback(self, transaction)
+    }
+
+    /// Resolves every transaction left in flight by an earlier process.
+    ///
+    /// Transactions that had not reached their commit point are rolled back and
+    /// those that had are completed. Running this is idempotent: it leaves no
+    /// bookkeeping behind, so an immediate second call resolves nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretStoreError::TransactionUnsupported`] when the backend
+    /// cannot enumerate, or any backend failure.
+    fn recover_pending(&self) -> Result<Vec<RecoveredTransaction>, SecretStoreError> {
+        transaction::recover_pending(self)
+    }
 }
 
 /// An in-memory store, used by tests and by ephemeral sessions.
@@ -376,6 +572,30 @@ impl SecretStore for MemorySecretStore {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(key)
             .is_some())
+    }
+
+    fn insert_if_absent(
+        &self,
+        key: &CredentialKey,
+        secret: &SecretString,
+    ) -> Result<bool, SecretStoreError> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.contains_key(key) {
+            return Ok(false);
+        }
+        entries.insert(key.clone(), secret.clone());
+        Ok(true)
+    }
+
+    fn accounts(&self, service: &str) -> Result<Vec<String>, SecretStoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .filter(|key| key.service() == service)
+            .map(|key| key.account().to_owned())
+            .collect())
     }
 }
 

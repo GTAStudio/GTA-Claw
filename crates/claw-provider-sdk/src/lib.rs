@@ -24,6 +24,7 @@ pub mod error;
 pub mod http;
 pub mod limit;
 pub mod model;
+pub mod origin;
 pub mod provider;
 pub mod retry;
 pub mod secret;
@@ -38,6 +39,7 @@ pub use model::{
     ModelDescriptor, ModelError, ModelId, ProviderId, ResponseFormat, ToolArguments, ToolCall,
     ToolChoice, ToolDefinition, ToolParameters, Usage,
 };
+pub use origin::{BoundApiKey, BoundSecret, Origin, OriginApproval, OriginError, TrustedOrigins};
 pub use provider::{BoxFuture, Provider, RequestContext};
 pub use secret::{ApiKey, CredentialKey, SecretStore, SecretStoreError, SecretString};
 pub use stream::{CompletionStream, StreamEvent};

@@ -9,8 +9,10 @@ const BACKEND: &str = "macos-keychain";
 
 /// Credential store backed by the macOS login Keychain.
 ///
-/// Each [`CredentialKey`] maps to one generic password item whose service and
-/// account attributes are the key components.
+/// Each [`CredentialKey`] maps to one generic password item. The service and
+/// account are percent-encoded on the way to the platform so that every native
+/// backend addresses a key the same way; see
+/// [`native`](super::native) for why the encoding exists.
 pub struct AppleKeychainStore {
     inner: NativeKeyringStore,
 }
@@ -55,6 +57,10 @@ impl SecretStore for AppleKeychainStore {
 
     fn delete(&self, key: &CredentialKey) -> Result<bool, SecretStoreError> {
         self.inner.delete(key)
+    }
+
+    fn accounts(&self, service: &str) -> Result<Vec<String>, SecretStoreError> {
+        self.inner.accounts(service)
     }
 }
 

@@ -30,6 +30,7 @@ use claw_provider_sdk::model::{
     Capability, CapabilitySet, CompletionRequest, CompletionResponse, ContentPart, ModelDescriptor,
     ModelId, ProviderId,
 };
+use claw_provider_sdk::origin::{BoundSecret, Origin, OriginApproval, TrustedOrigins};
 use claw_provider_sdk::provider::{BoxFuture, Provider, RequestContext};
 use claw_provider_sdk::secret::SecretString;
 use claw_provider_sdk::stream::CompletionStream;
@@ -125,7 +126,9 @@ pub struct DeviceAuthorization {
     pub interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
+/// Raw wire shape. Deliberately has no `Debug`: every one of these carries a
+/// credential in cleartext, and a derived `Debug` would print it.
+#[derive(Deserialize)]
 struct WireDeviceAuthorization {
     device_code: String,
     user_code: String,
@@ -187,7 +190,9 @@ struct WireOauthError {
     error_description: String,
 }
 
-#[derive(Debug, Deserialize)]
+/// Raw wire shape. Deliberately has no `Debug`: every one of these carries a
+/// credential in cleartext, and a derived `Debug` would print it.
+#[derive(Deserialize)]
 struct WireAccessToken {
     access_token: String,
 }
@@ -292,6 +297,53 @@ pub fn encode_device_poll_form(client_id: &str, device_code: &SecretString) -> S
         .finish()
 }
 
+/// Origins GitHub Copilot may present a credential to without enrollment.
+///
+/// A long-lived GitHub OAuth token is exchanged at
+/// [`COPILOT_TOKEN_URL`] and the resulting Copilot token is spent at
+/// [`DEFAULT_API_BASE_URL`]. Both URLs used to be free-form configuration, and
+/// TLS only proves that the named host owns its certificate — it does not prove
+/// the host is GitHub. Pinning the origins is what stops a tampered
+/// configuration from exfiltrating those credentials.
+///
+/// GitHub Enterprise and other self-hosted deployments are supported through
+/// [`GitHubCopilotConfig::approved_origins`].
+pub const TRUSTED_ORIGINS: [&str; 3] = [
+    "https://github.com",
+    "https://api.github.com",
+    "https://api.githubcopilot.com",
+];
+
+/// Builds the pinned trust set, widened by any enrolled origins.
+fn trust_set(approvals: &[OriginApproval]) -> Result<TrustedOrigins, ProviderError> {
+    let mut trusted = TrustedOrigins::pinned(&TRUSTED_ORIGINS).map_err(|error| {
+        provider_error(
+            ErrorKind::InvalidRequest,
+            Operation::Authorize,
+            format!("a pinned Copilot origin does not parse: {error}"),
+        )
+    })?;
+    for approval in approvals {
+        trusted = trusted.enrolled(approval);
+    }
+    Ok(trusted)
+}
+
+/// Authorizes `url` against `trusted`, naming the credential that is at risk.
+fn authorize_origin(
+    trusted: &TrustedOrigins,
+    url: &Url,
+    what: &str,
+) -> Result<Origin, ProviderError> {
+    trusted.authorize(url).map_err(|error| {
+        provider_error(
+            ErrorKind::Authentication,
+            Operation::Authorize,
+            format!("refusing to send the {what} to an untrusted origin: {error}"),
+        )
+    })
+}
+
 /// Configuration of the device authorization grant.
 #[derive(Debug)]
 pub struct DeviceFlowConfig {
@@ -303,6 +355,11 @@ pub struct DeviceFlowConfig {
     pub device_code_url: Url,
     /// Access-token endpoint.
     pub access_token_url: Url,
+    /// Origins the operator deliberately enrolled beyond [`TRUSTED_ORIGINS`].
+    ///
+    /// The device flow mints a GitHub OAuth token, so the endpoints that mint
+    /// it are as sensitive as the ones that spend it.
+    pub approved_origins: Vec<OriginApproval>,
     /// Reliability policies applied to both endpoints.
     pub reliability: ReliabilityConfig,
 }
@@ -320,6 +377,7 @@ impl DeviceFlowConfig {
             scope: DEFAULT_SCOPE.to_owned(),
             device_code_url: parse_url(DEVICE_CODE_URL, Operation::Authorize)?,
             access_token_url: parse_url(ACCESS_TOKEN_URL, Operation::Authorize)?,
+            approved_origins: Vec::new(),
             reliability: ReliabilityConfig::default(),
         })
     }
@@ -340,8 +398,17 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Transport`] when the TLS stack cannot be built.
+    /// Returns [`ErrorKind::Authentication`] when either endpoint is not a
+    /// [`TRUSTED_ORIGINS`] entry or an enrolled origin, and
+    /// [`ErrorKind::Transport`] when the TLS stack cannot be built.
     pub fn new(config: DeviceFlowConfig) -> Result<Self, ProviderError> {
+        let trusted = trust_set(&config.approved_origins)?;
+        authorize_origin(
+            &trusted,
+            &config.device_code_url,
+            "device authorization request",
+        )?;
+        authorize_origin(&trusted, &config.access_token_url, "device code")?;
         let policy = tls_policy_for(&[&config.device_code_url, &config.access_token_url]);
         Ok(Self {
             runtime: ProviderRuntime::new(PROVIDER, policy, config.reliability)?,
@@ -499,7 +566,9 @@ struct WireEndpoints {
     api: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Raw wire shape. Deliberately has no `Debug`: every one of these carries a
+/// credential in cleartext, and a derived `Debug` would print it.
+#[derive(Deserialize)]
 struct WireCopilotToken {
     token: String,
     #[serde(default)]
@@ -564,6 +633,13 @@ pub struct GitHubCopilotConfig {
     pub token_exchange_url: Url,
     /// Overrides the chat endpoint the exchange nominates.
     pub api_base_url: Option<Url>,
+    /// Origins the operator deliberately enrolled beyond [`TRUSTED_ORIGINS`].
+    ///
+    /// This is how a GitHub Enterprise deployment authorises its own
+    /// token-exchange and chat hosts. An approval must come from a human
+    /// decision; deriving one from the same configuration that supplies
+    /// `token_exchange_url` or `api_base_url` defeats the check entirely.
+    pub approved_origins: Vec<OriginApproval>,
     /// `Copilot-Integration-Id` header value.
     pub integration_id: String,
     /// `Editor-Version` header value.
@@ -586,6 +662,7 @@ impl GitHubCopilotConfig {
             github_token,
             token_exchange_url: parse_url(COPILOT_TOKEN_URL, Operation::Authorize)?,
             api_base_url: None,
+            approved_origins: Vec::new(),
             integration_id: DEFAULT_INTEGRATION_ID.to_owned(),
             editor_version: DEFAULT_EDITOR_VERSION.to_owned(),
             editor_plugin_version: DEFAULT_EDITOR_PLUGIN_VERSION.to_owned(),
@@ -598,10 +675,11 @@ impl GitHubCopilotConfig {
 #[derive(Debug)]
 pub struct GitHubCopilot {
     id: ProviderId,
-    github_token: SecretString,
+    github_token: BoundSecret,
     token_exchange_url: Url,
     configured_api_base_url: Option<Url>,
     fallback_api_base_url: Url,
+    trusted: TrustedOrigins,
     integration_id: String,
     editor_version: String,
     editor_plugin_version: String,
@@ -614,7 +692,9 @@ impl GitHubCopilot {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::Authentication`] when the GitHub token is empty and
+    /// Returns [`ErrorKind::Authentication`] when the GitHub token is empty or
+    /// when the token-exchange or chat endpoint is not a
+    /// [`TRUSTED_ORIGINS`] entry or an enrolled origin, and
     /// [`ErrorKind::Transport`] when the TLS stack cannot be built.
     pub fn new(config: GitHubCopilotConfig) -> Result<Self, ProviderError> {
         if config.github_token.is_empty() {
@@ -623,6 +703,15 @@ impl GitHubCopilot {
                 Operation::Authorize,
                 "GitHub Copilot requires a GitHub OAuth token",
             ));
+        }
+        let trusted = trust_set(&config.approved_origins)?;
+        // The GitHub OAuth token is the credential at risk here: it is
+        // long-lived and grants far more than chat. Bind it to the exchange
+        // origin so it is unusable anywhere else.
+        let exchange_origin =
+            authorize_origin(&trusted, &config.token_exchange_url, "GitHub OAuth token")?;
+        if let Some(base) = config.api_base_url.as_ref() {
+            authorize_origin(&trusted, base, "Copilot token")?;
         }
         let fallback_api_base_url = parse_url(DEFAULT_API_BASE_URL, Operation::Authorize)?;
         let mut urls: Vec<&Url> = vec![&config.token_exchange_url];
@@ -638,10 +727,11 @@ impl GitHubCopilot {
                     error.to_string(),
                 )
             })?,
-            github_token: config.github_token,
+            github_token: BoundSecret::new(exchange_origin, config.github_token),
             token_exchange_url: config.token_exchange_url,
             configured_api_base_url: config.api_base_url,
             fallback_api_base_url,
+            trusted,
             integration_id: config.integration_id,
             editor_version: config.editor_version,
             editor_plugin_version: config.editor_plugin_version,
@@ -700,16 +790,21 @@ impl GitHubCopilot {
         let response = self
             .runtime
             .execute(Operation::Authorize, cancel, || {
-                Ok(
-                    HttpRequest::new(Method::Get, self.token_exchange_url.clone())
-                        .header("accept", "application/json")
-                        .header("editor-version", self.editor_version.clone())
-                        .header("editor-plugin-version", self.editor_plugin_version.clone())
-                        .secret_header(
-                            "authorization",
-                            SecretString::new(format!("token {}", self.github_token.expose())),
-                        ),
-                )
+                HttpRequest::new(Method::Get, self.token_exchange_url.clone())
+                    .header("accept", "application/json")
+                    .header("editor-version", self.editor_version.clone())
+                    .header("editor-plugin-version", self.editor_plugin_version.clone())
+                    .bound_secret_header("authorization", "token ", &self.github_token)
+                    .map_err(|error| {
+                        provider_error(
+                            ErrorKind::Authentication,
+                            Operation::Authorize,
+                            format!(
+                                "the GitHub OAuth token is not authorised for this \
+                                 exchange endpoint: {error}"
+                            ),
+                        )
+                    })
             })
             .await?;
         decode_copilot_token(response.body())
@@ -724,33 +819,53 @@ impl GitHubCopilot {
         Ok(fetched)
     }
 
-    fn api_base(&self, token: &CopilotToken) -> Url {
-        self.configured_api_base_url
+    /// Resolves the chat endpoint and binds the Copilot token to it.
+    ///
+    /// The endpoint can come from configuration or from the exchange
+    /// response, so both are checked against the trust set. A compromised or
+    /// impersonated exchange could otherwise nominate any host and the
+    /// Copilot token would follow it there.
+    fn api_base(&self, token: &CopilotToken) -> Result<(Url, BoundSecret), ProviderError> {
+        let base = self
+            .configured_api_base_url
             .clone()
             .or_else(|| token.api_endpoint.clone())
-            .unwrap_or_else(|| self.fallback_api_base_url.clone())
+            .unwrap_or_else(|| self.fallback_api_base_url.clone());
+        let origin = authorize_origin(&self.trusted, &base, "Copilot token")?;
+        Ok((base, BoundSecret::new(origin, token.token.clone())))
     }
 
     fn endpoint(&self, token: &CopilotToken, path: &str) -> Result<Url, ProviderError> {
-        let base = self.api_base(token);
+        let (base, _) = self.api_base(token)?;
         let trimmed = base.as_str().trim_end_matches('/');
         parse_url(&format!("{trimmed}/{path}"), Operation::Transport)
     }
 
-    fn request(&self, method: Method, url: Url, token: &CopilotToken, vision: bool) -> HttpRequest {
+    fn request(
+        &self,
+        method: Method,
+        url: Url,
+        token: &CopilotToken,
+        vision: bool,
+    ) -> Result<HttpRequest, ProviderError> {
+        let (_, bound) = self.api_base(token)?;
         let mut request = HttpRequest::new(method, url)
             .header("accept", "application/json")
             .header("copilot-integration-id", self.integration_id.clone())
             .header("editor-version", self.editor_version.clone())
             .header("editor-plugin-version", self.editor_plugin_version.clone())
-            .secret_header(
-                "authorization",
-                SecretString::new(format!("Bearer {}", token.token.expose())),
-            );
+            .bound_secret_header("authorization", "Bearer ", &bound)
+            .map_err(|error| {
+                provider_error(
+                    ErrorKind::Authentication,
+                    Operation::Authorize,
+                    format!("the Copilot token is not authorised for this endpoint: {error}"),
+                )
+            })?;
         if vision {
             request = request.header("copilot-vision-request", "true");
         }
-        request
+        Ok(request)
     }
 }
 
@@ -795,7 +910,7 @@ impl Provider for GitHubCopilot {
                 .runtime
                 .execute(Operation::Complete, context.cancel(), || {
                     Ok(self
-                        .request(Method::Post, url.clone(), &token, vision)
+                        .request(Method::Post, url.clone(), &token, vision)?
                         .body(Body::Json(body.clone())))
                 })
                 .await?;
@@ -818,7 +933,7 @@ impl Provider for GitHubCopilot {
                 .runtime
                 .execute_streaming(Operation::StreamCompletion, &cancel, || {
                     Ok(self
-                        .request(Method::Post, url.clone(), &token, vision)
+                        .request(Method::Post, url.clone(), &token, vision)?
                         .replace_header("accept", "text/event-stream")
                         .body(Body::Json(body.clone())))
                 })
@@ -837,7 +952,7 @@ impl Provider for GitHubCopilot {
             let response = self
                 .runtime
                 .execute(Operation::ListModels, context.cancel(), || {
-                    Ok(self.request(Method::Get, url.clone(), &token, false))
+                    self.request(Method::Get, url.clone(), &token, false)
                 })
                 .await?;
             decode_models(response.body())
@@ -1156,7 +1271,7 @@ mod tests {
         let client =
             GitHubCopilot::with_github_token(secret("gho_token_value")).expect("build client");
         assert_eq!(
-            client.api_base(&token).as_str(),
+            client.api_base(&token).expect("api base").0.as_str(),
             "https://api.githubcopilot.com/"
         );
         assert_eq!(
@@ -1174,7 +1289,18 @@ mod tests {
             br#"{"token":"tid=x","expires_at":10,"endpoints":{"api":"https://api.enterprise.example/x"}}"#,
         )
         .expect("decode");
-        let client = GitHubCopilot::with_github_token(secret("gho_token")).expect("build client");
+        let unenrolled =
+            GitHubCopilot::with_github_token(secret("gho_token")).expect("build client");
+        let error = unenrolled
+            .endpoint(&token, "models")
+            .expect_err("an unenrolled nominated endpoint must be refused");
+        assert_eq!(error.kind(), ErrorKind::Authentication);
+
+        let mut config = GitHubCopilotConfig::new(secret("gho_token")).expect("config");
+        config.approved_origins = vec![OriginApproval::enroll(
+            Origin::parse("https://api.enterprise.example").expect("origin"),
+        )];
+        let client = GitHubCopilot::new(config).expect("build client");
         assert_eq!(
             client
                 .endpoint(&token, "models")
@@ -1192,6 +1318,9 @@ mod tests {
         .expect("decode");
         let mut config = GitHubCopilotConfig::new(secret("gho_token")).expect("config");
         config.api_base_url = Some("http://127.0.0.1:9/base".parse().expect("url"));
+        config.approved_origins = vec![OriginApproval::enroll(
+            Origin::parse("http://127.0.0.1:9").expect("origin"),
+        )];
         let client = GitHubCopilot::new(config).expect("build client");
         assert_eq!(
             client
@@ -1230,6 +1359,9 @@ mod tests {
         let clock = Arc::new(ManualClock::new(0));
         let mut config = GitHubCopilotConfig::new(secret("gho_token")).expect("config");
         config.api_base_url = Some("http://127.0.0.1:9".parse().expect("url"));
+        config.approved_origins = vec![OriginApproval::enroll(
+            Origin::parse("http://127.0.0.1:9").expect("origin"),
+        )];
         let mut client = GitHubCopilot::new(config).expect("build client");
         client.runtime = ProviderRuntime::with_parts(
             PROVIDER,
@@ -1276,7 +1408,9 @@ mod tests {
         let url = client
             .endpoint(&token, "chat/completions")
             .expect("endpoint");
-        let request = client.request(Method::Post, url, &token, false);
+        let request = client
+            .request(Method::Post, url, &token, false)
+            .expect("request");
         assert_eq!(
             request.header_names(),
             vec![
@@ -1311,12 +1445,14 @@ mod tests {
         assert!(
             !client
                 .request(Method::Post, url.clone(), &token, false)
+                .expect("request")
                 .header_names()
                 .contains(&"copilot-vision-request")
         );
         assert!(
             client
                 .request(Method::Post, url, &token, true)
+                .expect("request")
                 .header_names()
                 .contains(&"copilot-vision-request")
         );
