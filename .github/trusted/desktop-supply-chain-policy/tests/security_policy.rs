@@ -767,6 +767,8 @@ repository.workspace = true
 workspace = true
 "#;
 
+const REPOSITORY_POLICY_MEMBER: &str = "crates/claw-repo-policy";
+
 const REPOSITORY_POLICY_TEST_FIXTURE: &str = r#"const FORBIDDEN_FILE_NAMES: &[&str] = &[
     "package.json",
     "package-lock.json",
@@ -859,17 +861,72 @@ jobs:
         run: cargo test --locked --package claw-repo-policy --test repository_policy
 "#;
 
-fn activate_repository_policy(tree: &TempTree) {
-    add_root_member(tree, "crates/claw-repo-policy", REPOSITORY_POLICY_MANIFEST);
+fn deactivate_repository_policy(tree: &TempTree) {
+    let root_manifest_path = tree.join("Cargo.toml");
+    let mut root_manifest: toml::Value = toml::from_str(
+        &fs::read_to_string(&root_manifest_path).expect("read active policy root manifest"),
+    )
+    .expect("parse active policy root manifest");
+    let members = root_manifest
+        .get_mut("workspace")
+        .and_then(|workspace| workspace.get_mut("members"))
+        .and_then(toml::Value::as_array_mut)
+        .expect("active policy root workspace members");
+    let position = members
+        .binary_search_by(|candidate| {
+            candidate
+                .as_str()
+                .expect("root workspace member string")
+                .cmp(REPOSITORY_POLICY_MEMBER)
+        })
+        .expect("active policy root workspace member");
+    members.remove(position);
+    assert_unique_sorted_root_members(members);
     fs::write(
-        tree.join("crates/claw-repo-policy/src/lib.rs"),
+        root_manifest_path,
+        toml::to_string(&root_manifest).expect("serialize inactive policy root manifest"),
+    )
+    .expect("write inactive policy root manifest");
+
+    fs::remove_dir_all(tree.join(REPOSITORY_POLICY_MEMBER))
+        .expect("remove active repository policy crate");
+
+    let root_lock_path = tree.join("Cargo.lock");
+    let mut root_lock: toml::Value =
+        toml::from_str(&fs::read_to_string(&root_lock_path).expect("read active policy root lock"))
+            .expect("parse active policy root lock");
+    let packages = root_lock
+        .get_mut("package")
+        .and_then(toml::Value::as_array_mut)
+        .expect("active policy root lock packages");
+    let package_count = packages.len();
+    packages.retain(|package| {
+        package.get("name").and_then(toml::Value::as_str) != Some("claw-repo-policy")
+    });
+    assert_eq!(
+        package_count,
+        packages.len() + 1,
+        "active policy lock must contain exactly one claw-repo-policy package"
+    );
+    fs::write(
+        root_lock_path,
+        toml::to_string(&root_lock).expect("serialize inactive policy root lock"),
+    )
+    .expect("write inactive policy root lock");
+}
+
+fn activate_repository_policy(tree: &TempTree) {
+    add_root_member(tree, REPOSITORY_POLICY_MEMBER, REPOSITORY_POLICY_MANIFEST);
+    fs::write(
+        tree.join(REPOSITORY_POLICY_MEMBER).join("src/lib.rs"),
         "//! Repository-wide architecture policy gates for GTA Claw.\n",
     )
     .expect("write repository policy library");
-    fs::create_dir_all(tree.join("crates/claw-repo-policy/tests"))
+    fs::create_dir_all(tree.join(REPOSITORY_POLICY_MEMBER).join("tests"))
         .expect("create repository policy tests");
     fs::write(
-        tree.join("crates/claw-repo-policy/tests/repository_policy.rs"),
+        tree.join(REPOSITORY_POLICY_MEMBER)
+            .join("tests/repository_policy.rs"),
         REPOSITORY_POLICY_TEST_FIXTURE,
     )
     .expect("write repository policy test fixture");
@@ -2745,6 +2802,8 @@ fn git_tree_inventory_rejects_symlinks_and_gitlinks() {
 fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
     let trusted = final_tree("repository-ratchet-base");
     let candidate = final_tree("repository-ratchet-candidate");
+    deactivate_repository_policy(&trusted);
+    deactivate_repository_policy(&candidate);
     fs::write(candidate.join("src/newFeature.ts"), "new legacy feature")
         .expect("plant TypeScript addition");
     let trusted_root = SafeRoot::new(&trusted.path).expect("open ratchet base");
@@ -2764,9 +2823,11 @@ fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
         .expect("deleting a grandfathered artifact must keep the ratchet green");
 
     let reduced_base = final_tree("repository-ratchet-reduced-base");
+    deactivate_repository_policy(&reduced_base);
     fs::remove_file(reduced_base.join("src/utils/proxy.ts"))
         .expect("remove grandfathered artifact from protected-base fixture");
     let reintroduced_candidate = final_tree("repository-ratchet-reintroduced-candidate");
+    deactivate_repository_policy(&reintroduced_candidate);
     let error = validate_repository_policy_transition(
         &SafeRoot::new(&reduced_base.path).expect("open reduced protected base"),
         &SafeRoot::new(&reintroduced_candidate.path).expect("open reintroduced candidate"),
@@ -2788,8 +2849,10 @@ fn base_owned_repository_ratchet_rejects_node_in_future_mobile_workflows() {
         ),
         ("android-packaging.yml", "      - run: npm ci\n"),
     ] {
-        let trusted = bootstrap_tree(&format!("repository-{workflow}-ratchet-base"));
-        let candidate = bootstrap_tree(&format!("repository-{workflow}-ratchet-candidate"));
+        let trusted = final_tree(&format!("repository-{workflow}-ratchet-base"));
+        let candidate = final_tree(&format!("repository-{workflow}-ratchet-candidate"));
+        deactivate_repository_policy(&trusted);
+        deactivate_repository_policy(&candidate);
         let path = format!(".github/workflows/{workflow}");
         fs::write(
             candidate.join(&path),
@@ -2816,6 +2879,8 @@ fn base_owned_repository_ratchet_rejects_node_in_future_mobile_workflows() {
 fn repository_policy_activation_requires_exact_shape_and_zero_node_workflows() {
     let trusted = final_tree("repository-policy-inactive-base");
     let candidate = final_tree("repository-policy-active-candidate");
+    deactivate_repository_policy(&trusted);
+    deactivate_repository_policy(&candidate);
     activate_repository_policy(&candidate);
     let trusted_root = SafeRoot::new(&trusted.path).expect("open inactive policy base");
     let candidate_root = SafeRoot::new(&candidate.path).expect("open active policy candidate");
