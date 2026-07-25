@@ -230,7 +230,7 @@ wait_for_writer_lock() {
 
 start_manual_writer_lock() {
   local deadline
-  lock_gate_dir="$(mktemp -d)"
+  lock_gate_dir="$(sudo mktemp -d /run/gta-claw-lifecycle-lock.XXXXXXXX)"
   sudo chown gta-claw:gta-claw "$lock_gate_dir"
   sudo chmod 0700 "$lock_gate_dir"
   sudo -u gta-claw \
