@@ -108,6 +108,32 @@ trust root and fail the other. A cited name does **not** count when it is
 `#[ignore]`d, gated by a nearby `#[cfg(...)]`, inside a line or block comment,
 inside a string literal, or an ordinary function with no test attribute.
 
+#### Ownership of the enabled-test rule
+
+`declares_enabled_test` in `crates/claw-conformance/src/claims.rs` is the
+**normative** implementation. `Test-DeclaresEnabledRustTest` in `validate.ps1`
+is a follower port and has no independent authority: where the two ever disagree,
+the Rust harness is correct and this script is the bug.
+
+The two trees are independently owned, so this is a real drift risk. The rule is
+binding in one direction only:
+
+- Any change to `declares_enabled_test` must be reported to the coordinating
+  session and re-ported here in the same cycle.
+- This port must never be "improved" unilaterally. Tightening or loosening it
+  here without a matching change in the harness creates exactly the split the
+  port exists to prevent: a row that passes one trust root and fails the other.
+
+The port was verified against all eight of the harness's own unit cases, and the
+self-test re-checks the same eight behaviours (`synthetic-enabled-test-passes`,
+`synthetic-async-enabled-test-passes`, `implemented-with-ignored-test`,
+`implemented-with-cfg-gated-test`, `implemented-with-line-commented-test`,
+`implemented-with-block-commented-test`,
+`implemented-with-plain-function-not-a-test`,
+`implemented-with-test-name-in-string-literal`). Those cases are the drift
+detector: if the harness changes and the port does not, they are where it should
+be caught.
+
 ### Implementation pointers are not evidence
 
 A row may optionally carry `implementation_pointers`, a list of
@@ -164,3 +190,66 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
    digest and `baseline.json` stay hardcoded in `validate.ps1` and are unreachable
    from this command.
 5. Re-run `validate.ps1` and `validate-self-test.ps1`.
+
+## Continuous integration
+
+`validate.ps1` is a gate, not a report: a contract nobody runs is decoration.
+It is not wired into a workflow from this directory, because the repository
+trust-root allowlist is frozen at eight workflow files and this tree may not add
+one. The following step is written to be lifted verbatim into an existing
+allowed workflow by whoever owns that allowlist.
+
+```yaml
+      - name: Validate frozen upstream parity contract
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+              & ./compat/upstream/validate.ps1 | Out-Null
+              Write-Host "compat/upstream parity contract OK"
+          } catch {
+              Write-Host "::error title=compat/upstream parity contract::$($_.Exception.Message)"
+              exit 1
+          }
+```
+
+Contract:
+
+- **Runner** — any. `ubuntu-latest` is now correct; no `windows-latest` pin is
+  needed. Both Windows PowerShell 5.1 and PowerShell 7+ are supported and produce
+  identical digests and identical accept/reject decisions.
+- **Working directory** — the repository checkout root, the directory containing
+  `compat/` and `crates/`. The validator resolves acceptance-evidence paths
+  against `-RepositoryRoot`, which defaults to the parent of `compat/`. Do not
+  pass `-RepositoryRoot` in CI.
+- **Checkout** — a normal `actions/checkout` working tree. Evidence paths are
+  resolved against files on disk, so a sparse or partial checkout that omits
+  `crates/` will fail honestly rather than pass vacuously.
+- **Exit 0** — every check passed. The JSON report goes to stdout; the step
+  discards it above, drop the `| Out-Null` to keep it in the log.
+- **Exit 1** — some check failed, and the single-line reason is emitted as a
+  GitHub error annotation. **This must fail the job.** There is no advisory or
+  warning mode and no non-zero code that means "passed with remarks".
+- The `try`/`catch` exists only so the rejection reason is one clean line;
+  PowerShell 7's default error view wraps long messages mid-word and buries them
+  under source-line art. Exit codes are the same without it.
+- **Never** run `-WriteLedgerDigests` in CI. It rewrites `ledger-digests.sha256`,
+  which is a reviewed, committed artifact; regenerating it inside a job would
+  re-bless whatever the job happens to be looking at.
+
+The adversarial self-test is a separate, slower step. It spawns about 139 child
+validator processes — one per case, plus a second run for the 44 cases that first
+re-bless the ledger digests, plus one baseline run — and takes several minutes,
+so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
+every push:
+
+```yaml
+      - name: Validate the parity validator itself
+        shell: pwsh
+        run: ./compat/upstream/validate-self-test.ps1
+```
+
+It exits 0 when every case passes and 1 otherwise, printing `ok`/`FAIL` per case
+followed by an aggregate. It evaluates every case even after one fails, so a
+single regression cannot hide the cases behind it.
