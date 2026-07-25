@@ -14,7 +14,7 @@ concurrency:
 jobs:
   frozen-rust-reference:
     name: Frozen OpenClaw b43e832 Rust contract
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - name: Checkout GTA Claw
@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify frozen compatibility snapshot
-        shell: pwsh
+        shell: powershell
         run: ./compat/upstream/validate.ps1
 
       - name: Reject JavaScript toolchain artifacts
