@@ -674,6 +674,16 @@ function Resolve-RepositoryFilePath {
             return $null
         }
         $current = Join-Path $current $segment
+        # A reparse point (symlink or junction) can resolve outside the repository,
+        # which the Rust parity harness rejects through canonicalisation. Refuse it
+        # here too so the two trust roots cannot disagree about the same citation.
+        $entry = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -eq $entry) {
+            return $null
+        }
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $null
+        }
     }
     if (-not (Test-Path -LiteralPath $current -PathType Leaf)) {
         return $null
@@ -743,6 +753,96 @@ function Assert-EvidencePathShape {
     }
 }
 
+function Remove-RustBlockComments {
+    param([string]$Source)
+    # Byte-for-byte port of claw-conformance remove_block_comments: nesting aware,
+    # and newlines inside a stripped comment are preserved so line indices survive.
+    $output = New-Object System.Text.StringBuilder
+    $depth = 0
+    $index = 0
+    $length = $Source.Length
+    while ($index -lt $length) {
+        $character = $Source[$index]
+        $peek = if (($index + 1) -lt $length) { $Source[$index + 1] } else { [char]0 }
+        if ($character -eq '/' -and $peek -eq '*') {
+            $depth += 1
+            $index += 2
+            continue
+        }
+        if ($depth -gt 0 -and $character -eq '*' -and $peek -eq '/') {
+            $depth -= 1
+            $index += 2
+            continue
+        }
+        if ($depth -eq 0) {
+            [void]$output.Append($character)
+        } elseif ($character -eq "`n") {
+            [void]$output.Append($character)
+        }
+        $index += 1
+    }
+    return $output.ToString()
+}
+
+function Test-DeclaresEnabledRustTest {
+    param(
+        [string]$Source,
+        [string]$TestName
+    )
+    # Port of claw-conformance declares_enabled_test. Both trust roots must agree
+    # on what counts as a real test, so a row can never pass one and fail the other.
+    # A citation is only honoured when the recorded name is an ENABLED test:
+    # commented-out code, string literals, #[ignore]d tests, cfg-gated tests and
+    # ordinary functions are all rejected.
+    $lines = (Remove-RustBlockComments $Source).Split("`n")
+    for ($index = 0; $index -lt $lines.Length; $index += 1) {
+        $lines[$index] = $lines[$index].TrimEnd("`r")
+    }
+    for ($index = 0; $index -lt $lines.Length; $index += 1) {
+        $code = $lines[$index].TrimStart()
+        if ($code.StartsWith("//", [StringComparison]::Ordinal)) {
+            continue
+        }
+        $tokens = [regex]::Split($code, '[^A-Za-z0-9_]')
+        $isFunction = $false
+        for ($token = 0; ($token + 1) -lt $tokens.Length; $token += 1) {
+            if ((Test-OrdinalStringEqual $tokens[$token] "fn") -and
+                (Test-OrdinalStringEqual $tokens[$token + 1] $TestName)) {
+                $isFunction = $true
+                break
+            }
+        }
+        if (-not $isFunction) {
+            continue
+        }
+        $windowStart = [Math]::Max(0, $index - 6)
+        $hasTest = $false
+        $ignored = $false
+        $cfgGated = $false
+        for ($attribute = $windowStart; $attribute -le $index; $attribute += 1) {
+            $value = $lines[$attribute].Trim()
+            if ($value.StartsWith("//", [StringComparison]::Ordinal)) {
+                continue
+            }
+            if ((Test-OrdinalStringEqual $value "#[test]") -or
+                ($value.StartsWith("#[", [StringComparison]::Ordinal) -and
+                    $value.Contains("::test"))) {
+                $hasTest = $true
+            }
+            if ($value.StartsWith("#[ignore", [StringComparison]::Ordinal)) {
+                $ignored = $true
+            }
+            if ($value.StartsWith("#[cfg", [StringComparison]::Ordinal)) {
+                $cfgGated = $true
+            }
+        }
+        if ($hasTest -and -not $ignored -and -not $cfgGated) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Assert-RustTestSymbol {
     param(
         [string]$Text,
@@ -750,8 +850,8 @@ function Assert-RustTestSymbol {
         [string]$RelativePath,
         [string]$Context
     )
-    if ($Text -cnotmatch ('\bfn\s+' + [regex]::Escape($Symbol) + '\s*[(<]')) {
-        Fail "$Context cites test '$Symbol' that does not exist in '$RelativePath'"
+    if (-not (Test-DeclaresEnabledRustTest $Text $Symbol)) {
+        Fail "$Context cites test '$Symbol' that is not declared as an enabled #[test] in '$RelativePath'"
     }
 }
 
@@ -782,7 +882,7 @@ function Assert-EvidenceArtifact {
         if (-not ($check -cmatch '\A[a-z_][A-Za-z0-9_]*(?:::[a-z_][A-Za-z0-9_]*)*\z')) {
             Fail "$Context rust_test check '$check' must be a Rust test path"
         }
-        if ($text -cnotmatch '#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test') {
+        if ($text -cnotmatch '#\[\s*test\s*\]|#\[[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*::test') {
             Fail "$Context rust_test acceptance evidence '$relativePath' contains no Rust test attribute"
         }
         $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
@@ -816,7 +916,7 @@ function Assert-EvidenceArtifact {
         $symbol = @($check.Split(":") | Where-Object { $_.Length -gt 0 })[-1]
         $consumed = $false
         foreach ($testText in $RustTestTexts) {
-            if ($testText -cmatch ('\bfn\s+' + [regex]::Escape($symbol) + '\s*[(<]')) {
+            if (Test-DeclaresEnabledRustTest $testText $symbol) {
                 $consumed = $true
                 break
             }

@@ -53,14 +53,26 @@ claim parity outcomes without evidence.
 
 | `kind` | `path` must be | `check` names | verified by |
 | --- | --- | --- | --- |
-| `rust_test` | a `.rs` file that contains a Rust test attribute | the test function | `fn <name>` exists in that file |
+| `rust_test` | a `.rs` file that contains a Rust test attribute | the test function | that name is declared as an **enabled** `#[test]` in that file |
 | `rust_source` | a `.rs` file | an implementation symbol | the symbol is declared in that file |
-| `rust_fixture` | a non-Rust fixture file | the test that consumes it | that test is one of this row's own `rust_test` artifacts |
+| `rust_fixture` | a non-Rust fixture file | the test that consumes it | that test is an enabled `#[test]` in one of this row's own `rust_test` artifacts |
 | `ci_check` | a workflow under `.github/workflows` | a job key or step name | that key or `name:` value exists in the workflow |
+
+"Enabled `#[test]`" is decided by the same algorithm the Rust parity harness in
+`crates/claw-conformance` uses, ported line for line, so a row can never pass one
+trust root and fail the other. A cited name does **not** count when it is
+`#[ignore]`d, gated by a nearby `#[cfg(...)]`, inside a line or block comment,
+inside a string literal, or an ordinary function with no test attribute.
+
+`partial` is a first-class state with exactly the same evidence burden as
+`implemented`; the two differ only in `acceptance_evidence.status`. A subsystem
+that is genuinely half done should be recorded as `partial` with real evidence
+for the part that works, never as `unimplemented` and never as `implemented`.
 
 Every artifact path must exist in the working tree; a fabricated citation fails.
 Paths are matched ordinally, so evidence that only resolves on a case-insensitive
-filesystem fails the same way it would on Linux CI.
+filesystem fails the same way it would on Linux CI. Symlinks and junctions are
+rejected, because they can resolve outside the repository.
 
 Legacy TypeScript and JavaScript is never Rust acceptance evidence. Anything with
 a `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs` or `.cjs` extension is rejected, as is

@@ -30,6 +30,51 @@ $RealWorkflowPath = ".github/workflows/rust.yml"
 $RealWorkflowCheck = "msrv"
 $RustFileWithoutTests = "crates/claw-config/src/error.rs"
 
+# A throwaway repository root used only by the cases that probe what counts as an
+# ENABLED Rust test. The real tree has no #[ignore]d, cfg-gated or commented-out
+# test to cite, so those forgeries are staged in a synthetic tree instead of
+# adding files outside compat/upstream.
+$SyntheticRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    "gta-claw-upstream-validator-synthetic-" + [Guid]::NewGuid().ToString("N")
+)
+$SyntheticTestName = "parity_is_proven_here"
+
+function New-SyntheticRepositoryRoot {
+    param([string]$Root)
+    $files = [ordered]@{
+        "Cargo.toml" = "[workspace]`nmembers = [`"crates/synthetic`"]`n"
+        "crates/synthetic/Cargo.toml" = "[package]`nname = `"synthetic`"`n"
+        "crates/synthetic/tests/enabled.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/tests/async_enabled.rs" =
+            "#[tokio::test]`nasync fn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/tests/ignored.rs" =
+            "#[test]`n#[ignore]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/tests/cfg_gated.rs" =
+            "#[test]`n#[cfg(target_os = `"none`")]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/tests/line_commented.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`n`n`n`n`n`n`n// #[test]`n// fn $SyntheticTestName() {}`n"
+        "crates/synthetic/tests/block_commented.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`n`n`n`n`n`n`n/* #[test]`nfn $SyntheticTestName() {} */`n"
+        "crates/synthetic/tests/plain_fn.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`n`n`n`n`n`n`nfn $SyntheticTestName() {}`n"
+        "crates/synthetic/tests/string_literal.rs" =
+            "#[test]`nfn unrelated_but_real() {}`n`n`n`n`n`n`n`nconst CLAIM: &str = `"fn $SyntheticTestName`";`n"
+        "crates/synthetic/data/fixture.json" = "{}`n"
+    }
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    foreach ($relative in $files.Keys) {
+        $absolute = Join-Path $Root ($relative -replace "/", "\")
+        $directory = Split-Path -Parent $absolute
+        if (-not (Test-Path -LiteralPath $directory)) {
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText($absolute, [string]$files[$relative], $encoding)
+    }
+}
+
+New-SyntheticRepositoryRoot $SyntheticRoot
+
 function Read-Json {
     param([string]$Path)
     return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
@@ -61,6 +106,7 @@ function ConvertTo-PowerShellLiteral {
 function Invoke-Validator {
     param(
         [string]$CaseRoot,
+        [string]$RepositoryRootOverride,
         [switch]$WriteLedgerDigests
     )
     # The child is started through System.Diagnostics.Process rather than the
@@ -75,9 +121,14 @@ function Invoke-Validator {
     #     on a full pipe buffer.
     # The command text deliberately contains no double quote characters, which
     # keeps the single Windows argument quoting below exact.
+    $repositoryRoot = if ([string]::IsNullOrEmpty($RepositoryRootOverride)) {
+        $RepositoryRoot
+    } else {
+        $RepositoryRootOverride
+    }
     $invocation = "& {0} -RepositoryRoot {1}" -f
         (ConvertTo-PowerShellLiteral (Join-Path $CaseRoot "validate.ps1")),
-        (ConvertTo-PowerShellLiteral $RepositoryRoot)
+        (ConvertTo-PowerShellLiteral $repositoryRoot)
     if ($WriteLedgerDigests) {
         $invocation += " -WriteLedgerDigests"
     }
@@ -97,7 +148,6 @@ function Invoke-Validator {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.WorkingDirectory = $RepositoryRoot
-
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     [void]$process.Start()
@@ -218,6 +268,198 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "partial-honest-transition-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                -Feature $ledger.features[0] `
+                -Status "partial" `
+                -EvidenceStatus "partial" `
+                -Artifacts @(
+                    (New-Artifact "rust_test" $RealTestPath $RealTestName),
+                    (New-Artifact "rust_source" $RealSourcePath $RealSourceSymbol)
+                )
+            Save-FirstLedger $caseRoot $ledger
+            Set-ManifestStatusTotals $caseRoot 46 1 0
+        }
+    },
+    [ordered]@{
+        name = "partial-without-artifacts"
+        expected_message = "status 'partial' requires at least one acceptance evidence artifact"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                -Feature $ledger.features[0] `
+                -Status "partial" `
+                -EvidenceStatus "partial" `
+                -Artifacts @()
+            Save-FirstLedger $caseRoot $ledger
+            Set-ManifestStatusTotals $caseRoot 46 1 0
+        }
+    },
+    [ordered]@{
+        name = "partial-claiming-accepted-evidence"
+        expected_message = "status 'partial' requires acceptance_evidence.status 'partial', got 'accepted'"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                -Feature $ledger.features[0] `
+                -Status "partial" `
+                -EvidenceStatus "accepted" `
+                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName))
+            Save-FirstLedger $caseRoot $ledger
+            Set-ManifestStatusTotals $caseRoot 46 1 0
+        }
+    },
+    [ordered]@{
+        name = "partial-keeps-baseline-known-difference"
+        expected_message = "status 'partial' must not keep the baseline no-implementation known_differences placeholder"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                -Feature $ledger.features[0] `
+                -Status "partial" `
+                -EvidenceStatus "partial" `
+                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName)) `
+                -KeepBaselineDifference
+            Save-FirstLedger $caseRoot $ledger
+            Set-ManifestStatusTotals $caseRoot 46 1 0
+        }
+    },
+    [ordered]@{
+        name = "partial-not-declared-in-manifest-totals"
+        expected_message = "status_totals"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $ledger = Get-FirstLedger $caseRoot
+            Set-FeatureTransition `
+                -Feature $ledger.features[0] `
+                -Status "partial" `
+                -EvidenceStatus "partial" `
+                -Artifacts @((New-Artifact "rust_test" $RealTestPath $RealTestName))
+            Save-FirstLedger $caseRoot $ledger
+        }
+    },
+    [ordered]@{
+        name = "synthetic-enabled-test-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/enabled.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "synthetic-async-enabled-test-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/async_enabled.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-ignored-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/ignored.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-cfg-gated-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/cfg_gated.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-line-commented-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/line_commented.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-block-commented-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/block_commented.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-plain-function-not-a-test"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/plain_fn.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "implemented-with-test-name-in-string-literal"
+        expected_message = "is not declared as an enabled #[test]"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/string_literal.rs" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
+        name = "fixture-consumed-by-a-plain-function"
+        expected_message = "rust_fixture cites test '$SyntheticTestName' that is not one of the rust_test artifacts of this row"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "rust_test" "crates/synthetic/tests/plain_fn.rs" "unrelated_but_real"),
+                (New-Artifact "rust_fixture" "crates/synthetic/data/fixture.json" $SyntheticTestName)
+            )
+        }
+    },
+    [ordered]@{
         name = "implemented-without-artifacts"
         expected_message = "requires at least one acceptance evidence artifact"
         regenerate_digests = $true
@@ -297,7 +539,7 @@ $cases = @(
     },
     [ordered]@{
         name = "implemented-with-fabricated-test-name"
-        expected_message = "cites test 'proves_total_parity' that does not exist in"
+        expected_message = "cites test 'proves_total_parity' that is not declared as an enabled #[test] in"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
@@ -992,12 +1234,16 @@ try {
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseRoot -Recurse -Force
         & $case.mutate $caseRoot
+        $caseRepositoryRoot = ""
+        if ($case.Contains("repository_root")) {
+            $caseRepositoryRoot = [string]$case.repository_root
+        }
         if ($case.Contains("regenerate_digests") -and $case.regenerate_digests) {
             # Model an attacker who already re-blessed the mutable ledger digests.
-            Invoke-Validator $caseRoot -WriteLedgerDigests | Out-Null
+            Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot -WriteLedgerDigests | Out-Null
         }
 
-        $result = Invoke-Validator $caseRoot
+        $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
         if ($case.Contains("expect_success") -and $case.expect_success) {
             $positiveCases += 1
             if ($result.exit_code -ne 0) {
@@ -1022,6 +1268,9 @@ try {
 } finally {
     if (Test-Path -LiteralPath $temporaryRoot) {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $SyntheticRoot) {
+        Remove-Item -LiteralPath $SyntheticRoot -Recurse -Force
     }
 }
 
