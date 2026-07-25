@@ -10,6 +10,7 @@ members = [
   "crates/claw-domain",
   "crates/claw-gateway",
   "crates/claw-gateway-client",
+  "crates/claw-memory",
   "crates/claw-observability",
   "crates/claw-platform",
   "crates/claw-protocol",
@@ -17,6 +18,7 @@ members = [
   "crates/claw-security",
   "crates/claw-sqlite-file-control",
   "crates/claw-state",
+  "crates/claw-tools",
 ]
 exclude = ["desktop"]
 resolver = "3"
@@ -29,12 +31,14 @@ claw-crestodian = { path = "crates/claw-crestodian", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway = { path = "crates/claw-gateway", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
+claw-memory = { path = "crates/claw-memory", version = "0.1.0" }
 claw-observability = { path = "crates/claw-observability", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-sqlite-file-control = { path = "crates/claw-sqlite-file-control", version = "0.1.0" }
 claw-state = { path = "crates/claw-state", version = "0.1.0" }
+claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
 getrandom = "=0.2.17"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 same-file = "1.0.6"
