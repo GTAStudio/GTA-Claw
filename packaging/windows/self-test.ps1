@@ -8,6 +8,7 @@ $ProgressPreference = 'SilentlyContinue'
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
 Import-Module (Join-Path $scriptRoot 'WindowsPackaging.psm1') -Force
+Import-Module (Join-Path $scriptRoot 'SupplyChain.psm1') -Force
 
 $ownedRoot = Join-Path $scriptRoot '.work\self-tests'
 [System.IO.Directory]::CreateDirectory($ownedRoot) | Out-Null
@@ -47,6 +48,17 @@ try {
     Write-Utf8File -Path (Join-Path $hashRoot 'payload.txt') -Content 'after'
     Assert-Throws { Test-HashManifest $hashRoot } 'hash mismatch'
 
+    $artifactSet = Join-Path $testRoot 'artifact-set'
+    [System.IO.Directory]::CreateDirectory($artifactSet) | Out-Null
+    Write-Utf8File -Path (Join-Path $artifactSet 'artifact.bin') -Content 'published'
+    Write-ArtifactSetChecksums $artifactSet | Out-Null
+    Test-ArtifactSetChecksums $artifactSet
+    $passed++
+    Write-Utf8File -Path (Join-Path $artifactSet 'unexpected.bin') -Content 'not listed'
+    Assert-Throws {
+        Test-ArtifactSetChecksums $artifactSet
+    } 'incomplete artifact checksum coverage'
+
     $junctionTarget = Join-Path $testRoot 'junction-target'
     $junctionRoot = Join-Path $testRoot 'junction-root'
     [System.IO.Directory]::CreateDirectory($junctionTarget) | Out-Null
@@ -70,7 +82,8 @@ try {
             -TemplatePath (Join-Path $scriptRoot 'AppxManifest.template.xml') `
             -OutputPath $manifestPath `
             -MsixVersion $version.Msix `
-            -Architecture $architecture
+            -Architecture $architecture `
+            -Publisher 'CN=GTAStudio Windows Signing Placeholder'
         Test-AppxManifest -Path $manifestPath -Version $version.Msix -Architecture $architecture
         $passed++
     }
@@ -112,21 +125,86 @@ try {
     Test-WixSource (Join-Path $scriptRoot 'wix\GtaClaw.wxs')
     $passed++
 
+    $unsignedBundleProfile = Get-MsixBundleValidationProfile `
+        'gta-claw-desktop-1.2.3-windows-x64_arm64-unsigned-non-release.msixbundle'
+    $signedBundleProfile = Get-MsixBundleValidationProfile `
+        'gta-claw-desktop-1.2.3-windows-x64_arm64-signed.msixbundle'
+    if ($unsignedBundleProfile.SignatureMode -ne 'unsigned' -or
+        $unsignedBundleProfile.InnerSignatureMode -ne 'unsigned' -or
+        $unsignedBundleProfile.InnerReleaseStatus -ne 'non-release' -or
+        $signedBundleProfile.SignatureMode -ne 'signed' -or
+        $signedBundleProfile.InnerSignatureMode -ne 'signed' -or
+        $signedBundleProfile.InnerReleaseStatus -ne 'release-candidate') {
+        throw 'MSIXBundle publication status classification is invalid.'
+    }
+    $passed++
+    Assert-Throws {
+        Get-MsixBundleValidationProfile `
+            'gta-claw-desktop-1.2.3-windows-x64_arm64-release-candidate-unsigned.msixbundle'
+    } 'unpublished MSIXBundle status'
+
+    $workflow = [System.IO.File]::ReadAllText(
+        (Join-Path $repoRoot '.github\workflows\windows-packaging.yml')
+    )
+    foreach ($fetch in @(
+        'cargo fetch --manifest-path Cargo.toml --locked',
+        'cargo fetch --manifest-path desktop\Cargo.toml --locked'
+    )) {
+        $matches = [regex]::Matches(
+            $workflow,
+            "(?m)^\s*$([regex]::Escape($fetch))\s*$"
+        )
+        if ($matches.Count -ne 3) {
+            throw "Expected complete locked dependency acquisition in package, bundle, and release jobs: $fetch"
+        }
+    }
+    $passed++
+
+    $fakeCargoRoot = Join-Path $testRoot 'fake-cargo'
+    [System.IO.Directory]::CreateDirectory($fakeCargoRoot) | Out-Null
+    $fakeCargo = Join-Path $fakeCargoRoot 'cargo.cmd'
+    $cargoArguments = Join-Path $fakeCargoRoot 'arguments.txt'
+    Write-Utf8File -Path $fakeCargo -Content @"
+@echo off
+echo %* > "%GTA_CLAW_TEST_CARGO_ARGUMENTS%"
+echo gta-claw-cli v0.1.0
+"@
+    $priorPath = $env:PATH
+    $priorCargoArguments = $env:GTA_CLAW_TEST_CARGO_ARGUMENTS
+    try {
+        $env:PATH = "$fakeCargoRoot;$priorPath"
+        $env:GTA_CLAW_TEST_CARGO_ARGUMENTS = $cargoArguments
+        foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            Assert-HeadlessGraph -RepoRoot $repoRoot -TargetTriple $target
+            $arguments = [System.IO.File]::ReadAllText($cargoArguments)
+            if ($arguments -notmatch "(^|\s)--target\s+$([regex]::Escape($target))(\s|$)") {
+                throw "Headless Cargo graph proof omitted target '$target': $arguments"
+            }
+        }
+        $passed++
+    } finally {
+        $env:PATH = $priorPath
+        $env:GTA_CLAW_TEST_CARGO_ARGUMENTS = $priorCargoArguments
+    }
+
     Assert-Throws {
         & (Join-Path $scriptRoot 'package.ps1') -Architecture x64 -ReleaseMode
     } 'release without signing'
 
-    $fakeMsi = Join-Path $testRoot 'fake-unsigned.msi'
+    $fakeMsi = Join-Path $testRoot 'fake-release-candidate-unsigned.msi'
     Write-Utf8File -Path $fakeMsi -Content 'not an installer'
     Assert-Throws {
         & (Join-Path $scriptRoot 'sign.ps1') `
             -PackagePath $fakeMsi `
             -CertificateThumbprint ('0' * 40) `
             -TimestampUrl 'https://timestamp.invalid'
-    } 'MSI signing without database attestation'
+    } 'MSI signing without a provisioned certificate'
 
-    if ($passed -ne 17) {
-        throw "Expected 17 self-tests, completed $passed."
+    & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
+    $passed++
+
+    if ($passed -ne 24) {
+        throw "Expected 24 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

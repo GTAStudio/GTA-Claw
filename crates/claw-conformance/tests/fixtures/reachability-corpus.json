@@ -1,0 +1,153 @@
+{
+    "purpose":  "Reachability differential corpus: constructs that occur in NEITHER real tree, so a whole-tree sweep cannot compare the two implementations on them.",
+    "rule":  "a cargo test target root, or a source file reachable from one",
+    "cases":  [
+                  {
+                      "name":  "inline-path-mod-rs-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    #[path = \"proof.rs\"]\n    mod proof;\n}\n",
+                                    "crates/p/src/actual/proof.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/outer/proof.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/actual/proof.rs",
+                      "expect":  "accept",
+                      "why":  "#[path] on an inline mod renames the child directory; cargo compiles actual/proof.rs"
+                  },
+                  {
+                      "name":  "inline-path-mod-rs-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    #[path = \"proof.rs\"]\n    mod proof;\n}\n",
+                                    "crates/p/src/actual/proof.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/outer/proof.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/outer/proof.rs",
+                      "expect":  "reject",
+                      "why":  "where a reader carrying the inline module NAME would look"
+                  },
+                  {
+                      "name":  "inline-path-plain-child-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "#[path = \"actual\"]\nmod outer {\n    mod plain;\n}\n",
+                                    "crates/p/src/actual/plain.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/outer/plain.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/actual/plain.rs",
+                      "expect":  "accept",
+                      "why":  "the renamed directory governs plain children too"
+                  },
+                  {
+                      "name":  "inline-path-non-mod-rs-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod carrier;\n",
+                                    "crates/p/src/carrier.rs":  "#[path = \"deep\"]\nmod inner {\n    mod leaf;\n}\n",
+                                    "crates/p/src/deep/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/carrier/deep/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n",
+                                    "crates/p/src/carrier/inner/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/deep/leaf.rs",
+                      "expect":  "accept",
+                      "why":  "a TOP-LEVEL inline path resolves against the directory holding the file, not the module directory"
+                  },
+                  {
+                      "name":  "inline-path-non-mod-rs-module-dir-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod carrier;\n",
+                                    "crates/p/src/carrier.rs":  "#[path = \"deep\"]\nmod inner {\n    mod leaf;\n}\n",
+                                    "crates/p/src/deep/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/carrier/deep/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/carrier/deep/leaf.rs",
+                      "expect":  "reject",
+                      "why":  "module-directory base is wrong for a top-level inline path"
+                  },
+                  {
+                      "name":  "nested-inline-path-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod host;\n",
+                                    "crates/p/src/host.rs":  "mod outer {\n    #[path = \"renamed\"]\n    mod inner {\n        mod leaf;\n    }\n}\n",
+                                    "crates/p/src/host/outer/renamed/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/host/outer/inner/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n",
+                                    "crates/p/src/renamed/leaf.rs":  "compile_error!(\"decoy - cargo never compiles this\");\n"
+                                },
+                      "cite":  "crates/p/src/host/outer/renamed/leaf.rs",
+                      "expect":  "accept",
+                      "why":  "a NESTED inline path resolves against the enclosing module directory"
+                  },
+                  {
+                      "name":  "nested-inline-path-file-dir-decoy",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod host;\n",
+                                    "crates/p/src/host.rs":  "mod outer {\n    #[path = \"renamed\"]\n    mod inner {\n        mod leaf;\n    }\n}\n",
+                                    "crates/p/src/host/outer/renamed/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/renamed/leaf.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/renamed/leaf.rs",
+                      "expect":  "reject",
+                      "why":  "file-directory base is wrong for a NESTED inline path"
+                  },
+                  {
+                      "name":  "ambiguity-file-side",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod ambig;\n",
+                                    "crates/p/src/ambig.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/ambig/mod.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/ambig.rs",
+                      "expect":  "reject",
+                      "why":  "rustc E0761: both files answer one mod; NEITHER is compiled"
+                  },
+                  {
+                      "name":  "ambiguity-directory-side",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod ambig;\n",
+                                    "crates/p/src/ambig.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n",
+                                    "crates/p/src/ambig/mod.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/ambig/mod.rs",
+                      "expect":  "reject",
+                      "why":  "the other side of the same E0761"
+                  },
+                  {
+                      "name":  "unambiguous-mod-rs-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod solo;\n",
+                                    "crates/p/src/solo/mod.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/solo/mod.rs",
+                      "expect":  "accept",
+                      "why":  "mod.rs alone is the legitimate form and must NOT be caught by the ambiguity rule"
+                  },
+                  {
+                      "name":  "unambiguous-file-accept",
+                      "files":  {
+                                    "Cargo.toml":  "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+                                    "crates/p/Cargo.toml":  "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                                    "crates/p/src/lib.rs":  "mod solo;\n",
+                                    "crates/p/src/solo.rs":  "#[test]\nfn evidence_test() {\n    assert!(true);\n}\n"
+                                },
+                      "cite":  "crates/p/src/solo.rs",
+                      "expect":  "accept",
+                      "why":  "name.rs alone is the other legitimate form"
+                  }
+              ]
+}

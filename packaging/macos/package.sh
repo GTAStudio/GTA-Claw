@@ -7,17 +7,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_macos
-for tool in codesign ditto hdiutil lipo pkgbuild pkgutil productbuild security xcrun; do
+for tool in codesign ditto hdiutil lipo pkgbuild pkgutil productbuild security xcrun zipinfo; do
   require_tool "$tool"
 done
-[[ "$#" -eq 2 ]] || die "usage: package.sh prototype|release APP"
+[[ "$#" -ge 2 && "$#" -le 4 ]] ||
+  die "usage: package.sh prototype|release APP [APP_ARCHIVE_LABEL] [EXPECTED_ARCHES]"
 mode="$1"
 app="$2"
+app_archive_label="$(distribution_app_archive_label "${3:-}")"
+expected_arches="$(distribution_expected_arches "${4:-}")"
 [[ -d "$app" && "$app" == *.app && ! -L "$app" ]] || die "invalid app bundle: $app"
 reject_symlinks "$app"
 
-binary="$app/Contents/MacOS/$EXECUTABLE_NAME"
-expected_arches="$(lipo -archs "$binary")"
 if [[ "$mode" == "release" ]]; then
   "$MACOS_DIR/validate.sh" "$app" "$expected_arches" release
   xcrun stapler validate "$app"
@@ -39,18 +40,33 @@ else
 fi
 
 distribution="$OUTPUT_ROOT/distribution"
+checksum_name=SHA256SUMS
+archive_stage_root="$OUTPUT_ROOT/staging/app-archive"
+archive_stage="$archive_stage_root/$APP_NAME.app"
 dmg_stage="$OUTPUT_ROOT/staging/dmg"
 package_work="$OUTPUT_ROOT/staging/pkg"
 staged_app="$dmg_stage/$APP_NAME.app"
 package_root="$package_work/root"
 package_app="$package_root/Applications/$APP_NAME.app"
 for destination in \
-  "$distribution" "$dmg_stage" "$package_work" "$staged_app" "$package_root" "$package_app"; do
+  "$distribution" "$archive_stage_root" "$archive_stage" "$dmg_stage" "$package_work" \
+  "$staged_app" "$package_root" "$package_app"; do
   assert_output_path "$destination"
 done
 safe_reset_dir "$distribution"
+safe_reset_dir "$archive_stage_root"
 safe_reset_dir "$dmg_stage"
 safe_reset_dir "$package_work"
+
+archive_qualifier="unsigned-non-release"
+if [[ "$mode" == "release" ]]; then
+  archive_qualifier="signed-notarized"
+fi
+app_archive="$distribution/$(distribution_app_archive_name "$archive_qualifier" "$app_archive_label")"
+assert_output_file_slot "$app_archive"
+ditto "$app" "$archive_stage"
+find "$archive_stage_root" -exec touch -t "$NORMALIZED_MTIME" {} +
+ditto -c -k --keepParent "$archive_stage" "$app_archive"
 
 assert_output_path "$staged_app"
 ditto "$app" "$staged_app"
@@ -104,6 +120,19 @@ else
   productbuild --package "$component_pkg" "$pkg"
 fi
 
-write_sha256_manifest "$distribution" "$distribution/SHA256SUMS"
-verify_sha256_manifest "$distribution" "$distribution/SHA256SUMS" >/dev/null
-note "created prototype distribution containers under $distribution"
+if [[ "$mode" == "release" ]]; then
+  "$MACOS_DIR/notarize.sh" "$dmg"
+  "$MACOS_DIR/notarize.sh" "$pkg"
+fi
+
+write_artifact_supply_chain "$app_archive" desktop "$expected_arches"
+write_artifact_supply_chain "$dmg" desktop "$expected_arches"
+write_artifact_supply_chain "$pkg" desktop "$expected_arches"
+write_artifact_set_checksums "$distribution" "$checksum_name"
+"$MACOS_DIR/validate-artifacts.sh" \
+  "$distribution" \
+  "$mode" \
+  "$checksum_name" \
+  "$app_archive_label" \
+  "$expected_arches"
+note "created validated $mode distribution artifacts under $distribution"
