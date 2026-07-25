@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use claw_security::audit::{AuditEvent, AuditSink};
 use claw_security::authorization::{
     AuthorizationRequest, Role, Scope, ScopeSet, authorize_audited,
@@ -15,7 +15,9 @@ use claw_security::authorization::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::config::HttpLimits;
 use crate::error::ApiError;
+use crate::http_support::rejected_response;
 use crate::ports::{AuditPort, PortError};
 
 /// Authenticated HTTP principal.
@@ -109,6 +111,18 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 #[derive(Clone)]
 pub(crate) struct AuthMiddlewareState {
     pub(crate) authenticator: BearerAuthenticator,
+    pub(crate) limits: HttpLimits,
+}
+
+impl AuthMiddlewareState {
+    fn body_limit(&self, path: &str) -> usize {
+        match path {
+            "/v1/embeddings" => self.limits.embeddings_body_bytes,
+            "/tools/invoke" => self.limits.tools_body_bytes,
+            "/api/v1/admin/rpc" => self.limits.admin_body_bytes,
+            _ => self.limits.openai_body_bytes,
+        }
+    }
 }
 
 pub(crate) async fn require_bearer(
@@ -117,8 +131,14 @@ pub(crate) async fn require_bearer(
     next: Next,
 ) -> Response {
     let Some(principal) = state.authenticator.authenticate_headers(request.headers()) else {
-        return ApiError::openai(StatusCode::UNAUTHORIZED, "Unauthorized", "unauthorized")
-            .into_response();
+        let body_limit = state.body_limit(request.uri().path());
+        return rejected_response(
+            request,
+            body_limit,
+            state.limits.body_timeout,
+            ApiError::openai(StatusCode::UNAUTHORIZED, "Unauthorized", "unauthorized"),
+        )
+        .await;
     };
     request.extensions_mut().insert(principal);
     next.run(request).await

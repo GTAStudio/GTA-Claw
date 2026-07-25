@@ -16,7 +16,7 @@ use url::Url;
 
 use crate::auth::bearer_token;
 use crate::error::{ApiError, json_rpc_error};
-use crate::http_support::{CancelOnDrop, json_response, read_json_value};
+use crate::http_support::{CancelOnDrop, json_response, read_json_value, rejected_response};
 use crate::ports::{ToolInvocation, ToolInvocationContext, ToolOutcome};
 use crate::state::ApiState;
 
@@ -28,10 +28,35 @@ pub(crate) async fn handle(
     request: Request,
 ) -> Result<Response, ApiError> {
     if !peer.ip().is_loopback() {
-        return Err(ApiError::simple(StatusCode::FORBIDDEN, "forbidden"));
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.mcp_body_bytes,
+            state.inner.config.limits.body_timeout,
+            ApiError::simple(StatusCode::FORBIDDEN, "forbidden"),
+        )
+        .await);
     }
-    validate_browser_origin(request.headers())?;
-    let sender_is_owner = authenticate(&state, request.headers())?;
+    if let Err(error) = validate_browser_origin(request.headers()) {
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.mcp_body_bytes,
+            state.inner.config.limits.body_timeout,
+            error,
+        )
+        .await);
+    }
+    let sender_is_owner = match authenticate(&state, request.headers()) {
+        Ok(sender_is_owner) => sender_is_owner,
+        Err(error) => {
+            return Ok(rejected_response(
+                request,
+                state.inner.config.limits.mcp_body_bytes,
+                state.inner.config.limits.body_timeout,
+                error,
+            )
+            .await);
+        }
+    };
     match *request.method() {
         Method::GET => Ok(mcp_sse(&state)),
         Method::DELETE => Ok(json_response(StatusCode::OK, json!({"ok":true}))),
@@ -96,10 +121,16 @@ async fn post(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !content_type.starts_with("application/json") {
-        return Ok(json_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            json!({"error":"unsupported_media_type"}),
-        ));
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.mcp_body_bytes,
+            state.inner.config.limits.body_timeout,
+            json_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                json!({"error":"unsupported_media_type"}),
+            ),
+        )
+        .await);
     }
     let limits = &state.inner.config.limits;
     let value = match read_json_value(request, limits.mcp_body_bytes, limits.body_timeout).await {

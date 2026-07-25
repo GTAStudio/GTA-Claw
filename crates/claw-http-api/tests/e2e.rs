@@ -214,12 +214,122 @@ async fn request_at(
         .await
         .expect("write request head");
     stream.write_all(body).await.expect("write request body");
-    let mut raw = Vec::new();
-    timeout(Duration::from_secs(3), stream.read_to_end(&mut raw))
+    let raw = timeout(Duration::from_secs(3), read_complete_response(&mut stream))
         .await
         .expect("response timeout")
         .expect("read response");
     parse_response(&raw)
+}
+
+async fn read_complete_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if let Some(length) = complete_response_length(&raw) {
+            raw.truncate(length);
+            return Ok(raw);
+        }
+        match stream.read(&mut buffer).await {
+            Ok(0)
+                if raw.windows(4).any(|window| window == b"\r\n\r\n")
+                    && !has_explicit_response_framing(&raw) =>
+            {
+                return Ok(raw);
+            }
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before the complete HTTP response",
+                ));
+            }
+            Ok(read) => raw.extend_from_slice(&buffer[..read]),
+            Err(error) => {
+                if let Some(length) = complete_response_length(&raw) {
+                    raw.truncate(length);
+                    return Ok(raw);
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn has_explicit_response_framing(raw: &[u8]) -> bool {
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..split]) else {
+        return false;
+    };
+    head.split("\r\n").skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("content-length")
+                || (name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value
+                        .split(',')
+                        .any(|coding| coding.trim().eq_ignore_ascii_case("chunked")))
+        })
+    })
+}
+
+fn complete_response_length(raw: &[u8]) -> Option<usize> {
+    let split = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let body_start = split + 4;
+    let head = std::str::from_utf8(&raw[..split]).ok()?;
+    let headers = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim(), value.trim()));
+    let mut content_length = None;
+    let mut chunked = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse::<usize>().ok();
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+    if chunked {
+        return complete_chunked_length(&raw[body_start..])
+            .and_then(|length| body_start.checked_add(length));
+    }
+    content_length.and_then(|length| {
+        let total = body_start.checked_add(length)?;
+        (raw.len() >= total).then_some(total)
+    })
+}
+
+fn complete_chunked_length(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 0_usize;
+    loop {
+        let size_end = bytes
+            .get(offset..)?
+            .windows(2)
+            .position(|window| window == b"\r\n")?;
+        let size_text = std::str::from_utf8(bytes.get(offset..offset + size_end)?).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        offset = offset.checked_add(size_end + 2)?;
+        if size == 0 {
+            loop {
+                let trailer_end = bytes
+                    .get(offset..)?
+                    .windows(2)
+                    .position(|window| window == b"\r\n")?;
+                offset = offset.checked_add(trailer_end + 2)?;
+                if trailer_end == 0 {
+                    return Some(offset);
+                }
+            }
+        }
+        let chunk_end = offset.checked_add(size)?;
+        if bytes.get(chunk_end..chunk_end + 2)? != b"\r\n" {
+            return None;
+        }
+        offset = chunk_end + 2;
+    }
 }
 
 fn parse_response(raw: &[u8]) -> HttpResponse {

@@ -2,7 +2,7 @@
 
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::bearer_token;
 use crate::error::ApiError;
-use crate::http_support::{CancelOnDrop, json_response, read_json_value};
+use crate::http_support::{CancelOnDrop, json_response, read_json_value, rejected_response};
 use crate::state::ApiState;
 
 const ACTIONS: [&str; 13] = [
@@ -36,7 +36,13 @@ pub(crate) async fn invoke(
     request: Request,
 ) -> Result<Response, ApiError> {
     let Some(route) = state.inner.config.webhooks.get(&route_id) else {
-        return Ok((StatusCode::NOT_FOUND, "not found").into_response());
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.webhook_body_bytes,
+            state.inner.config.limits.body_timeout,
+            (StatusCode::NOT_FOUND, "not found"),
+        )
+        .await);
     };
     let presented = bearer_token(request.headers())
         .or_else(|| {
@@ -49,7 +55,13 @@ pub(crate) async fn invoke(
         .unwrap_or("");
     let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
     if presented.is_empty() || !bool::from(route.secret_digest.ct_eq(&digest)) {
-        return Ok((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.webhook_body_bytes,
+            state.inner.config.limits.body_timeout,
+            (StatusCode::UNAUTHORIZED, "unauthorized"),
+        )
+        .await);
     }
     let limits = &state.inner.config.limits;
     let value = read_json_value(request, limits.webhook_body_bytes, limits.body_timeout)

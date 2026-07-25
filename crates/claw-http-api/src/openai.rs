@@ -20,7 +20,9 @@ use url::Url;
 
 use crate::auth::{Principal, authorize_scope};
 use crate::error::ApiError;
-use crate::http_support::{CancelOnDrop, json_response, read_json, read_json_value};
+use crate::http_support::{
+    CancelOnDrop, json_response, read_json, read_json_value, rejected_response,
+};
 use crate::ports::{
     ClientTool, EmbeddingRequest, EmbeddingsBody, GenerationEvent, GenerationOutput,
     GenerationRequest, InputMedia, InputMediaKind, InputMediaSource, PortError, PortErrorKind,
@@ -84,12 +86,21 @@ struct ResponseTool {
 pub(crate) async fn models(
     State(state): State<ApiState>,
     Extension(principal): Extension<Principal>,
+    request: Request,
 ) -> Result<Response, ApiError> {
-    authorize_scope(
+    if let Err(error) = authorize_scope(
         principal,
         Scope::OperatorRead,
         state.inner.services.audit.as_ref(),
-    )?;
+    ) {
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.openai_body_bytes,
+            state.inner.config.limits.body_timeout,
+            error,
+        )
+        .await);
+    }
     let _ = timeout(
         state.inner.config.limits.operation_timeout,
         state.inner.services.provider.models(),
@@ -111,12 +122,21 @@ pub(crate) async fn model(
     State(state): State<ApiState>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
+    request: Request,
 ) -> Result<Response, ApiError> {
-    authorize_scope(
+    if let Err(error) = authorize_scope(
         principal,
         Scope::OperatorRead,
         state.inner.services.audit.as_ref(),
-    )?;
+    ) {
+        return Ok(rejected_response(
+            request,
+            state.inner.config.limits.openai_body_bytes,
+            state.inner.config.limits.body_timeout,
+            error,
+        )
+        .await);
+    }
     if !is_model_reference(&id) {
         return Err(ApiError::openai(
             StatusCode::BAD_REQUEST,
@@ -170,12 +190,20 @@ pub(crate) async fn embeddings(
     Extension(principal): Extension<Principal>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    authorize_scope(
+    let limits = &state.inner.config.limits;
+    if let Err(error) = authorize_scope(
         principal,
         Scope::OperatorWrite,
         state.inner.services.audit.as_ref(),
-    )?;
-    let limits = &state.inner.config.limits;
+    ) {
+        return Ok(rejected_response(
+            request,
+            limits.embeddings_body_bytes,
+            limits.body_timeout,
+            error,
+        )
+        .await);
+    }
     let body: EmbeddingsBody =
         read_json(request, limits.embeddings_body_bytes, limits.body_timeout).await?;
     let model = body
@@ -249,12 +277,20 @@ pub(crate) async fn chat(
     Extension(principal): Extension<Principal>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    authorize_scope(
+    let limits = &state.inner.config.limits;
+    if let Err(error) = authorize_scope(
         principal,
         Scope::OperatorWrite,
         state.inner.services.audit.as_ref(),
-    )?;
-    let limits = &state.inner.config.limits;
+    ) {
+        return Ok(rejected_response(
+            request,
+            limits.openai_body_bytes,
+            limits.body_timeout,
+            error,
+        )
+        .await);
+    }
     let body: ChatBody = read_json(request, limits.openai_body_bytes, limits.body_timeout).await?;
     let model = body
         .model
@@ -336,12 +372,20 @@ pub(crate) async fn responses(
     Extension(principal): Extension<Principal>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    authorize_scope(
+    let limits = &state.inner.config.limits;
+    if let Err(error) = authorize_scope(
         principal,
         Scope::OperatorWrite,
         state.inner.services.audit.as_ref(),
-    )?;
-    let limits = &state.inner.config.limits;
+    ) {
+        return Ok(rejected_response(
+            request,
+            limits.openai_body_bytes,
+            limits.body_timeout,
+            error,
+        )
+        .await);
+    }
     let value = read_json_value(request, limits.openai_body_bytes, limits.body_timeout).await?;
     validate_responses_body(&value)?;
     let body: ResponsesBody = serde_json::from_value(value).map_err(|error| {

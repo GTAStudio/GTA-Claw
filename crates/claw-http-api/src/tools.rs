@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::{Principal, authorize_scope};
 use crate::error::ApiError;
-use crate::http_support::{CancelOnDrop, json_response, read_json_value};
+use crate::http_support::{CancelOnDrop, json_response, read_json_value, rejected_response};
 use crate::ports::{PortErrorKind, ToolInvocation, ToolInvocationContext, ToolOutcome};
 use crate::state::ApiState;
 
@@ -19,12 +19,16 @@ pub(crate) async fn invoke(
     Extension(principal): Extension<Principal>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    authorize_scope(
+    let limits = &state.inner.config.limits;
+    if let Err(error) = authorize_scope(
         principal,
         Scope::OperatorWrite,
         state.inner.services.audit.as_ref(),
-    )?;
-    let limits = &state.inner.config.limits;
+    ) {
+        return Ok(
+            rejected_response(request, limits.tools_body_bytes, limits.body_timeout, error).await,
+        );
+    }
     let invocation_context = ToolInvocationContext {
         session_key: optional_body_string_from_request(&request, "x-openclaw-session-key"),
         agent_id: optional_body_string_from_request(&request, "x-openclaw-agent-id"),
