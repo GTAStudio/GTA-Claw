@@ -55,7 +55,7 @@ stop_initializer() {
   esac
 }
 
-ensure_failure_fence() {
+ensure_runtime_directory() {
   if [ -L "$runtime_directory" ] ||
     { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
     return 1
@@ -66,6 +66,10 @@ ensure_failure_fence() {
   if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
     return 1
   fi
+}
+
+ensure_failure_fence() {
+  ensure_runtime_directory || return 1
   touch "$failure_marker"
   touch "$replacement_fence"
   chown 0:0 "$failure_marker" "$replacement_fence"
@@ -140,6 +144,7 @@ restore_on_failure() {
 
 if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = "remove" ] &&
   [ -d /run/systemd/system ]; then
+  ensure_runtime_directory
   rm -f \
     "$remove_was_active" \
     "$remove_was_enabled" \

@@ -525,6 +525,14 @@ sudo dpkg -i "$deb2"
 assert_disabled_and_inactive
 assert_preserved "$deb_inactive_upgrade_snapshot"
 deb_inactive_snapshot="$(state_snapshot)"
+sudo rm -rf /run/gta-claw-state-init
+sudo dpkg --remove gta-claw
+assert_preserved "$deb_inactive_snapshot"
+sudo dpkg --purge gta-claw
+assert_preserved "$deb_inactive_snapshot"
+sudo dpkg -i "$deb2"
+assert_disabled_and_inactive
+assert_preserved "$deb_inactive_snapshot"
 establish_package_runtime_fence
 install_initializer_stop_denial
 if sudo dpkg --remove gta-claw; then
@@ -676,6 +684,12 @@ sudo rpm -Uvh --nodeps "$rpm2"
 assert_disabled_and_inactive
 assert_preserved "$rpm_inactive_upgrade_snapshot"
 rpm_inactive_snapshot="$(state_snapshot)"
+sudo rm -rf /run/gta-claw-state-init
+sudo rpm -e --nodeps gta-claw
+assert_preserved "$rpm_inactive_snapshot"
+sudo rpm -ivh --nodeps "$rpm2"
+assert_disabled_and_inactive
+assert_preserved "$rpm_inactive_snapshot"
 establish_package_runtime_fence
 install_initializer_stop_denial
 if sudo rpm -e --nodeps gta-claw; then
