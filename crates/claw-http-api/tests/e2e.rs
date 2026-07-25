@@ -1599,6 +1599,387 @@ async fn constrained_streams_fail_without_leaking_text_and_response_timeouts_fai
 }
 
 #[tokio::test]
+async fn restrictive_generation_parameters_are_enforced_or_rejected() {
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime.clone()).await;
+
+    let invalid_json = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"return JSON"}],
+            "response_format":{"type":"json_object"}
+        })),
+    )
+    .await;
+    assert_eq!(invalid_json.status, 502);
+    assert_eq!(
+        invalid_json.json(),
+        json!({"error":{
+            "message":"The provider did not return the requested JSON object.",
+            "type":"api_error"
+        }})
+    );
+
+    let invalid_json_stream = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"return JSON"}],
+            "response_format":{"type":"json_object"},
+            "stream":true
+        })),
+    )
+    .await;
+    assert_eq!(invalid_json_stream.status, 200);
+    let stream_blocks = invalid_json_stream
+        .text()
+        .split("\n\n")
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(stream_blocks.len(), 3);
+    let stream_failure: Value = serde_json::from_str(
+        stream_blocks[1]
+            .strip_prefix("data: ")
+            .expect("JSON constraint failure data"),
+    )
+    .expect("JSON constraint failure body");
+    assert_eq!(
+        stream_failure,
+        json!({"error":{
+            "message":"The provider did not return the requested JSON object.",
+            "type":"api_error"
+        }})
+    );
+    assert_eq!(stream_blocks[2].as_bytes(), b"data: [DONE]");
+    assert!(
+        !invalid_json_stream
+            .text()
+            .contains("deterministic response")
+    );
+
+    runtime
+        .set_output(GenerationOutput {
+            text: "{\"ok\":true}STOPsecret".to_owned(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5,
+            },
+        })
+        .expect("set constrained text output");
+    let stopped = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"return JSON"}],
+            "stop":"STOP",
+            "response_format":{"type":"json_object"}
+        })),
+    )
+    .await;
+    assert_eq!(stopped.status, 200);
+    assert_eq!(
+        stopped.json()["choices"][0]["message"]["content"],
+        "{\"ok\":true}"
+    );
+
+    let token_limited = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"short"}],
+            "max_completion_tokens":1
+        })),
+    )
+    .await;
+    assert_eq!(token_limited.status, 502);
+    assert_eq!(
+        token_limited.json(),
+        json!({"error":{
+            "message":"The provider exceeded the requested output token limit.",
+            "type":"api_error"
+        }})
+    );
+
+    runtime
+        .set_output(GenerationOutput {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-forbidden".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 1,
+                total_tokens: 4,
+            },
+        })
+        .expect("set forbidden tool output");
+    let no_tools = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"do not call tools"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup","parameters":{"type":"object"}
+            }}],
+            "tool_choice":"none"
+        })),
+    )
+    .await;
+    assert_eq!(no_tools.status, 502);
+    assert_eq!(
+        no_tools.json(),
+        json!({"error":{
+            "message":"The provider called a tool despite tool_choice being none.",
+            "type":"api_error"
+        }})
+    );
+
+    runtime
+        .set_output(GenerationOutput {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call-rogue".to_owned(),
+                name: "rogue".to_owned(),
+                arguments: "{\"secret\":true}".to_owned(),
+            }],
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 1,
+                total_tokens: 4,
+            },
+        })
+        .expect("set unsupplied tool output");
+    for stream in [false, true] {
+        let rogue = request(
+            &server,
+            "POST",
+            "/v1/chat/completions",
+            Some("operator-token"),
+            &[("Content-Type", "application/json")],
+            &json_body(json!({
+                "model":"openclaw",
+                "messages":[{"role":"user","content":"use only allowed"}],
+                "tools":[{"type":"function","function":{
+                    "name":"allowed","parameters":{"type":"object"}
+                }}],
+                "stream":stream
+            })),
+        )
+        .await;
+        if stream {
+            assert_eq!(rogue.status, 200);
+            let blocks = rogue
+                .text()
+                .split("\n\n")
+                .filter(|block| !block.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(blocks.len(), 3);
+            let error: Value = serde_json::from_str(
+                blocks[1]
+                    .strip_prefix("data: ")
+                    .expect("unsupplied tool failure data"),
+            )
+            .expect("unsupplied tool failure body");
+            assert_eq!(
+                error,
+                json!({"error":{
+                    "message":"The provider called a tool that was not supplied by the client.",
+                    "type":"api_error"
+                }})
+            );
+            assert_eq!(blocks[2].as_bytes(), b"data: [DONE]");
+            assert!(!rogue.text().contains("call-rogue"));
+            assert!(!rogue.text().contains("{\"secret\":true}"));
+        } else {
+            assert_eq!(rogue.status, 502);
+            assert_eq!(
+                rogue.json(),
+                json!({"error":{
+                    "message":"The provider called a tool that was not supplied by the client.",
+                    "type":"api_error"
+                }})
+            );
+        }
+    }
+
+    runtime
+        .set_output(GenerationOutput {
+            text: "calling twice".to_owned(),
+            tool_calls: vec![
+                ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "lookup".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                ToolCall {
+                    id: "call-2".to_owned(),
+                    name: "lookup".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            ],
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5,
+            },
+        })
+        .expect("set excessive tool output");
+    let tool_limited = request(
+        &server,
+        "POST",
+        "/v1/responses",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "input":"one call only",
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+            "max_tool_calls":1
+        })),
+    )
+    .await;
+    assert_eq!(tool_limited.status, 502);
+    assert_eq!(tool_limited.json()["status"], "failed");
+    assert_eq!(tool_limited.json()["output"], json!([]));
+    assert_eq!(
+        tool_limited.json()["error"],
+        json!({
+            "code":"api_error",
+            "message":"The provider exceeded the requested tool call limit."
+        })
+    );
+
+    for (unsupported, message) in [
+        (
+            json!({
+                "model":"openclaw","input":"strict",
+                "tools":[{
+                    "type":"function","name":"lookup",
+                    "parameters":{"type":"object"},"strict":true
+                }]
+            }),
+            "Invalid tools/tool_choice: invalid tool configuration",
+        ),
+        (
+            json!({"model":"openclaw","input":"private","store":false}),
+            "invalid request",
+        ),
+        (
+            json!({"model":"openclaw","input":"bounded","truncation":"disabled"}),
+            "invalid request",
+        ),
+    ] {
+        let response = request(
+            &server,
+            "POST",
+            "/v1/responses",
+            Some("operator-token"),
+            &[("Content-Type", "application/json")],
+            &json_body(unsupported),
+        )
+        .await;
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response.json(),
+            json!({"error":{"message":message,"type":"invalid_request_error"}})
+        );
+    }
+
+    let strict_chat = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"strict"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup","parameters":{"type":"object"},"strict":true
+            }}]
+        })),
+    )
+    .await;
+    assert_eq!(strict_chat.status, 400);
+    assert_eq!(
+        strict_chat.json(),
+        json!({"error":{
+            "message":"Invalid tools/tool_choice: invalid tool configuration",
+            "type":"invalid_request_error"
+        }})
+    );
+
+    let unsupported_schema = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"schema"}],
+            "response_format":{"type":"json_schema","json_schema":{"name":"answer"}}
+        })),
+    )
+    .await;
+    assert_eq!(unsupported_schema.status, 400);
+    assert_eq!(
+        unsupported_schema.json(),
+        json!({"error":{
+            "message":"Invalid response_format: only text and json_object are supported",
+            "type":"invalid_request_error"
+        }})
+    );
+
+    let unsupported_chat_field = request(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "model":"openclaw",
+            "messages":[{"role":"user","content":"one tool at a time"}],
+            "parallel_tool_calls":false
+        })),
+    )
+    .await;
+    assert_eq!(unsupported_chat_field.status, 400);
+    assert_eq!(
+        unsupported_chat_field.json(),
+        json!({"error":{
+            "message":"unknown field `parallel_tool_calls`, expected one of `model`, `stream`, `stream_options`, `tools`, `tool_choice`, `messages`, `user`, `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `response_format`, `frequency_penalty`, `presence_penalty`, `seed`, `stop`",
+            "type":"invalid_request_error"
+        }})
+    );
+}
+
+#[tokio::test]
 async fn responses_continuity_is_scoped_to_authenticated_subject_and_model() {
     let runtime = DeterministicRuntime::new();
     let server = spawn_with(config(), runtime.clone()).await;
@@ -1707,6 +2088,17 @@ async fn mcp_server_rejects_non_loopback_listener_bindings() {
 #[tokio::test]
 async fn generation_ports_receive_validated_parameters_media_and_strict_responses_input() {
     let runtime = DeterministicRuntime::new();
+    runtime
+        .set_output(GenerationOutput {
+            text: "{\"ok\":true}".to_owned(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5,
+            },
+        })
+        .expect("set valid structured output");
     let server = spawn_with(config(), runtime.clone()).await;
     let chat = request(
         &server,
