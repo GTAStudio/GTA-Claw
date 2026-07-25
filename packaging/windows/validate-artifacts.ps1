@@ -119,23 +119,16 @@ try {
                 -SignatureMode $signatureMode `
                 -ReleaseStatus $releaseStatus
         } elseif ($artifact.Extension -eq '.msixbundle') {
-            $innerMode = 'unsigned'
-            if ($name -match 'release-candidate|signed') {
-                $innerMode = 'signed'
-            }
-            $innerReleaseStatus = 'non-release'
-            if ($name -match 'release-candidate|signed') {
-                $innerReleaseStatus = 'release-candidate'
-            }
+            $bundleProfile = Get-MsixBundleValidationProfile $name
             Test-MsixBundle `
                 -PackagePath $artifact.FullName `
                 -MakeAppxPath $makeAppx `
                 -InspectionRoot (Join-Path $inspection $artifact.BaseName) `
                 -Version $version.Msix `
                 -ExpectedPublisher $Publisher `
-                -SignatureMode $signatureMode `
-                -InnerSignatureMode $innerMode `
-                -InnerReleaseStatus $innerReleaseStatus
+                -SignatureMode $bundleProfile.SignatureMode `
+                -InnerSignatureMode $bundleProfile.InnerSignatureMode `
+                -InnerReleaseStatus $bundleProfile.InnerReleaseStatus
         } else {
             $releaseStatus = 'release-candidate'
             if ($name -match 'unsigned-non-release') {

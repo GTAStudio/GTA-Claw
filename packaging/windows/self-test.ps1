@@ -125,6 +125,24 @@ try {
     Test-WixSource (Join-Path $scriptRoot 'wix\GtaClaw.wxs')
     $passed++
 
+    $unsignedBundleProfile = Get-MsixBundleValidationProfile `
+        'gta-claw-desktop-1.2.3-windows-x64_arm64-unsigned-non-release.msixbundle'
+    $signedBundleProfile = Get-MsixBundleValidationProfile `
+        'gta-claw-desktop-1.2.3-windows-x64_arm64-signed.msixbundle'
+    if ($unsignedBundleProfile.SignatureMode -ne 'unsigned' -or
+        $unsignedBundleProfile.InnerSignatureMode -ne 'unsigned' -or
+        $unsignedBundleProfile.InnerReleaseStatus -ne 'non-release' -or
+        $signedBundleProfile.SignatureMode -ne 'signed' -or
+        $signedBundleProfile.InnerSignatureMode -ne 'signed' -or
+        $signedBundleProfile.InnerReleaseStatus -ne 'release-candidate') {
+        throw 'MSIXBundle publication status classification is invalid.'
+    }
+    $passed++
+    Assert-Throws {
+        Get-MsixBundleValidationProfile `
+            'gta-claw-desktop-1.2.3-windows-x64_arm64-release-candidate-unsigned.msixbundle'
+    } 'unpublished MSIXBundle status'
+
     $workflow = [System.IO.File]::ReadAllText(
         (Join-Path $repoRoot '.github\workflows\windows-packaging.yml')
     )
@@ -185,8 +203,8 @@ echo gta-claw-cli v0.1.0
     & (Join-Path $scriptRoot 'validate-release-surfaces.ps1')
     $passed++
 
-    if ($passed -ne 22) {
-        throw "Expected 22 self-tests, completed $passed."
+    if ($passed -ne 24) {
+        throw "Expected 24 self-tests, completed $passed."
     }
     Write-Host "Windows packaging self-tests passed: $passed."
 } finally {

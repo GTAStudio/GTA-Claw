@@ -1224,6 +1224,28 @@ function Test-MsixBundle {
     Test-PackageSignature -Path $PackagePath -Mode $SignatureMode
 }
 
+function Get-MsixBundleValidationProfile {
+    param([Parameter(Mandatory)][string]$FileName)
+    if ([System.IO.Path]::GetFileName($FileName) -cne $FileName) {
+        throw "MSIXBundle validation requires a file name, not a path: $FileName"
+    }
+    if ($FileName -cmatch '-unsigned-non-release\.msixbundle$') {
+        return [pscustomobject]@{
+            SignatureMode = 'unsigned'
+            InnerSignatureMode = 'unsigned'
+            InnerReleaseStatus = 'non-release'
+        }
+    }
+    if ($FileName -cmatch '-signed\.msixbundle$') {
+        return [pscustomobject]@{
+            SignatureMode = 'signed'
+            InnerSignatureMode = 'signed'
+            InnerReleaseStatus = 'release-candidate'
+        }
+    }
+    throw "MSIXBundle file name has no recognized publication status: $FileName"
+}
+
 function Assert-HeadlessGraph {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
@@ -1317,6 +1339,7 @@ Export-ModuleMember -Function @(
     'Find-WindowsSdkTool',
     'Get-Architecture',
     'Get-CanonicalVersion',
+    'Get-MsixBundleValidationProfile',
     'Initialize-MsvcEnvironment',
     'Invoke-CheckedCommand',
     'New-AppxManifest',
