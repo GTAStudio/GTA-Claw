@@ -12,6 +12,7 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use claw_protocol::gateway::{ClientId, ClientMode, ConnectParams, GATEWAY_PROTOCOL_VERSION};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
@@ -82,7 +83,9 @@ impl WatchRuntime {
 
     fn issue_challenge(&self, client_ip: IpAddr) -> Result<(String, u64), ApiError> {
         let mut bytes = [0_u8; 32];
-        getrandom::fill(&mut bytes).map_err(|_| internal_error())?;
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| internal_error())?;
         let nonce = URL_SAFE_NO_PAD.encode(bytes);
         let now = Instant::now();
         let mut challenges = self.inner.challenges.lock().map_err(|_| internal_error())?;
@@ -588,7 +591,9 @@ fn validate_watch_connect(connect: &ConnectParams) -> Result<(), ApiError> {
 
 fn random_token() -> Result<String, ApiError> {
     let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes).map_err(|_| internal_error())?;
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| internal_error())?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
