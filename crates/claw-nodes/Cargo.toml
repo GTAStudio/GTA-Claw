@@ -1,0 +1,31 @@
+[package]
+name = "claw-nodes"
+description = "Authenticated node identity, discovery, and connectivity for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "=0.1.89"
+base64 = "=0.22.1"
+claw-protocol.workspace = true
+claw-security.workspace = true
+flume = "=0.12.0"
+hickory-resolver = "=0.26.1"
+mdns-sd = { version = "=0.20.2", default-features = false }
+russh = { version = "=0.62.4", default-features = false, features = ["ring"] }
+secrecy = "=0.10.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+url = "=2.5.8"
+
+[dev-dependencies]
+rand_chacha = "=0.10.0"
+
+[lints]
+workspace = true

@@ -3,12 +3,14 @@ members = [
   "apps/gta-claw-cli",
   "apps/gta-claw-daemon",
   "crates/claw-application",
+  "crates/claw-automation",
   "crates/claw-config",
   "crates/claw-conformance",
   "crates/claw-domain",
   "crates/claw-gateway",
   "crates/claw-gateway-client",
   "crates/claw-observability",
+  "crates/claw-nodes",
   "crates/claw-platform",
   "crates/claw-protocol",
   "crates/claw-repo-policy",
@@ -19,12 +21,14 @@ resolver = "3"
 
 [workspace.dependencies]
 claw-application = { path = "crates/claw-application", version = "0.1.0" }
-claw-conformance = { path = "crates/claw-conformance", version = "0.1.0" }
+claw-automation = { path = "crates/claw-automation", version = "0.1.0" }
 claw-config = { path = "crates/claw-config", version = "0.1.0" }
+claw-conformance = { path = "crates/claw-conformance", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway = { path = "crates/claw-gateway", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
 claw-observability = { path = "crates/claw-observability", version = "0.1.0" }
+claw-nodes = { path = "crates/claw-nodes", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }

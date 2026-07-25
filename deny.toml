@@ -15,6 +15,14 @@ highlight = "all"
 # fastwebsockets 0.10 uses rand 0.8 solely for RFC 6455 client masking.
 # ring 0.17 pins windows-sys 0.52 for rustls cryptography internals.
 [[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.8.7"
+
+[[bans.skip]]
 name = "rand_core"
 version = "=0.6.4"
 
@@ -55,6 +63,24 @@ version = "=1.0.69"
 [[bans.skip]]
 name = "thiserror-impl"
 version = "=1.0.69"
+
+# Hickory's OS resolver and the native TLS root loader currently straddle the
+# Core Foundation 0.9/0.10 transition on Apple targets.
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+
+# Hickory 0.26 and russh 0.62 use syn 3 while the established workspace
+# procedural macros remain on syn 2.
+[[bans.skip]]
+name = "syn"
+version = "=3.0.3"
+
+# russh 0.62 directly uses SHA-3 0.12 while its ML-KEM 0.3 dependency is still
+# on SHA-3 0.11.
+[[bans.skip]]
+name = "sha3"
+version = "=0.11.0"
 
 # SQLx 0.9 still uses the previous RustCrypto stack while claw-state uses the
 # latest stable SHA-2 API. SQLx also resolves two intentional hashbrown lines.
