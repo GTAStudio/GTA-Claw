@@ -54,6 +54,10 @@ impl ConfigError {
             source,
         }
     }
+
+    pub(crate) fn from_serialize(error: impl Display) -> Self {
+        Self::Serialize(error.to_string())
+    }
 }
 
 impl Display for ConfigError {

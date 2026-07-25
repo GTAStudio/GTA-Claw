@@ -117,6 +117,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-crestodian"
+version = "0.1.0"
+dependencies = [
+ "claw-config",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+]
+
+[[package]]
 name = "claw-domain"
 version = "0.1.0"
 

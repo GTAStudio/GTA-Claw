@@ -458,8 +458,12 @@ mod tests {
         bound.start().shutdown().await;
     }
 
+    /// The `278` here is transcribed from the frozen inventory's
+    /// `counts.methods`, so it is an independent expectation rather than one
+    /// derived from the registry. Note this is the *registered* total; the
+    /// smaller *advertised* subset (258) is checked in `tests/frozen_catalog.rs`.
     #[tokio::test]
-    async fn a_started_server_advertises_the_whole_frozen_method_catalog() {
+    async fn a_started_server_registers_the_whole_frozen_method_catalog() {
         let server = server(2);
         assert_eq!(server.registry().len(), 278);
         assert_eq!(server.directory().len(), 0);
