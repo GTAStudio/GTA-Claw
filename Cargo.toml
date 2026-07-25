@@ -8,6 +8,7 @@ members = [
   "crates/claw-domain",
   "crates/claw-gateway",
   "crates/claw-gateway-client",
+  "crates/claw-http-api",
   "crates/claw-observability",
   "crates/claw-platform",
   "crates/claw-protocol",
@@ -24,6 +25,7 @@ claw-config = { path = "crates/claw-config", version = "0.1.0" }
 claw-domain = { path = "crates/claw-domain", version = "0.1.0" }
 claw-gateway = { path = "crates/claw-gateway", version = "0.1.0" }
 claw-gateway-client = { path = "crates/claw-gateway-client", version = "0.1.0" }
+claw-http-api = { path = "crates/claw-http-api", version = "0.1.0" }
 claw-observability = { path = "crates/claw-observability", version = "0.1.0" }
 claw-platform = { path = "crates/claw-platform", version = "0.1.0" }
 claw-protocol = { path = "crates/claw-protocol", version = "0.1.0" }
