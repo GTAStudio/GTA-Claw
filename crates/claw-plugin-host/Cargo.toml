@@ -1,0 +1,30 @@
+[package]
+name = "claw-plugin-host"
+description = "Wasmtime component-model host that runs GTA Claw WebAssembly plugins in a deny-by-default sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claw-plugin-api = { workspace = true }
+claw-security = { workspace = true }
+# Pinned to the 0.2 line that `ring` already resolves in the root graph. A newer
+# getrandom would add a second version of the crate and `deny.toml` - which is
+# a frozen trust-root file - forbids duplicates.
+getrandom = "=0.2.17"
+serde_json.workspace = true
+wasmtime = { version = "=46.0.1", default-features = false, features = [
+  "component-model",
+  "cranelift",
+  "runtime",
+  "std",
+] }
+
+[dev-dependencies]
+ed25519-dalek = "=3.0.0"
+wat = "=1.251.0"
+
+[lints]
+workspace = true
