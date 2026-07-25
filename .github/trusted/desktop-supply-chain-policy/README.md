@@ -80,6 +80,15 @@ The validator exact-freezes:
   classes and messages;
 - the three real lockfile locations: root, desktop, and this validator.
 
+The `.github/workflows` directory is a closed inventory. Eight workflow files are
+**required** and must be present in every checkout. Two further exact paths,
+`.github/workflows/ios-packaging.yml` and `.github/workflows/android-packaging.yml`,
+are **admitted** for the shipped mobile platforms: each may be absent or present, and
+a present file is subjected to the same tagged-YAML, ASCII-identity, reserved-identity
+anti-spoofing, duplicate-name, and isolated-actionlint checks as a required one. No
+other path may appear at any depth, and no required path may be removed. Admitting a
+further workflow still requires an audited trust-root update.
+
 The root headless workspace remains extensible. A new canonical `crates/<name>` or
 `apps/<name>` member can pass without changing this trust root when it is explicitly
 declared, uses the required workspace inheritance, introduces no nested workspace or

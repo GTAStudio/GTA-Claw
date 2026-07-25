@@ -378,9 +378,12 @@ pub fn mutate_negative_case(
             let matrix = yaml_get_mut(strategy, "matrix").expect("native matrix");
             let include = yaml_sequence_mut(yaml_get_mut(matrix, "include"))
                 .expect("native include sequence");
-            yaml_mapping_mut(&mut include[1])
-                .expect("Intel matrix row")
-                .insert(yaml_key("runner"), YamlValue::String("macos-15".to_owned()));
+            yaml_mapping_mut(include.get_mut(1).expect(
+                "native matrix must declare the x86_64 row at index 1; \
+                 macos-15-intel is the only full-workspace test host on Intel macOS",
+            ))
+            .expect("Intel matrix row")
+            .insert(yaml_key("runner"), YamlValue::String("macos-15".to_owned()));
         }
         "native-arch-assertion-removed" => {
             yaml_mapping_mut(
@@ -446,9 +449,13 @@ pub fn mutate_negative_case(
             let matrix = yaml_get_mut(strategy, "matrix").expect("native matrix");
             let include = yaml_sequence_mut(yaml_get_mut(matrix, "include"))
                 .expect("native include sequence");
-            yaml_mapping_mut(&mut include[0])
-                .expect("ARM matrix row")
-                .insert(yaml_key("image"), YamlValue::String("shadow".to_owned()));
+            yaml_mapping_mut(
+                include
+                    .get_mut(0)
+                    .expect("native matrix must declare an arm64 row at index 0"),
+            )
+            .expect("ARM matrix row")
+            .insert(yaml_key("image"), YamlValue::String("shadow".to_owned()));
         }
         "deny-no-locked" => {
             let step = step_by_name_mut(

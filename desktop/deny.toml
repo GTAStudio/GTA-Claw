@@ -24,23 +24,44 @@ unused-allowed-license = "allow"
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
-# Gateway onboarding adds getrandom 0.4 directly while ring retains 0.2.
-# Ed25519/fastwebsockets retain rand_core 0.6 while getrandom uses 0.10.
-# Slint retains thiserror 1 while the Gateway transport graph uses thiserror 2.
 skip = [
+  # core-graphics 0.23 requires bitflags 1 while the rest of the desktop graph uses 2.
   { name = "bitflags", version = "=1.3.2" },
+  # Winit's objc2 0.2 family requires block2 0.5; Slint's objc2 0.3 family uses 0.6.
   { name = "block2", version = "=0.5.1" },
+  # core-graphics 0.23 and Winit 0.30 require core-foundation 0.9, while
+  # security-framework 3 and webbrowser 1 require 0.10.
   { name = "core-foundation", version = "=0.9.4" },
+  # ring 0.17 and fastwebsockets' rand 0.8 chain require getrandom 0.2; the
+  # desktop app pins 0.4 directly, and Slint's image chain uses 0.3.
   { name = "getrandom", version = "=0.2.17" },
+  # Slint compiler's rowan 0.16 requires hashbrown 0.14; the graph also uses
+  # hashbrown 0.16 through AccessKit and 0.17 through its text/indexmap chain.
   { name = "hashbrown", version = "=0.14.5" },
+  # AccessKit's platform crates and Slint's clru cache require hashbrown 0.16,
+  # while Slint's current text/indexmap chain uses 0.17.
   { name = "hashbrown", version = "=0.16.1" },
+  # Winit, AccessKit, and copypasta require objc2 0.5 through the objc2 0.2
+  # framework crates; Slint's newer framework crates use objc2 0.6.
   { name = "objc2", version = "=0.5.2" },
+  # Winit, AccessKit, and copypasta require objc2-app-kit 0.2, while Slint and
+  # Glutin require objc2-app-kit 0.3.
   { name = "objc2-app-kit", version = "=0.2.2" },
+  # Winit, AccessKit, and copypasta require objc2-foundation 0.2, while Slint
+  # and Glutin require objc2-foundation 0.3.
   { name = "objc2-foundation", version = "=0.2.2" },
+  # fastwebsockets' rand 0.8 chain requires rand_core 0.6; Slint's image chain
+  # uses 0.9, and the claw-security/Ed25519 chain uses 0.10.
   { name = "rand_core", version = "=0.6.4" },
+  # Winit 0.30 requires smol_str 0.2, while the Slint compiler requires 0.3.
   { name = "smol_str", version = "=0.2.2" },
+  # calloop 0.13 and fastwebsockets 0.10 require thiserror 1, while newer Slint
+  # transitive dependencies require thiserror 2.
   { name = "thiserror", version = "=1.0.69" },
+  # thiserror 1 pins its matching derive crate, while thiserror 2 pins impl 2.
   { name = "thiserror-impl", version = "=1.0.69" },
+  # Glutin 0.32, Winit 0.30, and ring 0.17 require windows-sys 0.52; the
+  # desktop graph also needs 0.48, 0.59, and 0.61 for other platform layers.
   { name = "windows-sys", version = "=0.52.0" },
 ]
 skip-tree = []
