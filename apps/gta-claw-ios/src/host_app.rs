@@ -719,12 +719,13 @@ impl HostAppDeclarations {
 /// A local-discovery backend, described at the type level.
 ///
 /// This mirrors the backend contract agreed with the `claw-nodes` owner. It is
-/// **not** yet present in that crate: as of PR #57 head `237b386e`,
-/// `crates/claw-nodes/src/dns_sd.rs` exports `GATEWAY_SERVICE_TYPE` and
-/// `MdnsBrowser` but no descriptor trait. This is therefore a deliberate
-/// private mirror rather than a re-export, kept here so that iOS does not
-/// create a cross-PR dependency, and shaped so that replacing it with the real
-/// trait is mechanical.
+/// **not** yet present in that crate: `crates/claw-nodes/src/dns_sd.rs` exports
+/// `GATEWAY_SERVICE_TYPE` and a desktop-only `MdnsBrowser`, but no descriptor
+/// trait. This is therefore a deliberate private mirror rather than a
+/// re-export, kept here so that iOS does not create a cross-PR dependency, and
+/// shaped so that replacing it with the real trait is mechanical. It cites no
+/// head or line number of the owning branch on purpose; those move, the names
+/// do not.
 ///
 /// Both associated items are `const`, so a caller cannot override them for a
 /// backend it is about to construct. That is the whole point: the mechanism
@@ -773,18 +774,32 @@ pub trait LocalDiscoveryBackend {
     }
 }
 
-/// The pure-Rust mDNS backend `claw-nodes` browses the Gateway with.
+/// Descriptor for the raw-multicast Gateway browser — **not shipped on iOS**.
 ///
 /// Uninhabited: it exists only as a type-level descriptor, and there is no
 /// reason to hold a value of it.
 ///
+/// **This type is not evidence that an iOS build can browse the local network.**
+/// In `claw-nodes`, `mdns-sd`, `hickory-resolver` and `flume` are declared under
+/// `[target.'cfg(any(target_os = "windows", target_os = "macos", target_os =
+/// "linux"))'.dependencies]`, and `MdnsBrowser` and the surrounding runtime
+/// carry the matching `cfg`. On `aarch64-apple-ios` that browser therefore does
+/// not exist at all — it is compiled out rather than merely ungranted. Mobile
+/// keeps only signed DNS-SD record parsing and verification.
+///
+/// So the descriptor states a *requirement*, not a *capability*: it records
+/// what an in-process multicast backend would have to satisfy before it could
+/// run here. Until a separately audited platform adapter establishes that
+/// capability, no iOS code path can construct the backend this describes, and
+/// a permit issued for it grants nothing that exists.
+///
 /// `DNS_SD_SERVICE_TYPE` mirrors `claw_nodes::dns_sd::GATEWAY_SERVICE_TYPE`,
-/// which is documented there as the frozen local Gateway service type. The
-/// mirror exists because `claw-nodes` is not on `main` yet; it is deliberately
+/// documented there as the frozen local Gateway service type. It is deliberately
 /// a copy of the *value* rather than a citation of a line, because the value is
-/// the stable part — the constant has been read at three different heads of the
-/// owning branch and moved line twice. Replacement with a direct dependency is
-/// mechanical once that crate lands.
+/// the stable part — the constant has been read at four different heads of the
+/// owning branch and moved line twice while never changing. That constant is
+/// **not** `cfg`-gated, so once `claw-nodes` lands the mirror can be replaced by
+/// a direct import even on iOS; only the backend itself is unavailable here.
 ///
 /// `MECHANISM` is [`DiscoveryMechanism::InProcessMulticast`] because that
 /// browser is built on `mdns-sd`, which binds its own UDP multicast sockets in
@@ -1118,6 +1133,7 @@ mod tests {
         HostAppDeclaration, HostAppDeclarations, HostAppEntitlement, LocalDiscoveryBackend,
         LocalNetworkPrivacy, ServiceTypeError, diagnose_empty_result,
     };
+    use crate::transport::ClientTransport;
 
     /// Stands in for the `claw-nodes` browser: raw sockets, test service type.
     enum TestMdnsBackend {}
@@ -1463,6 +1479,41 @@ mod tests {
             GatewayMdnsBackend::DNS_SD_SERVICE_TYPE,
             "the plist form must be the browsed form minus the domain; if this fails the two \
              names have drifted and the plist entry would silently not match"
+        );
+    }
+
+    #[test]
+    fn a_permit_for_the_raw_backend_is_not_a_claim_that_ios_can_browse() {
+        let declarations = HostAppDeclarations::new()
+            .with_local_network_usage(DeclarationStatus::Declared)
+            .with_bonjour_services(
+                DeclarationStatus::Declared,
+                [GatewayMdnsBackend::bonjour_service_type().expect("must derive")],
+            )
+            .with_entitlement(
+                HostAppEntitlement::MulticastNetworking,
+                EntitlementStatus::Granted,
+            );
+        let permitted = declarations
+            .discovery_precondition::<GatewayMdnsBackend>()
+            .expect("every declared prerequisite is present");
+
+        assert_eq!(
+            permitted.mechanism(),
+            DiscoveryMechanism::InProcessMulticast,
+            "the permit must name the mechanism it was checked against, but read {permitted:?}"
+        );
+
+        let record = ClientTransport::BonjourDiscovery.ios_record();
+        assert!(
+            !record.confirmed_on_ios(),
+            "a satisfied permit must not upgrade the recorded iOS transport status: the \
+             raw-multicast browser in claw-nodes is compiled out for non-desktop targets, so \
+             there is nothing on iOS for this permit to authorise, and the record read {record}"
+        );
+        assert!(
+            !record.usable_today(),
+            "the permit describes a prerequisite, not a capability, but the record read {record}"
         );
     }
 
