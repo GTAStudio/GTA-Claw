@@ -1387,25 +1387,15 @@ impl SecureDirectory {
     }
 
     fn list_names(&self) -> Result<Vec<OsString>, UpdateError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            use std::mem::MaybeUninit;
             use std::os::unix::ffi::OsStrExt as _;
 
-            let descriptor = rustix::fs::openat(
-                &*self.handle,
-                ".",
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(rustix_open_error)?;
-            let mut buffer = [MaybeUninit::uninit(); 8192];
+            let mut directory = rustix::fs::Dir::read_from(&*self.handle)
+                .map_err(rustix_error)
+                .map_err(UpdateError::Io)?;
             let mut entries = Vec::new();
-            let mut raw = rustix::fs::RawDir::new(&descriptor, &mut buffer);
-            while let Some(entry) = raw.next() {
+            for entry in &mut directory {
                 let entry = entry.map_err(rustix_error).map_err(UpdateError::Io)?;
                 let bytes = entry.file_name().to_bytes();
                 if bytes != b"." && bytes != b".." {
@@ -1413,19 +1403,6 @@ impl SecureDirectory {
                 }
             }
             Ok(entries)
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            use std::os::fd::AsRawFd as _;
-
-            fs::read_dir(format!("/dev/fd/{}", self.handle.as_raw_fd()))
-                .map_err(UpdateError::Io)?
-                .map(|entry| {
-                    entry
-                        .map(|entry| entry.file_name())
-                        .map_err(UpdateError::Io)
-                })
-                .collect()
         }
         #[cfg(windows)]
         {
