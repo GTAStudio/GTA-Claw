@@ -1278,6 +1278,8 @@ fn attempt_nonce(
     let mut mac =
         HmacSha256::new_from_slice(secret.bytes()).map_err(|_| WebhookError::SigningState)?;
     mac.update(DELIVERY_NONCE_DOMAIN);
+    // The attempt is deliberately excluded: retries share one authenticated digest, while the
+    // suffix remains observable and replay_nonce collapses every attempt to that delivery key.
     mac.update(delivery_nonce.as_bytes());
     Ok(format!(
         "{DELIVERY_NONCE_PREFIX}{}-{attempt}",
@@ -1623,6 +1625,16 @@ mod tests {
             Err(WebhookError::Replay)
         ));
         assert_eq!(*dispatcher.events.lock().expect("events"), vec![event]);
+    }
+
+    #[test]
+    fn retry_attempts_have_distinct_wire_nonces_but_one_replay_key() {
+        let delivery_nonce = format!("delivery-{}", std::process::id());
+        let first = attempt_nonce(&secret(), &delivery_nonce, 1).expect("first nonce");
+        let second = attempt_nonce(&secret(), &delivery_nonce, 2).expect("second nonce");
+
+        assert_ne!(first, second);
+        assert_eq!(replay_nonce(&first), replay_nonce(&second));
     }
 
     #[tokio::test]
