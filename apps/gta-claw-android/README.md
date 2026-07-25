@@ -85,6 +85,51 @@ If the platform CSPRNG fails, the attempt fails with an operator-facing error.
 It does not fall back to a weaker source: an identity built from predictable
 bytes would authenticate successfully and be forgeable.
 
+## Surfaces this platform cannot satisfy
+
+These are gaps in the frozen upstream contract, recorded rather than papered
+over. None has a substitute in this crate, because an invented analogue cannot
+later be told apart from a real implementation.
+
+**Tailscale authentication is unreachable.** The Gateway handshake registry can
+reject a client with `AuthTailscaleIdentityMissing`, `AuthTailscaleProxyMissing`,
+`AuthTailscaleWhoisFailed` or `AuthTailscaleIdentityMismatch`. Supplying that
+identity needs an app-accessible LocalAPI Unix socket or an explicit loopback
+proxy, and a stock sandboxed Android deployment offers neither. This crate
+therefore reports those four codes as a platform limit and explicitly does not
+advise retrying or re-entering the token, because neither can succeed. The
+transport itself is `cfg(unix)`-gated upstream and is not a dependency here.
+
+**Password authentication is not implemented.** The three `AuthPassword*` codes
+are reported as unsupported rather than retried; this client sends a token.
+
+**Pairing is not implemented.** `PairingRequired` is reported as needing another
+client. The scope set is also under revision upstream (`TalkSecrets`
+over-granted, `Pairing` missing across shared profiles); this crate requests only
+`operator.read` and has not yet been reviewed by the native-clients owner.
+
+**No Android Keystore integration, and no SSH.** SSH is absent from this crate's
+dependency tree entirely, so its requirement for caller-provisioned key and
+`known_hosts` paths does not arise here. The identity this crate generates is
+held in memory for the life of the process and is never written anywhere, so
+there is nothing yet for a hardware-backed keystore to protect. That is a real
+omission for any future build that persists an identity, and it is deliberate
+only in the sense that persistence has not been implemented.
+
+**No discovery, and a warning about adding it.** There is no `mdns-sd` here and
+no dependency that pulls it. If discovery is added, note that Android requires
+`CHANGE_WIFI_MULTICAST_STATE` plus a held `WifiManager.MulticastLock`; without
+the lock, discovery returns an empty result set on many devices, which is
+indistinguishable from a quiet network. A missing permission or unheld lock must
+surface as a reported condition, never as zero results.
+
+**All four of the above converge on one missing component.** Holding a multicast
+lock, reaching Android Keystore, and hosting an activity at all require JNI, and
+JNI requires `unsafe`. This workspace sets `unsafe_code = "forbid"` and root
+members must inherit workspace lints exactly, so no in-tree crate can contain
+that code. This is a structural limit of the current repository, not a task
+someone forgot to do.
+
 ## Packaging
 
 There is no APK build here and no CI job builds this crate; adding a workflow is
@@ -103,7 +148,18 @@ cargo fmt --all -- --check
 
 Host unit tests cover input policy, redaction, the state machine's generation
 guard, attempt-slot release on future drop, identity generation and its failure
-path, and the plaintext opt-in reaching the transport configuration.
+path, the plaintext opt-in reaching the transport configuration, and the mapping
+from every Gateway handshake detail code to an operator-facing remedy.
 
-No test has been run on an Android device or emulator, and this crate has never
-been cross-compiled as part of a landed CI job.
+Tests were run on **Windows 11 x86_64**, rustc/cargo 1.97.0. Local green is a
+property of that machine, not of the product.
+
+The crate cross-compiles for `aarch64-linux-android`, `armv7-linux-androideabi`
+and `x86_64-linux-android` against NDK 30.0.14904198 at API 24, and
+`cargo clippy --target aarch64-linux-android -- -D warnings` is clean. That is a
+compilation result only.
+
+**Nothing here has been executed on Android.** There is no emulator, AVD, system
+image or device on the machine that produced these results, and no CI job builds
+this crate for any Android target. Until a job runs against a real NDK in CI, no
+Android claim in this file should be treated as validated.

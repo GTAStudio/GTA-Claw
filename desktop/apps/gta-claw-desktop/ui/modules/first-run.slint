@@ -1,0 +1,423 @@
+import { ScrollView } from "std-widgets.slint";
+import {
+    Card,
+    Divider,
+    PrimaryButton,
+    SecondaryButton,
+    StatusBadge,
+} from "./primitives.slint";
+import { DesignTokens, Metrics, StatusKind } from "./tokens.slint";
+
+component StepMarker {
+    in property <int> number;
+    in property <string> label;
+    in property <int> current-step;
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: center;
+
+        Rectangle {
+            width: Metrics.control-small;
+            height: Metrics.control-small;
+            horizontal-stretch: 0;
+            background: root.number <= root.current-step
+                ? DesignTokens.accent
+                : DesignTokens.surface-subtle;
+            border-width: 1px;
+            border-color: root.number <= root.current-step
+                ? DesignTokens.accent
+                : DesignTokens.border-default;
+            border-radius: Metrics.radius-pill;
+
+            Text {
+                text: root.number < root.current-step ? "OK" : root.number;
+                color: root.number <= root.current-step
+                    ? DesignTokens.accent-on
+                    : DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                font-weight: 800;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+
+        Text {
+            text: root.label;
+            color: root.number == root.current-step
+                ? DesignTokens.text-primary
+                : DesignTokens.text-muted;
+            font-size: Metrics.type-small;
+            font-weight: root.number == root.current-step ? 700 : 500;
+            accessible-role: none;
+        }
+    }
+}
+
+component PermissionRow {
+    in property <string> title;
+    in property <string> detail;
+    in property <string> value;
+
+    min-height: max(50px, content.min-height);
+    accessible-role: region;
+    accessible-label: root.title + ". " + root.detail + " Decision: " + root.value;
+
+    content := HorizontalLayout {
+        spacing: Metrics.space-3;
+        alignment: center;
+
+        VerticalLayout {
+            spacing: Metrics.space-1;
+
+            Text {
+                text: root.title;
+                color: DesignTokens.text-primary;
+                font-size: Metrics.type-small;
+                font-weight: 700;
+                accessible-role: none;
+            }
+
+            Text {
+                text: root.detail;
+                color: DesignTokens.text-muted;
+                font-size: Metrics.type-caption;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        Text {
+            text: root.value;
+            color: DesignTokens.text-secondary;
+            font-size: Metrics.type-caption;
+            font-weight: 650;
+            accessible-role: none;
+        }
+    }
+}
+
+export component FirstRunSurface inherits FocusScope {
+    in property <int> stage: 0;
+    in property <length> available-width;
+    out property <bool> narrow-layout: root.available-width < 860px;
+
+    callback stage-requested(int);
+
+    accessible-role: main;
+    accessible-label: root.stage == 0
+        ? "Welcome to GTA Claw"
+        : (root.stage == 1
+            ? "Device authorization"
+            : "Workspace trust");
+
+    key-pressed(event) => {
+        if (event.text == Key.Escape && root.stage > 0) {
+            root.stage-requested(root.stage - 1);
+            return accept;
+        }
+        return reject;
+    }
+
+    Rectangle { background: DesignTokens.surface-app; }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: max(68px, Metrics.control-large + 2 * Metrics.space-3);
+            vertical-stretch: 0;
+            background: DesignTokens.surface-pane;
+            border-width: 1px;
+            border-color: DesignTokens.border-default;
+
+            HorizontalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                Rectangle {
+                    width: Metrics.control-large;
+                    height: Metrics.control-large;
+                    horizontal-stretch: 0;
+                    background: DesignTokens.accent;
+                    border-radius: Metrics.radius-large;
+
+                    Text {
+                        text: "GC";
+                        color: DesignTokens.accent-on;
+                        font-size: Metrics.type-small;
+                        font-weight: 850;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 0px;
+
+                    Text {
+                        text: "GTA Claw";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-title;
+                        font-weight: 800;
+                        accessible-role: none;
+                    }
+
+                    Text {
+                        text: "Native agent workspace";
+                        color: DesignTokens.text-muted;
+                        font-size: Metrics.type-caption;
+                        accessible-role: none;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                StatusBadge {
+                    kind: StatusKind.info;
+                    text: "Setup " + (root.stage + 1) + " of 3";
+                    semantic-label: "Setup progress";
+                    icon-text: root.stage + 1;
+                }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: body.min-height;
+
+            body := VerticalLayout {
+                width: parent.width;
+                padding: root.narrow-layout ? Metrics.space-4 : Metrics.space-8;
+                spacing: Metrics.space-6;
+                alignment: start;
+
+                Rectangle {
+                    width: min(900px, parent.width);
+                    horizontal-stretch: 0;
+                    min-height: step-row.min-height;
+
+                    step-row := HorizontalLayout {
+                        spacing: root.narrow-layout ? Metrics.space-3 : Metrics.space-8;
+                        alignment: center;
+
+                        StepMarker { number: 1; label: "Welcome"; current-step: root.stage + 1; }
+                        Divider { horizontal-stretch: 1; }
+                        StepMarker { number: 2; label: "Authorize"; current-step: root.stage + 1; }
+                        Divider { horizontal-stretch: 1; }
+                        StepMarker { number: 3; label: "Trust"; current-step: root.stage + 1; }
+                    }
+                }
+
+                if (root.stage == 0) : Card {
+                    width: min(900px, parent.width);
+                    horizontal-stretch: 0;
+                    accessible-name: "Welcome";
+
+                    Text {
+                        text: "Work with agents, without losing the thread";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-display;
+                        font-weight: 850;
+                        wrap: word-wrap;
+                        accessible-role: text;
+                    }
+
+                    Text {
+                        text: "GTA Claw brings runs, review, files, schedules, and extensions into one calm native workspace. Activity is summarized for auditability; hidden reasoning is never displayed.";
+                        color: DesignTokens.text-secondary;
+                        font-size: Metrics.type-body;
+                        wrap: word-wrap;
+                        accessible-role: text;
+                    }
+
+                    Divider { }
+
+                    PermissionRow {
+                        title: "Focused work queue";
+                        detail: "See what is running, blocked, or waiting for you.";
+                        value: "Local-first";
+                    }
+                    PermissionRow {
+                        title: "Review before execution";
+                        detail: "Commands, permissions, and diffs stay explicit.";
+                        value: "Auditable";
+                    }
+                    PermissionRow {
+                        title: "Native performance";
+                        detail: "Pure Rust and Slint with no web runtime.";
+                        value: "npm-free";
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+
+                        PrimaryButton {
+                            text: "Continue";
+                            accessible-name: "Continue to device authorization";
+                            clicked => { root.stage-requested(1); }
+                        }
+                    }
+                }
+
+                if (root.stage == 1) : Card {
+                    width: min(900px, parent.width);
+                    horizontal-stretch: 0;
+                    accessible-name: "Device authorization";
+
+                    Text {
+                        text: "Authorize this device";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-display;
+                        font-weight: 850;
+                        accessible-role: text;
+                    }
+
+                    Text {
+                        text: "Use the one-time code in your browser. GTA Claw stores no account password, and the code expires after 10 minutes.";
+                        color: DesignTokens.text-secondary;
+                        font-size: Metrics.type-body;
+                        wrap: word-wrap;
+                        accessible-role: text;
+                    }
+
+                    Rectangle {
+                        min-height: max(112px, Metrics.control-large + 2 * Metrics.space-6);
+                        background: DesignTokens.surface-subtle;
+                        border-width: 1px;
+                        border-color: DesignTokens.border-default;
+                        border-radius: Metrics.radius-large;
+                        accessible-role: text;
+                        accessible-label: "Device code G T A C dash 7 K 2 M";
+
+                        Text {
+                            text: "GTAC-7K2M";
+                            color: DesignTokens.text-primary;
+                            font-size: 30px;
+                            font-weight: 850;
+                            letter-spacing: 4px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            accessible-role: none;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-3;
+                        alignment: end;
+
+                        SecondaryButton {
+                            text: "Back";
+                            clicked => { root.stage-requested(0); }
+                        }
+                        PrimaryButton {
+                            text: "I authorized this device";
+                            accessible-name: "Continue to workspace trust";
+                            clicked => { root.stage-requested(2); }
+                        }
+                    }
+                }
+
+                if (root.stage == 2) : Card {
+                    width: min(900px, parent.width);
+                    horizontal-stretch: 0;
+                    accessible-name: "Workspace trust";
+
+                    Text {
+                        text: "Trust this workspace";
+                        color: DesignTokens.text-primary;
+                        font-size: Metrics.type-display;
+                        font-weight: 850;
+                        accessible-role: text;
+                    }
+
+                    Text {
+                        text: "Trust applies only to the selected directory. Destructive commands and connector writes still require explicit review.";
+                        color: DesignTokens.text-secondary;
+                        font-size: Metrics.type-body;
+                        wrap: word-wrap;
+                        accessible-role: text;
+                    }
+
+                    Rectangle {
+                        min-height: max(64px, Metrics.control-large + 2 * Metrics.space-2);
+                        background: DesignTokens.accent-surface;
+                        border-width: 1px;
+                        border-color: DesignTokens.accent;
+                        border-radius: Metrics.radius-medium;
+                        accessible-role: region;
+                        accessible-label: "Selected workspace GTA-Claw at C:\\work\\GTA-Claw";
+
+                        HorizontalLayout {
+                            padding: Metrics.space-3;
+                            spacing: Metrics.space-3;
+                            alignment: center;
+
+                            Text {
+                                text: "R";
+                                color: DesignTokens.accent;
+                                font-size: Metrics.type-title;
+                                font-weight: 850;
+                                accessible-role: none;
+                            }
+                            VerticalLayout {
+                                spacing: 0px;
+                                Text {
+                                    text: "GTA-Claw";
+                                    color: DesignTokens.text-primary;
+                                    font-size: Metrics.type-small;
+                                    font-weight: 750;
+                                    accessible-role: none;
+                                }
+                                Text {
+                                    text: "C:\\work\\GTA-Claw";
+                                    color: DesignTokens.text-muted;
+                                    font-size: Metrics.type-caption;
+                                    accessible-role: none;
+                                }
+                            }
+                        }
+                    }
+
+                    PermissionRow {
+                        title: "Read files";
+                        detail: "Inspect source, configuration, and repository metadata.";
+                        value: "Allowed";
+                    }
+                    PermissionRow {
+                        title: "Write files";
+                        detail: "Create reviewed changes inside this workspace.";
+                        value: "Allowed";
+                    }
+                    PermissionRow {
+                        title: "Run commands";
+                        detail: "Bounded commands with policy and approval checks.";
+                        value: "Ask";
+                    }
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-3;
+                        alignment: end;
+
+                        SecondaryButton {
+                            text: "Back";
+                            clicked => { root.stage-requested(1); }
+                        }
+                        PrimaryButton {
+                            text: "Trust and connect";
+                            accessible-name: "Trust workspace and configure Gateway";
+                            clicked => { root.stage-requested(3); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
