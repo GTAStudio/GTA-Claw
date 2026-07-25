@@ -1,4 +1,4 @@
-//! Strongly typed representations of every frozen ledger and inventory.
+//! Strongly typed representations of authoritative ledgers and frozen inventories.
 
 use std::collections::BTreeMap;
 
@@ -16,15 +16,13 @@ pub enum Classification {
     OfficialClientInterop,
 }
 
-/// Frozen ledger status.
+/// Allowed mutable ledger status.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LedgerStatus {
     Unimplemented,
     Partial,
     Implemented,
-    Blocked,
-    NotApplicable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -55,10 +53,18 @@ enum Profile {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct UpstreamSource {
-    repository: String,
-    paths: Vec<String>,
-    official_url: Option<String>,
+pub(crate) struct UpstreamSource {
+    pub(crate) repository: String,
+    pub(crate) paths: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub(crate) official_url: Option<String>,
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -66,24 +72,24 @@ struct UpstreamSource {
 pub(crate) struct AcceptanceEvidence {
     pub(crate) status: EvidenceStatus,
     pub(crate) artifacts: Vec<String>,
-    required: String,
+    pub(crate) required: String,
 }
 
-/// One frozen compatibility feature row.
+/// One compatibility feature row.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Feature {
     feature_id: String,
-    title: String,
-    domain: String,
+    pub(crate) title: String,
+    pub(crate) domain: String,
     tier: Tier,
     profile: Profile,
     classification: Classification,
-    upstream_source: UpstreamSource,
+    pub(crate) upstream_source: UpstreamSource,
     pub(crate) status: LedgerStatus,
     pub(crate) acceptance_evidence: AcceptanceEvidence,
-    last_verified_sha: String,
-    known_differences: Vec<String>,
+    pub(crate) last_verified_sha: String,
+    pub(crate) known_differences: Vec<String>,
 }
 
 impl Feature {
@@ -124,7 +130,7 @@ impl FeatureLedger {
         &self.ledger_id
     }
 
-    /// Frozen rows in source order.
+    /// Validated rows in source order.
     #[must_use]
     pub fn features(&self) -> &[Feature] {
         &self.features

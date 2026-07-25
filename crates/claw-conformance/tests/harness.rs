@@ -75,6 +75,18 @@ fn load_error(root: &Path) -> ConformanceError {
     Contract::load(root).expect_err("mutated contract must fail")
 }
 
+fn mutate_json(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
+    let source = fs::read_to_string(path).expect("read JSON fixture");
+    let mut value: serde_json::Value =
+        serde_json::from_str(source.trim_start_matches('\u{feff}')).expect("parse JSON fixture");
+    mutate(&mut value);
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&value).expect("serialize JSON fixture"),
+    )
+    .expect("write JSON fixture");
+}
+
 #[test]
 fn real_frozen_contract_loads_every_row() {
     let contract = Contract::load(upstream_root()).expect("load frozen contract");
@@ -365,6 +377,350 @@ fn raised_ledger_status_without_evidence_is_rejected() {
     assert_eq!(
         error.message(),
         "ledger status implemented requires recorded acceptance evidence"
+    );
+}
+
+#[test]
+fn legitimate_ledger_transitions_do_not_require_frozen_hashes() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        let features = ledger["features"].as_array_mut().expect("features array");
+        features[0]["status"] = serde_json::json!("partial");
+        features[0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        features[0]["acceptance_evidence"]["artifacts"] =
+            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+        features[1]["status"] = serde_json::json!("implemented");
+        features[1]["acceptance_evidence"]["status"] = serde_json::json!("accepted");
+        features[1]["acceptance_evidence"]["artifacts"] =
+            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::accepts_node_v3"]);
+    });
+    let validator = fixture.root.join("validate.ps1");
+    let mut validator_source = fs::read_to_string(&validator).expect("read validator");
+    validator_source.push_str("\n# Transition command fixture\n");
+    fs::write(validator, validator_source).expect("write validator fixture");
+
+    let contract = Contract::load(&fixture.root).expect("load transitioned ledger");
+    assert_eq!(contract.ledgers()[0].id(), "gateway-core");
+    assert_eq!(contract.ledgers()[0].features().len(), 16);
+    assert_eq!(
+        contract.ledgers()[0].features()[0].id(),
+        "gateway.protocol.v4"
+    );
+    assert_eq!(
+        contract.ledgers()[0].features()[1].id(),
+        "gateway.protocol.node-v3-window"
+    );
+}
+
+#[test]
+fn duplicate_feature_id_across_ledgers_is_rejected() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture
+        .root
+        .join("ledgers")
+        .join("official-integration.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["feature_id"] = serde_json::json!("gateway.protocol.v4");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerDrift);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(error.message(), "duplicate feature ID across ledgers");
+}
+
+#[test]
+fn feature_classification_must_match_its_ledger() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["classification"] = serde_json::json!("official_integration");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerDrift);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "feature classification official_integration does not match ledger classification gateway_core"
+    );
+}
+
+#[test]
+fn feature_last_verified_sha_must_match_the_baseline() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["last_verified_sha"] =
+            serde_json::json!("0000000000000000000000000000000000000000");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerDrift);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "last_verified_sha must equal b43e832fcc8000ed7287c7accc54e381db607f85"
+    );
+}
+
+#[test]
+fn unknown_ledger_status_is_rejected_at_its_json_path() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("blocked");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), Some("ledgers/gateway-core.json"));
+    assert_eq!(error.json_path(), Some("features[0].status"));
+}
+
+#[test]
+fn blank_ledger_evidence_artifact_is_rejected() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] = serde_json::json!(["   "]);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "acceptance evidence contains a blank artifact"
+    );
+}
+
+#[test]
+fn partial_ledger_status_requires_partial_evidence_state() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("accepted");
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] =
+            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "partial ledger status requires partial evidence"
+    );
+}
+
+#[test]
+fn blank_ledger_evidence_requirement_is_rejected() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] =
+            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+        ledger["features"][0]["acceptance_evidence"]["required"] = serde_json::json!(" ");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "acceptance evidence requirement must not be blank"
+    );
+}
+
+#[test]
+fn unimplemented_ledger_status_rejects_populated_evidence() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["acceptance_evidence"]["status"] = serde_json::json!("partial");
+        ledger["features"][0]["acceptance_evidence"]["artifacts"] =
+            serde_json::json!(["crates/claw-gateway/tests/protocol.rs::negotiates_v4"]);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::LedgerEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "unimplemented ledger status requires missing acceptance evidence"
+    );
+}
+
+#[test]
+fn mutable_ledger_rows_still_obey_the_frozen_schema() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["title"] = serde_json::json!("");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), Some("ledgers/gateway-core.json"));
+    assert_eq!(error.json_path(), Some("features[0].title"));
+    assert_eq!(error.message(), "title must not be empty");
+}
+
+#[test]
+fn windows_path_is_not_accepted_as_an_official_uri() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["upstream_source"]["official_url"] =
+            serde_json::json!("C:\\not-a-uri");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), Some("ledgers/gateway-core.json"));
+    assert_eq!(
+        error.json_path(),
+        Some("features[0].upstream_source.official_url")
+    );
+    assert_eq!(error.message(), "official_url must be an absolute URI");
+}
+
+#[test]
+fn forward_slash_windows_path_is_not_accepted_as_an_official_uri() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["upstream_source"]["official_url"] =
+            serde_json::json!("C:/not-a-uri");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(
+        error.json_path(),
+        Some("features[0].upstream_source.official_url")
+    );
+    assert_eq!(error.message(), "official_url must be an absolute URI");
+}
+
+#[test]
+fn malformed_percent_escape_is_not_accepted_as_an_official_uri() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["upstream_source"]["official_url"] =
+            serde_json::json!("https://docs.openclaw.ai/invalid%2");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(
+        error.json_path(),
+        Some("features[0].upstream_source.official_url")
+    );
+    assert_eq!(error.message(), "official_url must be an absolute URI");
+}
+
+#[test]
+fn non_ascii_official_uri_is_rejected() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["upstream_source"]["official_url"] =
+            serde_json::json!("https://docs.openclaw.ai/\u{00a0}");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(
+        error.json_path(),
+        Some("features[0].upstream_source.official_url")
+    );
+    assert_eq!(error.message(), "official_url must be an absolute URI");
+}
+
+#[test]
+fn explicit_null_is_not_accepted_as_an_official_uri() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["upstream_source"]["official_url"] = serde_json::Value::Null;
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), Some("ledgers/gateway-core.json"));
+    assert_eq!(
+        error.json_path(),
+        Some("features[0].upstream_source.official_url")
+    );
+}
+
+#[test]
+fn whitespace_padded_official_uri_is_rejected() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    mutate_json(&path, |ledger| {
+        ledger["features"][0]["upstream_source"]["official_url"] =
+            serde_json::json!(" https://docs.openclaw.ai/gateway ");
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), Some("ledgers/gateway-core.json"));
+    assert_eq!(
+        error.json_path(),
+        Some("features[0].upstream_source.official_url")
+    );
+    assert_eq!(error.message(), "official_url must be an absolute URI");
+}
+
+#[test]
+fn trailing_json_content_is_rejected() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("ledgers").join("gateway-core.json");
+    let mut source = fs::read_to_string(&path).expect("read ledger");
+    source.push_str("\n{}\n");
+    fs::write(path, source).expect("append trailing JSON");
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::JsonSchema);
+    assert_eq!(error.subject(), Some("ledgers/gateway-core.json"));
+    assert_eq!(error.json_path(), Some("$"));
+    assert_eq!(error.message(), "trailing content after the JSON document");
+}
+
+#[test]
+fn baseline_artifact_retains_an_independent_frozen_hash() {
+    let fixture = Fixture::copy_upstream();
+    let path = fixture.root.join("baseline.json");
+    let mut source = fs::read_to_string(&path).expect("read baseline");
+    source.push('\n');
+    fs::write(path, source).expect("mutate baseline");
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::ManifestDrift);
+    assert_eq!(error.subject(), Some("baseline.json"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "frozen support artifact changed in baseline.json; expected SHA-256 \
+         02bdfca9e47ace25ffd99199f2efc8dd04b80f0c4b35c8a63b08700dd9846dea, found \
+         9af9feea2b1dc352420fe63b05325cb50ee7b2159a22d217a9647fb1e3b1ae74"
     );
 }
 

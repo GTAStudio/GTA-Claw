@@ -1,4 +1,4 @@
-//! Frozen contract loading, schema checks, and drift detection.
+//! Contract loading, schema checks, and drift detection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -19,7 +19,7 @@ use crate::model::{
 
 const BASELINE_SHA: &str = "b43e832fcc8000ed7287c7accc54e381db607f85";
 
-const SUPPORT_SPECS: [(&str, &str); 5] = [
+const IMMUTABLE_SUPPORT_SPECS: [(&str, &str); 2] = [
     (
         "baseline.json",
         "02bdfca9e47ace25ffd99199f2efc8dd04b80f0c4b35c8a63b08700dd9846dea",
@@ -28,41 +28,26 @@ const SUPPORT_SPECS: [(&str, &str); 5] = [
         "feature-ledger.schema.json",
         "ee62fe4022cf7a3dc5165b817547dc07a49b3d0db763ca8b2c153512ce328525",
     ),
-    (
-        "manifest.json",
-        "f5f255aebbe687497bb183f5e810f31613f50b31c0306121bd84f07e4e8ddbe9",
-    ),
-    (
-        "validate.ps1",
-        "a4c43483a6b59bb84f81dcc7340788c6e47effde6cc20758e0742a54823f5ecb",
-    ),
-    (
-        "validate-self-test.ps1",
-        "a4413274fcc18c3f893d3190ad7baecb77727f9711b0c8b2e1cd7e456d986bd4",
-    ),
 ];
 
-const LEDGER_SPECS: [(&str, &str, Classification, usize, &str); 3] = [
+const LEDGER_SPECS: [(&str, &str, Classification, usize); 3] = [
     (
         "ledgers/gateway-core.json",
         "gateway-core",
         Classification::GatewayCore,
         16,
-        "9fbc37d72a44a2c7964607d20935635abe7bea9c4ebe017fbdbed5e94f983a59",
     ),
     (
         "ledgers/official-integration.json",
         "official-integration",
         Classification::OfficialIntegration,
         13,
-        "9f0de2657559ad5522800eb6596f539c06230c7fdd1d146d96151727500a1693",
     ),
     (
         "ledgers/official-client-interop.json",
         "official-client-interop",
         Classification::OfficialClientInterop,
         18,
-        "cc44309fcca8ed001ee9565e14216924efec25046c7a400573a374e40a258eae",
     ),
 ];
 
@@ -129,7 +114,7 @@ const INVENTORY_SPECS: [(&str, &str, usize, &str); 10] = [
     ),
 ];
 
-/// Fully validated frozen upstream contract.
+/// Fully validated upstream contract.
 #[derive(Clone, Debug)]
 pub struct Contract {
     root: PathBuf,
@@ -144,7 +129,7 @@ impl Contract {
         let root = root.as_ref();
         let manifest: Manifest = parse_file(root, "manifest.json")?;
         validate_manifest(&manifest)?;
-        for (path, expected_hash) in SUPPORT_SPECS {
+        for (path, expected_hash) in IMMUTABLE_SUPPORT_SPECS {
             let bytes = read_file(root, path)?;
             verify_hash(
                 path,
@@ -157,19 +142,31 @@ impl Contract {
         }
 
         let mut ledgers = Vec::with_capacity(LEDGER_SPECS.len());
-        for (path, expected_id, classification, expected_rows, expected_hash) in LEDGER_SPECS {
+        let mut feature_ids = BTreeSet::new();
+        for (path, expected_id, classification, expected_rows) in LEDGER_SPECS {
             let bytes = read_file(root, path)?;
             let ledger: FeatureLedger = parse_bytes(path, &bytes)?;
             validate_ledger(&ledger, path, expected_id, classification, expected_rows)?;
-            verify_hash(
-                path,
-                &bytes,
-                expected_hash,
-                ViolationCode::LedgerDrift,
-                expected_id,
-                "frozen ledger feature/source identity changed",
-            )?;
+            for feature in ledger.features() {
+                if !feature_ids.insert(feature.id().to_owned()) {
+                    return Err(ConformanceError::new(
+                        ViolationCode::LedgerDrift,
+                        Some(feature.id().to_owned()),
+                        "duplicate feature ID across ledgers".to_owned(),
+                    ));
+                }
+            }
             ledgers.push(ledger);
+        }
+        if feature_ids.len() != 47 {
+            return Err(ConformanceError::new(
+                ViolationCode::LedgerDrift,
+                Some("ledgers".to_owned()),
+                format!(
+                    "expected exactly 47 feature rows, found {}",
+                    feature_ids.len()
+                ),
+            ));
         }
 
         let mut inventories = BTreeMap::new();
@@ -245,7 +242,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ConformanceError> {
             manifest.ledgers.len()
         )));
     }
-    for (path, _, classification, rows, _) in LEDGER_SPECS {
+    for (path, _, classification, rows) in LEDGER_SPECS {
         let matches = manifest
             .ledgers
             .iter()
@@ -335,11 +332,11 @@ fn validate_ledger(
         ));
     }
     let mut ids = BTreeSet::new();
-    for feature in ledger.features() {
+    for (index, feature) in ledger.features().iter().enumerate() {
         if !valid_feature_id(feature.id()) {
             return Err(ConformanceError::at_json_path(
                 path,
-                format!("features.{}.feature_id", feature.id()),
+                format!("features[{index}].feature_id"),
                 "feature ID does not match the frozen schema pattern",
             ));
         }
@@ -350,34 +347,194 @@ fn validate_ledger(
                 "duplicate feature ID".to_owned(),
             ));
         }
-        let evidence_missing = feature.acceptance_evidence.artifacts.is_empty()
-            || feature.acceptance_evidence.status == EvidenceStatus::Missing;
-        if matches!(
-            feature.status,
-            LedgerStatus::Partial | LedgerStatus::Implemented
-        ) && evidence_missing
-        {
+        validate_feature_schema(feature, path, index)?;
+        if feature.classification() != expected_classification {
             return Err(ConformanceError::new(
-                ViolationCode::LedgerEvidence,
+                ViolationCode::LedgerDrift,
                 Some(feature.id().to_owned()),
                 format!(
-                    "ledger status {:?} requires recorded acceptance evidence",
-                    feature.status
-                )
-                .to_ascii_lowercase(),
+                    "feature classification {} does not match ledger classification {}",
+                    classification_name(feature.classification()),
+                    classification_name(expected_classification)
+                ),
             ));
         }
-        if feature.status == LedgerStatus::Implemented
-            && feature.acceptance_evidence.status != EvidenceStatus::Accepted
+        if feature.last_verified_sha != BASELINE_SHA {
+            return Err(ConformanceError::new(
+                ViolationCode::LedgerDrift,
+                Some(feature.id().to_owned()),
+                format!("last_verified_sha must equal {BASELINE_SHA}"),
+            ));
+        }
+        if feature
+            .acceptance_evidence
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.trim().is_empty())
         {
             return Err(ConformanceError::new(
                 ViolationCode::LedgerEvidence,
                 Some(feature.id().to_owned()),
-                "implemented ledger status requires accepted evidence".to_owned(),
+                "acceptance evidence contains a blank artifact".to_owned(),
+            ));
+        }
+        if feature.acceptance_evidence.required.trim().is_empty() {
+            return Err(ConformanceError::new(
+                ViolationCode::LedgerEvidence,
+                Some(feature.id().to_owned()),
+                "acceptance evidence requirement must not be blank".to_owned(),
+            ));
+        }
+        validate_ledger_evidence(feature)?;
+    }
+    Ok(())
+}
+
+fn validate_feature_schema(
+    feature: &crate::model::Feature,
+    path: &str,
+    index: usize,
+) -> Result<(), ConformanceError> {
+    let fail = |field: &str, message: &str| {
+        ConformanceError::at_json_path(path, format!("features[{index}].{field}"), message)
+    };
+    if feature.title.is_empty() {
+        return Err(fail("title", "title must not be empty"));
+    }
+    if feature.domain.is_empty() {
+        return Err(fail("domain", "domain must not be empty"));
+    }
+    if feature.upstream_source.repository != "openclaw/openclaw" {
+        return Err(fail(
+            "upstream_source.repository",
+            "upstream repository must be openclaw/openclaw",
+        ));
+    }
+    if feature.upstream_source.paths.is_empty() {
+        return Err(fail(
+            "upstream_source.paths",
+            "at least one upstream path is required",
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    for upstream_path in &feature.upstream_source.paths {
+        if upstream_path.is_empty() {
+            return Err(fail(
+                "upstream_source.paths",
+                "upstream paths must not be empty",
+            ));
+        }
+        if !paths.insert(upstream_path) {
+            return Err(fail(
+                "upstream_source.paths",
+                "upstream paths must be unique",
             ));
         }
     }
+    if feature
+        .upstream_source
+        .official_url
+        .as_deref()
+        .is_some_and(|url| !valid_uri(url))
+    {
+        return Err(fail(
+            "upstream_source.official_url",
+            "official_url must be an absolute URI",
+        ));
+    }
+    if feature.known_differences.is_empty()
+        || feature.known_differences.iter().any(String::is_empty)
+    {
+        return Err(fail(
+            "known_differences",
+            "known_differences must contain non-empty entries",
+        ));
+    }
     Ok(())
+}
+
+fn validate_ledger_evidence(feature: &crate::model::Feature) -> Result<(), ConformanceError> {
+    let fail = |message: &str| {
+        ConformanceError::new(
+            ViolationCode::LedgerEvidence,
+            Some(feature.id().to_owned()),
+            message.to_owned(),
+        )
+    };
+    match feature.status {
+        LedgerStatus::Unimplemented => {
+            if !feature.acceptance_evidence.artifacts.is_empty()
+                || feature.acceptance_evidence.status != EvidenceStatus::Missing
+            {
+                return Err(fail(
+                    "unimplemented ledger status requires missing acceptance evidence",
+                ));
+            }
+        }
+        LedgerStatus::Partial => {
+            if feature.acceptance_evidence.artifacts.is_empty()
+                || feature.acceptance_evidence.status == EvidenceStatus::Missing
+            {
+                return Err(fail(
+                    "ledger status partial requires recorded acceptance evidence",
+                ));
+            }
+            if feature.acceptance_evidence.status != EvidenceStatus::Partial {
+                return Err(fail("partial ledger status requires partial evidence"));
+            }
+        }
+        LedgerStatus::Implemented => {
+            if feature.acceptance_evidence.artifacts.is_empty()
+                || feature.acceptance_evidence.status == EvidenceStatus::Missing
+            {
+                return Err(fail(
+                    "ledger status implemented requires recorded acceptance evidence",
+                ));
+            }
+            if feature.acceptance_evidence.status != EvidenceStatus::Accepted {
+                return Err(fail("implemented ledger status requires accepted evidence"));
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn classification_name(classification: Classification) -> &'static str {
+    match classification {
+        Classification::GatewayCore => "gateway_core",
+        Classification::OfficialIntegration => "official_integration",
+        Classification::OfficialClientInterop => "official_client_interop",
+    }
+}
+
+fn valid_uri(value: &str) -> bool {
+    if !value.is_ascii() || value.contains('\\') {
+        return false;
+    }
+    let Some((scheme, _)) = value.split_once(':') else {
+        return false;
+    };
+    if scheme.len() == 1 && scheme.as_bytes()[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() || bytes[index].is_ascii_control() {
+            return false;
+        }
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 2;
+        }
+        index += 1;
+    }
+    url::Url::parse(value).is_ok()
 }
 
 fn valid_feature_id(value: &str) -> bool {
@@ -536,13 +693,17 @@ where
 {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+    let value = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
         ConformanceError::at_json_path(
             relative,
             error.path().to_string(),
             error.inner().to_string(),
         )
-    })
+    })?;
+    deserializer.end().map_err(|_| {
+        ConformanceError::at_json_path(relative, "$", "trailing content after the JSON document")
+    })?;
+    Ok(value)
 }
 
 fn read_file(root: &Path, relative: &str) -> Result<Vec<u8>, ConformanceError> {

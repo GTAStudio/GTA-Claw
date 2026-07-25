@@ -3,6 +3,11 @@
 //! The harness never changes the authoritative `compat/upstream` artifacts. It
 //! loads and validates them, accepts evidence-backed implementation claims, and
 //! produces deterministic parity reports.
+//!
+//! Evidence verification proves that a cited Rust test exists and is enabled;
+//! it cannot prove that the test is semantically sufficient for the claim.
+//! Automated citation integrity therefore composes with independent review:
+//! the harness rejects fabricated evidence, while reviewers judge sufficiency.
 
 mod claims;
 mod error;
