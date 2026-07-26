@@ -321,8 +321,30 @@ jobs:
         run: |
           set -euo pipefail
           package="${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb"
-          state_dir="$RUNNER_TEMP/gta-claw-deb-state"
-          sudo install -d -o root -g 65532 -m 0750 "$state_dir"
+          image=debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+          # LinuxProtected fstatfs()es the protected directory's PARENT, so
+          # /var/lib itself has to sit on an allowed filesystem. A container
+          # root is overlayfs, which the ext/XFS/Btrfs/F2FS allowlist correctly
+          # refuses because overlayfs cannot guarantee the ownership and xattr
+          # semantics the protected store depends on. Back /var/lib with a real
+          # ext4 loopback mount rather than widening the allowlist, so this step
+          # proves the store works on a filesystem it is actually allowed to use.
+          varlib_image="$RUNNER_TEMP/gta-claw-varlib.ext4"
+          varlib_mount="$RUNNER_TEMP/gta-claw-varlib"
+          rm -f "$varlib_image"
+          truncate -s 1G "$varlib_image"
+          mkfs.ext4 -q -F "$varlib_image"
+          mkdir -p "$varlib_mount"
+          sudo mount -o loop "$varlib_image" "$varlib_mount"
+          test "$(findmnt -no FSTYPE "$varlib_mount")" = "ext4"
+          # Seed the loopback from the pinned image's own /var/lib so dpkg's
+          # database stays consistent, then pre-create the protected state
+          # directory exactly as the previous bind mount did.
+          docker run --rm \
+            --volume "$varlib_mount:/seed" \
+            "$image" \
+            bash -c 'set -euo pipefail; cp -a /var/lib/. /seed/'
+          sudo install -d -o root -g 65532 -m 0750 "$varlib_mount/gta-claw-protected"
           docker run --rm \
             --cap-drop ALL \
             --cap-add CHOWN \
@@ -331,8 +353,8 @@ jobs:
             --cap-add SETGID \
             --cap-add SETUID \
             --volume "$package:/tmp/gta-claw.deb:ro" \
-            --volume "$state_dir:/var/lib/gta-claw-protected" \
-            debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df \
+            --volume "$varlib_mount:/var/lib" \
+            "$image" \
             bash -c '
               set -euo pipefail
               for forbidden in gcc cargo rustc rpm make; do
@@ -363,7 +385,9 @@ jobs:
               test ! -e /usr/libexec/gta-claw/gta-claw-daemon
               test "$(find /var/lib/gta-claw-protected -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
             '
-          sudo rm -rf "$state_dir"
+          sudo umount "$varlib_mount"
+          rmdir "$varlib_mount"
+          rm -f "$varlib_image"
 
       - name: Verify systemd unit with packaged executable
         shell: bash
