@@ -1494,16 +1494,17 @@ async fn open_timeout_error(
     let lifecycle_result = match lifecycle_result {
         Ok(result) => result,
         Err(_) => {
-            if !deadline_state.authorize_open_abort() {
-                return StateError::OperationCleanupFailed {
-                    operation: "state store open",
-                    primary: Box::new(primary),
-                    cleanup:
-                        "open cleanup lifecycle retained ownership beyond the absolute open deadline"
-                            .to_owned(),
-                };
+            // The absolute deadline has already passed, so this only reports
+            // whether the lifecycle happened to be finished at this instant.
+            // When it is not, ownership is decided rather than raced: either
+            // this path claims the abort, or the lifecycle already retained
+            // cleanup and keeps running detached, holding the pool and writer
+            // lock until it releases them itself. A detach is the designed
+            // outcome of a timed-out open, not a cleanup failure, so both
+            // arms report the deadline itself and neither extends it.
+            if deadline_state.authorize_open_abort() {
+                lifecycle.abort();
             }
-            lifecycle.abort();
             return primary;
         }
     };
