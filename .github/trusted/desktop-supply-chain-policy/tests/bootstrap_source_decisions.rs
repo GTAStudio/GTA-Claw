@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,10 +13,35 @@ use desktop_supply_chain_policy::input::{SafeRoot, sha256};
 use desktop_supply_chain_policy::policy::{
     BootstrapSnapshotArchive, bootstrap_fingerprint, bootstrap_snapshot,
 };
+use desktop_supply_chain_policy::workflows::{
+    AUTHORITATIVE_PATH as AUTHORITATIVE_WORKFLOW_PATH, BOOTSTRAP_PATH as BOOTSTRAP_WORKFLOW_PATH,
+    validate_protected_files,
+};
 
 const UPSTREAM_WORKFLOW: &str = ".github/workflows/upstream-gateway-reference.yml";
 const RUSTFMT: &str = "rustfmt.toml";
+const ROOT_LOCK: &str = "Cargo.lock";
+const SECURITY_MANIFEST: &str = "crates/claw-security/Cargo.toml";
+const PROTECTED_TREE: &str = ".github/trusted/desktop-supply-chain-policy";
+const CODEOWNERS: &str = ".github/CODEOWNERS";
 const FINGERPRINT_PREFIX: &str = "const BOOTSTRAP_FINGERPRINT: &str =\n    \"";
+
+/// Bootstrap sources that carry no standing preservation and therefore stay fully coupled.
+const FULLY_COUPLED_SOURCES: [&str; 13] = [
+    ".cargo/audit.toml",
+    ".gitattributes",
+    CODEOWNERS,
+    BOOTSTRAP_WORKFLOW_PATH,
+    ".github/workflows/docker-publish.yml",
+    ".github/workflows/linux-packaging.yml",
+    ".github/workflows/macos-packaging.yml",
+    ".github/workflows/rust.yml",
+    AUTHORITATIVE_WORKFLOW_PATH,
+    UPSTREAM_WORKFLOW,
+    ".github/workflows/windows-packaging.yml",
+    "rust-toolchain.toml",
+    RUSTFMT,
+];
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -266,6 +292,70 @@ fn placeholder_decision(id: usize, path: &str) -> TestDecision {
         snapshot_fingerprint: "4".repeat(64),
         rationale: "Previously reviewed preservation decision.".to_owned(),
     }
+}
+
+/// Returns the committed archive, which every fixture tree materializes verbatim.
+fn committed_archive() -> BootstrapSnapshotArchive {
+    let snapshot = fs::read(repo_root().join(BOOTSTRAP_SNAPSHOT_PATH))
+        .expect("read committed Bootstrap snapshot");
+    BootstrapSnapshotArchive::parse(&snapshot).expect("parse committed Bootstrap snapshot")
+}
+
+/// Appends one syntactically perfect standing preservation to a fixture ledger.
+///
+/// Ids stay consecutive and paths stay strictly ascending because every caller appends a
+/// path that sorts after the seeded dependency-graph entries.
+fn append_standing(tree: &TempTree, path: &str, payload_sha256: &str, fingerprint: &str) {
+    let ledger = tree.join(BOOTSTRAP_SOURCE_DECISIONS_PATH);
+    let mut text = fs::read_to_string(&ledger).expect("read fixture ledger");
+    let next_id = text.matches("\n[[standing]]\n").count() + 1;
+    text.push_str(&format!(
+        "\n[[standing]]\nid = {next_id}\npath = {}\nbase_oid = {}\nsnapshot_payload_sha256 = {}\nsnapshot_fingerprint = {}\nrationale = {}\n",
+        quote(path),
+        quote("988c6d64b6ec61adbfb7f04d39b83155e025de6c"),
+        quote(payload_sha256),
+        quote(fingerprint),
+        quote("Fixture standing preservation."),
+    ));
+    fs::write(ledger, text).expect("write fixture ledger");
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create fixture directory");
+    for entry in fs::read_dir(source).expect("read fixture directory") {
+        let entry = entry.expect("fixture directory entry");
+        // `target` is Git-ignored build output and is never present in a CI checkout.
+        if entry.file_name() == OsStr::new("target") {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("fixture entry type").is_dir() {
+            copy_directory(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
+}
+
+/// Materializes the complete surface that `validate_protected_files` compares.
+fn protected_surface_fixture(label: &str) -> TempTree {
+    let tree = TempTree::new(label);
+    copy_directory(
+        &repo_root().join(PROTECTED_TREE),
+        &tree.join(PROTECTED_TREE),
+    );
+    for path in [
+        CODEOWNERS,
+        AUTHORITATIVE_WORKFLOW_PATH,
+        BOOTSTRAP_WORKFLOW_PATH,
+    ] {
+        write_file(
+            &tree,
+            path,
+            fs::read(repo_root().join(path)).expect("read protected workflow input"),
+        );
+    }
+    tree
 }
 
 fn expect_error(
@@ -772,5 +862,249 @@ fn active_fingerprint_declaration_decoys_are_rejected_without_matching_comments(
         &gated_candidate,
         &manifest([('M', BOOTSTRAP_FINGERPRINT_SOURCE_PATH)]),
         "must not be attribute-gated or prefixed",
+    );
+}
+
+#[test]
+fn standing_preservations_admit_dependency_changes_without_writing_the_protected_tree() {
+    let trusted = snapshot_fixture("standing-trusted");
+    let candidate = snapshot_fixture("standing-candidate");
+    append_bytes(&candidate, ROOT_LOCK, b"\n# resolved a new dependency\n");
+    append_bytes(
+        &candidate,
+        SECURITY_MANIFEST,
+        b"\n# declared a new dependency\n",
+    );
+
+    assert_eq!(
+        fs::read(trusted.join(BOOTSTRAP_SOURCE_DECISIONS_PATH)).expect("read base ledger"),
+        fs::read(candidate.join(BOOTSTRAP_SOURCE_DECISIONS_PATH)).expect("read candidate ledger"),
+        "an ordinary dependency change must not write the protected decision ledger",
+    );
+    assert_eq!(
+        fs::read(trusted.join(BOOTSTRAP_SNAPSHOT_PATH)).expect("read base snapshot"),
+        fs::read(candidate.join(BOOTSTRAP_SNAPSHOT_PATH)).expect("read candidate snapshot"),
+        "an ordinary dependency change must not rewrite the historical archive",
+    );
+
+    assert_eq!(
+        validate(
+            &trusted,
+            &candidate,
+            &manifest([('M', ROOT_LOCK), ('M', SECURITY_MANIFEST)]),
+        )
+        .expect("standing preservations cover the dependency-graph surface"),
+        BootstrapSourceDecisionEvidence {
+            changed_paths: 2,
+            synchronized_paths: 0,
+            preserved_paths: 2,
+        }
+    );
+}
+
+#[test]
+fn sources_without_a_standing_preservation_stay_fully_coupled() {
+    let trusted = snapshot_fixture("coupled-trusted");
+    for path in FULLY_COUPLED_SOURCES {
+        let label = path.replace(['/', '.'], "-");
+        let candidate = snapshot_fixture(&format!("coupled-{label}"));
+        append_bytes(&candidate, path, b"\n# uncovered live source change\n");
+        expect_error(
+            &trusted,
+            &candidate,
+            &manifest([('M', path)]),
+            &format!(
+                "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: {path}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_candidate_cannot_mint_its_own_standing_preservation() {
+    let trusted = snapshot_fixture("minted-trusted");
+    let candidate = snapshot_fixture("minted-candidate");
+    let archive = committed_archive();
+    append_bytes(&candidate, RUSTFMT, b"\n# self-authorized live change\n");
+    // A perfectly formed, correctly bound entry: the only thing wrong with it is that the
+    // protected base does not carry it.
+    append_standing(
+        &candidate,
+        RUSTFMT,
+        &sha256(archive.payload(RUSTFMT).expect("archived rustfmt payload")),
+        &archive.semantic_fingerprint(),
+    );
+    expect_error(
+        &trusted,
+        &candidate,
+        &manifest([('M', RUSTFMT), ('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+        &format!(
+            "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: {RUSTFMT}"
+        ),
+    );
+}
+
+#[test]
+fn a_candidate_cannot_keep_coverage_it_edits_or_drops() {
+    let archive = committed_archive();
+    let payload = sha256(archive.payload(RUSTFMT).expect("archived rustfmt payload"));
+    let fingerprint = archive.semantic_fingerprint();
+
+    for label in ["edited", "dropped"] {
+        let trusted = snapshot_fixture(&format!("{label}-standing-trusted"));
+        let candidate = snapshot_fixture(&format!("{label}-standing-candidate"));
+        append_standing(&trusted, RUSTFMT, &payload, &fingerprint);
+        if label == "edited" {
+            append_standing(&candidate, RUSTFMT, &payload, &fingerprint);
+            let ledger = candidate.join(BOOTSTRAP_SOURCE_DECISIONS_PATH);
+            let text = fs::read_to_string(&ledger).expect("read candidate ledger");
+            fs::write(
+                ledger,
+                text.replace(
+                    "rationale = \"Fixture standing preservation.\"",
+                    "rationale = \"Widened fixture standing preservation.\"",
+                ),
+            )
+            .expect("write edited candidate ledger");
+        }
+        append_bytes(&candidate, RUSTFMT, b"\n# uncovered live change\n");
+        expect_error(
+            &trusted,
+            &candidate,
+            &manifest([('M', RUSTFMT), ('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
+            &format!(
+                "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: {RUSTFMT}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_standing_preservation_is_void_once_the_archive_it_names_moves() {
+    let archive = committed_archive();
+
+    // The named historical payload must be the one that is actually archived.
+    let payload_trusted = snapshot_fixture("void-payload-trusted");
+    let payload_candidate = snapshot_fixture("void-payload-candidate");
+    for tree in [&payload_trusted, &payload_candidate] {
+        append_standing(
+            tree,
+            RUSTFMT,
+            &"a".repeat(64),
+            &archive.semantic_fingerprint(),
+        );
+    }
+    append_bytes(&payload_candidate, RUSTFMT, b"\n# live change\n");
+    expect_error(
+        &payload_trusted,
+        &payload_candidate,
+        &manifest([('M', RUSTFMT)]),
+        &format!(
+            "Bootstrap standing preservation no longer binds the frozen historical payload: {RUSTFMT}"
+        ),
+    );
+
+    // Rewriting any archived payload moves the semantic fingerprint, which voids every
+    // standing preservation at once.
+    let fingerprint_trusted = snapshot_fixture("void-fingerprint-trusted");
+    let fingerprint_candidate = snapshot_fixture("void-fingerprint-candidate");
+    append_bytes(
+        &fingerprint_candidate,
+        UPSTREAM_WORKFLOW,
+        b"\n# rewrites the archive\n",
+    );
+    synchronize_snapshot(&fingerprint_candidate);
+    append_bytes(
+        &fingerprint_candidate,
+        ROOT_LOCK,
+        b"\n# resolved a dependency\n",
+    );
+    expect_error(
+        &fingerprint_trusted,
+        &fingerprint_candidate,
+        &manifest([
+            ('M', ROOT_LOCK),
+            ('M', UPSTREAM_WORKFLOW),
+            ('M', BOOTSTRAP_SNAPSHOT_PATH),
+            ('M', BOOTSTRAP_FINGERPRINT_SOURCE_PATH),
+        ]),
+        &format!(
+            "Bootstrap standing preservation no longer binds the candidate Bootstrap archive fingerprint: {ROOT_LOCK}"
+        ),
+    );
+}
+
+#[test]
+fn every_protected_file_including_the_decision_ledger_is_still_byte_pinned() {
+    let trusted = protected_surface_fixture("protected-surface-trusted");
+    let baseline = protected_surface_fixture("protected-surface-baseline");
+    validate_protected_files(
+        &SafeRoot::new(&trusted.path).expect("open protected base"),
+        &SafeRoot::new(&baseline.path).expect("open protected candidate"),
+    )
+    .expect("identical protected surfaces pass");
+
+    let mutations = [
+        ("ledger", "policy/bootstrap-source-decisions.toml"),
+        ("snapshot", "policy/bootstrap.snapshot"),
+        ("validator", "src/bootstrap_decisions.rs"),
+        ("fixture", "policy/final/desktop/Cargo.lock.fixture"),
+        ("script", "scripts/run-candidate-gates.sh"),
+    ];
+    for (label, relative) in mutations {
+        // A size-changing edit is caught by the inventory; a same-size edit is caught by the
+        // byte comparison. The decision ledger is deliberately in this list: nothing about
+        // standing preservations exempts it from either check.
+        for (kind, expected) in [
+            ("grown", "protected tree inventory changed"),
+            ("flipped", "protected trust-root file changed"),
+        ] {
+            let candidate = protected_surface_fixture(&format!("protected-{label}-{kind}"));
+            let target = candidate.join(PROTECTED_TREE).join(relative);
+            let mut bytes = fs::read(&target).expect("read protected file");
+            if kind == "grown" {
+                bytes.extend_from_slice(b"\n# unauthorised protected-tree edit\n");
+            } else {
+                let last = bytes.last_mut().expect("non-empty protected file");
+                *last = last.wrapping_add(1);
+            }
+            fs::write(&target, bytes).expect("mutate protected file");
+            let error = validate_protected_files(
+                &SafeRoot::new(&trusted.path).expect("open protected base"),
+                &SafeRoot::new(&candidate.path).expect("open mutated candidate"),
+            )
+            .expect_err("unauthorised protected-tree edit unexpectedly passed");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected refusal for {kind} {label}: {error}"
+            );
+        }
+    }
+
+    let added = protected_surface_fixture("protected-addition");
+    write_file(
+        &added,
+        &format!("{PROTECTED_TREE}/src/smuggled.rs"),
+        b"// smuggled validator source\n",
+    );
+    assert!(
+        validate_protected_files(
+            &SafeRoot::new(&trusted.path).expect("open protected base"),
+            &SafeRoot::new(&added.path).expect("open extended candidate"),
+        )
+        .is_err(),
+        "an added protected-tree file must be refused"
+    );
+
+    let codeowners = protected_surface_fixture("protected-codeowners");
+    append_bytes(&codeowners, CODEOWNERS, b"\n* @attacker\n");
+    let error = validate_protected_files(
+        &SafeRoot::new(&trusted.path).expect("open protected base"),
+        &SafeRoot::new(&codeowners.path).expect("open codeowners candidate"),
+    )
+    .expect_err("unauthorised CODEOWNERS edit unexpectedly passed");
+    assert!(
+        error.to_string().contains("protected workflow changed"),
+        "unexpected CODEOWNERS refusal: {error}"
     );
 }
