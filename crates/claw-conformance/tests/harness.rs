@@ -126,8 +126,60 @@ fn install_fixture_workspace(root: &Path, crate_name: &str, targets: &[(&str, &s
     fs::write(crate_root.join("src").join("lib.rs"), "").expect("write fixture crate root");
 }
 
+struct TransitionFixturePackage {
+    name: String,
+    files: BTreeSet<String>,
+    targets: BTreeSet<String>,
+}
+
+fn cargo_package_for_path(source_root: &Path, repository_path: &str) -> Option<(String, String)> {
+    let source_path = source_root.join(repository_path);
+    let mut directory = source_path.parent()?;
+    while directory.starts_with(source_root) {
+        let manifest_path = directory.join("Cargo.toml");
+        if manifest_path.is_file() {
+            let manifest = fs::read_to_string(&manifest_path).ok()?;
+            let manifest = manifest.parse::<toml_edit::DocumentMut>().ok()?;
+            if let Some(name) = manifest
+                .get("package")
+                .and_then(toml_edit::Item::as_table)
+                .and_then(|package| package.get("name"))
+                .and_then(toml_edit::Item::as_str)
+            {
+                let relative = directory.strip_prefix(source_root).ok()?;
+                return Some((
+                    relative.to_string_lossy().replace('\\', "/"),
+                    name.to_owned(),
+                ));
+            }
+        }
+        directory = directory.parent()?;
+    }
+    None
+}
+
+#[test]
+fn transition_fixture_discovers_apps_and_standalone_pointers() {
+    let source_root = repository_root()
+        .canonicalize()
+        .expect("resolve live repository root");
+
+    assert_eq!(
+        cargo_package_for_path(&source_root, "apps/gta-claw-cli/src/main.rs"),
+        Some(("apps/gta-claw-cli".to_owned(), "gta-claw-cli".to_owned()))
+    );
+    assert_eq!(
+        cargo_package_for_path(&source_root, ".github/workflows/rust.yml"),
+        None
+    );
+}
+
 fn install_transition_evidence(root: &Path) {
-    let mut packages = BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>)>::new();
+    let source_root = repository_root()
+        .canonicalize()
+        .expect("resolve live repository root");
+    let mut packages = BTreeMap::<String, TransitionFixturePackage>::new();
+    let mut standalone_files = BTreeSet::new();
     for ledger in [
         "gateway-core.json",
         "official-integration.json",
@@ -139,15 +191,21 @@ fn install_transition_evidence(root: &Path) {
             .expect("parse copied ledger");
         for feature in value["features"].as_array().expect("ledger features") {
             let mut record_path = |path: &str, test_target: bool| {
-                let segments = path.split('/').collect::<Vec<_>>();
-                assert!(
-                    segments.len() >= 4 && segments[0] == "crates",
-                    "fixture evidence must belong to a crate: {path}"
-                );
-                let (files, targets) = packages.entry(segments[1].to_owned()).or_default();
-                files.insert(path.to_owned());
+                let (package_root, package_name) = cargo_package_for_path(&source_root, path)
+                    .unwrap_or_else(|| {
+                        panic!("fixture evidence must belong to a Cargo package: {path}")
+                    });
+                let package =
+                    packages
+                        .entry(package_root)
+                        .or_insert_with(|| TransitionFixturePackage {
+                            name: package_name,
+                            files: BTreeSet::new(),
+                            targets: BTreeSet::new(),
+                        });
+                package.files.insert(path.to_owned());
                 if test_target {
-                    targets.insert(path.to_owned());
+                    package.targets.insert(path.to_owned());
                 }
             };
             for artifact in feature["acceptance_evidence"]["artifacts"]
@@ -159,10 +217,12 @@ fn install_transition_evidence(root: &Path) {
             }
             if let Some(pointers) = feature["implementation_pointers"].as_array() {
                 for pointer in pointers {
-                    record_path(
-                        pointer["path"].as_str().expect("implementation path"),
-                        false,
-                    );
+                    let path = pointer["path"].as_str().expect("implementation path");
+                    if cargo_package_for_path(&source_root, path).is_some() {
+                        record_path(path, false);
+                    } else {
+                        standalone_files.insert(path.to_owned());
+                    }
                 }
             }
         }
@@ -171,39 +231,49 @@ fn install_transition_evidence(root: &Path) {
         return;
     }
 
-    let source_root = repository_root();
-    let mut members = vec!["crates/claw-gateway".to_owned()];
-    let mut package_names = vec!["claw-gateway".to_owned()];
-    for (package, (paths, targets)) in &packages {
-        let package_root = root.join("crates").join(package);
+    let mut members = BTreeSet::from(["crates/claw-gateway".to_owned()]);
+    let mut package_names = BTreeSet::from(["claw-gateway".to_owned()]);
+    for (package_path, package) in &packages {
+        let package_root = root.join(package_path);
         fs::create_dir_all(&package_root).expect("create evidence package");
-        let mut manifest =
-            format!("[package]\nname = \"{package}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n");
-        for path in paths {
+        let manifest_path = package_root.join("Cargo.toml");
+        let mut manifest = if manifest_path.is_file() {
+            fs::read_to_string(&manifest_path).expect("read existing fixture manifest")
+        } else {
+            format!(
+                "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+                package.name
+            )
+        };
+        for path in &package.files {
             let relative = path
-                .strip_prefix(&format!("crates/{package}/"))
+                .strip_prefix(&format!("{package_path}/"))
                 .expect("artifact path belongs to package");
             let target = package_root.join(relative);
             fs::create_dir_all(target.parent().expect("evidence target parent"))
                 .expect("create evidence target parent");
             fs::copy(source_root.join(path), &target).expect("copy live transition evidence");
         }
-        for (index, path) in targets.iter().enumerate() {
+        for (index, path) in package.targets.iter().enumerate() {
             let relative = path
-                .strip_prefix(&format!("crates/{package}/"))
+                .strip_prefix(&format!("{package_path}/"))
                 .expect("artifact path belongs to package");
             manifest.push_str(&format!(
                 "\n[[test]]\nname = \"ledger-evidence-{index}\"\npath = \"{}\"\n",
                 relative.replace('\\', "/")
             ));
         }
-        fs::write(package_root.join("Cargo.toml"), manifest).expect("write evidence manifest");
-        members.push(format!("crates/{package}"));
-        package_names.push(package.clone());
+        fs::write(manifest_path, manifest).expect("write evidence manifest");
+        members.insert(package_path.clone());
+        package_names.insert(package.name.clone());
+    }
+    for path in standalone_files {
+        let target = root.join(&path);
+        fs::create_dir_all(target.parent().expect("implementation pointer parent"))
+            .expect("create implementation pointer parent");
+        fs::copy(source_root.join(&path), target).expect("copy live implementation pointer");
     }
 
-    members.sort();
-    package_names.sort();
     fs::write(
         root.join("Cargo.toml"),
         format!(

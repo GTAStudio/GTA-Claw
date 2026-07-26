@@ -276,10 +276,53 @@ function New-SyntheticRepositoryRoot {
     }
 }
 
+function Get-TransitionCargoPackage {
+    param([string]$RepositoryPath)
+
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
+    $source = Join-Path $RepositoryRoot ($RepositoryPath.Replace("/", $separator))
+    $directory = Split-Path -Parent $source
+    while (
+        $directory.Length -ge $RepositoryRoot.Length -and
+        $directory.StartsWith($RepositoryRoot, [StringComparison]::OrdinalIgnoreCase)
+    ) {
+        $manifestPath = Join-Path $directory "Cargo.toml"
+        if (Test-Path -LiteralPath $manifestPath) {
+            $manifest = [System.IO.File]::ReadAllText($manifestPath)
+            $package = [regex]::Match(
+                $manifest,
+                "(?ms)^\[package\]\s*(.*?)(?=^\[|\z)"
+            )
+            if ($package.Success) {
+                $name = [regex]::Match(
+                    $package.Groups[1].Value,
+                    "(?m)^name\s*=\s*`"([^`"]+)`"\s*$"
+                )
+                if ($name.Success) {
+                    $relativeRoot = $directory.Substring($RepositoryRoot.Length).
+                        TrimStart($separator).
+                        Replace($separator, "/")
+                    return [pscustomobject][ordered]@{
+                        root = $relativeRoot
+                        name = $name.Groups[1].Value
+                    }
+                }
+            }
+        }
+        $parent = Split-Path -Parent $directory
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($parent, $directory)) {
+            break
+        }
+        $directory = $parent
+    }
+    return $null
+}
+
 function Install-TransitionEvidenceFixture {
     param([string]$Root)
 
     $packageFiles = @{}
+    $packageNames = @{}
     $packageTargets = @{}
     $standaloneFiles = New-Object System.Collections.Generic.List[string]
     foreach ($ledgerPath in (Get-ChildItem -LiteralPath (Join-Path $SourceRoot "ledgers") -Filter "*.json")) {
@@ -290,23 +333,20 @@ function Install-TransitionEvidenceFixture {
             }
             foreach ($artifact in $feature.acceptance_evidence.artifacts) {
                 $path = [string]$artifact.path
-                $segments = $path.Split("/")
-                if ($segments.Count -lt 4 -or $segments[0] -ne "crates") {
-                    throw "transition evidence must belong to a crate: $path"
+                $package = Get-TransitionCargoPackage $path
+                if ($null -eq $package) {
+                    throw "transition evidence must belong to a Cargo package: $path"
                 }
-                $package = $segments[1]
-                $packageFiles[$package] = @($packageFiles[$package]) + @($path)
-                $packageTargets[$package] = @($packageTargets[$package]) + @($path)
+                $packageNames[$package.root] = $package.name
+                $packageFiles[$package.root] = @($packageFiles[$package.root]) + @($path)
+                $packageTargets[$package.root] = @($packageTargets[$package.root]) + @($path)
             }
             foreach ($pointer in @($feature.implementation_pointers)) {
                 $path = [string]$pointer.path
-                if ($path.StartsWith("crates/", [StringComparison]::Ordinal)) {
-                    $segments = $path.Split("/")
-                    if ($segments.Count -lt 4) {
-                        throw "transition implementation pointer must name a crate file: $path"
-                    }
-                    $package = $segments[1]
-                    $packageFiles[$package] = @($packageFiles[$package]) + @($path)
+                $package = Get-TransitionCargoPackage $path
+                if ($null -ne $package) {
+                    $packageNames[$package.root] = $package.name
+                    $packageFiles[$package.root] = @($packageFiles[$package.root]) + @($path)
                 } else {
                     $standaloneFiles.Add($path)
                 }
@@ -319,7 +359,7 @@ function Install-TransitionEvidenceFixture {
         "crates/decoy",
         "crates/nonrunning",
         "globbed/*"
-    ) + @($packageFiles.Keys | Sort-Object | ForEach-Object { "crates/$_" })
+    ) + @($packageFiles.Keys | Sort-Object)
     $memberLines = @($members | ForEach-Object { "  `"$_`"," })
     $workspaceManifest = (
         "[workspace]`nmembers = [`n" +
@@ -333,15 +373,16 @@ function Install-TransitionEvidenceFixture {
     )
 
     $separator = [string][System.IO.Path]::DirectorySeparatorChar
-    foreach ($package in ($packageFiles.Keys | Sort-Object)) {
-        $packageRoot = Join-Path $Root ("crates" + $separator + $package)
+    foreach ($packagePath in ($packageFiles.Keys | Sort-Object)) {
+        $packageRoot = Join-Path $Root ($packagePath.Replace("/", $separator))
         New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+        $packageName = $packageNames[$packagePath]
         $manifest = (
-            "[package]`nname = `"$package`"`nversion = `"0.0.0`"`nedition = `"2024`"`n"
+            "[package]`nname = `"$packageName`"`nversion = `"0.0.0`"`nedition = `"2024`"`n"
         )
         $index = 0
-        foreach ($path in @($packageTargets[$package] | Sort-Object -Unique)) {
-            $prefix = "crates/$package/"
+        foreach ($path in @($packageTargets[$packagePath] | Sort-Object -Unique)) {
+            $prefix = "$packagePath/"
             $relative = $path.Substring($prefix.Length)
             $manifest += (
                 "`n[[test]]`nname = `"transition-evidence-$index`"`n" +
@@ -354,7 +395,7 @@ function Install-TransitionEvidenceFixture {
             $manifest,
             (New-Object System.Text.UTF8Encoding($false))
         )
-        foreach ($path in @($packageFiles[$package] | Sort-Object -Unique)) {
+        foreach ($path in @($packageFiles[$packagePath] | Sort-Object -Unique)) {
             $relativePath = $path.Replace("/", $separator)
             $source = Join-Path $RepositoryRoot $relativePath
             $destination = Join-Path $Root $relativePath

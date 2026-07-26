@@ -1181,13 +1181,25 @@ mod tests {
             "Bearer refreshed-access"
         );
         assert!(header.value.is_sensitive());
+        let authorized = oauth
+            .send_authorized(
+                Method::POST,
+                base.join("mcp").expect("MCP resource URL"),
+                HeaderMap::new(),
+                b"{\"operation\":\"tools/list\"}".to_vec(),
+                header,
+            )
+            .await
+            .expect("authorized MCP request");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(authorized.body(), b"{\"authorized\":true}");
 
         oauth.logout(&binding, &store).await.expect("logout");
         assert!(store.load(&binding).expect("load after logout").is_none());
 
         server.await.expect("fixture server task");
         let requests = requests.lock().expect("request log");
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(
             request_line(&requests[0]),
             "GET /.well-known/oauth-protected-resource HTTP/1.1"
@@ -1236,6 +1248,13 @@ mod tests {
                 ("resource".into(), base.as_str().into()),
             ])
         );
+        assert_eq!(request_line(&requests[5]), "POST /mcp HTTP/1.1");
+        let expected_authorization = ["Bearer", "refreshed-access"].join(" ");
+        assert_eq!(
+            request_headers(&requests[5]).get("authorization"),
+            Some(&expected_authorization)
+        );
+        assert_eq!(request_body(&requests[5]), "{\"operation\":\"tools/list\"}");
     }
 
     #[tokio::test]
@@ -1505,6 +1524,18 @@ mod tests {
             .collect()
     }
 
+    fn request_headers(request: &str) -> BTreeMap<String, String> {
+        request
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .map(|line| {
+                let (name, value) = line.split_once(':').expect("HTTP header");
+                (name.to_ascii_lowercase(), value.trim().to_owned())
+            })
+            .collect()
+    }
+
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 1024];
@@ -1586,7 +1617,7 @@ mod tests {
         .to_string();
         let server = tokio::spawn(async move {
             let mut token_response = 0;
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().await.expect("accept request");
                 let request = read_http_request(&mut stream).await;
                 let path = request_line(&request)
@@ -1608,6 +1639,7 @@ mod tests {
                         token_response += 1;
                         r#"{"access_token":"refreshed-access","token_type":"Bearer","expires_in":3600,"scope":"tools:read"}"#.into()
                     }
+                    "/mcp" => r#"{"authorized":true}"#.into(),
                     _ => panic!("unexpected fixture request path: {path}"),
                 };
                 request_log.lock().expect("request log").push(request);
