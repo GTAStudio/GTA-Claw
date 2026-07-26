@@ -445,7 +445,7 @@ impl CargoTestTargets {
         })
     }
 
-    fn contains(&self, path: &Path) -> bool {
+    fn contains_compiled_source(&self, path: &Path) -> bool {
         self.source_paths.contains(path)
     }
 
@@ -1204,7 +1204,7 @@ pub(crate) fn validate_evidence_as(
         }
         let is_test_target = cargo_test_targets
             .as_ref()
-            .is_some_and(|targets| targets.contains(&canonical_path));
+            .is_some_and(|targets| targets.contains_compiled_source(&canonical_path));
         if !is_test_target {
             return Err(ConformanceError::new(
                 code,
@@ -2268,7 +2268,7 @@ mod tests {
                     .join(&path)
                     .canonicalize()
                     .expect("canonical tracked Rust source");
-                let accepted = targets.contains(&canonical);
+                let accepted = targets.contains_compiled_source(&canonical);
                 (normalized_api_path(PathBuf::from(path)), accepted)
             })
             .collect::<Vec<_>>();
@@ -2684,7 +2684,7 @@ mod nested {
         ] {
             let canonical = root.join(path).canonicalize().expect("canonical source");
             assert_eq!(
-                targets.contains(&canonical),
+                targets.contains_compiled_source(&canonical),
                 listed.contains(test),
                 "reachability diverged from Cargo for {path}"
             );
@@ -2753,7 +2753,7 @@ mod nested {
             .canonicalize()
             .expect("canonical fallback decoy");
         assert!(
-            !targets.contains(&decoy),
+            !targets.contains_compiled_source(&decoy),
             "an unreadable path attribute must not fall back to the module name"
         );
         fs::remove_dir_all(root).expect("remove invalid-path oracle");
@@ -2867,7 +2867,7 @@ mod nested {
         ] {
             let canonical = root.join(path).canonicalize().expect("canonical source");
             assert_eq!(
-                targets.contains(&canonical),
+                targets.contains_compiled_source(&canonical),
                 expected,
                 "target admission diverged from Cargo for {path}"
             );
@@ -3013,7 +3013,7 @@ mod nested {
         ] {
             let canonical = root.join(path).canonicalize().expect("canonical source");
             assert_eq!(
-                targets.contains(&canonical),
+                targets.contains_compiled_source(&canonical),
                 expected,
                 "workspace admission diverged for {path}"
             );
@@ -3153,7 +3153,7 @@ mod nested {
             .canonicalize()
             .expect("canonical cross-package source");
         assert!(
-            !targets.contains(&canonical),
+            !targets.contains_compiled_source(&canonical),
             "evidence reachability must remain inside its owning package"
         );
         fs::remove_dir_all(root).expect("remove package boundary compiler oracle");
@@ -3299,7 +3299,7 @@ mod nested {
                         .join(&case.cite)
                         .canonicalize()
                         .expect("canonical cited corpus source");
-                    targets.contains(&cited)
+                    targets.contains_compiled_source(&cited)
                 }
                 Err(error) => {
                     assert!(ambiguous, "unexpected target discovery error: {error}");
