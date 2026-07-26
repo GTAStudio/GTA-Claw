@@ -198,7 +198,11 @@ pub(crate) fn scoped_state_path(
     scope: &crate::session::SessionId,
 ) -> PathBuf {
     root.join(collection)
-        .join(format!("{}.json", sha256_hex(scope.as_str().as_bytes())))
+        .join(format!("{}.json", scope_key(scope)))
+}
+
+pub(crate) fn scope_key(scope: &crate::session::SessionId) -> String {
+    sha256_hex(scope.as_str().as_bytes())
 }
 
 pub(crate) fn read_json<T: DeserializeOwned>(
@@ -329,17 +333,19 @@ pub(crate) fn quarantine_corrupt_state(path: &Path) -> Result<PathBuf, Persisten
             "{file_name}.corrupt-{millis}-{}-{sequence}",
             std::process::id()
         ));
-        match fs::hard_link(&path, &backup) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+        match backup.try_exists() {
+            Ok(true) => continue,
+            Ok(false) => {}
             Err(source) => {
-                return Err(PersistenceError::io("quarantine", &path, source));
+                return Err(PersistenceError::io(
+                    "inspect corrupt-state backup",
+                    &backup,
+                    source,
+                ));
             }
         }
-        sync_parent(&backup)
-            .map_err(|source| PersistenceError::io("synchronize parent of", &backup, source))?;
-        fs::remove_file(&path)
-            .map_err(|source| PersistenceError::io("remove quarantined state", &path, source))?;
+        fs::rename(&path, &backup)
+            .map_err(|source| PersistenceError::io("quarantine", &path, source))?;
         sync_parent(&path)
             .map_err(|source| PersistenceError::io("synchronize parent of", &path, source))?;
         return Ok(backup);
@@ -375,6 +381,7 @@ fn prepare_destination(path: &Path) -> Result<PathBuf, PersistenceError> {
     let canonical_parent = fs::canonicalize(parent)
         .map_err(|source| PersistenceError::io("canonicalize parent for", &path, source))?;
     reject_unsafe_ancestors(&canonical_parent)?;
+    ensure_canonical_parent(parent, &canonical_parent)?;
     let destination = canonical_parent.join(file_name);
     match fs::symlink_metadata(&destination) {
         Ok(metadata) => {
@@ -426,7 +433,43 @@ fn prepare_lock_path(path: &Path) -> Result<PathBuf, PersistenceError> {
     let canonical_parent = fs::canonicalize(parent)
         .map_err(|source| PersistenceError::io("canonicalize parent for", &path, source))?;
     reject_unsafe_ancestors(&canonical_parent)?;
+    ensure_canonical_parent(parent, &canonical_parent)?;
     Ok(canonical_parent.join(file_name))
+}
+
+fn ensure_canonical_parent(parent: &Path, canonical: &Path) -> Result<(), PersistenceError> {
+    if same_path_location(parent, canonical)? {
+        return Ok(());
+    }
+    Err(PersistenceError::io(
+        "confine",
+        parent,
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state parent resolved outside its validated lexical path",
+        ),
+    ))
+}
+
+#[cfg(not(windows))]
+fn same_path_location(left: &Path, right: &Path) -> Result<bool, PersistenceError> {
+    Ok(absolute_lexical_path(left)? == absolute_lexical_path(right)?)
+}
+
+#[cfg(windows)]
+fn same_path_location(left: &Path, right: &Path) -> Result<bool, PersistenceError> {
+    fn normalized(path: &Path) -> String {
+        let value = path.to_string_lossy().replace('/', "\\");
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}").to_ascii_lowercase();
+        }
+        value
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&value)
+            .to_ascii_lowercase()
+    }
+
+    Ok(normalized(&absolute_lexical_path(left)?) == normalized(&absolute_lexical_path(right)?))
 }
 
 fn ensure_directory_chain(path: &Path) -> Result<(), PersistenceError> {

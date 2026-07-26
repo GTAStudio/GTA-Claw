@@ -467,6 +467,57 @@ fn transcript_search_and_backward_browse_are_deterministic_and_isolated() {
             .collect::<Vec<_>>(),
         vec![first.id, second.id]
     );
+    let complex_query = (0..33)
+        .map(|index| format!("term{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(matches!(
+        store.search(&alpha, &complex_query, 5),
+        Err(TranscriptError::QueryTooComplex)
+    ));
+}
+
+#[test]
+fn state_documents_are_bound_to_their_scope() {
+    let root = TempDir::new("scope-binding");
+    let alpha = scope("binding-alpha");
+    let beta = scope("binding-beta");
+    let store = DurableMemoryStore::new(root.path(), 500, 500).expect("valid limits");
+    store
+        .add(&alpha, MemoryTarget::Memory, "alpha-only state", 1)
+        .expect("write alpha");
+    let alpha_path = only_state_file(root.path(), "memory");
+    let alpha_bytes = fs::read(&alpha_path).expect("read alpha state");
+    store
+        .add(&beta, MemoryTarget::Memory, "beta-only state", 2)
+        .expect("write beta");
+    let beta_path = fs::read_dir(root.path().join("memory"))
+        .expect("memory directory")
+        .map(|entry| entry.expect("memory entry").path())
+        .find(|path| path.extension().is_some_and(|value| value == "json") && *path != alpha_path)
+        .expect("beta state path");
+    fs::write(&beta_path, &alpha_bytes).expect("copy alpha state over beta path");
+
+    assert!(
+        store
+            .list(&beta, MemoryTarget::Memory, 0, 20)
+            .expect("cross-scope state is quarantined")
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list(&alpha, MemoryTarget::Memory, 0, 20)
+            .expect("alpha remains intact")
+            .entries[0]
+            .content,
+        "alpha-only state"
+    );
+    assert!(
+        corrupt_backups(root.path(), "memory")
+            .iter()
+            .any(|backup| fs::read(backup).expect("read quarantine") == alpha_bytes)
+    );
 }
 
 #[test]

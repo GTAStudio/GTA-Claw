@@ -1,7 +1,7 @@
 //! Durable transcript append, search, and backward browsing.
 
-use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::{
     PersistenceError, ScopeLocks, atomic_write_json, quarantine_corrupt_state, read_json,
-    scoped_state_path,
+    scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, normalize_for_matching, scan_persistent_content};
 use crate::session::SessionId;
@@ -25,6 +25,7 @@ const MAX_RETAINED_CONTENT_CHARS: usize = 50_000_000;
 const MAX_TRANSCRIPT_STATE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_TRANSCRIPT_QUERY_CHARS: usize = 500;
 const MAX_TRANSCRIPT_QUERY_BYTES: usize = MAX_TRANSCRIPT_QUERY_CHARS * 4;
+const MAX_TRANSCRIPT_QUERY_TERMS: usize = 32;
 const MAX_TRANSCRIPT_RESULT_LIMIT: usize = 10;
 const TRUNCATION_MARKER: &str = "\n[transcript truncated]";
 const BLOCKED_TRANSCRIPT_CONTENT: &str = "[blocked unsafe historical content]";
@@ -144,6 +145,8 @@ pub enum TranscriptError {
     EmptyQuery,
     /// Search text exceeded its character bound.
     QueryTooLong,
+    /// Search text contained too many distinct terms.
+    QueryTooComplex,
     /// A browse or search result limit was outside `1..=10`.
     InvalidResultLimit,
     /// A backward-browse anchor was not present in the configured scope view.
@@ -171,6 +174,9 @@ impl Display for TranscriptError {
             Self::QueryTooLong => {
                 formatter.write_str("transcript query must be at most 500 characters")
             }
+            Self::QueryTooComplex => {
+                formatter.write_str("transcript query must contain at most 32 distinct terms")
+            }
             Self::InvalidResultLimit => {
                 formatter.write_str("transcript result limit must be from 1 to 10")
             }
@@ -194,6 +200,7 @@ impl Error for TranscriptError {
             | Self::CapacityExceeded { .. }
             | Self::EmptyQuery
             | Self::QueryTooLong
+            | Self::QueryTooComplex
             | Self::InvalidResultLimit
             | Self::AnchorNotFound
             | Self::IdentifierExhausted => None,
@@ -285,22 +292,24 @@ impl DurableTranscriptStore {
         limit: usize,
     ) -> Result<TranscriptPage, TranscriptError> {
         validate_result_limit(limit)?;
-        self.run_scoped(scope, || {
-            let document = self.read_document(scope)?;
-            let messages = self.configured_view(&document);
-            let end = match before {
-                None => messages.len(),
-                Some(anchor) => messages
-                    .iter()
-                    .position(|message| message.id == *anchor)
-                    .ok_or(TranscriptError::AnchorNotFound)?,
-            };
-            let start = end.saturating_sub(limit);
-            Ok(TranscriptPage {
-                messages: messages[start..end].iter().map(visible_message).collect(),
-                has_more: start > 0,
-                warning: TRANSCRIPT_WARNING,
-            })
+        let document = self.run_scoped(scope, || self.read_document(scope))?;
+        let messages = self.configured_view(&document);
+        let end = match before {
+            None => messages.len(),
+            Some(anchor) => messages
+                .iter()
+                .position(|message| message.id == *anchor)
+                .ok_or(TranscriptError::AnchorNotFound)?,
+        };
+        let start = end.saturating_sub(limit);
+        Ok(TranscriptPage {
+            messages: messages[start..end]
+                .iter()
+                .map(|message| limit_stored_message(message, self.content_char_limit))
+                .map(|message| visible_message(&message))
+                .collect(),
+            has_more: start > 0,
+            warning: TRANSCRIPT_WARNING,
         })
     }
 
@@ -323,38 +332,47 @@ impl DurableTranscriptStore {
             return Err(TranscriptError::QueryTooLong);
         }
         let query = query.to_owned();
-        self.run_scoped(scope, || {
-            let document = self.read_document(scope)?;
-            let messages = self.configured_view(&document);
-            let mut ranked = rank_messages(&messages, &query);
-            ranked.truncate(limit);
-            Ok(TranscriptSearch {
-                query,
-                hits: ranked
-                    .into_iter()
-                    .map(|candidate| TranscriptHit {
-                        message: visible_message(&candidate.message),
+        let normalized_query = normalize_for_matching(&query);
+        let terms = tokenize(&normalized_query);
+        if terms.len() > MAX_TRANSCRIPT_QUERY_TERMS {
+            return Err(TranscriptError::QueryTooComplex);
+        }
+        let document = self.run_scoped(scope, || self.read_document(scope))?;
+        let messages = self.configured_view(&document);
+        let ranked = rank_messages(
+            messages,
+            &normalized_query,
+            &terms,
+            self.content_char_limit,
+            limit,
+        );
+        Ok(TranscriptSearch {
+            query,
+            hits: ranked
+                .into_iter()
+                .map(|candidate| {
+                    let message = limit_stored_message(candidate.message, self.content_char_limit);
+                    TranscriptHit {
+                        message: visible_message(&message),
                         score: candidate.score,
-                    })
-                    .collect(),
-                warning: TRANSCRIPT_WARNING,
-            })
+                    }
+                })
+                .collect(),
+            warning: TRANSCRIPT_WARNING,
         })
     }
 
-    fn configured_view(&self, document: &TranscriptDocument) -> Vec<TranscriptMessage> {
+    fn configured_view<'a>(&self, document: &'a TranscriptDocument) -> &'a [TranscriptMessage] {
         let start = document.messages.len().saturating_sub(self.max_messages);
-        document.messages[start..]
-            .iter()
-            .map(|message| limit_stored_message(message, self.content_char_limit))
-            .collect()
+        &document.messages[start..]
     }
 
     fn read_document(&self, scope: &SessionId) -> Result<TranscriptDocument, TranscriptError> {
         let path = self.file_path(scope);
+        let expected_scope = scope_key(scope);
         let loaded = match read_json::<TranscriptDocumentWire>(&path, MAX_TRANSCRIPT_STATE_BYTES) {
             Ok(None) => return Ok(TranscriptDocument::empty()),
-            Ok(Some(wire)) => TranscriptDocument::from_wire(wire, &path),
+            Ok(Some(wire)) => TranscriptDocument::from_wire(wire, &path, &expected_scope),
             Err(error) => Err(error),
         };
         match loaded {
@@ -376,7 +394,7 @@ impl DurableTranscriptStore {
     ) -> Result<(), TranscriptError> {
         atomic_write_json(
             &self.file_path(scope),
-            &document.to_wire(),
+            &document.to_wire(&scope_key(scope)),
             MAX_TRANSCRIPT_STATE_BYTES,
         )
         .map_err(Into::into)
@@ -469,39 +487,79 @@ fn visible_message(message: &TranscriptMessage) -> VisibleTranscriptMessage {
     }
 }
 
-struct RankedMessage {
-    message: TranscriptMessage,
+struct RankedMessage<'a> {
+    message: &'a TranscriptMessage,
     score: u32,
 }
 
-fn rank_messages(messages: &[TranscriptMessage], query: &str) -> Vec<RankedMessage> {
-    let normalized_query = normalize_for_matching(query);
-    let terms = tokenize(&normalized_query);
-    let mut ranked = messages
-        .iter()
-        .filter_map(|message| {
-            let content = normalize_for_matching(&message.content);
-            let mut score = u32::from(content.contains(&normalized_query)).saturating_mul(20);
-            let mut all_terms_match = true;
-            for term in &terms {
-                let occurrences = count_occurrences(&content, term);
-                all_terms_match &= occurrences > 0;
-                score = score.saturating_add(u32::try_from(occurrences).unwrap_or(u32::MAX));
-            }
-            (score > 0 && (all_terms_match || terms.is_empty())).then_some(RankedMessage {
-                message: message.clone(),
-                score,
-            })
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| right.message.unix_millis.cmp(&left.message.unix_millis))
-            .then_with(|| left.message.id.cmp(&right.message.id))
-    });
+fn rank_messages<'a>(
+    messages: &'a [TranscriptMessage],
+    normalized_query: &str,
+    terms: &BTreeSet<String>,
+    content_limit: usize,
+    result_limit: usize,
+) -> Vec<RankedMessage<'a>> {
+    let mut ranked = Vec::with_capacity(result_limit);
+    for message in messages {
+        let configured = configured_content(message, content_limit);
+        let content = normalize_for_matching(&configured);
+        let phrase_score = u32::from(content.contains(normalized_query)).saturating_mul(20);
+        let Some(term_score) = matching_term_score(&content, terms) else {
+            continue;
+        };
+        let score = phrase_score.saturating_add(term_score);
+        if score == 0 {
+            continue;
+        }
+        ranked.push(RankedMessage { message, score });
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.message.unix_millis.cmp(&left.message.unix_millis))
+                .then_with(|| left.message.id.cmp(&right.message.id))
+        });
+        ranked.truncate(result_limit);
+    }
     ranked
+}
+
+fn configured_content(message: &TranscriptMessage, limit: usize) -> Cow<'_, str> {
+    if message.content.chars().take(limit + 1).count() <= limit {
+        Cow::Borrowed(&message.content)
+    } else {
+        Cow::Owned(limit_content(&message.content, limit).0)
+    }
+}
+
+fn matching_term_score(value: &str, terms: &BTreeSet<String>) -> Option<u32> {
+    if terms.is_empty() {
+        return Some(0);
+    }
+    let mut counts = BTreeMap::<&str, u32>::new();
+    let mut current = String::new();
+    let mut count_token = |token: &str| {
+        if token.chars().count() > 1
+            && let Some(term) = terms.get(token)
+        {
+            counts
+                .entry(term)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
+    };
+    for character in value.chars() {
+        if character.is_alphanumeric() || matches!(character, '_' | '-') {
+            current.push(character);
+        } else if !current.is_empty() {
+            count_token(&current);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        count_token(&current);
+    }
+    (counts.len() == terms.len()).then(|| counts.values().copied().fold(0_u32, u32::saturating_add))
 }
 
 fn tokenize(value: &str) -> BTreeSet<String> {
@@ -524,17 +582,11 @@ fn tokenize(value: &str) -> BTreeSet<String> {
     tokens
 }
 
-fn count_occurrences(value: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    value.match_indices(needle).count()
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TranscriptDocumentWire {
     version: u32,
+    scope: String,
     next_id: u64,
     messages: Vec<TranscriptMessageWire>,
 }
@@ -571,11 +623,21 @@ impl TranscriptDocument {
         }
     }
 
-    fn from_wire(wire: TranscriptDocumentWire, path: &Path) -> Result<Self, PersistenceError> {
+    fn from_wire(
+        wire: TranscriptDocumentWire,
+        path: &Path,
+        expected_scope: &str,
+    ) -> Result<Self, PersistenceError> {
         if wire.version != TRANSCRIPT_FILE_VERSION {
             return Err(PersistenceError::corrupt(
                 path,
                 format!("unsupported transcript state version {}", wire.version),
+            ));
+        }
+        if wire.scope != expected_scope {
+            return Err(PersistenceError::corrupt(
+                path,
+                "transcript state belongs to a different scope",
             ));
         }
         if wire.messages.len() > MAX_TRANSCRIPT_MESSAGES {
@@ -626,16 +688,13 @@ impl TranscriptDocument {
                         "transcript exceeds its structural retained-character capacity",
                     ));
                 }
-                let unsafe_reason = message
-                    .unsafe_reason
-                    .or_else(|| scan_persistent_content(&message.content).reason());
                 Ok(TranscriptMessage {
                     id,
                     role: message.role.into(),
                     content: message.content,
                     unix_millis: message.unix_millis,
                     truncated: message.truncated,
-                    unsafe_reason,
+                    unsafe_reason: message.unsafe_reason,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -645,9 +704,10 @@ impl TranscriptDocument {
         })
     }
 
-    fn to_wire(&self) -> TranscriptDocumentWire {
+    fn to_wire(&self, scope: &str) -> TranscriptDocumentWire {
         TranscriptDocumentWire {
             version: TRANSCRIPT_FILE_VERSION,
+            scope: scope.to_owned(),
             next_id: self.next_id,
             messages: self
                 .messages
@@ -701,28 +761,5 @@ impl From<TranscriptRoleWire> for TranscriptRole {
             TranscriptRoleWire::User => Self::User,
             TranscriptRoleWire::Assistant => Self::Assistant,
         }
-    }
-}
-
-impl PartialEq for RankedMessage {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.message == other.message
-    }
-}
-
-impl Eq for RankedMessage {}
-
-impl PartialOrd for RankedMessage {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RankedMessage {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .cmp(&other.score)
-            .then_with(|| self.message.unix_millis.cmp(&other.message.unix_millis))
-            .then_with(|| other.message.id.cmp(&self.message.id))
     }
 }

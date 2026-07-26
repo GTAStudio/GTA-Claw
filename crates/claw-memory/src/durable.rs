@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::{
     PersistenceError, ScopeLocks, atomic_write_json, quarantine_corrupt_state, read_json,
-    scoped_state_path,
+    scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, scan_persistent_content};
 use crate::session::SessionId;
@@ -474,9 +474,10 @@ impl DurableMemoryStore {
 
     fn read_document(&self, scope: &SessionId) -> Result<MemoryDocument, DurableMemoryError> {
         let path = self.file_path(scope);
+        let expected_scope = scope_key(scope);
         let loaded = match read_json::<MemoryDocumentWire>(&path, MAX_MEMORY_STATE_BYTES) {
             Ok(None) => return Ok(MemoryDocument::empty()),
-            Ok(Some(wire)) => MemoryDocument::from_wire(wire, &path),
+            Ok(Some(wire)) => MemoryDocument::from_wire(wire, &path, &expected_scope),
             Err(error) => Err(error),
         };
         match loaded {
@@ -498,7 +499,7 @@ impl DurableMemoryStore {
     ) -> Result<(), DurableMemoryError> {
         atomic_write_json(
             &self.file_path(scope),
-            &document.to_wire(),
+            &document.to_wire(&scope_key(scope)),
             MAX_MEMORY_STATE_BYTES,
         )
         .map_err(Into::into)
@@ -605,6 +606,7 @@ fn indent(value: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct MemoryDocumentWire {
     version: u32,
+    scope: String,
     next_id: u64,
     memory: Vec<MemoryEntryWire>,
     user_profile: Vec<MemoryEntryWire>,
@@ -634,11 +636,21 @@ impl MemoryDocument {
         }
     }
 
-    fn from_wire(wire: MemoryDocumentWire, path: &Path) -> Result<Self, PersistenceError> {
+    fn from_wire(
+        wire: MemoryDocumentWire,
+        path: &Path,
+        expected_scope: &str,
+    ) -> Result<Self, PersistenceError> {
         if wire.version != MEMORY_FILE_VERSION {
             return Err(PersistenceError::corrupt(
                 path,
                 format!("unsupported memory state version {}", wire.version),
+            ));
+        }
+        if wire.scope != expected_scope {
+            return Err(PersistenceError::corrupt(
+                path,
+                "memory state belongs to a different scope",
             ));
         }
         let mut identifiers = BTreeSet::new();
@@ -660,9 +672,10 @@ impl MemoryDocument {
         })
     }
 
-    fn to_wire(&self) -> MemoryDocumentWire {
+    fn to_wire(&self, scope: &str) -> MemoryDocumentWire {
         MemoryDocumentWire {
             version: MEMORY_FILE_VERSION,
+            scope: scope.to_owned(),
             next_id: self.next_id,
             memory: self.memory.iter().map(MemoryEntryWire::from).collect(),
             user_profile: self
