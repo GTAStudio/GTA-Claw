@@ -633,6 +633,118 @@ async fn absent_rate_limit_is_explicitly_unlimited() {
 }
 
 #[tokio::test]
+async fn main_and_mcp_listeners_have_independent_peer_budgets() {
+    let mut rate_config = config();
+    rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    let server = spawn_with(rate_config, DeterministicRuntime::new()).await;
+    let model_body =
+        json!({"id":"openclaw","object":"model","created":0,"owned_by":"openclaw","permission":[]});
+
+    for _ in 0..2 {
+        let model = request(
+            &server,
+            "GET",
+            "/v1/models/openclaw",
+            Some("operator-token"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(model.status, 200);
+        assert_eq!(model.json(), model_body);
+    }
+    let main_limited = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(main_limited.status, 429);
+    assert_eq!(main_limited.body, br#"{"error":"Too many requests"}"#);
+
+    let mcp_after_main_exhaustion = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "jsonrpc":"2.0","id":"mcp-after-main","method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        })),
+    )
+    .await;
+    assert_eq!(mcp_after_main_exhaustion.status, 200);
+    assert_eq!(
+        mcp_after_main_exhaustion.json(),
+        json!({
+            "jsonrpc":"2.0","id":"mcp-after-main",
+            "result":{
+                "protocolVersion":"2024-11-05",
+                "capabilities":{"tools":{}},
+                "serverInfo":{"name":"openclaw","version":"0.1.0"}
+            }
+        })
+    );
+
+    let mut second_rate_config = config();
+    second_rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    let second_server = spawn_with(second_rate_config, DeterministicRuntime::new()).await;
+    for id in ["first", "second"] {
+        let mcp = mcp_request(
+            &second_server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(json!({
+                "jsonrpc":"2.0","id":id,"method":"initialize",
+                "params":{"protocolVersion":"2024-11-05"}
+            })),
+        )
+        .await;
+        assert_eq!(mcp.status, 200);
+        assert_eq!(
+            mcp.json(),
+            json!({
+                "jsonrpc":"2.0","id":id,
+                "result":{
+                    "protocolVersion":"2024-11-05",
+                    "capabilities":{"tools":{}},
+                    "serverInfo":{"name":"openclaw","version":"0.1.0"}
+                }
+            })
+        );
+    }
+    let mcp_limited = mcp_request(
+        &second_server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(json!({
+            "jsonrpc":"2.0","id":"third","method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        })),
+    )
+    .await;
+    assert_eq!(mcp_limited.status, 429);
+    assert_eq!(mcp_limited.body, br#"{"error":"Too many requests"}"#);
+
+    let main_after_mcp_exhaustion = request(
+        &second_server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(main_after_mcp_exhaustion.status, 200);
+    assert_eq!(main_after_mcp_exhaustion.json(), model_body);
+}
+
+#[tokio::test]
 async fn cors_allows_only_explicit_origins_and_preserves_authentication() {
     let runtime = DeterministicRuntime::new();
     let mut cors_config = config();
