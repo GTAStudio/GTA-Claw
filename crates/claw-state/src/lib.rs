@@ -5018,20 +5018,24 @@ mod tests {
             .expect("create WAL frame behind reader");
 
         let started = std::time::Instant::now();
-        assert!(matches!(
-            store
-                .checkpoint()
-                .await
-                .expect_err("busy checkpoint reaches operation deadline"),
-            StateError::OperationCleanupFailed {
-                operation: "checkpoint SQLite WAL",
-                primary,
-                ref cleanup,
-            } if *primary == StateError::OperationTimedOut {
-                operation: "checkpoint SQLite WAL",
-                timeout_ms: 500,
-            } && cleanup.contains("Quarantined")
-        ));
+        let checkpoint_error = store
+            .checkpoint()
+            .await
+            .expect_err("busy checkpoint reaches operation deadline");
+        assert!(
+            matches!(
+                checkpoint_error,
+                StateError::OperationCleanupFailed {
+                    operation: "checkpoint SQLite WAL",
+                    ref primary,
+                    ref cleanup,
+                } if **primary == StateError::OperationTimedOut {
+                    operation: "checkpoint SQLite WAL",
+                    timeout_ms: 500,
+                } && cleanup.contains("Quarantined")
+            ),
+            "{checkpoint_error:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         reader
             .execute("ROLLBACK")
