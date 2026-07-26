@@ -1159,13 +1159,22 @@ function Get-RustTokens {
     # and the test stops being visible. Dropping those bytes silently, as an
     # earlier port did, accepted sources the normative rule rejects.
     #
-    # -WithStrings is a LOCAL extension with no counterpart in the normative Rust
-    # tokenizer. It emits "s:<value>" in place of "lit" for quoted strings and
-    # "=" in place of "oth" for an equals sign, so the locally owned Cargo
-    # reachability rule below can read a #[path = "..."] attribute value. It is
-    # otherwise the same stream. The oracle never passes it, so the token stream
-    # the oracle sees stays byte-identical to the Rust original; the differential
-    # is run against the default path to keep that honest.
+    # -WithStrings is a PowerShell-only invocation mode, not a divergent rule. It
+    # emits "s:<value>" in place of "lit" for quoted strings and "=" in place of
+    # "oth" for an equals sign, so the Cargo reachability rule below can read a
+    # #[path = "..."] attribute value. Both distinctions exist on the Rust side
+    # too: crates/claw-conformance/src/claims.rs carries them as the RustToken
+    # variants StringLiteral and Equals, produced by rust_tokens and consumed by
+    # path_attribute, which matches exactly [Ident("path"), Equals,
+    # StringLiteral(value)]. What has no Rust counterpart is the switch, because
+    # that implementation reads the tokens directly instead of re-serialising
+    # them to a string stream. The distinction is shared; only the plumbing is
+    # local.
+    #
+    # Default mode is unchanged and remains the enabled-test follower stream that
+    # the oracle consumes. The oracle never passes -WithStrings, so the stream it
+    # sees stays byte-identical to the Rust original; the differential is run
+    # against the default path to keep that honest.
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $length = $bytes.Length
     $tokens = New-Object System.Collections.Generic.List[string]
@@ -1865,8 +1874,18 @@ function Assert-RustTestSymbol {
 # ---------------------------------------------------------------------------
 # Cargo target reachability.
 #
-# LOCALLY OWNED rule. This is NOT part of the ported enabled-test oracle and has
-# no counterpart in crates/claw-conformance yet; see README.md.
+# SHARED rule, not locally owned. crates/claw-conformance/src/claims.rs
+# implements the same reachability semantics: CargoTestTargets::load discovers
+# the targets, uses_standard_test_harness applies the harness = false exclusion,
+# and reachable_rust_sources follows mod declarations and #[path = "..."] to
+# build the reachable set, mirroring Get-CrateCompiledFileSet and
+# Get-RustModuleReferences below. Agreement was verified at commit
+# 1296e69f0efeb1c30f97e1fc405bc921f77cb43a and is replayed, not assumed:
+# reachability-corpus.json encodes synthetic workspaces that both sides must
+# answer identically. See README.md.
+#
+# The corpus proves agreement only for the shapes it encodes. It is not an
+# exhaustive proof of reachability behaviour outside them.
 #
 # A structurally perfect, enabled #[test] in a .rs file that no Cargo target
 # compiles never runs. An author could add crates/foo/src/orphan.rs, never

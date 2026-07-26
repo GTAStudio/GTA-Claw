@@ -342,8 +342,24 @@ Three limits, stated plainly rather than left to be discovered:
 - It proves a file is compiled and a test is enabled. It does not prove the test
   passes; that is `cargo test`'s job.
 
-This rule is **shared, not locally owned**. `crates/claw-conformance` implements
-the same rule — "a target root, or reachable from a target root" — after a
+This rule is **shared, not locally owned**, and the sharing is replayed rather
+than asserted. `crates/claw-conformance/src/claims.rs` implements the same rule —
+"a target root, or reachable from a target root" — in `CargoTestTargets::load`
+(target discovery), `uses_standard_test_harness` (the `harness = false`
+exclusion described above) and `reachable_rust_sources` (`mod` and
+`#[path = "..."]` traversal). Those mirror `Get-CrateCompiledFileSet`,
+`Get-RustModuleReferences` and `Assert-EvidenceFileIsCompiled` in `validate.ps1`.
+
+Agreement was verified at commit `1296e69f0efeb1c30f97e1fc405bc921f77cb43a`, on
+both sides: `validate.ps1` replays `reachability-corpus.json` on every run, and
+the Rust side replays the same file in
+`claims::tests::shared_reachability_corpus_matches_cargo`. Neither side is
+normative and neither may edit a case to match itself; every expectation was
+produced by running Cargo against the fixture. The corpus proves agreement only
+for the shapes it encodes — it is not an exhaustive proof of reachability
+behaviour outside them.
+
+The rule was settled after a
 proposal to require the cited file to *be* a target root was put to the
 compatibility owner and then withdrawn: target-root-only left, at the time it was
 proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
