@@ -23,8 +23,10 @@ use desktop_supply_chain_policy::ownership::{
     validate_codeowners_text,
 };
 use desktop_supply_chain_policy::policy::{
-    bootstrap_fingerprint, bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
-    validate_casefold_paths, validate_final_static, write_final_dependency_fixtures,
+    BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, bootstrap_fingerprint,
+    bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
+    validate_build_artifact_pin_table, validate_casefold_paths, validate_final_static,
+    write_bootstrap_snapshot, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
 use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
@@ -395,8 +397,8 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "69d4dd13274184df81e40850af72b43a61616d39053756e4b9af048c6258d300",
     "9753cc1eadca7a09df356d08dafec088e646c94c0ce2868f84710df1943a2441",
     "3467fde87a6a406cc94335bd2bd63f0b8e3522c134e063976328a630de1dcaa7",
-    "75cb7f837f26e830939ba4367817b0de70c2e3d9adc3b84e7e65fa9064d020ab",
-    "579a3c2a71181662079aaf327014ea83086ad3f2ba820b90f49888aaa4cc2f83",
+    "1da40175a7d23d22a337c66d4142ff085d3ab600132af3a9b542e3c84db2ca9d",
+    "a6203dbf4d210e5e11ba68275ed600aac157a4d45adc3bea2a45027deebe6884",
     "167036eb447029f002f216247434daa4bb2e4134c0d5bc93267aaed0cc069327",
     "a8bbfc6d471d39ed81ad4676e57f477b5b50afd82129068eb6bc6d6f57733342",
     "a20a835fd001a0eca4eb665cf735848ff18c5fa311de33e905d6306f31bc3140",
@@ -404,13 +406,13 @@ const P04F_MUTATED_ARTIFACT_SHA256: [&str; 48] = [
     "ec82eef948d01d5cab301b32086204cb966db73dd01644070f6c6777a4b45924",
     "0bdd763bd89d491d9b8b35421b4ad3654a4679c86f1822bbf1c909c87374e00e",
     "5aee908db7a976b943b26425e848cfa90931ee626f804e39cb252486cf047383",
-    "3f051c251bafdf3a6b0f14c37e21ffdb1ef92c7e3bea0d303341544e7e0e0374",
-    "b5c925fa778bb9e0199b48b60eb8cfdc39c414c91cf9d9f02ce1cbadb511e1ff",
-    "98067986b73b2e60c3e49c54db9c255c041bcf40710f3a993f1eeedc98f84685",
-    "fa4fd6982b510690dc10aec44125af48bd4365a76be708650f5759b7598ea274",
-    "347bf30ac68502a5bc0f76186f59be0c4aab3ca708581e6ebd46e2062b326393",
-    "fe56db78495e1ae5104940a929f0178466c7c350c78b129e24594a578e2051c8",
-    "420e9159c23eae96a5b7c8fbdd1e84fead0e99e83b88a90b42bad93872947e4b",
+    "ccb878d811465ad1005d7bf4792506cde121e17cbeee566b244eeb05265800cc",
+    "4ae7bed67b0afe8d76e1fb6503497b1563d4b256b715e78d71029c875409a032",
+    "1b7b2da40c6655a218b0c7e20d844280df99d2cb9b09f7c20d689d5ff1183d08",
+    "14275c8e0e44b039a72082688afc2a6411eba71a96390d28247bf5802509c8ef",
+    "20a72617566a38befd9e48ae5ef899e8e41de2e15b4ad2b9b4a4c22549c8ee92",
+    "9492af801047bb872e00cbf2f458da57103af236b9f1e18ea2e3ef52284eb942",
+    "24e97bd0ff76612445f7ed60adefa4d5f22154c77c1c54602e8caeec8302f957",
     "6323a7af697145771d2c7347e8d58b7473a03aebdd9f4f454373265cd878b109",
     "6f9e9832a4b82fb713d312da5003f65c5c95324fc10a1ec64f5f59cc28bafcb0",
     "d25d49c53c9c183dd0686e25d714c17a8658992615b1c51b5154af2d5795eec7",
@@ -558,55 +560,21 @@ fn copy_repo(label: &str) -> TempTree {
     tree
 }
 
-fn read_u32(bytes: &[u8], offset: &mut usize) -> u32 {
-    let end = offset.checked_add(4).expect("snapshot u32 offset");
-    let value = u32::from_le_bytes(
-        bytes[*offset..end]
-            .try_into()
-            .expect("snapshot contains complete u32"),
-    );
-    *offset = end;
-    value
-}
-
-fn read_u64(bytes: &[u8], offset: &mut usize) -> u64 {
-    let end = offset.checked_add(8).expect("snapshot u64 offset");
-    let value = u64::from_le_bytes(
-        bytes[*offset..end]
-            .try_into()
-            .expect("snapshot contains complete u64"),
-    );
-    *offset = end;
-    value
-}
-
 fn bootstrap_tree(label: &str) -> TempTree {
     let tree = TempTree::new(label);
     let snapshot = fs::read(
         repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
     )
     .expect("read immutable bootstrap snapshot");
-    assert!(snapshot.starts_with(b"GTABOOT1"));
-    let mut offset = 8;
-    let count = read_u32(&snapshot, &mut offset);
-    assert_eq!(count, 28);
-    for _ in 0..count {
-        let path_length = read_u32(&snapshot, &mut offset) as usize;
-        let data_length =
-            usize::try_from(read_u64(&snapshot, &mut offset)).expect("snapshot data length");
-        let path_end = offset.checked_add(path_length).expect("snapshot path end");
-        let path = std::str::from_utf8(&snapshot[offset..path_end])
-            .expect("snapshot path is UTF-8")
-            .to_owned();
-        offset = path_end;
-        let data_end = offset.checked_add(data_length).expect("snapshot data end");
-        let destination = tree.join(&path);
+    let archive =
+        BootstrapSnapshotArchive::parse(&snapshot).expect("parse immutable bootstrap snapshot");
+    assert_eq!(archive.entries().len(), 28);
+    for (path, payload) in archive.entries() {
+        let destination = tree.join(path);
         fs::create_dir_all(destination.parent().expect("snapshot path parent"))
             .expect("create snapshot parent");
-        fs::write(destination, &snapshot[offset..data_end]).expect("write snapshot file");
-        offset = data_end;
+        fs::write(destination, payload).expect("write snapshot file");
     }
-    assert_eq!(offset, snapshot.len());
     copy_directory(
         &repo_root().join(".github/trusted/desktop-supply-chain-policy"),
         &tree.join(".github/trusted/desktop-supply-chain-policy"),
@@ -1074,7 +1042,7 @@ fn local_actionlint() -> Option<ActionlintTool> {
 
 fn fake_manifest(path: &Path, relevant: bool) {
     let changed = if relevant {
-        "desktop/Cargo.toml"
+        "desktop/deny.toml"
     } else {
         "crates/claw-domain/src/lib.rs"
     };
@@ -1090,6 +1058,166 @@ fn fake_manifest(path: &Path, relevant: bool) {
         },
     )
     .expect("write fake trusted manifest");
+}
+
+#[test]
+fn residual_bootstrap_coupling_does_not_shadow_workflow_or_static_diagnostics() {
+    let cases = [
+        (
+            "protected-workflow",
+            AUTHORITATIVE_PATH,
+            "\n# planted protected workflow mutation\n",
+            format!("protected workflow changed: {AUTHORITATIVE_PATH}"),
+        ),
+        (
+            "root-static",
+            "deny.toml",
+            "\n# planted root policy mutation\n",
+            "exact security policy file changed: deny.toml".to_owned(),
+        ),
+    ];
+    for (label, changed_path, suffix, expected) in cases {
+        let trusted = bootstrap_tree(&format!("{label}-trusted"));
+        let candidate = final_tree(&format!("{label}-candidate"));
+        for protected in [CODEOWNERS_PATH, AUTHORITATIVE_PATH, BOOTSTRAP_PATH] {
+            fs::copy(trusted.join(protected), candidate.join(protected))
+                .expect("align protected Bootstrap fixture bytes");
+        }
+        let path = candidate.join(changed_path);
+        let mut bytes = fs::read(&path).expect("read planted ordering input");
+        bytes.extend_from_slice(suffix.as_bytes());
+        fs::write(path, bytes).expect("write planted ordering mutation");
+        let artifacts = TempTree::new(&format!("{label}-artifacts"));
+        let changes = artifacts.join("changes.json");
+        write_manifest(
+            &changes,
+            &ChangeManifest {
+                base: "1111111111111111111111111111111111111111".to_owned(),
+                head: "2222222222222222222222222222222222222222".to_owned(),
+                paths: vec![ChangedPath {
+                    status: 'M',
+                    path: changed_path.to_owned(),
+                }],
+            },
+        )
+        .expect("write ordering manifest");
+        let error = validate_request(&ValidationRequest {
+            trusted_root: trusted.path.clone(),
+            candidate_root: candidate.path.clone(),
+            changes,
+            metadata_tools: MetadataTools {
+                cargo: artifacts.join("unreachable-cargo"),
+                cargo_sha256: "0".repeat(64),
+                rustc: artifacts.join("unreachable-rustc"),
+                rustc_sha256: "0".repeat(64),
+            },
+            actionlint: ActionlintTool {
+                path: artifacts.join("unreachable-actionlint"),
+                sha256: "0".repeat(64),
+            },
+            isolation_root: artifacts.join("isolation"),
+        })
+        .expect_err("planted preexisting diagnostic unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error, expected,
+            "{label} was shadowed by the residual Bootstrap coupling rule"
+        );
+    }
+}
+
+#[test]
+fn residual_bootstrap_coupling_does_not_shadow_repository_ratchet_diagnostic() {
+    let Some(actionlint) = local_actionlint() else {
+        eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires and runs this test");
+        return;
+    };
+    let trusted = final_tree("residual-repository-trusted");
+    let candidate = final_tree("residual-repository-candidate");
+    deactivate_repository_policy(&trusted);
+    deactivate_repository_policy(&candidate);
+    fs::write(candidate.join("src/newFeature.ts"), "new legacy feature")
+        .expect("plant repository ratchet violation");
+    let root_manifest = candidate.join("Cargo.toml");
+    let mut manifest_bytes = fs::read(&root_manifest).expect("read candidate root manifest");
+    manifest_bytes.extend_from_slice(b"\n# planted Bootstrap source change\n");
+    fs::write(root_manifest, manifest_bytes).expect("write Bootstrap source change");
+    let artifacts = TempTree::new("residual-repository-artifacts");
+    let changes = artifacts.join("changes.json");
+    write_manifest(
+        &changes,
+        &ChangeManifest {
+            base: "1111111111111111111111111111111111111111".to_owned(),
+            head: "2222222222222222222222222222222222222222".to_owned(),
+            paths: vec![
+                ChangedPath {
+                    status: 'M',
+                    path: "Cargo.toml".to_owned(),
+                },
+                ChangedPath {
+                    status: 'A',
+                    path: "src/newFeature.ts".to_owned(),
+                },
+            ],
+        },
+    )
+    .expect("write repository ordering manifest");
+    let error = validate_request(&ValidationRequest {
+        trusted_root: trusted.path.clone(),
+        candidate_root: candidate.path.clone(),
+        changes,
+        metadata_tools: local_metadata_tools(),
+        actionlint,
+        isolation_root: artifacts.join("isolation"),
+    })
+    .expect_err("repository ratchet violation unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("legacy Node artifacts outside the exact ceiling"),
+        "repository ratchet was shadowed by the residual Bootstrap coupling rule: {error}"
+    );
+}
+
+#[test]
+fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
+    let Some(actionlint) = local_actionlint() else {
+        eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires and runs this test");
+        return;
+    };
+    let trusted = final_tree("residual-exact-trusted");
+    let candidate = final_tree("residual-exact-candidate");
+    let root_manifest = candidate.join("Cargo.toml");
+    let mut manifest_bytes = fs::read(&root_manifest).expect("read candidate root manifest");
+    manifest_bytes.extend_from_slice(b"\n# otherwise-valid Bootstrap source change\n");
+    fs::write(root_manifest, manifest_bytes).expect("write otherwise-valid source change");
+    let artifacts = TempTree::new("residual-exact-artifacts");
+    let changes = artifacts.join("changes.json");
+    write_manifest(
+        &changes,
+        &ChangeManifest {
+            base: "1111111111111111111111111111111111111111".to_owned(),
+            head: "2222222222222222222222222222222222222222".to_owned(),
+            paths: vec![ChangedPath {
+                status: 'M',
+                path: "Cargo.toml".to_owned(),
+            }],
+        },
+    )
+    .expect("write otherwise-valid source manifest");
+    let error = validate_request(&ValidationRequest {
+        trusted_root: trusted.path.clone(),
+        candidate_root: candidate.path.clone(),
+        changes,
+        metadata_tools: local_metadata_tools(),
+        actionlint,
+        isolation_root: artifacts.join("isolation"),
+    })
+    .expect_err("silent Bootstrap source change unexpectedly passed")
+    .to_string();
+    assert_eq!(
+        error,
+        "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: Cargo.toml"
+    );
 }
 
 #[test]
@@ -1149,6 +1277,262 @@ fn immutable_bootstrap_snapshot_is_canonical_validator_output() {
     )
     .expect("read committed Bootstrap snapshot");
     assert_eq!(actual, expected);
+}
+
+fn committed_bootstrap_snapshot() -> Vec<u8> {
+    fs::read(
+        repo_root().join(".github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"),
+    )
+    .expect("read committed Bootstrap snapshot")
+}
+
+#[test]
+fn bootstrap_snapshot_writer_reports_an_exact_no_op() {
+    let tree = bootstrap_tree("snapshot-writer-no-op");
+    let output = tree.join("output.snapshot");
+    fs::write(&output, committed_bootstrap_snapshot()).expect("seed existing snapshot");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write no-op snapshot");
+
+    assert_eq!(delta.changed_count(), 0);
+    assert_eq!(delta.preserved_count(), 28);
+    assert!(delta.changes().is_empty());
+    assert_eq!(
+        delta.to_string(),
+        "bootstrap_snapshot_delta changed_count=0 preserved_count=28"
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_reports_one_reviewed_workflow_change() {
+    let tree = bootstrap_tree("snapshot-writer-one-entry");
+    let output = tree.join("output.snapshot");
+    fs::write(&output, committed_bootstrap_snapshot()).expect("seed existing snapshot");
+    let changed_path = ".github/workflows/upstream-gateway-reference.yml";
+    let mut payload = fs::read(tree.join(changed_path)).expect("read reviewed workflow");
+    payload.extend_from_slice(b"\n# reviewed replacement\n");
+    fs::write(tree.join(changed_path), payload).expect("plant reviewed workflow replacement");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write surgical snapshot");
+
+    assert_eq!(delta.changed_count(), 1);
+    assert_eq!(delta.preserved_count(), 27);
+    assert_eq!(delta.changes()[0].path(), changed_path);
+    assert_eq!(
+        delta.changes()[0].status(),
+        BootstrapSnapshotChangeStatus::Modified
+    );
+    assert_eq!(
+        delta.to_string(),
+        "bootstrap_snapshot_delta changed_count=1 preserved_count=27\nchanged_path=\".github/workflows/upstream-gateway-reference.yml\" status=modified"
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_cannot_hide_a_wholesale_rebaseline() {
+    let tree = bootstrap_tree("snapshot-writer-rebaseline");
+    let output = tree.join("output.snapshot");
+    let committed = committed_bootstrap_snapshot();
+    fs::write(&output, &committed).expect("seed existing snapshot");
+    let archive =
+        BootstrapSnapshotArchive::parse(&committed).expect("parse committed Bootstrap snapshot");
+    for (path, _) in archive.entries() {
+        let mut payload = fs::read(tree.join(path)).expect("read Bootstrap input");
+        payload.extend_from_slice(b"\n# planted rebaseline\n");
+        fs::write(tree.join(path), payload).expect("plant rebaseline input");
+    }
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write rebaseline snapshot");
+
+    assert_eq!(delta.changed_count(), 28);
+    assert_eq!(delta.preserved_count(), 0);
+    assert_eq!(delta.changes().len(), 28);
+    assert!(
+        delta
+            .changes()
+            .iter()
+            .all(|change| change.status() == BootstrapSnapshotChangeStatus::Modified)
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_rejects_malformed_existing_archive_without_overwrite() {
+    let tree = bootstrap_tree("snapshot-writer-malformed");
+    let output = tree.join("output.snapshot");
+    let malformed = b"GTABOOT1\x01\x00";
+    fs::write(&output, malformed).expect("seed malformed snapshot");
+
+    let error = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect_err("malformed snapshot must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("parse existing Bootstrap snapshot")
+    );
+    assert_eq!(
+        fs::read(output).expect("read rejected malformed snapshot"),
+        malformed
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_reports_inventory_additions_and_removals() {
+    let tree = bootstrap_tree("snapshot-writer-inventory");
+    let output = tree.join("output.snapshot");
+    let mut existing = committed_bootstrap_snapshot();
+    let expected = b".cargo/audit.toml";
+    let planted = b".cargo/zudit.toml";
+    let offset = existing
+        .windows(expected.len())
+        .position(|window| window == expected)
+        .expect("find first Bootstrap path");
+    existing[offset..offset + expected.len()].copy_from_slice(planted);
+    BootstrapSnapshotArchive::parse(&existing).expect("planted inventory remains canonical");
+    fs::write(&output, existing).expect("seed changed inventory");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write changed inventory snapshot");
+
+    assert_eq!(delta.changed_count(), 2);
+    assert_eq!(delta.preserved_count(), 27);
+    assert_eq!(delta.changes()[0].path(), ".cargo/audit.toml");
+    assert_eq!(
+        delta.changes()[0].status(),
+        BootstrapSnapshotChangeStatus::Added
+    );
+    assert_eq!(delta.changes()[1].path(), ".cargo/zudit.toml");
+    assert_eq!(
+        delta.changes()[1].status(),
+        BootstrapSnapshotChangeStatus::Removed
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_preserves_existing_archive_when_generation_fails() {
+    let tree = bootstrap_tree("snapshot-writer-generation-failure");
+    let output = tree.join("output.snapshot");
+    let existing = committed_bootstrap_snapshot();
+    fs::write(&output, &existing).expect("seed existing snapshot");
+    fs::remove_file(tree.join("rustfmt.toml")).expect("remove one required input");
+
+    write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open incomplete Bootstrap materialization"),
+        &output,
+    )
+    .expect_err("missing input must fail generation");
+
+    assert_eq!(
+        fs::read(output).expect("read preserved existing snapshot"),
+        existing
+    );
+}
+
+#[test]
+fn bootstrap_snapshot_writer_pins_first_write_semantics() {
+    let tree = bootstrap_tree("snapshot-writer-first-write");
+    let output = tree.join("first.snapshot");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write first snapshot");
+
+    assert_eq!(delta.changed_count(), 28);
+    assert_eq!(delta.preserved_count(), 0);
+    assert_eq!(delta.changes().len(), 28);
+    assert!(
+        delta
+            .changes()
+            .iter()
+            .all(|change| change.status() == BootstrapSnapshotChangeStatus::Added)
+    );
+    assert_eq!(
+        fs::read(output).expect("read first snapshot"),
+        committed_bootstrap_snapshot()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_snapshot_writer_accepts_a_symlinked_output_directory() {
+    use std::os::unix::fs::symlink;
+
+    let tree = bootstrap_tree("snapshot-writer-symlinked-parent");
+    let real_parent = tree.join("real-output");
+    let linked_parent = tree.join("linked-output");
+    fs::create_dir(&real_parent).expect("create real output directory");
+    symlink(&real_parent, &linked_parent).expect("symlink output directory");
+    let output = linked_parent.join("output.snapshot");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write through symlinked output directory");
+
+    assert_eq!(delta.changed_count(), 28);
+    assert_eq!(
+        fs::read(real_parent.join("output.snapshot")).expect("read canonical-parent output"),
+        committed_bootstrap_snapshot()
+    );
+    assert_eq!(
+        fs::read_dir(real_parent)
+            .expect("list canonical output directory")
+            .count(),
+        1,
+        "staged file must be renamed within the canonical output directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_snapshot_writer_rejects_an_existing_output_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tree = bootstrap_tree("snapshot-writer-symlinked-output");
+    let target = tree.join("target.snapshot");
+    let output = tree.join("output.snapshot");
+    let sentinel = b"unchanged symlink target";
+    fs::write(&target, sentinel).expect("write symlink target");
+    symlink(&target, &output).expect("symlink existing output");
+
+    let error = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect_err("existing output symlink must fail closed");
+
+    assert!(error.to_string().contains("symlink or reparse point"));
+    assert!(
+        fs::symlink_metadata(&output)
+            .expect("inspect output symlink")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(target).expect("read unchanged symlink target"),
+        sentinel
+    );
 }
 
 #[test]
@@ -1365,6 +1749,125 @@ fn dynamic_and_matrix_workflow_identities_cannot_spoof_reserved_checks() {
     assert!(
         validate_inventory(&SafeRoot::new(&split.path).expect("open split matrix spoof")).is_err(),
         "unnamed matrix split reserved identity unexpectedly passed"
+    );
+}
+
+fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
+    format!(
+        "name: \"{name}\"\n\
+         \n\
+         on:\n\
+         \x20 pull_request:\n\
+         \x20   branches:\n\
+         \x20     - main\n\
+         \n\
+         permissions:\n\
+         \x20 contents: read\n\
+         \n\
+         jobs:\n\
+         \x20 {job_id}:\n\
+         \x20   name: \"{job_name}\"\n\
+         \x20   runs-on: ubuntu-latest\n\
+         \x20   steps:\n\
+         \x20     - name: Placeholder\n\
+         \x20       run: echo packaging\n"
+    )
+}
+
+#[test]
+fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
+    let base = copy_repo("mobile-inventory-baseline");
+    let identities = validate_inventory(&SafeRoot::new(&base.path).expect("open baseline tree"))
+        .expect("the eight required workflows are a valid inventory");
+    assert_eq!(identities.len(), 8);
+
+    for (label, added) in [
+        ("ios", &[".github/workflows/ios-packaging.yml"][..]),
+        ("android", &[".github/workflows/android-packaging.yml"][..]),
+        (
+            "both",
+            &[
+                ".github/workflows/android-packaging.yml",
+                ".github/workflows/ios-packaging.yml",
+            ][..],
+        ),
+    ] {
+        let tree = copy_repo(&format!("mobile-inventory-{label}"));
+        for (index, path) in added.iter().enumerate() {
+            fs::write(
+                tree.join(path),
+                mobile_workflow_stub(
+                    &format!("mobile packaging {index}"),
+                    &format!("package{index}"),
+                    &format!("Mobile package {index}"),
+                ),
+            )
+            .expect("write admitted mobile workflow");
+        }
+        let identities =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open admitted mobile tree"))
+                .expect("admitted mobile workflows pass the inventory");
+        assert_eq!(identities.len(), 8 + added.len(), "{label}");
+    }
+
+    for (label, path) in [
+        ("unknown-name", ".github/workflows/linux-mobile.yml"),
+        (
+            "near-miss-extension",
+            ".github/workflows/ios-packaging.yaml",
+        ),
+        ("nested", ".github/workflows/mobile/ios-packaging.yml"),
+    ] {
+        let tree = copy_repo(&format!("mobile-inventory-{label}"));
+        let destination = tree.join(path);
+        fs::create_dir_all(destination.parent().expect("workflow parent"))
+            .expect("create workflow parent");
+        fs::write(
+            &destination,
+            mobile_workflow_stub("unadmitted packaging", "package", "Unadmitted package"),
+        )
+        .expect("write unadmitted workflow");
+        let error =
+            validate_inventory(&SafeRoot::new(&tree.path).expect("open unadmitted mobile tree"))
+                .expect_err("unadmitted workflow unexpectedly passed the inventory");
+        assert!(
+            error
+                .to_string()
+                .contains("workflow directory inventory changed"),
+            "{label} failed for the wrong reason: {error}"
+        );
+    }
+
+    let removed = copy_repo("mobile-inventory-missing-required");
+    fs::write(
+        removed.join(".github/workflows/ios-packaging.yml"),
+        mobile_workflow_stub("ios packaging", "package", "iOS package"),
+    )
+    .expect("write admitted iOS workflow");
+    fs::remove_file(removed.join(".github/workflows/windows-packaging.yml"))
+        .expect("remove required workflow");
+    let error = validate_inventory(&SafeRoot::new(&removed.path).expect("open reduced tree"))
+        .expect_err("missing required workflow unexpectedly passed the inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("workflow directory inventory changed"),
+        "removed required workflow failed for the wrong reason: {error}"
+    );
+
+    let spoof = copy_repo("mobile-inventory-spoof");
+    fs::write(
+        spoof.join(".github/workflows/android-packaging.yml"),
+        mobile_workflow_stub("android packaging", "package", AUTHORITATIVE_JOB_NAME),
+    )
+    .expect("write spoofing admitted workflow");
+    let error = validate_inventory(&SafeRoot::new(&spoof.path).expect("open spoofing tree"))
+        .expect_err("admitted workflow spoofed the authoritative identity");
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative workflow identity is spoofed"),
+        "admitted spoof failed for the wrong reason: {error}"
     );
 }
 
@@ -1801,6 +2304,55 @@ fn alternate_codeowners_locations_fail_final_inventory() {
             "alternate CODEOWNERS unexpectedly passed: {alternate}"
         );
     }
+}
+
+#[test]
+fn manifest_path_keys_cannot_bless_a_file_the_workspace_never_declared() {
+    // The manifest inventory is derived from `[workspace] members` only. `path` is also
+    // the source field of a dependency table, which is candidate-controlled, so a rule
+    // that treated any manifest `path =` as authorising would let one line of TOML admit
+    // an orphan crate. This pins both halves of that being closed.
+    let orphan_manifest = "[package]\nname = \"claw-orphan\"\nversion = \"0.1.0\"\n\
+         edition = \"2024\"\n\n[lints]\nworkspace = true\n";
+
+    let tree = final_tree("manifest-path-orphan-undeclared");
+    fs::create_dir_all(tree.join("crates/claw-orphan/src")).expect("create orphan crate");
+    fs::write(tree.join("crates/claw-orphan/Cargo.toml"), orphan_manifest)
+        .expect("write orphan manifest");
+    fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open orphan tree"))
+        .expect_err("an undeclared crate manifest must not enter the inventory");
+    // Mobile admission split this inventory into required and admitted halves, so an extra
+    // manifest is now reported by the more precise unadmitted branch. It must still be the
+    // inventory rule that rejects it, and it must name the orphan.
+    let error = error.to_string();
+    assert!(
+        error.starts_with("Cargo.toml inventory")
+            && error.contains("crates/claw-orphan/Cargo.toml"),
+        "orphan manifest was rejected by an unrelated rule: {error}"
+    );
+
+    // Now point a workspace dependency at it, which is the "bless it with one line of
+    // TOML" move. Measured: this is caught earlier still, by the dependency rule, because
+    // a `path` dependency must resolve to an already-declared member. The inventory check
+    // above is the independent backstop, so both halves are closed by separate rules.
+    let tree = final_tree("manifest-path-orphan-blessed");
+    fs::create_dir_all(tree.join("crates/claw-orphan/src")).expect("create orphan crate");
+    fs::write(tree.join("crates/claw-orphan/Cargo.toml"), orphan_manifest)
+        .expect("write orphan manifest");
+    fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
+    replace(
+        &tree.join("Cargo.toml"),
+        "[workspace.dependencies]\n",
+        "[workspace.dependencies]\n\
+         claw-orphan = { path = \"crates/claw-orphan\", version = \"0.1.0\" }\n",
+    );
+    let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open blessed tree"))
+        .expect_err("a dependency path must not admit an undeclared crate");
+    assert_eq!(
+        error.to_string(),
+        "path dependency is not a declared root member: claw-orphan -> crates/claw-orphan"
+    );
 }
 
 #[test]
@@ -2848,26 +3400,38 @@ fn base_owned_repository_ratchet_rejects_addition_and_allows_deletion() {
 }
 
 #[test]
-fn base_owned_repository_ratchet_rejects_new_node_workflow_debt() {
-    let trusted = final_tree("repository-workflow-ratchet-base");
-    let candidate = final_tree("repository-workflow-ratchet-candidate");
-    deactivate_repository_policy(&trusted);
-    deactivate_repository_policy(&candidate);
-    fs::write(
-        candidate.join(".github/workflows/new-node.yml"),
-        "name: forbidden\non: workflow_dispatch\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm ci\n",
-    )
-    .expect("plant Node workflow addition");
-    let error = validate_repository_policy_transition(
-        &SafeRoot::new(&trusted.path).expect("open workflow ratchet base"),
-        &SafeRoot::new(&candidate.path).expect("open workflow ratchet candidate"),
-    )
-    .expect_err("new Node workflow debt unexpectedly passed")
-    .to_string();
-    assert!(
-        error.contains("introduced new Node workflow/action violations"),
-        "workflow addition failed through the wrong rule: {error}"
-    );
+fn base_owned_repository_ratchet_rejects_node_in_future_mobile_workflows() {
+    for (workflow, step) in [
+        (
+            "ios-packaging.yml",
+            "      - uses: actions/setup-node@0123456789abcdef0123456789abcdef01234567\n",
+        ),
+        ("android-packaging.yml", "      - run: npm ci\n"),
+    ] {
+        let trusted = final_tree(&format!("repository-{workflow}-ratchet-base"));
+        let candidate = final_tree(&format!("repository-{workflow}-ratchet-candidate"));
+        deactivate_repository_policy(&trusted);
+        deactivate_repository_policy(&candidate);
+        let path = format!(".github/workflows/{workflow}");
+        fs::write(
+            candidate.join(&path),
+            format!(
+                "name: forbidden mobile Node dependency\non: workflow_dispatch\njobs:\n  package:\n    runs-on: ubuntu-latest\n    steps:\n{step}"
+            ),
+        )
+        .expect("plant Node dependency in a future mobile workflow");
+        let error = validate_repository_policy_transition(
+            &SafeRoot::new(&trusted.path).expect("open mobile workflow ratchet base"),
+            &SafeRoot::new(&candidate.path).expect("open mobile workflow ratchet candidate"),
+        )
+        .expect_err("new mobile Node workflow debt unexpectedly passed")
+        .to_string();
+        assert!(
+            error.contains("introduced new Node workflow/action violations")
+                && error.contains(&path),
+            "{workflow} addition failed through the wrong rule: {error}"
+        );
+    }
 }
 
 #[test]
@@ -3695,4 +4259,745 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
     } else {
         eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires actionlint mutation proof");
     }
+}
+
+// Mobile workspace admission.
+//
+// Every case below starts from an ACCEPTED baseline and then mutates exactly one thing, so a
+// rejection proves the rule under test rather than an unrelated defect in the fixture. Expectations
+// are derived from `repo_root()` through `final_tree`, never from the artifact under test.
+
+const MOBILE_WORKSPACE_MANIFEST: &str = r#"[workspace]
+members = ["apps/gta-claw-PLATFORM-shell"]
+resolver = "3"
+
+[workspace.dependencies]
+claw-protocol = { path = "../crates/claw-protocol", version = "0.1.0" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/GTAStudio/GTA-Claw"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+"#;
+
+const MOBILE_APP_MANIFEST: &str = r#"[package]
+name = "gta-claw-PLATFORM-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+"#;
+
+const MOBILE_DENY: &str = r#"[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "LicenseRef-Slint-Royalty-free-2.0", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+"#;
+
+const MOBILE_CHECKSUM: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn mobile_lock(platform: &str, extra: &str) -> String {
+    format!(
+        "version = 4\n\n[[package]]\nname = \"gta-claw-{platform}-shell\"\nversion = \"0.1.0\"\ndependencies = []\n{extra}"
+    )
+}
+
+fn registry_lock_entry(name: &str, version: &str) -> String {
+    format!(
+        "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{MOBILE_CHECKSUM}\"\n"
+    )
+}
+
+fn desktop_slint_version(tree: &TempTree) -> String {
+    let lock: toml::Value = toml::from_str(
+        &fs::read_to_string(tree.join("desktop/Cargo.lock")).expect("read desktop lock"),
+    )
+    .expect("parse desktop lock");
+    lock.get("package")
+        .and_then(toml::Value::as_array)
+        .expect("desktop lock packages")
+        .iter()
+        .find(|package| package.get("name").and_then(toml::Value::as_str) == Some("slint"))
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .expect("desktop lock declares slint")
+        .to_owned()
+}
+
+fn write_mobile_file(tree: &TempTree, relative: &str, contents: &str) {
+    let path = tree.join(relative);
+    fs::create_dir_all(path.parent().expect("mobile fixture parent"))
+        .expect("create mobile parent");
+    fs::write(path, contents).expect("write mobile fixture");
+}
+
+/// Writes one complete, compliant mobile workspace unit.
+///
+/// A dependency policy is deliberately absent: nothing executes a mobile `deny.toml` yet, so the
+/// validator rejects one outright. `a_mobile_dependency_policy_is_rejected_until_ci_executes_it`
+/// pins that.
+fn write_mobile_workspace(tree: &TempTree, platform: &str, lock: &str) {
+    write_mobile_file(
+        tree,
+        &format!("{platform}/Cargo.toml"),
+        &MOBILE_WORKSPACE_MANIFEST.replace("PLATFORM", platform),
+    );
+    write_mobile_file(
+        tree,
+        &format!("{platform}/apps/gta-claw-{platform}-shell/Cargo.toml"),
+        &MOBILE_APP_MANIFEST.replace("PLATFORM", platform),
+    );
+    write_mobile_file(
+        tree,
+        &format!("{platform}/apps/gta-claw-{platform}-shell/src/lib.rs"),
+        "",
+    );
+    write_mobile_file(tree, &format!("{platform}/Cargo.lock"), lock);
+}
+
+fn retarget_root_exclude(tree: &TempTree) {
+    let path = tree.join("Cargo.toml");
+    let text = fs::read_to_string(&path).expect("read root manifest");
+    assert!(
+        text.contains(r#"exclude = ["android", "desktop", "ios"]"#),
+        "root manifest must already pin the mobile-aware exclude list"
+    );
+}
+
+fn accepted_android_tree(label: &str) -> TempTree {
+    let tree = final_tree(label);
+    retarget_root_exclude(&tree);
+    write_mobile_workspace(&tree, "android", &mobile_lock("android", ""));
+    let root = SafeRoot::new(&tree.path).expect("open android baseline");
+    validate_final_static(&root).expect("compliant android workspace is admitted");
+    tree
+}
+
+fn rejection(tree: &TempTree, label: &str) -> String {
+    let root = SafeRoot::new(&tree.path).expect("open mutated mobile fixture");
+    validate_final_static(&root).expect_err(label).to_string()
+}
+
+#[test]
+fn live_tree_admits_mobile_paths_without_requiring_them() {
+    let tree = final_tree("mobile-absent");
+    let root = SafeRoot::new(&tree.path).expect("open mobile-free tree");
+    for platform in ["android", "ios"] {
+        assert!(
+            !tree.join(platform).exists(),
+            "baseline must contain no {platform} workspace"
+        );
+    }
+    validate_final_static(&root).expect("mobile paths are admitted, never required");
+}
+
+#[test]
+fn mobile_admission_does_not_reclassify_the_bootstrap_state() {
+    let tree = bootstrap_tree("mobile-bootstrap");
+    let root = SafeRoot::new(&tree.path).expect("open bootstrap fixture");
+    assert!(
+        is_bootstrap_state(&root).expect("classify bootstrap fixture"),
+        "widening the admitted lock inventory must not rewrite the historical bootstrap inventory"
+    );
+    assert_eq!(
+        bootstrap_fingerprint(&root).expect("bootstrap fingerprint"),
+        expected_bootstrap_fingerprint()
+    );
+}
+
+#[test]
+fn compliant_mobile_workspace_is_admitted_and_partial_units_are_rejected() {
+    let baseline = accepted_android_tree("mobile-complete");
+    drop(baseline);
+
+    for omitted in [
+        "android/Cargo.toml",
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        "android/Cargo.lock",
+    ] {
+        let tree = accepted_android_tree("mobile-partial");
+        fs::remove_file(tree.join(omitted)).expect("remove one unit member");
+        let error = rejection(&tree, "partial mobile workspace is rejected");
+        assert!(
+            error.contains("android workspace is incomplete") || error.contains(omitted),
+            "removing {omitted} must be reported precisely, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn mobile_lock_sources_checksums_and_local_packages_are_bound() {
+    let git = accepted_android_tree("mobile-git-source");
+    write_mobile_file(
+        &git,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"smuggled\"\nversion = \"0.1.0\"\nsource = \"git+https://example.invalid/smuggled\"\n",
+        ),
+    );
+    assert!(
+        rejection(&git, "git-sourced mobile lock entry is rejected")
+            .contains("forbidden package source"),
+        "a git source in a mobile lock must be rejected"
+    );
+
+    let unchecked = accepted_android_tree("mobile-missing-checksum");
+    write_mobile_file(
+        &unchecked,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"unchecked\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        ),
+    );
+    assert!(
+        rejection(&unchecked, "unchecksummed registry entry is rejected")
+            .contains("registry package checksum is invalid"),
+        "a registry entry without a checksum must be rejected"
+    );
+
+    let orphan = accepted_android_tree("mobile-orphan-local");
+    write_mobile_file(
+        &orphan,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"undeclared-local\"\nversion = \"0.1.0\"\n",
+        ),
+    );
+    assert!(
+        rejection(&orphan, "undeclared local package is rejected")
+            .contains("local package is not a declared workspace package"),
+        "a path package outside the declared workspaces must be rejected"
+    );
+}
+
+#[test]
+fn mobile_workspace_cannot_reintroduce_exclusion_or_weaken_lints() {
+    let excluded = accepted_android_tree("mobile-exclude");
+    let manifest = MOBILE_WORKSPACE_MANIFEST
+        .replace("PLATFORM", "android")
+        .replace(
+            "resolver = \"3\"",
+            "resolver = \"3\"\nexclude = [\"vendor\"]",
+        );
+    write_mobile_file(&excluded, "android/Cargo.toml", &manifest);
+    assert!(
+        rejection(&excluded, "nested exclusion is rejected").contains("workspace schema changed"),
+        "a mobile workspace must not reopen the excluded-workspace route"
+    );
+
+    let unsafe_allowed = accepted_android_tree("mobile-unsafe");
+    let manifest = MOBILE_WORKSPACE_MANIFEST
+        .replace("PLATFORM", "android")
+        .replace("unsafe_code = \"deny\"", "unsafe_code = \"allow\"");
+    write_mobile_file(&unsafe_allowed, "android/Cargo.toml", &manifest);
+    assert!(
+        rejection(&unsafe_allowed, "weakened unsafe policy is rejected")
+            .contains("lint policy is weaker"),
+        "a mobile workspace must not allow unsafe code"
+    );
+
+    let member = accepted_android_tree("mobile-member-lints");
+    let app = MOBILE_APP_MANIFEST.replace("PLATFORM", "android").replace(
+        "[lints]\nworkspace = true",
+        "[lints.rust]\nunsafe_code = \"allow\"",
+    );
+    write_mobile_file(
+        &member,
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        &app,
+    );
+    assert!(
+        rejection(&member, "member lint override is rejected")
+            .contains("lints must inherit exactly from workspace"),
+        "a mobile member must inherit the workspace lint table exactly"
+    );
+}
+
+#[test]
+fn mobile_admission_stays_bounded_to_the_two_declared_platforms() {
+    let extra = final_tree("mobile-unadmitted");
+    write_mobile_workspace(&extra, "web", &mobile_lock("web", ""));
+    let error = rejection(&extra, "an unadmitted sibling workspace is rejected");
+    assert!(
+        error.contains("Cargo.lock inventory contains unadmitted locations")
+            && error.contains("web/Cargo.lock"),
+        "admission must be a bounded path list, not a prefix rule, got: {error}"
+    );
+
+    let aliased = accepted_android_tree("mobile-case-alias");
+    assert!(
+        validate_casefold_paths(&[
+            "android/Cargo.lock".to_owned(),
+            "ANDROID/Cargo.lock".to_owned(),
+        ])
+        .is_err(),
+        "a mobile directory and its case alias must collide"
+    );
+    drop(aliased);
+}
+
+#[test]
+fn mobile_manifest_dependencies_cannot_escape_the_repository_or_use_forbidden_sources() {
+    for (label, replacement, expected) in [
+        (
+            "path escape",
+            "claw-protocol = { path = \"../../../../elsewhere/claw-protocol\", version = \"0.1.0\" }",
+            "escapes repository root",
+        ),
+        (
+            "undeclared member path",
+            "claw-protocol = { path = \"../crates/not-a-member\", version = \"0.1.0\" }",
+            "not a declared root member",
+        ),
+        (
+            "git source",
+            "claw-protocol = { git = \"https://example.invalid/claw-protocol\" }",
+            "source/schema is forbidden",
+        ),
+        (
+            "wildcard version",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"*\" }",
+            "bounded registry version",
+        ),
+    ] {
+        let tree = accepted_android_tree("mobile-dependency");
+        let manifest = MOBILE_WORKSPACE_MANIFEST
+            .replace("PLATFORM", "android")
+            .replace(
+                "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+                replacement,
+            );
+        write_mobile_file(&tree, "android/Cargo.toml", &manifest);
+        let error = rejection(&tree, "forbidden mobile dependency is rejected");
+        assert!(
+            error.contains(expected),
+            "mobile {label} must be rejected with {expected:?}, got: {error}"
+        );
+    }
+
+    // Slint itself must remain permitted, or the admission would be pointless.
+    let slint = accepted_android_tree("mobile-dependency-slint");
+    let manifest = MOBILE_WORKSPACE_MANIFEST
+        .replace("PLATFORM", "android")
+        .replace(
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "slint = { version = \"=1.17.1\", default-features = false }",
+        );
+    write_mobile_file(&slint, "android/Cargo.toml", &manifest);
+    let root = SafeRoot::new(&slint.path).expect("open mobile Slint fixture");
+    validate_final_static(&root).expect("a mobile workspace may depend on Slint");
+}
+
+#[test]
+fn a_mobile_dependency_policy_is_rejected_until_ci_executes_it() {
+    // `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths but do not
+    // exist, so nothing runs cargo-deny against a mobile policy file. A policy file that nothing
+    // executes is worse than none, because it reads as protection. Admitting one belongs in the
+    // change that also lands the workflow executing it, so today it fails closed.
+    for platform in ["android", "ios"] {
+        assert!(
+            !Path::new(&repo_root())
+                .join(format!(".github/workflows/{platform}-packaging.yml"))
+                .exists(),
+            "this rule is only correct while no {platform} packaging workflow exists"
+        );
+    }
+
+    let tree = accepted_android_tree("mobile-deny-unexecuted");
+    write_mobile_file(&tree, "android/deny.toml", MOBILE_DENY);
+    let error = rejection(&tree, "an unexecuted mobile dependency policy is rejected");
+    assert!(
+        error.contains("unexpected deny/audit policy file") && error.contains("android/deny.toml"),
+        "a mobile deny.toml must fail closed until a workflow runs it, got: {error}"
+    );
+
+    let audit = accepted_android_tree("mobile-audit-unexecuted");
+    write_mobile_file(&audit, "android/audit.toml", "[advisories]\nignore = []\n");
+    assert!(
+        rejection(&audit, "an unexecuted mobile audit policy is rejected")
+            .contains("unexpected deny/audit policy file"),
+        "the same rule must cover audit configuration"
+    );
+}
+#[test]
+fn an_admitted_mobile_workspace_cannot_impersonate_or_reach_outside_itself() {
+    // What can ios/Cargo.toml declare that would let it claim to be something trusted, or reach
+    // a file outside its own directory? Each case starts from the ACCEPTED baseline.
+    for (label, from, to, expected) in [
+        (
+            "member escaping into the frozen desktop tree",
+            "members = [\"apps/gta-claw-android-shell\"]",
+            "members = [\"../desktop/apps/gta-claw-desktop\"]",
+            "must declare exactly one member",
+        ),
+        (
+            "member claiming a root workspace app",
+            "members = [\"apps/gta-claw-android-shell\"]",
+            "members = [\"apps/gta-claw-daemon\"]",
+            "must declare exactly one member",
+        ),
+        (
+            "path dependency reaching into the frozen desktop tree",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "gta-claw-desktop = { path = \"../desktop/apps/gta-claw-desktop\", version = \"0.1.0\" }",
+            "not a declared root member",
+        ),
+        (
+            "path dependency reaching into the trust root itself",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "policy = { path = \"../.github/trusted/desktop-supply-chain-policy\", version = \"0.1.0\" }",
+            "not a declared root member",
+        ),
+        (
+            // `path` also appears in section form, not only inline. If the parsing were not
+            // section-aware this would bless an orphan file with one line of TOML.
+            "section-form path dependency escaping the repository",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "[workspace.dependencies.claw-protocol]\npath = \"../../../../elsewhere/claw-protocol\"\nversion = \"0.1.0\"",
+            "escapes repository root",
+        ),
+        (
+            "patched registry",
+            "[profile.release]",
+            "[patch.crates-io]\nslint = { path = \"../elsewhere/slint\" }\n\n[profile.release]",
+            "top-level schema changed",
+        ),
+        (
+            "workspace metadata smuggling",
+            "resolver = \"3\"",
+            "resolver = \"3\"\nmetadata = { trusted = true }",
+            "workspace schema changed",
+        ),
+    ] {
+        let tree = accepted_android_tree("mobile-impersonation");
+        let manifest = MOBILE_WORKSPACE_MANIFEST.replace("PLATFORM", "android");
+        assert!(manifest.contains(from), "fixture lost {from:?}");
+        write_mobile_file(&tree, "android/Cargo.toml", &manifest.replace(from, to));
+        let error = rejection(&tree, "impersonation attempt is rejected");
+        assert!(
+            error.contains(expected),
+            "{label} must be rejected with {expected:?}, got: {error}"
+        );
+    }
+
+    // The app member must not be able to rename itself into a trusted package.
+    let renamed = accepted_android_tree("mobile-impersonation-package");
+    let app = MOBILE_APP_MANIFEST.replace("PLATFORM", "android").replace(
+        "name = \"gta-claw-android-shell\"",
+        "name = \"gta-claw-desktop\"",
+    );
+    write_mobile_file(
+        &renamed,
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        &app,
+    );
+    assert!(
+        rejection(&renamed, "renamed mobile package is rejected")
+            .contains("package name must be gta-claw-android-shell"),
+        "a mobile member must not be able to claim a trusted package name"
+    );
+
+    // Nor may its lock claim to contain one.
+    let lock = accepted_android_tree("mobile-impersonation-lock");
+    write_mobile_file(
+        &lock,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"gta-claw-desktop\"\nversion = \"0.1.0\"\n",
+        ),
+    );
+    assert!(
+        rejection(&lock, "impersonating local lock entry is rejected")
+            .contains("local package is not a declared workspace package"),
+        "a mobile lock must not be able to claim a trusted local package"
+    );
+}
+
+#[test]
+fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
+    // A second hardcoded list could silently disagree with the platforms it is meant to describe.
+    for platform in ["android", "ios"] {
+        let tree = final_tree("mobile-derived-inventory");
+        retarget_root_exclude(&tree);
+        write_mobile_file(
+            &tree,
+            &format!("{platform}/Cargo.lock"),
+            &mobile_lock(platform, ""),
+        );
+        let error = rejection(&tree, "a lone admitted lock is still an incomplete unit");
+        assert!(
+            error.contains(&format!("{platform} workspace is incomplete")),
+            "{platform}/Cargo.lock must be admitted by path yet rejected as a partial unit, got: {error}"
+        );
+    }
+
+    let stray = final_tree("mobile-derived-inventory-stray");
+    retarget_root_exclude(&stray);
+    write_mobile_file(&stray, "windows/Cargo.lock", "version = 4\n");
+    assert!(
+        rejection(&stray, "an undeclared platform lock is rejected").contains("windows/Cargo.lock"),
+        "only locks belonging to a declared platform may be admitted"
+    );
+}
+
+#[test]
+fn reviewed_build_artifact_pin_table_shape_is_enforced() {
+    const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
+    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        url,
+        DIGEST,
+    )])
+    .expect("a well formed reviewed pin is accepted");
+    validate_build_artifact_pin_table(&[]).expect("an empty reviewed pin table is well formed");
+
+    for (label, pins) in [
+        (
+            "package that does not fetch at build time",
+            vec![("serde", "0.99.0", "aarch64-apple-ios", url, DIGEST)],
+        ),
+        (
+            "release other than the admitted one",
+            vec![("skia-bindings", "0.98.0", "aarch64-apple-ios", url, DIGEST)],
+        ),
+        (
+            "unadmitted target",
+            vec![("skia-bindings", "0.99.0", "x86_64-apple-ios", url, DIGEST)],
+        ),
+        (
+            "duplicate package and target",
+            vec![
+                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
+                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
+            ],
+        ),
+        (
+            "short digest",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                url,
+                "abc123",
+            )],
+        ),
+        (
+            "plaintext URL",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                "http://example.invalid/skia-aarch64-apple-ios.tar.gz",
+                DIGEST,
+            )],
+        ),
+        (
+            "traversal in URL",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                "https://example.invalid/../aarch64-apple-ios.tar.gz",
+                DIGEST,
+            )],
+        ),
+        (
+            "URL naming a different target",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios-sim",
+                url,
+                DIGEST,
+            )],
+        ),
+    ] {
+        assert!(
+            validate_build_artifact_pin_table(&pins).is_err(),
+            "reviewed build-artifact pin table must reject: {label}"
+        );
+    }
+}
+
+#[test]
+fn case_aliased_mobile_directories_fail_on_every_host() {
+    for path in [
+        "Android/Cargo.toml",
+        "ANDROID/Cargo.lock",
+        "iOS/Cargo.toml",
+        "IOS/deny.toml",
+        "Android/apps/gta-claw-android-shell/Cargo.toml",
+    ] {
+        assert!(
+            validate_casefold_paths(&[path.to_owned()]).is_err(),
+            "case-aliased mobile path must be rejected on every host: {path}"
+        );
+    }
+    for path in [
+        "android/Cargo.toml",
+        "android/Cargo.lock",
+        "ios/Cargo.toml",
+        "ios/deny.toml",
+    ] {
+        validate_casefold_paths(&[path.to_owned()]).expect("canonical mobile paths stay portable");
+    }
+}
+
+#[test]
+fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
+    let slint = {
+        let probe = final_tree("mobile-ios-slint-probe");
+        desktop_slint_version(&probe)
+    };
+
+    // Everything except the reviewed archive digest is satisfied, so the reported failure proves
+    // the digest gate is the sole remaining blocker rather than a defect elsewhere in the fixture.
+    let pinned = final_tree("mobile-ios-pinned");
+    retarget_root_exclude(&pinned);
+    let lock = mobile_lock(
+        "ios",
+        &format!(
+            "{}{}",
+            registry_lock_entry("skia-bindings", "0.99.0"),
+            registry_lock_entry("slint", &slint)
+        ),
+    );
+    write_mobile_workspace(&pinned, "ios", &lock);
+    let error = rejection(&pinned, "iOS without a reviewed Skia digest is rejected");
+    assert!(
+        error.contains("uses skia-bindings, which fetches at build time")
+            && error.contains("aarch64-apple-ios")
+            && error.contains("aarch64-apple-ios-sim"),
+        "iOS admission must require a reviewed digest for every admitted target, got: {error}"
+    );
+
+    let drifted = final_tree("mobile-ios-drift");
+    retarget_root_exclude(&drifted);
+    let lock = mobile_lock(
+        "ios",
+        &format!(
+            "{}{}",
+            registry_lock_entry("skia-bindings", "0.98.0"),
+            registry_lock_entry("slint", &slint)
+        ),
+    );
+    write_mobile_workspace(&drifted, "ios", &lock);
+    assert!(
+        rejection(&drifted, "unpinned skia-bindings release is rejected")
+            .contains("must pin skia-bindings to exactly 0.99.0"),
+        "the pinned Skia release must be bound before the archive digest is even consulted"
+    );
+
+    let missing = final_tree("mobile-ios-no-skia");
+    retarget_root_exclude(&missing);
+    write_mobile_workspace(&missing, "ios", &mobile_lock("ios", ""));
+    assert!(
+        rejection(&missing, "iOS lock without skia-bindings is rejected")
+            .contains("cannot avoid Skia"),
+        "an iOS Slint build cannot avoid Skia, so its absence signals an unresolved lock"
+    );
+
+    // Android can select femtovg or the software renderer, so Skia is optional there — but the
+    // moment its lock contains skia-bindings the same version pin and digest gate apply.
+    let android_skia = final_tree("mobile-android-skia");
+    retarget_root_exclude(&android_skia);
+    write_mobile_workspace(
+        &android_skia,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("skia-bindings", "0.99.0")),
+    );
+    let error = rejection(&android_skia, "Android Skia without digests is rejected");
+    assert!(
+        error.contains("uses skia-bindings, which fetches at build time")
+            && error.contains("aarch64-linux-android"),
+        "Android must not be able to consume an unverified Skia archive, got: {error}"
+    );
+
+    let android_drift = final_tree("mobile-android-skia-drift");
+    retarget_root_exclude(&android_drift);
+    write_mobile_workspace(
+        &android_drift,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("skia-bindings", "0.98.0")),
+    );
+    assert!(
+        rejection(&android_drift, "Android skia-bindings drift is rejected")
+            .contains("must pin skia-bindings to exactly 0.99.0"),
+        "the pinned Skia release binds every mobile lock, not only iOS"
+    );
+}
+
+#[test]
+fn mobile_slint_release_cannot_diverge_from_the_protected_desktop_release() {
+    let tree = final_tree("mobile-slint-drift");
+    retarget_root_exclude(&tree);
+    let desktop = desktop_slint_version(&tree);
+    assert_ne!(
+        desktop, "0.0.1",
+        "fixture requires a real desktop Slint pin"
+    );
+    write_mobile_workspace(
+        &tree,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("slint", "0.0.1")),
+    );
+    let error = rejection(&tree, "divergent Slint release is rejected");
+    assert!(
+        error.contains("single repository Slint release") && error.contains(&desktop),
+        "a mobile workspace must not introduce a second Slint line, got: {error}"
+    );
+
+    let agreed = final_tree("mobile-slint-agreed");
+    retarget_root_exclude(&agreed);
+    let desktop = desktop_slint_version(&agreed);
+    write_mobile_workspace(
+        &agreed,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("slint", &desktop)),
+    );
+    let root = SafeRoot::new(&agreed.path).expect("open agreed Slint fixture");
+    validate_final_static(&root).expect("a matching Slint release is admitted");
 }

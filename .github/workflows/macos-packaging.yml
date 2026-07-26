@@ -101,6 +101,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # x86_64 is no longer a shipped target, but this row is the only job in the
+        # repository that runs `cargo test --workspace --all-targets` on an Intel macOS
+        # host: rust.yml runs the full workspace only on macos-latest (arm64), ubuntu and
+        # windows, and its macos-15-intel job runs two named claw-gateway-client tests.
+        # Do not prune this row when pruning shipped targets; it is test coverage, not
+        # packaging.
         include:
           - runner: macos-15
             arch: arm64
@@ -184,8 +190,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  universal:
-    name: Universal2 assembly and containers
+  containers:
+    name: Container assembly and release input
     needs: source-policy
     runs-on: macos-15
     outputs:
@@ -198,26 +204,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build and validate both slices and universal2 app
+      - name: Build and validate the native arm64 app
         shell: bash
-        run: ./packaging/macos/build.sh universal2
+        run: ./packaging/macos/build.sh native
 
       - name: Build unsigned prototype DMG and PKG
         shell: bash
         run: |
           ./packaging/macos/package.sh prototype \
-            "$GITHUB_WORKSPACE/target/macos-package/apps/universal2/GTA Claw.app"
+            "$GITHUB_WORKSPACE/target/macos-package/apps/arm64/GTA Claw.app"
           hdiutil verify target/macos-package/distribution/*.dmg
           pkgutil --payload-files target/macos-package/distribution/*.pkg |
             LC_ALL=C sort > target/macos-package/distribution/pkg-payload.txt
 
-      - name: Validate universal architecture and content hashes
+      - name: Validate architecture and content hashes
         shell: bash
         run: |
           set -euo pipefail
-          app="target/macos-package/apps/universal2/GTA Claw.app"
-          ./packaging/macos/validate.sh "$app" "arm64 x86_64" adhoc
-          lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64 x86_64
+          app="target/macos-package/apps/arm64/GTA Claw.app"
+          ./packaging/macos/validate.sh "$app" "arm64" adhoc
+          lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64
           (
             cd target/macos-package/distribution
             shasum -a 256 -c SHA256SUMS
@@ -231,7 +237,7 @@ jobs:
           set -euo pipefail
           payload_sha256="$(
             ./packaging/macos/prepare-release-input.sh \
-              "$GITHUB_WORKSPACE/target/macos-package/apps/universal2/GTA Claw.app" \
+              "$GITHUB_WORKSPACE/target/macos-package/apps/arm64/GTA Claw.app" \
               "$GITHUB_SHA" \
               "$GITHUB_REF"
           )"
@@ -249,12 +255,12 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-      - name: Upload ephemeral universal prototype artifacts
+      - name: Upload ephemeral container prototype artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: macos-universal2-prototype-${{ github.sha }}
+          name: macos-containers-prototype-${{ github.sha }}
           path: |
-            target/macos-package/apps/universal2/GTA Claw.app
+            target/macos-package/apps/arm64/GTA Claw.app
             target/macos-package/headless/**/*.tar.gz
             target/macos-package/headless/**/*.sha256
             target/macos-package/distribution/*
@@ -408,7 +414,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.release == true
     needs:
       - native
-      - universal
+      - containers
       - release-policy
     runs-on: macos-15
     environment: macos-release
@@ -435,15 +441,15 @@ jobs:
       - name: Download exact secret-free release input
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          artifact-ids: ${{ needs.universal.outputs.release-artifact-id }}
+          artifact-ids: ${{ needs.containers.outputs.release-artifact-id }}
           path: ${{ runner.temp }}/gta-claw-release-download
 
       - name: Verify artifact digest, metadata, and unsigned app
         shell: bash
         env:
-          EXPECTED_ARTIFACT_ID: ${{ needs.universal.outputs.release-artifact-id }}
-          EXPECTED_ARTIFACT_DIGEST: ${{ needs.universal.outputs.release-artifact-digest }}
-          EXPECTED_PAYLOAD_SHA256: ${{ needs.universal.outputs.release-payload-sha256 }}
+          EXPECTED_ARTIFACT_ID: ${{ needs.containers.outputs.release-artifact-id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.containers.outputs.release-artifact-digest }}
+          EXPECTED_PAYLOAD_SHA256: ${{ needs.containers.outputs.release-payload-sha256 }}
           EXPECTED_RELEASE_REF: ${{ needs.release-policy.outputs.release-ref }}
           EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
           EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
@@ -512,7 +518,7 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = "com.gtastudio.gta-claw"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$EXPECTED_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = "14.0"
-          lipo "$binary" -verify_arch arm64 x86_64
+          lipo "$binary" -verify_arch arm64
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dvvv "$app" 2>&1 | grep -F 'Signature=adhoc' >/dev/null
           dependencies="$(otool -L "$binary")" || {
@@ -779,7 +785,7 @@ jobs:
           distribution="$state/distribution"
           verifier="$GITHUB_WORKSPACE/trusted-release-policy/.github/trusted/desktop-supply-chain-policy/scripts/verify-macos-app.sh"
           /bin/bash "$verifier" "$app"
-          lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64 x86_64
+          lipo "$app/Contents/MacOS/gta-claw-desktop" -verify_arch arm64
           codesign --verify --deep --strict --verbose=2 "$app"
           spctl --assess --type execute --verbose=4 "$app"
           xcrun stapler validate "$app"

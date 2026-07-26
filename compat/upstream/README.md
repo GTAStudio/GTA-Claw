@@ -11,6 +11,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
+| `reachability-corpus.json` (32 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
@@ -215,8 +216,16 @@ crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package
   **holding the source file**. For `src/a/b.rs`, `#[path = "foo.rs"] mod c;`
   names `src/a/foo.rs`, not `src/a/b/foo.rs`. The two coincide for *mod-rs*
   files — crate roots and `mod.rs` — and differ for every other file.
-- Inside an inline `mod { }` block, the path is relative to the module directory
-  plus the inline components.
+- Inside an inline `mod { }` block, a path on a *nested* declaration is relative
+  to the module directory plus the inline components.
+- A path attribute **on an inline `mod name { ... }` block itself** renames the
+  directory that block's children live in. `#[path = "actual"] mod outer {
+  #[path = "proof.rs"] mod proof; }` compiles `actual/proof.rs`, never
+  `outer/proof.rs`; the value is a directory, and it is resolved by the same
+  base rule as the two bullets above — against the directory holding the source
+  file at the top level of a file, and against the enclosing module directory
+  when nested. The enclosing scopes therefore cannot be carried as a list of
+  plain module names.
 - A path naming a `mod.rs` makes that module mod-rs, so **its** children resolve
   beside it: `#[path = "sub/mod.rs"] mod two;` puts `two`'s children in `sub/`,
   not in `sub/mod/`.
@@ -224,6 +233,17 @@ crate — the nearest ancestor directory whose `Cargo.toml` declares a `[package
 - A `path` attribute whose value this reader cannot resolve resolves to
   **nothing**. It must never fall back to resolving by module name, or an
   attribute pointing at one file blesses another.
+
+If a `mod name;` declaration is answered by **both** `<scope>/name.rs` and
+`<scope>/name/mod.rs`, the resolution fails closed and **neither** file is
+citable. `rustc` rejects that ambiguity outright — `E0761: file for module found
+at both paths` — and compiles neither, so a rule that picked either one, or both,
+would bless a test out of a crate that does not build. The rejection names the
+counterpart file and the error code rather than reporting the file as unwired,
+because telling someone to wire in a module that is already wired twice sends
+them the wrong way. Only the two ambiguous files are withdrawn; this validator is
+not a compiler and does not attempt to prove that the rest of the crate builds,
+which `cargo test` establishes far more directly in CI.
 
 Getting any of these wrong is a forgery vector and not merely a false rejection,
 because each wrong answer names a *specific* other file — one that nothing
@@ -246,6 +266,55 @@ Auto-discovery is suppressed by `autotests = false` and `autobins = false`, and 
 file named by an explicit target section is governed by that section alone —
 auto-discovery must not resurrect a target the manifest disabled.
 
+##### The owning package must itself be built
+
+Reachability from a target root proves cargo would compile the file **within its
+package**. It says nothing about whether anything builds that package. A package
+that no workspace lists is never compiled by `cargo test` at the repository root,
+so a `#[test]` inside it never runs — and adding one is a two-file change needing
+no unusual Rust and no manifest trickery, which makes it the cheapest forgery in
+the pipeline if membership is not checked.
+
+`validate.ps1` therefore also requires the owning package to be built. Walking up
+from the package directory, the **first** ancestor `Cargo.toml` carrying a
+`[workspace]` table decides, exactly as cargo does:
+
+- a manifest carrying its own `[workspace]` table is a separate build root and is
+  built on its own terms;
+- otherwise the package must match an entry of that workspace's `members`, where
+  entries may be globs (`crates/*` matches `crates/foo` but not
+  `crates/foo/bar`; `**` crosses separators);
+- an `exclude` entry removes the named directory and everything beneath it, and
+  is checked before `members`;
+- `members` and `exclude` are read from the `[workspace]` table only. Neither
+  `[workspace.package]` nor `[workspace.dependencies]` confers membership —
+  honouring a path there would repeat the mistake of treating a bare `path =`
+  under `[dependencies.<name>]` as a target.
+
+Two deliberate limits, both disclosed rather than left to be found:
+
+- Cargo also treats a **path dependency of a member** as a member. This validator
+  does not, so it is the stricter side: a package cargo builds but the workspace
+  manifest does not list is rejected. The repository lists all twenty-five root
+  members explicitly, so this costs nothing today, and the remedy when it does
+  cost something is one line in the workspace manifest rather than a change to
+  any production source.
+- A manifest carrying its own `[workspace]` is accepted as built. Whether CI
+  actually invokes that workspace is not statically knowable — the workflow files
+  are outside this contract and are themselves unpinned — so tightening here
+  would be a guess that falsely rejects real evidence. Two such roots exist
+  (`desktop/` and `.github/trusted/desktop-supply-chain-policy/`) and both are
+  built by named CI jobs. This is pinned in the **accepting** direction by
+  `implemented-citing-self-rooted-workspace-package-passes` so it cannot change
+  silently.
+
+Verified against cargo itself rather than reasoned: on a planted workspace,
+`cargo test --workspace` compiles only the listed member and never touches an
+unlisted or excluded package, and expands a `crates/*` member glob. On the real
+tree the rule changes **no** verdict — all twenty-nine packages are accounted
+for by twenty-seven root members, one `desktop/` member and one self-rooted
+workspace.
+
 Three limits, stated plainly rather than left to be discovered:
 
 - The rule catches files that **nothing references**, and targets that
@@ -256,7 +325,12 @@ Three limits, stated plainly rather than left to be discovered:
   as a root. `cargo metadata` does not filter on `required-features` either — it
   reports such targets with `test = true` — so both implementations are
   permissive here by the same rule. Evaluating either would reject honest
-  evidence, and the disclosed vector is the unreferenced file.
+  evidence, and the disclosed vector is the unreferenced file. The same
+  permissiveness applies when a `cfg` decides the *path* rather than the
+  module's existence: `#[cfg_attr(unix, path = "unix.rs")] mod imp;` is read as
+  a plain `mod imp;`, so `imp.rs` is treated as reachable. That is the honest
+  answer on a non-unix host and a permissive one on unix, which is the same
+  trade made above.
 - Reachability is computed within the owning crate: the crate that owns the
   *cited* file must itself reach it. A file pulled in only by a
   `#[path = "..."]` from a *different* crate is not recognised; cite a test in
@@ -271,35 +345,51 @@ Three limits, stated plainly rather than left to be discovered:
 This rule is **shared, not locally owned**. `crates/claw-conformance` implements
 the same rule — "a target root, or reachable from a target root" — after a
 proposal to require the cited file to *be* a target root was put to the
-compatibility owner and then withdrawn: target-root-only left 225 tests across
-34 files in 9 crates with no legal citation at all, and the only workaround was
-widening the visibility of private items in production code, which would have
-let the ledger dictate the API surface.
+compatibility owner and then withdrawn: target-root-only left, at the time it was
+proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
+and the only workaround was widening the visibility of private items in
+production code, which would have let the ledger dictate the API surface.
+Re-measured on the current tree — 292 tracked `.rs` files, counting `#[test]`
+occurrences in files this rule accepts that are not themselves target roots — the
+cost is now **822 tests across 99 files in 17 packages**. The figure is a lower
+bound on the harm and it grows with every crate the fleet adds, which is why it
+is recorded with its method and denominator rather than as a bare number.
 
 The two implementations are therefore intended to be **identical**, not merely
 ordered. A divergence in *either* direction is a defect and must be reported
 rather than managed: if this validator were the looser side, a row it blesses
 could be rejected by the parity report. The specification above is deliberately
-complete enough to be mirrored; the twenty-three `implemented-citing-*` cases in
-`validate-self-test.ps1` are its executable form — thirteen that must be rejected
-and ten that must be accepted.
+complete enough to be mirrored; the thirty-three `implemented-citing-*` cases in
+`validate-self-test.ps1` are its executable form — nineteen that must be rejected
+and fourteen that must be accepted.
 
 The root set is derived here by reading the manifest rather than by shelling out
 to `cargo metadata`, which keeps this trust root hermetic: it reads files and
 executes nothing. That is a deliberate trade. It costs exactness at the margins
 of cargo's auto-discovery rules, and it means the per-kind defaults above are a
 model of cargo rather than cargo's own answer — a model that was **wrong** once
-already, when `benches/` and `examples/` were treated as roots. Where the two
-differ today, this validator is the stricter side: `harness = false` cannot be
-expressed in `cargo metadata` at all, which still reports such a target as
-`test = true`.
+already, when `benches/` and `examples/` were treated as roots.
+
+The `harness = false` case is the one where the model was, for a time, the
+*stricter* side: it cannot be expressed in `cargo metadata` at all, which still
+reports such a target as `test = true`. Measured directly — a package carrying
+an explicit `harness = false` test target, a default example, a default bench, a
+`src/bin/` target, a lib and an ordinary integration test — `cargo metadata`
+reports `test = true` for the `harness = false` target, while
+`cargo test -- --list` yields exactly `lib_test`, `bin_test` and `normal_test`.
+Metadata alone therefore admits a target whose `#[test]` never runs.
+`claw-conformance` reads the manifest to overlay that one field, so the two
+implementations now agree here; the corpus pins all six of those paths so
+neither side can drift back.
 
 A tightening rule needs its false-positive cases pinned as much as its
-true-positive ones. Eight of the ten accepting cases pin reachability — a
+true-positive ones. Twelve of the fourteen accepting cases pin reachability — a
 `mod`-wired module, a `#[path]`-relocated module, a transitive `lib.rs` →
 `nested/mod.rs` → `nested/deep.rs` chain, a `src/bin/` target, a top-level
 `#[path]` sibling, the child of a `#[path]`-named `mod.rs`, a raw-string
-`#[path]`, and a `pub(crate) mod` — so that a later "improvement" to this rule
+`#[path]`, an inline `#[path] mod { … }` block, a `#[path]` module nested inside
+one, a `pub(crate) mod`, a glob-matched workspace member, and a package
+carrying its own `[workspace]` — so that a later "improvement" to this rule
 cannot quietly turn it into a false-rejection engine without turning the
 self-test red. The other two pin the enabled-test oracle. The `src/bin/` case is
 there specifically because dropping `benches/` and `examples/` from the root set
@@ -317,6 +407,76 @@ the same function correctly. **A rule verified only against a corpus cannot find
 a divergence the corpus does not exercise** — which is why the whole-tree sweep
 runs on every change and why its result is reported as a per-file verdict list
 rather than as a count.
+
+#### The sweep is silent on rules the tree never exercises
+
+The converse is equally true, and it is why `reachability-corpus.json` exists.
+Both implementations agree on the real tree — 292 files, 287 accepted, 5
+rejected, **zero per-file disagreements**. That agreement proves nothing about
+the two rules both sides changed most recently, because neither construct occurs
+anywhere in either tree: scanned at the time of writing, there are **zero inline
+`#[path]` modules and zero ambiguous `foo.rs` + `foo/mod.rs` pairs** in the
+repository. Two implementations could agree 287/5 forever with both fixes never
+once compared. A whole-tree sweep is the highest-yield instrument for rules the
+tree exercises and no instrument at all for rules it does not.
+
+`reachability-corpus.json` holds 32 synthetic workspaces — 15 that must be
+accepted and 17 that must be rejected — each a complete set of files, a cited
+path and the expected verdict. It covers explicit `test = false` targets,
+`harness = false` targets, default examples and default benches, the three
+`#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
+both directions, package boundaries, and target roots in excluded and
+self-rooted workspaces.
+
+**Neither implementation is normative here.** The `arbiter` field records that
+every expectation was produced by running `cargo` and `rustc` against the
+fixture, not by asking either resolver what it thinks. Accepting cases place
+`compile_error!` decoys at each formerly wrong path, so a successful `cargo
+build` is itself proof that cargo compiles none of them; rejecting cases that
+model a non-building crate are ones `cargo` actually fails on. One expectation
+in this corpus was **written wrong by hand and corrected by the toolchain**: a
+package that is neither a workspace member nor excluded and carries no
+`[workspace]` table of its own makes `cargo` exit 101, which is why the corpus
+distinguishes a legal standalone package from an unbuildable orphan.
+
+`validate.ps1` pins this file structurally and by digest but deliberately does
+**not** materialize and replay it during a validation run. The resolver memoizes
+per crate directory, and seeding those caches from fixtures carried in a file
+that lives in the tree under audit would turn a convenience into a forgery
+vector. Behavioural replay belongs in a harness that runs each case in its own
+process against its own root, never in the read-only trust root. What
+`validate.ps1` does enforce is that no case may cite a path it does not itself
+define — otherwise a case could name a real repository file and assert a verdict
+about something the fixture never contained — and that no path may contain a dot
+segment, so no replayer can be induced to write outside its fixture root.
+
+**This file is the single copy, and it now is one.** `crates/claw-conformance`
+loads it from `compat/upstream/reachability-corpus.json`, exactly as it already
+loads `compat/upstream/enabled-test-oracle.json`, and replays every case against
+`cargo` before comparing its own resolver's verdict to `expect`. The private
+duplicate that previously lived under that crate's fixtures has been deleted.
+A corpus that exists twice is not shared: it is two corpora that agree until one
+is edited, and the cheapest drift detector — comparing digests — is unavailable
+the moment the copies differ in whitespace or member order, which two independent
+serializers will do immediately. The schema is deliberately additive-only for
+that reason; a reader may ignore `schema_version`, `purpose`, `rule`, `arbiter`,
+`implementations` and each case's `why` and still see `name`, `files`, `cite` and
+`expect`.
+
+Sharing the file has a cost that must be stated rather than discovered. The
+consumer asserts an exact case count, so **adding a case to this corpus is a
+change that cannot land on either side alone** — the same coupling that already
+applies to `enabled-test-oracle.json` and to `canonical_counts.artifact_json_files`,
+and the reason the artifact count needed a single atomic pull request across two
+owners. The coupling is worth keeping in the shrinking direction: without it,
+cases could be deleted to hide a disagreement in a tree where `validate.ps1` was
+bypassed. It is not worth paying in the growing direction, because a corpus is
+only useful if adding coverage is cheap, and every case added here exists because
+some rule was otherwise pinned by nothing. An exact equality is also strictly
+weaker than the digest this validator already enforces: it cannot detect a case
+being *replaced* by a weaker one at constant count. A lower bound on the consumer
+side preserves the anti-deletion property, drops the coupling on additions, and
+gives up nothing the digest does not already cover.
 
 #### A row may not rewrite its own acceptance bar
 
@@ -461,9 +621,9 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 193 child
+The adversarial self-test is a separate, slower step. It spawns 257 child
 validator processes — one baseline run against the real tree, one per each of the
-121 cases, and a re-blessing pre-run for the 71 cases that model an attacker who
+153 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:
@@ -477,3 +637,34 @@ every push:
 It exits 0 when every case passes and 1 otherwise, printing `ok`/`FAIL` per case
 followed by an aggregate. It evaluates every case even after one fails, so a
 single regression cannot hide the cases behind it.
+
+### Where the self-test builds its throwaway trees
+
+Both throwaway trees — the per-case copies of this directory and the synthetic
+repository root used by the enabled-test cases — are created under the system
+temp directory by default. That directory is not private to the run. On Windows,
+Storage Sense deletes `%TEMP%` content under disk pressure, and a machine running
+several concurrent `cargo` builds produces exactly that pressure. Set
+
+```text
+GTA_CLAW_SELFTEST_WORK_ROOT=/some/stable/directory
+```
+
+to place them somewhere a temp cleaner will not reach.
+
+The self-test verifies its own fixture against a sentinel set immediately after
+construction and again before every case, and reports a disappearance as an
+explicit environment failure. This matters because of how the failure presents
+otherwise: the fixture is built once and never modified by any case, so if it is
+deleted mid-run every later case fails its precondition and reports "not a
+GTA-Claw tree", which reads exactly like a semantic regression in the validator.
+One such run cost a downstream session a real investigation before the cause was
+identified as the temp cleaner.
+
+The cases themselves degrade safely, which is the property that made that run
+diagnosable at all. A negative case asserts the *specific* rejection reason, not
+merely a non-zero exit, so a vanished fixture makes it fail with "failed for the
+wrong reason" rather than pass. Had the harness only checked that the validator
+rejected something, every one of the negative cases would have passed vacuously
+against a fixture that no longer existed — a green anti-forgery suite testing
+nothing.
