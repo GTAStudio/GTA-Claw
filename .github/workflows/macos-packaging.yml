@@ -98,6 +98,12 @@ jobs:
   native:
     name: Native ${{ matrix.arch }} on ${{ matrix.runner }}
     needs: source-policy
+    outputs:
+      # Set only by the arm64 row. Matrix job outputs are last-writer-wins, so the x86_64 row
+      # must never assign these; its steps are guarded by `matrix.arch == 'arm64'`.
+      release-payload-sha256: ${{ steps.release-input.outputs.sha256 }}
+      release-artifact-id: ${{ steps.release-upload.outputs.artifact-id }}
+      release-artifact-digest: ${{ steps.release-upload.outputs.artifact-digest }}
     strategy:
       fail-fast: false
       matrix:
@@ -178,6 +184,36 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare immutable release input
+        if: >-
+          matrix.arch == 'arm64' && github.event_name == 'workflow_dispatch'
+          && inputs.release == true
+        id: release-input
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload_sha256="$(
+            ./packaging/macos/prepare-release-input.sh \
+              "$GITHUB_WORKSPACE/target/macos-package/apps/arm64/GTA Claw.app" \
+              "$GITHUB_SHA" \
+              "$GITHUB_REF"
+          )"
+          test "${#payload_sha256}" -eq 64
+          echo "sha256=$payload_sha256" >>"$GITHUB_OUTPUT"
+
+      - name: Upload immutable release input
+        if: >-
+          matrix.arch == 'arm64' && github.event_name == 'workflow_dispatch'
+          && inputs.release == true
+        id: release-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-release-input-${{ github.sha }}
+          path: target/macos-package/release-input/gta-claw-*-release-input.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
       - name: Upload ephemeral native prototype artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -191,13 +227,9 @@ jobs:
           retention-days: 7
 
   containers:
-    name: Container assembly and release input
+    name: Container assembly and prototype validation
     needs: source-policy
     runs-on: macos-15
-    outputs:
-      release-payload-sha256: ${{ steps.release-input.outputs.sha256 }}
-      release-artifact-id: ${{ steps.release-upload.outputs.artifact-id }}
-      release-artifact-digest: ${{ steps.release-upload.outputs.artifact-digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -228,32 +260,6 @@ jobs:
             cd target/macos-package/distribution
             shasum -a 256 -c SHA256SUMS
           )
-
-      - name: Prepare immutable release input
-        if: github.event_name == 'workflow_dispatch' && inputs.release == true
-        id: release-input
-        shell: bash
-        run: |
-          set -euo pipefail
-          payload_sha256="$(
-            ./packaging/macos/prepare-release-input.sh \
-              "$GITHUB_WORKSPACE/target/macos-package/apps/arm64/GTA Claw.app" \
-              "$GITHUB_SHA" \
-              "$GITHUB_REF"
-          )"
-          test "${#payload_sha256}" -eq 64
-          echo "sha256=$payload_sha256" >>"$GITHUB_OUTPUT"
-
-      - name: Upload immutable release input
-        if: github.event_name == 'workflow_dispatch' && inputs.release == true
-        id: release-upload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: macos-release-input-${{ github.sha }}
-          path: target/macos-package/release-input/gta-claw-*-release-input.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
 
       - name: Upload ephemeral container prototype artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -441,15 +447,15 @@ jobs:
       - name: Download exact secret-free release input
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          artifact-ids: ${{ needs.containers.outputs.release-artifact-id }}
+          artifact-ids: ${{ needs.native.outputs.release-artifact-id }}
           path: ${{ runner.temp }}/gta-claw-release-download
 
       - name: Verify artifact digest, metadata, and unsigned app
         shell: bash
         env:
-          EXPECTED_ARTIFACT_ID: ${{ needs.containers.outputs.release-artifact-id }}
-          EXPECTED_ARTIFACT_DIGEST: ${{ needs.containers.outputs.release-artifact-digest }}
-          EXPECTED_PAYLOAD_SHA256: ${{ needs.containers.outputs.release-payload-sha256 }}
+          EXPECTED_ARTIFACT_ID: ${{ needs.native.outputs.release-artifact-id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.native.outputs.release-artifact-digest }}
+          EXPECTED_PAYLOAD_SHA256: ${{ needs.native.outputs.release-payload-sha256 }}
           EXPECTED_RELEASE_REF: ${{ needs.release-policy.outputs.release-ref }}
           EXPECTED_RELEASE_SHA: ${{ needs.release-policy.outputs.release-sha }}
           EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
