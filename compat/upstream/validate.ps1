@@ -82,7 +82,7 @@ $EvidenceSweepHeaderKeys = @("generated-by", "base-commit", "swept-at", "totals"
 # and fail under pwsh on Linux CI. -WriteLedgerDigests cannot reach this
 # constant; only -ReplayEvidenceSweep regenerates the record, and landing a new
 # record is a reviewed edit to this line.
-$ExpectedEvidenceSweepDigest = "f448cbc086483a329ee6c86dcb4d898d4b77d9e5aa23d802ea308f0edef2c2c6"
+$ExpectedEvidenceSweepDigest = "86f4fd61f099e3019f603df1be637c793ec258abde4d26e86c31f673e387b489"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
     "# Only the three mutable ledgers are covered here; inventory digests, the feature",
