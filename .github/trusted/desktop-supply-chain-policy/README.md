@@ -78,7 +78,102 @@ The validator exact-freezes:
 - raw LF execution bytes and executable modes for adversarial shell-tool fixtures;
 - an independent 48-case archived mutation inventory bound to exact artifact rule
   classes and messages;
-- the three real lockfile locations: root, desktop, and this validator.
+- the three required lockfile locations — root, desktop, and this validator — plus a bounded
+  admitted set that adds only `android/Cargo.lock` and `ios/Cargo.lock`.
+
+## Mobile workspace admission
+
+Slint cannot live anywhere in the root headless workspace: `FORBIDDEN_GUI_NAMES`, the `i-slint`
+prefix rule, the renamed-dependency check, and the root lock scan close every route, and the
+excluded-workspace route is closed by the byte-pinned `workspace.exclude`. Two top-level sibling
+workspaces are therefore admitted alongside `desktop`, mirroring it: `android` and `ios`.
+
+Admission is bounded and conditional, never a prefix rule and never a bypass:
+
+- the lock and manifest inventories became `required ⊆ actual ⊆ admitted`. The admitted set adds
+  exactly `android/Cargo.toml`, `android/apps/gta-claw-android-shell/Cargo.toml`,
+  `android/Cargo.lock` and their `ios` counterparts, derived from the platform table so a second
+  list cannot disagree with it. Any other sibling workspace still fails closed;
+- **a mobile `deny.toml` is not admitted.** `android-packaging.yml` and `ios-packaging.yml` are
+  admitted workflow paths but do not exist, so nothing executes a mobile dependency policy. A
+  policy file that nothing runs is worse than none because it reads as protection, so one is
+  rejected outright as an unexpected deny/audit file. Admitting it belongs in the change that also
+  lands the workflow executing it;
+- the historical Bootstrap lock inventory is a separate frozen constant, so widening what a Final
+  state admits can never rewrite what the pre-P04f snapshot contained;
+- a platform is a complete unit. Its manifest, sole app manifest, and lock are present together or
+  absent together; partial presence is rejected and names both sides;
+- a present platform is validated, not merely admitted: exact top-level and workspace schemas with
+  no `exclude` key, `resolver = "3"`, exactly one canonical app member, release version agreement
+  with the root workspace, a lint policy no weaker than the desktop one, exact member lint
+  inheritance, and a lock whose packages come only from the crates.io registry with valid
+  checksums or are declared local workspace packages;
+- both mobile manifests run through the same dependency validation the root members do, with the
+  GUI rejection lifted and nothing else. Git and alternate-registry sources, wildcard versions,
+  renamed sources, and `path` values that resolve outside the repository or to something that is
+  not a declared member all fail closed;
+- a mobile lock may not introduce a second Slint line. Any `slint` entry must match the release
+  recorded in the protected desktop lock.
+
+The two mobile app members are `gta-claw-android-shell` and `gta-claw-ios-shell`, deliberately
+distinct from the root `gta-claw-android` client core, so a shell can path-depend on its core
+without a package-name collision.
+
+### Skia is pinned before the iOS lock exists
+
+`i-slint-renderer-skia` is a non-optional dependency of `i-slint-backend-winit` under
+`cfg(all(target_vendor = "apple", not(target_os = "macos")))`, so an iOS Slint build cannot avoid
+Skia by feature selection. `skia-bindings` downloads a prebuilt archive from
+`https://github.com/rust-skia/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz`
+through `curl -L -f -sS` and verifies nothing about it; its own source carries a literal
+`// TODO: verify key`. A build that fetches a prebuilt artifact the lockfile does not describe is
+trusting something outside the supply chain.
+
+The reviewed position is the pattern `rust.yml` already applies to cargo-audit, cargo-deny, and
+actionlint: fetch the archive over hardened TLS, verify it against a reviewed SHA-256, and hand the
+verified file to the crate through `SKIA_BINARIES_URL`, which accepts a `file://` URL, so the
+crate's own unverified fetch never runs. Building Skia from source was rejected: the C++ tree is not
+vendored in the published crate and is itself fetched at build time, so a source build relocates the
+unverified fetch rather than removing it, at ten to forty-five minutes and roughly a gigabyte.
+
+The rules are driven by lock contents rather than by platform, because the exposure follows Skia
+and not Apple. Whenever **any** mobile lock contains `skia-bindings` it must be the pinned release,
+cross-checked against the protected desktop lock so the two can never drift, and every Skia target
+that platform declares must carry a reviewed digest. iOS additionally treats the *absence* of
+`skia-bindings` as an unresolved lock, because it cannot avoid Skia; Android can select FemtoVG or
+the software renderer instead, and is held to the identical discipline the moment it does not.
+
+`PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. The archive key embeds
+the crate commit, target, and resolved feature set, so it cannot be computed before the mobile lock
+exists. The table is therefore empty, and the validator refuses to admit any mobile workspace that
+uses Skia while it stays empty. Filling it is a reviewed trust-root edit. Obtain each digest from
+the release asset metadata, which publishes a SHA-256 the build script ignores:
+
+```text
+gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
+  --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
+```
+
+### Mobile CI is not yet reachable
+
+`android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths, but neither file
+exists, so nothing yet builds or `cargo deny`-checks a mobile workspace. That is the outstanding
+gap, and it is why a mobile `deny.toml` is rejected rather than admitted: the policy file and the
+workflow that executes it belong in the same change.
+
+`rust.yml` is unchanged and is not the place for this: it is byte-frozen, and the authoritative
+policy workflow carries no path filter, so every rule above already runs on every pull request
+regardless of which paths a change touches. A tree containing `android/` can never classify as
+Bootstrap, so it fails closed into Final validation.
+
+The `.github/workflows` directory is a closed inventory. Eight workflow files are
+**required** and must be present in every checkout. Two further exact paths,
+`.github/workflows/ios-packaging.yml` and `.github/workflows/android-packaging.yml`,
+are **admitted** for the shipped mobile platforms: each may be absent or present, and
+a present file is subjected to the same tagged-YAML, ASCII-identity, reserved-identity
+anti-spoofing, duplicate-name, and isolated-actionlint checks as a required one. No
+other path may appear at any depth, and no required path may be removed. Admitting a
+further workflow still requires an audited trust-root update.
 
 The root headless workspace remains extensible. A new canonical `crates/<name>` or
 `apps/<name>` member can pass without changing this trust root when it is explicitly
@@ -161,7 +256,7 @@ must:
    `crates/claw-security/tests/desktop_supply_chain_policy.rs` and its fixture.
 3. Remove the obsolete `serde_yaml_ng` and `toml` dev dependencies and recompute the
    root lock delta.
-4. Rename cargo-audit data locks to `Cargo.lock.fixture`, because only three real
+4. Rename cargo-audit data locks to `Cargo.lock.fixture`, because only the required and admitted
    `Cargo.lock` locations are permitted.
 5. Change `rust.yml`, `macos-packaging.yml`, desktop manifests, desktop lock, and deny
    policy to the exact protected final fixtures. `rust.yml` must not compile or run the
@@ -184,13 +279,143 @@ cargo +1.94.0 clippy --manifest-path .github/trusted/desktop-supply-chain-policy
 cargo +1.94.0 test --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked --all-targets
 ```
 
-During an audited Bootstrap trust-root update, regenerate the binary snapshot only
-through the validator and then copy its printed fingerprint into the reviewed constant:
+The Bootstrap snapshot is a historical anchor/composite, not a mirror of current Final policy.
+The validator does not require global equality between the archive and the live checkout.
+Instead, the trusted Git `ChangeManifest` forces a per-path decision whenever a direct
+base-to-head change names one of the exact 28 Bootstrap inputs:
+
+1. **Synchronize:** the candidate archive remains canonical with the exact Bootstrap inventory,
+   the changed path's embedded payload equals the normalized candidate live bytes, and the
+   archive's semantic fingerprint equals the single strictly parsed `BOOTSTRAP_FINGERPRINT`
+   declaration. The trusted manifest must name both `policy/bootstrap.snapshot` and
+   `src/policy.rs`; changing only one companion cannot authorize synchronization.
+2. **Preserve:** the embedded historical payload for that path remains byte-for-byte unchanged,
+   and the candidate appends one record to
+   `policy/bootstrap-source-decisions.toml`. The record binds the exact path, normalized
+   protected-base Git OID, normalized protected-base and candidate live SHA-256 values,
+   candidate embedded-payload SHA-256, candidate semantic archive fingerprint, and a bounded
+   non-empty rationale. The trusted manifest must name the decision ledger.
+3. **Standing preservation:** the protected base already carries a reviewed `[[standing]]` entry
+   for that path, the candidate ledger still carries the identical entry, and the embedded
+   historical payload for that path is unchanged. No candidate write of any kind is required.
+
+Options 1 and 2 both write inside the protected trust root, so an ordinary pull request cannot
+take either: `validate_protected_files` compares the whole trust-root tree and admits no
+exemption. Option 3 exists so that the routine case — a Final workspace resolving a new
+dependency while the historical archive stays frozen — is decided once, in a reviewed
+trust-root change, instead of once per pull request.
+
+A standing entry binds `path`, `base_oid` (provenance only), `snapshot_payload_sha256`,
+`snapshot_fingerprint`, and a bounded rationale. It deliberately records no per-change
+transition and is deliberately **not** re-bound to `manifest.base`, so the protected base
+advancing does not invalidate it and a queue of pending pull requests can land in any order.
+It binds archive-side facts only, which is what keeps it narrow:
+
+- coverage is read from the **protected base** ledger and additionally requires the identical
+  entry in the candidate ledger, so a candidate can neither mint coverage for itself nor keep
+  coverage it edited or dropped;
+- coverage requires the embedded payload for that path to be unchanged and to hash to
+  `snapshot_payload_sha256`;
+- coverage requires `snapshot_fingerprint` to equal the candidate archive's semantic
+  fingerprint, so rewriting *any* archived payload voids every standing entry at once and the
+  preservations must be re-taken alongside that synchronization.
+
+Standing entries are seeded for the 15 dependency-graph inputs in `BOOTSTRAP_FILES` — every
+`Cargo.toml`, every `Cargo.lock`, and `deny.toml`. The remaining 13 inputs (the seven
+workflows, `.github/CODEOWNERS`, `.cargo/audit.toml`, `.gitattributes`, `rust-toolchain.toml`,
+and `rustfmt.toml`) carry no standing entry and stay fully coupled: changing one still requires
+option 1 or option 2 and therefore a reviewed trust-root change.
+
+The schema-v1 ledger starts empty. `standing` is an optional key that is omitted entirely when
+there are no standing entries, so the canonical form stays unique. Standing entries use
+consecutive integer IDs and strictly ascending unique paths drawn from `BOOTSTRAP_FILES`.
+
+Records use consecutive integer IDs, canonical field order,
+lowercase full hashes, and deterministic ID order. The `(base_oid, path)` pair is a stable unique
+key, so rebasing or changing the same path again requires a new record bound to the current
+protected base. Existing records are an immutable prefix: they cannot be edited, deleted,
+reordered, copied under a new ID, or reused for a later change to the same path. Every appended
+record must correspond to exactly one changed Bootstrap path choosing preservation; stale,
+duplicate, or extraneous records fail. A pull request changing multiple Bootstrap paths may mix
+synchronized and preserved decisions independently.
+
+This coupling is deliberately residual. Protected workflow/tree checks, workflow inventory,
+Final static policy, the repository transition, actionlint, and metadata validation all run
+first and retain their specific diagnostics. Only an otherwise-valid candidate reaches the
+missing-decision diagnostic. Because the ledger, archive, and fingerprint source are protected
+trust-root files, an ordinary authoritative run still rejects their mutation before this
+residual rule and requires the audited bypass described above; direct coupling tests establish
+the mechanically valid review decision without weakening that authority boundary.
+
+The snapshot writer remains all-or-nothing over all 28 Bootstrap inputs. Every successful
+invocation compares the existing archive with the generated canonical archive and prints this
+deterministic contract before the result is accepted:
 
 ```text
-cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- write-bootstrap-snapshot --root "$PWD" --output "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
-cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$PWD"
+bootstrap_snapshot_delta changed_count=1 preserved_count=27
+changed_path=".github/workflows/upstream-gateway-reference.yml" status=modified
 ```
+
+Changed paths are sorted. First writes report all 28 paths as `added`, with
+`changed_count=28 preserved_count=0`. Inventory differences use `added` and `removed`; payload
+differences use `modified`. A malformed or noncanonical existing archive fails closed without
+being overwritten.
+
+For an audited, reviewed single-entry Bootstrap update, first materialize the immutable Bootstrap
+root byte-for-byte, replace only the reviewed path, run the canonical all-or-nothing writer against
+that materialization, and inspect its mandatory delta output. Accept the result only when it says
+`changed_count=1 preserved_count=27` and names the exact reviewed path. For example, Git can safely
+materialize and replace tree entries without routing binary bytes through a shell text stream:
+
+```text
+git worktree add --detach "$MATERIALIZED_ROOT" "$IMMUTABLE_BOOTSTRAP_OID"
+git -C "$MATERIALIZED_ROOT" restore --source="$REVIEWED_OID" --worktree -- ".github/workflows/upstream-gateway-reference.yml"
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- write-bootstrap-snapshot --root "$MATERIALIZED_ROOT" --output "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
+```
+
+Never generate the historical Bootstrap snapshot from live Final merely because that checkout is
+convenient. Binary extraction must remain byte-preserving: do not use PowerShell text redirection
+such as `git show > file`, and avoid `cmd.exe` commands whose commit/path syntax is exposed to caret
+escaping. There is not yet a first-class single-entry update command; the full materialization and
+mandatory delta review above remain required.
+
+After the snapshot delta is accepted, fingerprint the reviewed GTABOOT1 archive directly. The
+default output is deliberately human-facing and names the archive subject before the hash:
+
+```text
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --snapshot "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
+bootstrap archive /reviewed/GTA-Claw/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot fingerprint 96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3
+```
+
+Do not run fingerprinting against `--root "$PWD"`. Current Final intentionally differs from
+historical Bootstrap, so a live-root hash is not the reviewed archive fingerprint and must never
+be copied into `BOOTSTRAP_FINGERPRINT`. Root mode exists only to verify a directory containing
+exactly the archive's 28 normalized entries, with no missing or extra files:
+
+```text
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$EXACT_ARCHIVE_MATERIALIZATION" --snapshot "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
+```
+
+The command refuses live/Final roots, changed, missing, or extra materialized entries, and a root
+invocation without `--snapshot`. Successful output always names either `bootstrap archive <path>`
+or `verified materialized Bootstrap root <path>`; it never prints an unlabelled fingerprint.
+
+### Historical Bootstrap decision: 2026-07-26
+
+The coordinator's final, non-reopenable decision accepts the Bootstrap identity for
+`.github/workflows/upstream-gateway-reference.yml` that PR #67 Synchronized into
+`policy/bootstrap.snapshot`; that merged identity is deliberate. Immediately before PR #67, the
+live workflow was 29 lines while the archived payload was 185 lines. Those 156 lines were
+accidental drift created after PR #50 replaced the live workflow, when no companion-decision
+mechanism existed.
+
+The stale archived payload was the pre-PR #50 Node/pnpm workflow. Synchronization removed
+`setup-node`, npm/pnpm, and `node_modules` references from the trust root's own archive and
+included the `claw-repo-policy` ratchet entry point. PR #102 now closes that freshness gap by
+requiring Synchronize or Preserve for changed Bootstrap source paths.
+
+This note records the accepted historical decision. It does not claim that Bootstrap must mirror
+current Final, and it does not authorize regenerating or reverting the archive.
 
 During an audited Final dependency-surface update, copy the reviewed live root deny
 policy, desktop manifests, desktop lock, and desktop deny policy into their exact audit

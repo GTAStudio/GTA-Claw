@@ -124,6 +124,26 @@ fn install_fixture_workspace(root: &Path, crate_name: &str, targets: &[(&str, &s
     fs::write(crate_root.join("src").join("lib.rs"), "").expect("write fixture crate root");
 }
 
+fn install_test_package(root: &Path, directory: &str, package_name: &str, test_name: &str) {
+    let package = root.join(directory);
+    fs::create_dir_all(package.join("src")).expect("create package source");
+    fs::write(
+        package.join("Cargo.toml"),
+        format!(
+            "[package]\n\
+             name = \"{package_name}\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n"
+        ),
+    )
+    .expect("write package manifest");
+    fs::write(
+        package.join("src").join("lib.rs"),
+        format!("#[test]\nfn {test_name}() {{}}\n"),
+    )
+    .expect("write package test");
+}
+
 fn load_error(root: &Path) -> ConformanceError {
     Contract::load(root).expect_err("mutated contract must fail")
 }
@@ -226,6 +246,23 @@ fn real_frozen_contract_loads_every_row() {
             ("release-deployment", 24),
             ("skills", 51),
         ]
+    );
+}
+
+#[test]
+fn canonical_count_drift_names_the_key_and_values() {
+    let fixture = Fixture::copy_upstream();
+    mutate_json(&fixture.root.join("manifest.json"), |manifest| {
+        manifest["canonical_counts"]["artifact_json_files"] = serde_json::json!(17);
+    });
+
+    let error = load_error(&fixture.root);
+    assert_eq!(error.code(), ViolationCode::ManifestDrift);
+    assert_eq!(error.subject(), Some("manifest.json"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "canonical count 'artifact_json_files' must be 18, got 17"
     );
 }
 
@@ -847,6 +884,74 @@ fn exact_cfg_test_function_can_supply_acceptance_evidence() {
     assert_eq!(report.totals.implemented, 1);
     assert_eq!(report.totals.partial, 0);
     assert_eq!(report.totals.unimplemented, 46);
+}
+
+#[test]
+fn workspace_excluded_package_cannot_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[workspace]\n\
+         members = [\"crates/demo\"]\n\
+         exclude = [\"vendored\"]\n\
+         resolver = \"3\"\n",
+    )
+    .expect("exclude vendored package from workspace");
+    install_test_package(
+        &fixture.root,
+        "vendored",
+        "excluded-evidence",
+        "excluded_package_test",
+    );
+    let evidence_path = Path::new("vendored").join("src").join("lib.rs");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "excluded_package_test")],
+        ))
+        .expect("register excluded-package claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("workspace-excluded packages must not supply acceptance evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence path 'vendored/src/lib.rs' is not reachable from a test-enabled Cargo target"
+    );
+}
+
+#[test]
+fn workspace_unlisted_package_cannot_supply_acceptance_evidence() {
+    let contract = Contract::load(upstream_root()).expect("load frozen contract");
+    let fixture = Fixture::empty();
+    install_test_package(
+        &fixture.root,
+        "crates/ghost",
+        "unlisted-evidence",
+        "unlisted_package_test",
+    );
+    let evidence_path = Path::new("crates").join("ghost").join("src").join("lib.rs");
+    let mut registry = Registry::new();
+    registry
+        .register_feature(FeatureClaim::implemented(
+            "gateway.protocol.v4",
+            vec![Evidence::test(&evidence_path, "unlisted_package_test")],
+        ))
+        .expect("register unlisted-package claim");
+
+    let error = generate_report(&contract, &registry, &fixture.root)
+        .expect_err("workspace-unlisted packages must not supply acceptance evidence");
+    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+    assert_eq!(error.subject(), Some("gateway.protocol.v4"));
+    assert_eq!(error.json_path(), None);
+    assert_eq!(
+        error.message(),
+        "evidence path 'crates/ghost/src/lib.rs' is not reachable from a test-enabled Cargo target"
+    );
 }
 
 #[test]

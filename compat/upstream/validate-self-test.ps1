@@ -34,7 +34,21 @@ $RustFileWithoutTests = "crates/claw-config/src/error.rs"
 # ENABLED Rust test. The real tree has no #[ignore]d, cfg-gated or commented-out
 # test to cite, so those forgeries are staged in a synthetic tree instead of
 # adding files outside compat/upstream.
-$SyntheticRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+#
+# Both throwaway trees live under a work root that defaults to the system temp
+# directory. That directory is NOT private to this run: on Windows, Storage Sense
+# deletes %TEMP% content under disk pressure, and this repository's development
+# and CI machines run many concurrent cargo builds that create exactly that
+# pressure. Allow relocating the work root so a run can be made hermetic.
+$SelfTestWorkRoot = if ([string]::IsNullOrEmpty($env:GTA_CLAW_SELFTEST_WORK_ROOT)) {
+    [System.IO.Path]::GetTempPath()
+} else {
+    $env:GTA_CLAW_SELFTEST_WORK_ROOT
+}
+if (-not (Test-Path -LiteralPath $SelfTestWorkRoot)) {
+    New-Item -ItemType Directory -Path $SelfTestWorkRoot -Force | Out-Null
+}
+$SyntheticRoot = Join-Path $SelfTestWorkRoot (
     "gta-claw-upstream-validator-synthetic-" + [Guid]::NewGuid().ToString("N")
 )
 $SyntheticTestName = "parity_is_proven_here"
@@ -42,7 +56,12 @@ $SyntheticTestName = "parity_is_proven_here"
 function New-SyntheticRepositoryRoot {
     param([string]$Root)
     $files = [ordered]@{
-        "Cargo.toml" = "[workspace]`nmembers = [`"crates/synthetic`"]`n"
+        "Cargo.toml" = ("[workspace]`nmembers = [`n" +
+            "  `"crates/synthetic`",`n" +
+            "  `"crates/decoy`",`n" +
+            "  `"crates/nonrunning`",`n" +
+            "  `"globbed/*`",`n" +
+            "]`nexclude = [`"vendored`"]`n")
         "crates/synthetic/Cargo.toml" = "[package]`nname = `"synthetic`"`n"
         "crates/synthetic/tests/enabled.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
@@ -89,7 +108,7 @@ function New-SyntheticRepositoryRoot {
         # can ever run.
         "crates/synthetic/src/lib.rs" =
             ("mod wired;`nmod nested;`n#[path = `"relocated.rs`"]`nmod aliased;`nmod carrier;`n" +
-             "pub(crate) mod restricted;`n")
+             "pub(crate) mod restricted;`nmod inline_host;`nmod twinned;`n")
         "crates/synthetic/src/wired.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/src/relocated.rs" =
@@ -128,6 +147,31 @@ function New-SyntheticRepositoryRoot {
         "crates/synthetic/src/rawsib.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/synthetic/src/carrier/three.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A #[path] on an INLINE module renames the directory its children live
+        # in. cargo compiles blessed/proof.rs here; a reader that treats the
+        # inline block as a plain name segment looks under inline_host/scope/
+        # instead, so a decoy is planted there.
+        "crates/synthetic/src/inline_host.rs" =
+            ("#[path = `"blessed`"]`nmod scope {`n    mod proof;`n}`n" +
+             "mod holder {`n    #[path = `"renamed`"]`n    mod deeper {`n        mod nestleaf;`n    }`n}`n")
+        "crates/synthetic/src/blessed/proof.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/inline_host/scope/proof.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # A path on a NESTED inline module is relative to the enclosing module
+        # directory, not to the directory holding the file. Verified against
+        # cargo: it compiles inline_host/holder/renamed/nestleaf.rs.
+        "crates/synthetic/src/inline_host/holder/renamed/nestleaf.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/inline_host/holder/deeper/nestleaf.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # 'mod twinned;' is answered by BOTH files below. rustc rejects that with
+        # E0761 and compiles neither, so both must fail closed. They are the only
+        # fixture files deliberately left unbuildable.
+        "crates/synthetic/src/twinned.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        "crates/synthetic/src/twinned/mod.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         # Declared with a restricted visibility. The token walk has to step over
         # the whole (crate) group before it can see the mod keyword; stopping
@@ -194,6 +238,31 @@ function New-SyntheticRepositoryRoot {
             "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/tests/autodiscovered.rs" =
             "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
+        # Workspace membership. Reachability proves cargo would compile a file
+        # within its package; it says nothing about whether anything builds the
+        # package. Each of these four is a real cargo outcome, measured against
+        # cargo itself rather than recalled.
+        # Not listed in members and not excluded: cargo test --workspace never
+        # touches it, so its #[test] items never run.
+        "crates/orphanpkg/Cargo.toml" = "[package]`nname = `"orphanpkg`"`n"
+        "crates/orphanpkg/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # Named in the workspace exclude list -- a deliberate, reviewed statement
+        # that this directory is not part of the build.
+        "vendored/Cargo.toml" = "[package]`nname = `"vendored`"`n"
+        "vendored/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # The accepting direction, twice, because a membership rule that only
+        # pins its rejections becomes a false-rejection engine on the next edit.
+        # A glob member must expand.
+        "globbed/member/Cargo.toml" = "[package]`nname = `"globbed-member`"`n"
+        "globbed/member/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
+        # A manifest carrying its own [workspace] table is a separate build root
+        # and cargo builds it on its own terms. The real tree has two.
+        "standalone/Cargo.toml" = "[package]`nname = `"standalone`"`n`n[workspace]`n"
+        "standalone/src/lib.rs" =
+            "#[cfg(test)]`nmod tests {`n    #[test]`n    fn $SyntheticTestName() {`n        assert!(true);`n    }`n}`n"
     }
     $encoding = New-Object System.Text.UTF8Encoding($false)
     $separator = [string][System.IO.Path]::DirectorySeparatorChar
@@ -208,6 +277,52 @@ function New-SyntheticRepositoryRoot {
 }
 
 New-SyntheticRepositoryRoot $SyntheticRoot
+
+# Sentinels spanning every subtree the synthetic cases cite. The fixture is built
+# once at startup and no case ever modifies it, so a missing file can only mean
+# the tree was deleted or truncated underneath the run. Checked immediately after
+# construction AND before every case, because the observed failure mode is
+# disappearance mid-run rather than a failed create.
+$SyntheticRootSentinels = @(
+    "Cargo.toml",
+    "crates/synthetic/Cargo.toml",
+    "crates/synthetic/tests/enabled.rs",
+    "crates/synthetic/tests/ignored.rs",
+    "crates/orphanpkg/Cargo.toml",
+    "vendored/Cargo.toml",
+    "globbed/member/Cargo.toml",
+    "standalone/Cargo.toml"
+)
+
+function Assert-SelfTestFixtureIntact {
+    param([string]$Stage)
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($relative in $SyntheticRootSentinels) {
+        $absolute = Join-Path $SyntheticRoot ($relative.Replace("/", $separator))
+        if (-not (Test-Path -LiteralPath $absolute)) {
+            $missing.Add($relative)
+        }
+    }
+    if ($missing.Count -eq 0) {
+        return
+    }
+    # Deliberately not phrased as a rule violation. A run that reports this has
+    # measured nothing about the validator, and saying so plainly is the whole
+    # point: the previous behaviour was a cascade of per-case "not a GTA-Claw
+    # tree" errors that read exactly like a semantic regression.
+    throw (("validator self-test fixture is INCOMPLETE at {0}: {1} of {2} sentinel " +
+        "files are missing under '{3}' (first missing: {4}). This is an " +
+        "ENVIRONMENT failure, not a validator regression -- the fixture is built " +
+        "once at startup and never modified by any case, so missing files mean " +
+        "the directory was removed underneath this run. On Windows, Storage Sense " +
+        "deletes %TEMP% content under disk pressure, which concurrent cargo builds " +
+        "readily create. Re-run with GTA_CLAW_SELFTEST_WORK_ROOT set to a " +
+        "directory outside the temp cleaner's reach.") -f
+        $Stage, $missing.Count, $SyntheticRootSentinels.Count, $SyntheticRoot, $missing[0])
+}
+
+Assert-SelfTestFixtureIntact "construction"
 
 function Read-Json {
     param([string]$Path)
@@ -696,6 +811,100 @@ $cases = @(
         }
     },
     [ordered]@{
+        name = "reachability-corpus-case-deleted"
+        expected_message = "reachability-corpus must contain exactly"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # The shared reachability corpus is the only instrument that compares
+            # the two resolvers on constructs the real tree does not contain.
+            # Deleting a case is how a disagreement would be hidden.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases = @($corpus.cases | Select-Object -Skip 1)
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-expectation-flipped"
+        expected_message = "accepting cases; found"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Flipping an accepting case to rejecting is how a resolver that
+            # started refusing legitimate evidence would be papered over. The
+            # accepting/rejecting split is pinned so the false-rejection
+            # direction cannot be quietly relaxed.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            foreach ($case in $corpus.cases) {
+                if ($case.expect -eq "accept") {
+                    $case.expect = "reject"
+                    break
+                }
+            }
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-cites-undefined-file"
+        expected_message = "which the case does not define"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # A case that cites a path it never defines would assert a verdict
+            # about a file the fixture never contained - and on a replayer that
+            # materializes into a real checkout, about a file that already exists
+            # there. Same fabricated-citation defence as the ledger itself.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases[0].cite = "crates/claw-migrate/tests/providers.rs"
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-path-escapes-fixture-root"
+        expected_message = "must not contain a dot segment"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # A dot segment in a fixture key lets any harness that materializes
+            # this corpus write outside its fixture root.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $files = [ordered]@{}
+            foreach ($property in $corpus.cases[0].files.PSObject.Properties) {
+                $files["../" + $property.Name] = $property.Value
+            }
+            $corpus.cases[0].files = [pscustomobject]$files
+            $corpus.cases[0].cite = "../" + $corpus.cases[0].cite
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-removed"
+        expected_message = "fixed artifact topology mismatch; missing=[reachability-corpus.json]"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Remove-Item -LiteralPath (Join-Path $caseRoot "reachability-corpus.json") -Force
+        }
+    },
+    [ordered]@{
+        name = "reachability-corpus-case-renamed"
+        expected_message = "reachability-corpus digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            # Renaming preserves the count and the accept/reject split, so only
+            # the frozen digest catches it.
+            $corpusPath = Join-Path $caseRoot "reachability-corpus.json"
+            $corpus = Read-Json $corpusPath
+            $corpus.cases[0].name = "renamed-case"
+            Write-Json $corpusPath $corpus
+        }
+    },
+    [ordered]@{
         name = "frozen-acceptance-bar-weakened"
         expected_message = "frozen feature text changed"
         regenerate_digests = $true
@@ -928,6 +1137,91 @@ $cases = @(
             )
         }
     },    [ordered]@{
+        name = "implemented-citing-inline-path-attribute-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[path = "blessed"] on the inline 'mod scope { }' renames the
+            # directory its children resolve in, so 'mod proof;' inside the block
+            # is src/blessed/proof.rs. This pins the accepting direction: a rule
+            # that simply dropped inline path support would reject honest
+            # evidence here rather than merely bless the decoy below.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/blessed/proof.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-inline-path-attribute-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # src/inline_host/scope/proof.rs is where a reader that carried the
+            # inline module's NAME instead of its #[path] would look. cargo never
+            # compiles it.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/inline_host/scope/proof.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-nested-inline-path-attribute-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # #[path = "renamed"] on an inline module nested inside another
+            # inline module resolves against the ENCLOSING module directory
+            # (inline_host/holder/), not against the directory holding the file.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/inline_host/holder/renamed/nestleaf.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-nested-inline-path-attribute-decoy"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Where a reader that ignored the nested path attribute would look.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/inline_host/holder/deeper/nestleaf.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-ambiguous-module-file-side"
+        expected_message = "E0761: file for module found at both paths"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # src/twinned.rs and src/twinned/mod.rs both answer 'mod twinned;'.
+            # rustc refuses the crate outright, so neither file is ever compiled
+            # and neither can carry acceptance evidence.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/twinned.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-ambiguous-module-directory-side"
+        expected_message = "E0761: file for module found at both paths"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The other side of the same ambiguity. Both must fail, and both must
+            # fail for the ambiguity rather than for the generic unreachable
+            # message, or the report sends the reader to rewire a module that is
+            # already wired twice.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/synthetic/src/twinned/mod.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
         name = "implemented-citing-raw-string-path-attribute-passes"
         expect_success = $true
         regenerate_digests = $true
@@ -1065,6 +1359,69 @@ $cases = @(
             # the file is never built into a target.
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/nonrunning/tests/autodiscovered.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-non-member-package"
+        expected_message = "belongs to a Cargo package that nothing builds"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # crates/orphanpkg is a well-formed package whose src/lib.rs is a
+            # target root and whose test is a genuine enabled #[test]. Every
+            # file-level rule passes. It is simply not in the workspace members
+            # list, so cargo test at the repository root never builds it and the
+            # test never runs. Two new files and no unusual construct anywhere:
+            # the cheapest forgery in the pipeline until membership is checked.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/orphanpkg/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-workspace-excluded-package"
+        expected_message = "exclude list"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # Sharper than merely unlisted: the workspace manifest names this
+            # directory in exclude, which is an explicit reviewed statement that
+            # it is not part of the build.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "vendored/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-glob-member-package-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # The accepting direction. members entries may be globs, and a rule
+            # that compared them literally would reject every crate in a
+            # repository that uses `crates/*` -- a false-rejection engine with a
+            # green self-test.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "globbed/member/src/lib.rs" "tests::$SyntheticTestName")
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-self-rooted-workspace-package-passes"
+        expect_success = $true
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A manifest carrying its own [workspace] table is a separate build
+            # root that cargo builds on its own terms, and this repository has
+            # two of them. Pinned in the accepting direction because it is the
+            # documented residual of this rule: a static check cannot tell which
+            # workspaces CI invokes, so tightening here would be a guess that
+            # falsely rejects real evidence.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "standalone/src/lib.rs" "tests::$SyntheticTestName")
             )
         }
     },    [ordered]@{
@@ -1625,11 +1982,12 @@ $cases = @(
                 "feature-ledger.schema.json",
                 "baseline.json",
                 "manifest.json",
-                # git checks this out with CRLF on Windows and LF on Linux. Its
-                # digest is structural and every newline inside a case source is
+                # git checks these out with CRLF on Windows and LF on Linux. Their
+                # digests are structural and every newline inside a case source is
                 # a \n escape, so both checkouts must reach the same digest and
-                # the same 85 verdicts.
-                "enabled-test-oracle.json"
+                # the same 120 oracle verdicts and 32 reachability verdicts.
+                "enabled-test-oracle.json",
+                "reachability-corpus.json"
             )
             foreach ($target in $targets) {
                 $path = Join-Path $caseRoot $target
@@ -2135,7 +2493,7 @@ $cases = @(
     }
 )
 
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+$temporaryRoot = Join-Path $SelfTestWorkRoot (
     "gta-claw-upstream-validator-self-test-" + [Guid]::NewGuid().ToString("N")
 )
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
@@ -2146,6 +2504,16 @@ $negativeCases = 0
 $positiveCases = 1
 try {
     foreach ($case in $cases) {
+        # Re-checked every iteration: a fixture that evaporates part-way through
+        # would otherwise turn every remaining case into a confusing precondition
+        # error that looks like a rule regression.
+        Assert-SelfTestFixtureIntact ("case '" + $case.name + "'")
+        if (-not (Test-Path -LiteralPath $temporaryRoot)) {
+            throw (("validator self-test work root '{0}' disappeared before case " +
+                "'{1}'. This is an ENVIRONMENT failure, not a validator " +
+                "regression; see the fixture-integrity note above.") -f
+                $temporaryRoot, $case.name)
+        }
         $caseRoot = Join-Path $temporaryRoot $case.name
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseRoot -Recurse -Force

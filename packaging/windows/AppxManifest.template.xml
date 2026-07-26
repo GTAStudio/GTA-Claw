@@ -7,7 +7,7 @@
   IgnorableNamespaces="uap uap10 rescap">
   <Identity
     Name="GTAStudio.GTAClaw"
-    Publisher="CN=GTAStudio Windows Signing Placeholder"
+    Publisher="{{MSIX_PUBLISHER}}"
     Version="{{MSIX_VERSION}}"
     ProcessorArchitecture="{{MSIX_ARCHITECTURE}}" />
   <Properties>

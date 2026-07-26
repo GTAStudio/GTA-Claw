@@ -215,6 +215,46 @@ fn other_planted_violations_are_detected() {
 }
 
 #[test]
+fn cargo_target_directories_are_excluded_from_legacy_surface() {
+    let fixture = TemporaryTree::new("cargo-target");
+    for relative in [
+        "target/doc/search.index/root.js",
+        "target/doc/trait.impl/core/marker/impl.js",
+        "desktop/target/doc/search.index/desktop.js",
+        "workspaces/future/target/doc/trait.impl/future.js",
+    ] {
+        fixture.write(relative, b"generated rustdoc output");
+    }
+
+    assert!(
+        scan_tree(fixture.path(), &[])
+            .expect("scan Cargo target fixture")
+            .is_empty(),
+        "generated files below exact target directory components must be ignored"
+    );
+}
+
+#[test]
+fn cargo_target_directory_match_is_exact() {
+    let fixture = TemporaryTree::new("cargo-target-boundary");
+    fixture.write("src/target/doc/search.index/generated.js", b"generated");
+    fixture.write("targeted/doc/search.index/generated.js", b"prohibited");
+    fixture.write("ordinary/generated.js", b"prohibited");
+    fixture.write("ordinary/newFeature.ts", b"prohibited");
+
+    let violations = scan_tree(fixture.path(), &[]).expect("scan Cargo target boundary fixture");
+
+    assert_eq!(
+        violations,
+        [
+            "ordinary/generated.js",
+            "ordinary/newFeature.ts",
+            "targeted/doc/search.index/generated.js"
+        ]
+    );
+}
+
+#[test]
 fn compat_allowlist_is_exact_not_a_prefix() {
     let fixture = TemporaryTree::new("allowlist");
     fixture.write("compat/legacy/fixtures/inert.ts", b"fixture");
@@ -342,6 +382,9 @@ fn walk(
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             violations.push(format!("{relative} (symbolic link)"));
+            continue;
+        }
+        if file_type.is_dir() && entry.file_name() == OsStr::new("target") {
             continue;
         }
         if relative.starts_with(".github/fixtures/security-tools/")

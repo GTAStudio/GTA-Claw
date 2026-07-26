@@ -6,8 +6,13 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 workflow="$REPO_ROOT/.github/workflows/macos-packaging.yml"
+package_script="$REPO_ROOT/packaging/macos/package.sh"
 [[ -f "$workflow" ]] || {
   printf 'missing workflow: %s\n' "$workflow" >&2
+  exit 1
+}
+[[ -f "$package_script" ]] || {
+  printf 'missing package script: %s\n' "$package_script" >&2
   exit 1
 }
 
@@ -38,6 +43,8 @@ grep -F 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+' <<<"$release_policy" >/dev/null
 grep -F 'git merge-base --is-ancestor' <<<"$release_policy" >/dev/null
 grep -F 'RELEASE_COMMIT' <<<"$release_policy" >/dev/null
 grep -F 'persist-credentials: false' <<<"$release_policy" >/dev/null
+grep -Fx 'checksum_name=SHA256SUMS' "$package_script" >/dev/null
+grep -F 'shasum -a 256 -c SHA256SUMS' "$workflow" >/dev/null
 
 grep -F "github.event_name == 'workflow_dispatch' && inputs.release == true" \
   <<<"$protected_release" >/dev/null
