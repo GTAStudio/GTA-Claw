@@ -43,6 +43,7 @@ use crate::error::{
     ConnectionClose, DispatchError, EncodeError, HandshakeError, StoreError, WireError,
 };
 use crate::events::{ConnectionId, Delivery, EventBus, TopicFilter};
+use crate::meter::RequestMeter;
 use crate::store::GatewayStore;
 use crate::transport::{self, Inbound, MessageReader, ServerRead, ServerWrite};
 
@@ -74,6 +75,8 @@ pub struct ConnectionServices {
     pub authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
     /// Authorization currency port consulted before every later action.
     pub authorization: Arc<dyn AuthorizationSource>,
+    /// In-flight request accounting a graceful drain waits on.
+    pub meter: RequestMeter,
 }
 
 impl std::fmt::Debug for ConnectionServices {
@@ -444,10 +447,18 @@ async fn serve_request(
         filter: &session.filter,
         server_version: services.config.server_version().as_str(),
     };
-    match services.registry.dispatch(context, params).await {
+    // Taken before the dispatch and released by `Drop`, so a request whose
+    // connection is torn down mid-flight is subtracted rather than left
+    // permanently in the depth where it would stall every later drain.
+    let mut in_flight = services.meter.begin();
+    let outcome = match services.registry.dispatch(context, params).await {
         Ok(value) => respond_ok(write, codec, &request_id, &value).await,
         Err(error) => respond_error(write, codec, &request_id, &error).await,
+    };
+    if outcome.is_ok() {
+        in_flight.answered();
     }
+    outcome
 }
 
 async fn respond_ok(
@@ -1069,6 +1080,7 @@ mod tests {
                 clock,
             )),
             authorization: Arc::new(devices.clone()),
+            meter: RequestMeter::new(),
         }
     }
 
@@ -1284,6 +1296,7 @@ mod tests {
                 devices.clone(),
             )),
             authorization: Arc::new(devices.clone()),
+            meter: RequestMeter::new(),
         }
     }
 

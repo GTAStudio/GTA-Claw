@@ -259,7 +259,12 @@ async fn a_request_arriving_at_the_gateway_produces_the_same_answer_as_a_direct_
         .expect("the gateway describes the session");
 
     assert_eq!(described.body(), "via-gateway revision 1 turns 1");
-    assert_eq!(daemon.gateway().registered_methods(), 2);
+    // The wire catalogue, not the in-process one. `registered_methods` reports
+    // the frozen Gateway v4 protocol surface the bound server serves, which is
+    // a different vocabulary from the two names `GatewayDispatch` resolves —
+    // `session.prompt` and `session.describe` appear nowhere in the frozen
+    // inventory, and no catalogued method reaches the session service yet.
+    assert_eq!(daemon.gateway().registered_methods(), 278);
 
     assert!(daemon.stop().await.expect("the daemon stops").is_clean());
 }
@@ -390,20 +395,24 @@ async fn every_subsystem_is_initialized_started_and_stopped_exactly_once() {
     assert_eq!(daemon.http().bound().len(), 0);
 }
 
-/// No built-in subsystem may claim an address, because none of them binds one.
+/// A subsystem advertises exactly what it bound, and nothing else advertises
+/// anything.
 ///
-/// The in-process surfaces are doubles: they speak no wire protocol and open no
-/// socket. Reporting the *requested* `listen()` addresses as bound would
-/// advertise a service nothing is accepting on, which is worse than advertising
-/// nothing — a health check would see an address and believe it. Only a
-/// subsystem that owns a real listener may report `listening`, and the address
-/// must come from that listener.
+/// This used to read "no subsystem advertises an address", because none of them
+/// opened a socket: reporting the *requested* `listen()` addresses as bound
+/// would have advertised a service nothing was accepting on, which is worse
+/// than advertising nothing — a health check would see an address and believe
+/// it.
+///
+/// The Gateway now owns a real listener, so the property tightens rather than
+/// relaxes. The requested port is `0`, which is not a port anything can be
+/// reached on, so an implementation that echoed the request back would advertise
+/// `0` and be caught here. The advertised port must be a real one the operating
+/// system chose, and the in-process HTTP surface must still advertise nothing.
 #[tokio::test]
-async fn no_subsystem_advertises_an_address_it_has_not_bound() {
-    let requested: Vec<std::net::SocketAddr> = vec![
-        "127.0.0.1:65000".parse().expect("a valid address"),
-        "127.0.0.1:65001".parse().expect("a valid address"),
-    ];
+async fn every_subsystem_advertises_exactly_the_address_it_bound() {
+    let requested: Vec<std::net::SocketAddr> =
+        vec!["127.0.0.1:0".parse().expect("a valid address")];
     let mut daemon = Daemon::builder()
         .clock(Arc::new(SteppedClock::new()))
         .listen(requested.clone())
@@ -414,26 +423,53 @@ async fn no_subsystem_advertises_an_address_it_has_not_bound() {
 
     assert!(
         !handles.is_empty(),
-        "no handles were returned, so the assertion below proves nothing"
+        "no handles were returned, so the assertions below prove nothing"
     );
-    for handle in &handles {
-        assert!(
-            handle.bound().is_empty(),
-            "{} advertised {:?} without binding it",
-            handle.subsystem().as_str(),
-            handle.bound()
-        );
-    }
 
-    // While running, not merely after shutdown: the fiction would be live here.
-    assert!(daemon.gateway().bound().is_empty());
+    let mut advertising = Vec::new();
+    for handle in &handles {
+        if handle.bound().is_empty() {
+            continue;
+        }
+        advertising.push((handle.subsystem().as_str().to_owned(), handle.bound().len()));
+    }
+    assert_eq!(
+        advertising,
+        vec![("gateway".to_owned(), 1)],
+        "exactly one subsystem owns a listener, so exactly one may advertise"
+    );
+
+    let gateway = daemon.gateway().bound();
+    assert_eq!(gateway.len(), 1);
+    assert!(gateway[0].ip().is_loopback());
+    assert_ne!(
+        gateway[0].port(),
+        0,
+        "the advertised port was echoed from the request rather than taken from \
+         the listener, so nothing can be reached on it"
+    );
     assert!(daemon.http().bound().is_empty());
 
+    // The handle the composition returned and the port the daemon exposes are
+    // the same address, so a caller cannot be sent to a different one depending
+    // on which it read.
+    let handle_address = handles
+        .iter()
+        .find(|handle| handle.subsystem().as_str() == "gateway")
+        .expect("the gateway returned a handle")
+        .bound()
+        .to_vec();
+    assert_eq!(handle_address, gateway);
+
     // And the requested addresses really were carried into the composition, so
-    // this is "nothing advertises them", not "they were silently dropped".
+    // this is "the bound address is not the requested one", not "the request was
+    // silently dropped".
     assert_eq!(daemon.settings().listen(), requested.as_slice());
 
     daemon.stop().await.expect("the daemon stops");
+
+    // Nothing is accepting after the stop, so nothing may still be advertised.
+    assert!(daemon.gateway().bound().is_empty());
 }
 
 #[tokio::test]

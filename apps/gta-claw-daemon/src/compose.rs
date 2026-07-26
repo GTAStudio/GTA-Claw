@@ -32,9 +32,15 @@ use claw_application::composition::{
     well_known,
 };
 use claw_domain::SessionId;
+use claw_gateway::{
+    AuthorizationSource, CredentialPolicy, GatewayServer, GatewayServerConfig, Grant,
+    StaticAuthenticator,
+};
+use claw_protocol::gateway::AuthenticationPort;
 
 use crate::adapters::engine::DeterministicEngine;
-use crate::adapters::ingress::{LoopbackGateway, LoopbackHttpApi, PortSubsystem};
+use crate::adapters::gateway::GatewayIngress;
+use crate::adapters::ingress::{LoopbackHttpApi, PortSubsystem};
 use crate::adapters::model::{
     FakeTool, GuardedProviderRegistry, MemoryToolSurface, NoteContext, ProviderConfig,
     ScriptedTransport, reading_workspace,
@@ -46,6 +52,10 @@ use crate::runtime::{RuntimeHost, TaskLedger};
 
 /// The credential the built-in provider presents.
 const CREDENTIAL: &str = "primary-provider-key";
+
+/// How long the Gateway waits for requests already being served when it is
+/// drained, before reporting the ones it gave up on.
+const DEFAULT_GATEWAY_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long an authorization may live, whatever the policy asks for.
 const MAX_AUTHORIZATION_TTL: Duration = Duration::from_secs(30);
@@ -105,7 +115,7 @@ pub struct Daemon {
     tools: Arc<MemoryToolSurface>,
     context: Arc<NoteContext>,
     plugins: Arc<PerActivationPluginHost>,
-    gateway: Arc<LoopbackGateway>,
+    gateway: Arc<GatewayIngress>,
     http: Arc<LoopbackHttpApi>,
     dns: Arc<TableDns>,
     started: bool,
@@ -330,7 +340,7 @@ impl Daemon {
 
     /// Returns the gateway ingress.
     #[must_use]
-    pub fn gateway(&self) -> Arc<LoopbackGateway> {
+    pub fn gateway(&self) -> Arc<GatewayIngress> {
         Arc::clone(&self.gateway)
     }
 
@@ -391,6 +401,8 @@ pub struct DaemonBuilder {
     authorization_ttl: Duration,
     context_budget: usize,
     notes: Vec<String>,
+    gateway_devices: Vec<(String, Grant)>,
+    gateway_drain_grace: Duration,
     extra: Vec<Arc<dyn Subsystem>>,
 }
 
@@ -405,6 +417,8 @@ impl fmt::Debug for DaemonBuilder {
             .field("authorization_ttl", &self.authorization_ttl)
             .field("context_budget", &self.context_budget)
             .field("notes", &self.notes)
+            .field("gateway_devices", &self.gateway_devices.len())
+            .field("gateway_drain_grace", &self.gateway_drain_grace)
             .field("extra_subsystems", &self.extra.len())
             .finish_non_exhaustive()
     }
@@ -423,6 +437,8 @@ impl DaemonBuilder {
             authorization_ttl: Duration::from_secs(5),
             context_budget: 4 * 1024,
             notes: vec!["the operator prefers concise answers".to_owned()],
+            gateway_devices: Vec::new(),
+            gateway_drain_grace: DEFAULT_GATEWAY_DRAIN_GRACE,
             extra: Vec::new(),
         }
     }
@@ -439,6 +455,25 @@ impl DaemonBuilder {
     #[must_use]
     pub fn with_subsystem(mut self, subsystem: Arc<dyn Subsystem>) -> Self {
         self.extra.push(subsystem);
+        self
+    }
+
+    /// Pairs a device with the Gateway, granting it `grant`.
+    ///
+    /// The Gateway starts with no paired devices, so an unpaired peer that
+    /// completes the transport handshake is still refused at authentication.
+    /// This is the only way to open it, and it is deliberately explicit: a
+    /// composition that pairs nothing serves nothing.
+    #[must_use]
+    pub fn gateway_device(mut self, device_wire_id: impl Into<String>, grant: Grant) -> Self {
+        self.gateway_devices.push((device_wire_id.into(), grant));
+        self
+    }
+
+    /// Sets how long the Gateway drain waits for requests already in flight.
+    #[must_use]
+    pub const fn gateway_drain_grace(mut self, grace: Duration) -> Self {
+        self.gateway_drain_grace = grace;
         self
     }
 
@@ -566,8 +601,30 @@ impl DaemonBuilder {
                 .build()?,
         );
 
-        let gateway = Arc::new(LoopbackGateway::new(
-            Arc::clone(&service) as Arc<dyn GatewayDispatch>
+        // The real Gateway v4 server. `CredentialPolicy::None` means the
+        // handshake asks for no shared token *in addition to* device pairing —
+        // it does not mean the door is open. An unpaired device is refused, and
+        // the builder starts with no pairings at all, so this composition
+        // serves nobody until an operator names a device.
+        let authenticator = Arc::new(self.gateway_devices.into_iter().fold(
+            StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock)),
+            |authenticator, (device, grant)| authenticator.with_paired_device(device, grant),
+        ));
+        let devices = authenticator.devices();
+        let gateway = Arc::new(GatewayIngress::new(
+            GatewayServer::new(
+                GatewayServerConfig::default(),
+                Arc::clone(&authenticator) as Arc<dyn AuthenticationPort + Send + Sync>,
+                Arc::new(devices) as Arc<dyn AuthorizationSource>,
+            )
+            .map_err(|error| {
+                CompositionError::SubsystemFailed(SubsystemError::internal(
+                    well_known::gateway(),
+                    format!("the gateway server is invalid: {error}"),
+                ))
+            })?,
+            Arc::clone(&service) as Arc<dyn GatewayDispatch>,
+            self.gateway_drain_grace,
         ));
         let http = Arc::new(LoopbackHttpApi::new(
             Arc::clone(&service) as Arc<dyn GatewayDispatch>,

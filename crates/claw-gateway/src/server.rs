@@ -26,6 +26,7 @@ use crate::directory::ConnectionDirectory;
 use crate::dispatch::MethodRegistry;
 use crate::error::ServerError;
 use crate::events::{ConnectionId, EventBus, EventDraft};
+use crate::meter::RequestMeter;
 use crate::methods;
 use crate::store::{GatewayStore, InMemoryGatewayStore};
 
@@ -44,6 +45,7 @@ pub struct GatewayServer {
     directory: ConnectionDirectory,
     authenticator: Arc<dyn AuthenticationPort + Send + Sync>,
     authorization: Arc<dyn AuthorizationSource>,
+    meter: RequestMeter,
 }
 
 impl std::fmt::Debug for GatewayServer {
@@ -88,6 +90,7 @@ impl GatewayServer {
             config: Arc::new(config),
             authenticator,
             authorization,
+            meter: RequestMeter::new(),
         })
     }
 
@@ -133,6 +136,7 @@ impl GatewayServer {
             directory: self.directory.clone(),
             authenticator: Arc::clone(&self.authenticator),
             authorization: Arc::clone(&self.authorization),
+            meter: self.meter.clone(),
         }
     }
 
@@ -202,6 +206,7 @@ impl BoundServer {
         let events = server.events.clone();
         let directory = server.directory.clone();
         let permits = Arc::new(Semaphore::new(limits.max_connections));
+        let meter = server.meter.clone();
         let (shutdown, shutdown_rx) = watch::channel(false);
         // Quiescing and shutting down are different events and must not share a
         // signal. Quiescing releases the listener while every established
@@ -264,6 +269,7 @@ impl BoundServer {
             events,
             directory,
             permits,
+            meter,
             max_connections: limits.max_connections,
             acceptor,
             ticker,
@@ -358,6 +364,7 @@ pub struct ServerHandle {
     events: EventBus,
     directory: ConnectionDirectory,
     permits: Arc<Semaphore>,
+    meter: RequestMeter,
     max_connections: usize,
     acceptor: JoinHandle<()>,
     ticker: JoinHandle<()>,
@@ -409,6 +416,30 @@ impl ServerHandle {
                 break;
             }
         }
+    }
+
+    /// Waits up to `grace` for every request already being served to finish.
+    ///
+    /// This is the middle step of a graceful stop: it belongs *after*
+    /// [`stop_accepting`](Self::stop_accepting), which is what makes the set of
+    /// outstanding requests finite, and *before* [`shutdown`](Self::shutdown),
+    /// which closes the connections regardless. Returns how many requests were
+    /// still running when it stopped waiting, so a caller can report the work
+    /// it cut off rather than claiming a clean stop it did not achieve.
+    pub async fn drain_requests(&self, grace: std::time::Duration) -> u64 {
+        self.meter.drain(grace).await
+    }
+
+    /// Returns how many requests are being served at this instant.
+    #[must_use]
+    pub fn in_flight_requests(&self) -> u64 {
+        self.meter.in_flight()
+    }
+
+    /// Returns how many requests have been answered since the server started.
+    #[must_use]
+    pub fn completed_requests(&self) -> u64 {
+        self.meter.completed()
     }
 
     /// Announces shutdown, stops accepting, and waits for the accept loop.

@@ -629,6 +629,8 @@ fn a_builder_never_formats_the_provider_url_before_the_guard_has_seen_it() {
          authorization_ttl: 5s, \
          context_budget: 4096, \
          notes: [\"the operator prefers concise answers\"], \
+         gateway_devices: 0, \
+         gateway_drain_grace: 5s, \
          extra_subsystems: 0, .. }"
     );
 }

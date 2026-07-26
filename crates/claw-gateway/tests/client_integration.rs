@@ -1357,3 +1357,144 @@ async fn a_connection_spared_by_quiescing_outlives_the_closing_grace() {
     client.shutdown().await.expect("the client stops cleanly");
     handle.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_request_meter_counts_every_dispatched_request_including_refused_ones() {
+    let identity = device(44);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+    )
+    .await;
+
+    // The handshake is not a dispatch: `connect` is answered by the negotiator
+    // before the registry is ever consulted, so a completed handshake must
+    // leave the meter untouched.
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+    assert_eq!(handle.completed_requests(), 0);
+    assert_eq!(handle.in_flight_requests(), 0);
+
+    let response = client
+        .request(request_id("meter-health"), method("health"), &json!({}))
+        .await
+        .expect("the health call completes");
+    assert!(response.ok());
+    assert_eq!(handle.completed_requests(), 1);
+
+    let response = client
+        .request(
+            request_id("meter-identity"),
+            method("gateway.identity.get"),
+            &json!({}),
+        )
+        .await
+        .expect("the identity call completes");
+    assert!(response.ok());
+    assert_eq!(handle.completed_requests(), 2);
+
+    // A refused request is still a request the server served to completion, so
+    // it must be counted. A meter that only counted successes would report 2
+    // here and let a drain declare the server idle while refusals were running.
+    let response = client
+        .request(
+            request_id("meter-denied"),
+            method("sessions.create"),
+            &json!({}),
+        )
+        .await
+        .expect("the refusal is delivered as a response");
+    assert!(!response.ok());
+    assert_eq!(
+        response
+            .error()
+            .expect("a denial carries an error shape")
+            .code
+            .as_str(),
+        "UNAUTHORIZED"
+    );
+    assert_eq!(handle.completed_requests(), 3);
+
+    // A method in the frozen catalog with no behaviour answers with a typed
+    // error, which is also a served request.
+    let response = client
+        .request(
+            request_id("meter-unimplemented"),
+            method("diagnostics.stability"),
+            &json!({}),
+        )
+        .await
+        .expect("the not-implemented answer is delivered as a response");
+    assert!(!response.ok());
+    assert_eq!(
+        response
+            .error()
+            .expect("a typed error is returned")
+            .code
+            .as_str(),
+        "NOT_IMPLEMENTED"
+    );
+    assert_eq!(handle.completed_requests(), 4);
+
+    assert_eq!(handle.in_flight_requests(), 0);
+    assert_eq!(handle.drain_requests(Duration::from_millis(50)).await, 0);
+
+    client.shutdown().await.expect("the client stops cleanly");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_request_abandoned_by_a_vanishing_peer_leaves_the_meter_at_rest() {
+    let identity = device(45);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    let response = client
+        .request(
+            request_id("meter-before-drop"),
+            method("health"),
+            &json!({}),
+        )
+        .await
+        .expect("the health call completes");
+    assert!(response.ok());
+    assert_eq!(handle.completed_requests(), 1);
+
+    // Drop the client without a close handshake. Whatever the connection task
+    // was doing, the depth has to come back to zero, because a depth that only
+    // ever went up would make every later drain wait out its whole grace and
+    // then report work that had already stopped existing.
+    drop(client);
+    let remaining = handle.drain_requests(Duration::from_secs(5)).await;
+    assert_eq!(remaining, 0);
+    assert_eq!(handle.in_flight_requests(), 0);
+    assert_eq!(handle.completed_requests(), 1);
+
+    handle.shutdown().await;
+}

@@ -40,6 +40,7 @@ pub mod directory;
 pub mod dispatch;
 pub mod error;
 pub mod events;
+pub mod meter;
 pub mod methods;
 pub mod server;
 pub mod store;
@@ -63,6 +64,7 @@ pub use events::{
     ConnectionId, Delivery, EventAudience, EventBus, EventDraft, EventEnvelope, EventError,
     EventSubscription, EventVisibility, TopicFilter, TopicGroup, event_catalog, event_visibility,
 };
+pub use meter::{RequestGuard, RequestMeter};
 pub use server::{BoundServer, GatewayServer, ServerHandle};
 pub use store::{
     GatewayStore, HeartbeatRecord, InMemoryGatewayStore, PendingInvocation, SessionDraft,

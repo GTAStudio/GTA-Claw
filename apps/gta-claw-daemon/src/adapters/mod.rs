@@ -17,6 +17,7 @@
 //! real implementation. Nothing in [`crate::compose`] changes.
 
 pub mod engine;
+pub mod gateway;
 pub mod ingress;
 pub mod model;
 pub mod plugins;
