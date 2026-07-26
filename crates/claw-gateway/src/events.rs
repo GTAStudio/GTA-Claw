@@ -341,6 +341,41 @@ impl EventEnvelope {
             self.inner.state_version,
         ))
     }
+
+    /// Decides entitlement and spends a sequence in a single step.
+    ///
+    /// The bus filtered this envelope against the subscriber's scopes when it
+    /// was published. Authorization can narrow while the envelope sits in the
+    /// queue, so entitlement is decided again here, against the session as it
+    /// stands at the instant the bytes would go out.
+    ///
+    /// Both decisions live in this one function on purpose. A withheld
+    /// envelope must spend nothing, or the peer sees a hole in its `seq`
+    /// stream and treats it as an unrecoverable gap; keeping the check and the
+    /// spend in separate statements leaves that invariant resting on their
+    /// order, which nothing can enforce and a reordering cannot be caught by
+    /// any test of either half alone.
+    pub fn emit(
+        &self,
+        role: Role,
+        scopes: &[OperatorScope],
+        next: &mut u64,
+    ) -> Result<Emission, SequenceExhausted> {
+        if !self.visibility().admits(role, scopes) {
+            return Ok(Emission::Withheld);
+        }
+        Ok(Emission::Frame(self.to_frame(next)?))
+    }
+}
+
+/// What a connection does with an envelope at the instant of writing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Emission {
+    /// The session is no longer entitled to the envelope; nothing is written
+    /// and no sequence number was spent.
+    Withheld,
+    /// The frame to write, already carrying its sequence number if it takes one.
+    Frame(EventFrame),
 }
 
 /// A connection's broadcast sequence space cannot produce another number.
@@ -845,6 +880,155 @@ mod tests {
             error,
             EventError::HandshakeOnly("connect.challenge")
         ));
+    }
+
+    /// An envelope queued while the session was entitled is withheld once it is
+    /// not, and the peer is never told the event existed.
+    ///
+    /// The bus reauthorizes a subscriber when a grant narrows, but anything
+    /// already sitting in that subscriber's queue was admitted under the wider
+    /// grant. This is the only thing standing between such an envelope and a
+    /// peer that has lost the scope, so deleting it must fail a test: before
+    /// this existed, removing the delivery-time check broke nothing in the
+    /// whole crate.
+    #[tokio::test]
+    async fn an_envelope_queued_before_a_narrowing_is_withheld_when_it_is_written() {
+        let bus = EventBus::new(8, 4096);
+        let mut subscription = bus.subscribe(
+            ConnectionId::new(3),
+            Role::Operator,
+            vec![OperatorScope::Read, OperatorScope::Admin],
+            filter(),
+        );
+
+        // Admitted by the bus under the wider grant, and queued.
+        bus.publish(
+            EventDraft::broadcast("terminal.data", &serde_json::json!({ "chunk": "x" }))
+                .expect("terminal.data is catalogued"),
+        );
+        assert!(
+            bus.reauthorize(
+                ConnectionId::new(3),
+                Role::Operator,
+                vec![OperatorScope::Read]
+            ),
+            "the subscriber is known to the bus"
+        );
+
+        let narrowed = [OperatorScope::Read];
+        let mut next = 0_u64;
+        match subscription.recv().await {
+            Delivery::Event(envelope) => {
+                let emission = envelope
+                    .emit(Role::Operator, &narrowed, &mut next)
+                    .expect("the space is not exhausted");
+                assert_eq!(
+                    emission,
+                    Emission::Withheld,
+                    "an admin-only event must not reach a session that lost admin"
+                );
+            }
+            other => panic!("expected the queued terminal.data: {other:?}"),
+        }
+    }
+
+    /// A withheld envelope spends no sequence number.
+    ///
+    /// Written as a pair with the broadcast that follows it: the peer's tracker
+    /// only ever sees the second frame, and it must read one. Checking the
+    /// counter alone would not prove the peer is satisfied, and checking the
+    /// peer alone would not localize the cause.
+    #[tokio::test]
+    async fn a_withheld_envelope_spends_no_sequence_so_the_next_broadcast_is_still_one() {
+        let bus = EventBus::new(8, 4096);
+        let mut subscription = bus.subscribe(
+            ConnectionId::new(4),
+            Role::Operator,
+            vec![OperatorScope::Read, OperatorScope::Admin],
+            filter(),
+        );
+
+        bus.publish(
+            EventDraft::broadcast("terminal.data", &serde_json::json!({ "chunk": "x" }))
+                .expect("terminal.data is catalogued"),
+        );
+        bus.publish(
+            EventDraft::broadcast("heartbeat", &serde_json::json!({ "observedAtMs": 1 }))
+                .expect("heartbeat is catalogued"),
+        );
+        bus.reauthorize(
+            ConnectionId::new(4),
+            Role::Operator,
+            vec![OperatorScope::Read],
+        );
+
+        let narrowed = [OperatorScope::Read];
+        let mut next = 0_u64;
+
+        match subscription.recv().await {
+            Delivery::Event(envelope) => {
+                assert_eq!(
+                    envelope
+                        .emit(Role::Operator, &narrowed, &mut next)
+                        .expect("the space is not exhausted"),
+                    Emission::Withheld
+                );
+                assert_eq!(next, 0, "a withheld envelope must leave the counter alone");
+            }
+            other => panic!("expected the withheld terminal.data: {other:?}"),
+        }
+        match subscription.recv().await {
+            Delivery::Event(envelope) => {
+                let emission = envelope
+                    .emit(Role::Operator, &narrowed, &mut next)
+                    .expect("the space is not exhausted");
+                let Emission::Frame(frame) = emission else {
+                    panic!("a heartbeat reaches every authenticated session");
+                };
+                assert_eq!(
+                    frame.sequence().map(EventSequence::get),
+                    Some(1),
+                    "the first broadcast a peer actually receives is number one, \
+                     whatever was withheld before it"
+                );
+                assert_eq!(next, 1);
+            }
+            other => panic!("expected the heartbeat: {other:?}"),
+        }
+    }
+
+    /// An entitled targeted event is emitted, carries no number, and spends none.
+    ///
+    /// Separates "withheld" from "targeted": both write nothing to the counter,
+    /// but only one of them writes nothing to the socket.
+    #[tokio::test]
+    async fn an_entitled_targeted_envelope_is_emitted_without_spending_a_sequence() {
+        let bus = EventBus::new(4, 4096);
+        let mut subscription =
+            bus.subscribe(ConnectionId::new(5), Role::Node, Vec::new(), filter());
+        bus.publish(
+            EventDraft::targeted(
+                "node.invoke.request",
+                &serde_json::json!({ "id": "i1" }),
+                ConnectionId::new(5),
+            )
+            .expect("draft"),
+        );
+
+        let mut next = 0_u64;
+        match subscription.recv().await {
+            Delivery::Event(envelope) => {
+                let emission = envelope
+                    .emit(Role::Node, &[], &mut next)
+                    .expect("the space is not exhausted");
+                let Emission::Frame(frame) = emission else {
+                    panic!("a node is entitled to its own invocation");
+                };
+                assert_eq!(frame.sequence(), None);
+                assert_eq!(next, 0);
+            }
+            other => panic!("expected the targeted event: {other:?}"),
+        }
     }
 
     #[test]

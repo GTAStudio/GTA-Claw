@@ -61,9 +61,9 @@ pub use error::{
     StoreError, WireError,
 };
 pub use events::{
-    ConnectionId, Delivery, EventAudience, EventBus, EventDraft, EventEnvelope, EventError,
-    EventSubscription, EventVisibility, SequenceExhausted, TopicFilter, TopicGroup, event_catalog,
-    event_visibility,
+    ConnectionId, Delivery, Emission, EventAudience, EventBus, EventDraft, EventEnvelope,
+    EventError, EventSubscription, EventVisibility, SequenceExhausted, TopicFilter, TopicGroup,
+    event_catalog, event_visibility,
 };
 pub use meter::{RequestGuard, RequestMeter};
 pub use server::{BoundServer, GatewayServer, ServerHandle};

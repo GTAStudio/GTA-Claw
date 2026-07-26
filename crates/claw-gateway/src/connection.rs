@@ -42,7 +42,7 @@ use crate::dispatch::{MethodContext, MethodRegistry};
 use crate::error::{
     ConnectionClose, DispatchError, EncodeError, HandshakeError, StoreError, WireError,
 };
-use crate::events::{ConnectionId, Delivery, EventBus, TopicFilter};
+use crate::events::{ConnectionId, Delivery, Emission, EventBus, TopicFilter};
 use crate::meter::RequestMeter;
 use crate::store::GatewayStore;
 use crate::transport::{self, Inbound, MessageReader, ServerRead, ServerWrite};
@@ -325,21 +325,17 @@ async fn deliver(
 ) -> Result<(), ConnectionClose> {
     match delivery {
         Delivery::Event(envelope) => {
-            // The bus filtered this envelope against the subscriber's scopes at
-            // publication time. Authorization can have narrowed in between, so
-            // the entitlement is checked again here, against the session as it
-            // stands at the instant the bytes would go out. Dropping the
-            // envelope costs no sequence number, so the peer's own `seq` stream
+            // Entitlement and the sequence spend are one decision, made inside
+            // the envelope: a withheld event and a targeted event each write
+            // nothing to this connection's counter, so the peer's `seq` stream
             // stays consecutive and it never learns an event existed.
-            if !envelope.visibility().admits(session.role, &session.scopes) {
-                return Ok(());
-            }
-            // The envelope both decides whether a number is attached and spends
-            // it, so a targeted event cannot advance this connection's counter.
-            let frame = envelope
-                .to_frame(broadcast_seq)
+            let emission = envelope
+                .emit(session.role, &session.scopes, broadcast_seq)
                 .map_err(|exhausted| ConnectionClose::ProtocolViolation(exhausted.to_string()))?;
-            write_frame(write, codec, &Frame::Event(frame)).await
+            match emission {
+                Emission::Withheld => Ok(()),
+                Emission::Frame(frame) => write_frame(write, codec, &Frame::Event(frame)).await,
+            }
         }
         Delivery::Lagged { first_missed } => Err(ConnectionClose::SlowConsumer {
             dropped: services
