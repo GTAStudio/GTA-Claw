@@ -10,8 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use claw_memory::{
-    DurableMemoryError, DurableMemoryStore, DurableTranscriptStore, MemoryReference, MemoryTarget,
-    SessionId, TranscriptError, TranscriptRole, UnsafeContentReason,
+    DurableMemoryError, DurableMemoryPort, DurableMemoryStore, DurableStateConfig,
+    DurableStateRuntime, DurableStateRuntimeError, DurableTranscriptPort, DurableTranscriptStore,
+    MemoryReference, MemoryTarget, SessionId, TranscriptError, TranscriptRole, UnsafeContentReason,
 };
 use serde_json::Value;
 
@@ -570,6 +571,137 @@ fn concurrent_processes_to_one_scope_do_not_lose_entries() {
             .len(),
         writers
     );
+}
+
+#[test]
+fn runtime_ports_are_object_safe_file_backed_and_restartable() {
+    let root = TempDir::new("runtime-restart");
+    let config = DurableStateConfig::new(root.path(), 500, 250, 20, 1_000);
+    let alpha = scope("runtime-alpha");
+    let beta = scope("runtime-beta");
+    let runtime = DurableStateRuntime::open(config.clone()).expect("open durable runtime");
+    let memory: std::sync::Arc<dyn DurableMemoryPort> = runtime.memory();
+    let transcript: std::sync::Arc<dyn DurableTranscriptPort> = runtime.transcript();
+
+    memory
+        .add(
+            &alpha,
+            MemoryTarget::Memory,
+            "The runtime persists this fact.",
+            1,
+        )
+        .expect("persist memory through port");
+    memory
+        .add(
+            &alpha,
+            MemoryTarget::UserProfile,
+            "User prefers stable ports.",
+            2,
+        )
+        .expect("persist profile through port");
+    transcript
+        .append(
+            &alpha,
+            TranscriptRole::User,
+            "Remember this conversation.",
+            3,
+        )
+        .expect("persist transcript through port");
+    assert!(
+        memory
+            .list(&beta, MemoryTarget::Memory, 0, 20)
+            .expect("isolated beta scope")
+            .entries
+            .is_empty()
+    );
+    drop(memory);
+    drop(transcript);
+    drop(runtime);
+
+    let reopened = DurableStateRuntime::open(config).expect("reopen same state root");
+    assert_eq!(
+        reopened
+            .memory()
+            .list(&alpha, MemoryTarget::Memory, 0, 20)
+            .expect("reloaded memory")
+            .entries[0]
+            .content,
+        "The runtime persists this fact."
+    );
+    assert!(
+        reopened
+            .memory()
+            .render_prompt_snapshot(&alpha)
+            .expect("reloaded snapshot")
+            .contains("User prefers stable ports.")
+    );
+    assert_eq!(
+        reopened
+            .transcript()
+            .browse(&alpha, None, 10)
+            .expect("reloaded transcript")
+            .messages[0]
+            .content,
+        "Remember this conversation."
+    );
+}
+
+#[test]
+fn runtime_ports_recover_corruption_without_an_in_memory_fallback() {
+    let root = TempDir::new("runtime-recovery");
+    let config = DurableStateConfig::new(root.path(), 500, 250, 20, 1_000);
+    let scope = scope("runtime-corrupt");
+    let runtime = DurableStateRuntime::open(config.clone()).expect("open durable runtime");
+    runtime
+        .memory()
+        .add(&scope, MemoryTarget::Memory, "persisted memory", 1)
+        .expect("persist memory");
+    runtime
+        .transcript()
+        .append(&scope, TranscriptRole::User, "persisted turn", 2)
+        .expect("persist transcript");
+    drop(runtime);
+
+    let memory_path = only_state_file(root.path(), "memory");
+    let transcript_path = only_state_file(root.path(), "transcripts");
+    let corrupt_memory = b"{runtime-memory-corrupt";
+    let corrupt_transcript = b"{runtime-transcript-corrupt";
+    fs::write(&memory_path, corrupt_memory).expect("corrupt memory bytes");
+    fs::write(&transcript_path, corrupt_transcript).expect("corrupt transcript bytes");
+
+    let recovered = DurableStateRuntime::open(config).expect("reopen durable runtime");
+    assert!(
+        recovered
+            .memory()
+            .list(&scope, MemoryTarget::Memory, 0, 20)
+            .expect("recover memory through port")
+            .entries
+            .is_empty()
+    );
+    assert!(
+        recovered
+            .transcript()
+            .browse(&scope, None, 10)
+            .expect("recover transcript through port")
+            .messages
+            .is_empty()
+    );
+    let memory_backups = corrupt_backups(root.path(), "memory");
+    let transcript_backups = corrupt_backups(root.path(), "transcripts");
+    assert_eq!(
+        fs::read(&memory_backups[0]).expect("read memory quarantine"),
+        corrupt_memory
+    );
+    assert_eq!(
+        fs::read(&transcript_backups[0]).expect("read transcript quarantine"),
+        corrupt_transcript
+    );
+
+    let relative = DurableStateConfig::new("relative-state", 10, 10, 10, 10);
+    assert!(matches!(
+        DurableStateRuntime::open(relative),
+        Err(DurableStateRuntimeError::StateRootNotAbsolute)
+    ));
 }
 
 #[test]

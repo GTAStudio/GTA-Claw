@@ -35,6 +35,7 @@
 //! | [`durable`] | File-backed durable memory and user profile |
 //! | [`transcript`] | Durable transcript append, search, and browsing |
 //! | [`safety`] | Write-time and read-time persistent-content scanning |
+//! | [`runtime`] | Object-safe ports and a shared-root durable runtime facade |
 //!
 //! # Assembly order
 //!
@@ -71,6 +72,7 @@ pub mod context;
 pub mod durable;
 mod persistence;
 pub mod retrieval;
+pub mod runtime;
 pub mod safety;
 pub mod session;
 pub mod store;
@@ -91,6 +93,10 @@ pub use persistence::PersistenceError;
 pub use retrieval::{
     KeywordRetriever, MAX_RETRIEVAL_LIMIT, MemoryRecord, RecordKind, RetrievalError,
     RetrievalQuery, RetrievedItem, Retriever, VectorRetriever,
+};
+pub use runtime::{
+    DurableMemoryPort, DurableStateConfig, DurableStateRuntime, DurableStateRuntimeError,
+    DurableTranscriptPort,
 };
 pub use safety::{ContentScanResult, UnsafeContentReason, scan_persistent_content};
 pub use session::{Message, MessageId, Role, Session, SessionError, SessionId, Summary};
