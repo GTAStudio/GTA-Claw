@@ -349,9 +349,9 @@ compatibility owner and then withdrawn: target-root-only left, at the time it wa
 proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
 and the only workaround was widening the visibility of private items in
 production code, which would have let the ledger dictate the API surface.
-Re-measured on the current tree — 292 tracked `.rs` files, counting `#[test]`
-occurrences in files this rule accepts that are not themselves target roots — the
-cost is now **822 tests across 99 files in 17 packages**. The figure is a lower
+Re-measured when this rule was settled — 292 tracked `.rs` files at that point,
+counting `#[test]` occurrences in files this rule accepts that are not themselves
+target roots — the cost was **822 tests across 99 files in 17 packages**. The figure is a lower
 bound on the harm and it grows with every crate the fleet adds, which is why it
 is recorded with its method and denominator rather than as a bare number.
 
@@ -411,12 +411,19 @@ rather than as a count.
 #### The sweep is silent on rules the tree never exercises
 
 The converse is equally true, and it is why `reachability-corpus.json` exists.
-Both implementations agree on the real tree — 292 files, 287 accepted, 5
-rejected, **zero per-file disagreements**. That agreement proves nothing about
+Both implementations agree on the real tree: measured at `988c6d6`, **296 files,
+291 accepted, 5 rejected, zero per-file disagreements**. The totals churn on
+every merge and are deliberately pinned nowhere; only the rejection set is
+stable, and each entry names the rule that refuses it — three `build.rs`, one
+`.github/trusted/**` policy snapshot lying outside every Cargo package, and one
+`harness = false` desktop target. A measurement that moves with the tree is
+recorded with the revision it was taken at, or it is not reproducible.
+
+That agreement proves nothing about
 the two rules both sides changed most recently, because neither construct occurs
 anywhere in either tree: scanned at the time of writing, there are **zero inline
 `#[path]` modules and zero ambiguous `foo.rs` + `foo/mod.rs` pairs** in the
-repository. Two implementations could agree 287/5 forever with both fixes never
+repository. Two implementations could agree 291/5 forever with both fixes never
 once compared. A whole-tree sweep is the highest-yield instrument for rules the
 tree exercises and no instrument at all for rules it does not.
 
@@ -427,6 +434,12 @@ path and the expected verdict. It covers explicit `test = false` targets,
 `#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
 both directions, package boundaries, and target roots in excluded and
 self-rooted workspaces.
+
+The replay proves agreement **only for those 32 encoded shapes**. It is not an
+exhaustive proof of reachability behaviour outside them, and a green 32/32 must
+never be reported as one. The corpus and the sweep are complementary and neither
+is sufficient on its own: the sweep covers what the tree exercises, the corpus
+covers what it does not, and any rule outside both is pinned by nothing.
 
 **Neither implementation is normative here.** The `arbiter` field records that
 every expectation was produced by running `cargo` and `rustc` against the
