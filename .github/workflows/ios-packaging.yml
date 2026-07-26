@@ -168,25 +168,37 @@ jobs:
           # `IOS` is a strict prefix of `IOSSIMULATOR`, so a substring test would
           # accept a simulator object as a device build. That is the same
           # confusion class as a pin-table URL match accepting the wrong target.
-          build="$(vtool -show-build-version "${obj}" 2>&1 || true)"
-          echo "${build}"
-          actual="$(printf '%s\n' "${build}" \
+          # Apple encodes the platform in one of two mutually exclusive ways, and
+          # which one appears is itself a device/simulator discriminator:
+          #   * LC_BUILD_VERSION carries an explicit `platform` token. The
+          #     simulator has no other encoding, so a simulator object always
+          #     uses this one.
+          #   * LC_VERSION_MIN_IPHONEOS is the legacy, device-only command,
+          #     emitted when the deployment target predates LC_BUILD_VERSION
+          #     (rustc targets iOS 10.0 here). It has no way to express
+          #     "simulator", so its presence is positive evidence of a device
+          #     build. Measured: the device leg emits this and no platform token.
+          vt="$(vtool -show-build-version "${obj}" 2>&1 || true)"
+          lc="$(otool -l "${obj}" 2>&1 || true)"
+          token="$(printf '%s\n%s\n' "${vt}" "${lc}" \
             | awk '$1 == "platform" { print $2; exit }')"
 
-          # Fallback: older tooling prints the platform as a number rather than a
-          # name. Map the two admitted values explicitly instead of guessing.
-          if [ -z "${actual}" ]; then
-            echo "vtool reported no platform token; retrying with otool"
-            build="$(otool -l "${obj}" 2>&1 || true)"
-            numeric="$(printf '%s\n' "${build}" \
-              | awk '$1 == "platform" { print $2; exit }')"
-            case "${numeric}" in
-              2) actual="IOS" ;;
-              7) actual="IOSSIMULATOR" ;;
-              "") actual="" ;;
-              *) actual="UNKNOWN(${numeric})" ;;
-            esac
-          fi
+          case "${token}" in
+            IOS)          actual="IOS";          encoding="LC_BUILD_VERSION" ;;
+            IOSSIMULATOR) actual="IOSSIMULATOR"; encoding="LC_BUILD_VERSION" ;;
+            2)            actual="IOS";          encoding="LC_BUILD_VERSION(2)" ;;
+            7)            actual="IOSSIMULATOR"; encoding="LC_BUILD_VERSION(7)" ;;
+            "")
+              if printf '%s\n' "${lc}" | grep -q 'LC_VERSION_MIN_IPHONEOS'; then
+                actual="IOS"
+                encoding="LC_VERSION_MIN_IPHONEOS (legacy, device-only)"
+              else
+                actual=""
+                encoding="none"
+              fi
+              ;;
+            *) actual="UNKNOWN(${token})"; encoding="LC_BUILD_VERSION" ;;
+          esac
 
           case "${{ matrix.sdk }}" in
             iphoneos)        expected="IOS" ;;
@@ -197,17 +209,30 @@ jobs:
               ;;
           esac
           if [ -z "${actual}" ]; then
-            echo "no LC_BUILD_VERSION platform found in the object, so the platform"
-            echo "cannot be verified and this check must not report success. Last"
-            echo "tool output was:"
-            printf '%s\n' "${build}" | head -n 40
+            echo "the object carries neither an LC_BUILD_VERSION platform token nor"
+            echo "LC_VERSION_MIN_IPHONEOS, so the platform cannot be verified and"
+            echo "this check must not report success. Load commands were:"
+            printf '%s\n' "${lc}" | grep -E '^\s+cmd ' | head -n 40
             exit 1
           fi
           if [ "${actual}" != "${expected}" ]; then
             echo "platform mismatch for ${{ matrix.target }}:"
             echo "  expected exactly: ${expected}"
             echo "  actually built  : ${actual}"
+            echo "  encoding        : ${encoding}"
             exit 1
           fi
-          echo "verified: Mach-O arm64, LC_BUILD_VERSION platform ${actual}," \
-               "matching ${{ matrix.target }} exactly"
+
+          # Belt and braces on the direction that actually matters. A simulator
+          # object satisfying the device leg is the harmful confusion; assert the
+          # simulator marker is absent outright rather than relying on the token
+          # comparison alone.
+          if [ "${expected}" = "IOS" ] \
+            && printf '%s\n' "${vt}" "${lc}" | grep -q 'IOSSIMULATOR'; then
+            echo "the device leg found a simulator marker in the object:"
+            printf '%s\n' "${vt}" "${lc}" | grep -n 'IOSSIMULATOR' | head -n 10
+            exit 1
+          fi
+
+          echo "verified: Mach-O 64-bit arm64 object, platform ${actual} via" \
+               "${encoding}, matching ${{ matrix.target }} exactly"
