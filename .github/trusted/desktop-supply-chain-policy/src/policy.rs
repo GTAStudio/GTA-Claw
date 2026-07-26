@@ -410,17 +410,67 @@ pub(crate) fn admitted_skia_targets() -> BTreeSet<&'static str> {
         .collect()
 }
 
+/// Returns the admitted iOS platform's static description, if `MOBILE_PLATFORMS` declares one.
+///
+/// Centralizes the `directory == "ios"` lookup so every iOS-specific accessor below shares one
+/// definition of "the iOS platform" rather than repeating the same `find` predicate.
+fn ios_platform() -> Option<&'static MobilePlatform> {
+    MOBILE_PLATFORMS
+        .iter()
+        .find(|platform| platform.directory == "ios")
+}
+
 /// Returns the iOS platform's exact device and simulator Skia targets.
 ///
 /// Exposed so callers outside this module (the trusted CLI resolver and the mobile packaging
 /// workflow content policy) describe iOS by the same two targets `MOBILE_PLATFORMS` declares,
 /// rather than carrying a second hardcoded pair that could silently drift from it.
 pub(crate) fn ios_skia_targets() -> &'static [&'static str] {
-    MOBILE_PLATFORMS
-        .iter()
-        .find(|platform| platform.directory == "ios")
+    ios_platform()
         .map(|platform| platform.skia_targets)
         .unwrap_or(&[])
+}
+
+/// Returns the iOS platform's workspace manifest path (`ios/Cargo.toml`).
+///
+/// Exposed so the mobile packaging workflow content policy can recognize a cargo invocation that
+/// actually targets the iOS Skia workspace by exact manifest path, rather than carrying a second
+/// hardcoded copy of this path that could silently drift from `MOBILE_PLATFORMS`.
+pub(crate) fn ios_workspace_manifest_path() -> &'static str {
+    ios_platform()
+        .map(|platform| platform.manifest)
+        .unwrap_or("")
+}
+
+/// Returns the iOS platform's sole app member manifest path
+/// (`ios/apps/gta-claw-ios-shell/Cargo.toml`) — an equally exact alternative to the workspace
+/// manifest a cargo invocation may name instead.
+pub(crate) fn ios_app_manifest_path() -> &'static str {
+    ios_platform()
+        .map(|platform| platform.app_manifest)
+        .unwrap_or("")
+}
+
+/// Returns the iOS platform's sole declared package name (`gta-claw-ios-shell`).
+///
+/// Distinct from, and not a substring-safe discriminator against, an unrelated app such as
+/// `gta-claw-ios` (no `-shell` suffix): `"gta-claw-ios"` is a proper prefix of
+/// `"gta-claw-ios-shell"`, so an exact (never `contains`) match on this name is required for the
+/// same reason `exact_flag_token` in the mobile workflow content policy never uses `contains`.
+pub(crate) fn ios_app_package_name() -> &'static str {
+    ios_platform()
+        .map(|platform| platform.package)
+        .unwrap_or("")
+}
+
+/// Returns the iOS platform's top-level workspace directory name (`ios`).
+///
+/// Exposed so a step's exact `working-directory: ios` can be recognized as equally targeting the
+/// iOS Skia workspace, without a second hardcoded copy of the directory name.
+pub(crate) fn ios_workspace_directory() -> &'static str {
+    ios_platform()
+        .map(|platform| platform.directory)
+        .unwrap_or("")
 }
 
 /// Packages known to fetch a prebuilt artifact from the network during their build script.

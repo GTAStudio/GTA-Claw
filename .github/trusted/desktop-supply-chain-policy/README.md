@@ -246,7 +246,71 @@ versionless skips, source widening, advisory exceptions, graph target filtering,
 drift are rejected. The discovery transition pins only the reviewed older `getrandom`, `rand`,
 `core-foundation`, `syn`, and `sha3` lines that coexist with their newer ecosystem versions.
 
+### Admitted `ios-packaging.yml` content is bound to the trust chain, not its path
+
+A file at `.github/workflows/ios-packaging.yml` is an admitted path, not proof of Skia exposure.
+Live PR #138 already occupies this exact path while packaging `apps/gta-claw-ios` — a different,
+Skia-free application, proven so by that PR's own `cargo tree` assertion with a positive control —
+and never fetches a Skia archive at all. `mobile_workflow::validate_ios_packaging_workflow_skia_injection`
+therefore applies the checks below only to steps that actually target the iOS Skia workspace
+`MOBILE_PLATFORMS` declares: an exact `working-directory: ios`, or a `run:` invocation naming the
+exact workspace manifest (`ios/Cargo.toml`), exact app manifest
+(`ios/apps/gta-claw-ios-shell/Cargo.toml`), or exact app package (`gta-claw-ios-shell`) — always by
+exact match, never `contains`, since `gta-claw-ios` is a proper prefix of `gta-claw-ios-shell` and a
+substring check would let one satisfy a check meant for the other. A file with no such step, like PR
+#138's, has nothing here for this trust chain to protect and is accepted outright; the moment any
+step does target that workspace, every check below applies to the whole job.
+
+Once engaged, every prebuilt Skia archive a job could fetch must be resolved through the trusted CLI
+resolver (`resolve-build-artifact-pin`, backed by `PINNED_BUILD_ARTIFACTS`), never a URL or digest
+typed directly into the YAML — rejected even inside a comment. Given `--package`, `--version`, and
+`--target`, it prints one bounded, machine-consumable line naming the sole reviewed
+`(package, version, target, url, sha256)` fact for that exact input, and fails closed — loudly, with
+the real digest redacted from a mismatch error — on an unknown, duplicate, ambiguous, or cross-target
+input; matching is exact-string equality on all three fields, never substring or prefix, for the same
+reason a pin row's own URL-to-target match cannot be either. Passing `--verify-local <path>`
+additionally re-hashes that exact local file and checks its size against a bound
+(`MAX_BUILD_ARTIFACT_BYTES`, 128 MiB, overridable with `--max-bytes`), appending the verified path and
+byte count to the same line only on success; a digest mismatch, an oversized file, or a missing file
+is rejected before those fields ever print. A resolve-and-verify step must fetch with a fail-closed
+`curl` (`-f`/`--fail`) to a filename derived from the resolved URL's own `basename` — never a
+hardcoded literal, so a stale or mistyped local name can never silently pair with the wrong archive —
+`--verify-local` that exact fetched file, and publish the verified path under one of two fixed
+environment variable names (`SKIA_ARCHIVE_IOS_DEVICE` / `SKIA_ARCHIVE_IOS_SIM`) through
+`$GITHUB_ENV`, as a visibly absolute path (`/...`, `$(pwd)/...`, `$PWD/...`, `${PWD}/...`,
+`$GITHUB_WORKSPACE/...`, or `${GITHUB_WORKSPACE}/...`): `skia-bindings` reads everything after a
+`file://` prefix as a literal path with no further parsing, so a relative path would be silently
+working-directory-dependent. The two fixed variable names make cross-target substitution and
+"mutable name" fallbacks (reusing one name for both targets, so a later resolve silently overwrites
+an earlier target's path) structurally impossible to satisfy this check, rather than something this
+module has to detect after the fact.
+
+A Skia-resolving cargo step targeting that workspace (`cargo check`/`clippy`/`build`/`test`/`run`)
+must set `FORCE_SKIA_BINARIES_DOWNLOAD` to a truthy value — `skia-bindings` otherwise falls back
+silently to an unverified source build rather than failing — and point `SKIA_BINARIES_URL` at
+`file://` plus the verified archive matching its own `--target` (or either verified archive, for a
+step naming no explicit target). That alone only proves the workflow *asked* for the forced download
+path; the step must also request cargo's `-vv` build-script output (plain `-v`/`--verbose` alone
+suppresses it on a successful build) piped through `tee` to a captured log, and some step from that
+point on in the job must check the captured log for the literal lines
+`TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES` and `UNPACKING ARCHIVE INTO`, and reject
+`DOWNLOAD AND INSTALL FAILED` — a successful `Compiling skia-bindings` line alone proves nothing,
+since a stale build cache or a silent fallback source build can print that too.
+
+Finally, once a workflow engages this trust chain, every `on:` trigger event that narrows itself with
+a `paths:` allow list must include `.github/trusted/**`, so a future change to the pin table or the
+resolver itself always re-runs the workflow that consumes them; an event with no `paths:` filter at
+all is already unrestricted and compliant. This requirement is scoped by the same engagement check as
+the rest of this section, for the same reason: PR #138's own trigger, which never touches Skia, is
+exempt exactly as its steps are.
+
+All of the above is a bounded, textual content check over the workflow YAML — whitespace-tokenized,
+per line, quote-trimming only, not a shell parser or a GitHub Actions expression evaluator. It proves
+the workflow *says* the right things in the right order; it cannot prove a 404, a digest mismatch, or
+a wrong local archive at runtime, which remain the resolver/verifier's own job and its own tests.
+
 ## Legacy Node shrink-only ratchet
+
 
 For every Final protected base, the validator independently inventories both trees. The
 candidate legacy surface must be a subset of the base surface, and both must remain within the
