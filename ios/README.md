@@ -1,3 +1,58 @@
+# `ios/` — ARCHIVED, NOT SHIPPED
+
+> **This workspace is not part of the product.** Mobile ships without a GUI for
+> this release, and the ruling applies identically to iOS and Android. This
+> branch is kept as an archive so the work can be revived rather than redone.
+> It was never merged to `main`.
+>
+> **Do not treat a green build here as a shipping decision.** The decision was
+> made explicitly, on four grounds: the product requirement names Windows and
+> macOS as the GUI platforms and mobile was an addition; the trust-root pin
+> table needed to admit Skia is empty and not editable from a feature branch;
+> `ios/**` matches none of `rust.yml`'s path filters and the repository has no
+> required status checks, so an `ios/`-only PR runs zero Rust validation and
+> merges green; and CI can prove this compiles and links but cannot prove it
+> runs, so a defect in behaviour would surface at release rather than in review.
+>
+> **The fourth ground is narrower than "CI cannot build it".** CI *did* build
+> it — see the table below. What CI cannot do is launch it. And per Apple's
+> TN3179 the simulator *"doesn't support local network privacy"*, so even a
+> simulator job could never validate the discovery path. That ceiling is a
+> property of the platform, not of this code.
+
+## Exact state at archival
+
+| | |
+| --- | --- |
+| Branch | `aizhihuxiao-ios-slint-shell` |
+| Commits | `bde439a` (shell), `49e1fd2` (reachability boundary entry) |
+| Base | `main` at `988c6d64b6ec61adbfb7f04d39b83155e025de6c` |
+| Closed PR | #110 |
+| Rust | 1.97.0 pinned, MSRV 1.94.0 |
+| Slint | 1.17.1 (must equal `desktop/Cargo.lock`; the trust root cross-checks) |
+| `skia-bindings` | 0.99.0 |
+| Lock | 640 packages |
+| Targets | `aarch64-apple-ios`, `aarch64-apple-ios-sim` |
+
+### The two Skia pin rows, if this is ever revived
+
+Obtained independently — `curl` from the published release URL into a clean
+empty directory, SHA-256 computed there, **never** from a build output or
+cache. Both targets share release tag `0.99.0`. Recorded here so the
+acquisition does not have to be repeated.
+
+| package | version | target | bytes | SHA-256 |
+| --- | --- | --- | --- | --- |
+| `skia-bindings` | `0.99.0` | `aarch64-apple-ios` | 15024772 | `15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8` |
+| `skia-bindings` | `0.99.0` | `aarch64-apple-ios-sim` | 15063260 | `ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e` |
+
+Reviving this also requires fixing `url.contains(target)` at `policy.rs:1435`:
+`aarch64-apple-ios` is a proper prefix of `aarch64-apple-ios-sim`, so the
+simulator archive satisfies the device row. Measured, not inferred — the table
+accepted exactly that pairing.
+
+---
+
 # `ios/` — the Slint iOS shell workspace
 
 This is an **excluded** Cargo workspace, like `desktop/`. It is not a member of
