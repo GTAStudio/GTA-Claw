@@ -1477,17 +1477,26 @@ fn renamed_inventory_id_is_rejected_as_drift() {
 fn raised_ledger_status_without_evidence_is_rejected() {
     let fixture = Fixture::copy_upstream();
     let path = fixture.root.join("ledgers").join("gateway-core.json");
-    let source = fs::read_to_string(&path).expect("read ledger");
-    assert_eq!(source.matches("\"status\":  \"unimplemented\"").count(), 16);
-    fs::write(
-        &path,
-        source.replacen(
-            "\"status\":  \"unimplemented\"",
-            "\"status\":  \"implemented\"",
+    mutate_json(&path, |ledger| {
+        let features = ledger["features"].as_array_mut().expect("features array");
+        let matches = features
+            .iter_mut()
+            .filter(|feature| feature["feature_id"].as_str() == Some("gateway.protocol.v4"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
             1,
-        ),
-    )
-    .expect("mutate ledger");
+            "expected exactly one gateway.protocol.v4 feature, found {}",
+            matches.len()
+        );
+        let feature = matches.into_iter().next().expect("matching feature");
+        assert_eq!(
+            feature["status"].as_str(),
+            Some("unimplemented"),
+            "gateway.protocol.v4 must start unimplemented"
+        );
+        feature["status"] = serde_json::json!("implemented");
+    });
 
     let error = load_error(&fixture.root);
     assert_eq!(error.code(), ViolationCode::LedgerEvidence);
