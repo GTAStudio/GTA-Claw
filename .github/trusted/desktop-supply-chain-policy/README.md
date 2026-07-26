@@ -143,9 +143,14 @@ that platform declares must carry a reviewed digest. iOS additionally treats the
 `skia-bindings` as an unresolved lock, because it cannot avoid Skia; Android can select FemtoVG or
 the software renderer instead, and is held to the identical discipline the moment it does not.
 
-`PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. The archive key embeds
-the crate commit, target, and resolved feature set, so it cannot be computed before the mobile lock
-exists. The table is therefore empty, and the validator refuses to admit any mobile workspace that
+`PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. `BUILD_TIME_FETCHING_PACKAGES` also
+carries the fixed 20-hex archive key of the admitted release, and a pin's URL must be an asset of
+that release, carrying that key, whose name states the pin's own target. **The key is uniform
+across a release and does not encode the target or the feature set**: all 137 assets of 0.99.0
+carry `a25a0fdb7d90429aa2d1`, and the target and sorted feature set follow it as separate segments
+of the asset name. Only the feature segment depends on the resolved graph, so the key is knowable
+before the mobile lock exists while the complete asset name is not. The table is therefore empty,
+and the validator refuses to admit any mobile workspace that
 uses Skia while it stays empty. Filling it is a reviewed trust-root edit. Obtain each digest from
 the release asset metadata, which publishes a SHA-256 the build script ignores:
 
@@ -153,6 +158,12 @@ the release asset metadata, which publishes a SHA-256 the build script ignores:
 gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
   --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
 ```
+
+The target is derived from the asset name by longest match over the admitted targets and then
+compared for equality, because a substring test cannot separate a device archive from a simulator
+one: `skia-binaries-<key>-aarch64-apple-ios-sim-<features>.tar.gz` contains `aarch64-apple-ios`.
+That archive is a real upstream asset with a real published digest, so neither the digest nor the
+host proves which target it was built for — only its name does.
 
 #### Why the lockfile does not already cover this
 

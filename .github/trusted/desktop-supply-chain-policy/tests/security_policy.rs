@@ -4986,7 +4986,7 @@ fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
 #[test]
 fn reviewed_build_artifact_pin_table_shape_is_enforced() {
     const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
-    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-jpegd-jpege-metal-pdf-textlayout.tar.gz";
     validate_build_artifact_pin_table(&[(
         "skia-bindings",
         "0.99.0",
@@ -5061,6 +5061,74 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
         assert!(
             validate_build_artifact_pin_table(&pins).is_err(),
             "reviewed build-artifact pin table must reject: {label}"
+        );
+    }
+
+    // A simulator archive is a real upstream asset with a real digest, and its name *contains* the
+    // device target, so a substring test accepts it for a device pin. The binary it carries is
+    // built for the simulator. Each of these is asserted on its own production error so a rule that
+    // stops distinguishing them fails here rather than silently blessing the wrong archive.
+    let sim = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-sim-jpegd-jpege-metal-pdf-textlayout.tar.gz";
+    validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        sim,
+        DIGEST,
+    )])
+    .expect("the simulator archive is admitted for the simulator target");
+
+    for (label, target, url, expected) in [
+        (
+            "simulator archive declared as the device target",
+            "aarch64-apple-ios",
+            sim,
+            "declares aarch64-apple-ios but its archive is built for aarch64-apple-ios-sim",
+        ),
+        (
+            "archive key of another upstream build",
+            "aarch64-apple-ios",
+            "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-1111111111111111111f-aarch64-apple-ios-jpegd-pdf.tar.gz",
+            "does not carry the admitted skia-bindings archive key a25a0fdb7d90429aa2d1",
+        ),
+        (
+            "asset from a different release",
+            "aarch64-apple-ios",
+            "https://github.com/rust-skia/skia-binaries/releases/download/0.50.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-jpegd-pdf.tar.gz",
+            "is not the admitted skia-bindings 0.99.0 release download prefix",
+        ),
+        (
+            "asset hosted somewhere else",
+            "aarch64-apple-ios",
+            "https://attacker.example.invalid/aarch64-apple-ios.tar.gz",
+            "is not the admitted skia-bindings 0.99.0 release download prefix",
+        ),
+        (
+            "extra path segment below the release",
+            "aarch64-apple-ios",
+            "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/nested/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-jpegd-pdf.tar.gz",
+            "is not a single skia-bindings release asset",
+        ),
+        (
+            "target no platform admits",
+            "aarch64-apple-ios",
+            "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-pc-windows-msvc-jpegd-pdf.tar.gz",
+            "names no admitted target",
+        ),
+        (
+            "target name that merely starts with an admitted one",
+            "aarch64-apple-ios",
+            "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios2-jpegd-pdf.tar.gz",
+            "names no admitted target",
+        ),
+    ] {
+        let error =
+            validate_build_artifact_pin_table(&[("skia-bindings", "0.99.0", target, url, DIGEST)])
+                .expect_err(label)
+                .to_string();
+        assert!(
+            error.contains(expected),
+            "{label} must be rejected with {expected:?}, got: {error}"
         );
     }
 }
