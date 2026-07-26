@@ -750,6 +750,42 @@ fn ensure_existing_root_member(tree: &TempTree, member: &str, member_manifest: &
     );
 }
 
+fn setup_sqlite_file_control_member(tree: &TempTree, member: &str, member_manifest: &str) {
+    assert!(
+        member == P03B_SQLITE_FILE_CONTROL_MEMBER,
+        "only the exact native-FFI member may use the SQLite file-control setup helper"
+    );
+    assert!(
+        member_manifest == P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        "SQLite file-control setup must use the canonical manifest"
+    );
+
+    let root_manifest: toml::Value = toml::from_str(
+        &fs::read_to_string(tree.join("Cargo.toml"))
+            .expect("read SQLite file-control root manifest"),
+    )
+    .expect("parse SQLite file-control root manifest");
+    let members = root_manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .expect("root workspace member array");
+    assert_unique_sorted_root_members(members);
+    if members
+        .binary_search_by(|candidate| {
+            candidate
+                .as_str()
+                .expect("root workspace member string")
+                .cmp(member)
+        })
+        .is_ok()
+    {
+        ensure_existing_root_member(tree, member, member_manifest);
+    } else {
+        add_new_root_member(tree, member, member_manifest);
+    }
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
         .downcast_ref::<String>()
@@ -2608,6 +2644,9 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
         let manifest_path = tree
             .join(P03B_SQLITE_FILE_CONTROL_MEMBER)
             .join("Cargo.toml");
+        let source_path = tree
+            .join(P03B_SQLITE_FILE_CONTROL_MEMBER)
+            .join("src/lib.rs");
         if already_present {
             fs::create_dir_all(manifest_path.parent().expect("native-FFI member parent"))
                 .expect("create native-FFI member");
@@ -2616,27 +2655,51 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
                 P03B_SQLITE_FILE_CONTROL_MANIFEST.replace('\n', "\r\n"),
             )
             .expect("write exact native-FFI member manifest");
+            fs::create_dir_all(source_path.parent().expect("native-FFI source parent"))
+                .expect("create native-FFI source");
+            fs::write(&source_path, "//! Existing canonical member source.\r\n")
+                .expect("write existing native-FFI source");
         }
-        let manifest_before = already_present
-            .then(|| fs::read(&manifest_path).expect("read native-FFI manifest before setup"));
 
-        if already_present {
-            ensure_existing_root_member(
-                &tree,
-                P03B_SQLITE_FILE_CONTROL_MEMBER,
-                P03B_SQLITE_FILE_CONTROL_MANIFEST,
-            );
-        } else {
-            add_new_root_member(
-                &tree,
-                P03B_SQLITE_FILE_CONTROL_MEMBER,
-                P03B_SQLITE_FILE_CONTROL_MANIFEST,
-            );
-        }
-        ensure_existing_root_member(
+        let bytes_before = already_present.then(|| {
+            [
+                fs::read(tree.join("Cargo.toml")).expect("read root manifest before setup"),
+                fs::read(&manifest_path).expect("read native-FFI manifest before setup"),
+                fs::read(&source_path).expect("read native-FFI source before setup"),
+                fs::read(tree.join("Cargo.lock")).expect("read root lock before setup"),
+            ]
+        });
+        setup_sqlite_file_control_member(
             &tree,
             P03B_SQLITE_FILE_CONTROL_MEMBER,
             P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        let bytes_after_first_setup = [
+            fs::read(tree.join("Cargo.toml")).expect("read root manifest after first setup"),
+            fs::read(&manifest_path).expect("read native-FFI manifest after first setup"),
+            fs::read(&source_path).expect("read native-FFI source after first setup"),
+            fs::read(tree.join("Cargo.lock")).expect("read root lock after first setup"),
+        ];
+        if let Some(bytes_before) = bytes_before {
+            assert_eq!(
+                bytes_after_first_setup, bytes_before,
+                "canonical existing member setup changed fixture bytes"
+            );
+        }
+        setup_sqlite_file_control_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        assert_eq!(
+            [
+                fs::read(tree.join("Cargo.toml")).expect("read root manifest after second setup"),
+                fs::read(&manifest_path).expect("read native-FFI manifest after second setup"),
+                fs::read(&source_path).expect("read native-FFI source after second setup"),
+                fs::read(tree.join("Cargo.lock")).expect("read root lock after second setup"),
+            ],
+            bytes_after_first_setup,
+            "second native-FFI member setup changed fixture bytes: {label}"
         );
 
         assert_eq!(
@@ -2661,12 +2724,6 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
             1,
             "native-FFI lock setup was not idempotent: {label}"
         );
-        if already_present {
-            assert_eq!(
-                fs::read(&manifest_path).expect("read existing native-FFI manifest after setup"),
-                manifest_before.expect("present manifest snapshot")
-            );
-        }
     }
 
     let noncanonical = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
@@ -2674,24 +2731,53 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
         "futures-core = \"=0.3.31\"",
         1,
     );
-    let tree = final_tree("sqlite-file-control-noncanonical-input");
-    add_new_root_member(
-        &tree,
-        P03B_SQLITE_FILE_CONTROL_MEMBER,
-        P03B_SQLITE_FILE_CONTROL_MANIFEST,
-    );
-    ensure_existing_root_member(
-        &tree,
-        P03B_SQLITE_FILE_CONTROL_MEMBER,
-        P03B_SQLITE_FILE_CONTROL_MANIFEST,
-    );
+    let tree = final_tree("sqlite-file-control-helper-misuse");
     let rejection = std::panic::catch_unwind(|| {
-        ensure_existing_root_member(&tree, P03B_SQLITE_FILE_CONTROL_MEMBER, &noncanonical);
+        setup_sqlite_file_control_member(&tree, P03B_SQLITE_FILE_CONTROL_MEMBER, &noncanonical);
+    })
+    .expect_err("noncanonical setup manifest unexpectedly passed");
+    assert_eq!(
+        panic_message(rejection.as_ref()),
+        "SQLite file-control setup must use the canonical manifest"
+    );
+
+    let tree = final_tree("sqlite-file-control-wrong-helper-member");
+    let rejection = std::panic::catch_unwind(|| {
+        setup_sqlite_file_control_member(
+            &tree,
+            "crates/claw-native-control",
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+    })
+    .expect_err("wrong setup member unexpectedly passed");
+    assert_eq!(
+        panic_message(rejection.as_ref()),
+        "only the exact native-FFI member may use the SQLite file-control setup helper"
+    );
+
+    let tree = final_tree("sqlite-file-control-noncanonical-input");
+    setup_sqlite_file_control_member(
+        &tree,
+        P03B_SQLITE_FILE_CONTROL_MEMBER,
+        P03B_SQLITE_FILE_CONTROL_MANIFEST,
+    );
+    fs::write(
+        tree.join(P03B_SQLITE_FILE_CONTROL_MEMBER)
+            .join("Cargo.toml"),
+        &noncanonical,
+    )
+    .expect("write noncanonical existing native-FFI manifest");
+    let rejection = std::panic::catch_unwind(|| {
+        setup_sqlite_file_control_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
     })
     .expect_err("noncanonical existing-member manifest unexpectedly passed");
     assert_eq!(
         panic_message(rejection.as_ref()),
-        "existing native-FFI member must use the canonical manifest"
+        "existing native-FFI member manifest changed"
     );
 
     for (label, from, to) in [
@@ -2719,12 +2805,7 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
             "unauthorized helper manifest drift matched the reviewed digest: {label}"
         );
         let tree = final_tree(label);
-        add_new_root_member(
-            &tree,
-            P03B_SQLITE_FILE_CONTROL_MEMBER,
-            P03B_SQLITE_FILE_CONTROL_MANIFEST,
-        );
-        ensure_existing_root_member(
+        setup_sqlite_file_control_member(
             &tree,
             P03B_SQLITE_FILE_CONTROL_MEMBER,
             P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2773,28 +2854,35 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
         sha256(P03B_SQLITE_FILE_CONTROL_MANIFEST.as_bytes()),
         P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256
     );
-    let accepted = final_tree("sqlite-file-control-lints");
-    add_new_root_member(
-        &accepted,
-        P03B_SQLITE_FILE_CONTROL_MEMBER,
-        P03B_SQLITE_FILE_CONTROL_MANIFEST,
-    );
-    ensure_existing_root_member(
-        &accepted,
-        P03B_SQLITE_FILE_CONTROL_MEMBER,
-        P03B_SQLITE_FILE_CONTROL_MANIFEST,
-    );
-    let workspace = validate_final_static(
-        &SafeRoot::new(&accepted.path).expect("open exact native-FFI member fixture"),
-    )
-    .expect("accept the exact reviewed native-FFI lint exception");
-    assert_eq!(
-        workspace
-            .members
-            .get("crates/claw-sqlite-file-control")
-            .map(String::as_str),
-        Some("claw-sqlite-file-control")
-    );
+    for (label, establish_present_first) in [
+        ("sqlite-file-control-lints-absent", false),
+        ("sqlite-file-control-lints-present", true),
+    ] {
+        let accepted = final_tree(label);
+        if establish_present_first {
+            setup_sqlite_file_control_member(
+                &accepted,
+                P03B_SQLITE_FILE_CONTROL_MEMBER,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+            );
+        }
+        setup_sqlite_file_control_member(
+            &accepted,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        let workspace = validate_final_static(
+            &SafeRoot::new(&accepted.path).expect("open exact native-FFI member fixture"),
+        )
+        .expect("accept the exact reviewed native-FFI lint exception");
+        assert_eq!(
+            workspace
+                .members
+                .get("crates/claw-sqlite-file-control")
+                .map(String::as_str),
+            Some("claw-sqlite-file-control")
+        );
+    }
 
     let cases = [
         (
@@ -2899,12 +2987,7 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
     for (label, member, manifest, expected) in cases {
         let tree = final_tree(label);
         if member == P03B_SQLITE_FILE_CONTROL_MEMBER {
-            add_new_root_member(
-                &tree,
-                P03B_SQLITE_FILE_CONTROL_MEMBER,
-                P03B_SQLITE_FILE_CONTROL_MANIFEST,
-            );
-            ensure_existing_root_member(
+            setup_sqlite_file_control_member(
                 &tree,
                 P03B_SQLITE_FILE_CONTROL_MEMBER,
                 P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2926,12 +3009,7 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
 
     for mutation in ["duplicate", "unsorted"] {
         let tree = final_tree(&format!("sqlite-file-control-{mutation}"));
-        add_new_root_member(
-            &tree,
-            P03B_SQLITE_FILE_CONTROL_MEMBER,
-            P03B_SQLITE_FILE_CONTROL_MANIFEST,
-        );
-        ensure_existing_root_member(
+        setup_sqlite_file_control_member(
             &tree,
             P03B_SQLITE_FILE_CONTROL_MEMBER,
             P03B_SQLITE_FILE_CONTROL_MANIFEST,
