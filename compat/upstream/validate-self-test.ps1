@@ -495,6 +495,30 @@ function Set-ManifestStatusTotals {
     Write-Json $path $manifest
 }
 
+function Reset-MutableLedgerTransitions {
+    param([string]$CaseRoot)
+    $baselineDifference =
+        "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
+    $ledgerPaths = @(
+        "ledgers/gateway-core.json",
+        "ledgers/official-integration.json",
+        "ledgers/official-client-interop.json"
+    )
+    foreach ($relativePath in $ledgerPaths) {
+        $path = Join-Path $CaseRoot $relativePath
+        $ledger = Read-Json $path
+        foreach ($feature in @($ledger.features)) {
+            $feature.status = "unimplemented"
+            $feature.acceptance_evidence.status = "missing"
+            $feature.acceptance_evidence.artifacts = @()
+            $feature.known_differences = @($baselineDifference)
+            $feature.PSObject.Properties.Remove("implementation_pointers")
+        }
+        Write-Json $path $ledger
+    }
+    Set-ManifestStatusTotals $CaseRoot 47 0 0
+}
+
 # Applies a syntactically well-formed "implemented" claim to the first row of the
 # gateway-core ledger, differing from the honest claim only by the planted defect.
 function Set-ForgedTransition {
@@ -2497,6 +2521,14 @@ $temporaryRoot = Join-Path $SelfTestWorkRoot (
     "gta-claw-upstream-validator-self-test-" + [Guid]::NewGuid().ToString("N")
 )
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
+$caseTemplateRoot = Join-Path $temporaryRoot "neutral-case-template"
+New-Item -ItemType Directory -Path $caseTemplateRoot | Out-Null
+Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseTemplateRoot -Recurse -Force
+Reset-MutableLedgerTransitions $caseTemplateRoot
+$templateResult = Invoke-Validator $caseTemplateRoot -WriteLedgerDigests
+if ($templateResult.exit_code -ne 0) {
+    throw "validator self-test neutral template failed: $($templateResult.output)"
+}
 
 $passed = New-Object System.Collections.Generic.List[string]
 $failures = New-Object System.Collections.Generic.List[string]
@@ -2516,7 +2548,7 @@ try {
         }
         $caseRoot = Join-Path $temporaryRoot $case.name
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
-        Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseRoot -Recurse -Force
+        Copy-Item -Path (Join-Path $caseTemplateRoot "*") -Destination $caseRoot -Recurse -Force
         & $case.mutate $caseRoot
         $caseRepositoryRoot = ""
         if ($case.Contains("repository_root")) {
@@ -2556,6 +2588,7 @@ try {
             $failures.Add(("{0}: {1}" -f $case.name, $failure))
             [Console]::Error.WriteLine("  FAIL $($case.name)")
         }
+        Remove-Item -LiteralPath $caseRoot -Recurse -Force
     }
 } finally {
     if (Test-Path -LiteralPath $temporaryRoot) {

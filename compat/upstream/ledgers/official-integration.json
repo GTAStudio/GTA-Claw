@@ -177,18 +177,35 @@
                                                                "src/infra/clawhub-install-trust.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/clawhub.rs",
+                                                                           "test":  "tests::register_publish_search_install_update_subscribe_uninstall"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/clawhub.rs",
+                                                                           "test":  "tests::risk_acknowledgement_is_bound_to_version_and_digest"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/clawhub.rs",
+                                                                           "test":  "tests::forged_publish_tampering_and_revocation_fail_closed"
+                                                                       }
                                                                    ],
                                                      "required":  "Search, install, update, publish, risk acknowledgement, trust, and uninstall tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "No known behavioral differences from the frozen ClawHub lifecycle contract."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-automation/src/clawhub.rs",
+                                                             "note":  "Implements trusted registration, search, publish, subscription, installation, version updates, revocation, and uninstall lifecycle."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "integration.fleet",
@@ -205,18 +222,35 @@
                                                                "docs/cli/fleet.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/fleet.rs",
+                                                                           "test":  "tests::full_create_status_logs_backup_doctor_remove_lifecycle"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/fleet.rs",
+                                                                           "test":  "tests::leadership_fails_over_and_term_advances"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/fleet.rs",
+                                                                           "test":  "tests::rolling_update_stops_on_failure_and_preserves_resume_state"
+                                                                       }
                                                                    ],
                                                      "required":  "Create, status, logs, backup, doctor, and remove tests pass for local container cells."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "No known behavioral differences from the frozen fleet cell lifecycle contract."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-automation/src/fleet.rs",
+                                                             "note":  "Implements cell creation, membership, health, leases, leadership, rolling updates, backup, diagnostics, logs, and teardown."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "integration.discovery.dns-sd",
@@ -233,18 +267,39 @@
                                                                "src/infra/widearea-dns.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "partial",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/dns_sd.rs",
+                                                                           "test":  "tests::emits_the_pinned_gateway_txt_contract_and_both_ip_families"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/dns_sd.rs",
+                                                                           "test":  "tests::allocates_deterministic_collision_suffixes"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/dns_sd.rs",
+                                                                           "test":  "tests::wide_area_fixture_matches_srv_txt_a_and_aaaa_contract"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/dns_sd.rs",
+                                                                           "test":  "tests::rejects_spoofed_endpoint_and_txt_data"
+                                                                       }
                                                                    ],
                                                      "required":  "mDNS advertise/discover and wide-area DNS-SD fixtures match pinned TXT and resolution contracts."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "CI validates signed TXT, IPv4/IPv6, collision, spoofing, in-process mDNS, and wide-area DNS-SD fixtures, but Apple TN3179 states that the simulator does not support local network privacy and no runner provides a physical Apple device, so physical-device Bonjour behavior has no CI oracle."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-nodes/src/dns_sd.rs",
+                                                             "note":  "Implements signed DNS-SD records, pure-Rust mDNS advertisement and browsing, conflict handling, network-change revocation, and wide-area DNS resolution."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "integration.discovery.ssh",
@@ -261,18 +316,39 @@
                                                                "src/gateway/node-pairing-ssh-verify.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/ssh.rs",
+                                                                           "test":  "tests::discovers_and_resolves_bounded_ssh_config"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/ssh.rs",
+                                                                           "test":  "tests::host_key_mismatch_fails_closed"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/ssh.rs",
+                                                                           "test":  "tests::pairing_proof_binds_discovered_identity_and_verified_host_key"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/ssh.rs",
+                                                                           "test":  "tests::loopback_key_auth_local_and_remote_tunnels_complete_lifecycle"
+                                                                       }
                                                                    ],
                                                      "required":  "SSH config, host-key, pairing verification, and tunnel lifecycle tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "No known behavioral differences from the frozen SSH discovery and tunnel contract."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-nodes/src/ssh.rs",
+                                                             "note":  "Implements bounded SSH configuration discovery, fail-closed known-host verification, key authentication, pairing proof, and local and remote forwarding over Russh."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "integration.discovery.tailscale",
@@ -289,18 +365,35 @@
                                                                "docs/gateway/tailscale.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/tailscale.rs",
+                                                                           "test":  "tests::enumerates_tailnet_and_builds_funnel_config"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/tailscale.rs",
+                                                                           "test":  "tests::acl_denies_partial_identity_and_prevents_api_call"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-nodes/src/tailscale.rs",
+                                                                           "test":  "tests::status_discovery_whois_serve_and_cleanup_follow_local_api_contract"
+                                                                       }
                                                                    ],
                                                      "required":  "Serve/Funnel, auth policy, status, and cleanup tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "No known behavioral differences from the frozen Tailscale exposure and discovery contract."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-nodes/src/tailscale.rs",
+                                                             "note":  "Implements bounded LocalAPI transport, tailnet enumeration, identity and ACL enforcement, Serve/Funnel exposure, ETag coordination, and cleanup."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "integration.webhooks",
@@ -316,18 +409,39 @@
                                                                "extensions/webhooks/src/http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/webhooks.rs",
+                                                                           "test":  "tests::authenticates_binds_and_dispatches_exact_event"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/webhooks.rs",
+                                                                           "test":  "tests::rejects_forged_truncated_and_replayed_signatures"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/webhooks.rs",
+                                                                           "test":  "tests::rejects_oversize_body_and_wrong_session_before_dispatch"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-automation/src/webhooks.rs",
+                                                                           "test":  "tests::retries_exponentially_then_dead_letters_without_secret"
+                                                                       }
                                                                    ],
                                                      "required":  "Configurable route, secret, replay, body-limit, session binding, and TaskFlow dispatch tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "No known behavioral differences from the frozen authenticated TaskFlow webhook contract."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-automation/src/webhooks.rs",
+                                                             "note":  "Implements bounded authenticated ingress, constant-time signature verification, replay prevention, session binding, TaskFlow dispatch, retries, exponential backoff, and dead-letter delivery."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "integration.release-deployment",
