@@ -447,7 +447,7 @@ const SUPERSEDED_FINAL_DEPENDENCY_SHA256: [&str; 3] = [
 ];
 
 const P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256: &str =
-    "b2ce476ecc84143cfa0c071d6289ab35ec1f425ac4aa5af5fc47e6cc3258da82";
+    "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01";
 const P03B_SQLITE_FILE_CONTROL_MEMBER: &str = "crates/claw-sqlite-file-control";
 const FINAL_ROOT_DENY_SHA256: &str =
     "75dedb874582f2f6d32890e21cca11186112d13dd51f4140ada96c69989594d0";
@@ -463,7 +463,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-futures-core = "=0.3.32"
+futures-core = "=0.3.33"
 libsqlite3-sys = "0.37.0"
 sqlx.workspace = true
 tokio.workspace = true
@@ -2671,7 +2671,7 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
     }
 
     let noncanonical = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
-        "futures-core = \"=0.3.32\"",
+        "futures-core = \"=0.3.33\"",
         "futures-core = \"=0.3.31\"",
         1,
     );
@@ -2696,21 +2696,21 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
     );
 
     for (label, from, to) in [
-        ("dependency-removed", "futures-core = \"=0.3.32\"\n", ""),
+        ("dependency-removed", "futures-core = \"=0.3.33\"\n", ""),
         (
             "version-drift",
-            "futures-core = \"=0.3.32\"",
+            "futures-core = \"=0.3.33\"",
             "futures-core = \"=0.3.31\"",
         ),
         (
             "name-drift",
-            "futures-core = \"=0.3.32\"",
-            "futures-util = \"=0.3.32\"",
+            "futures-core = \"=0.3.33\"",
+            "futures-util = \"=0.3.33\"",
         ),
         (
             "broader-extra-dependency",
-            "futures-core = \"=0.3.32\"\n",
-            "futures-core = \"=0.3.32\"\nfutures-util = \"=0.3.32\"\n",
+            "futures-core = \"=0.3.33\"\n",
+            "futures-core = \"=0.3.33\"\nfutures-util = \"=0.3.33\"\n",
         ),
     ] {
         let drifted = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(from, to, 1);
