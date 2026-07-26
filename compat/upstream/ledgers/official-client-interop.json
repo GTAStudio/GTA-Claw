@@ -18,18 +18,36 @@
                                                                "src/acp/server.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/subprocess_interop.rs",
+                                                                           "test":  "debug_client_exercises_bridge_lifecycle_and_streaming"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/subprocess_interop.rs",
+                                                                           "test":  "debug_client_resumes_and_configures_a_session"
+                                                                       }
                                                                    ],
                                                      "required":  "ACP stdio tests cover initialize, session lifecycle, prompts, cancel, streaming, modes, and permissions."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Interoperability is exercised against a local pure-Rust ACP fixture rather than an external third-party agent.",
+                                                   "The bounded bidirectional JSON-RPC peer is maintained in this crate instead of delegating transport behavior to an ACP runtime SDK."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-acp/src/bridge.rs",
+                                                             "note":  "Implements the ACP stdio server bridge, request dispatch, lifecycle methods, streaming, cancellation, modes, and permissions."
+                                                         },
+                                                         {
+                                                             "path":  "crates/claw-acp/src/protocol.rs",
+                                                             "note":  "Implements bounded newline-delimited bidirectional JSON-RPC framing and connection-wide failure propagation."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.acp.client",
@@ -45,18 +63,35 @@
                                                                "src/acp/client.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/subprocess_interop.rs",
+                                                                           "test":  "debug_client_exercises_bridge_lifecycle_and_streaming"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/subprocess_interop.rs",
+                                                                           "test":  "debug_client_resumes_and_configures_a_session"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/subprocess_interop.rs",
+                                                                           "test":  "debug_client_rejects_unsupported_protocol_version"
+                                                                       }
                                                                    ],
                                                      "required":  "The Rust debug client negotiates and exercises the pinned ACP bridge lifecycle."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Interoperability is exercised against a local pure-Rust ACP fixture rather than an external third-party agent."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-acp/src/debug_client.rs",
+                                                             "note":  "Implements protocol negotiation, session lifecycle, prompt streaming, cancellation, permission handling, and subprocess-tree supervision."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.acpx",
@@ -72,18 +107,39 @@
                                                                "docs/tools/acp-agents-setup.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/acpx_interop.rs",
+                                                                           "test":  "runtime_resolves_aliases_persists_sessions_and_completes_leases"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-acp/tests/acpx_interop.rs",
+                                                                           "test":  "registry_stdio_configuration_maps_to_exact_acp_mcp_shape"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-acp/src/acpx.rs",
+                                                                           "test":  "tests::permission_policy_is_fail_closed_and_allowlisted"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-acp/src/acpx.rs",
+                                                                           "test":  "tests::process_leases_enforce_exclusivity_and_completion"
+                                                                       }
                                                                    ],
                                                      "required":  "Harness aliases, permissions, process leases, turns, and optional MCP bridges pass compatibility tests."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Harness subprocess interoperability is exercised with local pure-Rust fixtures; durable session and lease storage depends on the injected store implementations."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-acp/src/acpx.rs",
+                                                             "note":  "Implements harness aliases, fail-closed permissions, process leases, persistent and one-shot turns, and optional MCP bridge conversion."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.mcp.server",
@@ -99,18 +155,39 @@
                                                                "src/mcp/tools-stdio-server.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/stdio_interop.rs",
+                                                                           "test":  "stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/stdio_interop.rs",
+                                                                           "test":  "list_timeout_cancels_the_server_request"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/stdio_interop.rs",
+                                                                           "test":  "panicking_client_owner_terminates_the_descendant_process_tree"
+                                                                       }
                                                                    ],
                                                      "required":  "MCP initialize, list, call, resource, shutdown, and process-tree cleanup tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Protocol interoperability is exercised against a local pure-Rust MCP subprocess fixture and never contacts a third-party MCP service."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/server.rs",
+                                                             "note":  "Implements the GTA-Claw MCP server handler for negotiated tools, resources, prompts, sampling, notifications, and cancellation."
+                                                         },
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/framing.rs",
+                                                             "note":  "Implements bounded partial-read-safe newline-delimited JSON-RPC transport and whole-connection cancellation."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.mcp.client",
@@ -127,18 +204,43 @@
                                                                "src/agents/mcp-http.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/stdio_interop.rs",
+                                                                           "test":  "stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/http_interop.rs",
+                                                                           "test":  "streamable_http_discovers_capabilities_and_authenticates_requests"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/sse_interop.rs",
+                                                                           "test":  "legacy_sse_reconnects_with_event_id_and_authenticates_get_and_post"
+                                                                       }
                                                                    ],
                                                      "required":  "Stdio, SSE, and streamable-HTTP client transport tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Transport interoperability is exercised only with local pure-Rust MCP fixtures; tests never contact real third-party MCP endpoints."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/client.rs",
+                                                             "note":  "Implements capability-discovering MCP clients, request deadlines, stdio supervision, notifications, sampling, and shutdown."
+                                                         },
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/http_client.rs",
+                                                             "note":  "Implements the bounded Hyper and ring-Rustls HTTP connector with credential-safe proxy routing."
+                                                         },
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/sse.rs",
+                                                             "note":  "Implements legacy SSE endpoint discovery, event-ID reconnection, authenticated GET and POST, and bounded retries."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.mcp.oauth",
@@ -154,18 +256,36 @@
                                                                "src/agents/mcp-auth-profile.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/oauth.rs",
+                                                                           "test":  "tests::local_authorization_server_covers_registration_exchange_and_refresh"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/oauth.rs",
+                                                                           "test":  "tests::logout_waits_for_in_flight_refresh_and_removes_the_rotated_token"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/oauth.rs",
+                                                                           "test":  "tests::secrets_are_redacted_from_debug_output"
+                                                                       }
                                                                    ],
                                                      "required":  "OAuth metadata, login, refresh, storage, logout, and bearer injection tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "OAuth flows are exercised only against local pure-Rust authorization fixtures and never contact real authorization or MCP services.",
+                                                   "OAuth secure persistence is a port; at-rest security depends on the injected platform token-store implementation."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/oauth.rs",
+                                                             "note":  "Implements protected-resource and authorization-server discovery, dynamic registration, PKCE, exchange, serialized refresh, origin-bound bearer injection, logout, and redacted token-store ports."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.mcp.registry",
@@ -182,18 +302,39 @@
                                                                "src/cli/mcp-cli.ts"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/registry.rs",
+                                                                           "test":  "tests::add_configure_unset_and_reload_are_persistent"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/registry.rs",
+                                                                           "test":  "tests::login_completion_and_logout_delegate_to_the_configured_profile"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/registry_interop.rs",
+                                                                           "test":  "registry_manages_stdio_health_capabilities_tools_and_restart"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/tests/registry_interop.rs",
+                                                                           "test":  "failed_temporary_probe_still_stops_its_child"
+                                                                       }
                                                                    ],
                                                      "required":  "Registry list/show/status/doctor/probe/add/set/configure/tools/login/logout/reload/unset tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Registry lifecycle interoperability is exercised with local pure-Rust child servers; durable configuration and platform authentication depend on injected store and auth ports."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/registry.rs",
+                                                             "note":  "Implements persistent configuration, discovery, health, probe, doctor, tools, authentication delegation, and managed server lifecycle operations."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.mcp.conversation-projection",
@@ -210,18 +351,39 @@
                                                                "docs/cli/mcp.md"
                                                            ]
                                              },
-                         "status":  "unimplemented",
+                         "status":  "implemented",
                          "acceptance_evidence":  {
-                                                     "status":  "missing",
+                                                     "status":  "accepted",
                                                      "artifacts":  [
-
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/projection.rs",
+                                                                           "test":  "tests::conversation_shape_matches_frozen_channel_contract"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/projection.rs",
+                                                                           "test":  "tests::attachments_preserve_non_text_blocks_exactly"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/projection.rs",
+                                                                           "test":  "tests::gateway_operations_match_frozen_list_read_send_and_approval_shapes"
+                                                                       },
+                                                                       {
+                                                                           "path":  "crates/claw-mcp/src/projection.rs",
+                                                                           "test":  "tests::event_wait_wakes_for_the_first_matching_session_event"
+                                                                       }
                                                                    ],
                                                      "required":  "Conversation list/read/send, live event, attachment, and approval projection tests pass."
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No npm-free Rust implementation or acceptance evidence exists in this repository at this baseline."
-                                               ]
+                                                   "Projection fidelity is validated against the frozen upstream shapes through a local gateway backend port rather than a live external Gateway."
+                                               ],
+                         "implementation_pointers":  [
+                                                         {
+                                                             "path":  "crates/claw-mcp/src/projection.rs",
+                                                             "note":  "Implements exact conversation list, read, send, live-event, attachment, and approval projection over the GTA-Claw gateway port."
+                                                         }
+                                                     ]
                      },
                      {
                          "feature_id":  "interop.openai.chat-completions",
