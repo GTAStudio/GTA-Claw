@@ -30,10 +30,10 @@ pub enum GatewayCredential {
 /// How strictly a successful hello must match the requested authorization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthorizationExpectation {
-    /// Preserve generic Gateway behavior: require the requested role and accept any closed scopes.
-    #[default]
+    /// Explicit compatibility mode: require the requested role and accept any closed scopes.
     RequestedRole,
     /// Require the effective hello role and scope set to equal the request exactly.
+    #[default]
     ExactRequested,
 }
 
@@ -219,7 +219,7 @@ impl GatewayClientConfig {
             credential: GatewayCredential::None,
             role: Role::Operator,
             scopes: ScopeSet::EMPTY,
-            authorization_expectation: AuthorizationExpectation::RequestedRole,
+            authorization_expectation: AuthorizationExpectation::ExactRequested,
             min_protocol: GATEWAY_PROTOCOL_VERSION,
             max_protocol: GATEWAY_PROTOCOL_VERSION,
             client: ClientMetadata::default(),
