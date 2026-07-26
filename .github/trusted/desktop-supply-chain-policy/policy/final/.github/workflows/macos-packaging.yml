@@ -98,6 +98,10 @@ jobs:
   native:
     name: Native ${{ matrix.arch }} on ${{ matrix.runner }}
     needs: source-policy
+    outputs:
+      # Set only by the arm64 row. Matrix job outputs are last-writer-wins, so the x86_64 row
+      # must never assign this; the step producing it is guarded to arm64.
+      tested-executable-sha256: ${{ steps.tested-executable.outputs.sha256 }}
     strategy:
       fail-fast: false
       matrix:
@@ -178,6 +182,18 @@ jobs:
             exit 1
           fi
 
+      - name: Record the digest of the executable this job tested
+        if: matrix.arch == 'arm64'
+        id: tested-executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/macos-package/apps/arm64/GTA Claw.app/Contents/MacOS/gta-claw-desktop"
+          digest="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+          test "${#digest}" -eq 64
+          echo "sha256=$digest" >>"$GITHUB_OUTPUT"
+          echo "Tested executable digest: $digest"
+
       - name: Upload ephemeral native prototype artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -198,6 +214,7 @@ jobs:
       release-payload-sha256: ${{ steps.release-input.outputs.sha256 }}
       release-artifact-id: ${{ steps.release-upload.outputs.artifact-id }}
       release-artifact-digest: ${{ steps.release-upload.outputs.artifact-digest }}
+      packaged-executable-sha256: ${{ steps.packaged-executable.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -228,6 +245,17 @@ jobs:
             cd target/macos-package/distribution
             shasum -a 256 -c SHA256SUMS
           )
+
+      - name: Record the digest of the executable this job packages
+        id: packaged-executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/macos-package/apps/arm64/GTA Claw.app/Contents/MacOS/gta-claw-desktop"
+          digest="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+          test "${#digest}" -eq 64
+          echo "sha256=$digest" >>"$GITHUB_OUTPUT"
+          echo "Packaged executable digest: $digest"
 
       - name: Prepare immutable release input
         if: github.event_name == 'workflow_dispatch' && inputs.release == true
@@ -422,6 +450,27 @@ jobs:
       actions: read
       contents: read
     steps:
+      - name: Require the packaged executable to be the tested executable
+        shell: bash
+        env:
+          TESTED_SHA256: ${{ needs.native.outputs.tested-executable-sha256 }}
+          PACKAGED_SHA256: ${{ needs.containers.outputs.packaged-executable-sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "${#TESTED_SHA256}" -ne 64 ] || [ "${#PACKAGED_SHA256}" -ne 64 ]; then
+            echo "::error::Executable digests were not reported by both jobs" >&2
+            echo "tested   (native job)     : ${TESTED_SHA256:-<missing>}" >&2
+            echo "packaged (containers job) : ${PACKAGED_SHA256:-<missing>}" >&2
+            exit 1
+          fi
+          if [ "$TESTED_SHA256" != "$PACKAGED_SHA256" ]; then
+            echo "::error::Refusing to sign: the packaged executable is not the tested executable" >&2
+            echo "tested   (native job)     : $TESTED_SHA256" >&2
+            echo "packaged (containers job) : $PACKAGED_SHA256" >&2
+            exit 1
+          fi
+          echo "Verified the packaged executable is the tested executable: $TESTED_SHA256"
+
       - name: Checkout exact trusted release verifier
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
