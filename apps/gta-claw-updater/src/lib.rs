@@ -3636,6 +3636,106 @@ mod unit_tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_verified_handle_survives_rename_and_path_replacement_during_real_swap() {
+        let directory = UnitTestDir::new("windows-rename-replacement");
+        let target_path = directory.path.join("gta-claw.exe");
+        fs::write(&target_path, b"known good").expect("write existing target");
+        let target =
+            InstallTarget::new(target_path.clone(), InstallMode::Executable).expect("target");
+        let stage = Arc::new(SecureStaging::open(&target).expect("secure stage"));
+        let verified_bytes = b"verified replacement".to_vec();
+        let attacker_bytes = b"attacker-controlled replacement".to_vec();
+        let mut staged = stage
+            .directory
+            .open_regular(OsStr::new(STAGED_VERIFIED), true)
+            .expect("create staged replacement");
+        staged
+            .write_all(&verified_bytes)
+            .expect("write staged replacement");
+        staged.sync_all().expect("sync staged replacement");
+        let staged_path = stage.directory.path.join(STAGED_VERIFIED);
+        let prepared = PreparedArtifact {
+            path: staged_path.clone(),
+            source_name: OsString::from(STAGED_VERIFIED),
+            handle: staged,
+            stage: Arc::clone(&stage),
+            digest: Sha256::digest(&verified_bytes).into(),
+            size: u64::try_from(verified_bytes.len()).expect("small replacement"),
+        };
+
+        // This hardens an owner-only staging directory against a same-account concurrent process;
+        // it is not a remote or cross-user integrity boundary.
+        let moved_path = stage.directory.path.join("artifact.moved");
+        let start = Arc::new(Barrier::new(2));
+        let attacker_start = Arc::clone(&start);
+        let attacker_staged_path = staged_path.clone();
+        let attacker_moved_path = moved_path.clone();
+        let attacker_replacement = attacker_bytes.clone();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let attacker = std::thread::spawn(move || {
+            attacker_start.wait();
+            fs::rename(&attacker_staged_path, &attacker_moved_path)
+                .expect("FILE_SHARE_DELETE permits moving the verified pathname");
+            let moved_bytes = fs::read(&attacker_moved_path).expect("read renamed verified object");
+            let mut replacement = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&attacker_staged_path)
+                .expect("create replacement at original verified pathname");
+            replacement
+                .write_all(&attacker_replacement)
+                .expect("write attacker replacement");
+            replacement.sync_all().expect("sync attacker replacement");
+            drop(replacement);
+            let replacement_bytes =
+                fs::read(&attacker_staged_path).expect("read attacker replacement");
+            completed_tx
+                .send((moved_bytes, replacement_bytes))
+                .expect("report completed pathname replacement");
+        });
+
+        start.wait();
+        let (moved_bytes, replacement_bytes) = completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pathname replacement completes before installation");
+        attacker.join().expect("attacker thread");
+        assert_eq!(
+            moved_bytes, verified_bytes,
+            "rename must move verified bytes"
+        );
+        assert_eq!(
+            replacement_bytes, attacker_bytes,
+            "replacement must be created and written at the original pathname"
+        );
+        assert!(moved_path.is_file(), "renamed verified pathname must exist");
+        assert_eq!(
+            fs::read(&staged_path).expect("read original verified pathname"),
+            attacker_bytes
+        );
+
+        let retained_bytes = {
+            let mut retained = prepared.handle.try_clone().expect("clone retained handle");
+            retained
+                .seek(SeekFrom::Start(0))
+                .expect("rewind retained handle");
+            let mut bytes = Vec::new();
+            retained
+                .read_to_end(&mut bytes)
+                .expect("read retained verified object");
+            bytes
+        };
+        assert_eq!(retained_bytes, verified_bytes);
+
+        let outcome = atomic_swap_verified(&prepared, true).expect("real swap");
+
+        assert_eq!(outcome, InstallOutcome::Installed);
+        let installed = fs::read(&target_path).expect("read installed object");
+        assert_eq!(installed, retained_bytes);
+        assert_ne!(installed, attacker_bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_verified_handle_rejects_racing_writers_during_real_swaps() {
         for iteration in 0..32 {
             let directory = UnitTestDir::new("windows-writer-race");
