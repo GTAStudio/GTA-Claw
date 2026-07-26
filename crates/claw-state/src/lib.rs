@@ -1889,7 +1889,19 @@ mod tests {
         );
         release.0.store(true, std::sync::atomic::Ordering::Release);
         test_support::wait_for_process_identity_release(&path).await;
-        let reopened = open(&path).await;
+        let reopened = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match StateStore::open(StoreConfig::new(&path)).await {
+                    Ok(store) => break store,
+                    Err(StateError::StoreLocked { .. } | StateError::InvalidPath { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("post-verifier-timeout reopen failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("terminal verifier cleanup stabilizes SQLite sidecars");
         reopened
             .close()
             .await
