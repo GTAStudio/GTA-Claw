@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
@@ -96,6 +97,51 @@ fn require_clean_stderr(bytes: &[u8], label: &str) -> PolicyResult<()> {
     }
 }
 
+/// Transient names Git itself writes into `objects/pack/` while a pack, index,
+/// reverse index, bitmap, or cruft-mtimes file is being written.
+///
+/// Taken from Git's own sources rather than inferred from observation:
+/// `builtin/index-pack.c` and `pack-write.c` use `pack/tmp_pack_XXXXXX`,
+/// `pack/tmp_idx_XXXXXX`, `pack/tmp_rev_XXXXXX` and `pack/tmp_mtimes_XXXXXX`,
+/// and `pack-bitmap-write.c` uses `pack/tmp_bitmap_XXXXXX`. Observation alone
+/// misses `tmp_mtimes_`, which only appears when a cruft pack is written.
+///
+/// This is not an exemption from the unexpected-entry rule. That rule is that
+/// the directory contains exactly what we account for, and these are names we
+/// now account for: an entry under one of them is still rejected when it is a
+/// symlink or not a regular file, and it still counts against
+/// `MAX_GIT_PACK_FILES` and `MAX_GIT_PACK_BYTES`. Skipping such entries instead
+/// of counting them would trade this flake for a hole, because an arbitrarily
+/// large file parked under a transient name would then evade the storage bounds.
+const GIT_TRANSIENT_PACK_PREFIXES: [&str; 5] = [
+    "tmp_bitmap_",
+    "tmp_idx_",
+    "tmp_mtimes_",
+    "tmp_pack_",
+    "tmp_rev_",
+];
+
+/// Count of random characters `git_mkstemps_mode` substitutes for `XXXXXX`.
+const GIT_MKSTEMP_RANDOM_LEN: usize = 6;
+
+/// Reports whether one pack directory entry name is a Git pack-write temporary.
+///
+/// The random component is required to be exactly the shape Git produces:
+/// `git_mkstemps_mode` replaces a fixed six-character `XXXXXX` pattern from an
+/// alphabet of ASCII letters and digits. Matching the bare prefix would admit
+/// any name beginning `tmp_pack_`.
+fn is_git_transient_pack_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    GIT_TRANSIENT_PACK_PREFIXES.iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|random| {
+            random.len() == GIT_MKSTEMP_RANDOM_LEN
+                && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+    })
+}
+
 fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
     let pack_root = checkout.join(".git").join("objects").join("pack");
     if !pack_root.is_dir() {
@@ -110,8 +156,20 @@ fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
     let mut bytes = 0_u64;
     entries.try_for_each(|entry| -> PolicyResult<()> {
         let entry = entry.map_err(|cause| error("read Git pack entry", cause))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|cause| error("inspect Git pack entry", cause))?;
+        let transient = is_git_transient_pack_name(&entry.file_name());
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            // Git renames its temporaries into place and unlinks them while we
+            // are still walking the directory, so one can disappear between the
+            // enumeration and this call. It is then not an entry in the
+            // directory at all and there is nothing to account for. Only names
+            // Git owns are forgiven here; anything else that vanishes remains
+            // an error.
+            Err(cause) if transient && cause.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(cause) => return Err(error("inspect Git pack entry", cause)),
+        };
         let extension = entry
             .path()
             .extension()
@@ -120,7 +178,7 @@ fn verify_pack_storage(checkout: &Path) -> PolicyResult<()> {
             .to_ascii_lowercase();
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || !matches!(extension.as_str(), "pack" | "idx" | "rev")
+            || !(transient || matches!(extension.as_str(), "pack" | "idx" | "rev"))
         {
             return Err(PolicyError::new(format!(
                 "Git pack directory contains an unexpected entry: {}",

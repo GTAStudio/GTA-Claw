@@ -4112,6 +4112,73 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
     for path in fake_packs {
         fs::remove_file(path).expect("remove fake Git pack entry");
     }
+
+    // A transient Git wrote mid-pack must not fail the manifest, and must not
+    // become a way to park bytes the storage bounds never see. Both halves are
+    // asserted, because admitting the name without still counting it would
+    // trade the flake for a hole.
+    let transients = [
+        "tmp_pack_OWNHdS",
+        "tmp_idx_ShaNMT",
+        "tmp_rev_PKnK4d",
+        "tmp_bitmap_Dt4dDk",
+        "tmp_mtimes_a1B2c3",
+    ];
+    let mut transient_paths = Vec::new();
+    for name in transients {
+        let path = pack_root.join(name);
+        fs::write(&path, []).expect("write Git pack temporary");
+        transient_paths.push(path);
+    }
+    compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+        .expect("Git pack write temporaries must not fail the manifest");
+    for path in &transient_paths {
+        fs::remove_file(path).expect("remove Git pack temporary");
+    }
+
+    // Names that only resemble a temporary stay rejected. The random component
+    // is exactly six characters from git_mkstemps_mode's alphabet, so a bare
+    // prefix, a wrong length, or a path separator must not be admitted.
+    for rejected in [
+        "tmp_pack_",
+        "tmp_pack_short",
+        "tmp_pack_TOOLONG",
+        "tmp_pack_ab.cde",
+        "tmp_packOWNHdS",
+        "tmp_evil_OWNHdS",
+        "TMP_PACK_OWNHdS",
+    ] {
+        let path = pack_root.join(rejected);
+        fs::write(&path, []).expect("write near-miss Git pack entry");
+        let error = compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+            .expect_err("near-miss Git pack temporary unexpectedly accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("Git pack directory contains an unexpected entry"),
+            "{rejected} was rejected by the wrong rule: {error}"
+        );
+        fs::remove_file(&path).expect("remove near-miss Git pack entry");
+    }
+
+    // Transients are counted, not exempted: enough of them still trips the
+    // fixed storage bound.
+    let mut bounded = Vec::new();
+    for index in 0..=MAX_GIT_PACK_FILES {
+        let path = pack_root.join(format!("tmp_pack_b{index:05}"));
+        fs::write(&path, []).expect("write bounded Git pack temporary");
+        bounded.push(path);
+    }
+    let bound_error = compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+        .expect_err("Git pack temporaries unexpectedly escaped the storage bounds");
+    assert!(
+        bound_error.to_string().contains("Git pack storage exceeds"),
+        "transient names escaped the storage bounds: {bound_error}"
+    );
+    for path in bounded {
+        fs::remove_file(path).expect("remove bounded Git pack temporary");
+    }
+
     validate_pull_request_commit_count(1).expect("one commit is accepted");
     validate_pull_request_commit_count(MAX_PULL_REQUEST_COMMITS)
         .expect("exact pull request commit cap is accepted");
