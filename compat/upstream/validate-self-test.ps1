@@ -276,7 +276,103 @@ function New-SyntheticRepositoryRoot {
     }
 }
 
+function Install-TransitionEvidenceFixture {
+    param([string]$Root)
+
+    $packageFiles = @{}
+    $packageTargets = @{}
+    $standaloneFiles = New-Object System.Collections.Generic.List[string]
+    foreach ($ledgerPath in (Get-ChildItem -LiteralPath (Join-Path $SourceRoot "ledgers") -Filter "*.json")) {
+        $ledger = ConvertFrom-Json ([System.IO.File]::ReadAllText($ledgerPath.FullName))
+        foreach ($feature in $ledger.features) {
+            if ($feature.status -eq "unimplemented") {
+                continue
+            }
+            foreach ($artifact in $feature.acceptance_evidence.artifacts) {
+                $path = [string]$artifact.path
+                $segments = $path.Split("/")
+                if ($segments.Count -lt 4 -or $segments[0] -ne "crates") {
+                    throw "transition evidence must belong to a crate: $path"
+                }
+                $package = $segments[1]
+                $packageFiles[$package] = @($packageFiles[$package]) + @($path)
+                $packageTargets[$package] = @($packageTargets[$package]) + @($path)
+            }
+            foreach ($pointer in @($feature.implementation_pointers)) {
+                $path = [string]$pointer.path
+                if ($path.StartsWith("crates/", [StringComparison]::Ordinal)) {
+                    $segments = $path.Split("/")
+                    if ($segments.Count -lt 4) {
+                        throw "transition implementation pointer must name a crate file: $path"
+                    }
+                    $package = $segments[1]
+                    $packageFiles[$package] = @($packageFiles[$package]) + @($path)
+                } else {
+                    $standaloneFiles.Add($path)
+                }
+            }
+        }
+    }
+
+    $members = @(
+        "crates/synthetic",
+        "crates/decoy",
+        "crates/nonrunning",
+        "globbed/*"
+    ) + @($packageFiles.Keys | Sort-Object | ForEach-Object { "crates/$_" })
+    $memberLines = @($members | ForEach-Object { "  `"$_`"," })
+    $workspaceManifest = (
+        "[workspace]`nmembers = [`n" +
+        ($memberLines -join "`n") +
+        "`n]`nexclude = [`"vendored`"]`nresolver = `"3`"`n"
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Root "Cargo.toml"),
+        $workspaceManifest,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
+    foreach ($package in ($packageFiles.Keys | Sort-Object)) {
+        $packageRoot = Join-Path $Root ("crates" + $separator + $package)
+        New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+        $manifest = (
+            "[package]`nname = `"$package`"`nversion = `"0.0.0`"`nedition = `"2024`"`n"
+        )
+        $index = 0
+        foreach ($path in @($packageTargets[$package] | Sort-Object -Unique)) {
+            $prefix = "crates/$package/"
+            $relative = $path.Substring($prefix.Length)
+            $manifest += (
+                "`n[[test]]`nname = `"transition-evidence-$index`"`n" +
+                "path = `"$relative`"`n"
+            )
+            $index += 1
+        }
+        [System.IO.File]::WriteAllText(
+            (Join-Path $packageRoot "Cargo.toml"),
+            $manifest,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        foreach ($path in @($packageFiles[$package] | Sort-Object -Unique)) {
+            $relativePath = $path.Replace("/", $separator)
+            $source = Join-Path $RepositoryRoot $relativePath
+            $destination = Join-Path $Root $relativePath
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    foreach ($path in @($standaloneFiles | Sort-Object -Unique)) {
+        $relativePath = $path.Replace("/", $separator)
+        $source = Join-Path $RepositoryRoot $relativePath
+        $destination = Join-Path $Root $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+}
+
 New-SyntheticRepositoryRoot $SyntheticRoot
+Install-TransitionEvidenceFixture $SyntheticRoot
 
 # Sentinels spanning every subtree the synthetic cases cite. The fixture is built
 # once at startup and no case ever modifies it, so a missing file can only mean
@@ -514,7 +610,7 @@ function Set-ForgedTransition {
         -Pointers $Pointers `
         -KeepBaselineDifference:$KeepBaselineDifference
     Save-FirstLedger $CaseRoot $ledger
-    Set-ManifestStatusTotals $CaseRoot 46 0 1
+    Set-ManifestStatusTotals $CaseRoot 38 0 9
 }
 
 $validResult = Invoke-Validator $SourceRoot
@@ -555,7 +651,7 @@ $cases = @(
                     (New-Pointer $RealSourcePath "Registration is done; behaviour is not.")
                 )
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -571,7 +667,7 @@ $cases = @(
                 -EvidenceStatus "partial" `
                 -Artifacts @()
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -587,7 +683,7 @@ $cases = @(
                 -EvidenceStatus "accepted" `
                 -Artifacts @((New-Artifact $RealTestPath $RealTestName))
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -604,7 +700,7 @@ $cases = @(
                 -Artifacts @((New-Artifact $RealTestPath $RealTestName)) `
                 -KeepBaselineDifference
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 1 0
+            Set-ManifestStatusTotals $caseRoot 38 1 8
         }
     },
     [ordered]@{
@@ -1760,7 +1856,7 @@ $cases = @(
                 [pscustomobject][ordered]@{ path = $RealTestPath }
             )
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 0 1
+            Set-ManifestStatusTotals $caseRoot 38 0 9
         }
     },
     [ordered]@{
@@ -1776,7 +1872,7 @@ $cases = @(
                 -Artifacts @()
             $ledger.features[0].acceptance_evidence.artifacts = @("crates/claw-security/tests/frozen_gateway_registry.rs")
             Save-FirstLedger $caseRoot $ledger
-            Set-ManifestStatusTotals $caseRoot 46 0 1
+            Set-ManifestStatusTotals $caseRoot 38 0 9
         }
     },
     [ordered]@{
@@ -1848,7 +1944,7 @@ $cases = @(
     },
     [ordered]@{
         name = "status-totals-not-updated"
-        expected_message = "status_totals count 'unimplemented' must be '46'"
+        expected_message = "status_totals count 'unimplemented' must be '38'"
         regenerate_digests = $true
         mutate = {
             param($caseRoot)
