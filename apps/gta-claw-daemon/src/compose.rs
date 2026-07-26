@@ -430,7 +430,7 @@ impl DaemonBuilder {
     pub fn new() -> Self {
         Self {
             clock: None,
-            listen: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            listen: Vec::new(),
             provider_host: "models.example.test".to_owned(),
             provider_url: "https://models.example.test/v1".to_owned(),
             provider_addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))],
@@ -484,7 +484,20 @@ impl DaemonBuilder {
         self
     }
 
-    /// Sets the addresses ingress subsystems report as bound.
+    /// Sets the addresses ingress subsystems bind.
+    ///
+    /// Empty by default, and that default is load-bearing: the Gateway opens a
+    /// real socket for the first address given here, and opens none at all when
+    /// none is given. The packaged service
+    /// (`packaging/linux/systemd/gta-claw-daemon.service`) runs under
+    /// `RestrictAddressFamilies=AF_UNIX` and `IPAddressDeny=any`, so a daemon
+    /// that bound a TCP listener unconditionally could not start under its own
+    /// unit — and with `Type=simple` that failure is invisible to `systemctl
+    /// start`. Exposing the wire is therefore an explicit decision here, and the
+    /// packaging must be relaxed to match it.
+    ///
+    /// Only the first address is bound today; see
+    /// [`GatewayIngress`](crate::adapters::gateway::GatewayIngress).
     #[must_use]
     pub fn listen(mut self, listen: Vec<SocketAddr>) -> Self {
         self.listen = listen;

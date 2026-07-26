@@ -622,7 +622,7 @@ fn a_builder_never_formats_the_provider_url_before_the_guard_has_seen_it() {
 
     assert_eq!(
         format!("{builder:?}"),
-        "DaemonBuilder { listen: [127.0.0.1:0], \
+        "DaemonBuilder { listen: [], \
          provider_host: \"models.example.test\", \
          provider_url: \"[REDACTED]\", \
          provider_addresses: [203.0.113.10], \

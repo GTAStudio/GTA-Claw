@@ -8,6 +8,26 @@
 //! gave it — which is not in general the address that was requested, because a
 //! requested port of `0` becomes a real one only at bind time.
 //!
+//! # The socket is opt-in, and that is not timidity
+//!
+//! A composition that was given no listen address owns no socket. It still
+//! builds the whole server — registry, authenticator, event bus — and still
+//! serves the in-process path; it simply never calls `bind`, and reports
+//! [`ServiceHandle::inert`] exactly as [`LoopbackGateway`] did.
+//!
+//! The reason is concrete rather than stylistic. The packaged service in
+//! `packaging/linux/systemd/gta-claw-daemon.service` is hardened with
+//! `RestrictAddressFamilies=AF_UNIX` and `IPAddressDeny=any`, so under it a
+//! `socket(AF_INET, …)` call cannot succeed at all. A daemon that binds
+//! unconditionally therefore fails its own start-up under the unit it ships
+//! with — and because that unit is `Type=simple`, `systemctl start` still
+//! reports success while the process dies and is restarted every
+//! `RestartSec=5s` forever. Nothing in the packaging notices, which is precisely
+//! what makes it worth refusing to open a socket nobody asked for.
+//!
+//! Turning the wire on is [`DaemonBuilder::listen`](crate::compose::DaemonBuilder::listen),
+//! and it is a decision the packaging must be relaxed to match.
+//!
 //! # Two paths, deliberately
 //!
 //! The wire path and the in-process path are *not* the same catalogue, and this
@@ -60,6 +80,11 @@ use crate::adapters::ingress::LoopbackGateway;
 enum Stage {
     /// Constructed, no socket yet.
     Unbound(Box<GatewayServer>),
+    /// Deliberately socketless: no listen address was configured, so the wire
+    /// path is off and only the in-process path is served. The server is
+    /// dropped rather than parked, because nothing can bind it later without
+    /// going back through `initialize`.
+    Offline,
     /// Listener open, not accepting.
     Bound(Box<BoundServer>),
     /// Accepting.
@@ -73,6 +98,7 @@ impl Stage {
     const fn label(&self) -> &'static str {
         match self {
             Self::Unbound(_) => "unbound",
+            Self::Offline => "offline",
             Self::Bound(_) => "bound",
             Self::Running(_) => "running",
             Self::Stopped => "stopped",
@@ -128,12 +154,13 @@ impl GatewayIngress {
 
     /// Returns how many wire requests the server answered.
     ///
-    /// Zero before the server starts and after it stops, because the count
-    /// lives in the server rather than in this wrapper.
+    /// Zero before the server starts, after it stops, and whenever no listen
+    /// address was configured, because the count lives in the server rather
+    /// than in this wrapper.
     pub async fn wire_requests_completed(&self) -> u64 {
         match &*self.stage.lock().await {
             Stage::Running(handle) => handle.completed_requests(),
-            Stage::Unbound(_) | Stage::Bound(_) | Stage::Stopped => 0,
+            Stage::Unbound(_) | Stage::Offline | Stage::Bound(_) | Stage::Stopped => 0,
         }
     }
 
@@ -141,8 +168,19 @@ impl GatewayIngress {
     pub async fn wire_connections(&self) -> usize {
         match &*self.stage.lock().await {
             Stage::Running(handle) => handle.connection_count(),
-            Stage::Unbound(_) | Stage::Bound(_) | Stage::Stopped => 0,
+            Stage::Unbound(_) | Stage::Offline | Stage::Bound(_) | Stage::Stopped => 0,
         }
+    }
+
+    /// Returns whether the wire path owns a listener.
+    ///
+    /// False for a composition that was given no listen address, which is the
+    /// packaged default.
+    pub async fn serves_the_wire(&self) -> bool {
+        matches!(
+            &*self.stage.lock().await,
+            Stage::Bound(_) | Stage::Running(_)
+        )
     }
 
     /// Handles one request on the in-process path.
@@ -174,12 +212,7 @@ impl Subsystem for GatewayIngress {
         context: &'a StartContext,
     ) -> BoxFuture<'a, Result<(), SubsystemError>> {
         Box::pin(async move {
-            let address = *context.settings().listen().first().ok_or_else(|| {
-                SubsystemError::internal(
-                    well_known::gateway(),
-                    "the gateway was given no address to listen on",
-                )
-            })?;
+            let requested = context.settings().listen().first().copied();
 
             let mut stage = self.stage.lock().await;
             let Stage::Unbound(server) = std::mem::replace(&mut *stage, Stage::Stopped) else {
@@ -187,6 +220,16 @@ impl Subsystem for GatewayIngress {
                     well_known::gateway(),
                     "the gateway was initialized more than once",
                 ));
+            };
+
+            let Some(address) = requested else {
+                // No address was configured, so no socket is opened. See the
+                // module documentation: the packaged unit forbids IP address
+                // families outright, and binding anyway would put the process
+                // into a silent restart loop.
+                drop(server);
+                *stage = Stage::Offline;
+                return Ok(());
             };
 
             let bound = server.bind(address).await.map_err(|error| {
@@ -210,30 +253,51 @@ impl Subsystem for GatewayIngress {
     ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
         Box::pin(async move {
             let mut stage = self.stage.lock().await;
-            let Stage::Bound(bound) = std::mem::replace(&mut *stage, Stage::Stopped) else {
-                return Err(SubsystemError::internal(
-                    well_known::gateway(),
-                    format!("the gateway cannot start from the {} stage", stage.label()),
-                ));
+            let address = match std::mem::replace(&mut *stage, Stage::Stopped) {
+                Stage::Bound(bound) => {
+                    let handle = bound.start();
+                    let address = handle.local_address();
+                    *stage = Stage::Running(handle);
+                    Some(address)
+                }
+                Stage::Offline => {
+                    *stage = Stage::Offline;
+                    None
+                }
+                // Reports the stage it was *in*, which the replaced value still
+                // holds; reading `*stage` here would say "stopped" every time.
+                other => {
+                    return Err(SubsystemError::internal(
+                        well_known::gateway(),
+                        format!("the gateway cannot start from the {} stage", other.label()),
+                    ));
+                }
             };
-
-            let handle = bound.start();
-            let address = handle.local_address();
-            *stage = Stage::Running(handle);
             drop(stage);
 
-            self.publish_bound(vec![address]);
+            if let Some(address) = address {
+                self.publish_bound(vec![address]);
+            }
             self.loopback.start(context).await?;
 
             // The address comes from the listener, never from the request. A
             // requested port of zero is a different number by the time it gets
             // here, which is what makes this handle worth more than the
             // settings it was derived from.
-            Ok(
-                ServiceHandle::listening(well_known::gateway(), vec![address]).with_detail(
-                    format!("{} protocol methods over websocket", self.method_count),
-                ),
-            )
+            Ok(match address {
+                Some(address) => {
+                    ServiceHandle::listening(well_known::gateway(), vec![address]).with_detail(
+                        format!("{} protocol methods over websocket", self.method_count),
+                    )
+                }
+                // `inert`, not `listening` with an empty address list: this
+                // composition owns no socket at all, which is a different claim
+                // from owning one and having nothing to say about it.
+                None => ServiceHandle::inert(well_known::gateway()).with_detail(format!(
+                    "{} protocol methods, in-process only",
+                    self.method_count
+                )),
+            })
         })
     }
 
@@ -261,7 +325,7 @@ impl Subsystem for GatewayIngress {
                     let abandoned = handle.drain_requests(self.drain_grace).await;
                     (handle.completed_requests(), abandoned)
                 }
-                Stage::Unbound(_) | Stage::Bound(_) | Stage::Stopped => (0, 0),
+                Stage::Unbound(_) | Stage::Offline | Stage::Bound(_) | Stage::Stopped => (0, 0),
             };
 
             let completed = in_process

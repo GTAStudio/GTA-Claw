@@ -22,9 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_application::composition::{
-    BoxFuture, Capability, CapabilitySet, Clock, DrainReport, GatewayPort, GatewayRequest,
-    LifecyclePhase, Principal, ServiceHandle, StartContext, Subsystem, SubsystemDescriptor,
-    SubsystemError, SubsystemErrorKind, SubsystemId, SubsystemKind, well_known,
+    BoxFuture, Capability, CapabilitySet, Clock, CompositionError, DrainReport, GatewayPort,
+    GatewayRequest, LifecyclePhase, Principal, ServiceHandle, StartContext, Subsystem,
+    SubsystemDescriptor, SubsystemError, SubsystemErrorKind, SubsystemId, SubsystemKind,
+    well_known,
 };
 use claw_domain::SessionId;
 use claw_gateway::{Grant, RequestGuard, RequestMeter};
@@ -390,6 +391,106 @@ async fn a_bounded_drain_reports_the_work_it_gave_up_on() {
 
     drop(stuck);
     assert_eq!(meter.drain(Duration::from_millis(50)).await, 0);
+}
+
+/// The packaged shape: no listen address, therefore no socket at all.
+///
+/// This is the configuration the shipped `systemd` unit runs, and it is the
+/// default rather than an opt-out. `gta-claw-daemon.service` is hardened with
+/// `RestrictAddressFamilies=AF_UNIX` and `IPAddressDeny=any`, so a composition
+/// that bound a TCP listener unconditionally would fail its own start-up under
+/// its own packaging — invisibly, because `Type=simple` reports a successful
+/// start for a process that dies immediately afterwards.
+///
+/// The in-process path must keep working, so that "the wire is off" is not
+/// quietly "the gateway is broken", and the whole catalogue must still be
+/// registered, so that turning the wire on is a configuration change rather than
+/// a different build.
+#[tokio::test]
+async fn a_daemon_given_no_listen_address_opens_no_socket() {
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()) as Arc<dyn Clock>)
+        .build()
+        .expect("the composition is orderable");
+
+    let handles = daemon.start().await.expect("every subsystem comes up");
+
+    assert!(
+        !daemon.gateway().serves_the_wire().await,
+        "the gateway opened a socket nobody asked it for"
+    );
+    assert!(daemon.gateway().bound().is_empty());
+    assert_eq!(daemon.gateway().registered_methods(), 278);
+
+    // Nothing advertises an address, so no health check can be sent at one.
+    let advertised: Vec<&ServiceHandle> = handles
+        .iter()
+        .filter(|handle| !handle.bound().is_empty())
+        .collect();
+    assert!(
+        advertised.is_empty(),
+        "a socketless daemon advertised {advertised:?}"
+    );
+
+    // The in-process path is unaffected, which is what makes this "the wire is
+    // off" rather than "the gateway did not start".
+    let served = daemon
+        .call_gateway(GatewayRequest::new(
+            "session.prompt".to_owned(),
+            operator(),
+            SessionId::new("socketless").expect("a usable session id"),
+            "hello".to_owned(),
+        ))
+        .await
+        .expect("the in-process gateway path serves without a socket");
+    assert_eq!(served.body(), "echo: hello");
+    assert_eq!(daemon.gateway().served(), 1);
+
+    assert!(daemon.stop().await.expect("the daemon stops").is_clean());
+}
+
+/// A gateway that cannot bind must fail the whole start, not come up half-served.
+///
+/// This is the link that makes the socketless default matter rather than merely
+/// being tidy: a bind failure is fatal to `start`, `serve` propagates it, and the
+/// process exits non-zero. Under the packaged unit the refusal arrives from the
+/// kernel — `AF_INET` is not an address family the service is allowed to use —
+/// and it is reproduced here with an address that is genuinely unbindable
+/// because something else already holds it.
+///
+/// Without this, "the daemon would crash-loop under its own unit" would be an
+/// inference about systemd rather than a proved property of this composition.
+#[tokio::test]
+async fn a_gateway_that_cannot_bind_fails_the_whole_start() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("a port is available");
+    let address = occupied.local_addr().expect("the listener has an address");
+
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()) as Arc<dyn Clock>)
+        .listen(vec![address])
+        .build()
+        .expect("the composition is orderable");
+
+    let error = daemon
+        .start()
+        .await
+        .expect_err("a gateway that cannot bind must not report a started daemon");
+
+    let CompositionError::SubsystemFailed(failure) = error else {
+        panic!("the composition reported {error:?} rather than a subsystem failure");
+    };
+    assert_eq!(failure.kind(), SubsystemErrorKind::Internal);
+    assert_eq!(failure.subsystem(), &well_known::gateway());
+    assert!(!daemon.is_started());
+
+    // The port really was the obstacle: it is still held by this test, and the
+    // daemon advertises nothing it failed to open.
+    assert!(daemon.gateway().bound().is_empty());
+    assert_eq!(
+        occupied.local_addr().expect("the listener has an address"),
+        address
+    );
+    drop(occupied);
 }
 
 /// The capability set the gateway principal carries is the full one, so the
