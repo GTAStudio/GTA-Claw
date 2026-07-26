@@ -7,10 +7,10 @@
 //! # What is real here and what is standing in
 //!
 //! The composition, the lifecycle, the authorization flow, the task tracking
-//! and the shutdown path are real and are what will ship. The Gateway adapter
-//! owns the real `claw-gateway` server; remaining subsystem implementations in
-//! [`adapters`] are deterministic stand-ins for crates that are still on
-//! unmerged branches.
+//! and the shutdown path are real and are what will ship. When listen addresses
+//! are configured, the Gateway adapter owns the real `claw-gateway` server;
+//! remaining subsystem implementations in [`adapters`] are deterministic
+//! stand-ins for crates that are still on unmerged branches.
 //!
 //! # The two rules the composition enforces
 //!

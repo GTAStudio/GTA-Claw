@@ -69,11 +69,44 @@ fn read_tool() -> ToolName {
 async fn started(clock: Arc<SteppedClock>) -> Daemon {
     let mut daemon = Daemon::builder()
         .clock(clock as Arc<dyn Clock>)
+        .listen(vec![
+            "127.0.0.1:0"
+                .parse()
+                .expect("the loopback listener address is valid"),
+        ])
         .build()
         .expect("the composition is orderable");
 
     daemon.start().await.expect("every subsystem comes up");
     daemon
+}
+
+#[tokio::test]
+async fn the_default_process_topology_opens_no_ip_listener() {
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()))
+        .build()
+        .expect("the default composition is orderable");
+
+    assert_eq!(daemon.settings().listen(), &[]);
+    let handles = daemon.start().await.expect("the default daemon starts");
+    let gateway = handles
+        .iter()
+        .find(|handle| handle.subsystem() == &well_known::gateway())
+        .expect("the Gateway reports its inert network state");
+
+    assert_eq!(gateway.bound(), &[]);
+    assert_eq!(
+        gateway.detail(),
+        Some("Gateway disabled: no listen addresses configured")
+    );
+    assert_eq!(daemon.gateway().bound(), Vec::new());
+    assert_eq!(daemon.gateway().registered_methods(), 0);
+
+    let summary = daemon.stop().await.expect("the default daemon stops");
+    assert!(summary.is_clean());
+    assert_eq!(summary.tasks().spawned(), 0);
+    assert_eq!(summary.tasks().terminated(), 0);
 }
 
 #[tokio::test]

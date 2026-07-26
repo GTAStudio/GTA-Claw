@@ -9,9 +9,9 @@
 //! follows that order while shutdown follows its reverse with ingress quiesced
 //! first. Adding a subsystem means declaring an edge, not editing a sequence.
 //!
-//! The Gateway ingress owns the real `claw-gateway` listener and protocol
-//! server. Remaining deterministic adapters are seams for crates that have not
-//! landed yet.
+//! When listen addresses are configured, the Gateway ingress owns the real
+//! `claw-gateway` listener and protocol server. Remaining deterministic
+//! adapters are seams for crates that have not landed yet.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -430,7 +430,7 @@ impl DaemonBuilder {
     pub fn new() -> Self {
         Self {
             clock: None,
-            listen: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            listen: Vec::new(),
             provider_host: "models.example.test".to_owned(),
             provider_url: "https://models.example.test/v1".to_owned(),
             provider_addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))],
@@ -463,7 +463,10 @@ impl DaemonBuilder {
         self
     }
 
-    /// Sets the addresses ingress subsystems report as bound.
+    /// Enables the real Gateway listener on the requested addresses.
+    ///
+    /// The default is empty so the no-argument packaged service remains
+    /// compatible with its no-IP-network sandbox.
     #[must_use]
     pub fn listen(mut self, listen: Vec<SocketAddr>) -> Self {
         self.listen = listen;

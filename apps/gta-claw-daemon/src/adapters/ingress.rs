@@ -143,6 +143,7 @@ pub struct GatewayIngress {
     pending: Mutex<Vec<BoundServer>>,
     control: Mutex<Option<mpsc::UnboundedSender<GatewayCommand>>>,
     bound: Arc<RwLock<Vec<SocketAddr>>>,
+    listener_configured: AtomicBool,
     registered_methods: AtomicUsize,
 }
 
@@ -164,6 +165,7 @@ impl GatewayIngress {
             pending: Mutex::new(Vec::new()),
             control: Mutex::new(None),
             bound: Arc::new(RwLock::new(Vec::new())),
+            listener_configured: AtomicBool::new(false),
             registered_methods: AtomicUsize::new(0),
         }
     }
@@ -226,11 +228,16 @@ impl Subsystem for GatewayIngress {
         context: &'a StartContext,
     ) -> BoxFuture<'a, Result<(), SubsystemError>> {
         Box::pin(async move {
-            if context.settings().listen().is_empty() {
-                return Err(SubsystemError::invalid(
-                    well_known::gateway(),
-                    "at least one Gateway listen address is required",
-                ));
+            let listener_configured = !context.settings().listen().is_empty();
+            self.listener_configured
+                .store(listener_configured, Ordering::SeqCst);
+            if !listener_configured {
+                self.registered_methods.store(0, Ordering::SeqCst);
+                self.pending
+                    .lock()
+                    .expect("the Gateway pending-server lock is not poisoned")
+                    .clear();
+                return Ok(());
             }
 
             let clock = Arc::new(SystemClock);
@@ -280,6 +287,12 @@ impl Subsystem for GatewayIngress {
         context: &'a StartContext,
     ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
         Box::pin(async move {
+            if !self.listener_configured.load(Ordering::SeqCst) {
+                self.gate.accepting.store(true, Ordering::SeqCst);
+                return Ok(ServiceHandle::inert(well_known::gateway())
+                    .with_detail("Gateway disabled: no listen addresses configured"));
+            }
+
             let pending = std::mem::take(
                 &mut *self
                     .pending
@@ -339,6 +352,10 @@ impl Subsystem for GatewayIngress {
     fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
         Box::pin(async move {
             self.gate.accepting.store(false, Ordering::SeqCst);
+            if !self.listener_configured.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+
             let control = self
                 .control
                 .lock()
@@ -491,6 +508,10 @@ impl std::fmt::Debug for GatewayIngress {
         formatter
             .debug_struct("GatewayIngress")
             .field("bound", &self.bound())
+            .field(
+                "listener_configured",
+                &self.listener_configured.load(Ordering::SeqCst),
+            )
             .field("registered_methods", &self.registered_methods())
             .field("served", &self.served())
             .field("refused", &self.refused())
