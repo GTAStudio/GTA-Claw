@@ -1030,10 +1030,33 @@ function Assert-EvidencePathShape {
 # ---------------------------------------------------------------------------
 # Enabled-test oracle.
 #
-# This is a FOLLOWER port of declares_enabled_test in
-# crates/claw-conformance/src/claims.rs, which is the NORMATIVE implementation.
-# When the Rust function changes, this must be re-ported in the same cycle; this
-# script has no independent authority to decide what counts as a real test.
+# This is a port of declares_enabled_test in
+# crates/claw-conformance/src/claims.rs. An earlier note here made that port
+# unconditionally subordinate -- "where the two disagree, Rust is correct and
+# this script is the bug" -- and that framing is too strong. Following it would
+# have produced the wrong repair.
+#
+# What actually adjudicates agreement is enabled-test-oracle.json, replayed by
+# both sides on every run. Its expectations were produced by running the Rust
+# implementation at the pinned ported_at_commit, never written by hand, so the
+# corpus records a specific past Rust behaviour rather than acting as an
+# independent arbiter. (That is the opposite of reachability-corpus.json, whose
+# expectations were arbitrated by cargo and rustc directly and where neither
+# resolver is normative. The two corpora do not share provenance and must not be
+# described as if they do.)
+#
+# Two consequences. First, neither implementation may edit a stored expectation
+# to match itself; a disagreement is resolved by re-deriving the evidence, not
+# by assuming whichever side is easier to change. Second, Rust moving is not
+# automatically the corpus being wrong: #81 rewrote rust_tokens and
+# declares_in_items and touched no file under compat/upstream at all, and the
+# replay stayed green, so the Rust side changed while these expectations held.
+# This port was not the bug there and must not be relaxed to chase a divergence.
+#
+# Recorded defect, not fixed here: ported_at_commit 18774a2c is not an ancestor
+# of main, so the pin names a commit off the mainline. Repointing it edits a
+# digest-pinned fixture, which belongs in its own reviewed change.
+#
 # Agreement is not asserted by hand: enabled-test-oracle.json is a shared,
 # frozen fixture corpus that both implementations must classify identically, and
 # Assert-EnabledTestOracle below replays every case on every run.
