@@ -11,9 +11,9 @@ publish = false
 [dependencies]
 async-trait = "=0.1.89"
 base64 = "=0.22.1"
-bytes = "=1.11.1"
+bytes = "=1.12.1"
 claw-domain.workspace = true
-futures-util = { version = "=0.3.32", default-features = false, features = ["alloc", "std"] }
+futures-util = { version = "=0.3.33", default-features = false, features = ["alloc", "std"] }
 http = "=1.4.0"
 http-body-util = "=0.1.4"
 hyper = { version = "=1.11.0", features = ["client", "http1"] }
@@ -55,7 +55,6 @@ axum = "=0.8.9"
 [[bin]]
 name = "claw-mcp-fixture"
 path = "tests/fixtures/mcp_fixture.rs"
-test = false
 
 [lints]
 workspace = true

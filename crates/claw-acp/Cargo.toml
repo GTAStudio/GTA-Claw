@@ -26,7 +26,6 @@ tokio-util = { version = "=0.7.18", features = ["rt"] }
 [[bin]]
 name = "claw-acp-fixture"
 path = "tests/fixtures/acp_fixture.rs"
-test = false
 
 [lints]
 workspace = true

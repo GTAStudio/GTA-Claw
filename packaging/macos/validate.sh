@@ -43,6 +43,8 @@ while IFS= read -r entry; do
     *) die "unexpected top-level app bundle content: $entry" ;;
   esac
 done < <(find "$app/Contents" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)
+resources="$(find "$app/Contents/Resources" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)"
+[[ "$resources" == "GTAClaw.icns" ]] || die "app Resources content differs from its allowlist"
 
 assert_binary_arches "$binary" "$expected_arches"
 assert_macho_minimum_version "$binary"
@@ -51,12 +53,7 @@ validate_macho_dependencies "$binary" "$app"
 if strings "$binary" | grep -F "$REPO_ROOT" >/dev/null; then
   die "binary contains an absolute repository build path"
 fi
-if find "$app" -type f \( \
-  -iname 'node' -o -iname 'node.exe' -o -iname 'npm' -o -iname 'bun' -o -iname 'pnpm' -o \
-  -iname '*.js' -o -iname '*.mjs' -o -iname '*.cjs' -o -iname '*.node' \
-\) -print -quit | grep . >/dev/null; then
-  die "app bundle contains a JavaScript or Node runtime artifact"
-fi
+assert_no_javascript_payload "$app"
 dependencies="$(macho_dependencies "$binary")" ||
   die "otool could not inspect runtime dependencies for $binary"
 if grep -Ei '(^|/)libnode|javascriptcore' <<<"$dependencies" >/dev/null; then
