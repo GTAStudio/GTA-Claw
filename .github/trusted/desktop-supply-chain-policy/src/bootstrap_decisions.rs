@@ -47,9 +47,27 @@ struct PreservationDecision {
     rationale: String,
 }
 
+/// A reviewed, archive-bound permission for one live source to diverge from its
+/// frozen historical payload.
+///
+/// Unlike a [`PreservationDecision`], a standing preservation records no per-change
+/// transition and is deliberately not bound to `manifest.base`, so it stays valid
+/// while the protected base advances. It binds only archive-side facts, which makes
+/// it void the moment the historical payload it names is rewritten.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct StandingPreservation {
+    id: usize,
+    path: String,
+    base_oid: String,
+    snapshot_payload_sha256: String,
+    snapshot_fingerprint: String,
+    rationale: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct DecisionLedger {
     decisions: Vec<PreservationDecision>,
+    standing: Vec<StandingPreservation>,
 }
 
 fn exact_keys(
@@ -65,6 +83,23 @@ fn exact_keys(
         )));
     }
     Ok(())
+}
+
+/// Accepts exactly the schema-1 ledger root, with or without the optional
+/// `standing` array, and reports whether that array is present.
+fn ledger_root_shape(table: &toml::map::Map<String, TomlValue>) -> PolicyResult<bool> {
+    let actual = table.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    for (expected, has_standing) in [
+        (["schema_version", "decisions"].as_slice(), false),
+        (["schema_version", "decisions", "standing"].as_slice(), true),
+    ] {
+        if actual == expected.iter().copied().collect::<BTreeSet<_>>() {
+            return Ok(has_standing);
+        }
+    }
+    Err(PolicyError::new(
+        "Bootstrap source decision ledger schema changed",
+    ))
 }
 
 fn decision_string<'a>(
@@ -134,7 +169,7 @@ impl DecisionLedger {
                 "{label} Bootstrap source decision ledger root must be a table"
             ))
         })?;
-        exact_keys(root, &["schema_version", "decisions"], "ledger")?;
+        let has_standing = ledger_root_shape(root)?;
         if root.get("schema_version").and_then(TomlValue::as_integer) != Some(1) {
             return Err(PolicyError::new(
                 "Bootstrap source decision ledger schema_version must be 1",
@@ -224,7 +259,16 @@ impl DecisionLedger {
             });
         }
 
-        let ledger = Self { decisions };
+        let standing = if has_standing {
+            Self::parse_standing(root)?
+        } else {
+            Vec::new()
+        };
+
+        let ledger = Self {
+            decisions,
+            standing,
+        };
         if ledger.canonical_text().as_bytes() != normalized {
             return Err(PolicyError::new(format!(
                 "{label} Bootstrap source decision ledger is not canonical"
@@ -233,11 +277,99 @@ impl DecisionLedger {
         Ok(ledger)
     }
 
-    fn canonical_text(&self) -> String {
-        if self.decisions.is_empty() {
-            return "schema_version = 1\ndecisions = []\n".to_owned();
+    fn parse_standing(
+        root: &toml::map::Map<String, TomlValue>,
+    ) -> PolicyResult<Vec<StandingPreservation>> {
+        let values = root
+            .get("standing")
+            .and_then(TomlValue::as_array)
+            .ok_or_else(|| {
+                PolicyError::new("Bootstrap source decision ledger standing must be an array")
+            })?;
+        if values.is_empty() {
+            return Err(PolicyError::new(
+                "Bootstrap source decision ledger standing must be omitted when empty",
+            ));
         }
+        if values.len() > MAX_DECISIONS {
+            return Err(PolicyError::new(format!(
+                "Bootstrap source decision ledger exceeds {MAX_DECISIONS} standing preservations"
+            )));
+        }
+        let mut standing = Vec::with_capacity(values.len());
+        let mut previous_path: Option<&str> = None;
+        for (index, value) in values.iter().enumerate() {
+            let table = value.as_table().ok_or_else(|| {
+                PolicyError::new("Bootstrap standing preservation entry must be a table")
+            })?;
+            exact_keys(
+                table,
+                &[
+                    "id",
+                    "path",
+                    "base_oid",
+                    "snapshot_payload_sha256",
+                    "snapshot_fingerprint",
+                    "rationale",
+                ],
+                "standing entry",
+            )?;
+            let id = table
+                .get("id")
+                .and_then(TomlValue::as_integer)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    PolicyError::new(
+                        "Bootstrap standing preservation id must be a positive integer",
+                    )
+                })?;
+            let expected_id = index + 1;
+            if id != expected_id {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap standing preservations are not strictly sorted with consecutive ids: expected {expected_id}, found {id}"
+                )));
+            }
+            let path = decision_string(table, "path")?;
+            if !BOOTSTRAP_FILES.contains(&path) {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap standing preservation path is not in BOOTSTRAP_FILES: {path}"
+                )));
+            }
+            if previous_path.is_some_and(|previous| previous >= path) {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap standing preservations are not strictly sorted by path: {path}"
+                )));
+            }
+            previous_path = Some(path);
+            let base_oid = decision_string(table, "base_oid")?;
+            validate_oid(base_oid, "Bootstrap standing preservation base_oid")?;
+            let snapshot_payload_sha256 = decision_string(table, "snapshot_payload_sha256")?;
+            let snapshot_fingerprint = decision_string(table, "snapshot_fingerprint")?;
+            for (field, hash) in [
+                ("snapshot_payload_sha256", snapshot_payload_sha256),
+                ("snapshot_fingerprint", snapshot_fingerprint),
+            ] {
+                validate_hash(hash, field)?;
+            }
+            let rationale = decision_string(table, "rationale")?;
+            validate_rationale(rationale)?;
+            standing.push(StandingPreservation {
+                id,
+                path: path.to_owned(),
+                base_oid: base_oid.to_owned(),
+                snapshot_payload_sha256: snapshot_payload_sha256.to_owned(),
+                snapshot_fingerprint: snapshot_fingerprint.to_owned(),
+                rationale: rationale.to_owned(),
+            });
+        }
+        Ok(standing)
+    }
+
+    fn canonical_text(&self) -> String {
         let mut output = String::from("schema_version = 1\n");
+        if self.decisions.is_empty() {
+            output.push_str("decisions = []\n");
+        }
         for decision in &self.decisions {
             output.push_str("\n[[decisions]]\n");
             output.push_str(&format!("id = {}\n", decision.id));
@@ -258,6 +390,25 @@ impl DecisionLedger {
                     decision.snapshot_fingerprint.as_str(),
                 ),
                 ("rationale", decision.rationale.as_str()),
+            ] {
+                output.push_str(field);
+                output.push_str(" = ");
+                output.push_str(&toml_string(value));
+                output.push('\n');
+            }
+        }
+        for entry in &self.standing {
+            output.push_str("\n[[standing]]\n");
+            output.push_str(&format!("id = {}\n", entry.id));
+            for (field, value) in [
+                ("path", entry.path.as_str()),
+                ("base_oid", entry.base_oid.as_str()),
+                (
+                    "snapshot_payload_sha256",
+                    entry.snapshot_payload_sha256.as_str(),
+                ),
+                ("snapshot_fingerprint", entry.snapshot_fingerprint.as_str()),
+                ("rationale", entry.rationale.as_str()),
             ] {
                 output.push_str(field);
                 output.push_str(" = ");
@@ -570,7 +721,27 @@ fn residual_error(path: &str) -> PolicyError {
     ))
 }
 
-/// Forces an explicit snapshot synchronization or preservation decision for every changed source.
+/// Returns the standing preservation that still covers `path`, if any.
+///
+/// The entry must be present *and identical* in both the protected base ledger and the
+/// candidate ledger. Reading it from the protected base is what makes it unforgeable: a
+/// candidate cannot mint its own coverage, because an entry the base does not already
+/// carry is ignored, and an entry the candidate edits or drops stops matching.
+fn standing_preservation<'a>(
+    trusted: &'a DecisionLedger,
+    candidate: &DecisionLedger,
+    path: &str,
+) -> Option<&'a StandingPreservation> {
+    let entry = trusted.standing.iter().find(|entry| entry.path == path)?;
+    candidate
+        .standing
+        .iter()
+        .any(|candidate_entry| candidate_entry == entry)
+        .then_some(entry)
+}
+
+/// Forces an explicit snapshot synchronization, a newly appended preservation decision, or an
+/// already-reviewed standing preservation for every changed Bootstrap source.
 pub fn validate_bootstrap_source_decisions(
     trusted: &SafeRoot,
     candidate: &SafeRoot,
@@ -638,7 +809,25 @@ pub fn validate_bootstrap_source_decisions(
             .filter(|(_, decision)| decision.path == *path)
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            return Err(residual_error(path));
+            if archive_payload_changed {
+                return Err(residual_error(path));
+            }
+            let Some(entry) = standing_preservation(&trusted_ledger, &candidate_ledger, path)
+            else {
+                return Err(residual_error(path));
+            };
+            if entry.snapshot_payload_sha256 != sha256(candidate_payload) {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap standing preservation no longer binds the frozen historical payload: {path}"
+                )));
+            }
+            if entry.snapshot_fingerprint != candidate_snapshot.fingerprint {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap standing preservation no longer binds the candidate Bootstrap archive fingerprint: {path}"
+                )));
+            }
+            preserved.insert(*path);
+            continue;
         }
         if matches.len() != 1 {
             return Err(PolicyError::new(format!(
