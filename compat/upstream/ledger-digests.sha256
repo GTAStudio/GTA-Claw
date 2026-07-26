@@ -6,4 +6,4 @@
 # Format: <sha256>  <ledger path>
 4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d  ledgers/gateway-core.json
 db4442bcd627608ea2bee05f0103a56ab493aca92cd6deca850053a043b8b30e  ledgers/official-integration.json
-e2ba9299748d42d24f7b5d84a7a18af34a470ce260f40d5d3a20a9cddf288406  ledgers/official-client-interop.json
+e09abccfcf890939ee220fa303b574673c346b21479bf0ff622d0e183cb44e0d  ledgers/official-client-interop.json
