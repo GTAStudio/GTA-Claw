@@ -20,6 +20,11 @@
     the parent of compat/. The validator self-test passes the real tree explicitly
     because it runs mutated copies of this contract from a temporary directory.
 
+.PARAMETER ContractRoot
+    Contract directory to validate as bounded data. Defaults to the directory that
+    contains this script. CI executes the protected base script with this parameter
+    pointing at the immutable candidate's compat/upstream directory.
+
 .EXAMPLE
     powershell -NoProfile -File compat/upstream/validate.ps1
 
@@ -29,11 +34,14 @@
 [CmdletBinding()]
 param(
     [switch]$WriteLedgerDigests,
-    [string]$RepositoryRoot
+    [string]$RepositoryRoot,
+    [string]$ContractRoot
 )
 
 $ErrorActionPreference = "Stop"
-$Root = $PSScriptRoot
+$TrustedRoot = $PSScriptRoot
+$MaxContractEntries = 256
+$MaxDataFileBytes = 4 * 1024 * 1024
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
 $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f441e8de396"
 
@@ -273,6 +281,15 @@ function Fail {
     throw "compat/upstream validation failed: $Message"
 }
 
+function Read-BoundedText {
+    param([string]$Path)
+    $file = Get-Item -LiteralPath $Path -Force
+    if ($file.Length -gt $MaxDataFileBytes) {
+        Fail "data file '$Path' exceeds the $MaxDataFileBytes-byte validation limit"
+    }
+    return [System.IO.File]::ReadAllText($Path)
+}
+
 function Read-Json {
     param([string]$Path)
     try {
@@ -280,7 +297,7 @@ function Read-Json {
         # BOM-less file with the system ANSI codepage while PowerShell Core
         # decodes it as UTF-8, so the same bytes would parse differently on the
         # two platforms. ReadAllText is UTF-8 with BOM detection everywhere.
-        return (ConvertFrom-Json ([System.IO.File]::ReadAllText($Path)))
+        return (ConvertFrom-Json (Read-BoundedText $Path))
     } catch {
         Fail "invalid JSON in $Path`: $($_.Exception.Message)"
     }
@@ -394,6 +411,22 @@ function Get-Sha256Text {
     try {
         return (($algorithm.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) |
             ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-Sha256File {
+    param([string]$Path)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            return (($algorithm.ComputeHash($stream) |
+                ForEach-Object { $_.ToString("x2") }) -join "")
+        } finally {
+            $stream.Dispose()
+        }
     } finally {
         $algorithm.Dispose()
     }
@@ -910,6 +943,71 @@ function Resolve-RepositoryRoot {
     return $resolved
 }
 
+function Resolve-ContractRoot {
+    param([AllowNull()][string]$Requested)
+    $candidate = if ([string]::IsNullOrWhiteSpace($Requested)) {
+        $TrustedRoot
+    } else {
+        $Requested
+    }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+        Fail "contract root '$candidate' does not exist"
+    }
+    $entry = Get-Item -LiteralPath $candidate -Force
+    if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "contract root '$candidate' must not be a reparse point"
+    }
+    return (Resolve-Path -LiteralPath $candidate).ProviderPath
+}
+
+function Assert-TrustedValidatorIdentity {
+    if (Test-OrdinalStringEqual $Root $TrustedRoot) {
+        return
+    }
+    $candidateValidator = Join-Path $Root "validate.ps1"
+    if (-not (Test-Path -LiteralPath $candidateValidator -PathType Leaf)) {
+        Fail "candidate contract is missing validate.ps1"
+    }
+    $candidateEntry = Get-Item -LiteralPath $candidateValidator -Force
+    if (($candidateEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "candidate validate.ps1 must not be a reparse point"
+    }
+    $trustedValidator = Join-Path $TrustedRoot "validate.ps1"
+    if ($candidateEntry.Length -ne (Get-Item -LiteralPath $trustedValidator -Force).Length) {
+        Fail "candidate validate.ps1 differs from the trusted protected validator"
+    }
+    $candidateHash = Get-Sha256File $candidateValidator
+    $trustedHash = Get-Sha256File $trustedValidator
+    if (-not (Test-OrdinalStringEqual $candidateHash $trustedHash)) {
+        Fail "candidate validate.ps1 differs from the trusted protected validator"
+    }
+}
+
+function Get-SafeContractEntries {
+    param([string]$ContractRoot)
+    $pending = New-Object 'System.Collections.Generic.Queue[string]'
+    $entries = New-Object System.Collections.ArrayList
+    $pending.Enqueue($ContractRoot)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Dequeue()
+        foreach ($entry in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail "contract artifact '$($entry.FullName)' must not be a reparse point"
+            }
+            [void]$entries.Add($entry)
+            if ($entries.Count -gt $MaxContractEntries) {
+                Fail "contract topology exceeds the $MaxContractEntries-entry validation limit"
+            }
+            if ($entry.PSIsContainer) {
+                $pending.Enqueue($entry.FullName)
+            } elseif ($entry.Length -gt $MaxDataFileBytes) {
+                Fail "contract artifact '$($entry.FullName)' exceeds the $MaxDataFileBytes-byte validation limit"
+            }
+        }
+    }
+    return $entries.ToArray()
+}
+
 $script:DirectoryEntryCache = @{}
 $script:RepositoryFileTextCache = @{}
 $script:CrateReachabilityCache = @{}
@@ -957,7 +1055,7 @@ function Get-RepositoryFileText {
     if ($script:RepositoryFileTextCache.ContainsKey($AbsolutePath)) {
         return $script:RepositoryFileTextCache[$AbsolutePath]
     }
-    $text = [System.IO.File]::ReadAllText($AbsolutePath)
+    $text = Read-BoundedText $AbsolutePath
     $script:RepositoryFileTextCache[$AbsolutePath] = $text
     return $text
 }
@@ -2510,7 +2608,7 @@ function Read-LedgerDigestFile {
     if (-not (Test-Path -LiteralPath $AbsolutePath -PathType Leaf)) {
         Fail "$LedgerDigestFileName is missing; regenerate it with validate.ps1 -WriteLedgerDigests"
     }
-    $text = [System.IO.File]::ReadAllText($AbsolutePath).Replace("`r`n", "`n")
+    $text = (Read-BoundedText $AbsolutePath).Replace("`r`n", "`n")
     $digests = [ordered]@{}
     foreach ($line in $text.Split("`n")) {
         if ($line.Length -eq 0 -or $line.StartsWith("#", [StringComparison]::Ordinal)) {
@@ -2887,15 +2985,21 @@ function Assert-ManifestDeclarations {
     }
 }
 
+$Root = Resolve-ContractRoot $ContractRoot
+if ($WriteLedgerDigests -and -not (Test-OrdinalStringEqual $Root $TrustedRoot)) {
+    Fail "-WriteLedgerDigests cannot write through a separate trusted validator"
+}
 $script:RepositoryRootFull = Resolve-RepositoryRoot $RepositoryRoot
+Assert-TrustedValidatorIdentity
 
 # Runs before any contract file is read, in both verify and write mode, so a host
 # whose globalisation or JSON behaviour differs from a conforming host fails
 # loudly instead of silently computing a different digest.
 Assert-PortabilityInvariants
 
+$contractEntries = @(Get-SafeContractEntries $Root)
 $actualFilePaths = @(
-    Get-ChildItem -LiteralPath $Root -Recurse -File -Force | ForEach-Object {
+    $contractEntries | Where-Object { -not $_.PSIsContainer } | ForEach-Object {
         $relative = $_.FullName.Substring($Root.Length)
         while ($relative.StartsWith("\", [StringComparison]::Ordinal) -or
             $relative.StartsWith("/", [StringComparison]::Ordinal)) {
@@ -3202,6 +3306,7 @@ if ($WriteLedgerDigests) {
     status = "ok"
     mode = if ($WriteLedgerDigests) { "write-ledger-digests" } else { "verify" }
     baseline_sha = $ExpectedSha
+    contract_root = $Root
     repository_root = $script:RepositoryRootFull
     artifact_json_files = $actualJsonPaths.Count
     ledgers = $LedgerSpecs.Count

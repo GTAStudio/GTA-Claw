@@ -58,10 +58,10 @@ for operators who explicitly supply an external Gateway endpoint.
 
 ## Pinned upstream reference
 
-`.github/workflows/upstream-gateway-reference.yml` validates the immutable data
-under `compat/upstream/` and runs the `claw-protocol` and
-`claw-gateway-client` suites against that frozen contract. The workflow does not
-checkout, install, build, or execute the upstream implementation.
+`.github/workflows/upstream-gateway-reference.yml` runs the protected base's
+validator against immutable candidate data under `compat/upstream/`. Its
+`pull_request_target` job checks out the candidate separately and never runs,
+sources, imports or compiles candidate code.
 
 The ignored `pinned_official_gateway_live_contract` test can still perform a
 real authenticated v4 handshake, safe `health` interaction, negative token

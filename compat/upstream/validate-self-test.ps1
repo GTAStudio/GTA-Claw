@@ -362,6 +362,8 @@ function Invoke-Validator {
     param(
         [string]$CaseRoot,
         [string]$RepositoryRootOverride,
+        [string]$ValidatorRootOverride,
+        [string]$ContractRootOverride,
         [switch]$WriteLedgerDigests
     )
     # The child is started through System.Diagnostics.Process rather than the
@@ -381,9 +383,18 @@ function Invoke-Validator {
     } else {
         $RepositoryRootOverride
     }
+    $validatorRoot = if ([string]::IsNullOrEmpty($ValidatorRootOverride)) {
+        $CaseRoot
+    } else {
+        $ValidatorRootOverride
+    }
     $invocation = "& {0} -RepositoryRoot {1}" -f
-        (ConvertTo-PowerShellLiteral (Join-Path $CaseRoot "validate.ps1")),
+        (ConvertTo-PowerShellLiteral (Join-Path $validatorRoot "validate.ps1")),
         (ConvertTo-PowerShellLiteral $repositoryRoot)
+    if (-not [string]::IsNullOrEmpty($ContractRootOverride)) {
+        $invocation += " -ContractRoot {0}" -f
+            (ConvertTo-PowerShellLiteral $ContractRootOverride)
+    }
     if ($WriteLedgerDigests) {
         $invocation += " -WriteLedgerDigests"
     }
@@ -527,6 +538,7 @@ $cases = @(
         name = "honest-transition-passes"
         expect_success = $true
         regenerate_digests = $true
+        trusted_validator = $true
         mutate = {
             param($caseRoot)
             Set-ForgedTransition $caseRoot -Artifacts @(
@@ -2044,12 +2056,24 @@ $cases = @(
         name = "changed-baseline-survives-digest-regeneration"
         expected_message = "baseline upstream provenance mismatch"
         regenerate_digests = $true
+        trusted_validator = $true
         mutate = {
             param($caseRoot)
             $path = Join-Path $caseRoot "baseline.json"
             $baseline = Read-Json $path
             $baseline.upstream.commit_sha = "0000000000000000000000000000000000000000"
             Write-Json $path $baseline
+        }
+    },
+    [ordered]@{
+        name = "trusted-validator-rejects-candidate-validator-change"
+        expected_message = "candidate validate.ps1 differs from the trusted protected validator"
+        trusted_validator = $true
+        mutate = {
+            param($caseRoot)
+            Add-Content -LiteralPath (Join-Path $caseRoot "validate.ps1") `
+                -Value "# candidate-controlled validator change" `
+                -Encoding UTF8
         }
     },
     [ordered]@{
@@ -2527,7 +2551,14 @@ try {
             Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot -WriteLedgerDigests | Out-Null
         }
 
-        $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
+        if ($case.Contains("trusted_validator") -and $case.trusted_validator) {
+            $result = Invoke-Validator $caseRoot `
+                -RepositoryRootOverride $caseRepositoryRoot `
+                -ValidatorRootOverride $SourceRoot `
+                -ContractRootOverride $caseRoot
+        } else {
+            $result = Invoke-Validator $caseRoot -RepositoryRootOverride $caseRepositoryRoot
+        }
         # Every case is evaluated even after one fails, so a single regression
         # cannot hide the status of the cases behind it.
         $failure = ""

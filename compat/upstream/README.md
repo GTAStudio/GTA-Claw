@@ -25,8 +25,11 @@ pwsh       -NoProfile -File compat/upstream/validate-self-test.ps1
 ```
 
 `validate.ps1` resolves acceptance-evidence paths against the repository working
-tree. It defaults to the parent of `compat/`; pass `-RepositoryRoot` only when the
-contract is being validated from a copy (the self-test does this).
+tree. It defaults to the parent of `compat/`; pass `-RepositoryRoot` when the
+contract is being validated from a copy. `-ContractRoot` selects the contract
+directory read as data while the executing `validate.ps1` remains the trusted
+judge. When those roots differ, the candidate's `validate.ps1` must be
+byte-identical to the trusted validator and write mode is forbidden.
 
 ### Portability
 
@@ -577,56 +580,42 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
 ## Continuous integration
 
 `validate.ps1` is a gate, not a report: a contract nobody runs is decoration.
-It is not wired into a workflow from this directory, because the repository
-trust-root allowlist is frozen at eight workflow files and this tree may not add
-one. The following step is written to be lifted verbatim into an existing
-allowed workflow by whoever owns that allowlist.
+The authoritative workflow uses `pull_request_target`, checks out the exact
+protected base and immutable candidate into separate directories, and executes
+only the protected base's validator:
 
-```yaml
-      - name: Validate frozen upstream parity contract
-        shell: pwsh
-        working-directory: ${{ github.workspace }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          try {
-              & ./compat/upstream/validate.ps1 | Out-Null
-              Write-Host "compat/upstream parity contract OK"
-          } catch {
-              Write-Host "::error title=compat/upstream parity contract::$($_.Exception.Message)"
-              exit 1
-          }
+```powershell
+& "$trusted/compat/upstream/validate.ps1" `
+  -ContractRoot "$candidate/compat/upstream" `
+  -RepositoryRoot "$candidate"
 ```
 
 Contract:
 
-- **Runner** — any. `ubuntu-latest` is now correct; no `windows-latest` pin is
-  needed. Both Windows PowerShell 5.1 and PowerShell 7+ are supported and produce
-  identical digests and identical accept/reject decisions.
-- **Working directory** — the repository checkout root, the directory containing
-  `compat/` and `crates/`. The validator resolves acceptance-evidence paths
-  against `-RepositoryRoot`, which defaults to the parent of `compat/`. Do not
-  pass `-RepositoryRoot` in CI.
-- **Checkout** — a normal `actions/checkout` working tree. Evidence paths are
-  resolved against files on disk, so a sparse or partial checkout that omits
-  `crates/` will fail honestly rather than pass vacuously.
-- **Exit 0** — every check passed. The JSON report goes to stdout; the step
-  discards it above, drop the `| Out-Null` to keep it in the log.
-- **Exit 1** — some check failed, and the single-line reason is emitted as a
-  GitHub error annotation. **This must fail the job.** There is no advisory or
-  warning mode and no non-zero code that means "passed with remarks".
-- The `try`/`catch` exists only so the rejection reason is one clean line;
-  PowerShell 7's default error view wraps long messages mid-word and buries them
-  under source-line art. Exit codes are the same without it.
+- **Runner** — exact `windows-latest`. This is a GitHub-hosted runner-class pin
+  that prevents candidate-controlled or self-hosted execution, not an immutable
+  OS-image pin. The validator itself remains portable across Windows PowerShell
+  5.1 and PowerShell 7+.
+- **Working trees** — the protected base supplies executable validator code; the
+  immutable candidate supplies only contract and evidence data.
+- **Checkout** — both roots are normal full `actions/checkout` working trees with
+  credentials, submodules, LFS and safe-directory mutation disabled. A sparse or
+  partial candidate that omits evidence under `crates/` fails honestly.
+- **Exit 0** — every check passed. The JSON report remains in the job log.
+- **Exit 1** — some check failed. **This must fail the job.** There is no
+  advisory or warning mode and no non-zero code that means "passed with remarks".
 - **Never** run `-WriteLedgerDigests` in CI. It rewrites `ledger-digests.sha256`,
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
+- **Never** execute, source, import or compile a file from the candidate checkout.
+  Candidate paths are passed only as `-ContractRoot` and `-RepositoryRoot` data.
 
-The adversarial self-test is a separate, slower step. It spawns 257 child
+The adversarial self-test is a separate, slower step. It spawns 259 child
 validator processes — one baseline run against the real tree, one per each of the
-153 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
+155 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
-so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
-every push:
+so run it from a trusted local checkout or a separate protected-side workflow,
+never from the candidate checkout in the authoritative `pull_request_target` job:
 
 ```yaml
       - name: Validate the parity validator itself

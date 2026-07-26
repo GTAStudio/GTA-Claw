@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 use toml::Value as TomlValue;
 
 use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot};
@@ -16,8 +15,9 @@ const POLICY_LIBRARY: &str = "crates/claw-repo-policy/src/lib.rs";
 const POLICY_TEST: &str = "crates/claw-repo-policy/tests/repository_policy.rs";
 const UPSTREAM_WORKFLOW: &str = ".github/workflows/upstream-gateway-reference.yml";
 const RUST_WORKFLOW: &str = ".github/workflows/rust.yml";
-const POLICY_TEST_STEP_NAME: &str = "Reject JavaScript toolchain artifacts";
 const ALLOWED_SHELL_FIXTURE: &str = ".github/fixtures/security-tools/bash-env-poison.sh";
+const CANONICAL_UPSTREAM_WORKFLOW: &[u8] =
+    include_bytes!("../../../workflows/upstream-gateway-reference.yml");
 
 /// Exact historical ceiling: 18 TypeScript files and four load-bearing roots.
 pub const LEGACY_RUNTIME_CEILING: [&str; 22] = [
@@ -507,153 +507,11 @@ fn validate_policy_source(root: &SafeRoot) -> PolicyResult<()> {
     Ok(())
 }
 
-fn yaml_key(key: &str) -> YamlValue {
-    YamlValue::String(key.to_owned())
-}
-
-fn yaml_mapping(value: &YamlValue) -> Option<&YamlMapping> {
-    if let YamlValue::Mapping(mapping) = value {
-        Some(mapping)
-    } else {
-        None
-    }
-}
-
-fn yaml_get<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
-    yaml_mapping(value)?.get(yaml_key(key))
-}
-
-fn yaml_string(value: Option<&YamlValue>) -> Option<&str> {
-    if let Some(YamlValue::String(value)) = value {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-fn normalized_command(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn validate_policy_execution_workflows(root: &SafeRoot) -> PolicyResult<()> {
-    let workflow_text = root.read_text(UPSTREAM_WORKFLOW, DEFAULT_FILE_LIMIT)?;
-    let workflow: YamlValue = serde_yaml_ng::from_str(&workflow_text)
-        .map_err(|cause| error("parse upstream repository-policy workflow", cause))?;
-    if yaml_get(&workflow, "env").is_some() || yaml_get(&workflow, "defaults").is_some() {
+    let workflow = root.read_bytes(UPSTREAM_WORKFLOW, DEFAULT_FILE_LIMIT)?;
+    if workflow != CANONICAL_UPSTREAM_WORKFLOW {
         return Err(PolicyError::new(
-            "upstream repository-policy workflow must not override global execution state",
-        ));
-    }
-    let triggers = yaml_get(&workflow, "on")
-        .and_then(yaml_mapping)
-        .ok_or_else(|| PolicyError::new("upstream repository-policy workflow has no on mapping"))?;
-    let pull_request = triggers.get(yaml_key("pull_request")).ok_or_else(|| {
-        PolicyError::new("upstream repository-policy workflow must run on every pull request")
-    })?;
-    if !matches!(pull_request, YamlValue::Null)
-        && yaml_mapping(pull_request).is_none_or(|mapping| !mapping.is_empty())
-    {
-        return Err(PolicyError::new(
-            "upstream repository-policy pull_request trigger must not use filters",
-        ));
-    }
-    let permissions = yaml_get(&workflow, "permissions")
-        .and_then(yaml_mapping)
-        .ok_or_else(|| PolicyError::new("upstream repository-policy permissions are missing"))?;
-    if permissions.len() != 1 || yaml_string(permissions.get(yaml_key("contents"))) != Some("read")
-    {
-        return Err(PolicyError::new(
-            "upstream repository-policy permissions must be exactly contents: read",
-        ));
-    }
-    let jobs = yaml_get(&workflow, "jobs")
-        .and_then(yaml_mapping)
-        .ok_or_else(|| PolicyError::new("upstream repository-policy jobs are missing"))?;
-    let mut policy_jobs = 0_usize;
-    for job in jobs.values() {
-        let Some(steps) = yaml_get(job, "steps").and_then(YamlValue::as_sequence) else {
-            continue;
-        };
-        let policy_positions = steps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, step)| {
-                yaml_string(yaml_get(step, "run")).is_some_and(|run| {
-                normalized_command(run)
-                    == "cargo test --locked --package claw-repo-policy --test repository_policy"
-                })
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if policy_positions.is_empty() {
-            continue;
-        }
-        let job = yaml_mapping(job)
-            .ok_or_else(|| PolicyError::new("repository-policy job is not a mapping"))?;
-        let job_keys = job
-            .keys()
-            .filter_map(YamlValue::as_str)
-            .collect::<BTreeSet<_>>();
-        let timeout = job
-            .get(yaml_key("timeout-minutes"))
-            .and_then(YamlValue::as_u64);
-        if policy_positions != [1]
-            || job.len() != 4
-            || job_keys != BTreeSet::from(["name", "runs-on", "steps", "timeout-minutes"])
-            || yaml_string(job.get(yaml_key("runs-on"))) != Some("windows-latest")
-            || timeout.is_none_or(|timeout| !(1..=45).contains(&timeout))
-            || steps.len() < 2
-        {
-            return Err(PolicyError::new(
-                "repository-policy test job shape or execution order changed",
-            ));
-        }
-        let checkout = yaml_mapping(&steps[0])
-            .ok_or_else(|| PolicyError::new("repository-policy checkout is not a mapping"))?;
-        let checkout_with = checkout
-            .get(yaml_key("with"))
-            .and_then(yaml_mapping)
-            .ok_or_else(|| PolicyError::new("repository-policy checkout inputs are missing"))?;
-        if checkout.len() != 3
-            || checkout
-                .keys()
-                .filter_map(YamlValue::as_str)
-                .collect::<BTreeSet<_>>()
-                != BTreeSet::from(["name", "uses", "with"])
-            || yaml_string(checkout.get(yaml_key("name"))) != Some("Checkout GTA Claw")
-            || yaml_string(checkout.get(yaml_key("uses")))
-                != Some("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683")
-            || checkout_with.len() != 1
-            || checkout_with
-                .get(yaml_key("persist-credentials"))
-                .and_then(YamlValue::as_bool)
-                != Some(false)
-        {
-            return Err(PolicyError::new(
-                "repository-policy test must start from the exact isolated checkout",
-            ));
-        }
-        let policy_step = yaml_mapping(&steps[1])
-            .ok_or_else(|| PolicyError::new("repository-policy test step is not a mapping"))?;
-        if policy_step.len() != 2
-            || policy_step
-                .keys()
-                .filter_map(YamlValue::as_str)
-                .collect::<BTreeSet<_>>()
-                != BTreeSet::from(["name", "run"])
-            || yaml_string(policy_step.get(yaml_key("name"))) != Some(POLICY_TEST_STEP_NAME)
-        {
-            return Err(PolicyError::new(
-                "repository-policy test step or blocking semantics changed",
-            ));
-        }
-        policy_jobs = policy_jobs
-            .checked_add(1)
-            .ok_or_else(|| PolicyError::new("repository-policy job count overflow"))?;
-    }
-    if policy_jobs != 1 {
-        return Err(PolicyError::new(
-            "always-on repository-policy workflow must contain exactly one policy job",
+            "base-owned parity workflow or candidate-data execution boundary changed",
         ));
     }
 
