@@ -82,4 +82,21 @@ if ! awk '
   exit 1
 fi
 
+# build.sh runs the headless binaries it has just built, and can only do so when
+# the build target matches the host. Every invocation here must therefore be
+# `native`; a cross-build invocation would leave the packaged binaries unexecuted
+# while the job still passed.
+build_invocations="$(grep -F 'packaging/macos/build.sh' "$workflow" || true)"
+if [[ -z "$build_invocations" ]]; then
+  echo "workflow no longer invokes packaging/macos/build.sh" >&2
+  exit 1
+fi
+while IFS= read -r invocation; do
+  if [[ ! "$invocation" =~ packaging/macos/build\.sh[[:space:]]+native([[:space:]]|$) ]]; then
+    echo "build.sh must be invoked as native so the execution check cannot be skipped:" >&2
+    echo "$invocation" >&2
+    exit 1
+  fi
+done <<<"$build_invocations"
+
 echo "macOS workflow trust-boundary self-tests passed"
