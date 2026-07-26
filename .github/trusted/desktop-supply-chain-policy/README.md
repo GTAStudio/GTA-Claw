@@ -259,12 +259,26 @@ such as `git show > file`, and avoid `cmd.exe` commands whose commit/path syntax
 escaping. There is not yet a first-class single-entry update command; the full materialization and
 mandatory delta review above remain required.
 
-After the snapshot delta is accepted, compute the fingerprint from the same materialized Bootstrap
-root and copy it into the reviewed constant:
+After the snapshot delta is accepted, fingerprint the reviewed GTABOOT1 archive directly. The
+default output is deliberately human-facing and names the archive subject before the hash:
 
 ```text
-cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$MATERIALIZED_ROOT"
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --snapshot "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
+bootstrap archive /reviewed/GTA-Claw/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot fingerprint 96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3
 ```
+
+Do not run fingerprinting against `--root "$PWD"`. Current Final intentionally differs from
+historical Bootstrap, so a live-root hash is not the reviewed archive fingerprint and must never
+be copied into `BOOTSTRAP_FINGERPRINT`. Root mode exists only to verify a directory containing
+exactly the archive's 28 normalized entries, with no missing or extra files:
+
+```text
+cargo +1.94.0 run --manifest-path .github/trusted/desktop-supply-chain-policy/Cargo.toml --locked -- bootstrap-fingerprint --root "$EXACT_ARCHIVE_MATERIALIZATION" --snapshot "$PWD/.github/trusted/desktop-supply-chain-policy/policy/bootstrap.snapshot"
+```
+
+The command refuses live/Final roots, changed, missing, or extra materialized entries, and a root
+invocation without `--snapshot`. Successful output always names either `bootstrap archive <path>`
+or `verified materialized Bootstrap root <path>`; it never prints an unlabelled fingerprint.
 
 During an audited Final dependency-surface update, copy the reviewed live root deny
 policy, desktop manifests, desktop lock, and desktop deny policy into their exact audit

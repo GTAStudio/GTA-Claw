@@ -10,7 +10,8 @@ use desktop_supply_chain_policy::changes::{compute_manifest, write_manifest};
 use desktop_supply_chain_policy::input::SafeRoot;
 use desktop_supply_chain_policy::metadata::linux_tools;
 use desktop_supply_chain_policy::policy::{
-    bootstrap_fingerprint, write_bootstrap_snapshot, write_final_dependency_fixtures,
+    bootstrap_archive_fingerprint, verified_bootstrap_root_fingerprint, write_bootstrap_snapshot,
+    write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::validation::{ValidationRequest, validate_request};
 use desktop_supply_chain_policy::workflows::linux_actionlint;
@@ -87,10 +88,38 @@ fn diff_manifest(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
 
 fn fingerprint(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
     let mut options = parse_options(values)?;
-    let root = required(&mut options, "root")?;
+    let root = options.remove("root");
+    let snapshot = options.remove("snapshot");
     reject_unknown(&options)?;
-    println!("{}", bootstrap_fingerprint(&SafeRoot::new(root)?)?);
-    Ok(())
+    match (root, snapshot) {
+        (None, Some(snapshot)) => {
+            let (snapshot, fingerprint) = bootstrap_archive_fingerprint(&snapshot)?;
+            println!(
+                "bootstrap archive {} fingerprint {fingerprint}",
+                snapshot.display()
+            );
+            Ok(())
+        }
+        (Some(root), Some(snapshot)) => {
+            let root = SafeRoot::new(root)?;
+            let (snapshot, fingerprint) = verified_bootstrap_root_fingerprint(&root, &snapshot)?;
+            println!(
+                "verified materialized Bootstrap root {} against bootstrap archive {} fingerprint {fingerprint}",
+                root.path().display(),
+                snapshot.display()
+            );
+            Ok(())
+        }
+        (Some(_), None) => Err(PolicyError::new(
+            "bootstrap fingerprint --root requires --snapshot for exact archive verification; \
+             live/Final roots must not be fingerprinted directly; use \
+             `bootstrap-fingerprint --snapshot <archive>`",
+        )),
+        (None, None) => Err(PolicyError::new(
+            "bootstrap fingerprint requires --snapshot; use --root only with the same \
+             --snapshot for an exact materialization check",
+        )),
+    }
 }
 
 fn snapshot(values: impl Iterator<Item = OsString>) -> PolicyResult<()> {
