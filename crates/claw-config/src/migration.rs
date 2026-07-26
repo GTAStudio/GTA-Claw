@@ -4,25 +4,9 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::ConfigSnapshot;
 use crate::error::ConfigError;
+use crate::legacy::{LEGACY_MAPPINGS, LegacyMappingContract, MappingId};
 use crate::model::SecretRef;
 use crate::wire::{EnvelopeWire, LogLevelWire};
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LegacyMappingContract {
-    id: MappingId,
-    legacy_env: &'static str,
-    aliases: &'static [&'static str],
-    scope: &'static str,
-    target: &'static str,
-    secret: bool,
-    _default_json: &'static str,
-    _conversion: &'static str,
-    _validation: &'static str,
-    _required_when: &'static str,
-    _known_legacy_quirk: Option<&'static str>,
-}
-
-include!(concat!(env!("OUT_DIR"), "/legacy_mappings.rs"));
 
 /// A migration row that cannot be represented by this runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]

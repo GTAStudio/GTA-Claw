@@ -524,7 +524,11 @@ impl LoggingConfig {
     }
 }
 
-/// Legacy in-memory session limits.
+/// Ephemeral provider-session cache policy.
+///
+/// These limits never describe TTL or LRU eviction of durable `claw-memory`
+/// records. A consumer must bind them explicitly before they affect runtime
+/// provider sessions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionsConfig {
     pub(crate) ttl_ms: u64,

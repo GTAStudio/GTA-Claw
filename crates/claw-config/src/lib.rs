@@ -10,6 +10,7 @@ pub mod domains;
 mod error;
 mod io;
 mod layer;
+pub mod legacy;
 mod migration;
 mod model;
 mod reload;
@@ -37,6 +38,10 @@ pub use domains::{
 pub use error::ConfigError;
 pub use io::{WriteOutcome, WriteWarning, load_file, write_bytes_atomically, write_file};
 pub use layer::{ConfigLayerKind, ConfigLayers, LayeredConfigError, ResolvedConfig};
+pub use legacy::{
+    AcceptedOnlyReason, ConsumerEnforcement, LEGACY_RUNTIME_CONFIGS, LegacyRuntimeConfig,
+    LegacyRuntimeDisposition, LegacyRuntimeKey, LegacyRuntimeOwner, legacy_runtime_config,
+};
 pub use migration::{
     ManualMapping, MigrationDiagnostic, MigrationError, MigrationResult, migrate_legacy_environment,
 };

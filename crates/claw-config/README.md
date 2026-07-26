@@ -50,6 +50,25 @@ The generated Rust table embeds every behavioral field so contract changes are
 visible to code review; executable conversion remains an explicitly tested,
 typed Rust implementation rather than an interpreted rule engine.
 
+`LEGACY_RUNTIME_CONFIGS` is the public typed disposition registry for the 35
+runtime semantic leaves that migrate automatically. Each entry records its
+canonical environment name, aliases, JSON5 destination, intended subsystem
+owner, current disposition, and routing note. Migration acceptance is not
+consumer enforcement: every entry is currently `AcceptedOnly` because no
+production crate outside `claw-config` has been established as a consumer.
+Future consumer work must attach independent implementation evidence before
+changing an entry to `Enforced`.
+
+This distinction is security-relevant. `ALLOWED_SKILL_DOMAINS` does not restrict
+skill egress, and `RATE_LIMIT_PER_MIN` does not throttle ingress, until their
+respective consumers bind and enforce them. A configured security control must
+not be presented as active merely because `claw-config` accepted it.
+
+`SESSION_TTL_MS` (`sessions.ttl_ms`) and `MAX_SESSIONS`
+(`sessions.max_entries`) describe only an ephemeral provider-session cache
+policy. They are not TTL/LRU controls for durable `claw-memory` data, and must
+never cause silent eviction of durable memory.
+
 Atomic writes require a trusted configuration directory. Existing destination
 and parent symlinks/reparse points are rejected, but path-based replacement
 cannot eliminate every rename race in a directory writable by an attacker.
