@@ -10,7 +10,8 @@ runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 replacement_fence=$runtime_directory/replacement-fenced
 authorization_marker=$runtime_directory/start-authorized
-persistent_failure_marker=/var/lib/gta-claw-install/transaction-failed
+persistent_runtime_directory=/var/lib/gta-claw-install
+persistent_failure_marker=$persistent_runtime_directory/transaction-failed
 
 if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
   echo "gta-claw start authorization requires real and effective UID 0" >&2
@@ -56,6 +57,14 @@ validate_fence() {
 }
 
 authorization_valid() {
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    return 1
+  fi
+  [ ! -e "$persistent_runtime_directory" ] ||
+    [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
   validate_fence "$failure_marker" "0:0:644:1" || return 1
   validate_fence "$replacement_fence" "0:0:644:1" || return 1
   validate_fence "$persistent_failure_marker" "0:0:600:1" || return 1

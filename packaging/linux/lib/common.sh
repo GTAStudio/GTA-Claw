@@ -810,6 +810,7 @@ reject_forbidden_runtime_content() {
 }
 
 validate_service_contract() {
+  local network_directives
   local service="$1"
   local required
   for required in \
@@ -817,8 +818,10 @@ validate_service_contract() {
     'After=local-fs.target gta-claw-state-init.service' \
     'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
     'ExecCondition=+/usr/libexec/gta-claw/gta-claw-start-authorized check' \
+    'ExecCondition=+/usr/libexec/gta-claw/gta-claw-direct-config network-deny-check gta-claw-daemon.service' \
     'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
     'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
+    'EnvironmentFile=/run/gta-claw-state-init/gta-claw.env' \
     'Type=notify' \
     'NotifyAccess=main' \
     'TimeoutStartSec=60s' \
@@ -835,7 +838,7 @@ validate_service_contract() {
     'ProtectKernelTunables=yes' \
     'ProtectControlGroups=yes' \
     'CapabilityBoundingSet=CAP_SETGID CAP_SETPCAP CAP_SETUID' \
-    'RestrictAddressFamilies=AF_UNIX' \
+    'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
     'IPAddressDeny=any' \
     'SystemCallFilter=@system-service setgroups setresgid setresuid' \
     'LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf'; do
@@ -847,6 +850,26 @@ validate_service_contract() {
   fi
   if grep -Eiq 'Environment=.*(token|secret|password|private.?key)=' "$service"; then
     die "service embeds a secret-like environment literal"
+  fi
+  network_directives="$(
+    awk -F= '
+      /^[[:space:]]*(RestrictAddressFamilies|IPAddressDeny|IPAddressAllow)[[:space:]]*=/ {
+        key = $1
+        value = substr($0, index($0, "=") + 1)
+        gsub(/[[:space:]]/, "", key)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        print key "=" value
+      }
+    ' "$service"
+  )"
+  [[ "$(printf '%s\n' "$network_directives" |
+    grep -c '^RestrictAddressFamilies=' || true)" == "1" &&
+    "$(printf '%s\n' "$network_directives" |
+      grep -c '^IPAddressDeny=' || true)" == "1" ]] ||
+    die "service network policy contains duplicate effective directives"
+  if printf '%s\n' "$network_directives" | grep -q '^IPAddressAllow='; then
+    die "package-owned service grants network access instead of requiring an operator drop-in"
   fi
   if grep -Eq '^ExecStart=.*--(listen|socket|config|log)' "$service"; then
     die "service invents a daemon runtime flag"
@@ -864,7 +887,7 @@ validate_initializer_service_contract() {
     'User=root' \
     'Group=root' \
     'ExecStart=/usr/libexec/gta-claw/gta-claw-state-init' \
-    'RemainAfterExit=yes' \
+    'RemainAfterExit=no' \
     'RuntimeDirectory=gta-claw-state-init' \
     'RuntimeDirectoryMode=0755' \
     'RuntimeDirectoryPreserve=yes' \
@@ -902,6 +925,9 @@ validate_initializer_wrapper_contract() {
     'namespace=/var/lib/gta-claw-protected' \
     'runtime_directory=/run/gta-claw-state-init' \
     'failure_marker=$runtime_directory/initialization-failed' \
+    'validated_environment=$runtime_directory/gta-claw.env' \
+    'configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config' \
+    '"$configuration_helper" materialize / "$environment_file" "$credential_file"' \
     'service_gid="$(getent group gta-claw | cut -d: -f3)"' \
     'if [ "$primary_gid" != "$service_gid" ]; then' \
     'touch "$failure_marker"' \
@@ -953,7 +979,8 @@ validate_start_authorization_contract() {
     'failure_marker=$runtime_directory/initialization-failed' \
     'replacement_fence=$runtime_directory/replacement-fenced' \
     'authorization_marker=$runtime_directory/start-authorized' \
-    'persistent_failure_marker=/var/lib/gta-claw-install/transaction-failed' \
+    'persistent_runtime_directory=/var/lib/gta-claw-install' \
+    'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
     'process_start_time()' \
     'process_state="$1"' \
     'Z | X | x) return 1' \

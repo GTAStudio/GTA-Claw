@@ -424,6 +424,8 @@ install -D -m 0644 "$source_root/lib/sysusers.d/gta-claw.conf" \
 /usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
 install -D -m 0755 "$source_root/libexec/gta-claw-state-init" \
   /usr/libexec/gta-claw/gta-claw-state-init
+install -D -m 0755 "$source_root/libexec/gta-claw-direct-config" \
+  /usr/libexec/gta-claw/gta-claw-direct-config
 install -D -m 0755 "$source_root/libexec/gta-claw-runtime-ready" \
   /usr/libexec/gta-claw/gta-claw-runtime-ready
 install -D -m 0755 "$source_root/libexec/gta-claw-start-authorized" \
@@ -438,6 +440,7 @@ if [ -d /run/systemd/system ]; then
   systemctl daemon-reload || fail_install_runtime
 fi
 /usr/bin/sync -f "$persistent_failure_marker"
+/usr/bin/sync -f /usr/libexec/gta-claw/gta-claw-direct-config
 /usr/bin/sync -f /usr/lib/systemd/system/gta-claw-daemon.service
 /usr/bin/sync -f /etc/gta-claw/credentials/daemon.conf
 if [ "${GTA_CLAW_DIRECT_TEST_FAIL_AFTER:-}" = "unit" ]; then
@@ -465,7 +468,7 @@ interrupt_install_after daemon
 GTA_CLAW_DEFER_FENCE_CLEAR=1 \
   /usr/libexec/gta-claw/gta-claw-state-init
 /usr/bin/python3 \
-  "$source_root/libexec/gta-claw-direct-config" \
+  /usr/libexec/gta-claw/gta-claw-direct-config \
   verify \
   / \
   "$source_root/etc/gta-claw/gta-claw.env" \

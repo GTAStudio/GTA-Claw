@@ -10,6 +10,10 @@ namespace=/var/lib/gta-claw-protected
 runtime_directory=/run/gta-claw-state-init
 failure_marker=$runtime_directory/initialization-failed
 complete_marker=$runtime_directory/initialization-complete
+validated_environment=$runtime_directory/gta-claw.env
+configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config
+environment_file=/etc/gta-claw/gta-claw.env
+credential_file=/etc/gta-claw/credentials/daemon.conf
 
 if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
   echo "gta-claw protected initialization requires real and effective UID 0" >&2
@@ -37,6 +41,18 @@ touch "$failure_marker"
 chown 0:0 "$failure_marker"
 chmod 0644 "$failure_marker"
 rm -f "$complete_marker"
+
+if [ -L "$validated_environment" ] ||
+  { [ -e "$validated_environment" ] && [ ! -f "$validated_environment" ]; }; then
+  echo "gta-claw validated environment is not a physical file" >&2
+  exit 1
+fi
+rm -f "$validated_environment"
+if [ ! -x "$configuration_helper" ]; then
+  echo "gta-claw configuration validator is not executable" >&2
+  exit 1
+fi
+"$configuration_helper" materialize / "$environment_file" "$credential_file"
 
 if [ ! -x "$daemon" ]; then
   echo "gta-claw daemon is not executable: $daemon" >&2

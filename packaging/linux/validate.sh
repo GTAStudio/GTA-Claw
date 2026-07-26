@@ -69,6 +69,7 @@ native_rootfs_files() {
     usr/lib/systemd/system/gta-claw-state-init.service \
     usr/lib/sysusers.d/gta-claw.conf \
     usr/libexec/gta-claw/gta-claw-daemon \
+    usr/libexec/gta-claw/gta-claw-direct-config \
     usr/libexec/gta-claw/gta-claw-runtime-ready \
     usr/libexec/gta-claw/gta-claw-start-authorized \
     usr/libexec/gta-claw/gta-claw-state-init \
@@ -193,6 +194,7 @@ compare_native_sources() {
     "systemd/gta-claw-state-init.service|usr/lib/systemd/system/gta-claw-state-init.service" \
     "systemd/80-gta-claw.preset|usr/lib/systemd/system-preset/80-gta-claw.preset" \
     "sysusers/gta-claw.conf|usr/lib/sysusers.d/gta-claw.conf" \
+    "direct/config-safeio.py|usr/libexec/gta-claw/gta-claw-direct-config" \
     "libexec/gta-claw-runtime-ready|usr/libexec/gta-claw/gta-claw-runtime-ready" \
     "libexec/gta-claw-start-authorized|usr/libexec/gta-claw/gta-claw-start-authorized" \
     "libexec/gta-claw-state-init|usr/libexec/gta-claw/gta-claw-state-init" \
@@ -234,6 +236,7 @@ validate_published_native_root() {
   for executable in \
     usr/bin/gta-claw-cli \
     usr/libexec/gta-claw/gta-claw-daemon \
+    usr/libexec/gta-claw/gta-claw-direct-config \
     usr/libexec/gta-claw/gta-claw-runtime-ready \
     usr/libexec/gta-claw/gta-claw-start-authorized \
     usr/libexec/gta-claw/gta-claw-state-init; do
@@ -261,6 +264,9 @@ validate_published_native_root() {
   validate_sysusers_contract "$root/usr/lib/sysusers.d/gta-claw.conf"
   validate_initializer_wrapper_contract \
     "$root/usr/libexec/gta-claw/gta-claw-state-init"
+  python3 -B -c \
+    'import pathlib; compile(pathlib.Path(__import__("sys").argv[1]).read_text(encoding="utf-8"), "gta-claw-direct-config", "exec")' \
+    "$root/usr/libexec/gta-claw/gta-claw-direct-config"
   validate_runtime_ready_contract \
     "$root/usr/libexec/gta-claw/gta-claw-runtime-ready"
   validate_start_authorization_contract \
@@ -467,7 +473,7 @@ validate_start_authorization_contract \
 [[ "$(dpkg-deb --field "$deb_artifact" Architecture)" == "$deb_architecture" ]] ||
   die "Debian architecture mismatch"
 [[ "$(dpkg-deb --field "$deb_artifact" Depends)" == \
-  "libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249), util-linux" ]] ||
+  "libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, python3 (>= 3.8), systemd (>= 249), util-linux" ]] ||
   die "Debian dependencies do not match ELF-derived requirements"
 deb_contents="$(dpkg-deb --contents "$deb_artifact")"
 deb_payload_tar="$work_dir/published-deb-payload.tar"
@@ -560,7 +566,7 @@ Priority: optional
 Architecture: $deb_architecture
 Maintainer: GTAStudio <noreply@github.com>
 Installed-Size: $installed_size
-Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249), util-linux
+Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, python3 (>= 3.8), systemd (>= 249), util-linux
 Homepage: https://github.com/GTAStudio/GTA-Claw
 Description: GTA Claw native Rust headless prototype
  Packages gta-claw-daemon and gta-claw-cli without the legacy JavaScript
@@ -646,6 +652,10 @@ rpm -qp --requires "$rpm_artifact" | grep -Fx "glibc >= $BUILD_GLIBC_REQUIREMENT
   die "RPM glibc dependency does not match ELF-derived requirement"
 rpm -qp --requires "$rpm_artifact" | grep -Fx "util-linux" >/dev/null ||
   die "RPM does not require the setpriv provider"
+rpm -qp --requires "$rpm_artifact" | grep -Fx "python3 >= 3.8" >/dev/null ||
+  die "RPM does not require the configuration-validator interpreter"
+rpm -qp --requires "$rpm_artifact" | grep -Fx "/usr/bin/env" >/dev/null ||
+  die "RPM does not require the configuration-validator shebang interpreter"
 rpm_script_validation="$work_dir/published-rpm-scriptlets"
 create_private_validation_directory "$rpm_script_validation"
 for scriptlet in \
@@ -724,6 +734,7 @@ expected_rpm_requirements="$(
       "config($LINUX_PACKAGE_NAME)" "$VERSION-$LINUX_PACKAGE_RELEASE" 268435464 \
       glibc "$BUILD_GLIBC_REQUIREMENT" 12 \
       libgcc '' 0 \
+      python3 3.8 12 \
       'rpmlib(CompressedFileNames)' '3.0.4-1' 16777226 \
       'rpmlib(FileDigests)' '4.6.0-1' 16777226 \
       'rpmlib(PayloadFilesHavePrefix)' '4.0-1' 16777226 \
@@ -788,12 +799,17 @@ validate_initializer_service_contract \
 validate_sysusers_contract "$rootfs/usr/lib/sysusers.d/gta-claw.conf"
 validate_initializer_wrapper_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+python3 -B -c \
+  'import pathlib; compile(pathlib.Path(__import__("sys").argv[1]).read_text(encoding="utf-8"), "gta-claw-direct-config", "exec")' \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-direct-config"
 validate_runtime_ready_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
 validate_start_authorization_contract \
   "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 [[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-state-init")" == "755" ]] ||
   die "initializer wrapper mode is not 0755"
+[[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-direct-config")" == "755" ]] ||
+  die "configuration validator mode is not 0755"
 [[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready")" == "755" ]] ||
   die "runtime readiness wrapper mode is not 0755"
 [[ "$(stat -c '%a' "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized")" == "755" ]] ||

@@ -25,6 +25,7 @@ done
   die "lifecycle test requires systemd as PID 1"
 
 namespace=/var/lib/gta-claw-protected
+configuration_failure_marker=/var/lib/gta-claw-install/transaction-failed
 expected_names="$(
   printf '%s\n' \
     snapshot-0.meta \
@@ -47,6 +48,10 @@ transition_gate_dir=
 transition_gate_script=
 transition_stop_job=
 transition_rpm_job=
+role_server_job=
+role_server_root=
+role_server_port=43119
+notify_ready_pid=
 
 install_policy_denial() {
   [[ ! -e /usr/sbin/policy-rc.d && ! -L /usr/sbin/policy-rc.d ]] ||
@@ -55,6 +60,180 @@ install_policy_denial() {
     sudo tee /usr/sbin/policy-rc.d >/dev/null
   sudo chmod 0755 /usr/sbin/policy-rc.d
   policy_installed=1
+}
+
+assert_configuration_reboot_fenced() {
+  local active_state
+  local control_pid
+  local label="$1"
+  local main_pid
+  { sudo test -f "$configuration_failure_marker" &&
+    sudo test ! -L "$configuration_failure_marker" &&
+    [[ "$(sudo stat -c '%u:%g:%a:%h' "$configuration_failure_marker")" == "0:0:600:1" ]]; } ||
+    die "$label did not retain its authenticated persistent configuration fence"
+  [[ "$(sudo cat "$configuration_failure_marker")" == "configuration active" ]] ||
+    die "$label did not retain its authenticated restart intent"
+  sudo systemctl unmask --runtime gta-claw-daemon.service
+  sudo rm -rf /run/gta-claw-state-init
+  sudo rm -f /run/gta-claw-daemon.ready-for-replacement
+  sudo systemctl daemon-reload
+  [[ "$(systemctl show -P LoadState gta-claw-daemon.service)" == "loaded" ]] ||
+    die "$label simulated reboot could not load the daemon unit"
+  sudo systemctl start gta-claw-daemon.service >/dev/null 2>&1 || true
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service)"
+  case "$active_state:$main_pid:$control_pid" in
+    inactive:0:0 | failed:0:0) ;;
+    *) die "$label simulated reboot left a daemon process: $active_state:$main_pid:$control_pid" ;;
+  esac
+}
+
+start_role_server() {
+  if [[ -n "$role_server_job" ]] &&
+    kill -0 "$role_server_job" >/dev/null 2>&1; then
+    return
+  fi
+  role_server_root="$(mktemp -d)"
+  python3 - "$role_server_root" "$role_server_port" <<'PY' &
+import http.server
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+port = int(sys.argv[2])
+body = b'{"content":"You are the GTA Claw lifecycle fixture.","model":"gpt-4o"}\n'
+requested = root / "requested"
+probe = root / "probe"
+held = root / "held"
+release = root / "release"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/role.json":
+            self.send_error(404)
+            return
+        requested.touch(exist_ok=True)
+        while not release.exists():
+            if probe.exists():
+                held.touch(exist_ok=True)
+            time.sleep(0.01)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+root.joinpath("ready").touch(exist_ok=False)
+server.serve_forever()
+PY
+  role_server_job=$!
+  deadline=$((SECONDS + 10))
+  while [[ ! -e "$role_server_root/ready" ]]; do
+    kill -0 "$role_server_job" >/dev/null 2>&1 ||
+      die "local role server exited before readiness"
+    ((SECONDS < deadline)) ||
+      die "local role server did not become ready"
+    sleep 0.01
+  done
+}
+
+prepare_daemon_runtime_fixture() {
+  start_role_server
+  rm -f \
+    "$role_server_root/requested" \
+    "$role_server_root/probe" \
+    "$role_server_root/held" \
+    "$role_server_root/release"
+  sudo tee /etc/gta-claw/gta-claw.env >/dev/null <<EOF
+ENABLE_TEAMS=false
+AGENT_ROLE_URL=http://127.0.0.1:$role_server_port/role.json
+DEVICE_FLOW_ENABLED=true
+GITHUB_CLIENT_ID=gta-claw-lifecycle-fixture
+EOF
+  sudo chown 0:0 /etc/gta-claw/gta-claw.env
+  sudo chmod 0640 /etc/gta-claw/gta-claw.env
+  sudo mkdir -p /etc/systemd/system/gta-claw-daemon.service.d
+  sudo tee \
+    /etc/systemd/system/gta-claw-daemon.service.d/10-lifecycle-network.conf \
+    >/dev/null <<'EOF'
+[Service]
+IPAddressAllow=127.0.0.1/32
+EOF
+  sudo chmod 0644 \
+    /etc/systemd/system/gta-claw-daemon.service.d/10-lifecycle-network.conf
+  sudo systemctl daemon-reload
+}
+
+assert_notify_ready_continuous() {
+  local active_state
+  local after
+  local before
+  local control_pid
+  local sub_state
+  [[ "$(systemctl show -P Type gta-claw-daemon.service)" == "notify" ]] ||
+    die "daemon unit is not Type=notify"
+  [[ "$(systemctl show -P NotifyAccess gta-claw-daemon.service)" == "main" ]] ||
+    die "daemon unit does not restrict readiness to the main process"
+  before="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service)"
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+  sub_state="$(systemctl show -P SubState gta-claw-daemon.service)"
+  [[ "$before" =~ ^[1-9][0-9]*$ && "$control_pid" == "0" &&
+    "$active_state:$sub_state" == "active:running" ]] ||
+    die "daemon did not reach notify-ready running state with stable PID ownership"
+  sudo /usr/libexec/gta-claw/gta-claw-runtime-ready
+  after="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  [[ "$after" == "$before" ]] ||
+    die "daemon PID changed between notify readiness and writer-lock readiness"
+  notify_ready_pid="$before"
+}
+
+enable_daemon_with_runtime_fixture() {
+  local startup_pid
+  local start_job
+  prepare_daemon_runtime_fixture
+  sudo systemctl enable --now gta-claw-daemon.service &
+  start_job=$!
+  deadline=$((SECONDS + 15))
+  while [[ ! -e "$role_server_root/requested" ]]; do
+    kill -0 "$start_job" >/dev/null 2>&1 ||
+      die "daemon enable completed before requesting its mandatory role"
+    ((SECONDS < deadline)) ||
+      die "daemon did not request its mandatory role before startup timeout"
+    sleep 0.01
+  done
+  [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "activating" ]] ||
+    die "daemon left activating before the role response was released"
+  startup_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+  [[ "$startup_pid" =~ ^[1-9][0-9]*$ ]] ||
+    die "daemon has no stable MainPID while role validation is blocked"
+  touch "$role_server_root/probe"
+  deadline=$((SECONDS + 10))
+  while [[ ! -e "$role_server_root/held" ]]; do
+    kill -0 "$start_job" >/dev/null 2>&1 ||
+      die "daemon enable completed before the held role response"
+    [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "activating" ]] ||
+      die "daemon left activating while the role response remained held"
+    [[ "$(systemctl show -P MainPID gta-claw-daemon.service)" == "$startup_pid" ]] ||
+      die "daemon PID changed while the role response remained held"
+    ((SECONDS < deadline)) ||
+      die "local role server did not acknowledge the held response"
+    sleep 0.01
+  done
+  [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "activating" &&
+    "$(systemctl show -P MainPID gta-claw-daemon.service)" == "$startup_pid" ]] ||
+    die "daemon readiness or PID changed before role-response release"
+  touch "$role_server_root/release"
+  wait "$start_job"
+  assert_notify_ready_continuous
+  [[ "$notify_ready_pid" == "$startup_pid" ]] ||
+    die "daemon PID changed across mandatory role validation and readiness"
 }
 
 begin_daemon_deactivation() {
@@ -262,6 +441,13 @@ remove_policy_denial() {
 
 cleanup() {
   remove_policy_denial
+  if [[ -n "$role_server_job" ]]; then
+    kill "$role_server_job" >/dev/null 2>&1 || true
+    wait "$role_server_job" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$role_server_root" ]]; then
+    rm -rf "$role_server_root"
+  fi
   if [[ -n "$lock_gate_dir" ]]; then
     sudo touch "$lock_gate_dir/release" >/dev/null 2>&1 || true
   fi
@@ -296,6 +482,8 @@ cleanup() {
   if rpm -q gta-claw >/dev/null 2>&1; then
     sudo rpm -e --nodeps gta-claw >/dev/null 2>&1 || true
   fi
+  sudo rm -f "$configuration_failure_marker"
+  sudo rmdir /var/lib/gta-claw-install >/dev/null 2>&1 || true
   sudo systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ ! -e "$namespace" && ! -L "$namespace" ]]; then
     if getent passwd gta-claw >/dev/null 2>&1; then
@@ -522,7 +710,8 @@ install_failure_dropin() {
 }
 
 remove_failure_dropin() {
-  sudo rm -rf /etc/systemd/system/gta-claw-daemon.service.d
+  sudo rm -f /etc/systemd/system/gta-claw-daemon.service.d/failure.conf
+  sudo rmdir /etc/systemd/system/gta-claw-daemon.service.d >/dev/null 2>&1 || true
   sudo systemctl daemon-reload
   sudo systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 || true
 }
@@ -612,10 +801,9 @@ for _ in 1 2; do
     die "direct mask rejection claimed an administrator-owned transaction"
 done
 sudo systemctl unmask --runtime gta-claw-daemon.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now gta-claw-daemon.service
+enable_daemon_with_runtime_fixture
 assert_live_initializer_rejected
-direct_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+direct_pid="$notify_ready_pid"
 direct_reinstall_snapshot="$(state_identity_snapshot)"
 sudo mv /etc/gta-claw/gta-claw.env /etc/gta-claw/gta-claw.env.saved
 sudo ln -s /nonexistent/gta-claw.env /etc/gta-claw/gta-claw.env
@@ -891,9 +1079,9 @@ assert_disabled_and_inactive
 assert_protected_contract
 [[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
   die "Debian install changed the static service identity"
-sudo systemctl enable --now gta-claw-daemon.service
+enable_daemon_with_runtime_fixture
 assert_live_initializer_rejected
-deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+deb_pid="$notify_ready_pid"
 deb_reinstall_snapshot="$(state_identity_snapshot)"
 sudo dpkg -i "$deb1"
 assert_active_restart "$deb_pid"
@@ -930,7 +1118,7 @@ fi
 stop_manual_writer_lock
 sudo systemctl start gta-claw-daemon.service
 
-for package_boundary in initialization unmask daemon-reload restart readiness; do
+for package_boundary in initialization configuration unmask daemon-reload restart readiness; do
   deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
   if sudo env \
     GTA_CLAW_PACKAGE_TEST_FAIL_AFTER="$package_boundary" \
@@ -943,8 +1131,34 @@ for package_boundary in initialization unmask daemon-reload restart readiness; d
     -e /run/gta-claw-state-init/replacement-fenced ]] ||
     die "Debian $package_boundary fault lost its transaction fence"
   sudo dpkg --configure gta-claw
+  { sudo test ! -e "$configuration_failure_marker" &&
+    sudo test ! -L "$configuration_failure_marker"; } ||
+    die "Debian configuration recovery did not clear its persistent fence"
   assert_active_restart "$deb_pid"
 done
+
+deb_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo mv /etc/gta-claw/gta-claw.env /etc/gta-claw/gta-claw.env.saved
+printf 'ENABLE_TEAMS=false\nLD_PRELOAD=/tmp/attacker.so\n' |
+  sudo tee /etc/gta-claw/gta-claw.env >/dev/null
+sudo chown 0:0 /etc/gta-claw/gta-claw.env
+sudo chmod 0640 /etc/gta-claw/gta-claw.env
+if sudo dpkg -i "$deb2"; then
+  die "Debian configure accepted an invalid preserved environment"
+fi
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "Debian invalid configuration left the daemon active"
+[[ -e /run/gta-claw-state-init/initialization-failed &&
+  -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "Debian invalid configuration lost its transaction fence"
+sudo rm /etc/gta-claw/gta-claw.env
+sudo mv /etc/gta-claw/gta-claw.env.saved /etc/gta-claw/gta-claw.env
+assert_configuration_reboot_fenced "Debian invalid configuration"
+sudo dpkg --configure gta-claw
+{ sudo test ! -e "$configuration_failure_marker" &&
+  sudo test ! -L "$configuration_failure_marker"; } ||
+  die "Debian configuration recovery did not clear its persistent fence"
+assert_active_restart "$deb_pid"
 
 bin_true_hash="$(sha256sum /bin/true)"
 if sudo env \
@@ -1121,9 +1335,9 @@ assert_disabled_and_inactive
 assert_protected_contract
 [[ "$(id -u gta-claw):$(id -g gta-claw)" == "$static_identity" ]] ||
   die "RPM install changed the static service identity"
-sudo systemctl enable --now gta-claw-daemon.service
+enable_daemon_with_runtime_fixture
 assert_live_initializer_rejected
-rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+rpm_pid="$notify_ready_pid"
 rpm_reinstall_snapshot="$(state_identity_snapshot)"
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm1"
 assert_active_restart "$rpm_pid"
@@ -1223,7 +1437,7 @@ fi
 stop_manual_writer_lock
 sudo systemctl start gta-claw-daemon.service
 
-for package_boundary in initialization unmask daemon-reload restart readiness; do
+for package_boundary in initialization configuration unmask daemon-reload restart readiness; do
   rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
   set +e
   sudo env \
@@ -1244,6 +1458,33 @@ for package_boundary in initialization unmask daemon-reload restart readiness; d
     die "RPM $package_boundary recovery left duplicate package instances"
   assert_active_restart "$rpm_pid"
 done
+
+rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+sudo mv /etc/gta-claw/gta-claw.env /etc/gta-claw/gta-claw.env.saved
+printf 'ENABLE_TEAMS=false\nLD_PRELOAD=/tmp/attacker.so\n' |
+  sudo tee /etc/gta-claw/gta-claw.env >/dev/null
+sudo chown 0:0 /etc/gta-claw/gta-claw.env
+sudo chmod 0640 /etc/gta-claw/gta-claw.env
+set +e
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+rpm_invalid_config_status=$?
+set -e
+! systemctl is-active --quiet gta-claw-daemon.service ||
+  die "RPM invalid configuration left the daemon active"
+[[ -e /run/gta-claw-state-init/initialization-failed &&
+  -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "RPM invalid configuration lost its transaction fence"
+if [[ "$rpm_invalid_config_status" -eq 0 ]]; then
+  echo "RPM reported invalid configuration as a warning; runtime remained fenced" >&2
+fi
+sudo rm /etc/gta-claw/gta-claw.env
+sudo mv /etc/gta-claw/gta-claw.env.saved /etc/gta-claw/gta-claw.env
+assert_configuration_reboot_fenced "RPM invalid configuration"
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2"
+{ sudo test ! -e "$configuration_failure_marker" &&
+  sudo test ! -L "$configuration_failure_marker"; } ||
+  die "RPM configuration recovery did not clear its persistent fence"
+assert_active_restart "$rpm_pid"
 
 bin_true_hash="$(sha256sum /bin/true)"
 set +e

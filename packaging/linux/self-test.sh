@@ -246,6 +246,50 @@ expect_failure missing-static-user \
 } >"$work/service-secret"
 expect_failure environment-secret \
   bash -c "source '$common'; validate_service_contract '$work/service-secret'"
+{
+  cat "$work/service-good"
+  printf 'IPAddressAllow=0.0.0.0/0\n'
+} >"$work/service-network-grant"
+expect_failure package-owned-network-grant \
+  bash -c "source '$common'; validate_service_contract '$work/service-network-grant'"
+{
+  cat "$work/service-good"
+  printf 'IPAddressAllow = 0.0.0.0/0\n'
+} >"$work/service-spaced-network-grant"
+expect_failure spaced-package-network-grant \
+  bash -c "source '$common'; validate_service_contract '$work/service-spaced-network-grant'"
+{
+  cat "$work/service-good"
+  printf 'IPAddressDeny=\n'
+} >"$work/service-network-reset"
+expect_failure package-network-deny-reset \
+  bash -c "source '$common'; validate_service_contract '$work/service-network-reset'"
+expect_success native-config-validation-hooks \
+  bash -c "
+    for hook in '$SCRIPT_DIR/debian/postinst' '$SCRIPT_DIR/rpm/post'; do
+      grep -F 'configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config' \
+        \"\$hook\"
+      grep -F 'retain_configuration_failure || fence_failed_runtime' \"\$hook\"
+      grep -F 'verify / \"\$environment_file\" \"\$credential_file\"' \"\$hook\"
+      grep -F 'clear_configuration_failure || fence_failed_runtime' \"\$hook\"
+      awk '
+        /fail_configure_after configuration/ { configured = 1 }
+        configured && /systemctl unmask --runtime gta-claw-daemon.service/ {
+          unmasked_after_configuration = 1
+          exit
+        }
+        END { exit !(configured && unmasked_after_configuration) }
+      ' \"\$hook\"
+    done
+  "
+expect_success native-config-removal-hooks \
+  bash -c "
+    grep -F 'clear_native_configuration_fence' '$SCRIPT_DIR/debian/postrm'
+    grep -F 'clear_native_configuration_fence' '$SCRIPT_DIR/rpm/postun'
+  "
+expect_success debian-abort-deconfigure-fence \
+  grep -F 'prepare_abort_deconfigure_configuration "$1" || fence_failed_runtime' \
+  "$SCRIPT_DIR/debian/postinst"
 expect_success hardened-initializer-service \
   bash -c "source '$common'; validate_initializer_service_contract '$SCRIPT_DIR/systemd/gta-claw-state-init.service'"
 expect_success static-sysusers \

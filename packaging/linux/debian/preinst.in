@@ -22,6 +22,8 @@ package_fenced=0
 old_active=0
 old_initializer_active=0
 old_enable_state=
+persistent_runtime_directory=/var/lib/gta-claw-install
+persistent_failure_marker=$persistent_runtime_directory/transaction-failed
 
 ensure_failure_fence() {
   if [ -L "$runtime_directory" ] ||
@@ -73,6 +75,67 @@ restore_marker() {
       chmod 0644 "$path"
   else
     rm -f "$path"
+  fi
+}
+
+read_native_configuration_state() {
+  size="$(wc -c <"$persistent_failure_marker")" || return 1
+  state=
+  extra=
+  {
+    IFS= read -r state || return 1
+    if IFS= read -r extra || [ -n "$extra" ]; then
+      return 1
+    fi
+  } <"$persistent_failure_marker"
+  case "$state:$size" in
+    'configuration active:21' | 'configuration inactive:23') ;;
+    *) return 1 ;;
+  esac
+}
+
+persist_configuration_pending() {
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    return 1
+  fi
+  if [ ! -e "$persistent_runtime_directory" ]; then
+    mkdir -m 0700 -- "$persistent_runtime_directory" || return 1
+  fi
+  [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  prior_intent=
+  if [ -L "$persistent_failure_marker" ] ||
+    { [ -e "$persistent_failure_marker" ] &&
+      { [ ! -f "$persistent_failure_marker" ] ||
+        [ "$(stat -c '%u:%g:%a:%h' "$persistent_failure_marker")" != "0:0:600:1" ]; }; }; then
+    return 1
+  fi
+  if [ -e "$persistent_failure_marker" ]; then
+    read_native_configuration_state || return 1
+    prior_intent="$state"
+    case "$prior_intent" in
+      'configuration active' | 'configuration inactive') ;;
+      *) return 1 ;;
+    esac
+  fi
+  intent=inactive
+  if [ "$old_active" -eq 1 ] || [ "$prior_intent" = "configuration active" ]; then
+    intent=active
+  fi
+  temporary="$persistent_runtime_directory/.transaction-failed.$$"
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+  if ! {
+    (umask 077 && printf 'configuration %s\n' "$intent" >"$temporary") &&
+      chown 0:0 "$temporary" &&
+      chmod 0600 "$temporary" &&
+      /usr/bin/sync -f "$temporary" &&
+      mv -f "$temporary" "$persistent_failure_marker" &&
+      /usr/bin/sync -f "$persistent_runtime_directory"
+  }; then
+    rm -f "$temporary"
+    return 1
   fi
 }
 
@@ -355,6 +418,7 @@ case "$1" in
         touch "$replacement_fence"
         verify_writer_lock_released
       fi
+      persist_configuration_pending || fence_rollback_failure
       rm -f "$rollback_complete"
       prepared=1
       trap - 0 HUP INT TERM

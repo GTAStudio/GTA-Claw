@@ -12,6 +12,11 @@ complete_marker=$runtime_directory/initialization-complete
 replacement_fence=$runtime_directory/replacement-fenced
 authorization_marker=$runtime_directory/start-authorized
 authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized
+configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config
+environment_file=/etc/gta-claw/gta-claw.env
+credential_file=/etc/gta-claw/credentials/daemon.conf
+persistent_runtime_directory=/var/lib/gta-claw-install
+persistent_failure_marker=$persistent_runtime_directory/transaction-failed
 was_active=/run/gta-claw-daemon.was-active
 remove_was_active=/run/gta-claw-daemon.remove-was-active
 remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
@@ -22,6 +27,7 @@ remove_was_package_fenced=$runtime_directory/remove-was-package-fenced
 lock=/var/lib/gta-claw-protected/state.writer.lock
 rollback_complete=/run/gta-claw-daemon.preinst-rollback-complete
 configure_complete=0
+configuration_restart_intent=0
 
 lock_holder_pid() {
   if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
@@ -64,6 +70,92 @@ retain_replacement_fence() {
   touch "$replacement_fence" || return 1
   chown 0:0 "$replacement_fence" || return 1
   chmod 0644 "$replacement_fence" || return 1
+}
+
+retain_configuration_failure() {
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    echo "gta-claw persistent configuration path is not a physical directory" >&2
+    return 1
+  fi
+  if [ ! -e "$persistent_runtime_directory" ]; then
+    mkdir -m 0700 -- "$persistent_runtime_directory" || return 1
+  fi
+  [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  if [ -L "$persistent_failure_marker" ] ||
+    [ ! -f "$persistent_failure_marker" ] ||
+    [ "$(stat -c '%u:%g:%a:%h' "$persistent_failure_marker")" != "0:0:600:1" ]; then
+    return 1
+  fi
+  configuration_state=
+  extra=
+  size="$(wc -c <"$persistent_failure_marker")" || return 1
+  {
+    IFS= read -r configuration_state || return 1
+    if IFS= read -r extra || [ -n "$extra" ]; then
+      return 1
+    fi
+  } <"$persistent_failure_marker"
+  case "$configuration_state:$size" in
+    'configuration active:21') configuration_restart_intent=1 ;;
+    'configuration inactive:23') configuration_restart_intent=0 ;;
+    *) return 1 ;;
+  esac
+}
+
+clear_configuration_failure() {
+  [ -f "$persistent_failure_marker" ] &&
+    [ ! -L "$persistent_failure_marker" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$persistent_failure_marker")" = "0:0:600:1" ] ||
+    return 1
+  rm -f "$persistent_failure_marker" || return 1
+  if /usr/bin/sync -f "$persistent_runtime_directory"; then
+    return
+  fi
+  printf '%s\n' "$configuration_state" >"$persistent_failure_marker" || return 1
+  chown 0:0 "$persistent_failure_marker" || return 1
+  chmod 0600 "$persistent_failure_marker" || return 1
+  /usr/bin/sync -f "$persistent_failure_marker" || return 1
+  /usr/bin/sync -f "$persistent_runtime_directory" || return 1
+  return 1
+}
+
+prepare_abort_deconfigure_configuration() {
+  [ "$1" = "abort-deconfigure" ] || return 0
+  if [ -e "$persistent_failure_marker" ] || [ -L "$persistent_failure_marker" ]; then
+    return 0
+  fi
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    return 1
+  fi
+  if [ ! -e "$persistent_runtime_directory" ]; then
+    mkdir -m 0700 -- "$persistent_runtime_directory" || return 1
+  fi
+  [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  intent=inactive
+  active_state="$(systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null || true)"
+  case "$active_state" in
+    active | activating | reloading | deactivating) intent=active ;;
+  esac
+  [ ! -e "$remove_was_active" ] || intent=active
+  temporary="$persistent_runtime_directory/.transaction-failed.$$"
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+  if ! {
+    (umask 077 && printf 'configuration %s\n' "$intent" >"$temporary") &&
+      chown 0:0 "$temporary" &&
+      chmod 0600 "$temporary" &&
+      /usr/bin/sync -f "$temporary" &&
+      mv -f "$temporary" "$persistent_failure_marker" &&
+      /usr/bin/sync -f "$persistent_runtime_directory"
+  }; then
+    rm -f "$temporary"
+    return 1
+  fi
 }
 
 verify_unit_stopped() {
@@ -261,7 +353,7 @@ stop_for_idempotent_configure() {
 }
 
 restore_remove_state() {
-  [ -e "$remove_prepared" ] || return
+  [ -e "$remove_prepared" ] || return 0
   if ! systemctl unmask --runtime gta-claw-daemon.service; then
     fence_failed_remove_restore
   fi
@@ -341,6 +433,7 @@ case "$1" in
         preinst_rolled_back=1
       fi
       if [ "$preinst_rolled_back" -eq 0 ]; then
+        prepare_abort_deconfigure_configuration "$1" || fence_failed_runtime
         trap 'cancel_incomplete_configure "$?"' 0
         trap 'cancel_incomplete_configure 129' HUP
         trap 'cancel_incomplete_configure 130' INT
@@ -358,6 +451,12 @@ case "$1" in
         GTA_CLAW_DEFER_FENCE_CLEAR=1 \
           /usr/libexec/gta-claw/gta-claw-state-init
         fail_configure_after initialization
+        retain_configuration_failure || fence_failed_runtime
+        if ! "$configuration_helper" \
+          verify / "$environment_file" "$credential_file"; then
+          fence_failed_runtime
+        fi
+        fail_configure_after configuration
         if [ -d /run/systemd/system ]; then
           if ! systemctl unmask --runtime gta-claw-daemon.service; then
             fence_failed_runtime
@@ -374,13 +473,14 @@ case "$1" in
             fi
           fi
           if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&
-            [ ! -e "$was_active" ]; then
+            [ ! -e "$was_active" ] &&
+            [ "$configuration_restart_intent" -eq 0 ]; then
             if ! systemctl preset gta-claw-daemon.service >/dev/null; then
               fence_failed_runtime
             fi
             fail_configure_after preset
           fi
-          if [ -e "$was_active" ]; then
+          if [ -e "$was_active" ] || [ "$configuration_restart_intent" -eq 1 ]; then
             if ! "$authorization_helper" arm "$$"; then
               fence_failed_runtime
             fi
@@ -402,6 +502,7 @@ case "$1" in
         fi
         rm -f "$authorization_marker"
         rm -f "$failure_marker" "$complete_marker" "$replacement_fence"
+        clear_configuration_failure || fence_failed_runtime
         configure_complete=1
         trap - 0 HUP INT TERM
       fi

@@ -457,6 +457,7 @@ chmod 0755 \
   "$archive_stage/bin/$LINUX_CLI_NAME" \
   "$archive_stage/install.sh" \
   "$archive_stage/uninstall.sh" \
+  "$archive_stage/libexec/gta-claw-direct-config" \
   "$archive_stage/libexec/gta-claw-state-init" \
   "$archive_stage/libexec/gta-claw-runtime-ready" \
   "$archive_stage/libexec/gta-claw-start-authorized"
@@ -511,6 +512,10 @@ copy_regular_input \
   "$rootfs/usr/libexec/gta-claw/gta-claw-state-init" \
   0755
 copy_regular_input \
+  "$LINUX_DIR/direct/config-safeio.py" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-direct-config" \
+  0755
+copy_regular_input \
   "$LINUX_DIR/libexec/gta-claw-runtime-ready" \
   "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready" \
   0755
@@ -544,6 +549,7 @@ chmod 0700 "$rootfs/etc/gta-claw/credentials"
 chmod 0755 "$rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-direct-config"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 chmod 0640 "$rootfs/etc/gta-claw/gta-claw.env"
@@ -576,7 +582,7 @@ Priority: optional
 Architecture: $deb_architecture
 Maintainer: GTAStudio <noreply@github.com>
 Installed-Size: $installed_size
-Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249), util-linux
+Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, python3 (>= 3.8), systemd (>= 249), util-linux
 Homepage: https://github.com/GTAStudio/GTA-Claw
 Description: GTA Claw native Rust headless prototype
  Packages gta-claw-daemon and gta-claw-cli without the legacy JavaScript
@@ -700,6 +706,7 @@ Requires:       glibc >= $BUILD_GLIBC_REQUIREMENT
 Requires:       libgcc
 Requires:       systemd >= 249
 Requires:       util-linux
+Requires:       python3 >= 3.8
 
 %description
 Packages gta-claw-daemon and gta-claw-cli without a JavaScript runtime or
@@ -721,6 +728,7 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 %config(noreplace) %attr(0600,root,root) /etc/gta-claw/credentials/daemon.conf
 /usr/bin/gta-claw-cli
 /usr/libexec/gta-claw/gta-claw-daemon
+/usr/libexec/gta-claw/gta-claw-direct-config
 /usr/libexec/gta-claw/gta-claw-runtime-ready
 /usr/libexec/gta-claw/gta-claw-start-authorized
 /usr/libexec/gta-claw/gta-claw-state-init

@@ -83,7 +83,10 @@ The native packages install the CLI at `/usr/bin/gta-claw-cli`, the daemon at
 `/usr/libexec/gta-claw/gta-claw-daemon`, the service at
 `/usr/lib/systemd/system/gta-claw-daemon.service`, documentation under
 `/usr/share/doc/gta-claw`, and administrator-controlled files below
-`/etc/gta-claw`.
+`/etc/gta-claw`. They also install the reviewed root configuration validator at
+`/usr/libexec/gta-claw/gta-claw-direct-config`; Python 3 is a declared package
+dependency for that bounded maintainer-hook helper, not for the Rust daemon or
+CLI runtime.
 
 Debian conffiles and RPM `%config(noreplace)` preserve local environment and
 credential-file edits on upgrade. Package removal removes package-owned
@@ -116,24 +119,48 @@ before the runtime. `gta-claw-daemon.service` requires that oneshot, uses the
 static identity, uses `setpriv` to clear systemd's implicit supplementary
 primary group and drop the launcher's temporary credential capabilities, and always supplies
 `--state-profile linux-protected --state-path /var/lib/gta-claw-protected`.
-The unit is `Type=notify`; the daemon sends readiness only after state open and
-health complete, and package hooks additionally require `MainPID` to own the
-fixed writer lock.
+The unit is `Type=notify`; the daemon sends readiness only after protected state
+open, mandatory role and credential/provider validation, and the real listener
+bind complete. Package hooks additionally require `MainPID` to own the fixed
+writer lock.
 `ProtectSystem=strict` is paired with a namespace `ReadWritePaths` exception;
 filesystem mode `0750` still withholds directory-entry mutation while the held
-`0600` files remain writable. The runtime has no capabilities, denies IP
-networking, permits only `AF_UNIX`, and retains the existing shutdown/restart
-hardening.
+`0600` files remain writable. The runtime has no capabilities and retains
+`IPAddressDeny=any`; the package grants no network destination. The unit permits
+the `AF_UNIX`, `AF_INET`, and `AF_INET6` socket families, but an operator-owned
+drop-in must add narrow `IPAddressAllow=` CIDRs for intended ingress, DNS when
+needed, and every reviewed role/provider destination. Application egress is a
+second deny-by-default boundary that admits only exact configured origins and
+revalidates DNS and redirects.
+Before startup, an `ExecCondition` parses systemd's effective
+`IPAddressAllow` policy, rejects IPv4 prefixes broader than `/24`, IPv6 prefixes
+broader than `/64`, and any rule covering reserved canaries. It then sends UDP
+through both address families to an unallowlisted canary and requires `EPERM`.
+Unavailable BPF enforcement or an over-broad operator allow therefore fails
+closed. Phase 1 reserves IPv4 `127.255.255.254` and IPv6 `::1` for these probes;
+operator policy must not allow either address.
 
 `gta-claw-daemon.socket.deferred` records a future `AF_UNIX` endpoint but is not
 a `.socket` unit and is not installed in the systemd unit search path.
 
-`gta-claw.env` is for non-secret settings only and currently contains no
-assignments. Secret material belongs in root-owned mode-0600
-`/etc/gta-claw/credentials/daemon.conf`; systemd exposes it through
-`LoadCredential` rather than an environment literal. The current binary does
-not consume that credential, so adding actual secret-dependent behavior is
-deferred until the Rust boundary supports `CREDENTIALS_DIRECTORY`.
+`gta-claw.env` is an exact non-secret phase-1 allowlist. It ships only
+`ENABLE_TEAMS=false`; before explicitly enabling the service, the operator must
+set `AGENT_ROLE_URL` and configure the documented GitHub device-flow pair. The
+validator rejects unknown, duplicate, malformed, and secret-like keys. Secret
+material belongs in root-owned mode-0600
+`/etc/gta-claw/credentials/daemon.conf`; systemd exposes it only as
+`$CREDENTIALS_DIRECTORY/gta-claw-config`, never as an environment literal.
+The root initializer validates `/etc/gta-claw/gta-claw.env` and atomically
+materializes `/run/gta-claw-state-init/gta-claw.env`; the daemon unit consumes
+only that authenticated runtime copy, so rejected raw values never enter an
+`ExecCondition` or launcher environment.
+Native replacement writes the root-owned mode-0600
+`/var/lib/gta-claw-install/transaction-failed` fence before payload handoff.
+For configuration transactions its exact content also records whether the
+daemon was active. The predecessor start helper already rejects this path, so
+the fence and restart intent survive both reboot and helper replacement. Only a
+later successful exact validation and, when required, notify-ready restart may
+clear it.
 
 ## OCI two-phase startup
 

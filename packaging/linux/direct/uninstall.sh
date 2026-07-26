@@ -507,6 +507,7 @@ payload_mutated=1
 rm -f -- \
   /usr/bin/gta-claw-cli \
   /usr/libexec/gta-claw/gta-claw-daemon \
+  /usr/libexec/gta-claw/gta-claw-direct-config \
   /usr/libexec/gta-claw/gta-claw-runtime-ready \
   /usr/libexec/gta-claw/gta-claw-start-authorized \
   /usr/libexec/gta-claw/gta-claw-state-init \
