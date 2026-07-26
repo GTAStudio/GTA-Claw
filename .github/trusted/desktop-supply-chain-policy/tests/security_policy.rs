@@ -25,8 +25,8 @@ use desktop_supply_chain_policy::ownership::{
 use desktop_supply_chain_policy::policy::{
     BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, bootstrap_fingerprint,
     bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
-    validate_casefold_paths, validate_final_static, write_bootstrap_snapshot,
-    write_final_dependency_fixtures,
+    validate_build_artifact_pin_table, validate_casefold_paths, validate_final_static,
+    write_bootstrap_snapshot, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
 use desktop_supply_chain_policy::repository_policy::validate_repository_policy_transition;
@@ -2322,10 +2322,13 @@ fn manifest_path_keys_cannot_bless_a_file_the_workspace_never_declared() {
     fs::write(tree.join("crates/claw-orphan/src/lib.rs"), "").expect("write orphan source");
     let error = validate_final_static(&SafeRoot::new(&tree.path).expect("open orphan tree"))
         .expect_err("an undeclared crate manifest must not enter the inventory");
+    // Mobile admission split this inventory into required and admitted halves, so an extra
+    // manifest is now reported by the more precise unadmitted branch. It must still be the
+    // inventory rule that rejects it, and it must name the orphan.
+    let error = error.to_string();
     assert!(
-        error
-            .to_string()
-            .starts_with("Cargo.toml inventory does not match declared root members"),
+        error.starts_with("Cargo.toml inventory")
+            && error.contains("crates/claw-orphan/Cargo.toml"),
         "orphan manifest was rejected by an unrelated rule: {error}"
     );
 
@@ -4256,4 +4259,745 @@ fn archived_p04f_mutations_are_actionlint_valid_and_rejected() {
     } else {
         eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires actionlint mutation proof");
     }
+}
+
+// Mobile workspace admission.
+//
+// Every case below starts from an ACCEPTED baseline and then mutates exactly one thing, so a
+// rejection proves the rule under test rather than an unrelated defect in the fixture. Expectations
+// are derived from `repo_root()` through `final_tree`, never from the artifact under test.
+
+const MOBILE_WORKSPACE_MANIFEST: &str = r#"[workspace]
+members = ["apps/gta-claw-PLATFORM-shell"]
+resolver = "3"
+
+[workspace.dependencies]
+claw-protocol = { path = "../crates/claw-protocol", version = "0.1.0" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/GTAStudio/GTA-Claw"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+"#;
+
+const MOBILE_APP_MANIFEST: &str = r#"[package]
+name = "gta-claw-PLATFORM-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+"#;
+
+const MOBILE_DENY: &str = r#"[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "LicenseRef-Slint-Royalty-free-2.0", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+"#;
+
+const MOBILE_CHECKSUM: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn mobile_lock(platform: &str, extra: &str) -> String {
+    format!(
+        "version = 4\n\n[[package]]\nname = \"gta-claw-{platform}-shell\"\nversion = \"0.1.0\"\ndependencies = []\n{extra}"
+    )
+}
+
+fn registry_lock_entry(name: &str, version: &str) -> String {
+    format!(
+        "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{MOBILE_CHECKSUM}\"\n"
+    )
+}
+
+fn desktop_slint_version(tree: &TempTree) -> String {
+    let lock: toml::Value = toml::from_str(
+        &fs::read_to_string(tree.join("desktop/Cargo.lock")).expect("read desktop lock"),
+    )
+    .expect("parse desktop lock");
+    lock.get("package")
+        .and_then(toml::Value::as_array)
+        .expect("desktop lock packages")
+        .iter()
+        .find(|package| package.get("name").and_then(toml::Value::as_str) == Some("slint"))
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .expect("desktop lock declares slint")
+        .to_owned()
+}
+
+fn write_mobile_file(tree: &TempTree, relative: &str, contents: &str) {
+    let path = tree.join(relative);
+    fs::create_dir_all(path.parent().expect("mobile fixture parent"))
+        .expect("create mobile parent");
+    fs::write(path, contents).expect("write mobile fixture");
+}
+
+/// Writes one complete, compliant mobile workspace unit.
+///
+/// A dependency policy is deliberately absent: nothing executes a mobile `deny.toml` yet, so the
+/// validator rejects one outright. `a_mobile_dependency_policy_is_rejected_until_ci_executes_it`
+/// pins that.
+fn write_mobile_workspace(tree: &TempTree, platform: &str, lock: &str) {
+    write_mobile_file(
+        tree,
+        &format!("{platform}/Cargo.toml"),
+        &MOBILE_WORKSPACE_MANIFEST.replace("PLATFORM", platform),
+    );
+    write_mobile_file(
+        tree,
+        &format!("{platform}/apps/gta-claw-{platform}-shell/Cargo.toml"),
+        &MOBILE_APP_MANIFEST.replace("PLATFORM", platform),
+    );
+    write_mobile_file(
+        tree,
+        &format!("{platform}/apps/gta-claw-{platform}-shell/src/lib.rs"),
+        "",
+    );
+    write_mobile_file(tree, &format!("{platform}/Cargo.lock"), lock);
+}
+
+fn retarget_root_exclude(tree: &TempTree) {
+    let path = tree.join("Cargo.toml");
+    let text = fs::read_to_string(&path).expect("read root manifest");
+    assert!(
+        text.contains(r#"exclude = ["android", "desktop", "ios"]"#),
+        "root manifest must already pin the mobile-aware exclude list"
+    );
+}
+
+fn accepted_android_tree(label: &str) -> TempTree {
+    let tree = final_tree(label);
+    retarget_root_exclude(&tree);
+    write_mobile_workspace(&tree, "android", &mobile_lock("android", ""));
+    let root = SafeRoot::new(&tree.path).expect("open android baseline");
+    validate_final_static(&root).expect("compliant android workspace is admitted");
+    tree
+}
+
+fn rejection(tree: &TempTree, label: &str) -> String {
+    let root = SafeRoot::new(&tree.path).expect("open mutated mobile fixture");
+    validate_final_static(&root).expect_err(label).to_string()
+}
+
+#[test]
+fn live_tree_admits_mobile_paths_without_requiring_them() {
+    let tree = final_tree("mobile-absent");
+    let root = SafeRoot::new(&tree.path).expect("open mobile-free tree");
+    for platform in ["android", "ios"] {
+        assert!(
+            !tree.join(platform).exists(),
+            "baseline must contain no {platform} workspace"
+        );
+    }
+    validate_final_static(&root).expect("mobile paths are admitted, never required");
+}
+
+#[test]
+fn mobile_admission_does_not_reclassify_the_bootstrap_state() {
+    let tree = bootstrap_tree("mobile-bootstrap");
+    let root = SafeRoot::new(&tree.path).expect("open bootstrap fixture");
+    assert!(
+        is_bootstrap_state(&root).expect("classify bootstrap fixture"),
+        "widening the admitted lock inventory must not rewrite the historical bootstrap inventory"
+    );
+    assert_eq!(
+        bootstrap_fingerprint(&root).expect("bootstrap fingerprint"),
+        expected_bootstrap_fingerprint()
+    );
+}
+
+#[test]
+fn compliant_mobile_workspace_is_admitted_and_partial_units_are_rejected() {
+    let baseline = accepted_android_tree("mobile-complete");
+    drop(baseline);
+
+    for omitted in [
+        "android/Cargo.toml",
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        "android/Cargo.lock",
+    ] {
+        let tree = accepted_android_tree("mobile-partial");
+        fs::remove_file(tree.join(omitted)).expect("remove one unit member");
+        let error = rejection(&tree, "partial mobile workspace is rejected");
+        assert!(
+            error.contains("android workspace is incomplete") || error.contains(omitted),
+            "removing {omitted} must be reported precisely, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn mobile_lock_sources_checksums_and_local_packages_are_bound() {
+    let git = accepted_android_tree("mobile-git-source");
+    write_mobile_file(
+        &git,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"smuggled\"\nversion = \"0.1.0\"\nsource = \"git+https://example.invalid/smuggled\"\n",
+        ),
+    );
+    assert!(
+        rejection(&git, "git-sourced mobile lock entry is rejected")
+            .contains("forbidden package source"),
+        "a git source in a mobile lock must be rejected"
+    );
+
+    let unchecked = accepted_android_tree("mobile-missing-checksum");
+    write_mobile_file(
+        &unchecked,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"unchecked\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        ),
+    );
+    assert!(
+        rejection(&unchecked, "unchecksummed registry entry is rejected")
+            .contains("registry package checksum is invalid"),
+        "a registry entry without a checksum must be rejected"
+    );
+
+    let orphan = accepted_android_tree("mobile-orphan-local");
+    write_mobile_file(
+        &orphan,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"undeclared-local\"\nversion = \"0.1.0\"\n",
+        ),
+    );
+    assert!(
+        rejection(&orphan, "undeclared local package is rejected")
+            .contains("local package is not a declared workspace package"),
+        "a path package outside the declared workspaces must be rejected"
+    );
+}
+
+#[test]
+fn mobile_workspace_cannot_reintroduce_exclusion_or_weaken_lints() {
+    let excluded = accepted_android_tree("mobile-exclude");
+    let manifest = MOBILE_WORKSPACE_MANIFEST
+        .replace("PLATFORM", "android")
+        .replace(
+            "resolver = \"3\"",
+            "resolver = \"3\"\nexclude = [\"vendor\"]",
+        );
+    write_mobile_file(&excluded, "android/Cargo.toml", &manifest);
+    assert!(
+        rejection(&excluded, "nested exclusion is rejected").contains("workspace schema changed"),
+        "a mobile workspace must not reopen the excluded-workspace route"
+    );
+
+    let unsafe_allowed = accepted_android_tree("mobile-unsafe");
+    let manifest = MOBILE_WORKSPACE_MANIFEST
+        .replace("PLATFORM", "android")
+        .replace("unsafe_code = \"deny\"", "unsafe_code = \"allow\"");
+    write_mobile_file(&unsafe_allowed, "android/Cargo.toml", &manifest);
+    assert!(
+        rejection(&unsafe_allowed, "weakened unsafe policy is rejected")
+            .contains("lint policy is weaker"),
+        "a mobile workspace must not allow unsafe code"
+    );
+
+    let member = accepted_android_tree("mobile-member-lints");
+    let app = MOBILE_APP_MANIFEST.replace("PLATFORM", "android").replace(
+        "[lints]\nworkspace = true",
+        "[lints.rust]\nunsafe_code = \"allow\"",
+    );
+    write_mobile_file(
+        &member,
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        &app,
+    );
+    assert!(
+        rejection(&member, "member lint override is rejected")
+            .contains("lints must inherit exactly from workspace"),
+        "a mobile member must inherit the workspace lint table exactly"
+    );
+}
+
+#[test]
+fn mobile_admission_stays_bounded_to_the_two_declared_platforms() {
+    let extra = final_tree("mobile-unadmitted");
+    write_mobile_workspace(&extra, "web", &mobile_lock("web", ""));
+    let error = rejection(&extra, "an unadmitted sibling workspace is rejected");
+    assert!(
+        error.contains("Cargo.lock inventory contains unadmitted locations")
+            && error.contains("web/Cargo.lock"),
+        "admission must be a bounded path list, not a prefix rule, got: {error}"
+    );
+
+    let aliased = accepted_android_tree("mobile-case-alias");
+    assert!(
+        validate_casefold_paths(&[
+            "android/Cargo.lock".to_owned(),
+            "ANDROID/Cargo.lock".to_owned(),
+        ])
+        .is_err(),
+        "a mobile directory and its case alias must collide"
+    );
+    drop(aliased);
+}
+
+#[test]
+fn mobile_manifest_dependencies_cannot_escape_the_repository_or_use_forbidden_sources() {
+    for (label, replacement, expected) in [
+        (
+            "path escape",
+            "claw-protocol = { path = \"../../../../elsewhere/claw-protocol\", version = \"0.1.0\" }",
+            "escapes repository root",
+        ),
+        (
+            "undeclared member path",
+            "claw-protocol = { path = \"../crates/not-a-member\", version = \"0.1.0\" }",
+            "not a declared root member",
+        ),
+        (
+            "git source",
+            "claw-protocol = { git = \"https://example.invalid/claw-protocol\" }",
+            "source/schema is forbidden",
+        ),
+        (
+            "wildcard version",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"*\" }",
+            "bounded registry version",
+        ),
+    ] {
+        let tree = accepted_android_tree("mobile-dependency");
+        let manifest = MOBILE_WORKSPACE_MANIFEST
+            .replace("PLATFORM", "android")
+            .replace(
+                "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+                replacement,
+            );
+        write_mobile_file(&tree, "android/Cargo.toml", &manifest);
+        let error = rejection(&tree, "forbidden mobile dependency is rejected");
+        assert!(
+            error.contains(expected),
+            "mobile {label} must be rejected with {expected:?}, got: {error}"
+        );
+    }
+
+    // Slint itself must remain permitted, or the admission would be pointless.
+    let slint = accepted_android_tree("mobile-dependency-slint");
+    let manifest = MOBILE_WORKSPACE_MANIFEST
+        .replace("PLATFORM", "android")
+        .replace(
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "slint = { version = \"=1.17.1\", default-features = false }",
+        );
+    write_mobile_file(&slint, "android/Cargo.toml", &manifest);
+    let root = SafeRoot::new(&slint.path).expect("open mobile Slint fixture");
+    validate_final_static(&root).expect("a mobile workspace may depend on Slint");
+}
+
+#[test]
+fn a_mobile_dependency_policy_is_rejected_until_ci_executes_it() {
+    // `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths but do not
+    // exist, so nothing runs cargo-deny against a mobile policy file. A policy file that nothing
+    // executes is worse than none, because it reads as protection. Admitting one belongs in the
+    // change that also lands the workflow executing it, so today it fails closed.
+    for platform in ["android", "ios"] {
+        assert!(
+            !Path::new(&repo_root())
+                .join(format!(".github/workflows/{platform}-packaging.yml"))
+                .exists(),
+            "this rule is only correct while no {platform} packaging workflow exists"
+        );
+    }
+
+    let tree = accepted_android_tree("mobile-deny-unexecuted");
+    write_mobile_file(&tree, "android/deny.toml", MOBILE_DENY);
+    let error = rejection(&tree, "an unexecuted mobile dependency policy is rejected");
+    assert!(
+        error.contains("unexpected deny/audit policy file") && error.contains("android/deny.toml"),
+        "a mobile deny.toml must fail closed until a workflow runs it, got: {error}"
+    );
+
+    let audit = accepted_android_tree("mobile-audit-unexecuted");
+    write_mobile_file(&audit, "android/audit.toml", "[advisories]\nignore = []\n");
+    assert!(
+        rejection(&audit, "an unexecuted mobile audit policy is rejected")
+            .contains("unexpected deny/audit policy file"),
+        "the same rule must cover audit configuration"
+    );
+}
+#[test]
+fn an_admitted_mobile_workspace_cannot_impersonate_or_reach_outside_itself() {
+    // What can ios/Cargo.toml declare that would let it claim to be something trusted, or reach
+    // a file outside its own directory? Each case starts from the ACCEPTED baseline.
+    for (label, from, to, expected) in [
+        (
+            "member escaping into the frozen desktop tree",
+            "members = [\"apps/gta-claw-android-shell\"]",
+            "members = [\"../desktop/apps/gta-claw-desktop\"]",
+            "must declare exactly one member",
+        ),
+        (
+            "member claiming a root workspace app",
+            "members = [\"apps/gta-claw-android-shell\"]",
+            "members = [\"apps/gta-claw-daemon\"]",
+            "must declare exactly one member",
+        ),
+        (
+            "path dependency reaching into the frozen desktop tree",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "gta-claw-desktop = { path = \"../desktop/apps/gta-claw-desktop\", version = \"0.1.0\" }",
+            "not a declared root member",
+        ),
+        (
+            "path dependency reaching into the trust root itself",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "policy = { path = \"../.github/trusted/desktop-supply-chain-policy\", version = \"0.1.0\" }",
+            "not a declared root member",
+        ),
+        (
+            // `path` also appears in section form, not only inline. If the parsing were not
+            // section-aware this would bless an orphan file with one line of TOML.
+            "section-form path dependency escaping the repository",
+            "claw-protocol = { path = \"../crates/claw-protocol\", version = \"0.1.0\" }",
+            "[workspace.dependencies.claw-protocol]\npath = \"../../../../elsewhere/claw-protocol\"\nversion = \"0.1.0\"",
+            "escapes repository root",
+        ),
+        (
+            "patched registry",
+            "[profile.release]",
+            "[patch.crates-io]\nslint = { path = \"../elsewhere/slint\" }\n\n[profile.release]",
+            "top-level schema changed",
+        ),
+        (
+            "workspace metadata smuggling",
+            "resolver = \"3\"",
+            "resolver = \"3\"\nmetadata = { trusted = true }",
+            "workspace schema changed",
+        ),
+    ] {
+        let tree = accepted_android_tree("mobile-impersonation");
+        let manifest = MOBILE_WORKSPACE_MANIFEST.replace("PLATFORM", "android");
+        assert!(manifest.contains(from), "fixture lost {from:?}");
+        write_mobile_file(&tree, "android/Cargo.toml", &manifest.replace(from, to));
+        let error = rejection(&tree, "impersonation attempt is rejected");
+        assert!(
+            error.contains(expected),
+            "{label} must be rejected with {expected:?}, got: {error}"
+        );
+    }
+
+    // The app member must not be able to rename itself into a trusted package.
+    let renamed = accepted_android_tree("mobile-impersonation-package");
+    let app = MOBILE_APP_MANIFEST.replace("PLATFORM", "android").replace(
+        "name = \"gta-claw-android-shell\"",
+        "name = \"gta-claw-desktop\"",
+    );
+    write_mobile_file(
+        &renamed,
+        "android/apps/gta-claw-android-shell/Cargo.toml",
+        &app,
+    );
+    assert!(
+        rejection(&renamed, "renamed mobile package is rejected")
+            .contains("package name must be gta-claw-android-shell"),
+        "a mobile member must not be able to claim a trusted package name"
+    );
+
+    // Nor may its lock claim to contain one.
+    let lock = accepted_android_tree("mobile-impersonation-lock");
+    write_mobile_file(
+        &lock,
+        "android/Cargo.lock",
+        &mobile_lock(
+            "android",
+            "\n[[package]]\nname = \"gta-claw-desktop\"\nversion = \"0.1.0\"\n",
+        ),
+    );
+    assert!(
+        rejection(&lock, "impersonating local lock entry is rejected")
+            .contains("local package is not a declared workspace package"),
+        "a mobile lock must not be able to claim a trusted local package"
+    );
+}
+
+#[test]
+fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
+    // A second hardcoded list could silently disagree with the platforms it is meant to describe.
+    for platform in ["android", "ios"] {
+        let tree = final_tree("mobile-derived-inventory");
+        retarget_root_exclude(&tree);
+        write_mobile_file(
+            &tree,
+            &format!("{platform}/Cargo.lock"),
+            &mobile_lock(platform, ""),
+        );
+        let error = rejection(&tree, "a lone admitted lock is still an incomplete unit");
+        assert!(
+            error.contains(&format!("{platform} workspace is incomplete")),
+            "{platform}/Cargo.lock must be admitted by path yet rejected as a partial unit, got: {error}"
+        );
+    }
+
+    let stray = final_tree("mobile-derived-inventory-stray");
+    retarget_root_exclude(&stray);
+    write_mobile_file(&stray, "windows/Cargo.lock", "version = 4\n");
+    assert!(
+        rejection(&stray, "an undeclared platform lock is rejected").contains("windows/Cargo.lock"),
+        "only locks belonging to a declared platform may be admitted"
+    );
+}
+
+#[test]
+fn reviewed_build_artifact_pin_table_shape_is_enforced() {
+    const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
+    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        url,
+        DIGEST,
+    )])
+    .expect("a well formed reviewed pin is accepted");
+    validate_build_artifact_pin_table(&[]).expect("an empty reviewed pin table is well formed");
+
+    for (label, pins) in [
+        (
+            "package that does not fetch at build time",
+            vec![("serde", "0.99.0", "aarch64-apple-ios", url, DIGEST)],
+        ),
+        (
+            "release other than the admitted one",
+            vec![("skia-bindings", "0.98.0", "aarch64-apple-ios", url, DIGEST)],
+        ),
+        (
+            "unadmitted target",
+            vec![("skia-bindings", "0.99.0", "x86_64-apple-ios", url, DIGEST)],
+        ),
+        (
+            "duplicate package and target",
+            vec![
+                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
+                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
+            ],
+        ),
+        (
+            "short digest",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                url,
+                "abc123",
+            )],
+        ),
+        (
+            "plaintext URL",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                "http://example.invalid/skia-aarch64-apple-ios.tar.gz",
+                DIGEST,
+            )],
+        ),
+        (
+            "traversal in URL",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                "https://example.invalid/../aarch64-apple-ios.tar.gz",
+                DIGEST,
+            )],
+        ),
+        (
+            "URL naming a different target",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios-sim",
+                url,
+                DIGEST,
+            )],
+        ),
+    ] {
+        assert!(
+            validate_build_artifact_pin_table(&pins).is_err(),
+            "reviewed build-artifact pin table must reject: {label}"
+        );
+    }
+}
+
+#[test]
+fn case_aliased_mobile_directories_fail_on_every_host() {
+    for path in [
+        "Android/Cargo.toml",
+        "ANDROID/Cargo.lock",
+        "iOS/Cargo.toml",
+        "IOS/deny.toml",
+        "Android/apps/gta-claw-android-shell/Cargo.toml",
+    ] {
+        assert!(
+            validate_casefold_paths(&[path.to_owned()]).is_err(),
+            "case-aliased mobile path must be rejected on every host: {path}"
+        );
+    }
+    for path in [
+        "android/Cargo.toml",
+        "android/Cargo.lock",
+        "ios/Cargo.toml",
+        "ios/deny.toml",
+    ] {
+        validate_casefold_paths(&[path.to_owned()]).expect("canonical mobile paths stay portable");
+    }
+}
+
+#[test]
+fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
+    let slint = {
+        let probe = final_tree("mobile-ios-slint-probe");
+        desktop_slint_version(&probe)
+    };
+
+    // Everything except the reviewed archive digest is satisfied, so the reported failure proves
+    // the digest gate is the sole remaining blocker rather than a defect elsewhere in the fixture.
+    let pinned = final_tree("mobile-ios-pinned");
+    retarget_root_exclude(&pinned);
+    let lock = mobile_lock(
+        "ios",
+        &format!(
+            "{}{}",
+            registry_lock_entry("skia-bindings", "0.99.0"),
+            registry_lock_entry("slint", &slint)
+        ),
+    );
+    write_mobile_workspace(&pinned, "ios", &lock);
+    let error = rejection(&pinned, "iOS without a reviewed Skia digest is rejected");
+    assert!(
+        error.contains("uses skia-bindings, which fetches at build time")
+            && error.contains("aarch64-apple-ios")
+            && error.contains("aarch64-apple-ios-sim"),
+        "iOS admission must require a reviewed digest for every admitted target, got: {error}"
+    );
+
+    let drifted = final_tree("mobile-ios-drift");
+    retarget_root_exclude(&drifted);
+    let lock = mobile_lock(
+        "ios",
+        &format!(
+            "{}{}",
+            registry_lock_entry("skia-bindings", "0.98.0"),
+            registry_lock_entry("slint", &slint)
+        ),
+    );
+    write_mobile_workspace(&drifted, "ios", &lock);
+    assert!(
+        rejection(&drifted, "unpinned skia-bindings release is rejected")
+            .contains("must pin skia-bindings to exactly 0.99.0"),
+        "the pinned Skia release must be bound before the archive digest is even consulted"
+    );
+
+    let missing = final_tree("mobile-ios-no-skia");
+    retarget_root_exclude(&missing);
+    write_mobile_workspace(&missing, "ios", &mobile_lock("ios", ""));
+    assert!(
+        rejection(&missing, "iOS lock without skia-bindings is rejected")
+            .contains("cannot avoid Skia"),
+        "an iOS Slint build cannot avoid Skia, so its absence signals an unresolved lock"
+    );
+
+    // Android can select femtovg or the software renderer, so Skia is optional there — but the
+    // moment its lock contains skia-bindings the same version pin and digest gate apply.
+    let android_skia = final_tree("mobile-android-skia");
+    retarget_root_exclude(&android_skia);
+    write_mobile_workspace(
+        &android_skia,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("skia-bindings", "0.99.0")),
+    );
+    let error = rejection(&android_skia, "Android Skia without digests is rejected");
+    assert!(
+        error.contains("uses skia-bindings, which fetches at build time")
+            && error.contains("aarch64-linux-android"),
+        "Android must not be able to consume an unverified Skia archive, got: {error}"
+    );
+
+    let android_drift = final_tree("mobile-android-skia-drift");
+    retarget_root_exclude(&android_drift);
+    write_mobile_workspace(
+        &android_drift,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("skia-bindings", "0.98.0")),
+    );
+    assert!(
+        rejection(&android_drift, "Android skia-bindings drift is rejected")
+            .contains("must pin skia-bindings to exactly 0.99.0"),
+        "the pinned Skia release binds every mobile lock, not only iOS"
+    );
+}
+
+#[test]
+fn mobile_slint_release_cannot_diverge_from_the_protected_desktop_release() {
+    let tree = final_tree("mobile-slint-drift");
+    retarget_root_exclude(&tree);
+    let desktop = desktop_slint_version(&tree);
+    assert_ne!(
+        desktop, "0.0.1",
+        "fixture requires a real desktop Slint pin"
+    );
+    write_mobile_workspace(
+        &tree,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("slint", "0.0.1")),
+    );
+    let error = rejection(&tree, "divergent Slint release is rejected");
+    assert!(
+        error.contains("single repository Slint release") && error.contains(&desktop),
+        "a mobile workspace must not introduce a second Slint line, got: {error}"
+    );
+
+    let agreed = final_tree("mobile-slint-agreed");
+    retarget_root_exclude(&agreed);
+    let desktop = desktop_slint_version(&agreed);
+    write_mobile_workspace(
+        &agreed,
+        "android",
+        &mobile_lock("android", &registry_lock_entry("slint", &desktop)),
+    );
+    let root = SafeRoot::new(&agreed.path).expect("open agreed Slint fixture");
+    validate_final_static(&root).expect("a matching Slint release is admitted");
 }
