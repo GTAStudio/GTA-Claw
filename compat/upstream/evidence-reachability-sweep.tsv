@@ -4,9 +4,9 @@
 # row is accepted. Regenerate ONLY through the reviewed command, never by hand:
 #   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep
 # generated-by: validate.ps1 -ReplayEvidenceSweep
-# base-commit: 0c9c84b3baa33b7ee1bc6acec2407e57b1c52bb2
+# base-commit: 68ce24f38989ca5026bec53dc93783e3fd4f77d1
 # swept-at: 2026-07-26
-# totals: files=332 accept=327 reject=5
+# totals: files=359 accept=354 reject=5
 reject	.github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs
 accept	.github/trusted/desktop-supply-chain-policy/src/bootstrap_decisions.rs
 accept	.github/trusted/desktop-supply-chain-policy/src/changes.rs
@@ -35,8 +35,22 @@ accept	apps/gta-claw-cli/src/main.rs
 accept	apps/gta-claw-cli/tests/foundation.rs
 accept	apps/gta-claw-cli/tests/gateway_health.rs
 accept	apps/gta-claw-cli/tests/unsupported_send.rs
+accept	apps/gta-claw-daemon/src/adapters/engine.rs
+accept	apps/gta-claw-daemon/src/adapters/ingress.rs
+accept	apps/gta-claw-daemon/src/adapters/mod.rs
+accept	apps/gta-claw-daemon/src/adapters/model.rs
+accept	apps/gta-claw-daemon/src/adapters/plugins.rs
+accept	apps/gta-claw-daemon/src/adapters/state.rs
+accept	apps/gta-claw-daemon/src/adapters/support.rs
+accept	apps/gta-claw-daemon/src/compose.rs
+accept	apps/gta-claw-daemon/src/control.rs
+accept	apps/gta-claw-daemon/src/lib.rs
 accept	apps/gta-claw-daemon/src/main.rs
+accept	apps/gta-claw-daemon/src/runtime.rs
+accept	apps/gta-claw-daemon/tests/end_to_end.rs
 accept	apps/gta-claw-daemon/tests/process_lifecycle.rs
+accept	apps/gta-claw-daemon/tests/process_shutdown.rs
+accept	apps/gta-claw-daemon/tests/security_regressions.rs
 accept	apps/gta-claw-ios/src/credential.rs
 accept	apps/gta-claw-ios/src/device.rs
 accept	apps/gta-claw-ios/src/endpoint.rs
@@ -69,6 +83,19 @@ accept	crates/claw-acp/src/protocol.rs
 accept	crates/claw-acp/tests/acpx_interop.rs
 accept	crates/claw-acp/tests/fixtures/acp_fixture.rs
 accept	crates/claw-acp/tests/subprocess_interop.rs
+accept	crates/claw-application/src/composition/authority.rs
+accept	crates/claw-application/src/composition/clock.rs
+accept	crates/claw-application/src/composition/egress.rs
+accept	crates/claw-application/src/composition/error.rs
+accept	crates/claw-application/src/composition/graph.rs
+accept	crates/claw-application/src/composition/host.rs
+accept	crates/claw-application/src/composition/id.rs
+accept	crates/claw-application/src/composition/lifecycle.rs
+accept	crates/claw-application/src/composition/mod.rs
+accept	crates/claw-application/src/composition/ports.rs
+accept	crates/claw-application/src/composition/service.rs
+accept	crates/claw-application/src/composition/session.rs
+accept	crates/claw-application/src/composition/subsystem.rs
 accept	crates/claw-application/src/lib.rs
 accept	crates/claw-channel-sdk/src/lib.rs
 accept	crates/claw-channels/src/lib.rs

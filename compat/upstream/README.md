@@ -454,9 +454,10 @@ Every ordinary run enforces two different things about it:
   record unforgeable. An earlier design instead re-derived the verdict for every
   row the record labelled `reject`, and a negative control broke it in one edit:
   flipping a row to `accept` made the checker skip it, so the single change that
-  hides a refusal was the one change it could not see. Re-deriving all 307 rows
-  closes that hole and costs about 110 seconds on every invocation, which the
-  self-test — roughly 156 validator invocations — cannot absorb. The digest
+  hides a refusal was the one change it could not see. Re-deriving every row
+  closes that hole and cost about 110 seconds per invocation when the tree held
+  307 files, which the self-test — roughly 156 validator invocations — cannot
+  absorb. The digest
   closes it for the price of one hash, because no label can be edited at all
   without a reviewed change to a constant in `validate.ps1`.
 - **The refusals, re-derived from the tree.** The digest cannot detect the other
@@ -473,14 +474,41 @@ before the re-derivation was ever reached.
 
 Two things are deliberately **not** enforced: a `.rs` file absent from the record,
 and a recorded row whose file no longer exists. The swept tree belongs to
-seventeen other sessions and grew from 114 to 307 files in about a day. Failing
+seventeen other sessions and grew from 114 to 359 files in about a day. Failing
 on their additions, renames and deletions would couple this contract to every one
 of them — the exact coupling that has already had to be untangled four times in
 this repository, each time as a change that could not land from either side
 alone. Additions and deletions surface in the `-ReplayEvidenceSweep` differential
-instead, where somebody is already reading.
+instead, where somebody is already reading. That tolerance is not theoretical
+slack, and it was demonstrated rather than assumed: a record listing 332 files
+was checked against a tree that had since grown to 359, and an ordinary validator
+run exited `0`.
 
-That agreement proves nothing about
+The swept universe is **git's tracked file list**, not a filesystem walk. A walk
+needs hand-written exclusions for `.git`, `target/` and `compat/legacy`, which is
+gitignore semantics reimplemented by hand, and it silently admits an *untracked*
+`.rs` file dropped anywhere else. `crates/claw-conformance` derives its
+denominator from `git ls-files`, so a walk here could admit a file that cannot
+enter theirs, and the two would read as disagreeing about the **rule** when they
+only disagree about which files exist. This was measured before it was changed:
+on the tree the current record was taken at, the walk and `git ls-files` returned
+the identical 359 paths. The walk was correct by luck of its exclusions, not by
+construction — the same defect this contract has twice found in its own scratch
+harnesses, both times producing a right number by an unsound method.
+
+`base-commit` is a claim that the record describes that commit's tree, so replay
+refuses to write one it cannot honestly date. The rows are read from the working
+tree, so the claim holds only when no tracked `.rs` file differs from `HEAD`;
+`-ReplayEvidenceSweep` therefore fails, naming the paths, if any Rust file is
+modified, staged, deleted or untracked. This is not a hypothetical: regenerating
+in the middle of a merge produced a record of 332 files dated at a commit whose
+tree held 307, a checked-in artifact citing a commit that did not contain a
+quarter of its own rows. Nothing downstream would have caught it, because every
+other consistency rule about the record is internal to the record. The date
+covers the swept Rust files and not `validate.ps1` itself, which is necessarily
+uncommitted while a rule change is being reviewed against its own differential.
+
+That agreement between the two implementations proves nothing about
 the two rules both sides changed most recently, because neither construct occurs
 anywhere in either tree: scanned at the time of writing, there are **zero inline
 `#[path]` modules and zero ambiguous `foo.rs` + `foo/mod.rs` pairs** in the

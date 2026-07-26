@@ -82,7 +82,7 @@ $EvidenceSweepHeaderKeys = @("generated-by", "base-commit", "swept-at", "totals"
 # and fail under pwsh on Linux CI. -WriteLedgerDigests cannot reach this
 # constant; only -ReplayEvidenceSweep regenerates the record, and landing a new
 # record is a reviewed edit to this line.
-$ExpectedEvidenceSweepDigest = "b4f5868ebc0070fdee57409bcb7497193c978d078bd4afaa70a6dd9cd7f493c6"
+$ExpectedEvidenceSweepDigest = "f448cbc086483a329ee6c86dcb4d898d4b77d9e5aa23d802ea308f0edef2c2c6"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
     "# Only the three mutable ledgers are covered here; inventory digests, the feature",
@@ -2403,26 +2403,44 @@ function Assert-EvidenceFileIsCompiled {
 }
 
 function Get-RepositoryRustFiles {
-    # Enumerated with -Force so a checkout whose hidden-attribute handling differs
-    # from Windows (pwsh on Linux CI) sweeps exactly the same set. .git is skipped
-    # because it holds no source, and compat/legacy is skipped because the legacy
-    # JavaScript tree is never Rust acceptance evidence by rule.
+    # The swept universe is git's tracked file list, never a filesystem walk. A
+    # walk needs hand-written exclusions for .git, target/ and compat/legacy, and
+    # those are gitignore semantics reimplemented by hand: they silently admit an
+    # UNTRACKED .rs file dropped anywhere else. crates/claw-conformance derives
+    # its denominator from `git ls-files`, so a walk here could admit a file that
+    # cannot enter theirs, and the two would then read as disagreeing about the
+    # RULE when they only disagree about which files exist.
+    #
+    # This was measured before it was changed rather than argued: on the tree this
+    # record was taken at, the walk and `git ls-files` returned the identical 359
+    # paths. The walk was correct by luck of its exclusions, not by construction,
+    # which is the same defect this contract has already found twice in its own
+    # scratch harnesses.
+    #
+    # Only replay calls this, and replay already requires git to date the record,
+    # so a normal verify run gains no dependency on git.
+    #
+    # git can emit a path outside the record's charset. Every row is passed
+    # through Assert-EvidencePathShape when the freshly written record is parsed
+    # back, so an exotic name fails loudly instead of being mis-recorded.
     $root = [string]$script:RepositoryRootFull
+    $tracked = @(& git -C $root -c core.quotepath=off ls-files -- "*.rs" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Fail ("-ReplayEvidenceSweep could not list tracked Rust files with git, so it cannot take a " +
+            "sweep. Run it inside a git working tree.")
+    }
     $results = New-Object System.Collections.Generic.List[string]
-    Get-ChildItem -LiteralPath $root -Recurse -File -Force -Filter *.rs |
-        ForEach-Object {
-            $relative = $_.FullName.Substring($root.Length)
-            while ($relative.StartsWith("\", [StringComparison]::Ordinal) -or
-                $relative.StartsWith("/", [StringComparison]::Ordinal)) {
-                $relative = $relative.Substring(1)
-            }
-            $relative = $relative.Replace("\", "/")
-            if ($relative.StartsWith(".git/", [StringComparison]::Ordinal)) { return }
-            if ($relative.StartsWith("target/", [StringComparison]::Ordinal)) { return }
-            if ($relative.Contains("/target/")) { return }
-            if ($relative.StartsWith("compat/legacy/", [StringComparison]::Ordinal)) { return }
-            $results.Add($relative)
-        }
+    foreach ($entry in $tracked) {
+        $relative = ([string]$entry).Trim()
+        if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+        $relative = $relative.Replace("\", "/")
+        # compat/legacy is a RULE-level exclusion, not housekeeping: the legacy
+        # JavaScript tree is never Rust acceptance evidence. Everything the old
+        # walk excluded for housekeeping reasons is already absent from git's
+        # list, so it is no longer restated here.
+        if ($relative.StartsWith("compat/legacy/", [StringComparison]::Ordinal)) { continue }
+        $results.Add($relative)
+    }
     # Ordinal, never Sort-Object: culture-aware sorting orders 'claw-channel-sdk'
     # and 'claw-channels' differently from [string]::CompareOrdinal, so a record
     # written with the default sort fails its own ascending-order check, and two
@@ -3449,6 +3467,26 @@ if ($ReplayEvidenceSweep) {
     if (-not [regex]::IsMatch([string]$EvidenceSweepBaseCommit, '\A[0-9a-f]{40}\z')) {
         Fail ("-ReplayEvidenceSweep could not read the current commit from git, so it cannot date the " +
             "record. Run it inside a git working tree.")
+    }
+    # base-commit is a CLAIM that this record describes that commit's tree, and
+    # the rows are read from the working tree, so the claim is only true when no
+    # tracked Rust file differs from HEAD. That is not hypothetical: regenerating
+    # in the middle of a merge produced a record of 332 files dated at a commit
+    # whose tree held 307, i.e. a checked-in artifact citing a commit that does
+    # not contain a quarter of its own rows. Nothing downstream would have caught
+    # it, because every consistency rule here is internal to the record.
+    #
+    # Untracked .rs files are refused too. They cannot enter the record now that
+    # the universe is git's list, but a tree holding one is a tree whose sweep is
+    # not reproducible from the commit being named.
+    $dirtyRustPaths = @(& git -C $script:RepositoryRootFull status --porcelain -- "*.rs" 2>$null |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($dirtyRustPaths.Count -gt 0) {
+        Fail ((("-ReplayEvidenceSweep will not date a record it cannot honestly date: {0} Rust path(s) " +
+                    "differ from HEAD, so 'base-commit: {1}' would name a commit whose tree is not the tree " +
+                    "that was swept. Commit or stash the Rust changes first, then replay. Differing: {2}") -f
+                $dirtyRustPaths.Count, $EvidenceSweepBaseCommit, ($dirtyRustPaths -join "; ")))
     }
     $EvidenceSweepDate = [datetime]::UtcNow.ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
     $sweptFiles = Get-RepositoryRustFiles
