@@ -61,6 +61,37 @@ version = "=0.16.1"
 name = "sha2"
 version = "=0.10.9"
 
+# system-configuration 0.7 retains core-foundation 0.9.4 while
+# security-framework 3.7 uses 0.10.1. Close when the Apple-target graph converges.
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+
+# OPEN (@aizhihuxiao): russh 0.62.4's compat-0_14 edge retains generic-array
+# 0.14.7. Close only when russh upstream removes compat-0_14 or an audit-approved
+# equivalent patch removes that edge.
+[[bans.skip]]
+name = "generic-array"
+version = "=0.14.7"
+
+# claw-plugin-host, rand_core 0.6.4, and ring 0.17.14 retain getrandom 0.2.17;
+# russh and Hickory use 0.4.3. Close when those paths converge to 0.4.3.
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+
+# fastwebsockets 0.10.0 retains rand 0.8.7 while Hickory and russh use 0.10.
+# Close when the fastwebsockets gateway path converges to rand 0.10.
+[[bans.skip]]
+name = "rand"
+version = "=0.8.7"
+
+# ml-kem 0.3.2 retains sha3 0.11.0 while russh 0.62.4 directly uses 0.12.
+# Close when the ml-kem path converges to sha3 0.12.
+[[bans.skip]]
+name = "sha3"
+version = "=0.11.0"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
