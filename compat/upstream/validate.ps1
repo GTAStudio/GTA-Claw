@@ -19,7 +19,8 @@
     Re-runs the shipped reachability rule over every .rs file in the working tree,
     rewrites compat/upstream/evidence-reachability-sweep.tsv and prints the diff
     against the previous record for review. This is the ONLY supported way to
-    change that record. It cannot reach any other artifact.
+    change that record. It cannot reach any other artifact. The two writer modes
+    are pairwise exclusive; binding both fails before any artifact write.
 
 .PARAMETER RepositoryRoot
     Repository working tree used to resolve acceptance-evidence paths. Defaults to
@@ -43,6 +44,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+$selectedWriteModes = @()
+if ($WriteLedgerDigests) { $selectedWriteModes += "-WriteLedgerDigests" }
+if ($ReplayEvidenceSweep) { $selectedWriteModes += "-ReplayEvidenceSweep" }
+if ($selectedWriteModes.Count -gt 1) {
+    throw ("validator write modes are pairwise mutually exclusive and are rejected before any artifact write; " +
+        "select exactly one of: -WriteLedgerDigests, -ReplayEvidenceSweep")
+}
+
 $Root = $PSScriptRoot
 $ExpectedSha = "b43e832fcc8000ed7287c7accc54e381db607f85"
 $ExpectedSchemaDigest = "5fd454c7a1012e78410178bc44c02dc3201f46eed94d62c5dc811f441e8de396"
@@ -73,10 +83,20 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "ece2e6f87d4788f18cf2676db50dee75bb7ece5dc83ef4ac2083bc14df825e10"
+$ExpectedSelfTestDigest = "9e685ce8a14b575f8c13ed549e6905485da3d0948bafa84641fc4a1a3f35d7a4"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $EvidenceSweepFileName = "evidence-reachability-sweep.tsv"
-$EvidenceSweepHeaderKeys = @("generated-by", "base-commit", "swept-at", "totals")
+$EvidenceSweepExpectedFiles = 404
+$EvidenceSweepExpectedAccepted = 399
+$EvidenceSweepExpectedRejected = 5
+$EvidenceSweepPreamble = @(
+    "# GTA-Claw acceptance-evidence reachability sweep.",
+    "# Every .rs file in the working tree, judged by the reachability rule shipped in",
+    "# validate.ps1. A cross-check record only: nothing here decides whether a feature",
+    "# row is accepted. Regenerate ONLY through the reviewed command, never by hand:",
+    "#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep"
+)
+$EvidenceSweepGeneratedByLine = "# generated-by: validate.ps1 -ReplayEvidenceSweep"
 # LF-normalised for the same reason as the self-test digest: *.tsv is not covered
 # by .gitattributes either, so a raw byte digest would pass on a Windows checkout
 # and fail under pwsh on Linux CI. -WriteLedgerDigests cannot reach this
@@ -2412,7 +2432,7 @@ function Get-RepositoryRustFiles {
     # RULE when they only disagree about which files exist.
     #
     # This was measured before it was changed rather than argued: on the tree this
-    # record was taken at, the walk and `git ls-files` returned the identical 359
+    # record was taken at, the walk and `git ls-files` returned the identical 404
     # paths. The walk was correct by luck of its exclusions, not by construction,
     # which is the same defect this contract has already found twice in its own
     # scratch harnesses.
@@ -2431,9 +2451,8 @@ function Get-RepositoryRustFiles {
     }
     $results = New-Object System.Collections.Generic.List[string]
     foreach ($entry in $tracked) {
-        $relative = ([string]$entry).Trim()
-        if ([string]::IsNullOrWhiteSpace($relative)) { continue }
-        $relative = $relative.Replace("\", "/")
+        $relative = [string]$entry
+        if ([string]::IsNullOrEmpty($relative)) { continue }
         # compat/legacy is a RULE-level exclusion, not housekeeping: the legacy
         # JavaScript tree is never Rust acceptance evidence. Everything the old
         # walk excluded for housekeeping reasons is already absent from git's
@@ -2449,59 +2468,141 @@ function Get-RepositoryRustFiles {
     return @($results)
 }
 
-function Test-EvidenceFileReachable {
+function Get-EvidenceFileReachability {
     # The sweep MUST answer with the shipped rule rather than a copy of it, so it
-    # calls Assert-EvidenceFileIsCompiled and reads the verdict from whether that
-    # throws. A reimplementation here could agree with a broken rule.
+    # calls Assert-EvidenceFileIsCompiled and records the verdict and exact reason
+    # from whether that throws. A reimplementation here could agree with a broken
+    # rule.
     param([string]$RelativePath)
+    $resolved = Resolve-RepositoryFilePath $RelativePath
+    if ($null -eq $resolved) {
+        return [pscustomobject]@{
+            verdict = "missing"
+            reason = "the recorded path is absent, is not a regular file, has non-ordinal spelling, or traverses a reparse point"
+        }
+    }
     try {
         Assert-EvidenceFileIsCompiled $RelativePath "sweep"
-        return $true
+        return [pscustomobject]@{
+            verdict = "accept"
+            reason = "the shipped reachability rule accepts the existing repository file"
+        }
     } catch {
-        return $false
+        return [pscustomobject]@{
+            verdict = "reject"
+            reason = [string]$_.Exception.Message
+        }
     }
 }
 
 function Get-EvidenceSweepRecord {
-    # Parses the checked-in sweep record and refuses anything structurally sloppy.
-    # This runs with no access to the working tree, so it cannot be affected by
-    # other sessions adding, moving or deleting Rust files.
+    # Parse one complete canonical stream. No header discovery or key assignment
+    # is used: every line has one position, so duplicate, reordered, unknown,
+    # malformed and post-row headers are unrepresentable.
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         Fail "$EvidenceSweepFileName is missing"
     }
-    $text = [System.IO.File]::ReadAllText($Path) -replace "`r`n", "`n"
-    $lines = @($text -split "`n")
-    if ($lines.Count -gt 0 -and [string]::IsNullOrEmpty($lines[$lines.Count - 1])) {
-        $lines = @($lines[0..($lines.Count - 2)])
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        Fail "$EvidenceSweepFileName must be BOM-less UTF-8"
     }
-    $header = @($lines | Where-Object { $_.StartsWith("#", [StringComparison]::Ordinal) })
-    $data = @($lines | Where-Object { -not $_.StartsWith("#", [StringComparison]::Ordinal) })
-    $values = [ordered]@{}
-    foreach ($line in $header) {
-        $match = [regex]::Match($line, '\A# ([a-z-]+): (.+)\z')
-        if ($match.Success) { $values[$match.Groups[1].Value] = $match.Groups[2].Value }
+    try {
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $rawText = $strictUtf8.GetString($bytes)
+    } catch {
+        Fail "$EvidenceSweepFileName must be valid BOM-less UTF-8"
     }
-    foreach ($key in $EvidenceSweepHeaderKeys) {
-        if (-not $values.Contains($key)) { Fail "$EvidenceSweepFileName header is missing '$key'" }
+    if ([regex]::IsMatch($rawText, "`r(?!`n)")) {
+        Fail "$EvidenceSweepFileName contains a bare CR; use uniform LF or uniform CRLF"
     }
-    if (-not [regex]::IsMatch([string]$values["base-commit"], '\A[0-9a-f]{40}\z')) {
-        Fail "$EvidenceSweepFileName base-commit must be a 40-character lowercase hex commit id"
+    $hasCrlf = $rawText.Contains("`r`n")
+    $withoutCrlf = $rawText.Replace("`r`n", "")
+    if ($hasCrlf -and $withoutCrlf.Contains("`n")) {
+        Fail "$EvidenceSweepFileName mixes LF and CRLF; use one line-ending convention for the complete file"
     }
-    if (-not [regex]::IsMatch([string]$values["swept-at"], '\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z')) {
-        Fail "$EvidenceSweepFileName swept-at must be an ISO yyyy-MM-dd date"
+    $text = $rawText.Replace("`r`n", "`n")
+    if (-not $text.EndsWith("`n", [StringComparison]::Ordinal)) {
+        Fail "$EvidenceSweepFileName must end with exactly one newline"
     }
+    if ($text.EndsWith("`n`n", [StringComparison]::Ordinal)) {
+        Fail "$EvidenceSweepFileName must end with exactly one newline"
+    }
+    $lines = @($text.Substring(0, $text.Length - 1) -split "`n")
+    $fixedHeaderLines = $EvidenceSweepPreamble.Count + 4
+    if ($lines.Count -lt $fixedHeaderLines) {
+        Fail "$EvidenceSweepFileName is truncated before its complete canonical header"
+    }
+
+    for ($index = 0; $index -lt $EvidenceSweepPreamble.Count; $index += 1) {
+        $expected = [string]$EvidenceSweepPreamble[$index]
+        if (-not (Test-OrdinalStringEqual ([string]$lines[$index]) $expected)) {
+            Fail ("$EvidenceSweepFileName canonical header line {0} must be exactly '{1}', got '{2}'" -f
+                ($index + 1), $expected, [string]$lines[$index])
+        }
+    }
+
+    $generatedIndex = $EvidenceSweepPreamble.Count
+    if (-not (Test-OrdinalStringEqual ([string]$lines[$generatedIndex]) $EvidenceSweepGeneratedByLine)) {
+        Fail ("$EvidenceSweepFileName generated-by line must be exactly '{0}', got '{1}'" -f
+            $EvidenceSweepGeneratedByLine, [string]$lines[$generatedIndex])
+    }
+
+    $baseCommitIndex = $generatedIndex + 1
+    $baseCommitMatch = [regex]::Match(
+        [string]$lines[$baseCommitIndex],
+        '\A# base-commit: ([0-9a-f]{40})\z'
+    )
+    if (-not $baseCommitMatch.Success) {
+        Fail "$EvidenceSweepFileName canonical header line 7 must be '# base-commit: <40 lowercase hex characters>'"
+    }
+
+    $sweptAtIndex = $baseCommitIndex + 1
+    $sweptAtMatch = [regex]::Match(
+        [string]$lines[$sweptAtIndex],
+        '\A# swept-at: ([0-9]{4}-[0-9]{2}-[0-9]{2})\z'
+    )
+    if (-not $sweptAtMatch.Success) {
+        Fail "$EvidenceSweepFileName canonical header line 8 must be '# swept-at: <ISO yyyy-MM-dd date>'"
+    }
+    $parsedDate = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact(
+            $sweptAtMatch.Groups[1].Value,
+            "yyyy-MM-dd",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None,
+            [ref]$parsedDate
+        )) {
+        Fail "$EvidenceSweepFileName swept-at value is not a real ISO yyyy-MM-dd date"
+    }
+
+    $totalsIndex = $sweptAtIndex + 1
+    $totalsMatch = [regex]::Match(
+        [string]$lines[$totalsIndex],
+        '\A# totals: files=([0-9]+) accept=([0-9]+) reject=([0-9]+)\z'
+    )
+    if (-not $totalsMatch.Success) {
+        Fail "$EvidenceSweepFileName canonical header line 9 must be '# totals: files=<n> accept=<n> reject=<n>'"
+    }
+
     $rows = New-Object System.Collections.Generic.List[object]
     $previous = $null
     $accepted = 0
     $rejected = 0
-    foreach ($line in $data) {
-        $match = [regex]::Match($line, '\A(accept|reject)\t(\S+)\z')
-        if (-not $match.Success) {
-            Fail "$EvidenceSweepFileName row is not '<accept|reject><TAB><path>': '$line'"
+    for ($index = $fixedHeaderLines; $index -lt $lines.Count; $index += 1) {
+        $line = [string]$lines[$index]
+        $tab = $line.IndexOf("`t", [StringComparison]::Ordinal)
+        if ($tab -lt 0 -or $line.IndexOf("`t", $tab + 1, [StringComparison]::Ordinal) -ge 0) {
+            Fail ("$EvidenceSweepFileName row {0} must contain exactly two fields separated by one TAB: '{1}'" -f
+                ($index + 1), $line)
         }
-        $verdict = $match.Groups[1].Value
-        $path = $match.Groups[2].Value
+        $verdict = $line.Substring(0, $tab)
+        $path = $line.Substring($tab + 1)
+        if (-not (Test-OrdinalStringEqual $verdict "accept") -and
+            -not (Test-OrdinalStringEqual $verdict "reject")) {
+            Fail "$EvidenceSweepFileName row $($index + 1) verdict must be exactly 'accept' or 'reject', got '$verdict'"
+        }
         if (-not $path.EndsWith(".rs", [StringComparison]::Ordinal)) {
             Fail "$EvidenceSweepFileName row path '$path' is not a .rs file"
         }
@@ -2516,12 +2617,10 @@ function Get-EvidenceSweepRecord {
         $rows.Add([pscustomobject]@{ verdict = $verdict; path = $path })
     }
     $expectedTotals = "files={0} accept={1} reject={2}" -f $rows.Count, $accepted, $rejected
-    if (-not (Test-OrdinalStringEqual ([string]$values["totals"]) $expectedTotals)) {
+    $declaredTotals = [string]$lines[$totalsIndex].Substring("# totals: ".Length)
+    if (-not (Test-OrdinalStringEqual $declaredTotals $expectedTotals)) {
         Fail ("$EvidenceSweepFileName totals line disagrees with its own rows; header says '{0}', rows are '{1}'" -f
-            [string]$values["totals"], $expectedTotals)
-    }
-    if ($rejected -lt 1) {
-        Fail "$EvidenceSweepFileName records no refusal at all, so it cannot detect the rule being weakened"
+            $declaredTotals, $expectedTotals)
     }
     # .ToArray(), not @($rows): Windows PowerShell 5.1 throws "Argument types do
     # not match" when an [ordered] literal is given a generic List wrapped in @().
@@ -2530,8 +2629,8 @@ function Get-EvidenceSweepRecord {
         rows = $rows.ToArray()
         accepted = $accepted
         rejected = $rejected
-        base_commit = [string]$values["base-commit"]
-        swept_at = [string]$values["swept-at"]
+        base_commit = $baseCommitMatch.Groups[1].Value
+        swept_at = $sweptAtMatch.Groups[1].Value
     }
 }
 
@@ -3386,34 +3485,15 @@ foreach ($key in $ExpectedCanonicalCounts.Keys) {
 # script and crates/claw-conformance -- can be shown to agree on a real tree
 # rather than assumed to.
 #
-# Every run verifies the record's digest, then re-checks the recorded REFUSALS
-# against the tree. Those are two different guarantees and both are needed.
-#
-# The digest is what makes the record unforgeable. An earlier design re-derived
-# verdicts only for the rows the record itself labelled "reject", and a negative
-# control broke it immediately: flipping a row to "accept" made the checker skip
-# it, so the one edit that hides a refusal was the one edit it could not see.
-# Re-deriving all 307 rows closes that, but costs 110s on every run and the
-# self-test invokes this validator about 156 times. The digest closes it for the
-# price of one hash, because the label cannot be edited at all without a reviewed
-# change to $ExpectedEvidenceSweepDigest.
-#
-# The refusal recheck then catches the other direction, which the digest cannot:
-# the record staying honest while the RULE is weakened underneath it. Those are
-# the rows that matter -- build scripts, `harness = false` targets and files no
-# target declares -- and there are few enough of them to re-derive cheaply.
-#
-# Neither check cares about .rs files absent from the record, or recorded rows
-# whose file no longer exists. The swept tree belongs to seventeen other sessions
-# and grew from 114 to 307 files in about a day; failing on their additions,
-# renames and deletions would couple this contract to every one of them, which is
-# the exact coupling class this repository has already been bitten by four times.
-# Those show up in the -ReplayEvidenceSweep differential, where a human is
-# already reading.
+# Every ordinary run first checks artifact integrity, then independently invokes
+# the shipped reachability rule for every row. The record's own verdict never
+# decides whether a row is checked. Only after all 404 semantic comparisons agree
+# are the exact 399/5 totals accepted. New Rust files outside the dated record are
+# intentionally tolerated; a recorded path becoming absent, non-ordinal or a
+# reparse point is not.
 $evidenceSweepPath = Join-Path $Root $EvidenceSweepFileName
 $sweepRecord = $null
 $sweepRowsRechecked = 0
-$sweepRowsAbsent = 0
 if ($ReplayEvidenceSweep) {
     # Best-effort on the way in: a record that no longer parses must still be
     # repairable by the reviewed command, or the only way to fix it is by hand,
@@ -3436,21 +3516,38 @@ if ($ReplayEvidenceSweep) {
             $EvidenceSweepFileName, $ExpectedEvidenceSweepDigest, $sweepDigest)
     }
     $sweepRecord = Get-EvidenceSweepRecord $evidenceSweepPath
+    $semanticMismatches = New-Object System.Collections.Generic.List[string]
     foreach ($row in $sweepRecord.rows) {
-        if (-not (Test-OrdinalStringEqual ([string]$row.verdict) "reject")) { continue }
-        # Reuses the shipped path resolver rather than joining by hand, so this
-        # agrees with how every other evidence path in the contract is located.
-        if ($null -eq (Resolve-RepositoryFilePath $row.path)) {
-            $sweepRowsAbsent += 1
-            continue
-        }
-        if (Test-EvidenceFileReachable $row.path) {
-            Fail (("{0} records '{1}' as unreachable, but the shipped reachability rule now accepts it. " +
-                "Either the rule was weakened, or that file genuinely became a test target. Re-run " +
-                "validate.ps1 -ReplayEvidenceSweep, read the printed differential, and land the refreshed " +
-                "record as a reviewed change.") -f $EvidenceSweepFileName, $row.path)
+        $live = Get-EvidenceFileReachability ([string]$row.path)
+        if (Test-OrdinalStringEqual ([string]$live.verdict) "missing") {
+            $semanticMismatches.Add(("{0} semantic mismatch for '{1}': record says '{2}', but {3}." -f
+                    $EvidenceSweepFileName, [string]$row.path, [string]$row.verdict, [string]$live.reason))
+        } elseif (-not (Test-OrdinalStringEqual ([string]$row.verdict) ([string]$live.verdict))) {
+            $semanticMismatches.Add((("{0} semantic mismatch for '{1}': record says '{2}', shipped reachability rule says " +
+                        "'{3}'. Reason: {4}") -f
+                    $EvidenceSweepFileName,
+                    [string]$row.path,
+                    [string]$row.verdict,
+                    [string]$live.verdict,
+                    [string]$live.reason))
         }
         $sweepRowsRechecked += 1
+    }
+    if ($semanticMismatches.Count -gt 0) {
+        Fail ($semanticMismatches.ToArray() -join [Environment]::NewLine)
+    }
+    if ($sweepRecord.rows.Count -ne $EvidenceSweepExpectedFiles -or
+        $sweepRecord.accepted -ne $EvidenceSweepExpectedAccepted -or
+        $sweepRecord.rejected -ne $EvidenceSweepExpectedRejected) {
+        Fail (("{0} semantic verdicts agree, but the reviewed record must contain exactly " +
+                "{1} files / {2} accept / {3} reject; found {4} / {5} / {6}") -f
+            $EvidenceSweepFileName,
+            $EvidenceSweepExpectedFiles,
+            $EvidenceSweepExpectedAccepted,
+            $EvidenceSweepExpectedRejected,
+            $sweepRecord.rows.Count,
+            $sweepRecord.accepted,
+            $sweepRecord.rejected)
     }
 }
 
@@ -3492,8 +3589,11 @@ if ($ReplayEvidenceSweep) {
     $sweptFiles = Get-RepositoryRustFiles
     $sweptRows = New-Object System.Collections.Generic.List[object]
     foreach ($file in $sweptFiles) {
-        $verdict = $(if (Test-EvidenceFileReachable $file) { "accept" } else { "reject" })
-        $sweptRows.Add([pscustomobject]@{ verdict = $verdict; path = $file })
+        $live = Get-EvidenceFileReachability $file
+        if (Test-OrdinalStringEqual ([string]$live.verdict) "missing") {
+            Fail "-ReplayEvidenceSweep listed tracked Rust path '$file', but $($live.reason)"
+        }
+        $sweptRows.Add([pscustomobject]@{ verdict = [string]$live.verdict; path = $file })
     }
     $previousByPath = @{}
     if ($null -ne $sweepRecord) {
@@ -3513,12 +3613,8 @@ if ($ReplayEvidenceSweep) {
     $acceptedCount = @($sweptRows | Where-Object { $_.verdict -eq "accept" }).Count
     $rejectedCount = @($sweptRows | Where-Object { $_.verdict -eq "reject" }).Count
     $sweepLines = New-Object System.Collections.Generic.List[string]
-    $sweepLines.Add("# GTA-Claw acceptance-evidence reachability sweep.")
-    $sweepLines.Add("# Every .rs file in the working tree, judged by the reachability rule shipped in")
-    $sweepLines.Add("# validate.ps1. A cross-check record only: nothing here decides whether a feature")
-    $sweepLines.Add("# row is accepted. Regenerate ONLY through the reviewed command, never by hand:")
-    $sweepLines.Add("#   powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep")
-    $sweepLines.Add("# generated-by: validate.ps1 -ReplayEvidenceSweep")
+    foreach ($line in $EvidenceSweepPreamble) { $sweepLines.Add([string]$line) }
+    $sweepLines.Add($EvidenceSweepGeneratedByLine)
     $sweepLines.Add("# base-commit: $EvidenceSweepBaseCommit")
     $sweepLines.Add("# swept-at: $EvidenceSweepDate")
     $sweepLines.Add(("# totals: files={0} accept={1} reject={2}" -f $sweptRows.Count, $acceptedCount, $rejectedCount))
@@ -3567,7 +3663,7 @@ if ($WriteLedgerDigests) {
     ledger_digests = $computedLedgerDigests
     evidence_sweep_files = $(if ($null -eq $sweepRecord) { 0 } else { $sweepRecord.rows.Count })
     evidence_sweep_rows_rechecked = $sweepRowsRechecked
-    evidence_sweep_rows_absent = $sweepRowsAbsent
+    evidence_sweep_rows_absent = 0
     inventory_files = $InventorySpecs.Count
     inventory_rows = $inventoryRowCount
     canonical_counts = $derivedCanonicalCounts
