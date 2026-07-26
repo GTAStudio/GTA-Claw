@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::{
     PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json,
-    quarantine_corrupt_state, read_json, scope_key, scoped_state_path,
+    initialize_state_root, quarantine_corrupt_state, read_json, scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, normalize_for_matching, scan_persistent_content};
 use crate::session::SessionId;
@@ -227,7 +227,7 @@ pub struct DurableTranscriptStore {
 }
 
 impl DurableTranscriptStore {
-    /// Creates a transcript store with explicit message and content bounds.
+    /// Creates a transcript store under one canonicalized durable directory.
     pub fn new(
         root: impl Into<PathBuf>,
         max_messages: usize,
@@ -242,8 +242,10 @@ impl DurableTranscriptStore {
         {
             return Err(TranscriptError::InvalidLimits);
         }
+        let root = root.into();
+        let root = initialize_state_root(&root)?;
         Ok(Self {
-            root: root.into(),
+            root,
             max_messages,
             content_char_limit,
             locks: ScopeLocks,

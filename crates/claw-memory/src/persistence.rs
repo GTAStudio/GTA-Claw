@@ -246,6 +246,116 @@ fn absolute_lexical_path(path: &Path) -> Result<PathBuf, PersistenceError> {
     Ok(normalized)
 }
 
+fn has_root_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::RootDir))
+}
+
+pub(crate) fn initialize_state_root(root: &Path) -> Result<PathBuf, PersistenceError> {
+    let root = absolute_lexical_path(root)?;
+    let mut existing = root.as_path();
+    let mut missing = Vec::new();
+
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(metadata) => {
+                if missing.is_empty() && is_link_or_reparse(&metadata) {
+                    return Err(PersistenceError::io(
+                        "prepare",
+                        &root,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "configured durable root must not be a link",
+                        ),
+                    ));
+                }
+                let target_metadata = if is_link_or_reparse(&metadata) {
+                    fs::metadata(existing).map_err(|source| {
+                        PersistenceError::io("inspect ambient root ancestor", existing, source)
+                    })?
+                } else {
+                    metadata
+                };
+                if !target_metadata.is_dir() {
+                    return Err(PersistenceError::io(
+                        "prepare",
+                        existing,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable root ancestor must be a directory",
+                        ),
+                    ));
+                }
+                break;
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                let component = existing.file_name().ok_or_else(|| {
+                    PersistenceError::io(
+                        "prepare",
+                        &root,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable root has no existing directory ancestor",
+                        ),
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    PersistenceError::io(
+                        "prepare",
+                        &root,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable root has no existing directory ancestor",
+                        ),
+                    )
+                })?;
+            }
+            Err(source) => {
+                return Err(PersistenceError::io(
+                    "inspect durable root ancestor",
+                    existing,
+                    source,
+                ));
+            }
+        }
+    }
+
+    let mut canonical = fs::canonicalize(existing).map_err(|source| {
+        PersistenceError::io("canonicalize durable root ancestor", existing, source)
+    })?;
+    reject_unsafe_ancestors(&canonical)?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+        match fs::create_dir(&canonical) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(PersistenceError::io(
+                    "create durable state directory",
+                    &canonical,
+                    source,
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&canonical).map_err(|source| {
+            PersistenceError::io("inspect durable state directory", &canonical, source)
+        })?;
+        if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(PersistenceError::io(
+                "prepare",
+                &canonical,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable state directory must be a real directory",
+                ),
+            ));
+        }
+    }
+    reject_unsafe_ancestors(&canonical)?;
+    Ok(canonical)
+}
+
 pub(crate) fn scoped_state_path(
     root: &Path,
     collection: &str,
@@ -513,7 +623,7 @@ fn ensure_canonical_parent(parent: &Path, canonical: &Path) -> Result<(), Persis
         parent,
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "state parent resolved outside its validated lexical path",
+            "state parent resolved outside its canonical durable root",
         ),
     ))
 }
@@ -543,7 +653,7 @@ fn ensure_directory_chain(path: &Path) -> Result<(), PersistenceError> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        if !current.is_absolute() {
+        if !has_root_component(&current) {
             continue;
         }
         match fs::symlink_metadata(&current) {
@@ -596,7 +706,7 @@ fn reject_unsafe_ancestors(path: &Path) -> Result<(), PersistenceError> {
     let mut ancestors: Vec<_> = path.ancestors().collect();
     ancestors.reverse();
     for ancestor in ancestors {
-        if ancestor.as_os_str().is_empty() {
+        if ancestor.as_os_str().is_empty() || !has_root_component(ancestor) {
             continue;
         }
         let metadata = fs::symlink_metadata(ancestor)
@@ -1256,6 +1366,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir(&directory).expect("create replacement test directory");
+        let directory = fs::canonicalize(directory).expect("canonical replacement test directory");
         let cleanup = Cleanup(directory.clone());
         let destination = directory.join("state.json");
         let temporary = directory.join("replacement.json");

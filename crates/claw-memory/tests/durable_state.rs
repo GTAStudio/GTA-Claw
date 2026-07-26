@@ -24,11 +24,16 @@ struct TempDir {
 
 impl TempDir {
     fn new(label: &str) -> Self {
+        Self::new_in(&std::env::temp_dir(), label)
+    }
+
+    fn new_in(base: &Path, label: &str) -> Self {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let path = base.join(format!(
             "gta-claw-memory-{label}-{}-{sequence}",
             std::process::id()
         ));
+        assert!(path.is_absolute(), "test paths must be absolute");
         fs::create_dir(&path).expect("create isolated test directory");
         Self { path }
     }
@@ -46,6 +51,66 @@ impl Drop for TempDir {
 
 fn scope(value: &str) -> SessionId {
     SessionId::new(value).expect("valid scope")
+}
+
+#[cfg(windows)]
+fn run_windows_test_script(directory: &Path, body: &str) -> std::process::Output {
+    assert!(directory.is_absolute(), "script directory must be absolute");
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let script = directory.join(format!(
+        ".gta-claw-test-{}-{sequence}.cmd",
+        std::process::id()
+    ));
+    assert!(script.is_absolute(), "script path must be absolute");
+    fs::write(&script, body).expect("write Windows test script");
+    let output = Command::new(
+        std::env::var_os("COMSPEC").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe")),
+    )
+    .args(["/d", "/c"])
+    .arg(&script)
+    .output()
+    .expect("run Windows test script");
+    fs::remove_file(&script).expect("remove Windows test script");
+    output
+}
+
+#[cfg(windows)]
+fn windows_short_path(path: &Path) -> PathBuf {
+    assert!(path.is_absolute(), "short-path target must be absolute");
+    let script = format!(r#"@for %%I in ("{}") do @echo %%~sI"#, path.display());
+    let output = run_windows_test_script(
+        path.parent().expect("short-path target has a parent"),
+        &script,
+    );
+    assert!(output.status.success(), "query DOS short path failed");
+    let short = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("DOS short path is UTF-8")
+            .trim(),
+    );
+    assert!(short.is_absolute(), "DOS short path must be absolute");
+    assert_ne!(short, path, "test volume must expose a distinct DOS alias");
+    assert!(
+        short.to_string_lossy().contains('~'),
+        "DOS alias must contain a short-name component: long={}, short={}",
+        path.display(),
+        short.display()
+    );
+    short
+}
+
+#[cfg(windows)]
+fn create_directory_junction(link: &Path, target: &Path) {
+    assert!(link.is_absolute(), "junction path must be absolute");
+    assert!(target.is_absolute(), "junction target must be absolute");
+    let script = format!(r#"@mklink /J "{}" "{}""#, link.display(), target.display());
+    let output =
+        run_windows_test_script(link.parent().expect("junction path has a parent"), &script);
+    assert!(
+        output.status.success(),
+        "create directory junction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn only_state_file(root: &Path, collection: &str) -> PathBuf {
@@ -777,6 +842,207 @@ fn runtime_ports_recover_corruption_without_an_in_memory_fallback() {
         DurableStateRuntime::open(relative),
         Err(DurableStateRuntimeError::StateRootNotAbsolute)
     ));
+}
+
+#[test]
+#[cfg(unix)]
+fn ambient_ancestor_alias_is_canonicalized_for_both_runtime_ports() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = TempDir::new("ambient-alias");
+    let real_parent = sandbox.path().join("real-parent");
+    let ambient_alias = sandbox.path().join("ambient-alias");
+    let configured_root = ambient_alias.join("durable-state");
+    assert!(real_parent.is_absolute());
+    assert!(ambient_alias.is_absolute());
+    assert!(configured_root.is_absolute());
+    fs::create_dir(&real_parent).expect("create real ambient parent");
+    symlink(&real_parent, &ambient_alias).expect("create ambient parent alias");
+
+    let config = DurableStateConfig::new(&configured_root, 500, 500, 10, 500);
+    let runtime = DurableStateRuntime::open(config).expect("open through ambient alias");
+    let scope = scope("ambient-alias");
+    runtime
+        .memory()
+        .add(&scope, MemoryTarget::Memory, "alias-backed memory", 1)
+        .expect("write memory through ambient alias");
+    runtime
+        .transcript()
+        .append(&scope, TranscriptRole::User, "alias-backed transcript", 2)
+        .expect("write transcript through ambient alias");
+
+    let canonical_root = fs::canonicalize(&configured_root).expect("canonical durable root");
+    assert_eq!(
+        canonical_root,
+        fs::canonicalize(&real_parent)
+            .expect("canonical real parent")
+            .join("durable-state")
+    );
+    let reopened =
+        DurableStateRuntime::open(DurableStateConfig::new(&canonical_root, 500, 500, 10, 500))
+            .expect("reopen canonical durable root");
+    assert_eq!(
+        reopened
+            .memory()
+            .list(&scope, MemoryTarget::Memory, 0, 10)
+            .expect("read canonical memory")
+            .entries
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .transcript()
+            .browse(&scope, None, 10)
+            .expect("read canonical transcript")
+            .messages
+            .len(),
+        1
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_temp_alias_and_canonical_root_share_one_store() {
+    let local_temp = PathBuf::from(
+        std::env::var_os("LOCALAPPDATA").expect("Windows LOCALAPPDATA is configured"),
+    )
+    .join("Temp");
+    assert!(local_temp.is_absolute());
+    let root = TempDir::new_in(
+        &local_temp,
+        "windows-deliberately-long-eight-dot-three-root",
+    );
+    let short_root = windows_short_path(root.path());
+    let canonical_root = fs::canonicalize(root.path()).expect("canonical Windows root");
+    assert!(canonical_root.is_absolute());
+    assert_eq!(
+        fs::canonicalize(&short_root).expect("canonical DOS alias"),
+        canonical_root
+    );
+    let scope = scope("windows-canonical-root");
+
+    let runtime =
+        DurableStateRuntime::open(DurableStateConfig::new(&short_root, 500, 500, 10, 500))
+            .expect("open Windows lexical root");
+    runtime
+        .memory()
+        .add(&scope, MemoryTarget::Memory, "Windows alias memory", 1)
+        .expect("write through Windows lexical root");
+    runtime
+        .transcript()
+        .append(&scope, TranscriptRole::User, "Windows alias transcript", 2)
+        .expect("write through Windows lexical root");
+
+    let reopened =
+        DurableStateRuntime::open(DurableStateConfig::new(&canonical_root, 500, 500, 10, 500))
+            .expect("reopen Windows canonical root");
+    assert_eq!(
+        reopened
+            .memory()
+            .list(&scope, MemoryTarget::Memory, 0, 10)
+            .expect("read canonical Windows memory")
+            .entries
+            .len(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .transcript()
+            .browse(&scope, None, 10)
+            .expect("read canonical Windows transcript")
+            .messages
+            .len(),
+        1
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn configured_root_and_descendant_junctions_are_rejected() {
+    let sandbox = TempDir::new("descendant-junction");
+    let external_root = sandbox.path().join("external-root");
+    let configured_root_junction = sandbox.path().join("configured-root-junction");
+    assert!(external_root.is_absolute());
+    assert!(configured_root_junction.is_absolute());
+    fs::create_dir(&external_root).expect("create external root");
+    create_directory_junction(&configured_root_junction, &external_root);
+    assert!(matches!(
+        DurableMemoryStore::new(&configured_root_junction, 500, 500),
+        Err(DurableMemoryError::Persistence(_))
+    ));
+    fs::remove_dir(&configured_root_junction).expect("remove configured-root junction");
+
+    let state_root = sandbox.path().join("state-root");
+    let external_collection = sandbox.path().join("external-collection");
+    let collection_junction = state_root.join("memory");
+    assert!(state_root.is_absolute());
+    assert!(external_collection.is_absolute());
+    assert!(collection_junction.is_absolute());
+    let store = DurableMemoryStore::new(&state_root, 500, 500).expect("create real state root");
+    fs::create_dir(&external_collection).expect("create external collection");
+    create_directory_junction(&collection_junction, &external_collection);
+
+    assert!(matches!(
+        store.add(
+            &scope("descendant-junction"),
+            MemoryTarget::Memory,
+            "must remain confined",
+            1,
+        ),
+        Err(DurableMemoryError::Persistence(_))
+    ));
+    assert_eq!(
+        fs::read_dir(&external_collection)
+            .expect("read external collection")
+            .count(),
+        0
+    );
+    fs::remove_dir(&collection_junction).expect("remove descendant junction");
+}
+
+#[test]
+#[cfg(unix)]
+fn configured_root_and_descendant_symlinks_are_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = TempDir::new("descendant-symlink");
+    let external_root = sandbox.path().join("external-root");
+    let configured_root_link = sandbox.path().join("configured-root-link");
+    assert!(external_root.is_absolute());
+    assert!(configured_root_link.is_absolute());
+    fs::create_dir(&external_root).expect("create external root");
+    symlink(&external_root, &configured_root_link).expect("link configured root");
+    assert!(matches!(
+        DurableMemoryStore::new(&configured_root_link, 500, 500),
+        Err(DurableMemoryError::Persistence(_))
+    ));
+
+    let state_root = sandbox.path().join("state-root");
+    let external_collection = sandbox.path().join("external-collection");
+    let collection_link = state_root.join("memory");
+    assert!(state_root.is_absolute());
+    assert!(external_collection.is_absolute());
+    assert!(collection_link.is_absolute());
+    let store = DurableMemoryStore::new(&state_root, 500, 500).expect("create real state root");
+    fs::create_dir(&external_collection).expect("create external collection");
+    symlink(&external_collection, &collection_link).expect("link state collection");
+
+    assert!(matches!(
+        store.add(
+            &scope("descendant-symlink"),
+            MemoryTarget::Memory,
+            "must remain confined",
+            1,
+        ),
+        Err(DurableMemoryError::Persistence(_))
+    ));
+    assert_eq!(
+        fs::read_dir(&external_collection)
+            .expect("read external collection")
+            .count(),
+        0
+    );
 }
 
 #[test]
