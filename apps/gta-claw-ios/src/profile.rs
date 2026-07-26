@@ -93,7 +93,7 @@ impl IosGatewayProfile {
         config.credential = self.credential.into_gateway_credential();
         config.role = Role::Operator;
         config.scopes = self.requested_scopes;
-        config.authorization_expectation = AuthorizationExpectation::RequestedRole;
+        config.authorization_expectation = AuthorizationExpectation::ExactRequested;
         config.client = self.identity.metadata();
         config
     }
