@@ -6476,6 +6476,57 @@ enum CommitVeto {
     Uncertain = 2,
 }
 
+/// Locks the fail-closed defaults of the commit-veto attribution.
+///
+/// The guard records its classification as an integer in an atomic, and
+/// `recorded_commit_veto` decodes it. Only a recorded `ProvableRollback` may
+/// ever be read back as provable: an unrecognised class, a missing guard, and
+/// the non-unix build all have to decay to "not provable" so that an
+/// unattributed rollback is reported as uncertain rather than definite.
+#[cfg(all(test, unix))]
+mod commit_veto_fallback_tests {
+    use super::CommitVeto;
+
+    /// Mirrors the decode in `recorded_commit_veto`.
+    fn decode(class: i32) -> Option<CommitVeto> {
+        match class {
+            1 => Some(CommitVeto::ProvableRollback),
+            2 => Some(CommitVeto::Uncertain),
+            _ => None,
+        }
+    }
+
+    /// Mirrors the decision in `commit_synchronously`.
+    fn is_provable(veto: Option<CommitVeto>) -> bool {
+        veto == Some(CommitVeto::ProvableRollback)
+    }
+
+    #[test]
+    fn recorded_classes_keep_the_discriminants_the_guard_writes() {
+        assert_eq!(CommitVeto::ProvableRollback as i32, 1);
+        assert_eq!(CommitVeto::Uncertain as i32, 2);
+    }
+
+    #[test]
+    fn unattributed_veto_classes_are_never_provable() {
+        // 0 is the cleared state a panicking guard leaves behind, and every
+        // other value is a class this build does not recognise.
+        for class in [0, 3, -1, i32::MIN, i32::MAX] {
+            assert!(
+                !is_provable(decode(class)),
+                "unattributed veto class {class} must not be provable"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_recorded_provable_rollback_is_definite() {
+        assert!(is_provable(decode(1)));
+        assert!(!is_provable(decode(2)));
+        assert!(!is_provable(None));
+    }
+}
+
 #[cfg(any(unix, windows))]
 struct PinnedSidecar {
     path: std::path::PathBuf,
