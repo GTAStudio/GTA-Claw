@@ -366,6 +366,23 @@ The command refuses live/Final roots, changed, missing, or extra materialized en
 invocation without `--snapshot`. Successful output always names either `bootstrap archive <path>`
 or `verified materialized Bootstrap root <path>`; it never prints an unlabelled fingerprint.
 
+### Historical Bootstrap decision: 2026-07-26
+
+The coordinator's final, non-reopenable decision accepts the Bootstrap identity for
+`.github/workflows/upstream-gateway-reference.yml` that PR #67 Synchronized into
+`policy/bootstrap.snapshot`; that merged identity is deliberate. Immediately before PR #67, the
+live workflow was 29 lines while the archived payload was 185 lines. Those 156 lines were
+accidental drift created after PR #50 replaced the live workflow, when no companion-decision
+mechanism existed.
+
+The stale archived payload was the pre-PR #50 Node/pnpm workflow. Synchronization removed
+`setup-node`, npm/pnpm, and `node_modules` references from the trust root's own archive and
+included the `claw-repo-policy` ratchet entry point. PR #102 now closes that freshness gap by
+requiring Synchronize or Preserve for changed Bootstrap source paths.
+
+This note records the accepted historical decision. It does not claim that Bootstrap must mirror
+current Final, and it does not authorize regenerating or reverting the archive.
+
 During an audited Final dependency-surface update, copy the reviewed live root deny
 policy, desktop manifests, desktop lock, and desktop deny policy into their exact audit
 fixtures only through the validator:
