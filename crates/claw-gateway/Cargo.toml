@@ -23,7 +23,7 @@ subtle = "=2.6.1"
 tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-claw-gateway-client.workspace = true
+claw-gateway-client = { workspace = true, features = ["test-support"] }
 rand_chacha = "=0.10.0"
 tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 url = "=2.5.8"

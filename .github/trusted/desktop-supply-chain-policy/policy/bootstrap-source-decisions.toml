@@ -1,0 +1,122 @@
+schema_version = 1
+decisions = []
+
+[[standing]]
+id = 1
+path = "Cargo.lock"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "89aeb3905b6918651f3d91e95554f550b4aa2dd9cc87d6e3cd1bd0a4ce015aeb"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 2
+path = "Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "901dab0edd19a930deaef8030779c60fc859a44512e8f98646dabaaaf24590ad"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 3
+path = "apps/gta-claw-cli/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "0c633edb0c5ba5b212fb481fc66ada58098bcc765ab53f18a367787849d3b6e0"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 4
+path = "apps/gta-claw-daemon/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "cf55de949c6a0ed963c2f267abdca7e534333bdf23c3aff726d654c82ac00f8b"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 5
+path = "crates/claw-application/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "c19f674659d6298aad68d705e8cae8e8439fc09cc016dd7d31b32da3a4ae6ee1"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 6
+path = "crates/claw-config/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "406138ebf530cdb3402828fd52a2a99f853e0453ee1e3765a09d1a96e0ef3321"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 7
+path = "crates/claw-domain/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "63c921a6ba6a292001b13a028988eb0e5a290dc254c38fbe68324d0a5c114124"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 8
+path = "crates/claw-gateway-client/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "42f6f18afa36340f5a5bc1538cefbe903198e01873d21ffbb336e77c2ca0b566"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 9
+path = "crates/claw-platform/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "fd63930c44284540a47da71c1266bb483241959a7c852b78878a8385ec88c648"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 10
+path = "crates/claw-protocol/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "4788295f61b22eadf5b4447cd4e7256ba7ba2be822e616c9d6819be1f13a2071"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 11
+path = "crates/claw-security/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "e81ef2ed1f0e76b1b5436252130aa84a794b258b0c4465cadb273203b537e0f1"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 12
+path = "deny.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "0019b9c385caf28cb16a7ab90f281a2767e327652fa122147e90daff4d9ccdcd"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 13
+path = "desktop/Cargo.lock"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "1b5bfe4f0cf8589be3deadd0c5e271b904e9f964d5ed572b8aa011707805f8b6"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 14
+path = "desktop/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "597bfbaf79ac07fa1cbddb25acba7ac1446a8e1d02296149e5a3fe715ce85f06"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."
+
+[[standing]]
+id = 15
+path = "desktop/apps/gta-claw-desktop/Cargo.toml"
+base_oid = "988c6d64b6ec61adbfb7f04d39b83155e025de6c"
+snapshot_payload_sha256 = "da06c9e15e019ca705cf0e3220419a7fb963298b4122e002c0f10bca96f4ff4f"
+snapshot_fingerprint = "96e8c3dabd6d341133ddae8732e90fe088c62f5dc78d1f579eeeac5f9e8497d3"
+rationale = "Dependency-graph input: the Final workspace evolves while the pre-P04f archive stays frozen. Reviewed in the Bootstrap coupling unblock; void if this archived payload is ever rewritten."

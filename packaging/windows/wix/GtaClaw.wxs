@@ -11,7 +11,7 @@
     Scope="perMachine"
     InstallerVersion="500"
     Compressed="yes">
-    <SummaryInformation Description="GTA Claw Windows installer prototype" />
+    <SummaryInformation Description="GTA Claw native Windows installer" />
     <MajorUpgrade
       DowngradeErrorMessage="A newer version of GTA Claw is already installed."
       Schedule="afterInstallInitialize" />
@@ -28,8 +28,8 @@
     <Component Id="LicenseFile" Directory="INSTALLFOLDER" Guid="$(var.LicenseComponentGuid)">
       <File Id="LicenseTxt" Source="$(var.StageDir)\LICENSE.txt" KeyPath="yes" />
     </Component>
-    <Component Id="NonReleaseMarker" Directory="INSTALLFOLDER" Guid="$(var.NonReleaseComponentGuid)">
-      <File Id="NonReleaseTxt" Source="$(var.StageDir)\NON-RELEASE.txt" KeyPath="yes" />
+    <Component Id="ReleaseStatus" Directory="INSTALLFOLDER" Guid="$(var.ReleaseStatusComponentGuid)">
+      <File Id="ReleaseStatusTxt" Source="$(var.StageDir)\RELEASE-STATUS.txt" KeyPath="yes" />
     </Component>
     <Component Id="HashManifest" Directory="INSTALLFOLDER" Guid="$(var.HashManifestComponentGuid)">
       <File Id="Sha256SumsTxt" Source="$(var.StageDir)\SHA256SUMS.txt" KeyPath="yes" />
@@ -38,15 +38,15 @@
       <File Id="DesktopExe" Source="$(var.StageDir)\gta-claw-desktop.exe" KeyPath="yes" />
     </Component>
     <Component Id="CliExecutable" Directory="HEADLESSFOLDER" Guid="$(var.CliComponentGuid)">
-      <File Id="CliExe" Source="$(var.StageDir)\gta-claw-cli.exe" KeyPath="yes" />
+      <File Id="CliExe" Source="$(var.StageDir)\headless\gta-claw-cli.exe" KeyPath="yes" />
     </Component>
     <Component Id="DaemonExecutable" Directory="HEADLESSFOLDER" Guid="$(var.DaemonComponentGuid)">
-      <File Id="DaemonExe" Source="$(var.StageDir)\gta-claw-daemon.exe" KeyPath="yes" />
+      <File Id="DaemonExe" Source="$(var.StageDir)\headless\gta-claw-daemon.exe" KeyPath="yes" />
     </Component>
 
     <Feature Id="GTAClaw" Title="GTA Claw" Level="1" ConfigurableDirectory="INSTALLFOLDER">
       <ComponentRef Id="LicenseFile" />
-      <ComponentRef Id="NonReleaseMarker" />
+      <ComponentRef Id="ReleaseStatus" />
       <ComponentRef Id="HashManifest" />
       <Feature Id="Gui" Title="Desktop application" Description="Install the native GTA Claw GUI." Level="1">
         <ComponentRef Id="DesktopExecutable" />
