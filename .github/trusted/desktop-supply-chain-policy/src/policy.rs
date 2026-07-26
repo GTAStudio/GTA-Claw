@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use toml::Value as TomlValue;
 
 use crate::identity::canonical_caseless;
-use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot, require_plain};
+use crate::input::{DEFAULT_FILE_LIMIT, SafeRoot, require_plain, sha256};
 use crate::ownership::{CODEOWNERS_PATH, is_codeowners_path_or_alias, validate_codeowners};
 use crate::{PolicyError, PolicyResult, error};
 
@@ -1588,6 +1588,113 @@ fn bootstrap_manifest_inventory(root: &SafeRoot) -> PolicyResult<bool> {
 /// Computes the exact pre-P04f product and trust-root workflow fingerprint.
 pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
     Ok(BootstrapSnapshotArchive::from_root(root)?.semantic_fingerprint())
+}
+
+fn read_bootstrap_archive(path: &Path) -> PolicyResult<(PathBuf, BootstrapSnapshotArchive)> {
+    let file_name = path.file_name().ok_or_else(|| {
+        PolicyError::new(format!(
+            "Bootstrap snapshot input has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let lexical_parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(lexical_parent)
+        .map_err(|cause| error("canonicalize Bootstrap snapshot input directory", cause))?;
+    let safe_parent = SafeRoot::new(&parent)?;
+    let bytes = safe_parent.read_bytes(file_name, MAX_REPOSITORY_BYTES)?;
+    let canonical = safe_parent.regular_file(file_name, MAX_REPOSITORY_BYTES)?;
+    let archive = BootstrapSnapshotArchive::parse(&bytes)
+        .map_err(|cause| error("parse Bootstrap snapshot input", cause))?;
+    archive.validate_bootstrap_contents()?;
+    if archive.canonical_bytes()? != bytes {
+        return Err(PolicyError::new(format!(
+            "Bootstrap snapshot input is not canonical: {}",
+            canonical.display()
+        )));
+    }
+    Ok((canonical, archive))
+}
+
+/// Fingerprints one strict canonical GTABOOT1 archive.
+pub fn bootstrap_archive_fingerprint(path: &Path) -> PolicyResult<(PathBuf, String)> {
+    let (canonical, archive) = read_bootstrap_archive(path)?;
+    Ok((canonical, archive.semantic_fingerprint()))
+}
+
+fn bootstrap_root_refusal(
+    root: &SafeRoot,
+    snapshot: &Path,
+    mismatch: impl fmt::Display,
+) -> PolicyError {
+    PolicyError::new(format!(
+        "Bootstrap root input {} is not an exact materialization of bootstrap archive {}: \
+         {mismatch}; live/Final repository roots are not historical Bootstrap inputs; use \
+         `bootstrap-fingerprint --snapshot <archive>`",
+        root.path().display(),
+        snapshot.display()
+    ))
+}
+
+/// Fingerprints a root only after proving it exactly materializes one GTABOOT1 archive.
+pub fn verified_bootstrap_root_fingerprint(
+    root: &SafeRoot,
+    snapshot: &Path,
+) -> PolicyResult<(PathBuf, String)> {
+    let (canonical_snapshot, archive) = read_bootstrap_archive(snapshot)?;
+    let expected = archive
+        .entries()
+        .map(|(path, _)| path.to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual = root
+        .list_all(MAX_REPOSITORY_FILES, MAX_REPOSITORY_BYTES)
+        .map_err(|cause| {
+            bootstrap_root_refusal(
+                root,
+                &canonical_snapshot,
+                format!("could not inventory root: {cause}"),
+            )
+        })?
+        .into_iter()
+        .map(|entry| entry.relative)
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).next();
+        let unexpected = actual.difference(&expected).next();
+        let mismatch = match (missing, unexpected) {
+            (Some(missing), Some(unexpected)) => {
+                format!("missing {missing:?} and found unexpected {unexpected:?}")
+            }
+            (Some(missing), None) => format!("missing {missing:?}"),
+            (None, Some(unexpected)) => format!("found unexpected {unexpected:?}"),
+            (None, None) => "inventory changed".to_owned(),
+        };
+        return Err(bootstrap_root_refusal(root, &canonical_snapshot, mismatch));
+    }
+    for (path, expected_payload) in archive.entries() {
+        let actual_payload =
+            normalize_text(&root.read_bytes(path, MAX_LOCK_BYTES).map_err(|cause| {
+                bootstrap_root_refusal(
+                    root,
+                    &canonical_snapshot,
+                    format!("could not read {path:?}: {cause}"),
+                )
+            })?);
+        if actual_payload != expected_payload {
+            return Err(bootstrap_root_refusal(
+                root,
+                &canonical_snapshot,
+                format!(
+                    "entry {path:?} expected payload SHA-256 {}, found {}",
+                    sha256(expected_payload),
+                    sha256(&actual_payload)
+                ),
+            ));
+        }
+    }
+    Ok((canonical_snapshot, archive.semantic_fingerprint()))
 }
 
 /// Serializes the exact pre-P04f policy inputs into the canonical Bootstrap snapshot format.
