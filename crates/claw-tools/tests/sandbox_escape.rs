@@ -51,6 +51,41 @@ fn the_sibling_secret_really_exists_outside_the_root() {
     );
 }
 
+/// Positive control for every link-based escape test in this file.
+///
+/// Seven of those tests return early when the platform cannot build the link
+/// they attack, which is correct — a junction is not constructible on Linux and
+/// an unprivileged Windows host may refuse a symbolic link. But an early return
+/// is indistinguishable from a pass, so a host that could build *neither* kind
+/// of directory link would run all seven to a silent success and this file
+/// would report that no escape was possible when in fact none was attempted.
+/// This asserts the capability those tests depend on, so that degradation
+/// becomes one loud failure here rather than seven quiet passes elsewhere.
+#[test]
+fn the_platform_can_build_at_least_one_directory_link_escape() {
+    let tree = TempTree::new("linkcontrol");
+    tree.dir("outside");
+    tree.dir("workspace");
+    let target = tree.join("outside");
+    let link = tree.join("workspace/bridge");
+
+    let symlinked = try_symlink_dir(&target, &link);
+    if symlinked {
+        remove_dir_link(&link).expect("a directory symlink is removable");
+    }
+    let junctioned = try_junction(&target, &link);
+    if junctioned {
+        remove_dir_link(&link).expect("a junction is removable");
+    }
+
+    assert!(
+        symlinked || junctioned,
+        "neither a directory symlink nor a junction can be created on this host, \
+         so every link-based escape test in this file returns before attempting \
+         its escape and the whole suite proves nothing"
+    );
+}
+
 #[test]
 fn parent_traversal_is_refused_in_every_position() {
     let (_tree, sandbox) = workspace();
@@ -605,9 +640,19 @@ fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
     });
 
     let path = sandbox.relative("flip/target.txt").expect("legal name");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The race is exercised only when a swap actually lands while writes are in
+    // flight, so the loop runs until that has been observed rather than for a
+    // fixed span. A saturated host can starve the flipper for several seconds;
+    // the answer is to give it more wall clock, never to accept a weaker claim.
+    // The outer bound exists solely so a flipper that can never win fails the
+    // run with a reason instead of hanging the suite.
+    const TARGET_ATTEMPTS: u32 = 400;
+    const TARGET_FLIPS: usize = 20;
+    const UNLOADED_WINDOW: Duration = Duration::from_secs(5);
+    const SATURATED_WINDOW: Duration = Duration::from_secs(90);
+    let started = Instant::now();
     let mut attempts = 0_u32;
-    while Instant::now() < deadline && (attempts < 400 || flips.load(Ordering::Relaxed) < 20) {
+    loop {
         attempts += 1;
         let _ = sandbox.write_file(&path, b"ATTACKER-CONTROLLED", WriteMode::Overwrite);
         // Read back through a path the sandbox never validated, so the check
@@ -617,14 +662,40 @@ fn a_parent_swapped_concurrently_never_truncates_a_file_outside_the_root() {
             survived, "ORIGINAL-OUTSIDE-CONTENT",
             "a racing parent swap let a write reach outside the root"
         );
+
+        let observed = flips.load(Ordering::Relaxed);
+        let elapsed = started.elapsed();
+        if attempts >= TARGET_ATTEMPTS && observed >= TARGET_FLIPS {
+            break;
+        }
+        if observed > 0 && elapsed >= UNLOADED_WINDOW {
+            break;
+        }
+        if elapsed >= SATURATED_WINDOW {
+            break;
+        }
+        if observed == 0 && elapsed >= UNLOADED_WINDOW {
+            // The flipper can only win the rename in the gap between two
+            // writes, and on Windows the pinned ancestor makes the kernel
+            // refuse it outright while a write is open. Once the ordinary
+            // window has passed without a single swap, yield that gap
+            // deliberately rather than spinning the writer against it.
+            thread::sleep(Duration::from_millis(1));
+        }
     }
     stop.store(true, Ordering::Relaxed);
     flipper.join().expect("flipper thread finishes");
-    // Without this the test could silently degrade into a no-op on a host
-    // where neither link type can be created.
+    let observed = flips.load(Ordering::Relaxed);
+    let elapsed = started.elapsed();
+    // Without this the test could silently degrade into a no-op on a host where
+    // neither link type can be created, or where the flipper never won a swap.
+    // Zero is the only value that means no race happened, so it stays a failure
+    // however loaded the machine is: a guard that yields under pressure is not
+    // a guard, and pressure is when the race it guards would matter most.
     assert!(
-        flips.load(Ordering::Relaxed) > 0,
-        "the swap never happened, so no race was exercised"
+        observed > 0,
+        "no parent swap landed across {attempts} attempts in {elapsed:?}, so the \
+         race was never exercised and this run proves nothing"
     );
     assert_eq!(
         fs::read_to_string(&victim).expect("outside file survives"),
