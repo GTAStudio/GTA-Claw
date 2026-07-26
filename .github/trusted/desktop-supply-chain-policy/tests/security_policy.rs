@@ -4985,8 +4985,13 @@ fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
 
 #[test]
 fn reviewed_build_artifact_pin_table_shape_is_enforced() {
-    const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
-    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-jpegd-jpege-metal-pdf-textlayout.tar.gz";
+    // The accepted tuples below are real: both asset names exist in the `skia-binaries` 0.99.0
+    // release and both digests are the SHA-256 GitHub publishes for them, read from `.assets[].digest`
+    // (sizes 15024772 and 15063260 bytes). A fixture upstream never publishes would let this rule
+    // read as though it constrained real asset names while never having met one.
+    const DIGEST: &str = "15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8";
+    const SIM_DIGEST: &str = "ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e";
+    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz";
     validate_build_artifact_pin_table(&[(
         "skia-bindings",
         "0.99.0",
@@ -4994,7 +4999,7 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
         url,
         DIGEST,
     )])
-    .expect("a well formed reviewed pin is accepted");
+    .expect("the real iOS device release asset is accepted for the device target");
     validate_build_artifact_pin_table(&[]).expect("an empty reviewed pin table is well formed");
 
     for (label, pins) in [
@@ -5066,64 +5071,73 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
 
     // A simulator archive is a real upstream asset with a real digest, and its name *contains* the
     // device target, so a substring test accepts it for a device pin. The binary it carries is
-    // built for the simulator. Each of these is asserted on its own production error so a rule that
-    // stops distinguishing them fails here rather than silently blessing the wrong archive.
-    let sim = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-sim-jpegd-jpege-metal-pdf-textlayout.tar.gz";
+    // built for the simulator. The hostile case below therefore carries the simulator's own real
+    // digest: it is a coherent, fully verifiable tuple whose only false statement is the target.
+    // Each of these is asserted on its own production error so a rule that stops distinguishing
+    // them fails here rather than silently blessing the wrong archive.
+    let sim = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-sim-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz";
     validate_build_artifact_pin_table(&[(
         "skia-bindings",
         "0.99.0",
         "aarch64-apple-ios-sim",
         sim,
-        DIGEST,
+        SIM_DIGEST,
     )])
-    .expect("the simulator archive is admitted for the simulator target");
+    .expect("the real simulator release asset is admitted for the simulator target");
 
-    for (label, target, url, expected) in [
+    for (label, target, url, digest, expected) in [
         (
             "simulator archive declared as the device target",
             "aarch64-apple-ios",
             sim,
+            SIM_DIGEST,
             "declares aarch64-apple-ios but its archive is built for aarch64-apple-ios-sim",
         ),
         (
             "archive key of another upstream build",
             "aarch64-apple-ios",
             "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-1111111111111111111f-aarch64-apple-ios-jpegd-pdf.tar.gz",
+            DIGEST,
             "does not carry the admitted skia-bindings archive key a25a0fdb7d90429aa2d1",
         ),
         (
             "asset from a different release",
             "aarch64-apple-ios",
             "https://github.com/rust-skia/skia-binaries/releases/download/0.50.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-jpegd-pdf.tar.gz",
+            DIGEST,
             "is not the admitted skia-bindings 0.99.0 release download prefix",
         ),
         (
             "asset hosted somewhere else",
             "aarch64-apple-ios",
             "https://attacker.example.invalid/aarch64-apple-ios.tar.gz",
+            DIGEST,
             "is not the admitted skia-bindings 0.99.0 release download prefix",
         ),
         (
             "extra path segment below the release",
             "aarch64-apple-ios",
             "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/nested/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-jpegd-pdf.tar.gz",
+            DIGEST,
             "is not a single skia-bindings release asset",
         ),
         (
             "target no platform admits",
             "aarch64-apple-ios",
             "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-pc-windows-msvc-jpegd-pdf.tar.gz",
+            DIGEST,
             "names no admitted target",
         ),
         (
             "target name that merely starts with an admitted one",
             "aarch64-apple-ios",
             "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios2-jpegd-pdf.tar.gz",
+            DIGEST,
             "names no admitted target",
         ),
     ] {
         let error =
-            validate_build_artifact_pin_table(&[("skia-bindings", "0.99.0", target, url, DIGEST)])
+            validate_build_artifact_pin_table(&[("skia-bindings", "0.99.0", target, url, digest)])
                 .expect_err(label)
                 .to_string();
         assert!(

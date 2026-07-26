@@ -447,6 +447,16 @@ const BUILD_ARTIFACT_KEY_LEN: usize = 20;
 /// and `validate_mobile_lock` refuses to admit any workspace whose lock contains a fetching package
 /// while the corresponding pins are absent. That makes the pin impossible to skip, keeps filling it
 /// a reviewed trust-root edit, and stops a second fetching package appearing silently.
+///
+/// A pin therefore binds a target and a feature set *together*: the asset name states both, and the
+/// digest covers the archive that one combination produced. Changing the resolved feature set of the
+/// Skia dependency changes the asset name, so every affected tuple must be regenerated — the old
+/// digest stays valid for an archive the build will no longer fetch, which is a stale pin rather
+/// than a failing one. Nothing below enforces that, and this comment does not claim it does: the
+/// validator cannot observe the build's resolved features. Enforcing it would mean reproducing
+/// `skia-bindings`' cargo-feature to asset-token mapping inside the trust root, where it could drift
+/// from upstream silently. Feature sets are also not uniform across platforms — 0.99.0 publishes
+/// `metal` for Apple targets and `vulkan` for Android ones — so no cross-target equality is assumed.
 const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 0] = [];
 
 const FORBIDDEN_GUI_NAMES: [&str; 11] = [

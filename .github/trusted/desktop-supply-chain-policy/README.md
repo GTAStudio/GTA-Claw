@@ -165,6 +165,17 @@ one: `skia-binaries-<key>-aarch64-apple-ios-sim-<features>.tar.gz` contains `aar
 That archive is a real upstream asset with a real published digest, so neither the digest nor the
 host proves which target it was built for — only its name does.
 
+A pin binds a **target and a feature set together**, because the asset name states both and the
+digest covers the archive that one combination produced. A change to the resolved Skia feature set
+changes the asset name, so every affected tuple has to be regenerated; the recorded digest stays
+valid for an archive the build will no longer fetch, which fails as a stale pin rather than as a
+mismatch. That is a rule for whoever fills the table and **not** a control: the validator cannot
+observe the build's resolved features, and reproducing `skia-bindings`' cargo-feature to
+asset-token mapping here would put a copy of an upstream build script in the trust root that can
+drift from it silently. Feature sets are not uniform across platforms either — 0.99.0 publishes
+`metal` for the Apple targets and `vulkan` for the Android ones — so the tuples are not required to
+agree with one another.
+
 #### Why the lockfile does not already cover this
 
 **The `Cargo.lock` checksum covers the crates.io package — it says nothing about the tarball
