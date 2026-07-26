@@ -238,14 +238,40 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn render_ledger(decisions: &[TestDecision]) -> String {
-    if decisions.is_empty() {
-        return "schema_version = 1\ndecisions = []\n".to_owned();
+const EMPTY_LEDGER: &str = "schema_version = 1\ndecisions = []\n";
+
+/// Returns a ledger's `[[decisions]]` blocks verbatim.
+///
+/// Fixtures used to render their candidate ledger from nothing, which silently assumed the
+/// committed ledger carries no decisions. That held only while `decisions` was empty: the validator
+/// compares base and candidate records **positionally** (`bootstrap_decisions.rs`, `appended_decisions`),
+/// so the first real bound decision would have made every from-scratch fixture ledger differ at
+/// index 0 and fail as `edited existing record id 1` — a fixture artefact, not a policy finding.
+fn base_decision_blocks(ledger: &str) -> Vec<String> {
+    ledger
+        .split("\n[[decisions]]\n")
+        .skip(1)
+        .map(|rest| {
+            let body = rest.split("\n[[standing]]\n").next().unwrap_or_default();
+            format!("\n[[decisions]]\n{body}")
+        })
+        .collect()
+}
+
+/// Renders `base`'s decisions followed by `appended`, whose ids are treated as 1-based offsets from
+/// the base rather than absolute values.
+fn ledger_text(base: &str, appended: &[TestDecision]) -> String {
+    let base_blocks = base_decision_blocks(base);
+    if base_blocks.is_empty() && appended.is_empty() {
+        return EMPTY_LEDGER.to_owned();
     }
     let mut output = String::from("schema_version = 1\n");
-    for decision in decisions {
+    for block in &base_blocks {
+        output.push_str(block);
+    }
+    for decision in appended {
         output.push_str("\n[[decisions]]\n");
-        output.push_str(&format!("id = {}\n", decision.id));
+        output.push_str(&format!("id = {}\n", decision.id + base_blocks.len()));
         for (field, value) in [
             ("path", decision.path.as_str()),
             ("base_oid", decision.base_oid.as_str()),
@@ -273,10 +299,31 @@ fn render_ledger(decisions: &[TestDecision]) -> String {
     output
 }
 
+/// Renders a ledger with no inherited decisions, so ids are written exactly as given.
+///
+/// Callers that build deliberately malformed ledgers depend on that: they pass duplicate and
+/// out-of-order ids and assert the validator rejects them.
+fn render_ledger(decisions: &[TestDecision]) -> String {
+    ledger_text(EMPTY_LEDGER, decisions)
+}
+
+/// The number of decisions the repository's committed ledger carries.
+///
+/// Derived from the repository rather than assumed, so an expectation that names a record id stays
+/// correct once the first real bound decision lands.
+fn committed_decision_count() -> usize {
+    committed_ledger_text().matches("\n[[decisions]]\n").count()
+}
+
+fn committed_ledger_text() -> String {
+    fs::read_to_string(repo_root().join(BOOTSTRAP_SOURCE_DECISIONS_PATH))
+        .expect("read committed decision ledger")
+}
+
 fn write_ledger(tree: &TempTree, decisions: &[TestDecision]) {
     fs::write(
         tree.join(BOOTSTRAP_SOURCE_DECISIONS_PATH),
-        render_ledger(decisions),
+        ledger_text(&committed_ledger_text(), decisions),
     )
     .expect("write decision ledger");
 }
@@ -625,6 +672,56 @@ fn malformed_schema_hash_duplicate_unsorted_and_noncanonical_ledgers_fail() {
     }
 }
 
+/// Fixture ledgers must build on decisions they did not author.
+///
+/// This is deliberately written against `ledger_text` with a synthetic base rather than against the
+/// repository's ledger, because the repository carries no decisions yet: a test that read the real
+/// ledger would assert `0 + 1 == 1` and pass no matter what the code did. The base below supplies
+/// the condition that does not exist yet, which is the whole point — the defect this guards is
+/// invisible until the first real bound decision lands, and by then it fails four unrelated tests
+/// with a message that blames the new record rather than the fixture.
+#[test]
+fn fixture_ledgers_extend_the_committed_decisions_instead_of_replacing_them() {
+    let inherited = ledger_text(EMPTY_LEDGER, &[placeholder_decision(1, UPSTREAM_WORKFLOW)]);
+    assert_eq!(base_decision_blocks(&inherited).len(), 1);
+
+    let extended = ledger_text(&inherited, &[placeholder_decision(1, RUSTFMT)]);
+    let blocks = base_decision_blocks(&extended);
+
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the inherited decision was dropped instead of extended: {extended}"
+    );
+    assert_eq!(
+        blocks[0],
+        base_decision_blocks(&inherited)[0],
+        "the inherited decision was rewritten, which the validator reports as an edited record"
+    );
+    assert!(
+        blocks[1].contains("id = 2\n"),
+        "the appended decision restarted numbering instead of continuing it: {}",
+        blocks[1]
+    );
+    assert!(
+        blocks[1].contains(&quote(RUSTFMT)),
+        "the appended decision lost its path: {}",
+        blocks[1]
+    );
+
+    // A ledger written onto a tree inherits whatever the repository committed, so the count the
+    // fixtures assume always matches the count the validator will read.
+    let tree = snapshot_fixture("ledger-extends-committed");
+    write_ledger(&tree, &[placeholder_decision(1, UPSTREAM_WORKFLOW)]);
+    let written = fs::read_to_string(tree.join(BOOTSTRAP_SOURCE_DECISIONS_PATH))
+        .expect("read fixture ledger");
+    assert_eq!(
+        base_decision_blocks(&written).len(),
+        committed_decision_count() + 1,
+        "write_ledger did not carry the committed decisions into the fixture"
+    );
+}
+
 #[test]
 fn existing_decisions_are_immutable_and_new_decisions_cannot_be_extraneous() {
     let historical = placeholder_decision(1, UPSTREAM_WORKFLOW);
@@ -636,7 +733,10 @@ fn existing_decisions_are_immutable_and_new_decisions_cannot_be_extraneous() {
         &deleted_trusted,
         &deleted_candidate,
         &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
-        "deleted existing record id 1",
+        &format!(
+            "deleted existing record id {}",
+            committed_decision_count() + 1
+        ),
     );
 
     let edited_trusted = snapshot_fixture("edited-trusted");
@@ -649,7 +749,10 @@ fn existing_decisions_are_immutable_and_new_decisions_cannot_be_extraneous() {
         &edited_trusted,
         &edited_candidate,
         &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
-        "edited existing record id 1",
+        &format!(
+            "edited existing record id {}",
+            committed_decision_count() + 1
+        ),
     );
 
     let extra_trusted = snapshot_fixture("extra-trusted");
@@ -662,7 +765,10 @@ fn existing_decisions_are_immutable_and_new_decisions_cannot_be_extraneous() {
         &extra_trusted,
         &extra_candidate,
         &manifest([('M', BOOTSTRAP_SOURCE_DECISIONS_PATH)]),
-        "extraneous Bootstrap preservation decision id 1",
+        &format!(
+            "extraneous Bootstrap preservation decision id {}",
+            committed_decision_count() + 1
+        ),
     );
 }
 
