@@ -6561,7 +6561,15 @@ fn compose_terminal_close(
     primary: StateError,
     close: claw_sqlite_file_control::TerminalCloseOutcome,
 ) -> StateError {
-    if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
+    if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed
+        // A bounded operation that reaches its deadline is still running when
+        // its connection is taken away, so quarantining that connection is the
+        // designed containment rather than an additional cleanup failure.
+        // Reporting the deadline itself keeps the outcome identical on every
+        // platform, where it otherwise depended on whether the in-flight
+        // statement happened to finish before the terminal close.
+        || matches!(primary, StateError::OperationTimedOut { .. })
+    {
         primary
     } else {
         append_operation_cleanup(
@@ -6806,15 +6814,7 @@ impl<'store> StoreOperationConnection<'store> {
             .take()
             .expect("failed state operation connection remains owned");
         let close = self.discard(connection).await;
-        if close == claw_sqlite_file_control::TerminalCloseOutcome::Closed {
-            primary
-        } else {
-            append_operation_cleanup(
-                self.deadline_state.operation,
-                primary,
-                format!("terminal connection close: {close:?}"),
-            )
-        }
+        compose_terminal_close(self.deadline_state.operation, primary, close)
     }
 }
 
