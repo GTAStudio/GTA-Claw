@@ -49,6 +49,23 @@ const LEGACY_RUNTIME_INVENTORY: &[&str] = &[
     "src/utils/splitMessage.ts",
     "tsconfig.json",
 ];
+// The legacy build roots. Each one may be listed above or absent from the tree,
+// but never absent from both: dropping a root from the inventory while the file
+// survives would silently un-audit it.
+const LEGACY_BUILD_ROOTS: &[&str] = &[
+    "Dockerfile",
+    "package-lock.json",
+    "package.json",
+    "tsconfig.json",
+];
+// High-water mark for grandfathered TypeScript. This number may only ever be
+// lowered; raising it re-opens the surface the ratchet exists to close.
+const LEGACY_TYPESCRIPT_CEILING: usize = 18;
+// Container definitions that may still build a Node runtime. Every entry must
+// also appear in LEGACY_RUNTIME_INVENTORY, so the exemption disappears the
+// moment the container itself leaves the inventory.
+const LEGACY_CONTAINER_RUNTIMES: &[&str] = &["Dockerfile"];
+const NODE_BASE_IMAGE_NAMES: &[&str] = &["node", "nodejs"];
 const ALLOWED_INERT_WORKFLOW_LINES: &[(&str, &str)] = &[
     (
         ".github/workflows/macos-packaging.yml",
@@ -81,25 +98,31 @@ fn repository_legacy_javascript_surface_does_not_grow() {
         LEGACY_RUNTIME_INVENTORY.len(),
         "legacy runtime inventory contains duplicate paths"
     );
-    assert_eq!(
+    assert!(
         LEGACY_RUNTIME_INVENTORY
             .iter()
             .filter(|path| path.ends_with(".ts") || path.ends_with(".tsx"))
-            .count(),
-        18,
-        "the binding legacy TypeScript ceiling changed without an explicit ratchet update"
+            .count()
+            <= LEGACY_TYPESCRIPT_CEILING,
+        "the binding legacy TypeScript ceiling was raised instead of lowered"
     );
-    for required_root in [
-        "Dockerfile",
-        "package-lock.json",
-        "package.json",
-        "tsconfig.json",
-    ] {
+    for required_root in LEGACY_BUILD_ROOTS {
         assert!(
-            LEGACY_RUNTIME_INVENTORY.contains(&required_root),
-            "legacy build root is missing from the explicit inventory: {required_root}"
+            LEGACY_RUNTIME_INVENTORY.contains(required_root) || !root.join(required_root).exists(),
+            "legacy build root left the explicit inventory while it still exists: {required_root}"
         );
     }
+    for exempt_container in LEGACY_CONTAINER_RUNTIMES {
+        assert!(
+            LEGACY_RUNTIME_INVENTORY.contains(exempt_container),
+            "container runtime exemption escapes the legacy inventory: {exempt_container}"
+        );
+    }
+    assert!(
+        stale_inventory_entries(&root, LEGACY_RUNTIME_INVENTORY).is_empty(),
+        "the legacy inventory must shrink in the same commit that deletes its files: {:?}",
+        stale_inventory_entries(&root, LEGACY_RUNTIME_INVENTORY)
+    );
     for allowed in LEGACY_RUNTIME_INVENTORY {
         assert!(
             !allowed.starts_with('/') && !allowed.contains('\\') && !allowed.contains("/../"),
@@ -135,6 +158,7 @@ fn repository_legacy_javascript_surface_does_not_grow() {
     violations.extend(scan_git_index(&root).expect("scan tracked repository entry modes"));
     violations.extend(scan_workflows(&root).expect("scan workflow command policy"));
     violations.extend(scan_local_actions(&root).expect("scan repository-owned action runtimes"));
+    violations.extend(scan_containers(&root).expect("scan container runtime policy"));
     violations.sort();
 
     assert!(
@@ -334,6 +358,101 @@ runs:
 }
 
 #[test]
+fn container_definitions_cannot_reintroduce_a_node_runtime() {
+    let fixture = TemporaryTree::new("containers");
+    fixture.write(
+        "services/web/Dockerfile",
+        b"FROM node:20-bookworm-slim\nRUN npm install\nCMD [\"node\", \"dist/index.js\"]\n",
+    );
+    fixture.write(
+        "services/api/Dockerfile.build",
+        b"# FROM node:20 is only a comment\nFROM --platform=linux/amd64 docker.io/library/node:22 AS builder\nRUN corepack yarn install\n",
+    );
+    fixture.write(
+        "packaging/linux/Dockerfile.build",
+        b"FROM rust:1.97.0-bookworm@sha256:aaaa\nRUN apt-get install -y python3\n",
+    );
+    fixture.write("packaging/linux/notes.txt", b"FROM node:20\n");
+
+    let violations = scan_containers(fixture.path()).expect("scan planted container definitions");
+
+    for expected in [
+        "services/web/Dockerfile:1: node base image node",
+        "services/web/Dockerfile:2: forbidden container token npm",
+        "services/web/Dockerfile:3: forbidden container token node",
+        "services/api/Dockerfile.build:2: node base image node",
+        "services/api/Dockerfile.build:3: forbidden container token corepack",
+        "services/api/Dockerfile.build:3: forbidden container token yarn",
+    ] {
+        assert!(
+            violations.iter().any(|violation| violation == expected),
+            "container gate missed {expected}: {violations:?}"
+        );
+    }
+    assert!(
+        violations
+            .iter()
+            .all(|violation| !violation.starts_with("services/api/Dockerfile.build:1")),
+        "commented instructions must not be flagged: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|violation| !violation.starts_with("packaging/")),
+        "a pinned Rust builder and a plain text file must stay clean: {violations:?}"
+    );
+}
+
+#[test]
+fn an_inventoried_container_is_exempt_only_while_it_is_inventoried() {
+    let fixture = TemporaryTree::new("container-exemption");
+    fixture.write("Dockerfile", b"FROM node:20\nRUN npm ci\n");
+
+    assert!(
+        LEGACY_CONTAINER_RUNTIMES
+            .iter()
+            .all(|exempt| LEGACY_RUNTIME_INVENTORY.contains(exempt)),
+        "an exempt container escaped the legacy inventory"
+    );
+    assert!(
+        scan_containers(fixture.path())
+            .expect("scan exempt container")
+            .is_empty()
+    );
+
+    fixture.write("second/Dockerfile", b"FROM node:20\n");
+
+    assert_eq!(
+        scan_containers(fixture.path()).expect("scan unexempt sibling"),
+        [
+            "second/Dockerfile:1: forbidden container token node",
+            "second/Dockerfile:1: node base image node"
+        ]
+    );
+}
+
+#[test]
+fn inventory_entries_that_no_longer_exist_are_reported_as_stale() {
+    let fixture = TemporaryTree::new("stale-inventory");
+    fixture.write("package.json", b"grandfathered");
+    fixture.write("src/index.ts", b"grandfathered");
+    let inventory = ["package.json", "src/index.ts", "src/config.ts"];
+
+    assert_eq!(
+        stale_inventory_entries(fixture.path(), &inventory),
+        ["src/config.ts"]
+    );
+
+    fs::remove_file(fixture.path().join("src/index.ts")).expect("remove grandfathered entry");
+
+    assert_eq!(
+        stale_inventory_entries(fixture.path(), &inventory),
+        ["src/config.ts", "src/index.ts"],
+        "deleting a file must force its inventory entry out in the same commit"
+    );
+}
+
+#[test]
 fn tracked_symlink_and_gitlink_modes_are_rejected() {
     let fixture = b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\tREADME.md\0\
 120000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0\tlinked-runtime\0\
@@ -511,6 +630,122 @@ fn collect_action_files(directory: &Path, action_files: &mut Vec<PathBuf>) -> io
         }
     }
     Ok(())
+}
+
+fn stale_inventory_entries(root: &Path, inventory: &[&str]) -> Vec<String> {
+    let mut stale = inventory
+        .iter()
+        .filter(|relative| !root.join(relative).exists())
+        .map(|relative| (*relative).to_owned())
+        .collect::<Vec<_>>();
+    stale.sort();
+    stale
+}
+
+fn scan_containers(root: &Path) -> io::Result<Vec<String>> {
+    let mut container_files = Vec::new();
+    collect_container_files(root, &mut container_files)?;
+    container_files.sort();
+    let mut violations = Vec::new();
+    for path in container_files {
+        let relative = normalized_relative(root, &path);
+        if LEGACY_CONTAINER_RUNTIMES.contains(&relative.as_str()) {
+            continue;
+        }
+        let document = fs::read_to_string(path)?;
+        scan_container_document(&relative, &document, &mut violations);
+    }
+    violations.sort();
+    Ok(violations)
+}
+
+fn collect_container_files(directory: &Path, container_files: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        } else if file_type.is_dir() {
+            if matches!(entry.file_name().to_str(), Some(".git" | "target")) {
+                continue;
+            }
+            collect_container_files(&path, container_files)?;
+        } else if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                let lower = name.to_ascii_lowercase();
+                matches!(lower.as_str(), "dockerfile" | "containerfile")
+                    || lower.starts_with("dockerfile.")
+                    || lower.starts_with("containerfile.")
+                    || lower.ends_with(".dockerfile")
+            })
+        {
+            container_files.push(path);
+        }
+    }
+    Ok(())
+}
+
+// A container definition can reintroduce the whole Node runtime without writing
+// a single forbidden token into a workflow, because the build happens inside
+// the image. The workflow scanner cannot see that, so containers are scanned
+// directly.
+fn scan_container_document(path: &str, document: &str, violations: &mut Vec<String>) {
+    for (line_index, line) in document.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let line_number = line_index + 1;
+        if let Some(image) = base_image_reference(trimmed)
+            && NODE_BASE_IMAGE_NAMES.contains(&image.as_str())
+        {
+            violations.push(format!("{path}:{line_number}: node base image {image}"));
+        }
+        let mut commands = std::collections::BTreeSet::new();
+        let decoded = decode_policy_escapes(trimmed);
+        for token in decoded.split(|character: char| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | '\\'))
+        }) {
+            let command = normalized_command_token(token);
+            if is_forbidden_workflow_token(&command) {
+                commands.insert(command);
+            }
+        }
+        violations.extend(
+            commands.into_iter().map(|command| {
+                format!("{path}:{line_number}: forbidden container token {command}")
+            }),
+        );
+    }
+}
+
+// Returns the bare repository name of a `FROM` instruction: no registry, no
+// tag, no digest. `--platform=` flags and `AS <stage>` aliases are discarded so
+// they cannot hide the image behind an option.
+fn base_image_reference(line: &str) -> Option<String> {
+    let mut tokens = line.split_ascii_whitespace();
+    if !tokens.next()?.eq_ignore_ascii_case("from") {
+        return None;
+    }
+    let reference = tokens.find(|token| !token.starts_with("--"))?;
+    let repository = reference
+        .split_once('@')
+        .map_or(reference, |(repository, _)| repository);
+    let repository = repository
+        .rsplit_once(':')
+        .filter(|(head, _)| !head.is_empty())
+        .map_or(repository, |(repository, _)| repository);
+    Some(
+        repository
+            .rsplit('/')
+            .next()
+            .unwrap_or(repository)
+            .to_ascii_lowercase(),
+    )
 }
 
 fn scan_policy_document(path: &str, document: &str, violations: &mut Vec<String>) {
