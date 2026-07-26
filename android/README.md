@@ -29,7 +29,9 @@ out-of-tree copy was therefore not restorable; this branch is.
 
 Relocated from `apps/gta-claw-android/` to top-level `android/`, mirroring
 `desktop/`. That path is occupied on `main` by the shipped no-GUI crate, and it
-is the location this UI is intended to occupy if the trust root ever admits it.
+is the location this UI is intended to occupy. The trust root has since
+admitted `android/` as a workspace path, though not in this tree's shape —
+see "Correction: a placement now exists" below.
 The five path dependencies were rewritten from `../../crates/` to `../crates/`
 to match the new depth. **Nothing else was modified.**
 
@@ -94,12 +96,70 @@ Android `Cargo.lock`; the manifest inventory is a closed set; and
 `[target.'cfg(...)'.*]` table, the `package = "..."` rename field, and every
 package name in the root `Cargo.lock`. A root member also inherits
 `unsafe_code = "forbid"` exactly, under which the `android_main` entry point is
-unrepresentable. **There is no placement for a Slint crate in this repository
-today except `desktop/`, which is itself byte-frozen.**
+unrepresentable.
 
 Admitting `slint` to a root member would also add 560 packages and 26 duplicated
 crates to the **root** lock, forcing roughly 17 skips into a byte-frozen
 `deny.toml` whose holes would then stop protecting the daemon as well.
+
+### Correction: a placement now exists, and this tree does not fit it
+
+An earlier revision of this file ended the section above with "there is no
+placement for a Slint crate in this repository today except `desktop/`".
+**That was true when written and is now false.** PR #72 landed on `main`
+at `988c6d64b6ec` and admits two top-level sibling workspaces, `android/`
+and `ios/`, alongside `desktop/`. The claim is corrected here rather than
+deleted, because a reader who finds this branch needs to know the barrier
+moved.
+
+The placement is bounded, not a prefix rule, and **this tree does not
+satisfy it.** The list below was produced by building the trust root's own
+validator from `main` and running it against this branch, taking each
+rejection in turn — not by reading the policy source:
+
+1. `REJECTED: unexpected deny/audit policy file: android/deny.toml`
+   A mobile `deny.toml` is rejected outright. Nothing executes it, because
+   `android-packaging.yml` is an admitted path that does not exist, and the
+   trust root's stated reasoning is that a policy file nothing runs is worse
+   than none because it reads as protection. The `deny.toml` in this archive
+   is therefore a file that must be **deleted, not ported**, and it should
+   return only in the same change that lands the workflow running it.
+2. `REJECTED: android workspace is incomplete: present ["android/Cargo.toml",
+   "android/Cargo.lock"], missing ["android/apps/gta-claw-android-shell/Cargo.toml"]`
+   A platform is a complete unit. This crate sits directly at `android/`;
+   the admitted shape puts the sole app member at
+   `android/apps/gta-claw-android-shell/`, and the package must be named
+   `gta-claw-android-shell` — deliberately distinct from the root
+   `gta-claw-android` client core so a shell can path-depend on its core
+   without a name collision.
+3. `REJECTED: android/Cargo.toml top-level schema changed`
+   After relocating the member, the workspace manifest is still rejected.
+   `validate_mobile_workspace` requires top-level keys to be exactly
+   `profile` and `workspace`, and `[workspace]` keys to be exactly
+   `dependencies`, `lints`, `members`, `package`, `resolver`. This archive's
+   manifest is a combined workspace-and-package file with no `[profile]`,
+   no `[workspace.package]` and no `[workspace.dependencies]`.
+   **`desktop/Cargo.toml` is the working template**; mobile mirrors it.
+
+The lint policy is *not* a barrier: this crate's `unsafe_code = "deny"`
+byte-matches `desktop/Cargo.toml`, and the rule is "no weaker than desktop",
+so the single `android_main` exception survives. The ceiling that blocks a
+**root** member does not block a mobile-workspace member.
+
+Two barriers beyond the three above were **not** reached, because validation
+stops at the first rejection, and they are the likely next ones. They are
+recorded as unverified: a mobile lock may not introduce a second `slint`
+line — any `slint` entry must match the release in the protected desktop
+lock — and wherever a mobile lock contains `skia-bindings` it must be the
+pinned release. This archive's lock was resolved independently and neither
+property has been checked against it.
+
+**None of this makes the tree shippable.** Mobile ships without a GUI this
+release, so conforming to the admitted shape would be speculative work on a
+cancelled feature, and reshaping the tree would destroy the byte-identity
+to what actually built and linked that gives this archive its value. The
+tree is therefore left exactly as it was built and the gap is written down
+instead.
 
 ---
 
