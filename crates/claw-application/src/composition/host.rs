@@ -683,6 +683,73 @@ mod tests {
         );
     }
 
+    /// Every ingress must stop accepting before *any* subsystem is drained.
+    ///
+    /// A composition with a single ingress cannot tell this apart from the much
+    /// weaker "each ingress quiesces immediately before it is drained", because
+    /// both produce the same journal. Two ingress subsystems separate them: the
+    /// weaker ordering would interleave `gateway/quiesce` after `http-api/drain`.
+    ///
+    /// The distinction is not academic. An ingress that is still accepting while
+    /// another is being drained lets the in-flight set grow during the drain, so
+    /// a `DrainReport` counts a moving target.
+    #[tokio::test]
+    async fn every_ingress_is_quiesced_before_any_subsystem_is_drained() {
+        let log = journal();
+        let mut host = SubsystemHost::new(vec![
+            Arc::new(Recorder::new(&log, "store", &[])),
+            Arc::new(Recorder::new(&log, "gateway", &["store"]).ingress()),
+            Arc::new(Recorder::new(&log, "http-api", &["store"]).ingress()),
+        ])
+        .expect("the composition is orderable");
+
+        host.start(&context()).await.expect("startup succeeds");
+        let report = host.shutdown().await.expect("shutdown succeeds");
+
+        assert!(report.is_clean());
+
+        let recorded = entries(&log);
+
+        assert_eq!(
+            recorded,
+            vec![
+                "store/initialize",
+                "gateway/initialize",
+                "http-api/initialize",
+                "store/start",
+                "gateway/start",
+                "http-api/start",
+                "http-api/quiesce",
+                "gateway/quiesce",
+                "http-api/drain",
+                "gateway/drain",
+                "store/drain",
+                "http-api/shutdown",
+                "gateway/shutdown",
+                "store/shutdown",
+            ]
+        );
+
+        // Stated as the invariant as well as the literal, so a future change that
+        // reorders subsystems within a phase cannot silently weaken the property
+        // this test exists to hold.
+        let last_quiesce = recorded
+            .iter()
+            .rposition(|entry| entry.ends_with("/quiesce"))
+            .expect("an ingress composition quiesces");
+        let first_drain = recorded
+            .iter()
+            .position(|entry| entry.ends_with("/drain"))
+            .expect("a shutdown drains");
+
+        assert!(
+            last_quiesce < first_drain,
+            "{} was drained before {} stopped accepting: {recorded:?}",
+            recorded[first_drain],
+            recorded[last_quiesce]
+        );
+    }
+
     #[tokio::test]
     async fn a_failure_during_initialization_stops_everything_already_initialized() {
         let log = journal();
