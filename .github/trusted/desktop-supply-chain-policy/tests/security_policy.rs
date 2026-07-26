@@ -3035,9 +3035,12 @@ fn superseded_final_and_dependency_surface_mutations_are_rejected() {
             "\n[[package]]\nname = \"{package}\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n"
         ));
         fs::write(tree.join("desktop/Cargo.lock"), lock).expect("write desktop lock mutation");
-        assert!(
-            validate_final_static(&SafeRoot::new(&tree.path).expect("open lock mutation")).is_err(),
-            "desktop lock mutation unexpectedly passed: {package}"
+        assert_eq!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open lock mutation"))
+                .expect_err("desktop lock mutation unexpectedly passed")
+                .to_string(),
+            "exact security policy file changed: desktop/Cargo.lock",
+            "desktop lock mutation failed through the wrong rule: {package}"
         );
     }
 }
