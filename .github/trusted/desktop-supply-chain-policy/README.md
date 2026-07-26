@@ -194,9 +194,42 @@ cargo +1.94.0 test --manifest-path .github/trusted/desktop-supply-chain-policy/C
 ```
 
 The Bootstrap snapshot is a historical anchor/composite, not a mirror of current Final policy.
-The writer is all-or-nothing over all 28 Bootstrap inputs. Every successful invocation compares
-the existing archive with the generated canonical archive and prints this deterministic contract
-before the result is accepted:
+The validator does not require global equality between the archive and the live checkout.
+Instead, the trusted Git `ChangeManifest` forces a per-path decision whenever a direct
+base-to-head change names one of the exact 28 Bootstrap inputs:
+
+1. **Synchronize:** the candidate archive remains canonical with the exact Bootstrap inventory,
+   the changed path's embedded payload equals the normalized candidate live bytes, and the
+   archive's semantic fingerprint equals the single strictly parsed `BOOTSTRAP_FINGERPRINT`
+   declaration. The trusted manifest must name both `policy/bootstrap.snapshot` and
+   `src/policy.rs`; changing only one companion cannot authorize synchronization.
+2. **Preserve:** the embedded historical payload for that path remains byte-for-byte unchanged,
+   and the candidate appends one record to
+   `policy/bootstrap-source-decisions.toml`. The record binds the exact path, normalized
+   protected-base Git OID, normalized protected-base and candidate live SHA-256 values,
+   candidate embedded-payload SHA-256, candidate semantic archive fingerprint, and a bounded
+   non-empty rationale. The trusted manifest must name the decision ledger.
+
+The schema-v1 ledger starts empty. Records use consecutive integer IDs, canonical field order,
+lowercase full hashes, and deterministic ID order. The `(base_oid, path)` pair is a stable unique
+key, so rebasing or changing the same path again requires a new record bound to the current
+protected base. Existing records are an immutable prefix: they cannot be edited, deleted,
+reordered, copied under a new ID, or reused for a later change to the same path. Every appended
+record must correspond to exactly one changed Bootstrap path choosing preservation; stale,
+duplicate, or extraneous records fail. A pull request changing multiple Bootstrap paths may mix
+synchronized and preserved decisions independently.
+
+This coupling is deliberately residual. Protected workflow/tree checks, workflow inventory,
+Final static policy, the repository transition, actionlint, and metadata validation all run
+first and retain their specific diagnostics. Only an otherwise-valid candidate reaches the
+missing-decision diagnostic. Because the ledger, archive, and fingerprint source are protected
+trust-root files, an ordinary authoritative run still rejects their mutation before this
+residual rule and requires the audited bypass described above; direct coupling tests establish
+the mechanically valid review decision without weakening that authority boundary.
+
+The snapshot writer remains all-or-nothing over all 28 Bootstrap inputs. Every successful
+invocation compares the existing archive with the generated canonical archive and prints this
+deterministic contract before the result is accepted:
 
 ```text
 bootstrap_snapshot_delta changed_count=1 preserved_count=27
