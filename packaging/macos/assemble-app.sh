@@ -16,7 +16,7 @@ arch_label="$2"
 expected_arches="${3//,/ }"
 validate_safe_component "$arch_label" ARCH_LABEL
 app_parent="$OUTPUT_ROOT/apps/$arch_label"
-app="$app_parent/$APP_NAME.app"
+app="$(app_bundle_path "$arch_label")"
 macos_dir="$app/Contents/MacOS"
 executable="$app/Contents/MacOS/$EXECUTABLE_NAME"
 resources="$app/Contents/Resources"

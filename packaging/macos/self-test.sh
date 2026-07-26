@@ -535,4 +535,64 @@ expect_failure headless-execution-rejects-non-executable-cli \
   bash -c "source '$common'; assert_headless_binaries_execute \
     '$exec_probe/cli-not-executable' '$exec_probe/daemon' '$stub_target'"
 
+app_probe="$work/app-execution"
+app_report="gta-claw-desktop packaging self-check ok"
+app_report+=" version=$VERSION runtime=macos-aarch64"
+
+write_app_stub() {
+  local label="$1"
+  local report="$2"
+  local status="${3:-0}"
+  ensure_output_directory "$app_probe/$label/$APP_NAME.app/Contents/MacOS"
+  write_report_stub \
+    "$app_probe/$label/$APP_NAME.app/Contents/MacOS/$EXECUTABLE_NAME" \
+    "$report" "$status"
+}
+
+write_app_stub accepted "$app_report"
+write_app_stub other-build \
+  "gta-claw-desktop packaging self-check ok version=0.0.0-other runtime=macos-aarch64"
+write_app_stub other-arch \
+  "gta-claw-desktop packaging self-check ok version=$VERSION runtime=macos-x86_64"
+write_app_stub failing "$app_report" 1
+write_app_stub not-executable "$app_report"
+chmod -x "$app_probe/not-executable/$APP_NAME.app/Contents/MacOS/$EXECUTABLE_NAME"
+ensure_output_directory "$app_probe/missing/$APP_NAME.app/Contents/MacOS"
+
+# The report is the last thing the binary does, after the real shutdown path has
+# returned. A bundle that prints it and then keeps talking did not complete the
+# same run, so the comparison is equality and not containment.
+ensure_output_directory "$app_probe/noisy/$APP_NAME.app/Contents/MacOS"
+noisy_stub="$app_probe/noisy/$APP_NAME.app/Contents/MacOS/$EXECUTABLE_NAME"
+{
+  printf '#!/bin/sh\n'
+  printf "echo '%s'\n" "$app_report"
+  printf "echo 'controller shutdown timed out'\n"
+  printf 'exit 0\n'
+} >"$noisy_stub"
+chmod +x "$noisy_stub"
+
+expect_success app-execution-accepts-this-build \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/accepted/$APP_NAME.app' '$stub_target'"
+
+expect_failure app-execution-rejects-another-builds-version \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/other-build/$APP_NAME.app' '$stub_target'"
+expect_failure app-execution-rejects-another-target-arch \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/other-arch/$APP_NAME.app' '$stub_target'"
+expect_failure app-execution-rejects-failing-app \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/failing/$APP_NAME.app' '$stub_target'"
+expect_failure app-execution-rejects-extra-output \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/noisy/$APP_NAME.app' '$stub_target'"
+expect_failure app-execution-rejects-missing-executable \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/missing/$APP_NAME.app' '$stub_target'"
+expect_failure app-execution-rejects-non-executable-app \
+  bash -c "source '$common'; assert_packaged_app_executes \
+    '$app_probe/not-executable/$APP_NAME.app' '$stub_target'"
+
 note "$tests macOS packaging self-tests passed"

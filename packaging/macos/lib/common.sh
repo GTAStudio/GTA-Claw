@@ -378,6 +378,47 @@ assert_headless_binaries_execute() {
     die "packaged gta-claw-daemon reported '$actual', expected '$expected'"
 }
 
+# Returns the assembled bundle path for an architecture label.
+#
+# assemble-app.sh writes it and build.sh runs it, so the two would otherwise
+# repeat the same literal and could drift apart silently.
+app_bundle_path() {
+  validate_safe_component "$1" ARCH_LABEL
+  printf '%s\n' "$OUTPUT_ROOT/apps/$1/$APP_NAME.app"
+}
+
+# Runs the assembled application bundle and checks what it reports.
+#
+# gta-claw-desktop is the only executable in the released payload, and it was
+# the one binary nothing had ever run: it ends in an event loop, so there is no
+# bounded way to start it without the application's cooperation. The flag below
+# is that cooperation -- the binary performs its real startup, its real
+# controller spawn and its real shutdown, and stops itself instead of waiting.
+#
+# The bundle is executed after assemble-app.sh has ad-hoc signed and validated
+# it, so this also shows that signing did not produce something that cannot
+# start. It runs on the software renderer because that is the configuration this
+# repository already demonstrates works on these runners: macos-packaging.yml
+# runs macos_winit_smoke with SLINT_BACKEND=winit-software. The GPU renderer
+# path stays unexecuted here, as it is everywhere else.
+assert_packaged_app_executes() {
+  local app="$1"
+  local target="$2"
+  local executable="$app/Contents/MacOS/$EXECUTABLE_NAME"
+  local rust_arch="${target%%-*}"
+  local expected
+  local actual
+
+  [[ -f "$executable" && -x "$executable" && ! -L "$executable" ]] ||
+    die "packaged app executable is missing or not executable: $executable"
+  expected="gta-claw-desktop packaging self-check ok"
+  expected+=" version=$VERSION runtime=macos-$rust_arch"
+  actual="$(SLINT_BACKEND=winit-software "$executable" --packaging-self-check </dev/null)" ||
+    die "packaged gta-claw-desktop did not complete its self-check: $executable"
+  [[ "$actual" == "$expected" ]] ||
+    die "packaged gta-claw-desktop reported '$actual', expected '$expected'"
+}
+
 sha256_file() {
   shasum -a 256 "$1" | awk '{ print $1 }'
 }
