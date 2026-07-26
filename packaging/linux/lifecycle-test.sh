@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in dpkg flock jq python3 rpm sha256sum systemctl tar; do
+for tool in dpkg flock jq ps python3 rpm sha256sum systemctl tar; do
   require_tool "$tool"
 done
 [[ "$#" -eq 6 ]] ||
@@ -44,6 +44,7 @@ lifecycle_gate_dir=
 lifecycle_lock_job=
 zombie_parent_job=
 transition_gate_dir=
+transition_gate_script=
 transition_stop_job=
 transition_rpm_job=
 
@@ -65,6 +66,8 @@ begin_daemon_deactivation() {
 set -eu
 touch '$transition_gate_dir/entered'
 while [ ! -e '$transition_gate_dir/release' ]; do
+  [ ! -e '$transition_gate_dir/probe' ] ||
+    touch '$transition_gate_dir/held'
   sleep 0.05
 done
 EOF
@@ -87,6 +90,131 @@ EOF
   done
 }
 
+protected_state_snapshot() {
+  assert_protected_contract
+  state_snapshot
+}
+
+begin_daemon_activation() {
+  local component="gta-claw-transition-$BASHPID"
+  sudo systemctl stop gta-claw-daemon.service
+  transition_gate_dir="/run/$component"
+  transition_gate_script="/run/$component-gate"
+  sudo tee "$transition_gate_script" >/dev/null <<EOF
+#!/usr/bin/python3
+import os
+import signal
+import time
+
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, signal.SIG_IGN)
+open('$transition_gate_dir/entered', 'x').close()
+while not os.path.exists('$transition_gate_dir/release'):
+    if os.path.exists('$transition_gate_dir/probe'):
+        open('$transition_gate_dir/held', 'a').close()
+    time.sleep(0.05)
+EOF
+  sudo chmod 0755 "$transition_gate_script"
+  sudo mkdir -p /etc/systemd/system/gta-claw-daemon.service.d
+  sudo tee /etc/systemd/system/gta-claw-daemon.service.d/transition.conf >/dev/null <<EOF
+[Service]
+RuntimeDirectory=gta-claw $component
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStartPre=$transition_gate_script
+TimeoutStopSec=30s
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl start gta-claw-daemon.service &
+  transition_stop_job=$!
+  deadline=$((SECONDS + 10))
+  while ! sudo test -e "$transition_gate_dir/entered" ||
+    [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "activating" ]]; do
+    ((SECONDS < deadline)) ||
+      die "daemon did not enter the activating RPM fixture"
+    sleep 0.05
+  done
+}
+
+rpm_waits_for_daemon_stop() {
+  sudo ps -eo pid=,ppid=,comm=,args= |
+    awk -v root="$transition_rpm_job" '
+      {
+        rows += 1
+        process_id[rows] = $1
+        parent_id[rows] = $2
+        command_name[rows] = $3
+        $1 = $2 = $3 = ""
+        sub(/^[[:space:]]+/, "")
+        arguments[rows] = $0
+      }
+      END {
+        descendant[root] = 1
+        for (round = 1; round <= rows; round += 1) {
+          for (row = 1; row <= rows; row += 1) {
+            if (descendant[parent_id[row]]) {
+              descendant[process_id[row]] = 1
+            }
+          }
+        }
+        for (row = 1; row <= rows; row += 1) {
+          if (descendant[process_id[row]] &&
+              command_name[row] == "systemctl" &&
+              arguments[row] ~ /(^|[[:space:]])([^[:space:]]*\/)?systemctl[[:space:]]+stop[[:space:]]+gta-claw-daemon\.service([[:space:]]|$)/) {
+            found = 1
+          }
+        }
+        exit(found ? 0 : 1)
+      }
+    '
+}
+
+assert_rpm_transition_held() {
+  local expected_state="$1"
+  local label="$2"
+  local receipt="$3"
+  deadline=$((SECONDS + 10))
+  while ! rpm_waits_for_daemon_stop; do
+    kill -0 "$transition_rpm_job" >/dev/null 2>&1 ||
+      die "RPM $label replacement exited before joining the held stop"
+    [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "deactivating" ]] ||
+      die "RPM $label fixture left deactivating before joining the held stop"
+    [[ "$(stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon)" == \
+      "$receipt" ]] ||
+      die "RPM replaced the daemon before joining the $label held stop"
+    [[ "$(protected_state_snapshot)" == "$expected_state" ]] ||
+      die "RPM $label replacement changed protected state before joining the held stop"
+    ((SECONDS < deadline)) ||
+      die "RPM $label replacement did not join the held daemon stop"
+    sleep 0.05
+  done
+  sudo touch "$transition_gate_dir/probe"
+  deadline=$((SECONDS + 10))
+  while ! sudo test -e "$transition_gate_dir/held"; do
+    kill -0 "$transition_rpm_job" >/dev/null 2>&1 ||
+      die "RPM $label replacement exited before the stop gate acknowledged its hold"
+    [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "deactivating" ]] ||
+      die "RPM $label fixture left deactivating before gate acknowledgment"
+    [[ "$(stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon)" == \
+      "$receipt" ]] ||
+      die "RPM replaced the daemon while the $label stop gate was held"
+    [[ "$(protected_state_snapshot)" == "$expected_state" ]] ||
+      die "RPM $label replacement changed protected state while the stop gate was held"
+    ((SECONDS < deadline)) ||
+      die "RPM $label stop gate did not acknowledge its hold"
+    sleep 0.05
+  done
+  kill -0 "$transition_rpm_job" >/dev/null 2>&1 ||
+    die "RPM $label replacement exited while the stop gate remained held"
+  [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "deactivating" ]] ||
+    die "RPM $label fixture left deactivating while the stop gate remained held"
+  [[ "$(stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon)" == \
+    "$receipt" ]] ||
+    die "RPM replaced the daemon before the $label stop gate was released"
+  [[ "$(protected_state_snapshot)" == "$expected_state" ]] ||
+    die "RPM $label replacement changed protected state before stop release"
+}
+
 finish_daemon_deactivation() {
   sudo rm -f /etc/systemd/system/gta-claw-daemon.service.d/transition.conf
   sudo systemctl daemon-reload
@@ -99,6 +227,20 @@ finish_daemon_deactivation() {
   transition_gate_dir=
 }
 
+finish_daemon_activation() {
+  sudo rm -f /etc/systemd/system/gta-claw-daemon.service.d/transition.conf
+  sudo systemctl daemon-reload
+  sudo touch "$transition_gate_dir/release"
+  wait "$transition_stop_job" >/dev/null 2>&1 || true
+  transition_stop_job=
+  wait "$transition_rpm_job"
+  transition_rpm_job=
+  sudo rm -f "$transition_gate_script"
+  transition_gate_script=
+  sudo rm -rf "$transition_gate_dir"
+  transition_gate_dir=
+}
+
 remove_policy_denial() {
   if [[ "$policy_installed" -eq 1 ]]; then
     sudo rm -f /usr/sbin/policy-rc.d
@@ -106,6 +248,9 @@ remove_policy_denial() {
   fi
   if [[ -n "$transition_gate_dir" ]]; then
     sudo touch "$transition_gate_dir/release" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$transition_gate_script" ]]; then
+    sudo rm -f "$transition_gate_script" >/dev/null 2>&1 || true
   fi
   if [[ -n "$transition_rpm_job" ]]; then
     wait "$transition_rpm_job" >/dev/null 2>&1 || true
@@ -993,9 +1138,48 @@ rpm_transition_snapshot="$(state_identity_snapshot)"
 rpm_transition_receipt="$(
   stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon
 )"
+begin_daemon_activation
+[[ ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  die "RPM activating-state fixture started with a stale replacement fence"
+rpm_transition_content_snapshot="$(protected_state_snapshot)"
+sudo rpm -Uvh --nodeps --replacepkgs "$rpm2" \
+  >/dev/null 2>&1 &
+transition_rpm_job=$!
+deadline=$((SECONDS + 10))
+while [[ ! -e /run/gta-claw-state-init/replacement-fenced ]]; do
+  kill -0 "$transition_rpm_job" >/dev/null 2>&1 ||
+    die "RPM activating-state replacement exited before fencing"
+  ((SECONDS < deadline)) ||
+    die "RPM activating-state replacement did not establish its fence"
+  sleep 0.05
+done
+deadline=$((SECONDS + 10))
+while [[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "deactivating" ]]; do
+  kill -0 "$transition_rpm_job" >/dev/null 2>&1 ||
+    die "RPM activating-state replacement exited before stop was held"
+  [[ "$(stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon)" == \
+    "$rpm_transition_receipt" ]] ||
+    die "RPM replaced the daemon before activating-state stop was held"
+  ((SECONDS < deadline)) ||
+    die "RPM activating-state replacement did not block in deactivating"
+  sleep 0.05
+done
+assert_rpm_transition_held \
+  "$rpm_transition_content_snapshot" \
+  "activating-state" \
+  "$rpm_transition_receipt"
+finish_daemon_activation
+assert_active_restart "$rpm_pid"
+assert_identity_preserved "$rpm_transition_snapshot"
+rpm_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+rpm_transition_snapshot="$(state_identity_snapshot)"
+rpm_transition_receipt="$(
+  stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon
+)"
 begin_daemon_deactivation
 [[ ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
   die "RPM transitional-state fixture started with a stale replacement fence"
+rpm_transition_content_snapshot="$(protected_state_snapshot)"
 sudo rpm -Uvh --nodeps --replacepkgs "$rpm2" \
   >/dev/null 2>&1 &
 transition_rpm_job=$!
@@ -1007,11 +1191,10 @@ while [[ ! -e /run/gta-claw-state-init/replacement-fenced ]]; do
     die "RPM transitional-state replacement did not establish its fence"
   sleep 0.05
 done
-[[ "$(systemctl show -P ActiveState gta-claw-daemon.service)" == "deactivating" ]] ||
-  die "RPM transitional-state fixture left deactivating before release"
-[[ "$(stat -Lc '%d:%i:%s:%y:%z' /usr/libexec/gta-claw/gta-claw-daemon)" == \
-  "$rpm_transition_receipt" ]] ||
-  die "RPM replaced the daemon before transitional stop completed"
+assert_rpm_transition_held \
+  "$rpm_transition_content_snapshot" \
+  "deactivating-state" \
+  "$rpm_transition_receipt"
 finish_daemon_deactivation
 assert_active_restart "$rpm_pid"
 assert_identity_preserved "$rpm_transition_snapshot"
