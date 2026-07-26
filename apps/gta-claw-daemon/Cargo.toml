@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-claw-application.workspace = true
+claw-application = { workspace = true, features = ["composition"] }
 claw-domain.workspace = true
 claw-platform.workspace = true
 claw-protocol.workspace = true
