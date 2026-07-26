@@ -9,7 +9,9 @@ param(
 
     [string]$WixPath,
 
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [switch]$ReleaseMode
 )
 
 Set-StrictMode -Version Latest
@@ -28,17 +30,37 @@ Test-HashManifest $stage
 Assert-PayloadSafety -Root $stage -ExpectedExecutables @(
     'gta-claw-desktop.exe', 'gta-claw-cli.exe', 'gta-claw-daemon.exe'
 )
-foreach ($name in @('gta-claw-desktop.exe', 'gta-claw-cli.exe', 'gta-claw-daemon.exe')) {
-    Assert-PeArchitecture -Path (Join-Path $stage $name) -ExpectedMachine $arch.PeMachine
+$releaseStatus = [System.IO.File]::ReadAllText((Join-Path $stage 'RELEASE-STATUS.txt'))
+if ($ReleaseMode -and $releaseStatus -notmatch 'RELEASE CANDIDATE') {
+    throw 'Release MSI staging lacks an explicit release-candidate marker.'
 }
+if (-not $ReleaseMode -and $releaseStatus -notmatch 'UNSIGNED NON-RELEASE') {
+    throw 'Unsigned MSI staging lacks an explicit non-release marker.'
+}
+foreach ($name in @('gta-claw-desktop.exe', 'gta-claw-cli.exe', 'gta-claw-daemon.exe')) {
+    $binary = Join-Path $stage $name
+    if ($name -ne 'gta-claw-desktop.exe') {
+        $binary = Join-Path $stage "headless\$name"
+    }
+    Assert-PeArchitecture -Path $binary -ExpectedMachine $arch.PeMachine
+}
+Set-NormalizedTreeTimestamp $stage
 
 $source = Join-Path $scriptRoot 'wix\GtaClaw.wxs'
 Test-WixSource $source
 if ([string]::IsNullOrWhiteSpace($WixPath)) {
-    $command = Get-Command wix -ErrorAction Stop
+    if (-not [string]::IsNullOrWhiteSpace($env:GTA_CLAW_WIX)) {
+        $WixPath = $env:GTA_CLAW_WIX
+    }
+}
+if ([string]::IsNullOrWhiteSpace($WixPath)) {
+    $command = Get-Command wix.exe -ErrorAction Stop
     $WixPath = $command.Source
 }
 Assert-PlainFile $WixPath | Out-Null
+if ($null -eq (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) {
+    Initialize-MsvcEnvironment $Architecture | Out-Null
+}
 
 $ownedRoot = Join-Path $scriptRoot 'out'
 Assert-NoReparsePathComponents -Root $repoRoot -Path $ownedRoot
@@ -49,7 +71,11 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     Assert-NoReparsePathComponents -Root $ownedRoot -Path $outputDirectory
     [System.IO.Directory]::CreateDirectory($outputDirectory) | Out-Null
     Assert-NoReparsePathComponents -Root $ownedRoot -Path $outputDirectory
-    $OutputPath = Join-Path $outputDirectory "gta-claw-$($version.Cargo)-windows-$($arch.Name)-unsigned-non-release.msi"
+    $qualifier = 'unsigned-non-release'
+    if ($ReleaseMode) {
+        $qualifier = 'release-candidate-unsigned'
+    }
+    $OutputPath = Join-Path $outputDirectory "gta-claw-$($version.Cargo)-windows-$($arch.Name)-$qualifier.msi"
 } else {
     $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
     Assert-ChildPath -Parent $ownedRoot -Child $OutputPath | Out-Null
@@ -61,8 +87,10 @@ if (Test-Path -LiteralPath $OutputPath) {
 
 $productNamespace = [Guid]'DAD72B88-4094-5FD5-9494-D8C54C8DFE7D'
 $productCode = New-UuidV5 -Namespace $productNamespace -Name "$($arch.Name):$($version.Msi)"
+$packageNamespace = [Guid]'30E765FA-E804-5919-987E-C06725F6F25B'
+$packageCode = New-UuidV5 -Namespace $packageNamespace -Name "$($arch.Name):$($version.Msi)"
 $componentNamespace = [Guid]'725599B6-B7E4-5A10-A600-FC1E40B62EAE'
-$componentIds = @('License', 'NonRelease', 'HashManifest', 'Desktop', 'Cli', 'Daemon')
+$componentIds = @('License', 'ReleaseStatus', 'HashManifest', 'Desktop', 'Cli', 'Daemon')
 $componentDefines = @()
 foreach ($componentId in $componentIds) {
     $guid = New-UuidV5 -Namespace $componentNamespace -Name "$($arch.Name):$componentId"
@@ -79,5 +107,57 @@ $wixArguments = @(
 ) + $componentDefines + @($source)
 Invoke-CheckedCommand -FilePath $WixPath -Arguments $wixArguments
 Assert-PlainFile $OutputPath | Out-Null
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$summary = $installer.GetType().InvokeMember(
+    'SummaryInformation',
+    [System.Reflection.BindingFlags]::GetProperty,
+    $null,
+    $installer,
+    @($OutputPath, 3)
+)
+$fixedTimestamp = [DateTime]::SpecifyKind(
+    [DateTime]::ParseExact('2000-01-01T00:00:00', 'yyyy-MM-ddTHH:mm:ss', $null),
+    [DateTimeKind]::Unspecified
+)
+foreach ($property in @(12, 13)) {
+    $summary.GetType().InvokeMember(
+        'Property',
+        [System.Reflection.BindingFlags]::SetProperty,
+        $null,
+        $summary,
+        @($property, $fixedTimestamp)
+    ) | Out-Null
+}
+$summary.GetType().InvokeMember(
+    'Property',
+    [System.Reflection.BindingFlags]::SetProperty,
+    $null,
+    $summary,
+    @(9, $packageCode.ToString('B').ToUpperInvariant())
+) | Out-Null
+$summary.GetType().InvokeMember(
+    'Persist',
+    [System.Reflection.BindingFlags]::InvokeMethod,
+    $null,
+    $summary,
+    $null
+) | Out-Null
+$summary = $null
+[GC]::Collect()
+[GC]::WaitForPendingFinalizers()
+Set-NormalizedMsiStorageTimestamps $OutputPath
+$wixPdb = [System.IO.Path]::ChangeExtension($OutputPath, '.wixpdb')
+if (Test-Path -LiteralPath $wixPdb -PathType Leaf) {
+    Remove-Item -LiteralPath $wixPdb -Force
+}
+Test-MsiPackage `
+    -PackagePath $OutputPath `
+    -InspectionRoot (Join-Path (Split-Path -Parent $OutputPath) '.msi-inspection') `
+    -Architecture $Architecture `
+    -SignatureMode unsigned `
+    -ReleaseStatus $(if ($ReleaseMode) { 'release-candidate' } else { 'non-release' })
+Remove-OwnedDirectory `
+    -OwnedRoot (Split-Path -Parent $OutputPath) `
+    -Path (Join-Path (Split-Path -Parent $OutputPath) '.msi-inspection')
 Write-ArtifactHash $OutputPath | Out-Null
-Write-Host "Created unsigned non-release MSI prototype '$OutputPath'."
+Write-Host "Created and inspected unsigned MSI '$OutputPath'."

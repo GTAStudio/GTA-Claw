@@ -2019,7 +2019,7 @@ fn char_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2054,6 +2054,19 @@ mod tests {
         source: String,
         test: String,
         expected: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct ReachabilityCorpus {
+        cases: Vec<ReachabilityCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReachabilityCase {
+        name: String,
+        files: BTreeMap<String, String>,
+        cite: String,
+        expect: String,
     }
 
     struct CompilerOracleFixture {
@@ -3214,6 +3227,118 @@ mod nested {
              'duplicate/mod.rs' exist"
         );
         fs::remove_dir_all(root).expect("remove ambiguous compiler oracle");
+    }
+
+    #[test]
+    fn shared_reachability_corpus_matches_cargo() {
+        let corpus: ReachabilityCorpus = serde_json::from_str(include_str!(
+            "../../../compat/upstream/reachability-corpus.json"
+        ))
+        .expect("parse shared reachability corpus");
+        // This exact count is an independent fail-closed anti-deletion pin; update it atomically with the canonical corpus.
+        assert_eq!(corpus.cases.len(), 32);
+        let fixture_root = env::temp_dir().join(format!(
+            "claw-conformance-reachability-corpus-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&fixture_root).expect("create reachability corpus root");
+        let cargo = cargo_executable(&fixture_root, ViolationCode::ClaimEvidence)
+            .expect("resolve trusted Cargo");
+
+        for case in corpus.cases {
+            let root = fixture_root.join(&case.name);
+            let manifests = case
+                .files
+                .keys()
+                .filter(|path| path.ends_with("Cargo.toml"))
+                .cloned()
+                .collect::<Vec<_>>();
+            for (path, source) in case.files {
+                let destination = root.join(path);
+                fs::create_dir_all(destination.parent().expect("corpus file parent"))
+                    .expect("create corpus directory");
+                fs::write(destination, source).expect("write corpus file");
+            }
+            for manifest in manifests {
+                let _ = compiler_oracle_command(&cargo, &root)
+                    .args([
+                        "generate-lockfile",
+                        "--offline",
+                        "--quiet",
+                        "--manifest-path",
+                    ])
+                    .arg(manifest)
+                    .output()
+                    .expect("generate reachability corpus lockfile");
+            }
+            let output = compiler_oracle_command(&cargo, &root)
+                .args(["build", "--offline", "--quiet", "--locked"])
+                .output()
+                .expect("run reachability corpus compiler oracle");
+            let ambiguous = matches!(
+                case.name.as_str(),
+                "ambiguity-file-side"
+                    | "ambiguity-directory-side"
+                    | "peer6-ambiguity-file-side"
+                    | "peer6-ambiguity-directory-side"
+            );
+            assert_eq!(
+                output.status.success(),
+                !ambiguous,
+                "Cargo build verdict diverged for {}:\nstdout:\n{}\nstderr:\n{}",
+                case.name,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let accepted = match CargoTestTargets::load(&root, ViolationCode::ClaimEvidence) {
+                Ok(targets) => {
+                    assert!(!ambiguous, "ambiguous case must fail target discovery");
+                    let cited = root
+                        .join(&case.cite)
+                        .canonicalize()
+                        .expect("canonical cited corpus source");
+                    targets.contains(&cited)
+                }
+                Err(error) => {
+                    assert!(ambiguous, "unexpected target discovery error: {error}");
+                    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+                    assert_eq!(error.subject(), Some("crates/p/src/lib.rs"));
+                    let expected_message = match case.name.as_str() {
+                        "ambiguity-file-side" | "ambiguity-directory-side" => {
+                            "Rust module 'ambig' is ambiguous because both 'ambig.rs' and \
+                             'ambig/mod.rs' exist"
+                        }
+                        "peer6-ambiguity-file-side" | "peer6-ambiguity-directory-side" => {
+                            "Rust module 'foo' is ambiguous because both 'foo.rs' and \
+                             'foo/mod.rs' exist"
+                        }
+                        value => panic!("unexpected ambiguous corpus case '{value}'"),
+                    };
+                    assert_eq!(error.message(), expected_message);
+                    false
+                }
+            };
+            let expected = match case.expect.as_str() {
+                "accept" => true,
+                "reject" => false,
+                value => panic!("unknown reachability corpus verdict '{value}'"),
+            };
+            println!(
+                "{}\tcite={}\texpect={}\trust={}",
+                case.name,
+                case.cite,
+                case.expect,
+                if accepted { "accept" } else { "reject" }
+            );
+            assert_eq!(
+                accepted, expected,
+                "Rust reachability verdict diverged for {}",
+                case.name
+            );
+        }
+        fs::remove_dir_all(fixture_root).expect("remove reachability corpus fixture");
     }
 
     #[test]

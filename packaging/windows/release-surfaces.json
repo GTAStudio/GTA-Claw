@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "platform": "windows",
+  "implemented": [
+    "github-release",
+    "installer",
+    "windows-node"
+  ],
+  "native_replacements": {
+    "windows-node": "npm-free Rust GUI and headless Windows release artifacts"
+  }
+}

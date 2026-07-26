@@ -476,6 +476,31 @@ impl ConnectionEpoch {
         Self(value)
     }
 
+    /// Mints an epoch so downstream crates can build [`ConnectionState::Ready`]
+    /// in their own tests.
+    ///
+    /// `ReadyConnection` and `ConnectionInfo` already expose public fields, so
+    /// this constructor was the only reason an out-of-crate test could not
+    /// construct an authenticated state. Client cores that must prove they bind
+    /// authorization to a connection lifecycle need to synthesize two distinct
+    /// epochs, which is impossible without it.
+    ///
+    /// # This grants no authority
+    ///
+    /// An epoch is a process-local staleness token. It is never derived from
+    /// peer input and never serialized on the wire, so no value reaches the
+    /// Gateway. The only consumer, [`GatewayClient::request_for_epoch`], compares
+    /// the supplied epoch against the *live* connection and fails closed on any
+    /// mismatch, so a synthesized epoch can never be more permissive than the
+    /// already-public epoch-free request path.
+    ///
+    /// [`GatewayClient::request_for_epoch`]: crate::GatewayClient::request_for_epoch
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn for_tests(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
     /// Returns the monotonically allocated process-local value.
     #[must_use]
     pub const fn get(self) -> u64 {
