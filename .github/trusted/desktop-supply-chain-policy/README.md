@@ -154,6 +154,15 @@ gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
   --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
 ```
 
+Matching a pin row's URL to its target is not a plain `url.contains(target)`: `aarch64-apple-ios` is
+a proper prefix of `aarch64-apple-ios-sim`, so a simulator archive's URL also contains the device
+target's name and would otherwise satisfy the device row. The validator instead extracts the
+**longest** admitted target that appears in the URL and requires it to equal the row's own target,
+and rejects the row outright if no admitted target appears or if two distinct admitted targets of
+the same longest length both appear. This resolves collisions between admitted targets; it does not
+parse the URL, so a target name reachable only through an unrelated path segment or query string is
+still out of scope for this check and depends on the digest to catch the wrong artifact.
+
 #### Why the lockfile does not already cover this
 
 **The `Cargo.lock` checksum covers the crates.io package — it says nothing about the tarball

@@ -4986,35 +4986,88 @@ fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
 #[test]
 fn reviewed_build_artifact_pin_table_shape_is_enforced() {
     const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
-    let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    // `aarch64-apple-ios` is a proper prefix of `aarch64-apple-ios-sim`: the device URL never
+    // contains the sim target's name, but the sim URL always contains the device target's name.
+    // These two URLs are the fixture the prefix-collision regressions below rely on.
+    let device_url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
+    let sim_url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios-sim.tar.gz";
+    // The reviewed digests for `skia-bindings` 0.99.0, independently obtained from the release
+    // asset metadata for `aarch64-apple-ios` and `aarch64-apple-ios-sim`.
+    const DEVICE_DIGEST: &str = "15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8";
+    const SIM_DIGEST: &str = "ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e";
+
     validate_build_artifact_pin_table(&[(
         "skia-bindings",
         "0.99.0",
         "aarch64-apple-ios",
-        url,
+        device_url,
         DIGEST,
     )])
     .expect("a well formed reviewed pin is accepted");
     validate_build_artifact_pin_table(&[]).expect("an empty reviewed pin table is well formed");
 
+    // The exact two reviewed rows are accepted together, and only together: this is the shape
+    // `PINNED_BUILD_ARTIFACTS` must take once filled for the iOS packaging workflow.
+    validate_build_artifact_pin_table(&[
+        (
+            "skia-bindings",
+            "0.99.0",
+            "aarch64-apple-ios",
+            device_url,
+            DEVICE_DIGEST,
+        ),
+        (
+            "skia-bindings",
+            "0.99.0",
+            "aarch64-apple-ios-sim",
+            sim_url,
+            SIM_DIGEST,
+        ),
+    ])
+    .expect("the exact two reviewed skia-bindings 0.99.0 pins are accepted together");
+
     for (label, pins) in [
         (
             "package that does not fetch at build time",
-            vec![("serde", "0.99.0", "aarch64-apple-ios", url, DIGEST)],
+            vec![("serde", "0.99.0", "aarch64-apple-ios", device_url, DIGEST)],
         ),
         (
             "release other than the admitted one",
-            vec![("skia-bindings", "0.98.0", "aarch64-apple-ios", url, DIGEST)],
+            vec![(
+                "skia-bindings",
+                "0.98.0",
+                "aarch64-apple-ios",
+                device_url,
+                DIGEST,
+            )],
         ),
         (
             "unadmitted target",
-            vec![("skia-bindings", "0.99.0", "x86_64-apple-ios", url, DIGEST)],
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "x86_64-apple-ios",
+                device_url,
+                DIGEST,
+            )],
         ),
         (
             "duplicate package and target",
             vec![
-                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
-                ("skia-bindings", "0.99.0", "aarch64-apple-ios", url, DIGEST),
+                (
+                    "skia-bindings",
+                    "0.99.0",
+                    "aarch64-apple-ios",
+                    device_url,
+                    DIGEST,
+                ),
+                (
+                    "skia-bindings",
+                    "0.99.0",
+                    "aarch64-apple-ios",
+                    device_url,
+                    DIGEST,
+                ),
             ],
         ),
         (
@@ -5023,7 +5076,7 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
                 "skia-bindings",
                 "0.99.0",
                 "aarch64-apple-ios",
-                url,
+                device_url,
                 "abc123",
             )],
         ),
@@ -5048,12 +5101,12 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
             )],
         ),
         (
-            "URL naming a different target",
+            "URL naming no admitted target at all",
             vec![(
                 "skia-bindings",
                 "0.99.0",
-                "aarch64-apple-ios-sim",
-                url,
+                "aarch64-apple-ios",
+                "https://example.invalid/skia-binaries.tar.gz",
                 DIGEST,
             )],
         ),
@@ -5063,6 +5116,61 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
             "reviewed build-artifact pin table must reject: {label}"
         );
     }
+
+    // The prefix-collision regressions: `aarch64-apple-ios` is a proper prefix of
+    // `aarch64-apple-ios-sim`, so a naive `url.contains(target)` lets a simulator archive satisfy
+    // the device row. Both mismatched directions must be rejected, and the error must name both
+    // the row's target and the target the URL actually names, so a reviewer can tell the two
+    // apart without re-deriving the match themselves.
+    let device_row_with_sim_url = validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        sim_url,
+        DEVICE_DIGEST,
+    )]);
+    let error = device_row_with_sim_url
+        .expect_err("the device row must reject the simulator archive's URL");
+    // Asserted with an exact message, not `contains`: `aarch64-apple-ios-sim` itself contains
+    // `aarch64-apple-ios`, so a substring check on both strings would pass even if the message
+    // named the sim target twice and never mentioned the device row's target at all.
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "reviewed build-artifact URL names target aarch64-apple-ios-sim, not the row's target aarch64-apple-ios: {sim_url}"
+        ),
+        "rejection must distinguish the row's declared target from the target the URL actually names"
+    );
+
+    let sim_row_with_device_url = validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        device_url,
+        SIM_DIGEST,
+    )]);
+    let error = sim_row_with_device_url
+        .expect_err("the simulator row must reject the device archive's URL");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "reviewed build-artifact URL names target aarch64-apple-ios, not the row's target aarch64-apple-ios-sim: {device_url}"
+        ),
+        "rejection must distinguish the row's declared target from the target the URL actually names"
+    );
+
+    // `aarch64-linux-android` and `aarch64-apple-ios-sim` are both admitted and both 21 bytes
+    // long. A URL naming both is ambiguous at the longest-match length and must fail closed
+    // rather than arbitrarily picking one, even though the row's own target is present.
+    let ambiguous_tie = validate_build_artifact_pin_table(&[(
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        "https://example.invalid/aarch64-linux-android-aarch64-apple-ios-sim.tar.gz",
+        SIM_DIGEST,
+    )]);
+    ambiguous_tie
+        .expect_err("a URL naming two distinct same-length admitted targets must fail closed");
 }
 
 #[test]

@@ -1394,6 +1394,39 @@ impl MobilePlatform {
     }
 }
 
+/// Returns the single admitted target with the longest name that `url` contains, or `None` if no
+/// admitted target appears in `url` or more than one distinct admitted target of the same
+/// (longest) length appears in it.
+///
+/// A plain `url.contains(target)` is unsound whenever one admitted target is a proper prefix of
+/// another — `aarch64-apple-ios` is a proper prefix of `aarch64-apple-ios-sim`, so a simulator
+/// archive's URL also contains the device target's name and would satisfy the device row. Taking
+/// the *longest* admitted target actually present in the URL resolves that: a simulator URL
+/// contains both `aarch64-apple-ios` and `aarch64-apple-ios-sim`, and only the longer, more
+/// specific one is the one the URL actually names. Ties at the longest length are rejected rather
+/// than resolved arbitrarily, so the check fails closed instead of guessing.
+fn longest_admitted_target_in_url<'a>(
+    url: &str,
+    admitted_targets: &BTreeSet<&'a str>,
+) -> Option<&'a str> {
+    let longest_len = admitted_targets
+        .iter()
+        .filter(|target| url.contains(*target))
+        .map(|target| target.len())
+        .max()?;
+    let mut longest_matches = admitted_targets
+        .iter()
+        .copied()
+        .filter(|target| target.len() == longest_len && url.contains(target));
+    let candidate = longest_matches.next()?;
+    if longest_matches.next().is_some() {
+        // Two distinct admitted targets of the same length both appear in the URL: ambiguous,
+        // so fail closed instead of picking one arbitrarily.
+        return None;
+    }
+    Some(candidate)
+}
+
 /// Requires a reviewed build-time fetch pin table to stay well formed and within admitted targets.
 ///
 /// Exposed so the table's shape is proven directly rather than only vacuously through the empty
@@ -1432,9 +1465,19 @@ pub fn validate_build_artifact_pin_table(
                 "reviewed build-artifact digest is not a SHA-256: {package} {target}"
             )));
         }
-        if !url.starts_with("https://") || url.contains("..") || !url.contains(target) {
+        if !url.starts_with("https://") || url.contains("..") {
             return Err(PolicyError::new(format!(
-                "reviewed build-artifact URL is not a hardened absolute URL naming its target: {url}"
+                "reviewed build-artifact URL is not a hardened absolute URL: {url}"
+            )));
+        }
+        let Some(url_target) = longest_admitted_target_in_url(url, &admitted_targets) else {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL does not unambiguously name an admitted target: {url}"
+            )));
+        };
+        if url_target != *target {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL names target {url_target}, not the row's target {target}: {url}"
             )));
         }
     }
