@@ -9,6 +9,12 @@ name: iOS target compile
 # windows-msvc and x86_64-apple-darwin), which is evidence about the host and not
 # about iOS.
 #
+# It runs `cargo build`, not `cargo check`. `check` stops after type and borrow
+# checking and emits only `.rmeta`: it never runs codegen, so it cannot produce a
+# Mach-O object and cannot fail on a codegen or target-ABI problem. Claiming an
+# iOS compile on the strength of `cargo check` would overstate the evidence, so
+# codegen is forced and the emitted objects are then inspected.
+#
 # It needs no reviewed Skia pin because the shipped crate is UI-independent and
 # pulls in no `skia-bindings`. That invariant is asserted below rather than
 # assumed, because it is the property that keeps this workflow runnable while
@@ -107,8 +113,101 @@ jobs:
           fi
           echo "no skia-bindings/skia-safe/i-slint-renderer-skia in ${total} resolved lines"
 
-      - name: Compile gta-claw-ios for ${{ matrix.target }}
+      - name: Compile gta-claw-ios with codegen for the matrix target
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --locked --package gta-claw-ios --target '${{ matrix.target }}'
+          cargo build --locked --package gta-claw-ios --target '${{ matrix.target }}'
+
+      - name: Prove the emitted objects are Mach-O arm64 for this exact platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="target/${{ matrix.target }}/debug"
+          rlib="$(find "${outdir}" -maxdepth 1 -name 'libgta_claw_ios*.rlib' \
+            | head -n 1 || true)"
+          if [ -z "${rlib}" ]; then
+            echo "cargo build emitted no rlib for ${{ matrix.target }}, so there is"
+            echo "no object to inspect and no compile to claim. Contents of ${outdir}:"
+            ls -la "${outdir}" || echo "(directory absent)"
+            exit 1
+          fi
+          rlib="$(cd "$(dirname "${rlib}")" && pwd)/$(basename "${rlib}")"
+          echo "artifact: ${rlib}"
+
+          workdir="$(mktemp -d)"
+          cd "${workdir}"
+          ar x "${rlib}"
+
+          # Positive control. An architecture assertion over zero object files
+          # would pass while proving nothing, so require that codegen actually
+          # emitted members before asserting anything about them.
+          obj="$(find . -name '*.o' | head -n 1 || true)"
+          if [ -z "${obj}" ]; then
+            echo "the rlib contains no object members, so this check cannot tell"
+            echo "'wrong architecture' from 'nothing was compiled'. Members were:"
+            ar t "${rlib}" | head -n 20
+            exit 1
+          fi
+          echo "object members: $(find . -name '*.o' | wc -l | tr -d ' ')"
+
+          kind="$(file -b "${obj}")"
+          echo "file: ${kind}"
+          case "${kind}" in
+            *'Mach-O 64-bit object arm64'*) ;;
+            *)
+              echo "expected a Mach-O 64-bit arm64 object for ${{ matrix.target }},"
+              echo "but file reported: ${kind}"
+              exit 1
+              ;;
+          esac
+
+          # arm64 alone cannot separate device from simulator: both are arm64, and
+          # the platform lives in LC_BUILD_VERSION rather than in the cpu type.
+          # Compare the platform token by equality, not by prefix or substring:
+          # `IOS` is a strict prefix of `IOSSIMULATOR`, so a substring test would
+          # accept a simulator object as a device build. That is the same
+          # confusion class as a pin-table URL match accepting the wrong target.
+          build="$(vtool -show-build-version "${obj}" 2>&1 || true)"
+          echo "${build}"
+          actual="$(printf '%s\n' "${build}" \
+            | awk '$1 == "platform" { print $2; exit }')"
+
+          # Fallback: older tooling prints the platform as a number rather than a
+          # name. Map the two admitted values explicitly instead of guessing.
+          if [ -z "${actual}" ]; then
+            echo "vtool reported no platform token; retrying with otool"
+            build="$(otool -l "${obj}" 2>&1 || true)"
+            numeric="$(printf '%s\n' "${build}" \
+              | awk '$1 == "platform" { print $2; exit }')"
+            case "${numeric}" in
+              2) actual="IOS" ;;
+              7) actual="IOSSIMULATOR" ;;
+              "") actual="" ;;
+              *) actual="UNKNOWN(${numeric})" ;;
+            esac
+          fi
+
+          case "${{ matrix.sdk }}" in
+            iphoneos)        expected="IOS" ;;
+            iphonesimulator) expected="IOSSIMULATOR" ;;
+            *)
+              echo "unmapped sdk '${{ matrix.sdk }}': refusing to guess a platform"
+              exit 1
+              ;;
+          esac
+          if [ -z "${actual}" ]; then
+            echo "no LC_BUILD_VERSION platform found in the object, so the platform"
+            echo "cannot be verified and this check must not report success. Last"
+            echo "tool output was:"
+            printf '%s\n' "${build}" | head -n 40
+            exit 1
+          fi
+          if [ "${actual}" != "${expected}" ]; then
+            echo "platform mismatch for ${{ matrix.target }}:"
+            echo "  expected exactly: ${expected}"
+            echo "  actually built  : ${actual}"
+            exit 1
+          fi
+          echo "verified: Mach-O arm64, LC_BUILD_VERSION platform ${actual}," \
+               "matching ${{ matrix.target }} exactly"
