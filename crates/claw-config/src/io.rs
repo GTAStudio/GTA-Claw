@@ -65,7 +65,19 @@ pub fn write_file(
         .map_err(|error| ConfigError::io(path, error))
 }
 
-fn atomic_write_bytes(
+/// Atomically writes non-secret auxiliary bytes with the same path hardening.
+///
+/// This is intended for typed subsystem state colocated with configuration.
+/// Callers remain responsible for serializing only data that is safe to persist.
+pub fn write_bytes_atomically(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+) -> Result<WriteOutcome, ConfigError> {
+    let path = path.as_ref();
+    atomic_write_bytes(path, contents, || Ok(())).map_err(|error| ConfigError::io(path, error))
+}
+
+pub(crate) fn atomic_write_bytes(
     path: &Path,
     contents: &[u8],
     precommit: impl FnOnce() -> io::Result<()>,

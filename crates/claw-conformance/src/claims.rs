@@ -1,7 +1,8 @@
 //! Typed implementation claims and evidence registration.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -223,13 +224,105 @@ struct CargoMetadata {
 
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
+    manifest_path: PathBuf,
     targets: Vec<CargoTarget>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoTarget {
+    kind: Vec<String>,
+    name: String,
     src_path: PathBuf,
     test: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CargoManifestTargets {
+    #[serde(rename = "lib")]
+    library: Option<CargoManifestTarget>,
+    #[serde(rename = "bin")]
+    binaries: Vec<CargoManifestTarget>,
+    #[serde(rename = "test")]
+    tests: Vec<CargoManifestTarget>,
+    #[serde(rename = "bench")]
+    benches: Vec<CargoManifestTarget>,
+    #[serde(rename = "example")]
+    examples: Vec<CargoManifestTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoManifestTarget {
+    name: Option<String>,
+    path: Option<PathBuf>,
+    harness: Option<bool>,
+}
+
+#[derive(Debug)]
+struct CargoWorkspaceSpec {
+    directory: PathBuf,
+    members: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CargoManifestScope {
+    package: bool,
+    workspace: Option<CargoWorkspaceSpec>,
+}
+
+impl CargoWorkspaceSpec {
+    fn includes_package(&self, package_directory: &Path) -> bool {
+        if package_directory == self.directory {
+            return true;
+        }
+        let Ok(relative) = package_directory.strip_prefix(&self.directory) else {
+            return false;
+        };
+        let relative = normalized_api_path(relative.to_path_buf());
+        if self
+            .exclude
+            .iter()
+            .any(|pattern| cargo_exclude_pattern_covers(pattern, &relative))
+        {
+            return false;
+        }
+        self.members
+            .iter()
+            .any(|pattern| cargo_pattern_matches(pattern, &relative))
+    }
+}
+
+impl CargoManifestTargets {
+    fn uses_standard_test_harness(&self, package_directory: &Path, target: &CargoTarget) -> bool {
+        let declaration = if target.kind.iter().any(|kind| kind == "bin") {
+            matching_manifest_target(&self.binaries, package_directory, target)
+        } else if target.kind.iter().any(|kind| kind == "test") {
+            matching_manifest_target(&self.tests, package_directory, target)
+        } else if target.kind.iter().any(|kind| kind == "bench") {
+            matching_manifest_target(&self.benches, package_directory, target)
+        } else if target.kind.iter().any(|kind| kind == "example") {
+            matching_manifest_target(&self.examples, package_directory, target)
+        } else {
+            self.library.as_ref()
+        };
+        declaration.is_none_or(|declaration| declaration.harness != Some(false))
+    }
+}
+
+fn matching_manifest_target<'a>(
+    declarations: &'a [CargoManifestTarget],
+    package_directory: &Path,
+    target: &CargoTarget,
+) -> Option<&'a CargoManifestTarget> {
+    declarations.iter().find(|declaration| {
+        declaration.name.as_deref() == Some(target.name.as_str())
+            || declaration.path.as_ref().is_some_and(|path| {
+                let declared = package_directory.join(path).canonicalize();
+                let metadata = target.src_path.canonicalize();
+                declared.is_ok_and(|declared| metadata.is_ok_and(|metadata| declared == metadata))
+            })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -240,38 +333,6 @@ pub(crate) struct CargoTestTargets {
 
 impl CargoTestTargets {
     fn load(repository_root: &Path, code: ViolationCode) -> Result<Self, ConformanceError> {
-        let manifest_path = repository_root.join("Cargo.toml");
-        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = Command::new(cargo)
-            .current_dir(repository_root)
-            .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
-            .arg("--manifest-path")
-            .arg(&manifest_path)
-            .output()
-            .map_err(|error| {
-                ConformanceError::new(
-                    code,
-                    Some("Cargo.toml".to_owned()),
-                    format!("cannot run cargo metadata: {error}"),
-                )
-            })?;
-        if !output.status.success() {
-            return Err(ConformanceError::new(
-                code,
-                Some("Cargo.toml".to_owned()),
-                format!(
-                    "cargo metadata failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ));
-        }
-        let metadata: CargoMetadata = serde_json::from_slice(&output.stdout).map_err(|error| {
-            ConformanceError::new(
-                code,
-                Some("Cargo.toml".to_owned()),
-                format!("cannot parse cargo metadata: {error}"),
-            )
-        })?;
         let canonical_root = repository_root.canonicalize().map_err(|error| {
             ConformanceError::new(
                 code,
@@ -279,27 +340,105 @@ impl CargoTestTargets {
                 format!("cannot resolve repository root: {error}"),
             )
         })?;
-        let mut source_paths = BTreeSet::new();
-        for target in metadata
-            .packages
-            .into_iter()
-            .flat_map(|package| package.targets)
-            .filter(|target| target.test)
-        {
-            let source_path = target.src_path.canonicalize().map_err(|error| {
+        let manifests = discover_cargo_manifests(&canonical_root).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!("cannot discover Cargo manifests: {error}"),
+            )
+        })?;
+        let mut scoped_manifests = Vec::new();
+        for manifest_path in manifests {
+            let canonical_manifest = manifest_path.canonicalize().map_err(|error| {
                 ConformanceError::new(
                     code,
                     Some("Cargo.toml".to_owned()),
                     format!(
-                        "cannot resolve test-enabled Cargo target '{}': {error}",
-                        target.src_path.display()
+                        "cannot resolve Cargo manifest '{}': {error}",
+                        manifest_path.display()
                     ),
                 )
             })?;
-            if source_path.starts_with(&canonical_root) {
-                source_paths.insert(source_path);
+            let scope = load_manifest_scope(&canonical_root, &canonical_manifest, code)?;
+            scoped_manifests.push((canonical_manifest, scope));
+        }
+        let workspace_directories = scoped_manifests
+            .iter()
+            .filter_map(|(_, scope)| {
+                scope
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.directory.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let mut target_roots = BTreeSet::new();
+        for (canonical_manifest, scope) in scoped_manifests {
+            let package_directory = canonical_manifest
+                .parent()
+                .expect("a canonical Cargo manifest has a parent");
+            let workspace = if let Some(workspace) = scope.workspace {
+                workspace
+            } else if scope.package
+                && !workspace_directories
+                    .iter()
+                    .any(|directory| package_directory.starts_with(directory))
+            {
+                CargoWorkspaceSpec {
+                    directory: package_directory.to_path_buf(),
+                    members: Vec::new(),
+                    exclude: Vec::new(),
+                }
+            } else {
+                continue;
+            };
+            let metadata = load_cargo_metadata(&canonical_root, &canonical_manifest, code)?;
+            for package in metadata.packages {
+                let package_manifest = package.manifest_path.canonicalize().map_err(|error| {
+                    ConformanceError::new(
+                        code,
+                        Some("Cargo.toml".to_owned()),
+                        format!(
+                            "cannot resolve Cargo package manifest '{}': {error}",
+                            package.manifest_path.display()
+                        ),
+                    )
+                })?;
+                let package_directory = package_manifest.parent().ok_or_else(|| {
+                    ConformanceError::new(
+                        code,
+                        Some("Cargo.toml".to_owned()),
+                        format!(
+                            "Cargo package manifest '{}' has no parent directory",
+                            package_manifest.display()
+                        ),
+                    )
+                })?;
+                if !workspace.includes_package(package_directory) {
+                    continue;
+                }
+                let manifest_targets =
+                    load_manifest_targets(&canonical_root, &package_manifest, code)?;
+                for target in package.targets.into_iter().filter(|target| {
+                    target.test
+                        && manifest_targets.uses_standard_test_harness(package_directory, target)
+                }) {
+                    let source_path = target.src_path.canonicalize().map_err(|error| {
+                        ConformanceError::new(
+                            code,
+                            Some("Cargo.toml".to_owned()),
+                            format!(
+                                "cannot resolve test-enabled Cargo target '{}': {error}",
+                                target.src_path.display()
+                            ),
+                        )
+                    })?;
+                    if source_path.starts_with(package_directory) {
+                        target_roots.insert((source_path, package_directory.to_path_buf()));
+                    }
+                }
             }
         }
+        let source_paths = reachable_rust_sources(&canonical_root, target_roots, code)?;
         Ok(Self {
             repository_root: canonical_root,
             source_paths,
@@ -315,6 +454,485 @@ impl CargoTestTargets {
             .canonicalize()
             .is_ok_and(|root| root == self.repository_root)
     }
+}
+
+fn load_manifest_scope(
+    repository_root: &Path,
+    manifest_path: &Path,
+    code: ViolationCode,
+) -> Result<CargoManifestScope, ConformanceError> {
+    let subject = normalized_api_path(
+        manifest_path
+            .strip_prefix(repository_root)
+            .unwrap_or(manifest_path)
+            .to_path_buf(),
+    );
+    let source = fs::read_to_string(manifest_path).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject.clone()),
+            format!("cannot read Cargo manifest: {error}"),
+        )
+    })?;
+    let document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject),
+            format!("cannot parse Cargo manifest: {error}"),
+        )
+    })?;
+    let package = document
+        .get("package")
+        .and_then(toml_edit::Item::as_table)
+        .is_some_and(|package| !package.is_implicit());
+    let Some(workspace) = document
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table)
+        .filter(|workspace| !workspace.is_implicit())
+    else {
+        return Ok(CargoManifestScope {
+            package,
+            workspace: None,
+        });
+    };
+    let strings = |key: &str| {
+        workspace
+            .get(key)
+            .and_then(toml_edit::Item::as_array)
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter_map(toml_edit::Value::as_str)
+            .map(|value| value.trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+    };
+    let directory = manifest_path
+        .parent()
+        .expect("a canonical Cargo manifest has a parent")
+        .to_path_buf();
+    Ok(CargoManifestScope {
+        package,
+        workspace: Some(CargoWorkspaceSpec {
+            directory,
+            members: strings("members"),
+            exclude: strings("exclude"),
+        }),
+    })
+}
+
+fn cargo_exclude_pattern_covers(pattern: &str, relative_directory: &str) -> bool {
+    let mut prefix = String::new();
+    relative_directory.split('/').any(|segment| {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        cargo_pattern_matches(pattern, &prefix)
+    })
+}
+
+fn cargo_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    fn matches(
+        pattern: &[char],
+        candidate: &[char],
+        pattern_index: usize,
+        candidate_index: usize,
+        memo: &mut BTreeMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, candidate_index)) {
+            return *result;
+        }
+        let result = if pattern_index == pattern.len() {
+            candidate_index == candidate.len()
+        } else if pattern[pattern_index] == '*' && pattern.get(pattern_index + 1) == Some(&'*') {
+            matches(pattern, candidate, pattern_index + 2, candidate_index, memo)
+                || (candidate_index < candidate.len()
+                    && matches(pattern, candidate, pattern_index, candidate_index + 1, memo))
+        } else if pattern[pattern_index] == '*' {
+            matches(pattern, candidate, pattern_index + 1, candidate_index, memo)
+                || (candidate
+                    .get(candidate_index)
+                    .is_some_and(|value| *value != '/')
+                    && matches(pattern, candidate, pattern_index, candidate_index + 1, memo))
+        } else if pattern[pattern_index] == '?' {
+            candidate
+                .get(candidate_index)
+                .is_some_and(|value| *value != '/')
+                && matches(
+                    pattern,
+                    candidate,
+                    pattern_index + 1,
+                    candidate_index + 1,
+                    memo,
+                )
+        } else {
+            candidate.get(candidate_index) == Some(&pattern[pattern_index])
+                && matches(
+                    pattern,
+                    candidate,
+                    pattern_index + 1,
+                    candidate_index + 1,
+                    memo,
+                )
+        };
+        memo.insert((pattern_index, candidate_index), result);
+        result
+    }
+
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let candidate = candidate.chars().collect::<Vec<_>>();
+    matches(&pattern, &candidate, 0, 0, &mut BTreeMap::new())
+}
+
+fn load_manifest_targets(
+    repository_root: &Path,
+    manifest_path: &Path,
+    code: ViolationCode,
+) -> Result<CargoManifestTargets, ConformanceError> {
+    let subject = normalized_api_path(
+        manifest_path
+            .strip_prefix(repository_root)
+            .unwrap_or(manifest_path)
+            .to_path_buf(),
+    );
+    let source = fs::read_to_string(manifest_path).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject.clone()),
+            format!("cannot read Cargo manifest: {error}"),
+        )
+    })?;
+    toml::from_str(&source).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some(subject),
+            format!("cannot parse Cargo manifest: {error}"),
+        )
+    })
+}
+
+fn load_cargo_metadata(
+    repository_root: &Path,
+    manifest_path: &Path,
+    code: ViolationCode,
+) -> Result<CargoMetadata, ConformanceError> {
+    let cargo = cargo_executable(repository_root, code)?;
+    let output = Command::new(cargo)
+        .current_dir(repository_root)
+        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .output()
+        .map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some("Cargo.toml".to_owned()),
+                format!(
+                    "cannot run cargo metadata for '{}': {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!(
+                "cargo metadata failed for '{}': {}",
+                manifest_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!(
+                "cannot parse cargo metadata for '{}': {error}",
+                manifest_path.display()
+            ),
+        )
+    })
+}
+
+fn cargo_executable(
+    repository_root: &Path,
+    code: ViolationCode,
+) -> Result<PathBuf, ConformanceError> {
+    let configured = env::var_os("CARGO");
+    let search_path = env::var_os("PATH");
+    resolve_cargo_executable(
+        repository_root,
+        configured.as_deref(),
+        search_path.as_deref(),
+    )
+    .map_err(|message| {
+        ConformanceError::new(
+            code,
+            Some("Cargo.toml".to_owned()),
+            format!("cannot resolve trusted Cargo executable: {message}"),
+        )
+    })
+}
+
+fn resolve_cargo_executable(
+    repository_root: &Path,
+    configured: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    resolve_external_executable(
+        repository_root,
+        "CARGO",
+        configured,
+        &format!("cargo{}", env::consts::EXE_SUFFIX),
+        search_path,
+    )
+}
+
+fn resolve_external_executable(
+    repository_root: &Path,
+    variable: &str,
+    configured: Option<&OsStr>,
+    default_name: &str,
+    search_path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    let configured = configured.map(PathBuf::from);
+    if let Some(path) = configured
+        .as_ref()
+        .filter(|path| path.components().count() > 1)
+    {
+        if !path.is_absolute() {
+            return Err(format!(
+                "{variable} names a relative path '{}'",
+                path.display()
+            ));
+        }
+        return trusted_executable(repository_root, path);
+    }
+
+    let executable_name = configured
+        .and_then(|path| path.file_name().map(OsString::from))
+        .unwrap_or_else(|| OsString::from(default_name));
+    let search_path = search_path.ok_or_else(|| "PATH is not set".to_owned())?;
+    for directory in env::split_paths(search_path).filter(|directory| directory.is_absolute()) {
+        let candidate = directory.join(&executable_name);
+        if candidate.is_file() {
+            return trusted_executable(repository_root, &candidate);
+        }
+    }
+    Err(format!(
+        "'{}' was not found in an absolute PATH directory",
+        Path::new(&executable_name).display()
+    ))
+}
+
+fn trusted_executable(repository_root: &Path, candidate: &Path) -> Result<PathBuf, String> {
+    let executable = candidate
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve '{}': {error}", candidate.display()))?;
+    let repository_root = repository_root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve repository root: {error}"))?;
+    if executable.starts_with(repository_root) {
+        return Err(format!(
+            "resolved executable '{}' is inside the repository under validation",
+            executable.display()
+        ));
+    }
+    Ok(executable)
+}
+
+fn discover_cargo_manifests(repository_root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut manifests = Vec::new();
+    let mut directories = VecDeque::from([repository_root.to_path_buf()]);
+    while let Some(directory) = directories.pop_front() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_symlink_or_reparse(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                if !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "target" | "node_modules")
+                ) {
+                    directories.push_back(path);
+                }
+            } else if metadata.is_file() && entry.file_name() == "Cargo.toml" {
+                manifests.push(path);
+            }
+        }
+    }
+    manifests.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(manifests)
+}
+
+#[derive(Debug)]
+struct ReachableRustSource {
+    path: PathBuf,
+    module_directory: PathBuf,
+    package_directory: PathBuf,
+}
+
+fn reachable_rust_sources(
+    repository_root: &Path,
+    target_roots: BTreeSet<(PathBuf, PathBuf)>,
+    code: ViolationCode,
+) -> Result<BTreeSet<PathBuf>, ConformanceError> {
+    let mut reachable = target_roots
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut visited = target_roots.clone();
+    let mut queue = target_roots
+        .into_iter()
+        .filter_map(|(path, package_directory)| {
+            let module_directory = path.parent()?.to_path_buf();
+            Some(ReachableRustSource {
+                path,
+                module_directory,
+                package_directory,
+            })
+        })
+        .collect::<VecDeque<_>>();
+
+    while let Some(current) = queue.pop_front() {
+        let source = fs::read_to_string(&current.path).map_err(|error| {
+            ConformanceError::new(
+                code,
+                Some(normalized_api_path(
+                    current
+                        .path
+                        .strip_prefix(repository_root)
+                        .unwrap_or(&current.path)
+                        .to_path_buf(),
+                )),
+                format!(
+                    "cannot read test-enabled Cargo source '{}': {error}",
+                    current.path.display()
+                ),
+            )
+        })?;
+        for reference in rust_module_references(&source) {
+            let mut scope = current.module_directory.clone();
+            for (index, directory) in reference.inline_modules.iter().enumerate() {
+                match directory {
+                    InlineModuleDirectory::Default(name) => scope.push(name),
+                    InlineModuleDirectory::Path(path) if index == 0 => {
+                        scope = current.path.parent().unwrap_or(&scope).join(path);
+                    }
+                    InlineModuleDirectory::Path(path) => scope.push(path),
+                }
+            }
+            let candidates = if let Some(path) = &reference.path {
+                let base = if reference.inline_modules.is_empty() {
+                    current.path.parent().unwrap_or(&scope)
+                } else {
+                    &scope
+                };
+                vec![base.join(path)]
+            } else {
+                let child_directory = scope.join(&reference.name);
+                vec![
+                    scope.join(format!("{}.rs", reference.name)),
+                    child_directory.join("mod.rs"),
+                ]
+            };
+            let mut resolved = Vec::new();
+            for candidate in candidates {
+                let Some(path) = resolve_module_file(&current.package_directory, &candidate)
+                    .map_err(|error| {
+                        ConformanceError::new(
+                            code,
+                            Some("Cargo.toml".to_owned()),
+                            format!(
+                                "cannot resolve Rust module source '{}': {error}",
+                                candidate.display()
+                            ),
+                        )
+                    })?
+                else {
+                    continue;
+                };
+                resolved.push(path);
+            }
+            if reference.path.is_none() && resolved.len() > 1 {
+                return Err(ConformanceError::new(
+                    code,
+                    Some(normalized_api_path(
+                        current
+                            .path
+                            .strip_prefix(repository_root)
+                            .unwrap_or(&current.path)
+                            .to_path_buf(),
+                    )),
+                    format!(
+                        "Rust module '{}' is ambiguous because both '{}.rs' and '{}/mod.rs' exist",
+                        reference.name, reference.name, reference.name
+                    ),
+                ));
+            }
+            for path in resolved {
+                if visited.insert((path.clone(), current.package_directory.clone())) {
+                    reachable.insert(path.clone());
+                    let module_directory = module_directory_for_source(&path);
+                    queue.push_back(ReachableRustSource {
+                        path,
+                        module_directory,
+                        package_directory: current.package_directory.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(reachable)
+}
+
+fn module_directory_for_source(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(|name| name == "mod.rs") {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else if path.extension().is_some_and(|extension| extension == "rs") {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn resolve_module_file(
+    repository_root: &Path,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    let Some(relative) = normalized_repository_relative(repository_root, candidate) else {
+        return Ok(None);
+    };
+    resolve_ordinal_file(repository_root, &normalized_api_path(relative))
+}
+
+fn normalized_repository_relative(repository_root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(repository_root).ok()?;
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(normalized)
 }
 
 impl Registry {
@@ -592,7 +1210,7 @@ pub(crate) fn validate_evidence_as(
                 code,
                 Some(subject.to_owned()),
                 format!(
-                    "evidence path '{}' is not a test-enabled Cargo target source",
+                    "evidence path '{}' is not reachable from a test-enabled Cargo target",
                     item.path
                 ),
             ));
@@ -803,6 +1421,10 @@ enum RustToken {
     CloseParen,
     ColonColon,
     Semi,
+    Equals,
+    Literal,
+    StringLiteral(String),
+    Other,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -810,6 +1432,26 @@ struct RustAttribute {
     inner: bool,
     path: Vec<String>,
     tokens: Vec<RustToken>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustModuleReference {
+    inline_modules: Vec<InlineModuleDirectory>,
+    name: String,
+    path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathAttribute {
+    Absent,
+    Value(String),
+    Invalid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InlineModuleDirectory {
+    Default(String),
+    Path(String),
 }
 
 // This is the normative enabled-test decision. The transition validator ports
@@ -848,16 +1490,7 @@ fn declares_in_items(
             break;
         }
         index = skip_visibility(tokens, index, end);
-        while matches!(
-            tokens.get(index),
-            Some(RustToken::Ident(value))
-                if matches!(
-                    value.as_str(),
-                    "async" | "const" | "default" | "extern" | "unsafe"
-                )
-        ) {
-            index += 1;
-        }
+        index = skip_item_modifiers(tokens, index);
         match (tokens.get(index), tokens.get(index + 1)) {
             (Some(RustToken::Ident(keyword)), Some(RustToken::Ident(name))) if keyword == "mod" => {
                 if tokens.get(index + 2) == Some(&RustToken::OpenBrace) {
@@ -928,6 +1561,108 @@ fn parse_attributes(
     (attributes, index)
 }
 
+fn rust_module_references(source: &str) -> Vec<RustModuleReference> {
+    let tokens = rust_tokens(source);
+    let mut references = Vec::new();
+    collect_rust_module_references(&tokens, 0, tokens.len(), &[], &mut references);
+    references
+}
+
+fn collect_rust_module_references(
+    tokens: &[RustToken],
+    start: usize,
+    end: usize,
+    inline_modules: &[InlineModuleDirectory],
+    references: &mut Vec<RustModuleReference>,
+) {
+    let mut index = start;
+    while index < end {
+        let item_start = index;
+        let (attributes, after_attributes) = parse_attributes(tokens, index, end);
+        let outer_attributes = attributes
+            .into_iter()
+            .filter(|attribute| !attribute.inner)
+            .collect::<Vec<_>>();
+        index = skip_visibility(tokens, after_attributes, end);
+        index = skip_item_modifiers(tokens, index);
+
+        match (tokens.get(index), tokens.get(index + 1)) {
+            (Some(RustToken::Ident(keyword)), Some(RustToken::Ident(name))) if keyword == "mod" => {
+                if tokens.get(index + 2) == Some(&RustToken::OpenBrace) {
+                    let open = index + 2;
+                    let close = matching_delimiter(tokens, open, end).unwrap_or(end);
+                    let mut nested = inline_modules.to_vec();
+                    match path_attribute(&outer_attributes) {
+                        PathAttribute::Absent => {
+                            nested.push(InlineModuleDirectory::Default(name.clone()));
+                            collect_rust_module_references(
+                                tokens,
+                                open + 1,
+                                close,
+                                &nested,
+                                references,
+                            );
+                        }
+                        PathAttribute::Value(path) => {
+                            nested.push(InlineModuleDirectory::Path(path));
+                            collect_rust_module_references(
+                                tokens,
+                                open + 1,
+                                close,
+                                &nested,
+                                references,
+                            );
+                        }
+                        PathAttribute::Invalid => {}
+                    }
+                    index = close.saturating_add(1);
+                } else if tokens.get(index + 2) == Some(&RustToken::Semi) {
+                    match path_attribute(&outer_attributes) {
+                        PathAttribute::Absent => references.push(RustModuleReference {
+                            inline_modules: inline_modules.to_vec(),
+                            name: name.clone(),
+                            path: None,
+                        }),
+                        PathAttribute::Value(path) => references.push(RustModuleReference {
+                            inline_modules: inline_modules.to_vec(),
+                            name: name.clone(),
+                            path: Some(path),
+                        }),
+                        PathAttribute::Invalid => {}
+                    }
+                    index += 3;
+                } else {
+                    index = skip_item(tokens, index, end);
+                }
+            }
+            _ => index = skip_item(tokens, index, end),
+        }
+        if index <= item_start {
+            index = item_start + 1;
+        }
+    }
+}
+
+fn path_attribute(attributes: &[RustAttribute]) -> PathAttribute {
+    let mut paths = attributes
+        .iter()
+        .filter(|attribute| attribute.path.as_slice() == ["path"]);
+    let Some(attribute) = paths.next() else {
+        return PathAttribute::Absent;
+    };
+    if paths.next().is_some() {
+        return PathAttribute::Invalid;
+    }
+    match attribute.tokens.as_slice() {
+        [
+            RustToken::Ident(name),
+            RustToken::Equals,
+            RustToken::StringLiteral(value),
+        ] if name == "path" => PathAttribute::Value(value.clone()),
+        _ => PathAttribute::Invalid,
+    }
+}
+
 fn attributes_declare_enabled_test(attributes: &[RustAttribute]) -> bool {
     let has_test = attributes.iter().any(|attribute| {
         attribute
@@ -935,40 +1670,30 @@ fn attributes_declare_enabled_test(attributes: &[RustAttribute]) -> bool {
             .last()
             .is_some_and(|segment| segment == "test")
     });
-    let ignored = attributes.iter().any(|attribute| {
-        attribute
-            .path
-            .first()
-            .is_some_and(|segment| segment == "ignore")
-    });
-    let cfg_gated = attributes.iter().any(|attribute| {
-        attribute
-            .path
-            .first()
-            .is_some_and(|segment| matches!(segment.as_str(), "cfg" | "cfg_attr"))
-    });
-    has_test && !ignored && !cfg_gated
+    has_test && attributes.iter().all(attribute_enables_tests)
 }
 
 fn module_attributes_enable_tests(attributes: &[RustAttribute]) -> bool {
-    attributes.iter().all(|attribute| {
-        let Some(first) = attribute.path.first() else {
-            return true;
-        };
-        if first == "ignore" || first == "cfg_attr" {
-            return false;
-        }
-        if first != "cfg" {
-            return true;
-        }
-        attribute.tokens.as_slice()
-            == [
-                RustToken::Ident("cfg".to_owned()),
-                RustToken::OpenParen,
-                RustToken::Ident("test".to_owned()),
-                RustToken::CloseParen,
-            ]
-    })
+    attributes.iter().all(attribute_enables_tests)
+}
+
+fn attribute_enables_tests(attribute: &RustAttribute) -> bool {
+    let Some(first) = attribute.path.first() else {
+        return true;
+    };
+    if first == "ignore" || first == "cfg_attr" {
+        return false;
+    }
+    if first != "cfg" {
+        return true;
+    }
+    attribute.tokens.as_slice()
+        == [
+            RustToken::Ident("cfg".to_owned()),
+            RustToken::OpenParen,
+            RustToken::Ident("test".to_owned()),
+            RustToken::CloseParen,
+        ]
 }
 
 fn test_identity_matches(modules: &[String], function: &str, target: &[&str]) -> bool {
@@ -993,8 +1718,47 @@ fn skip_visibility(tokens: &[RustToken], mut index: usize, end: usize) -> usize 
     index
 }
 
+fn skip_item_modifiers(tokens: &[RustToken], mut index: usize) -> usize {
+    loop {
+        match tokens.get(index) {
+            Some(RustToken::Ident(value)) if value == "extern" => {
+                index += 1;
+                if matches!(
+                    tokens.get(index),
+                    Some(RustToken::Literal | RustToken::StringLiteral(_))
+                ) {
+                    index += 1;
+                }
+            }
+            Some(RustToken::Ident(value))
+                if matches!(value.as_str(), "async" | "const" | "default" | "unsafe") =>
+            {
+                index += 1;
+            }
+            _ => return index,
+        }
+    }
+}
+
 fn skip_item(tokens: &[RustToken], mut index: usize, end: usize) -> usize {
+    let item_start = index;
     while index < end {
+        if matches!(tokens.get(index), Some(RustToken::Ident(_)))
+            && tokens.get(index + 1) == Some(&RustToken::Bang)
+        {
+            let Some(after_macro) = macro_invocation_end(tokens, index, end) else {
+                return end;
+            };
+            let macro_is_item = macro_item_prefix(tokens, item_start, index);
+            index = after_macro;
+            if macro_is_item {
+                if tokens.get(index) == Some(&RustToken::Semi) {
+                    index += 1;
+                }
+                return index;
+            }
+            continue;
+        }
         match &tokens[index] {
             RustToken::Semi => return index + 1,
             RustToken::OpenBrace => {
@@ -1008,20 +1772,61 @@ fn skip_item(tokens: &[RustToken], mut index: usize, end: usize) -> usize {
     end
 }
 
+fn macro_invocation_end(tokens: &[RustToken], index: usize, end: usize) -> Option<usize> {
+    if !matches!(tokens.get(index), Some(RustToken::Ident(_)))
+        || tokens.get(index + 1) != Some(&RustToken::Bang)
+    {
+        return None;
+    }
+    let mut open = index + 2;
+    if matches!(tokens.get(index), Some(RustToken::Ident(name)) if name == "macro_rules")
+        && matches!(tokens.get(open), Some(RustToken::Ident(_)))
+    {
+        open += 1;
+    }
+    if !matches!(
+        tokens.get(open),
+        Some(RustToken::OpenBracket | RustToken::OpenBrace | RustToken::OpenParen)
+    ) {
+        return None;
+    }
+    matching_delimiter(tokens, open, end).map(|close| close + 1)
+}
+
+fn macro_item_prefix(tokens: &[RustToken], start: usize, macro_name: usize) -> bool {
+    let mut prefix = &tokens[start..=macro_name];
+    if prefix.first() == Some(&RustToken::ColonColon) {
+        prefix = &prefix[1..];
+    }
+    !prefix.is_empty()
+        && prefix.iter().enumerate().all(|(offset, token)| {
+            if offset % 2 == 0 {
+                matches!(token, RustToken::Ident(_))
+            } else {
+                token == &RustToken::ColonColon
+            }
+        })
+}
+
 fn matching_delimiter(tokens: &[RustToken], open: usize, end: usize) -> Option<usize> {
-    let (opening, closing) = match tokens.get(open)? {
-        RustToken::OpenBracket => (RustToken::OpenBracket, RustToken::CloseBracket),
-        RustToken::OpenBrace => (RustToken::OpenBrace, RustToken::CloseBrace),
-        RustToken::OpenParen => (RustToken::OpenParen, RustToken::CloseParen),
-        _ => return None,
-    };
-    let mut depth = 0_usize;
+    let mut expected = Vec::new();
     for (index, token) in tokens.iter().enumerate().take(end).skip(open) {
-        if token == &opening {
-            depth += 1;
-        } else if token == &closing {
-            depth -= 1;
-            if depth == 0 {
+        let closing = match token {
+            RustToken::OpenBracket => Some(RustToken::CloseBracket),
+            RustToken::OpenBrace => Some(RustToken::CloseBrace),
+            RustToken::OpenParen => Some(RustToken::CloseParen),
+            _ => None,
+        };
+        if let Some(closing) = closing {
+            expected.push(closing);
+        } else if matches!(
+            token,
+            RustToken::CloseBracket | RustToken::CloseBrace | RustToken::CloseParen
+        ) {
+            if expected.pop().as_ref() != Some(token) {
+                return None;
+            }
+            if expected.is_empty() {
                 return Some(index);
             }
         }
@@ -1034,7 +1839,9 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
     let mut tokens = Vec::new();
     let mut index = 0_usize;
     while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
+        if bytes.get(index..index + 3) == Some(&[0xef, 0xbb, 0xbf]) {
+            index += 3;
+        } else if bytes[index].is_ascii_whitespace() {
             index += 1;
         } else if bytes.get(index..index + 2) == Some(b"//") {
             index += 2;
@@ -1044,25 +1851,51 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
         } else if bytes.get(index..index + 2) == Some(b"/*") {
             index = skip_block_comment(bytes, index);
         } else if let Some(end) = raw_string_end(bytes, index) {
+            if let Some(value) = raw_string_value(source, index, end) {
+                tokens.push(RustToken::StringLiteral(value));
+            } else {
+                tokens.push(RustToken::Literal);
+            }
             index = end;
         } else if bytes[index] == b'"'
             || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"'))
         {
+            let is_byte = bytes[index] == b'b';
             let quote = if bytes[index] == b'"' {
                 index
             } else {
                 index + 1
             };
-            index = quoted_end(bytes, quote, b'"');
+            let end = quoted_end(bytes, quote, b'"');
+            if !is_byte && bytes.get(end.saturating_sub(1)) == Some(&b'"') {
+                tokens.push(RustToken::StringLiteral(
+                    source[quote + 1..end - 1].to_owned(),
+                ));
+            } else {
+                tokens.push(RustToken::Literal);
+            }
+            index = end;
         } else if bytes[index] == b'\'' {
+            tokens.push(RustToken::Literal);
             index = char_literal_end(bytes, index).unwrap_or(index + 1);
-        } else if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+        } else if bytes[index].is_ascii_alphabetic()
+            || bytes[index] == b'_'
+            || !bytes[index].is_ascii()
+        {
             let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-            {
-                index += 1;
+            index += if bytes[index].is_ascii() {
+                1
+            } else {
+                source[index..].chars().next().map_or(1, char::len_utf8)
+            };
+            while index < bytes.len() {
+                if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
+                    index += 1;
+                } else if !bytes[index].is_ascii() {
+                    index += source[index..].chars().next().map_or(1, char::len_utf8);
+                } else {
+                    break;
+                }
             }
             tokens.push(RustToken::Ident(source[start..index].to_owned()));
         } else {
@@ -1076,11 +1909,12 @@ fn rust_tokens(source: &str) -> Vec<RustToken> {
                 b'(' => tokens.push(RustToken::OpenParen),
                 b')' => tokens.push(RustToken::CloseParen),
                 b';' => tokens.push(RustToken::Semi),
+                b'=' => tokens.push(RustToken::Equals),
                 b':' if bytes.get(index + 1) == Some(&b':') => {
                     tokens.push(RustToken::ColonColon);
                     index += 1;
                 }
-                _ => {}
+                _ => tokens.push(RustToken::Other),
             }
             index += 1;
         }
@@ -1139,6 +1973,26 @@ fn raw_string_end(bytes: &[u8], index: usize) -> Option<usize> {
     Some(bytes.len())
 }
 
+fn raw_string_value(source: &str, index: usize, end: usize) -> Option<String> {
+    let bytes = source.as_bytes();
+    if bytes.get(index) != Some(&b'r') {
+        return None;
+    }
+    let hashes = bytes[index + 1..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    let content_start = index + 2 + hashes;
+    let content_end = end.checked_sub(1 + hashes)?;
+    if bytes.get(index + 1 + hashes) != Some(&b'"')
+        || bytes.get(content_end) != Some(&b'"')
+        || content_end < content_start
+    {
+        return None;
+    }
+    source.get(content_start..content_end).map(str::to_owned)
+}
+
 fn quoted_end(bytes: &[u8], quote: usize, delimiter: u8) -> usize {
     let mut cursor = quote + 1;
     while cursor < bytes.len() {
@@ -1165,13 +2019,296 @@ fn char_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::declares_enabled_test;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use serde::Deserialize;
+
+    use super::{
+        CargoTestTargets, cargo_executable, cargo_pattern_matches, declares_enabled_test,
+        load_manifest_scope, normalized_api_path, resolve_cargo_executable,
+        resolve_external_executable,
+    };
+    use crate::ViolationCode;
+
+    static NEXT_COMPILER_ORACLE: AtomicU64 = AtomicU64::new(0);
+    const COMPILER_ORACLE_WARNING_ENV: [&str; 4] = [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_WARNINGS",
+    ];
+
+    #[derive(Deserialize)]
+    struct SharedOracleCorpus {
+        cases: Vec<SharedOracleCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct SharedOracleCase {
+        name: String,
+        source: String,
+        test: String,
+        expected: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct ReachabilityCorpus {
+        cases: Vec<ReachabilityCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReachabilityCase {
+        name: String,
+        files: BTreeMap<String, String>,
+        cite: String,
+        expect: String,
+    }
+
+    struct CompilerOracleFixture {
+        root: PathBuf,
+    }
+
+    fn compiler_oracle_command(cargo: &Path, root: &Path) -> Command {
+        let mut command = Command::new(cargo);
+        command
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", root.join("target"));
+        for variable in COMPILER_ORACLE_WARNING_ENV {
+            command.env_remove(variable);
+        }
+        command
+    }
+
+    impl CompilerOracleFixture {
+        fn new(source: &str) -> Self {
+            let root = env::temp_dir().join(format!(
+                "claw-conformance-compiler-oracle-{}-{}",
+                std::process::id(),
+                NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let tests = root.join("tests");
+            fs::create_dir_all(&tests).expect("create compiler oracle fixture");
+            fs::write(
+                root.join("Cargo.toml"),
+                "[package]\n\
+                 name = \"claw-conformance-compiler-oracle\"\n\
+                 version = \"0.0.0\"\n\
+                 edition = \"2024\"\n\n\
+                 [[test]]\n\
+                 name = \"oracle\"\n\
+                 path = \"tests/oracle.rs\"\n",
+            )
+            .expect("write compiler oracle manifest");
+            fs::write(tests.join("oracle.rs"), source).expect("write compiler oracle source");
+            Self { root }
+        }
+
+        fn cargo_test_list(&self, ignored_only: bool) -> BTreeSet<String> {
+            let cargo = cargo_executable(&self.root, ViolationCode::ClaimEvidence)
+                .expect("resolve trusted Cargo");
+            let mut command = compiler_oracle_command(&cargo, &self.root);
+            command.args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--manifest-path",
+                "Cargo.toml",
+                "--test",
+                "oracle",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ]);
+            if ignored_only {
+                command.arg("--ignored");
+            }
+            let output = command.output().expect("run compiler oracle");
+            assert_command_succeeded(&output);
+            String::from_utf8(output.stdout)
+                .expect("compiler oracle output is UTF-8")
+                .lines()
+                .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+                .collect()
+        }
+    }
+
+    impl Drop for CompilerOracleFixture {
+        fn drop(&mut self) {
+            if self.root.exists() {
+                fs::remove_dir_all(&self.root).expect("remove compiler oracle fixture");
+            }
+        }
+    }
+
+    fn assert_command_succeeded(output: &Output) {
+        assert!(
+            output.status.success(),
+            "compiler oracle failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn compiler_oracle_command_removes_warning_escalation() {
+        let command = compiler_oracle_command(Path::new("cargo"), Path::new("."));
+        for variable in COMPILER_ORACLE_WARNING_ENV {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == variable)
+                    .map(|(_, value)| value),
+                Some(None),
+                "{variable} must be absent from compiler oracle subprocesses"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_resolution_rejects_repository_controlled_executables() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-cargo-resolution-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let repository = root.join("repository");
+        let trusted = root.join("trusted");
+        fs::create_dir_all(&repository).expect("create repository executable directory");
+        fs::create_dir_all(&trusted).expect("create trusted executable directory");
+        let executable_name = format!("cargo{}", env::consts::EXE_SUFFIX);
+        let planted = repository.join(&executable_name);
+        let trusted_cargo = trusted.join(&executable_name);
+        fs::write(&planted, "candidate controlled").expect("write planted Cargo executable");
+        fs::write(&trusted_cargo, "trusted").expect("write trusted Cargo executable");
+
+        let search_path =
+            env::join_paths([repository.as_path(), trusted.as_path()]).expect("join search path");
+        let error = resolve_cargo_executable(&repository, None, Some(&search_path))
+            .expect_err("repository Cargo must be rejected");
+        let canonical_planted = planted.canonicalize().expect("canonical planted Cargo");
+        assert_eq!(
+            error,
+            format!(
+                "resolved executable '{}' is inside the repository under validation",
+                canonical_planted.display()
+            )
+        );
+
+        let relative_then_trusted =
+            env::join_paths([Path::new("."), trusted.as_path()]).expect("join safe search path");
+        let resolved = resolve_cargo_executable(&repository, None, Some(&relative_then_trusted))
+            .expect("relative PATH entries must be ignored");
+        assert_eq!(
+            resolved,
+            trusted_cargo
+                .canonicalize()
+                .expect("canonical trusted Cargo")
+        );
+
+        let configured_error =
+            resolve_cargo_executable(&repository, Some(planted.as_os_str()), Some(&search_path))
+                .expect_err("configured repository Cargo must be rejected");
+        assert_eq!(
+            configured_error,
+            format!(
+                "resolved executable '{}' is inside the repository under validation",
+                canonical_planted.display()
+            )
+        );
+        fs::remove_dir_all(root).expect("remove Cargo resolution fixture");
+    }
+
+    #[test]
+    fn tracked_rust_sources_match_the_reviewed_reachability_boundary() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("canonical repository root");
+        let configured = env::var_os("GIT");
+        let search_path = env::var_os("PATH");
+        let git = resolve_external_executable(
+            &root,
+            "GIT",
+            configured.as_deref(),
+            &format!("git{}", env::consts::EXE_SUFFIX),
+            search_path.as_deref(),
+        )
+        .expect("resolve trusted Git");
+        let output = Command::new(git)
+            .current_dir(&root)
+            .args(["ls-files", "-z", "--", "*.rs"])
+            .output()
+            .expect("list tracked Rust sources");
+        assert_command_succeeded(&output);
+        let tracked = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                std::str::from_utf8(path)
+                    .expect("tracked path is UTF-8")
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(!tracked.is_empty(), "Git must report tracked Rust sources");
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        let verdicts = tracked
+            .into_iter()
+            .map(|path| {
+                let canonical = root
+                    .join(&path)
+                    .canonicalize()
+                    .expect("canonical tracked Rust source");
+                let accepted = targets.contains(&canonical);
+                (normalized_api_path(PathBuf::from(path)), accepted)
+            })
+            .collect::<Vec<_>>();
+        if let Some(output_path) = env::var_os("CLAW_CONFORMANCE_VERDICT_OUT") {
+            let mut lines = verdicts
+                .iter()
+                .map(|(path, accepted)| {
+                    format!("{}\t{path}", if *accepted { "accept" } else { "reject" })
+                })
+                .collect::<Vec<_>>();
+            lines.sort();
+            fs::write(output_path, format!("{}\n", lines.join("\n")))
+                .expect("write Rust reachability verdicts");
+        }
+        let rejected = verdicts
+            .into_iter()
+            .filter_map(|(path, accepted)| (!accepted).then_some(path))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            rejected,
+            BTreeSet::from([
+                ".github/trusted/desktop-supply-chain-policy/policy/final/desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+                "crates/claw-config/build.rs".to_owned(),
+                "crates/claw-protocol/build.rs".to_owned(),
+                "desktop/apps/gta-claw-desktop/build.rs".to_owned(),
+                "desktop/apps/gta-claw-desktop/tests/macos_winit_smoke.rs".to_owned(),
+            ])
+        );
+    }
 
     #[test]
     fn evidence_requires_an_enabled_test_declaration() {
         let cases = [
             ("#[test]\nfn exact_name() {}", true),
             ("#[tokio::test]\nasync fn exact_name() {}", true),
+            ("#[cfg(test)]\n#[test]\nfn exact_name() {}", true),
+            (
+                "#[cfg(test = \"disabled\")]\n#[test]\nfn exact_name() {}",
+                false,
+            ),
             ("#[test]\n#[ignore]\nfn exact_name() {}", false),
             (
                 "#[test]\n#[cfg(target_os = \"none\")]\nfn exact_name() {}",
@@ -1240,5 +2377,984 @@ mod tests {
         assert!(!declares_enabled_test(string_literal, "exact_name"));
         let raw_string = "const SOURCE: &str = r#\"#[test] fn exact_name() {}\"#;";
         assert!(!declares_enabled_test(raw_string, "exact_name"));
+        let macro_tokens = "const _D: &str = stringify!({} #[test] fn forged_evidence_test() {});";
+        assert!(!declares_enabled_test(macro_tokens, "forged_evidence_test"));
+        let malformed_macro = "m!([); #[test] fn forged_evidence_test() {}])";
+        assert!(!declares_enabled_test(
+            malformed_macro,
+            "forged_evidence_test"
+        ));
+    }
+
+    #[test]
+    fn cargo_test_listing_matches_enabled_test_detector() {
+        let source = concat!(
+            r#"
+const _FORGED: &str = stringify!({} #[test] fn forged_evidence_test() {});
+const _FORGED_BRACE: &str = stringify! { #[test] fn forged_brace_test() {} };
+const _FORGED_BRACKET: &str = stringify![#[test] fn forged_bracket_test() {}];
+
+macro_rules! discard {
+    ($($tokens:tt)*) => {};
+}
+discard! {
+    #[test]
+    fn discarded_macro_test() {}
+}
+
+macro_rules! dormant {
+    () => {
+        #[test]
+        fn macro_definition_test() {}
+    };
+}
+"#,
+            "macro_rules! \u{5b8f} { ($($tokens:tt)*) => {}; }\n",
+            "\u{5b8f}!(const _: () = (); #[test] fn unicode_macro_test() {});\n",
+            r#"
+::std::thread_local! { static ABSOLUTE_MACRO_VALUE: u32 = 1; }
+
+#[test]
+fn after_absolute_macro() {}
+
+#[test]
+fn direct_test() {}
+
+#[cfg(test)]
+#[test]
+fn cfg_test_function() {}
+
+#[cfg(test = "disabled")]
+#[test]
+fn cfg_key_value_test() {}
+
+#[test]
+#[ignore]
+fn ignored_test() {}
+
+mod nested {
+    #[test]
+    fn nested_test() {}
+}
+"#
+        );
+        let fixture = CompilerOracleFixture::new(source);
+        let listed = fixture.cargo_test_list(false);
+        let ignored = fixture.cargo_test_list(true);
+        let enabled = listed
+            .difference(&ignored)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let identities = [
+            "forged_evidence_test",
+            "forged_brace_test",
+            "forged_bracket_test",
+            "discarded_macro_test",
+            "macro_definition_test",
+            "unicode_macro_test",
+            "after_absolute_macro",
+            "direct_test",
+            "cfg_test_function",
+            "cfg_key_value_test",
+            "ignored_test",
+            "nested::nested_test",
+        ];
+        for identity in identities {
+            assert_eq!(
+                declares_enabled_test(source, identity),
+                enabled.contains(identity),
+                "detector diverged from Cargo for {identity}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_test_listing_matches_module_reachability() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-reachability-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src").join("outer").join("nested"))
+            .expect("create nested module directory");
+        fs::create_dir_all(root.join("src").join("custom"))
+            .expect("create custom module directory");
+        fs::create_dir_all(root.join("src").join("actual"))
+            .expect("create redirected inline module directory");
+        fs::create_dir_all(root.join("src").join("host").join("actual"))
+            .expect("create redirected inline decoy directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-reachability-oracle\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [[bin]]\n\
+             name = \"disabled\"\n\
+             path = \"src/disabled.rs\"\n\
+             test = false\n",
+        )
+        .expect("write reachability manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-reachability-oracle\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write reachability lockfile");
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "#[test]\nfn root_test() {}\n\
+             mod outer;\n\
+             mod host;\n\
+             pub(crate) mod restricted;\n\
+             #[path = \"support/mod.rs\"]\nmod support;\n\
+             #[path = r\"raw/raw_module.rs\"]\nmod raw;\n",
+        )
+        .expect("write reachability crate root");
+        fs::write(
+            root.join("src").join("outer.rs"),
+            "mod nested {\n    mod proof;\n}\n\
+             #[path = \"custom/from_outer.rs\"]\nmod from_outer;\n",
+        )
+        .expect("write outer module");
+        fs::write(
+            root.join("src").join("host.rs"),
+            "#[path = \"actual\"]\n\
+             mod redirected {\n\
+                 #[path = \"proof.rs\"]\n\
+                 mod proof;\n\
+             }\n",
+        )
+        .expect("write redirected inline module");
+        fs::write(
+            root.join("src").join("actual").join("proof.rs"),
+            "#[test]\nfn redirected_inline_test() {}\n",
+        )
+        .expect("write redirected inline module evidence");
+        fs::write(
+            root.join("src")
+                .join("host")
+                .join("actual")
+                .join("proof.rs"),
+            "#[test]\nfn redirected_inline_decoy_test() {}\n",
+        )
+        .expect("write redirected inline module decoy");
+        fs::write(
+            root.join("src")
+                .join("outer")
+                .join("nested")
+                .join("proof.rs"),
+            "#[test]\nfn deep_test() {}\n",
+        )
+        .expect("write deep module");
+        fs::write(
+            root.join("src").join("custom").join("from_outer.rs"),
+            "#[test]\nfn outer_path_test() {}\n",
+        )
+        .expect("write path-attributed module from name.rs");
+        fs::create_dir_all(root.join("src").join("outer").join("custom"))
+            .expect("create path decoy directory");
+        fs::write(
+            root.join("src")
+                .join("outer")
+                .join("custom")
+                .join("from_outer.rs"),
+            "#[test]\nfn outer_path_decoy_test() {}\n",
+        )
+        .expect("write path-attributed decoy");
+        fs::create_dir_all(root.join("src").join("support").join("mod"))
+            .expect("create mod.rs decoy directory");
+        fs::write(
+            root.join("src").join("support").join("mod.rs"),
+            "#[test]\nfn mod_rs_root_test() {}\nmod child;\n",
+        )
+        .expect("write path-attributed mod.rs");
+        fs::write(
+            root.join("src").join("support").join("child.rs"),
+            "#[test]\nfn mod_rs_child_test() {}\n",
+        )
+        .expect("write mod.rs child");
+        fs::write(
+            root.join("src")
+                .join("support")
+                .join("mod")
+                .join("child.rs"),
+            "#[test]\nfn mod_rs_child_decoy_test() {}\n",
+        )
+        .expect("write mod.rs child decoy");
+        fs::create_dir_all(root.join("src").join("raw")).expect("create raw path directory");
+        fs::write(
+            root.join("src").join("raw").join("raw_module.rs"),
+            "#[test]\nfn raw_path_test() {}\n",
+        )
+        .expect("write raw path module");
+        fs::write(
+            root.join("src").join("orphan.rs"),
+            "#[test]\nfn orphan_test() {}\n",
+        )
+        .expect("write orphan module");
+        fs::write(
+            root.join("src").join("restricted.rs"),
+            "#[test]\nfn restricted_visibility_test() {}\n",
+        )
+        .expect("write restricted-visibility module");
+        fs::write(
+            root.join("src").join("disabled.rs"),
+            "#[test]\nfn disabled_test() {}\nfn main() {}\n",
+        )
+        .expect("write test-disabled target");
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--lib",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run reachability compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout)
+            .expect("reachability oracle output is UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([
+                "host::redirected::proof::redirected_inline_test".to_owned(),
+                "outer::nested::proof::deep_test".to_owned(),
+                "outer::from_outer::outer_path_test".to_owned(),
+                "raw::raw_path_test".to_owned(),
+                "restricted::restricted_visibility_test".to_owned(),
+                "root_test".to_owned(),
+                "support::child::mod_rs_child_test".to_owned(),
+                "support::mod_rs_root_test".to_owned(),
+            ])
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        for (path, test) in [
+            ("src/lib.rs", "root_test"),
+            (
+                "src/actual/proof.rs",
+                "host::redirected::proof::redirected_inline_test",
+            ),
+            (
+                "src/host/actual/proof.rs",
+                "host::redirected::proof::redirected_inline_decoy_test",
+            ),
+            (
+                "src/outer/nested/proof.rs",
+                "outer::nested::proof::deep_test",
+            ),
+            (
+                "src/custom/from_outer.rs",
+                "outer::from_outer::outer_path_test",
+            ),
+            (
+                "src/outer/custom/from_outer.rs",
+                "outer::from_outer::outer_path_decoy_test",
+            ),
+            ("src/support/mod.rs", "support::mod_rs_root_test"),
+            ("src/support/child.rs", "support::child::mod_rs_child_test"),
+            (
+                "src/support/mod/child.rs",
+                "support::child::mod_rs_child_decoy_test",
+            ),
+            ("src/raw/raw_module.rs", "raw::raw_path_test"),
+            (
+                "src/restricted.rs",
+                "restricted::restricted_visibility_test",
+            ),
+            ("src/orphan.rs", "orphan_test"),
+            ("src/disabled.rs", "disabled_test"),
+        ] {
+            let canonical = root.join(path).canonicalize().expect("canonical source");
+            assert_eq!(
+                targets.contains(&canonical),
+                listed.contains(test),
+                "reachability diverged from Cargo for {path}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove reachability compiler oracle");
+    }
+
+    #[test]
+    fn unreadable_path_attribute_never_falls_back_to_module_name() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-invalid-path-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src")).expect("create invalid-path oracle directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-invalid-path-oracle\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n",
+        )
+        .expect("write invalid-path oracle manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-invalid-path-oracle\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write invalid-path oracle lockfile");
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "#[path = b\"real.rs\"]\nmod forged;\n",
+        )
+        .expect("write invalid path attribute");
+        fs::write(
+            root.join("src").join("forged.rs"),
+            "#[test]\nfn forged_fallback_test() {}\n",
+        )
+        .expect("write fallback decoy");
+        fs::write(
+            root.join("src").join("real.rs"),
+            "#[test]\nfn forged_path_value_test() {}\n",
+        )
+        .expect("write apparent path target");
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args(["test", "--offline", "--quiet", "--locked", "--no-run"])
+            .output()
+            .expect("run invalid-path compiler oracle");
+        assert!(
+            !output.status.success(),
+            "rustc must reject a non-string path attribute"
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        let decoy = root
+            .join("src")
+            .join("forged.rs")
+            .canonicalize()
+            .expect("canonical fallback decoy");
+        assert!(
+            !targets.contains(&decoy),
+            "an unreadable path attribute must not fall back to the module name"
+        );
+        fs::remove_dir_all(root).expect("remove invalid-path oracle");
+    }
+
+    #[test]
+    fn cargo_test_listing_matches_target_harness_policy() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-target-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for directory in ["src", "tests", "examples", "benches"] {
+            fs::create_dir_all(root.join(directory)).expect("create target oracle directory");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-target-oracle\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [[bin]]\n\
+             name = \"disabled-bin\"\n\
+             path = \"src/disabled-bin.rs\"\n\
+             test = false\n\n\
+             [[test]]\n\
+             name = \"enabled-test\"\n\
+             path = \"tests/enabled.rs\"\n\n\
+             [[test]]\n\
+             name = \"harnessless-test\"\n\
+             path = \"tests/harnessless.rs\"\n\
+             harness = false\n\n\
+             [[example]]\n\
+             name = \"inert-example\"\n\
+             path = \"examples/inert.rs\"\n\n\
+             [[bench]]\n\
+             name = \"inert-bench\"\n\
+             path = \"benches/inert.rs\"\n",
+        )
+        .expect("write target oracle manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-target-oracle\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write target oracle lockfile");
+        for (path, source) in [
+            ("src/lib.rs", "#[test]\nfn library_test() {}\n"),
+            (
+                "src/disabled-bin.rs",
+                "#[test]\nfn disabled_bin_test() {}\nfn main() {}\n",
+            ),
+            ("tests/enabled.rs", "#[test]\nfn enabled_test() {}\n"),
+            (
+                "tests/harnessless.rs",
+                "#[test]\nfn harnessless_test() {}\n\
+                 fn main() { println!(\"forged_harnessless_test: test\"); }\n",
+            ),
+            (
+                "examples/inert.rs",
+                "#[test]\nfn example_test() {}\nfn main() {}\n",
+            ),
+            ("benches/inert.rs", "#[test]\nfn bench_test() {}\n"),
+        ] {
+            fs::write(root.join(path), source).expect("write target oracle source");
+        }
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run target compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout)
+            .expect("target oracle output is UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([
+                "enabled_test".to_owned(),
+                "forged_harnessless_test".to_owned(),
+                "library_test".to_owned(),
+            ])
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        for (path, expected) in [
+            ("src/lib.rs", true),
+            ("src/disabled-bin.rs", false),
+            ("tests/enabled.rs", true),
+            ("tests/harnessless.rs", false),
+            ("examples/inert.rs", false),
+            ("benches/inert.rs", false),
+        ] {
+            let canonical = root.join(path).canonicalize().expect("canonical source");
+            assert_eq!(
+                targets.contains(&canonical),
+                expected,
+                "target admission diverged from Cargo for {path}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove target compiler oracle");
+    }
+
+    #[test]
+    fn workspace_membership_requires_declared_build_roots() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-workspace-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for directory in [
+            "crates/real/src",
+            "crates/ghost/src",
+            "globbed/member/src",
+            "standalone/src",
+            "vendored/src",
+        ] {
+            fs::create_dir_all(root.join(directory)).expect("create membership oracle directory");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n\
+             members = [\"crates/real\", \"globbed/*\"]\n\
+             exclude = [\"vendored\"]\n\
+             resolver = \"3\"\n",
+        )
+        .expect("write membership oracle workspace");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"ghost\"\n\
+             version = \"0.0.0\"\n\n\
+             [[package]]\n\
+             name = \"globbed-member\"\n\
+             version = \"0.0.0\"\n\n\
+             [[package]]\n\
+             name = \"real\"\n\
+             version = \"0.0.0\"\n\
+             dependencies = [\n\
+              \"ghost\",\n\
+             ]\n",
+        )
+        .expect("write membership oracle lockfile");
+        for (directory, name, extra) in [
+            (
+                "crates/real",
+                "real",
+                "\n[dependencies]\nghost = { path = \"../ghost\" }\n",
+            ),
+            ("crates/ghost", "ghost", ""),
+            ("globbed/member", "globbed-member", ""),
+            ("vendored", "vendored", ""),
+        ] {
+            fs::write(
+                root.join(directory).join("Cargo.toml"),
+                format!(
+                    "[package]\n\
+                     name = \"{name}\"\n\
+                     version = \"0.0.0\"\n\
+                     edition = \"2024\"\n\
+                     {extra}"
+                ),
+            )
+            .expect("write membership oracle package");
+        }
+        fs::write(
+            root.join("standalone").join("Cargo.toml"),
+            "[package]\n\
+             name = \"standalone\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n\n\
+             [workspace]\n\
+             resolver = \"3\"\n",
+        )
+        .expect("write standalone workspace package");
+        fs::write(
+            root.join("standalone").join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"standalone\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write standalone workspace lockfile");
+        for (path, test) in [
+            ("crates/real/src/lib.rs", "real_test"),
+            ("crates/ghost/src/lib.rs", "implicit_path_member_test"),
+            ("globbed/member/src/lib.rs", "globbed_member_test"),
+            ("standalone/src/lib.rs", "standalone_workspace_test"),
+            ("vendored/src/lib.rs", "excluded_package_test"),
+        ] {
+            fs::write(root.join(path), format!("#[test]\nfn {test}() {{}}\n"))
+                .expect("write membership oracle source");
+        }
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args([
+                "test",
+                "--workspace",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run membership compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout)
+            .expect("membership oracle output is UTF-8")
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test").map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([
+                "globbed_member_test".to_owned(),
+                "implicit_path_member_test".to_owned(),
+                "real_test".to_owned(),
+            ])
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        for (path, expected) in [
+            ("crates/real/src/lib.rs", true),
+            ("crates/ghost/src/lib.rs", false),
+            ("globbed/member/src/lib.rs", true),
+            ("standalone/src/lib.rs", true),
+            ("vendored/src/lib.rs", false),
+        ] {
+            let canonical = root.join(path).canonicalize().expect("canonical source");
+            assert_eq!(
+                targets.contains(&canonical),
+                expected,
+                "workspace admission diverged for {path}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove membership compiler oracle");
+    }
+
+    #[test]
+    fn only_explicit_workspace_table_establishes_a_build_root() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-workspace-marker-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create workspace marker fixture");
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\n\
+             name = \"workspace-marker\"\n\
+             version = \"0.0.0\"\n\
+             description = '''\n\
+             [workspace]\n\
+             '''\n\n\
+             [workspace.package]\n\
+             edition = \"2024\"\n",
+        )
+        .expect("write workspace marker fixture");
+
+        let scope = load_manifest_scope(&root, &manifest, ViolationCode::ClaimEvidence)
+            .expect("parse workspace marker fixture");
+        assert!(scope.package);
+        assert!(scope.workspace.is_none());
+        fs::remove_dir_all(root).expect("remove workspace marker fixture");
+    }
+
+    #[test]
+    fn cargo_workspace_patterns_match_only_declared_path_shapes() {
+        for (pattern, candidate, expected) in [
+            ("crates/*", "crates/real", true),
+            ("crates/*", "crates/nested/real", false),
+            ("crates/**", "crates/nested/real", true),
+            ("crates/rea?", "crates/real", true),
+            ("crates/rea?", "crates/real/deeper", false),
+            ("crates/[real]", "crates/r", false),
+        ] {
+            assert_eq!(
+                cargo_pattern_matches(pattern, candidate),
+                expected,
+                "Cargo workspace pattern verdict diverged for {pattern:?} and {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_package_module_is_compiled_but_not_accepted_as_evidence() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-package-boundary-oracle-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for package in ["consumer", "decoy"] {
+            fs::create_dir_all(root.join(package).join("src"))
+                .expect("create package boundary oracle directory");
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"consumer\", \"decoy\"]\nresolver = \"3\"\n",
+        )
+        .expect("write package boundary workspace");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"consumer\"\n\
+             version = \"0.0.0\"\n\n\
+             [[package]]\n\
+             name = \"decoy\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write package boundary lockfile");
+        for package in ["consumer", "decoy"] {
+            fs::write(
+                root.join(package).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n"
+                ),
+            )
+            .expect("write package boundary manifest");
+        }
+        fs::write(
+            root.join("consumer").join("src").join("lib.rs"),
+            "#[path = \"../../decoy/src/proof.rs\"]\nmod proof;\n",
+        )
+        .expect("write cross-package module declaration");
+        fs::write(root.join("decoy").join("src").join("lib.rs"), "")
+            .expect("write decoy crate root");
+        fs::write(
+            root.join("decoy").join("src").join("proof.rs"),
+            "#[test]\nfn cross_package_test() {}\n",
+        )
+        .expect("write cross-package test");
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "-p",
+                "consumer",
+                "--lib",
+                "--",
+                "--list",
+                "--format",
+                "terse",
+            ])
+            .output()
+            .expect("run package boundary compiler oracle");
+        assert_command_succeeded(&output);
+        let listed = String::from_utf8(output.stdout).expect("package boundary output is UTF-8");
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            ["proof::cross_package_test: test"]
+        );
+
+        let targets =
+            CargoTestTargets::load(&root, ViolationCode::ClaimEvidence).expect("load target graph");
+        let canonical = root
+            .join("decoy")
+            .join("src")
+            .join("proof.rs")
+            .canonicalize()
+            .expect("canonical cross-package source");
+        assert!(
+            !targets.contains(&canonical),
+            "evidence reachability must remain inside its owning package"
+        );
+        fs::remove_dir_all(root).expect("remove package boundary compiler oracle");
+    }
+
+    #[test]
+    fn ambiguous_module_sources_fail_closed_like_rustc() {
+        let root = env::temp_dir().join(format!(
+            "claw-conformance-ambiguous-module-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("src").join("duplicate"))
+            .expect("create ambiguous module directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\n\
+             name = \"claw-conformance-ambiguous-module\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2024\"\n",
+        )
+        .expect("write ambiguous manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\n\
+             name = \"claw-conformance-ambiguous-module\"\n\
+             version = \"0.0.0\"\n",
+        )
+        .expect("write ambiguous lockfile");
+        fs::write(root.join("src").join("lib.rs"), "mod duplicate;\n")
+            .expect("write ambiguous crate root");
+        fs::write(
+            root.join("src").join("duplicate.rs"),
+            "#[test]\nfn first_forged_test() {}\n",
+        )
+        .expect("write first ambiguous module");
+        fs::write(
+            root.join("src").join("duplicate").join("mod.rs"),
+            "#[test]\nfn second_forged_test() {}\n",
+        )
+        .expect("write second ambiguous module");
+
+        let cargo =
+            cargo_executable(&root, ViolationCode::ClaimEvidence).expect("resolve trusted Cargo");
+        let output = compiler_oracle_command(&cargo, &root)
+            .args([
+                "test",
+                "--offline",
+                "--quiet",
+                "--locked",
+                "--lib",
+                "--no-run",
+            ])
+            .output()
+            .expect("run ambiguous compiler oracle");
+        assert!(
+            !output.status.success(),
+            "rustc must reject ambiguous modules"
+        );
+
+        let error = CargoTestTargets::load(&root, ViolationCode::ClaimEvidence)
+            .expect_err("reachability must reject ambiguous modules");
+        assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+        assert_eq!(error.subject(), Some("src/lib.rs"));
+        assert_eq!(
+            error.message(),
+            "Rust module 'duplicate' is ambiguous because both 'duplicate.rs' and \
+             'duplicate/mod.rs' exist"
+        );
+        fs::remove_dir_all(root).expect("remove ambiguous compiler oracle");
+    }
+
+    #[test]
+    fn shared_reachability_corpus_matches_cargo() {
+        let corpus: ReachabilityCorpus = serde_json::from_str(include_str!(
+            "../../../compat/upstream/reachability-corpus.json"
+        ))
+        .expect("parse shared reachability corpus");
+        // This exact count is an independent fail-closed anti-deletion pin; update it atomically with the canonical corpus.
+        assert_eq!(corpus.cases.len(), 32);
+        let fixture_root = env::temp_dir().join(format!(
+            "claw-conformance-reachability-corpus-{}-{}",
+            std::process::id(),
+            NEXT_COMPILER_ORACLE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&fixture_root).expect("create reachability corpus root");
+        let cargo = cargo_executable(&fixture_root, ViolationCode::ClaimEvidence)
+            .expect("resolve trusted Cargo");
+
+        for case in corpus.cases {
+            let root = fixture_root.join(&case.name);
+            let manifests = case
+                .files
+                .keys()
+                .filter(|path| path.ends_with("Cargo.toml"))
+                .cloned()
+                .collect::<Vec<_>>();
+            for (path, source) in case.files {
+                let destination = root.join(path);
+                fs::create_dir_all(destination.parent().expect("corpus file parent"))
+                    .expect("create corpus directory");
+                fs::write(destination, source).expect("write corpus file");
+            }
+            for manifest in manifests {
+                let _ = compiler_oracle_command(&cargo, &root)
+                    .args([
+                        "generate-lockfile",
+                        "--offline",
+                        "--quiet",
+                        "--manifest-path",
+                    ])
+                    .arg(manifest)
+                    .output()
+                    .expect("generate reachability corpus lockfile");
+            }
+            let output = compiler_oracle_command(&cargo, &root)
+                .args(["build", "--offline", "--quiet", "--locked"])
+                .output()
+                .expect("run reachability corpus compiler oracle");
+            let ambiguous = matches!(
+                case.name.as_str(),
+                "ambiguity-file-side"
+                    | "ambiguity-directory-side"
+                    | "peer6-ambiguity-file-side"
+                    | "peer6-ambiguity-directory-side"
+            );
+            assert_eq!(
+                output.status.success(),
+                !ambiguous,
+                "Cargo build verdict diverged for {}:\nstdout:\n{}\nstderr:\n{}",
+                case.name,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let accepted = match CargoTestTargets::load(&root, ViolationCode::ClaimEvidence) {
+                Ok(targets) => {
+                    assert!(!ambiguous, "ambiguous case must fail target discovery");
+                    let cited = root
+                        .join(&case.cite)
+                        .canonicalize()
+                        .expect("canonical cited corpus source");
+                    targets.contains(&cited)
+                }
+                Err(error) => {
+                    assert!(ambiguous, "unexpected target discovery error: {error}");
+                    assert_eq!(error.code(), ViolationCode::ClaimEvidence);
+                    assert_eq!(error.subject(), Some("crates/p/src/lib.rs"));
+                    let expected_message = match case.name.as_str() {
+                        "ambiguity-file-side" | "ambiguity-directory-side" => {
+                            "Rust module 'ambig' is ambiguous because both 'ambig.rs' and \
+                             'ambig/mod.rs' exist"
+                        }
+                        "peer6-ambiguity-file-side" | "peer6-ambiguity-directory-side" => {
+                            "Rust module 'foo' is ambiguous because both 'foo.rs' and \
+                             'foo/mod.rs' exist"
+                        }
+                        value => panic!("unexpected ambiguous corpus case '{value}'"),
+                    };
+                    assert_eq!(error.message(), expected_message);
+                    false
+                }
+            };
+            let expected = match case.expect.as_str() {
+                "accept" => true,
+                "reject" => false,
+                value => panic!("unknown reachability corpus verdict '{value}'"),
+            };
+            println!(
+                "{}\tcite={}\texpect={}\trust={}",
+                case.name,
+                case.cite,
+                case.expect,
+                if accepted { "accept" } else { "reject" }
+            );
+            assert_eq!(
+                accepted, expected,
+                "Rust reachability verdict diverged for {}",
+                case.name
+            );
+        }
+        fs::remove_dir_all(fixture_root).expect("remove reachability corpus fixture");
+    }
+
+    #[test]
+    fn shared_enabled_test_oracle_corpus_matches() {
+        let corpus: SharedOracleCorpus = serde_json::from_str(include_str!(
+            "../../../compat/upstream/enabled-test-oracle.json"
+        ))
+        .expect("parse shared enabled-test oracle");
+        assert_eq!(corpus.cases.len(), 120);
+        for case in corpus.cases {
+            assert_eq!(
+                declares_enabled_test(&case.source, &case.test),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
     }
 }

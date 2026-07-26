@@ -12,7 +12,7 @@ publish = false
 base64 = "=0.22.1"
 bytes = "=1.12.1"
 ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
-futures-util = "=0.3.32"
+futures-util = "=0.3.33"
 http-body-util = "=0.1.4"
 httparse = "=1.10.1"
 hyper = { version = "=1.11.0", features = ["client", "http1"] }

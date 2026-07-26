@@ -1,6 +1,30 @@
+import { FirstRunSurface } from "@gta-ui/first-run.slint";
 import { GatewayOnboardingSurface } from "@gta-ui/gateway-onboarding.slint";
+import {
+    ActivityItem,
+    DeliverableItem,
+    DiffItem,
+    ExtensionItem,
+    FileItem,
+    ProductShell,
+    RunItem,
+    ScheduleItem,
+    TranscriptItem,
+    WorkspaceItem,
+} from "@gta-ui/product-shell.slint";
 import { DesignTokens, StatusKind, ThemeMode, VisualPreferences } from "@gta-ui/tokens.slint";
 export { DesignTokens, VisualPreferences }
+export {
+    ActivityItem,
+    DeliverableItem,
+    DiffItem,
+    ExtensionItem,
+    FileItem,
+    RunItem,
+    ScheduleItem,
+    TranscriptItem,
+    WorkspaceItem,
+}
 
 export component AppWindow inherits Window {
     title: "GTA Claw Gateway";
@@ -37,7 +61,43 @@ export component AppWindow inherits Window {
     in-out property <bool> token-preserve-focus: false;
     in-out property <bool> consent-checked: false;
     in property <length> layout-width: root.width;
-    out property <bool> narrow-layout <=> onboarding.narrow-layout;
+    out property <bool> narrow-layout: root.layout-width < 900px;
+    in property <bool> workspace-ready: false;
+    in property <int> onboarding-stage: 0;
+    in property <int> selected-screen: 0;
+    in property <int> selected-settings-section: 0;
+    in property <bool> palette-open: false;
+    in property <int> diff-mode: 0;
+    in property <[RunItem]> runs;
+    in property <[WorkspaceItem]> workspaces;
+    in property <[ScheduleItem]> schedules;
+    in property <[DeliverableItem]> deliverables;
+    in property <[ExtensionItem]> extensions;
+    in property <[TranscriptItem]> transcript;
+    in property <[ActivityItem]> activity;
+    in property <[DiffItem]> diff-lines;
+    in property <[FileItem]> session-files;
+    in property <int> selected-file-index: 0;
+    in property <string> selected-file-name: "";
+    in property <string> session-title: "Session";
+    in property <string> session-state: "Draft";
+    in property <string> session-detail: "";
+    in property <int> session-tone: 0;
+    in property <bool> can-approve: false;
+    in property <bool> can-answer: false;
+    in property <string> approval-prompt: "";
+    in property <string> approval-scope: "";
+    in property <string> question: "";
+    in property <int> selected-deliverable-index: 0;
+    in property <string> selected-deliverable-name: "";
+    in property <string> selected-deliverable-kind: "";
+    in property <string> selected-deliverable-source: "";
+    in property <string> selected-deliverable-size: "";
+    in property <string> selected-deliverable-content: "";
+    in property <bool> selected-deliverable-pinned: false;
+    in property <string> run-page-label: "Page 1 of 1";
+    in property <bool> can-previous-run-page: false;
+    in property <bool> can-next-run-page: false;
     in-out property <ThemeMode> theme-mode <=> VisualPreferences.theme-mode;
     in-out property <bool> high-contrast <=> VisualPreferences.high-contrast;
     in-out property <bool> reduced-motion <=> VisualPreferences.reduced-motion;
@@ -48,6 +108,28 @@ export component AppWindow inherits Window {
     callback cancel-requested();
     callback disconnect-requested();
     callback error-dismiss-requested();
+    callback onboarding-stage-requested(int);
+    callback navigate-requested(int);
+    callback palette-toggle-requested();
+    callback palette-dismiss-requested();
+    callback open-session-requested(int);
+    callback open-workspace-requested(int);
+    callback settings-section-requested(int);
+    callback update-requested();
+    callback diagnostics-requested();
+    callback back-requested();
+    callback diff-mode-requested(int);
+    callback previous-run-page-requested();
+    callback next-run-page-requested();
+    callback approval-requested(bool);
+    callback answer-requested(string);
+    callback message-submitted(string);
+    callback file-selected(int);
+    callback schedule-create-requested();
+    callback schedule-toggled(int);
+    callback extension-toggled(int);
+    callback deliverable-selected(int);
+    callback deliverable-pin-toggle-requested();
 
     public function request-close() -> bool {
         return root.close();
@@ -65,9 +147,21 @@ export component AppWindow inherits Window {
         root.endpoint-reset-selector = !root.endpoint-reset-selector;
     }
 
+    first-run := FirstRunSurface {
+        width: 100%;
+        height: 100%;
+        visible: !root.workspace-ready && root.onboarding-stage < 3;
+        enabled: self.visible;
+        stage: root.onboarding-stage;
+        available-width: root.layout-width;
+        stage-requested(stage) => { root.onboarding-stage-requested(stage); }
+    }
+
     onboarding := GatewayOnboardingSurface {
         width: 100%;
         height: 100%;
+        visible: !root.workspace-ready && root.onboarding-stage == 3;
+        enabled: self.visible;
         available-width: root.layout-width;
         state-title: root.state-title;
         state-detail: root.state-detail;
@@ -105,5 +199,69 @@ export component AppWindow inherits Window {
         cancel-requested => { root.cancel-requested(); }
         disconnect-requested => { root.disconnect-requested(); }
         error-dismiss-requested => { root.error-dismiss-requested(); }
+    }
+
+    product := ProductShell {
+        width: 100%;
+        height: 100%;
+        visible: root.workspace-ready;
+        enabled: self.visible;
+        available-width: root.layout-width;
+        selected-screen: root.selected-screen;
+        selected-settings-section: root.selected-settings-section;
+        palette-open: root.palette-open;
+        diff-mode: root.diff-mode;
+        runs: root.runs;
+        workspaces: root.workspaces;
+        schedules: root.schedules;
+        deliverables: root.deliverables;
+        extensions: root.extensions;
+        transcript: root.transcript;
+        activity: root.activity;
+        diff-lines: root.diff-lines;
+        session-files: root.session-files;
+        selected-file-index: root.selected-file-index;
+        selected-file-name: root.selected-file-name;
+        session-title: root.session-title;
+        session-state: root.session-state;
+        session-detail: root.session-detail;
+        session-tone: root.session-tone;
+        can-approve: root.can-approve;
+        can-answer: root.can-answer;
+        approval-prompt: root.approval-prompt;
+        approval-scope: root.approval-scope;
+        question: root.question;
+        selected-deliverable-index: root.selected-deliverable-index;
+        selected-deliverable-name: root.selected-deliverable-name;
+        selected-deliverable-kind: root.selected-deliverable-kind;
+        selected-deliverable-source: root.selected-deliverable-source;
+        selected-deliverable-size: root.selected-deliverable-size;
+        selected-deliverable-content: root.selected-deliverable-content;
+        selected-deliverable-pinned: root.selected-deliverable-pinned;
+        run-page-label: root.run-page-label;
+        can-previous-run-page: root.can-previous-run-page;
+        can-next-run-page: root.can-next-run-page;
+        navigate-requested(index) => { root.navigate-requested(index); }
+        palette-toggle-requested => { root.palette-toggle-requested(); }
+        palette-dismiss-requested => { root.palette-dismiss-requested(); }
+        open-session-requested(index) => { root.open-session-requested(index); }
+        open-workspace-requested(index) => { root.open-workspace-requested(index); }
+        settings-section-requested(index) => { root.settings-section-requested(index); }
+        disconnect-requested => { root.disconnect-requested(); }
+        update-requested => { root.update-requested(); }
+        diagnostics-requested => { root.diagnostics-requested(); }
+        back-requested => { root.back-requested(); }
+        diff-mode-requested(mode) => { root.diff-mode-requested(mode); }
+        previous-run-page-requested => { root.previous-run-page-requested(); }
+        next-run-page-requested => { root.next-run-page-requested(); }
+        approval-requested(approved) => { root.approval-requested(approved); }
+        answer-requested(answer) => { root.answer-requested(answer); }
+        message-submitted(message) => { root.message-submitted(message); }
+        file-selected(index) => { root.file-selected(index); }
+        schedule-create-requested => { root.schedule-create-requested(); }
+        schedule-toggled(index) => { root.schedule-toggled(index); }
+        extension-toggled(index) => { root.extension-toggled(index); }
+        deliverable-selected(index) => { root.deliverable-selected(index); }
+        deliverable-pin-toggle-requested => { root.deliverable-pin-toggle-requested(); }
     }
 }
