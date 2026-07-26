@@ -60,9 +60,10 @@ Future consumer work must attach independent implementation evidence before
 changing an entry to `Enforced`.
 
 This distinction is security-relevant. `ALLOWED_SKILL_DOMAINS` does not restrict
-skill egress, and `RATE_LIMIT_PER_MIN` does not throttle ingress, until their
-respective consumers bind and enforce them. A configured security control must
-not be presented as active merely because `claw-config` accepted it.
+skill egress, and `RATE_LIMIT_PER_MIN` does not throttle per-IP requests to
+`/api/messages`, until their respective consumers bind and enforce them. A
+configured security control must not be presented as active merely because
+`claw-config` accepted it.
 
 `SESSION_TTL_MS` (`sessions.ttl_ms`) and `MAX_SESSIONS`
 (`sessions.max_entries`) describe only an ephemeral provider-session cache

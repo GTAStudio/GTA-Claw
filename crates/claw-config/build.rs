@@ -237,7 +237,7 @@ fn runtime_metadata(legacy_env: &str) -> (&'static str, &'static str) {
         ),
         "RATE_LIMIT_PER_MIN" => (
             "GatewayHttp",
-            "Intended Teams HTTP ingress rate limit; configuration alone does not enforce request throttling.",
+            "Intended per-IP /api/messages ingress rate limit; configuration alone does not enforce request throttling.",
         ),
         "ALLOWED_SKILL_DOMAINS" => (
             "SkillRuntime",

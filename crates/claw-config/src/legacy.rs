@@ -45,27 +45,17 @@ pub enum LegacyRuntimeOwner {
 /// construct it only after reviewing an actual production consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConsumerEnforcement {
-    consumer: LegacyRuntimeOwner,
     evidence: &'static str,
 }
 
 impl ConsumerEnforcement {
-    /// Creates evidence that a production subsystem enforces the setting.
-    ///
-    /// `evidence` must name the reviewed implementation surface precisely.
-    #[must_use]
-    pub const fn new(consumer: LegacyRuntimeOwner, evidence: &'static str) -> Self {
+    #[allow(dead_code)]
+    const fn new(evidence: &'static str) -> Self {
         assert!(
             !evidence.is_empty(),
             "consumer enforcement evidence must not be empty"
         );
-        Self { consumer, evidence }
-    }
-
-    /// Returns the subsystem that enforces the setting.
-    #[must_use]
-    pub const fn consumer(self) -> LegacyRuntimeOwner {
-        self.consumer
+        Self { evidence }
     }
 
     /// Returns the implementation evidence recorded during consumer review.
@@ -185,4 +175,21 @@ pub fn legacy_runtime_config(key: LegacyRuntimeKey) -> &'static LegacyRuntimeCon
         .iter()
         .find(|entry| entry.key() == key)
         .expect("generated legacy runtime key must have exactly one registry entry")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConsumerEnforcement;
+
+    #[test]
+    fn internal_enforcement_evidence_requires_a_reviewed_surface() {
+        let evidence = ConsumerEnforcement::new("claw-skills::outbound_policy");
+        assert_eq!(evidence.evidence(), "claw-skills::outbound_policy");
+    }
+
+    #[test]
+    #[should_panic(expected = "consumer enforcement evidence must not be empty")]
+    fn internal_enforcement_evidence_rejects_an_empty_surface() {
+        let _ = ConsumerEnforcement::new("");
+    }
 }

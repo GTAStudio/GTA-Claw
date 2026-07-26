@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use build_support::load_contract;
 use claw_config::{
-    AcceptedOnlyReason, ConsumerEnforcement, LEGACY_RUNTIME_CONFIGS, LegacyRuntimeDisposition,
-    LegacyRuntimeKey, LegacyRuntimeOwner, legacy_runtime_config,
+    AcceptedOnlyReason, LEGACY_RUNTIME_CONFIGS, LegacyRuntimeDisposition, LegacyRuntimeKey,
+    LegacyRuntimeOwner, legacy_runtime_config,
 };
 
 #[test]
@@ -110,22 +110,8 @@ fn accepted_only_is_a_typed_non_enforcement_disposition() {
     assert_eq!(rate_limit.intended_owner(), LegacyRuntimeOwner::GatewayHttp);
     assert_eq!(
         rate_limit.semantic_note(),
-        "Intended Teams HTTP ingress rate limit; configuration alone does not enforce request throttling."
+        "Intended per-IP /api/messages ingress rate limit; configuration alone does not enforce request throttling."
     );
-
-    let evidence = ConsumerEnforcement::new(
-        LegacyRuntimeOwner::SkillRuntime,
-        "reviewed consumer implementation",
-    );
-    assert_eq!(
-        LegacyRuntimeDisposition::Enforced(evidence),
-        LegacyRuntimeDisposition::Enforced(ConsumerEnforcement::new(
-            LegacyRuntimeOwner::SkillRuntime,
-            "reviewed consumer implementation",
-        ))
-    );
-    assert_eq!(evidence.consumer(), LegacyRuntimeOwner::SkillRuntime);
-    assert_eq!(evidence.evidence(), "reviewed consumer implementation");
 }
 
 #[test]
