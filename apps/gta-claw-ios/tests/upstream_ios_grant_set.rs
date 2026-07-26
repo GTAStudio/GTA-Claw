@@ -69,6 +69,11 @@ fn authorization_from_upstream_profile() -> ObservedAuthorization {
         .map(|scope| scope.as_str().to_owned())
         .collect();
 
+    authorization_from_scopes(scopes)
+}
+
+/// Builds an authorization from an arbitrary set of *server-confirmed* scopes.
+fn authorization_from_scopes(scopes: Vec<String>) -> ObservedAuthorization {
     let info = ConnectionInfo {
         protocol: GATEWAY_PROTOCOL_VERSION,
         server_version: "2026.7.2".to_owned(),
@@ -135,39 +140,59 @@ fn upstream_ios_is_not_granted_the_pairing_scope() {
     assert!(
         !scopes.contains(&OperatorScope::Pairing),
         "claw-clients must not request operator.pairing for iOS; the full requested set read \
-         {scopes:?}. If this now fails, upstream's iOS client gained pairing authority and \
-         IosAction::ManagePairing has become reachable — see the module docs before changing it."
+         {scopes:?}. If this now fails, upstream's iOS client gained pairing authority and this \
+         crate should model a pairing action again — see the module docs before changing it."
     );
 }
 
+/// Control. `grants()` must be able to return `false`, or every refusal this
+/// crate reports is vacuous.
+///
+/// This property used to be carried by `IosAction::ManagePairing`, an action no
+/// iOS profile could ever hold. That action has been removed, so the
+/// discrimination is proved here instead — and from a **reachable** state
+/// rather than an impossible one: a server that confirms fewer scopes than the
+/// client asked for, which is the exact situation `ObservedAuthorization`
+/// exists to represent. `validate_gateway_profile` admits any subset of the
+/// ceiling, so this is not hypothetical.
 #[test]
-fn this_client_never_reports_a_pairing_grant_it_cannot_have() {
-    let observed = authorization_from_upstream_profile();
+fn grants_refuses_an_action_whose_scope_the_server_did_not_confirm() {
+    let observed = authorization_from_scopes(vec![OperatorScope::Read.as_str().to_owned()]);
 
     assert!(
-        !observed.grants(IosAction::ManagePairing),
-        "an authorization built from the upstream iOS profile must refuse ManagePairing (needs \
-         {:?}), but it granted it from the observed scopes {:?}",
-        IosAction::ManagePairing.required_scope(),
+        observed.grants(IosAction::ReadSessions),
+        "a connection confirmed with only {:?} must still grant {:?} (needs {:?}); the observed \
+         set read {:?}",
+        OperatorScope::Read.as_str(),
+        IosAction::ReadSessions,
+        IosAction::ReadSessions.required_scope(),
+        readable(&observed)
+    );
+    assert!(
+        !observed.grants(IosAction::SendMessage),
+        "a connection confirmed with only {:?} must refuse {:?} (needs {:?}), but it was granted \
+         from the observed set {:?}. If this fails, grants() is permissive rather than strict and \
+         every refusal this crate reports is worthless.",
+        OperatorScope::Read.as_str(),
+        IosAction::SendMessage,
+        IosAction::SendMessage.required_scope(),
         readable(&observed)
     );
 }
 
-/// The other four actions must be granted, or the test above passes for the
-/// wrong reason — a `grants` that always returned `false` would satisfy it.
+/// Every action must be granted by the upstream profile.
+///
+/// Paired with the discrimination control above: that one proves `grants()` can
+/// say no, this one proves it is not saying no to everything.
 #[test]
-fn every_other_action_is_granted_by_the_upstream_profile() {
+fn every_action_is_granted_by_the_upstream_profile() {
     let observed = authorization_from_upstream_profile();
 
     for action in IosAction::ALL {
-        if action == IosAction::ManagePairing {
-            continue;
-        }
         assert!(
             observed.grants(action),
             "the upstream iOS profile must grant {action:?} (needs {:?}), but the observed scopes \
-             {:?} did not. If ManagePairing is the only refusal, that refusal is meaningful; if \
-             everything is refused, grants() is broken rather than strict.",
+             {:?} did not.",
             action.required_scope(),
             readable(&observed)
         );

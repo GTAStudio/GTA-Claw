@@ -5,6 +5,51 @@ use std::fmt::{self, Display, Formatter};
 
 use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEvent};
 
+/// Process-wiring machinery for binaries that compose subsystems.
+///
+/// Gated behind the `composition` feature. Front-ends that link this crate
+/// only for [`Application`] and [`SystemProbe`] therefore do not inherit
+/// `claw-domain`, `secrecy` or `url`.
+///
+/// `test` is in the gate as well as the feature so that `cargo test -p
+/// claw-application` compiles and runs the composition suite instead of
+/// silently reporting success over 123 skipped tests. Under `cfg(test)` the
+/// three crates are supplied by dev-dependencies, which are not resolved into
+/// dependent lockfiles, so the gate costs consumers nothing.
+#[cfg(any(feature = "composition", test))]
+pub mod composition;
+/// Domain model shared by the agent runtime's ports.
+///
+/// Gated behind the `runtime-ports` feature so that front-ends linking this
+/// crate only for [`Application`] and [`SystemProbe`] do not inherit
+/// `claw-domain`. `test` is in the gate as well so `cargo test -p
+/// claw-application` still compiles and runs the suite rather than reporting
+/// success over skipped tests.
+#[cfg(any(feature = "runtime-ports", test))]
+pub mod model;
+/// Port traits the agent runtime requires of its adapters.
+///
+/// Gated behind the `runtime-ports` feature; see [`model`].
+#[cfg(any(feature = "runtime-ports", test))]
+pub mod ports;
+
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::approval::ApprovalPort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::clock::ClockPort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::context::ContextEnginePort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::goal::GoalStorePort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::provider::{ProviderPort, ProviderStream};
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::state::StatePort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::tool::ToolPort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::{PortError, PortFuture};
+
 /// Supplies native runtime identity without coupling the application to an OS.
 pub trait SystemProbe {
     /// Returns the native runtime identity.

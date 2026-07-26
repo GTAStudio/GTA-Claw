@@ -353,26 +353,45 @@ mod tests {
         );
     }
 
+    /// Every endpoint here must be constructible with the opt-in it is paired
+    /// with. An earlier version of this test looped over `[false, true]` against
+    /// a remote `ws://` URL, where the `false` case is refused at construction
+    /// and took a `continue` branch, so the assertion only ever ran with
+    /// `accepted == true` and could not observe the transport ignoring the
+    /// operator's choice. The counter below exists so that reintroducing an
+    /// unreachable case fails rather than silently narrowing the test.
     #[test]
     fn the_plaintext_opt_in_reaches_the_transport_configuration() {
-        for accepted in [false, true] {
-            let request = ConnectRequest::prepare("ws://gateway.example.com", "", accepted);
-            let Ok(request) = request else {
-                assert!(
-                    !accepted,
-                    "the opt-in must make remote plaintext acceptable, got {request:?}"
-                );
-                continue;
-            };
+        const CASES: &[(&str, bool)] = &[
+            ("wss://gateway.example.com", false),
+            ("wss://gateway.example.com", true),
+            ("ws://127.0.0.1:9000", false),
+            ("ws://gateway.example.com", true),
+        ];
+        let mut observed = Vec::new();
+
+        for (endpoint, accepted) in CASES {
+            let request =
+                ConnectRequest::prepare(endpoint, "", *accepted).unwrap_or_else(|error| {
+                    panic!("{endpoint} with opt-in {accepted} must be constructible, got {error:?}")
+                });
 
             let config = build_client_config(request, test_identity());
 
             assert_eq!(
-                config.allow_insecure_remote_ws, accepted,
-                "the transport must enforce exactly the operator's choice ({accepted}), got {}",
+                config.allow_insecure_remote_ws, *accepted,
+                "the transport must carry exactly the operator's choice for {endpoint} \
+                 (expected {accepted}), got {}",
                 config.allow_insecure_remote_ws
             );
+            observed.push(config.allow_insecure_remote_ws);
         }
+
+        assert!(
+            observed.contains(&false) && observed.contains(&true),
+            "this test is only meaningful if both opt-in states reach the transport; \
+             observed {observed:?}"
+        );
     }
 
     #[test]
@@ -523,6 +542,45 @@ mod tests {
             !unrequested.is_empty(),
             "this client deliberately requests less than the contract allows; if it now \
              requests all of {ceiling:?} that is an over-grant to justify, requested {requested:?}"
+        );
+    }
+
+    /// `operator.admin` is not one privilege among the five in the Android
+    /// ceiling. `claw_protocol::gateway::authorization` returns `Allowed` for
+    /// every method as soon as the granted set contains it, without consulting
+    /// the method's own scope at all. Requesting it would therefore acquire the
+    /// whole ceiling by implication and make every other bound in this module
+    /// vacuous, so it is asserted separately from the subset check that admits
+    /// it.
+    #[test]
+    fn this_client_never_requests_the_admin_scope() {
+        let config = test_config();
+        let requested = requested_operator_scopes(&config);
+
+        assert!(
+            !requested.contains(&OperatorScope::Admin),
+            "`operator.admin` satisfies every operator scope by implication, so requesting \
+             it would silently grant the entire Android ceiling and leave the subset bound \
+             asserted elsewhere in this module true but meaningless; requested {requested:?}"
+        );
+    }
+
+    /// An empty scope request is the maximum, not the minimum. The Gateway reads
+    /// an empty requested set as "take the whole grant" and hands back every
+    /// scope the device was granted, so a client that requests nothing is the
+    /// most privileged one on the socket. The subset and strictly-less bounds
+    /// above are both satisfied vacuously by an empty set, which is why this is
+    /// a separate assertion rather than a clause of either.
+    #[test]
+    fn this_client_requests_a_non_empty_scope_set() {
+        let config = test_config();
+        let requested = requested_operator_scopes(&config);
+
+        assert!(
+            !requested.is_empty(),
+            "an empty request is not least privilege: the Gateway substitutes the device's \
+             entire grant when the requested set is empty, so this must never be allowed to \
+             become empty; requested {requested:?}"
         );
     }
 }

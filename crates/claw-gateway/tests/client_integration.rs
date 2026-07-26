@@ -1,5 +1,6 @@
 //! End-to-end tests that drive this server through the real `claw-gateway-client`.
 
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use claw_security::identity::DeviceIdentity;
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
 use url::Url;
 
 /// Deterministically derives one in-memory device identity from a seed byte.
@@ -42,6 +44,23 @@ fn config() -> GatewayServerConfig {
 
 async fn start(authenticator: StaticAuthenticator) -> ServerHandle {
     start_with_devices(authenticator).await.0
+}
+
+/// Starts a server whose closing grace is short enough that a test can outlive
+/// it, which is what makes quiescing distinguishable from a deferred shutdown.
+async fn start_with_close_grace(
+    authenticator: StaticAuthenticator,
+    close: Duration,
+) -> ServerHandle {
+    let devices = authenticator.devices();
+    let mut configuration = config();
+    configuration.timeouts.close = close;
+    GatewayServer::new(configuration, Arc::new(authenticator), Arc::new(devices))
+        .expect("the configuration and registry are valid")
+        .bind("127.0.0.1:0".parse().expect("loopback address parses"))
+        .await
+        .expect("an ephemeral loopback port is available")
+        .start()
 }
 
 /// Starts a server and also hands back the live device directory, so a test can
@@ -1140,5 +1159,201 @@ async fn changing_a_device_role_closes_its_open_operator_connection() {
         ),
     }
 
+    handle.shutdown().await;
+}
+
+/// Quiescing is the ingress half of a graceful stop. The composition root stops
+/// its edges before it drains the subsystems behind them, so the server has to
+/// release the listener while every connection established beforehand keeps
+/// answering. A server that closed live connections here, or one that kept
+/// accepting, would each be unusable for that ordering in a different way, so
+/// this asserts both halves against one running server.
+#[tokio::test]
+async fn quiescing_refuses_new_peers_while_an_established_connection_keeps_serving() {
+    let identity = device(41);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+    )
+    .await;
+    let port = handle.local_address().port();
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    // Establishes that the refusal below is caused by quiescing and not by the
+    // port never having been connectable in the first place.
+    let before = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("the listener completes a TCP handshake before quiescing");
+    drop(before);
+
+    handle.stop_accepting().await;
+
+    let refused = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect_err("a quiesced server must not complete a TCP handshake");
+    assert_eq!(
+        refused.kind(),
+        ErrorKind::ConnectionRefused,
+        "the listener must be released, not merely ignoring the connection"
+    );
+
+    let response = client
+        .request(
+            request_id("health-after-quiesce"),
+            method("health"),
+            &json!({}),
+        )
+        .await
+        .expect("a connection established before quiescing still serves");
+    assert!(response.ok());
+    assert_eq!(response.error(), None);
+    assert_eq!(payload(&response)["protocol"], json!(4));
+
+    client.shutdown().await.expect("the client stops cleanly");
+    handle.shutdown().await;
+}
+
+/// Quiescing must not become a way to keep a connection alive forever: the
+/// shutdown that follows still has to close what quiescing deliberately spared.
+#[tokio::test]
+async fn shutting_down_a_quiesced_server_still_closes_the_connections_it_spared() {
+    let identity = device(42);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    handle.stop_accepting().await;
+    let spared = client
+        .request(request_id("health-spared"), method("health"), &json!({}))
+        .await
+        .expect("quiescing spares an established connection");
+    assert!(spared.ok());
+
+    handle.shutdown().await;
+
+    let outcome = client
+        .request(
+            request_id("health-after-stop"),
+            method("health"),
+            &json!({}),
+        )
+        .await;
+    match outcome {
+        Err(
+            GatewayClientError::ConnectionChanged { .. }
+            | GatewayClientError::DisconnectedNotReplayed
+            | GatewayClientError::NotReady
+            | GatewayClientError::Cancelled
+            | GatewayClientError::Transport(_)
+            | GatewayClientError::RequestTimedOut(_),
+        ) => {}
+        Err(other) => panic!("the connection must end because the server stopped: {other}"),
+        Ok(response) => panic!(
+            "a shut-down server answered anyway: ok={} error={:?}",
+            response.ok(),
+            response.error()
+        ),
+    }
+}
+
+/// A composition root may quiesce an ingress it has already quiesced, because
+/// shutdown can be reached from more than one path. The second call must return
+/// rather than wait for a state change that has already happened.
+#[tokio::test]
+async fn quiescing_twice_is_idempotent_and_still_refuses_new_peers() {
+    let handle = start(StaticAuthenticator::new(
+        CredentialPolicy::None,
+        Arc::new(claw_gateway::SystemClock),
+    ))
+    .await;
+    let port = handle.local_address().port();
+
+    handle.stop_accepting().await;
+    handle.stop_accepting().await;
+
+    let refused = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect_err("the server is still quiesced after a repeated call");
+    assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
+
+    handle.shutdown().await;
+}
+
+/// Quiescing must not put a deadline on the connections it spared.
+///
+/// The accept loop's closing grace bounds a real shutdown's drain. If quiescing
+/// entered that same bounded drain, a spared connection would still be aborted
+/// once the grace elapsed — a shutdown merely deferred, not a quiesce. The two
+/// are indistinguishable to any test that acts immediately after quiescing,
+/// which is why this one deliberately outlives the grace before asking. That
+/// difference is invisible with the default three-second grace, so this server
+/// is built with a short one.
+#[tokio::test]
+async fn a_connection_spared_by_quiescing_outlives_the_closing_grace() {
+    let grace = Duration::from_millis(150);
+    let identity = device(43);
+    let wire_id = identity.device_id().gateway_wire_id();
+    let handle = start_with_close_grace(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                wire_id.clone(),
+                Grant::new(Role::Operator, [OperatorScope::Read]),
+            ),
+        grace,
+    )
+    .await;
+
+    let (client, _events) = GatewayClient::start(client_config(
+        &handle,
+        Arc::clone(&identity),
+        SecurityRole::Operator,
+        &[Scope::OperatorRead],
+    ))
+    .expect("the client configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    handle.stop_accepting().await;
+    tokio::time::sleep(grace * 4).await;
+
+    let response = client
+        .request(
+            request_id("health-outlives-grace"),
+            method("health"),
+            &json!({}),
+        )
+        .await
+        .expect("quiescing spares a connection indefinitely, not until the closing grace");
+    assert!(response.ok());
+    assert_eq!(response.error(), None);
+    assert_eq!(payload(&response)["protocol"], json!(4));
+
+    client.shutdown().await.expect("the client stops cleanly");
     handle.shutdown().await;
 }

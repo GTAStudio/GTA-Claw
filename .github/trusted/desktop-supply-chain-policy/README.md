@@ -154,6 +154,41 @@ gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
   --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
 ```
 
+#### Why the lockfile does not already cover this
+
+**The `Cargo.lock` checksum covers the crates.io package — it says nothing about the tarball
+fetched later. The lockfile describes the code that performs the download, not the thing
+downloaded.** This is the point most likely to be missed, because the checksum is a real control,
+correctly implemented, over something adjacent to the claim. `skia-bindings` 0.99.0 proves it in its
+own manifest: its `include` list is `Cargo.toml`, `bindings_docs.rs`, `build.rs`,
+`build_support/**/*.rs`, and `src/**`. The published `.crate` file cannot contain the artifact, so
+no checksum over it can cover the artifact.
+
+Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a future session
+filling `PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source:
+
+- **The artifact host is a different repository from the crate source.** The crate declares
+  `repository = "https://github.com/rust-skia/rust-skia"`; the archive is served from
+  `rust-skia/skia-binaries`. Vetting the crate's project does not vet the artifact's host, and the
+  two have different contributor sets and release automation. Reasoning "rust-skia is well known"
+  vets the wrong thing.
+- **GitHub already serves a SHA-256 for every release asset, and the build never asks for it.** The
+  `gh api` command above reads `.digest` from the same host that serves the archive. So the missing
+  verification is a choice made by `skia-bindings`, not an unavoidable property of the ecosystem —
+  which is what makes the `file://` handover a use of available data rather than a workaround.
+- **`no-compile` is a Cargo feature, not an environment variable**, declared as `no-compile = []`
+  with the comment *"Panic when any compilation steps are required to run."* Anyone attempting to
+  forbid a fallback compile by exporting an environment variable will silently achieve nothing.
+
+The archive key is the first twenty hex characters of the `rust-skia` commit plus the target triple
+plus the sorted feature set. **It is not content-addressed and carries no digest**, so the URL alone
+can never establish what was served. `FORCE_SKIA_BUILD` does not fix this: it relocates the trust,
+because the Skia source archive, the many third-party repositories `git-sync-deps` clones, and the
+GN binary from `chrome-infra-packages.appspot.com` are each themselves unverified.
+
+These findings come from reading the pinned source rather than executing it; no Windows host can run
+a `skia-bindings` build for an Apple target, so the first real iOS build remains the proof.
+
 ### Mobile CI is not yet reachable
 
 `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths, but neither file
@@ -295,8 +330,42 @@ base-to-head change names one of the exact 28 Bootstrap inputs:
    protected-base Git OID, normalized protected-base and candidate live SHA-256 values,
    candidate embedded-payload SHA-256, candidate semantic archive fingerprint, and a bounded
    non-empty rationale. The trusted manifest must name the decision ledger.
+3. **Standing preservation:** the protected base already carries a reviewed `[[standing]]` entry
+   for that path, the candidate ledger still carries the identical entry, and the embedded
+   historical payload for that path is unchanged. No candidate write of any kind is required.
 
-The schema-v1 ledger starts empty. Records use consecutive integer IDs, canonical field order,
+Options 1 and 2 both write inside the protected trust root, so an ordinary pull request cannot
+take either: `validate_protected_files` compares the whole trust-root tree and admits no
+exemption. Option 3 exists so that the routine case — a Final workspace resolving a new
+dependency while the historical archive stays frozen — is decided once, in a reviewed
+trust-root change, instead of once per pull request.
+
+A standing entry binds `path`, `base_oid` (provenance only), `snapshot_payload_sha256`,
+`snapshot_fingerprint`, and a bounded rationale. It deliberately records no per-change
+transition and is deliberately **not** re-bound to `manifest.base`, so the protected base
+advancing does not invalidate it and a queue of pending pull requests can land in any order.
+It binds archive-side facts only, which is what keeps it narrow:
+
+- coverage is read from the **protected base** ledger and additionally requires the identical
+  entry in the candidate ledger, so a candidate can neither mint coverage for itself nor keep
+  coverage it edited or dropped;
+- coverage requires the embedded payload for that path to be unchanged and to hash to
+  `snapshot_payload_sha256`;
+- coverage requires `snapshot_fingerprint` to equal the candidate archive's semantic
+  fingerprint, so rewriting *any* archived payload voids every standing entry at once and the
+  preservations must be re-taken alongside that synchronization.
+
+Standing entries are seeded for the 15 dependency-graph inputs in `BOOTSTRAP_FILES` — every
+`Cargo.toml`, every `Cargo.lock`, and `deny.toml`. The remaining 13 inputs (the seven
+workflows, `.github/CODEOWNERS`, `.cargo/audit.toml`, `.gitattributes`, `rust-toolchain.toml`,
+and `rustfmt.toml`) carry no standing entry and stay fully coupled: changing one still requires
+option 1 or option 2 and therefore a reviewed trust-root change.
+
+The schema-v1 ledger starts empty. `standing` is an optional key that is omitted entirely when
+there are no standing entries, so the canonical form stays unique. Standing entries use
+consecutive integer IDs and strictly ascending unique paths drawn from `BOOTSTRAP_FILES`.
+
+Records use consecutive integer IDs, canonical field order,
 lowercase full hashes, and deterministic ID order. The `(base_oid, path)` pair is a stable unique
 key, so rebasing or changing the same path again requires a new record bound to the current
 protected base. Existing records are an immutable prefix: they cannot be edited, deleted,

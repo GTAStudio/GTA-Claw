@@ -119,17 +119,52 @@ session's, from #76.)
 
 Consequences, each asserted:
 
-- `IosAction::ManagePairing` can never be granted on iOS. `grants()` refuses it
-  because it consults the *observed* scopes from the server hello, so nothing
-  fabricates a permission — but any front end must treat pairing as
-  unavailable rather than as a control that will work.
-- The other four actions *are* granted, which is asserted too. Without that, a
-  `grants()` that always returned `false` would satisfy the pairing test.
+- **This crate models no pairing action at all.** `IosAction::ManagePairing`
+  existed until the fleet coordinator ruled it out: pairing is a desktop and
+  terminal operation, and both mobile profiles — Android and iOS — omit
+  `operator.pairing`. A mobile client is *paired*; it does not *pair others*.
+  Any front end must treat pairing as absent rather than as a control that
+  will work.
+- **The refusal is still enforced, at the contract rather than at the action.**
+  `validate_gateway_profile` rejects an iOS profile that requests
+  `operator.pairing`, with an admitted read-only control alongside it so the
+  refusal is not vacuous. That test never referenced the action and is
+  unchanged.
+- **`grants()` is proved to discriminate from a reachable state.** The removed
+  action had been carrying that proof: it was the one action the upstream
+  profile refused, so it demonstrated `grants()` could return `false` at all.
+  Deleting it would have left a fully permissive `grants()` undetected —
+  measured, not assumed: with `grants()` stubbed to `true`, every other test in
+  that file still passed. The replacement control observes a connection
+  confirmed with only `operator.read` and asserts `SendMessage` is refused,
+  which is a state the server can actually produce, since the scope set is a
+  ceiling and any subset is admissible.
+- All four remaining actions *are* granted by the upstream profile, so the
+  control above cannot pass by `grants()` refusing everything.
 - `operator.talk.secrets` is granted but modelled by no action here, because no
   Talk surface is built yet. That gap is asserted so it cannot change unnoticed.
 
-Mutation-checked: repointing `ManagePairing` at `operator.read` fails with the
-granted set spelled out, rather than `ScopeSet(47)`.
+Mutation-checked, on Windows x86_64 with rustc 1.97.0: stubbing `grants()` to
+return `true` unconditionally fails the discrimination control with the observed
+set spelled out — `must refuse SendMessage (needs OperatorWrite) … from the
+observed set ["operator.read"]` — rather than `ScopeSet(47)`.
+
+### The Gateway is more permissive than this client, deliberately
+
+`claw_protocol::gateway::authorization` allows **any** operator method when the
+granted set contains `operator.admin`, and treats `operator.write` as satisfying
+`operator.read`. `IOS_OPERATOR_SCOPES` contains `operator.admin`, so a Gateway
+would in fact permit pairing-classified methods on an accepted iOS session even
+though the *connect-time* check refuses a profile that asks for
+`operator.pairing` outright.
+
+This client does not mirror those implication rules. It asks only whether the
+server confirmed the exact scope an action needs. That makes it strictly
+stricter than the server, which is the safe direction: it may withhold an action
+the Gateway would have allowed, but it never offers one the Gateway would
+refuse. Mirroring server-side subsumption would mean inferring a grant the
+server never stated, which is the fabricated permission summary
+`ObservedAuthorization` exists to prevent.
 
 This does **not** prove upstream's Swift client requests these scopes. That
 source is not vendored here and cannot be read from this repository.
