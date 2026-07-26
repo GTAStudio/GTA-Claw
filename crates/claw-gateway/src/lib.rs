@@ -62,7 +62,8 @@ pub use error::{
 };
 pub use events::{
     ConnectionId, Delivery, EventAudience, EventBus, EventDraft, EventEnvelope, EventError,
-    EventSubscription, EventVisibility, TopicFilter, TopicGroup, event_catalog, event_visibility,
+    EventSubscription, EventVisibility, SequenceExhausted, TopicFilter, TopicGroup, event_catalog,
+    event_visibility,
 };
 pub use meter::{RequestGuard, RequestMeter};
 pub use server::{BoundServer, GatewayServer, ServerHandle};

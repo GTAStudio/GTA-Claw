@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use claw_gateway::{
-    CredentialPolicy, DeviceDirectory, Exposure, GatewayServer, GatewayServerConfig, Grant,
-    ServerHandle, ServerLimits, ServerTimeouts, StaticAuthenticator,
+    ConnectionId, CredentialPolicy, DeviceDirectory, EventDraft, Exposure, GatewayServer,
+    GatewayServerConfig, Grant, ServerHandle, ServerLimits, ServerTimeouts, StaticAuthenticator,
 };
 use claw_gateway_client::{
     GatewayClient, GatewayClientConfig, GatewayClientError, ProtocolFailure, ReconnectPolicy,
@@ -1496,5 +1496,85 @@ async fn a_request_abandoned_by_a_vanishing_peer_leaves_the_meter_at_rest() {
     assert_eq!(handle.in_flight_requests(), 0);
     assert_eq!(handle.completed_requests(), 1);
 
+    handle.shutdown().await;
+}
+
+/// A targeted event must not spend a number it does not carry.
+///
+/// `deliver` advances the per-connection broadcast counter for every admitted
+/// envelope, but `EventEnvelope::to_frame` attaches the number only to
+/// broadcasts. A targeted event therefore burned a number and shipped none, so
+/// the next broadcast on that connection skipped one and the client's gap
+/// detector closed the connection as unrecoverable.
+///
+/// A node is the connection that sees both kinds: `node.invoke.request` is
+/// visible only to nodes, and `heartbeat` reaches every authenticated peer.
+#[tokio::test]
+async fn a_targeted_event_does_not_consume_the_connection_broadcast_sequence() {
+    let identity = device(40);
+    let handle = start(
+        StaticAuthenticator::new(CredentialPolicy::None, Arc::new(claw_gateway::SystemClock))
+            .with_paired_device(
+                identity.device_id().gateway_wire_id(),
+                Grant::new(Role::Node, []),
+            ),
+    )
+    .await;
+
+    let mut config = client_config(&handle, Arc::clone(&identity), SecurityRole::Node, &[]);
+    config.client.id = ClientId::NodeHost;
+    config.client.mode = ClientMode::Node;
+    let (client, mut events) = GatewayClient::start(config).expect("the configuration is valid");
+    client.wait_ready().await.expect("the handshake succeeds");
+
+    // The first connection this server accepts is numbered one.
+    let target = ConnectionId::new(1);
+    handle.events().publish(
+        EventDraft::targeted("node.invoke.request", &json!({ "id": "i1" }), target)
+            .expect("node.invoke.request is catalogued"),
+    );
+    handle.events().publish(
+        EventDraft::broadcast("heartbeat", &json!({ "source": "test", "observedAtMs": 1 }))
+            .expect("heartbeat is catalogued"),
+    );
+    handle.events().publish(
+        EventDraft::broadcast("heartbeat", &json!({ "source": "test", "observedAtMs": 2 }))
+            .expect("heartbeat is catalogued"),
+    );
+
+    let mut seen: Vec<(String, Option<u64>)> = Vec::new();
+    while seen.len() < 3 {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("events arrive promptly")
+            .expect("the event stream stays open, so no gap closed it");
+        let frame = event.into_frame();
+        seen.push((
+            frame.event().as_str().to_owned(),
+            frame
+                .sequence()
+                .map(claw_protocol::gateway::EventSequence::get),
+        ));
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            ("node.invoke.request".to_owned(), None),
+            ("heartbeat".to_owned(), Some(1)),
+            ("heartbeat".to_owned(), Some(2)),
+        ],
+        "the targeted event carries no number and spends none, so the broadcasts \
+         that follow it still number from one"
+    );
+
+    // The connection is still usable, which is what the gap used to destroy.
+    let response = client
+        .request(request_id("after-targeted"), method("health"), &json!({}))
+        .await
+        .expect("the connection survived the targeted event");
+    assert!(response.ok());
+
+    client.shutdown().await.expect("the client stops cleanly");
     handle.shutdown().await;
 }

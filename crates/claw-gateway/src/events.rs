@@ -14,8 +14,15 @@
 //! first publication it could not enqueue and terminates that subscription, so
 //! the connection learns it has an incomplete view instead of silently skipping
 //! events.
+//!
+//! Two things consume no wire sequence, and both matter: an envelope dropped
+//! because authorization narrowed after publication, and a *targeted* envelope,
+//! which carries no `seq` at all. Either one spending a number would leave a
+//! hole the peer reads as a gap and treats as unrecoverable, so
+//! [`EventEnvelope::to_frame`] owns both the decision and the spend.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -308,21 +315,48 @@ impl EventEnvelope {
         self.inner.encoded_len
     }
 
-    /// Builds the wire frame, attaching `seq` only to broadcasts.
-    #[must_use]
-    pub fn to_frame(&self, sequence: EventSequence) -> EventFrame {
+    /// Builds the wire frame, spending a sequence number only when the frame
+    /// will carry one.
+    ///
+    /// Takes the connection's counter rather than an already-chosen number so
+    /// that "spent but not attached" is unrepresentable: a targeted frame never
+    /// reaches the branch that advances `next`. Holding those two decisions in
+    /// different functions is what previously let a targeted event burn a
+    /// number it did not ship, which opened a gap in the peer's broadcast
+    /// stream and made the peer close the connection as unrecoverable.
+    pub fn to_frame(&self, next: &mut u64) -> Result<EventFrame, SequenceExhausted> {
         let sequence = match self.inner.audience {
-            EventAudience::Broadcast => Some(sequence),
+            EventAudience::Broadcast => {
+                let candidate = next.saturating_add(1);
+                let sequence = EventSequence::new(candidate).map_err(|_| SequenceExhausted)?;
+                *next = candidate;
+                Some(sequence)
+            }
             EventAudience::Connection(_) => None,
         };
-        EventFrame::new(
+        Ok(EventFrame::new(
             self.inner.event.clone(),
             OpaqueField::Value(self.inner.payload.clone()),
             sequence,
             self.inner.state_version,
-        )
+        ))
     }
 }
+
+/// A connection's broadcast sequence space cannot produce another number.
+///
+/// The counter is left untouched when this is returned, so a caller that
+/// closes the connection does not also leave a hole behind it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceExhausted;
+
+impl fmt::Display for SequenceExhausted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("broadcast sequence space is exhausted")
+    }
+}
+
+impl std::error::Error for SequenceExhausted {}
 
 /// A catalogued event awaiting publication.
 #[derive(Clone, Debug)]
@@ -897,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_frames_omit_seq_and_broadcast_frames_carry_it() {
+    async fn a_targeted_frame_spends_no_sequence_and_a_broadcast_spends_exactly_one() {
         let bus = EventBus::new(4, 4096);
         let mut subscription =
             bus.subscribe(ConnectionId::new(7), Role::Node, Vec::new(), filter());
@@ -911,14 +945,31 @@ mod tests {
         );
         bus.publish(EventDraft::broadcast("tick", &serde_json::json!({ "ts": 4 })).expect("draft"));
 
-        let wire = EventSequence::new(1).expect("positive");
+        // The counter is threaded through both calls exactly as a connection
+        // threads it, because the defect this pins was not in which frames
+        // carry a number but in which frames consume one.
+        let mut next = 0_u64;
         match subscription.recv().await {
-            Delivery::Event(envelope) => assert_eq!(envelope.to_frame(wire).sequence(), None),
+            Delivery::Event(envelope) => {
+                let frame = envelope
+                    .to_frame(&mut next)
+                    .expect("the space is not exhausted");
+                assert_eq!(frame.sequence(), None);
+                assert_eq!(next, 0, "a targeted frame must leave the counter alone");
+            }
             other => panic!("expected the targeted event: {other:?}"),
         }
         match subscription.recv().await {
             Delivery::Event(envelope) => {
-                assert_eq!(envelope.to_frame(wire).sequence(), Some(wire));
+                let frame = envelope
+                    .to_frame(&mut next)
+                    .expect("the space is not exhausted");
+                assert_eq!(
+                    frame.sequence().map(EventSequence::get),
+                    Some(1),
+                    "the first broadcast after a targeted event is still number one"
+                );
+                assert_eq!(next, 1);
             }
             other => panic!("expected the broadcast event: {other:?}"),
         }

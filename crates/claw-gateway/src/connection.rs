@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use claw_protocol::gateway::{
     AUTHENTICATED_MAX_FRAME_BYTES, AuthenticationDecision, AuthenticationPort,
     AuthenticationRequest, Codec, ConnectErrorDetailCode, ConnectParams, CoreErrorCode, ErrorCode,
-    ErrorMessage, ErrorShape, EventFrame, EventName, EventSequence, Frame,
-    GATEWAY_PROTOCOL_VERSION, HandshakeRejection, HelloAuth, HelloFeatures, HelloOk, HelloOkKind,
-    HelloPolicy, HelloServer, Name, Negotiation, NegotiationError, NonNegativeInteger, OpaqueField,
-    OpaqueJson, OperatorScope, PREAUTH_MAX_FRAME_BYTES, PositiveInteger, RequestId, ResponseFrame,
-    Role, Snapshot, StateVersion, core_events, resolve_core_event,
+    ErrorMessage, ErrorShape, EventFrame, EventName, Frame, GATEWAY_PROTOCOL_VERSION,
+    HandshakeRejection, HelloAuth, HelloFeatures, HelloOk, HelloOkKind, HelloPolicy, HelloServer,
+    Name, Negotiation, NegotiationError, NonNegativeInteger, OpaqueField, OpaqueJson,
+    OperatorScope, PREAUTH_MAX_FRAME_BYTES, PositiveInteger, RequestId, ResponseFrame, Role,
+    Snapshot, StateVersion, core_events, resolve_core_event,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -334,13 +334,12 @@ async fn deliver(
             if !envelope.visibility().admits(session.role, &session.scopes) {
                 return Ok(());
             }
-            *broadcast_seq = broadcast_seq.saturating_add(1);
-            let Ok(sequence) = EventSequence::new(*broadcast_seq) else {
-                return Err(ConnectionClose::ProtocolViolation(
-                    "broadcast sequence space is exhausted".to_owned(),
-                ));
-            };
-            write_frame(write, codec, &Frame::Event(envelope.to_frame(sequence))).await
+            // The envelope both decides whether a number is attached and spends
+            // it, so a targeted event cannot advance this connection's counter.
+            let frame = envelope
+                .to_frame(broadcast_seq)
+                .map_err(|exhausted| ConnectionClose::ProtocolViolation(exhausted.to_string()))?;
+            write_frame(write, codec, &Frame::Event(frame)).await
         }
         Delivery::Lagged { first_missed } => Err(ConnectionClose::SlowConsumer {
             dropped: services
