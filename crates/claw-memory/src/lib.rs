@@ -32,6 +32,9 @@
 //! | [`retrieval`] | Memory records, queries, and retriever ports |
 //! | [`context`] | Budget-aware assembly of the final model input |
 //! | [`store`] | Narrow persistence port and an in-memory adapter |
+//! | [`durable`] | File-backed durable memory and user profile |
+//! | [`transcript`] | Durable transcript append, search, and browsing |
+//! | [`safety`] | Write-time and read-time persistent-content scanning |
 //!
 //! # Assembly order
 //!
@@ -65,10 +68,14 @@
 
 pub mod budget;
 pub mod context;
+pub mod durable;
+mod persistence;
 pub mod retrieval;
+pub mod safety;
 pub mod session;
 pub mod store;
 pub mod summarize;
+pub mod transcript;
 pub mod vector;
 
 pub use budget::{
@@ -76,15 +83,25 @@ pub use budget::{
     plan_truncation,
 };
 pub use context::{AssembledContext, ContextAssembler, ContextError};
+pub use durable::{
+    DurableMemoryEntry, DurableMemoryError, DurableMemoryStore, MemoryMutation, MemoryPage,
+    MemoryReference, MemoryTarget, MemoryUsage, VisibleMemoryEntry,
+};
+pub use persistence::PersistenceError;
 pub use retrieval::{
     KeywordRetriever, MAX_RETRIEVAL_LIMIT, MemoryRecord, RecordKind, RetrievalError,
     RetrievalQuery, RetrievedItem, Retriever, VectorRetriever,
 };
+pub use safety::{ContentScanResult, UnsafeContentReason, scan_persistent_content};
 pub use session::{Message, MessageId, Role, Session, SessionError, SessionId, Summary};
 pub use store::{InMemoryMemoryStore, MemoryStore, StoreError};
 pub use summarize::{
     ExtractiveSummarizer, SummarizationPlan, SummarizationPolicy, Summarizer, SummaryError,
     SummaryRequest, compact, plan_summarization,
+};
+pub use transcript::{
+    DurableTranscriptStore, TRANSCRIPT_WARNING, TranscriptError, TranscriptHit, TranscriptMessage,
+    TranscriptPage, TranscriptRole, TranscriptSearch, VisibleTranscriptMessage,
 };
 pub use vector::{
     Embedding, EmbeddingModel, ExactVectorIndex, HashingEmbeddingModel, RecordId, ScoredMatch,
