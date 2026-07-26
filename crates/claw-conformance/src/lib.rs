@@ -4,7 +4,7 @@
 //! loads and validates them, accepts evidence-backed implementation claims, and
 //! produces deterministic parity reports.
 //!
-//! Evidence verification proves that a cited Rust test is literally declared in
+//! Static evidence verification proves that a cited Rust test is literally declared in
 //! a standard-libtest Cargo target root in a package admitted by the repository's
 //! workspace topology, or a source file reachable through explicit `mod`
 //! declarations from one. The resolver follows nested inline modules and exact
@@ -14,8 +14,11 @@
 //! path-dependency members, cross-package paths, test-disabled targets, and
 //! targets with `harness = false`, while retaining standalone build roots outside
 //! any declared workspace. Parent-module `cfg` predicates are deliberately not
-//! evaluated. This cannot prove that the test ran or is semantically sufficient
-//! for the claim.
+//! evaluated. Callers may explicitly enable libtest membership verification to
+//! additionally prove that each exact identity is registered by at least one
+//! reachable standard-libtest target. That optional mode executes Cargo's
+//! listing path, but still does not run tests, prove that they pass, or establish
+//! that they are semantically sufficient for the claim.
 //! Automated citation integrity therefore composes with independent review:
 //! the harness rejects fabricated evidence, while reviewers judge sufficiency.
 //! The verifier recognizes literal test declarations only; macro-generated
@@ -47,5 +50,5 @@ pub use loader::Contract;
 pub use model::{Classification, Feature, FeatureLedger, InventoryRecord};
 pub use report::{
     FeatureReport, InventoryCoverage, LedgerReport, ParityReport, ParityStatus, ParityTotals,
-    generate_report,
+    ReportOptions, generate_report, generate_report_with_options,
 };
