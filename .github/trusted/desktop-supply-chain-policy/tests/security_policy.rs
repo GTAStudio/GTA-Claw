@@ -26,9 +26,10 @@ use desktop_supply_chain_policy::ownership::{
     validate_codeowners_text,
 };
 use desktop_supply_chain_policy::policy::{
-    BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, bootstrap_fingerprint,
-    bootstrap_snapshot, expected_bootstrap_fingerprint, is_bootstrap_state,
-    validate_build_artifact_pin_table, validate_casefold_paths, validate_final_static,
+    BootstrapSnapshotArchive, BootstrapSnapshotChangeStatus, ROOT_LOCK_TRANSITION_ID,
+    RootLockTransitionState, bootstrap_fingerprint, bootstrap_snapshot,
+    expected_bootstrap_fingerprint, is_bootstrap_state, validate_build_artifact_pin_table,
+    validate_casefold_paths, validate_final_static, validate_root_lock_transition,
     write_bootstrap_snapshot, write_final_dependency_fixtures,
 };
 use desktop_supply_chain_policy::process::{CommandSpec, run, run_checked};
@@ -3537,6 +3538,392 @@ workspace = true
         "exact security policy file changed: deny.toml"
     );
 }
+
+// ============================================================================
+// Temporary root lock/manifest transition (phase 1 of 2) regressions.
+//
+// See the matching banner comment around `validate_root_lock_transition` in
+// `src/policy.rs` for full context. These tests, the fixtures under
+// `policy/transition/root-lock-58/`, this block, and the call site in
+// `validate_final_static` are deleted together in phase 2, once a follow-up
+// trust-root-only PR collapses the accepted set to the single #58 (`Post58`)
+// tuple as a permanent byte-exact fixture.
+//
+// The lock dependency arrays below are independently transcribed from the
+// live root `Cargo.lock` (not imported from `src/policy.rs`, whose copies are
+// private) so that a typo in either copy is itself caught by these tests
+// disagreeing with the implementation.
+// ============================================================================
+
+/// Pre-#58 canonical `claw-application` lock dependency edges (commit `cfb88cd`).
+const TRANSITION_PRE58_APPLICATION_LOCK_DEPS: &[&str] = &["claw-domain", "claw-protocol"];
+/// Pre-#58 canonical `gta-claw-daemon` lock dependency edges (commit `cfb88cd`).
+const TRANSITION_PRE58_DAEMON_LOCK_DEPS: &[&str] =
+    &["claw-application", "claw-platform", "claw-protocol"];
+/// #58 (current) canonical `claw-application` lock dependency edges.
+const TRANSITION_POST58_APPLICATION_LOCK_DEPS: &[&str] =
+    &["claw-domain", "claw-protocol", "secrecy", "tokio", "url"];
+/// #58 (current) canonical `gta-claw-daemon` lock dependency edges.
+const TRANSITION_POST58_DAEMON_LOCK_DEPS: &[&str] = &[
+    "claw-application",
+    "claw-domain",
+    "claw-platform",
+    "claw-protocol",
+    "secrecy",
+    "tokio",
+    "tokio-util",
+];
+
+#[derive(Debug, Clone, Copy)]
+enum TransitionSide {
+    Pre58,
+    Post58,
+}
+
+impl TransitionSide {
+    fn application_lock_deps(self) -> &'static [&'static str] {
+        match self {
+            TransitionSide::Pre58 => TRANSITION_PRE58_APPLICATION_LOCK_DEPS,
+            TransitionSide::Post58 => TRANSITION_POST58_APPLICATION_LOCK_DEPS,
+        }
+    }
+
+    fn daemon_lock_deps(self) -> &'static [&'static str] {
+        match self {
+            TransitionSide::Pre58 => TRANSITION_PRE58_DAEMON_LOCK_DEPS,
+            TransitionSide::Post58 => TRANSITION_POST58_DAEMON_LOCK_DEPS,
+        }
+    }
+}
+
+fn transition_fixture(name: &str) -> Vec<u8> {
+    fs::read(
+        repo_root()
+            .join(".github/trusted/desktop-supply-chain-policy/policy/transition/root-lock-58")
+            .join(name),
+    )
+    .unwrap_or_else(|error| panic!("read root lock transition fixture {name}: {error}"))
+}
+
+/// Rewrites the `dependencies = [...]` array of a single named `[[package]]`
+/// entry in the tree's root `Cargo.lock`, leaving every other byte (name,
+/// version, source, checksum, and every other package block) untouched. Safe
+/// because `validate_root_lock`'s structural check never inspects the
+/// `dependencies` field of a `[[package]]` entry.
+fn set_root_lock_dependencies(tree: &TempTree, package: &str, deps: &[&str]) {
+    let path = tree.join("Cargo.lock");
+    let text = fs::read_to_string(&path).expect("read root lock for dependency rewrite");
+    let marker = format!("\nname = \"{package}\"\nversion = \"0.1.0\"\ndependencies = [\n");
+    let start = text.find(&marker).unwrap_or_else(|| {
+        panic!("root lock transition fixture: package block not found: {package}")
+    });
+    let deps_start = start + marker.len();
+    let close_offset = text[deps_start..].find("\n]\n").unwrap_or_else(|| {
+        panic!("root lock transition fixture: dependencies array not closed for {package}")
+    });
+    let deps_end = deps_start + close_offset + 1;
+    let mut replacement = String::new();
+    for dep in deps {
+        replacement.push_str(&format!(" \"{dep}\",\n"));
+    }
+    let mut rewritten = String::with_capacity(text.len());
+    rewritten.push_str(&text[..deps_start]);
+    rewritten.push_str(&replacement);
+    rewritten.push_str(&text[deps_end..]);
+    fs::write(&path, rewritten).expect("write rewritten root lock dependencies");
+}
+
+/// Builds a `final_tree` overlaid with the exact pre-#58 or exact #58
+/// manifest/lock transition tuple - nothing else in the tree changes. The
+/// result is accepted by `validate_root_lock_transition` (and the full
+/// `validate_final_static` pipeline) as-is; individual tests mutate a copy
+/// of this baseline to isolate one specific failure mode.
+fn transition_tree(label: &str, side: TransitionSide) -> TempTree {
+    let tree = final_tree(label);
+    let (application_manifest, daemon_manifest) = match side {
+        TransitionSide::Pre58 => (
+            "pre58-application-Cargo.toml.fixture",
+            "pre58-daemon-Cargo.toml.fixture",
+        ),
+        TransitionSide::Post58 => (
+            "post58-application-Cargo.toml.fixture",
+            "post58-daemon-Cargo.toml.fixture",
+        ),
+    };
+    fs::write(
+        tree.join("crates/claw-application/Cargo.toml"),
+        transition_fixture(application_manifest),
+    )
+    .expect("write application manifest transition fixture");
+    fs::write(
+        tree.join("apps/gta-claw-daemon/Cargo.toml"),
+        transition_fixture(daemon_manifest),
+    )
+    .expect("write daemon manifest transition fixture");
+    set_root_lock_dependencies(&tree, "claw-application", side.application_lock_deps());
+    set_root_lock_dependencies(&tree, "gta-claw-daemon", side.daemon_lock_deps());
+    tree
+}
+
+#[test]
+fn root_lock_transition_id_is_present_and_stable() {
+    // The temporary transition identifier is an audit anchor: pin its exact
+    // value so a rename or removal is a deliberate, reviewed edit rather
+    // than an accidental one.
+    assert_eq!(ROOT_LOCK_TRANSITION_ID, "root-lock-transition-pr58-phase1");
+}
+
+#[test]
+fn root_lock_transition_exact_pre58_tuple_is_accepted() {
+    let tree = transition_tree("pre58-exact", TransitionSide::Pre58);
+    let root = SafeRoot::new(&tree.path).expect("open pre58 transition tuple fixture");
+    validate_final_static(&root).expect("exact pre-#58 manifest/lock tuple must be accepted");
+    assert_eq!(
+        validate_root_lock_transition(&root).expect("classify pre58 tuple"),
+        RootLockTransitionState::Pre58
+    );
+}
+
+#[test]
+fn root_lock_transition_exact_post58_tuple_is_accepted() {
+    let tree = transition_tree("post58-exact", TransitionSide::Post58);
+    let root = SafeRoot::new(&tree.path).expect("open post58 transition tuple fixture");
+    validate_final_static(&root).expect("exact #58 manifest/lock tuple must be accepted");
+    assert_eq!(
+        validate_root_lock_transition(&root).expect("classify post58 tuple"),
+        RootLockTransitionState::Post58
+    );
+}
+
+#[test]
+fn root_lock_transition_live_repository_tree_is_the_post58_tuple() {
+    // The unmodified live repository (no synthetic overlay at all) must
+    // resolve to exactly `Post58`: proves the fixtures/lock dependency
+    // constants above are not just internally self-consistent but match the
+    // real, current root manifests and lock in this repository.
+    let tree = final_tree("live-post58");
+    let root = SafeRoot::new(&tree.path).expect("open live repository tree");
+    assert_eq!(
+        validate_root_lock_transition(&root).expect("classify live repository tuple"),
+        RootLockTransitionState::Post58
+    );
+}
+
+#[test]
+fn root_lock_transition_pre58_manifests_with_post58_lock_dependencies_reject() {
+    let tree = transition_tree("pre58-manifest-post58-lock", TransitionSide::Pre58);
+    set_root_lock_dependencies(
+        &tree,
+        "claw-application",
+        TRANSITION_POST58_APPLICATION_LOCK_DEPS,
+    );
+    set_root_lock_dependencies(&tree, "gta-claw-daemon", TRANSITION_POST58_DAEMON_LOCK_DEPS);
+    let error = rejection(
+        &tree,
+        "pre-#58 manifests paired with #58 lock dependency edges must not be accepted",
+    );
+    assert!(
+        error.contains("do not match the Pre58 tuple"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_post58_manifests_with_pre58_lock_dependencies_reject() {
+    let tree = transition_tree("post58-manifest-pre58-lock", TransitionSide::Post58);
+    set_root_lock_dependencies(
+        &tree,
+        "claw-application",
+        TRANSITION_PRE58_APPLICATION_LOCK_DEPS,
+    );
+    set_root_lock_dependencies(&tree, "gta-claw-daemon", TRANSITION_PRE58_DAEMON_LOCK_DEPS);
+    let error = rejection(
+        &tree,
+        "#58 manifests paired with pre-#58 lock dependency edges must not be accepted",
+    );
+    assert!(
+        error.contains("do not match the Post58 tuple"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_partial_daemon_only_adoption_rejects() {
+    let tree = transition_tree("partial-daemon-only", TransitionSide::Pre58);
+    // Only the daemon manifest adopts #58; the application manifest and both
+    // lock dependency arrays stay exactly pre-#58. A partial (single-file)
+    // subset of the #58 manifest input set must be rejected before the lock
+    // is even compared.
+    fs::write(
+        tree.join("apps/gta-claw-daemon/Cargo.toml"),
+        transition_fixture("post58-daemon-Cargo.toml.fixture"),
+    )
+    .expect("write daemon manifest to post58 while application manifest stays pre58");
+    let error = rejection(
+        &tree,
+        "adopting #58 in only one of the two manifests must not be accepted",
+    );
+    assert!(
+        error.contains("manifest input set is split across states"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("Pre58") && error.contains("Post58"),
+        "error must name both mismatched states: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_near_miss_manifest_version_change_rejects() {
+    let tree = transition_tree("near-miss-version", TransitionSide::Post58);
+    // A single-digit version drift in one manifest byte must match neither
+    // canonical tuple - proving exact-byte, not fuzzy or semver-range,
+    // comparison.
+    replace(
+        &tree.join("crates/claw-application/Cargo.toml"),
+        r#"tokio = { version = "=1.52.3", features = ["macros", "rt", "rt-multi-thread"] }"#,
+        r#"tokio = { version = "=1.52.4", features = ["macros", "rt", "rt-multi-thread"] }"#,
+    );
+    let error = rejection(
+        &tree,
+        "a single-byte manifest version drift must match neither canonical tuple",
+    );
+    assert!(
+        error.contains("manifest input matches neither the pre-#58 nor the #58 canonical tuple"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("crates/claw-application/Cargo.toml"),
+        "error must name the mismatched manifest path: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_correct_lock_content_at_an_unadmitted_path_rejects() {
+    // A byte-perfect copy of the correct root Cargo.lock staged at a decoy,
+    // non-canonical path must not be treated as satisfying the transition.
+    // The pre-existing admitted-lock-location inventory check - not the new
+    // transition tuple check, which only ever reads the one canonical
+    // `Cargo.lock` path - rejects this first: lock identity is bound to
+    // `Cargo.lock` at its one canonical path, never to "this content exists
+    // somewhere in the tree". This demonstrates the two layers agree and
+    // that adding the new check does not weaken the existing one.
+    let tree = transition_tree("lock-content-wrong-path", TransitionSide::Post58);
+    let correct_lock = fs::read(tree.join("Cargo.lock")).expect("read exact root lock");
+    fs::write(
+        tree.join("crates/claw-application/Cargo.lock"),
+        &correct_lock,
+    )
+    .expect("write decoy lock at a non-admitted path");
+    let error = rejection(
+        &tree,
+        "a correct lock at a non-admitted path must not be treated as satisfying the transition",
+    );
+    assert!(
+        error.contains("Cargo.lock inventory contains unadmitted locations"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("crates/claw-application/Cargo.lock"),
+        "error must name the unadmitted decoy path: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_arbitrary_third_lock_dependency_set_rejects() {
+    let tree = transition_tree("arbitrary-third-lock", TransitionSide::Post58);
+    set_root_lock_dependencies(
+        &tree,
+        "gta-claw-daemon",
+        &["claw-application", "claw-platform", "claw-protocol", "rand"],
+    );
+    let error = rejection(
+        &tree,
+        "a lock dependency set matching neither canonical tuple must be rejected",
+    );
+    assert!(
+        error.contains(
+            "Cargo.lock dependency edges for gta-claw-daemon do not match the Post58 tuple"
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_extra_unregistered_lock_dependency_edge_rejects() {
+    let tree = transition_tree("extra-lock-dependency", TransitionSide::Post58);
+    let mut deps = TRANSITION_POST58_APPLICATION_LOCK_DEPS.to_vec();
+    deps.push("rand");
+    set_root_lock_dependencies(&tree, "claw-application", &deps);
+    let error = rejection(
+        &tree,
+        "an extra unaccounted-for lock dependency edge must be rejected",
+    );
+    assert!(
+        error.contains(
+            "Cargo.lock dependency edges for claw-application do not match the Post58 tuple"
+        ),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("\"rand\""),
+        "error must surface the extra edge: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_target_manifest_rename_and_sibling_decoy_rejects() {
+    let tree = transition_tree("manifest-rename-decoy", TransitionSide::Post58);
+    let manifest_path = tree.join("apps/gta-claw-daemon/Cargo.toml");
+    let correct_bytes = fs::read(&manifest_path).expect("read exact daemon manifest");
+    // Stash a byte-perfect copy of the correct manifest at a decoy sibling
+    // path - `validate_root_lock_transition` reads exactly
+    // `apps/gta-claw-daemon/Cargo.toml` and never scans siblings for
+    // matching content - then leave a minimally mutated, non-canonical
+    // manifest at the real, required path.
+    fs::write(
+        tree.join("apps/gta-claw-daemon/Cargo.toml.decoy"),
+        &correct_bytes,
+    )
+    .expect("write sibling decoy manifest");
+    replace(&manifest_path, "=0.7.18", "=0.7.19");
+    let error = rejection(
+        &tree,
+        "a sibling decoy holding the correct bytes must not substitute for the canonical manifest path",
+    );
+    assert!(
+        error.contains("manifest input matches neither the pre-#58 nor the #58 canonical tuple"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("apps/gta-claw-daemon/Cargo.toml"),
+        "error must name the canonical path being checked: {error}"
+    );
+}
+
+#[test]
+fn root_lock_transition_addition_does_not_mask_the_existing_desktop_lock_diagnostic() {
+    // Prove the new check is additive: an otherwise-exact Post58 transition
+    // tuple still surfaces the pre-existing, unrelated desktop lock
+    // byte-exact diagnostic when `desktop/Cargo.lock` is mutated. The new
+    // transition check must never run first, short-circuit, or swallow this
+    // existing diagnostic.
+    let tree = transition_tree("existing-diagnostic-preserved", TransitionSide::Post58);
+    let mut lock = fs::read_to_string(tree.join("desktop/Cargo.lock")).expect("read desktop lock");
+    lock.push('\n');
+    fs::write(tree.join("desktop/Cargo.lock"), lock).expect("mutate desktop lock");
+    assert_eq!(
+        rejection(
+            &tree,
+            "an unrelated desktop lock byte mutation must still be caught by its own existing diagnostic"
+        ),
+        "exact security policy file changed: desktop/Cargo.lock",
+        "the pre-existing desktop lock diagnostic must fire unmodified"
+    );
+}
+// ============================================================================
+// END temporary root lock/manifest transition (phase 1 of 2) regressions.
+// ============================================================================
 
 #[test]
 fn git_tree_inventory_rejects_symlinks_and_gitlinks() {

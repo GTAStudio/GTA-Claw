@@ -2008,6 +2008,226 @@ pub fn validate_root_lock(root: &SafeRoot, workspace: &RootWorkspace) -> PolicyR
     Ok(())
 }
 
+// ============================================================================
+// TEMPORARY root lock/manifest transition (phase 1 of 2).
+//
+// Context: merged PR #58 ("Add the daemon composition layer", squash commit
+// 4570b9d, parent cfb88cd) changed two root-workspace manifests -
+// `crates/claw-application/Cargo.toml` and `apps/gta-claw-daemon/Cargo.toml`
+// - to gate the daemon's composition dependency edges (`secrecy`, `tokio`,
+// `tokio-util`, `url`, and a `claw-domain` edge on `gta-claw-daemon`) behind
+// a `composition` Cargo feature. That changed the corresponding
+// `[[package]] dependencies` arrays for those two packages in the root
+// `Cargo.lock`. Unlike `desktop/Cargo.lock` (byte-frozen via
+// `FINAL_DESKTOP_LOCK`/`require_exact_file`), the root lock is validated
+// only *structurally* by `validate_root_lock` above (registry checksum
+// shape, local package/version agreement with declared workspace members):
+// it carries no byte-exact pin, so #58's lock change landed with no
+// dedicated regression coverage binding it to its manifest inputs.
+//
+// This block adds narrow, fail-closed coverage of exactly that
+// manifest/lock tuple - two named files and the two named packages' lock
+// dependency arrays, nothing else. It intentionally does NOT bind the
+// broader, by-design-evolving root workspace member set (see
+// `validate_root_workspace` and
+// `compliant_declared_root_member_and_lock_evolution_pass` in
+// `tests/security_policy.rs`, which must keep passing unmodified). It
+// accepts exactly two independently-reproducible states - the exact
+// pre-#58 tuple or the exact #58 tuple - and fails closed on every other
+// combination, including cross-matches between the two states.
+//
+// The `Post58` lock dependency edges below are exactly the live root
+// `Cargo.lock` content; they were confirmed reproducible from the `Post58`
+// manifest tuple with the repository-pinned toolchain
+// (`cargo metadata --locked`, rust-toolchain.toml channel 1.97.0) rather
+// than hand-authored. The `Pre58` tuple is a frozen historical snapshot
+// taken from commit `cfb88cd` (the parent of #58's squash-merge), similarly
+// confirmed reproducible at that commit.
+//
+// PHASE 2 CLOSURE CONDITION: #58 is already merged to `main`; this PR only
+// adds the transition guard so the manifest/lock pin becomes real
+// regression coverage rather than a silent gap. Once a follow-up
+// trust-root-only PR collapses the accepted set down to the single #58
+// (`Post58`) tuple as the sole canonical fixture (mirroring
+// `FINAL_DESKTOP_LOCK`/`FINAL_APP_MANIFEST`'s permanent byte-exact
+// pinning), delete in one pass: this entire banner-to-banner block, its
+// call site in `validate_final_static`, the
+// `policy/transition/root-lock-58/` fixture directory, and the
+// `root_lock_transition_*` tests in `tests/security_policy.rs`. Nothing in
+// this block runs automatically, self-modifies, or expires on its own;
+// removal is a manual, independently reviewed trust-root-only change.
+// ============================================================================
+
+/// Temporary identifier for the phase-1 root lock/manifest transition guard.
+/// This is an audit/documentation anchor only: nothing in this crate reads
+/// or branches on its value. Delete it together with the rest of this block
+/// in phase 2.
+pub const ROOT_LOCK_TRANSITION_ID: &str = "root-lock-transition-pr58-phase1";
+
+const APPLICATION_MANIFEST: &str = "crates/claw-application/Cargo.toml";
+const DAEMON_MANIFEST: &str = "apps/gta-claw-daemon/Cargo.toml";
+
+const TRANSITION_PRE58_APPLICATION_MANIFEST: &[u8] =
+    include_bytes!("../policy/transition/root-lock-58/pre58-application-Cargo.toml.fixture");
+const TRANSITION_PRE58_DAEMON_MANIFEST: &[u8] =
+    include_bytes!("../policy/transition/root-lock-58/pre58-daemon-Cargo.toml.fixture");
+const TRANSITION_POST58_APPLICATION_MANIFEST: &[u8] =
+    include_bytes!("../policy/transition/root-lock-58/post58-application-Cargo.toml.fixture");
+const TRANSITION_POST58_DAEMON_MANIFEST: &[u8] =
+    include_bytes!("../policy/transition/root-lock-58/post58-daemon-Cargo.toml.fixture");
+
+/// Pre-#58 canonical `claw-application` lock dependency edges (commit `cfb88cd`).
+const TRANSITION_PRE58_APPLICATION_LOCK_DEPS: &[&str] = &["claw-domain", "claw-protocol"];
+/// Pre-#58 canonical `gta-claw-daemon` lock dependency edges (commit `cfb88cd`).
+const TRANSITION_PRE58_DAEMON_LOCK_DEPS: &[&str] =
+    &["claw-application", "claw-platform", "claw-protocol"];
+/// #58 (current) canonical `claw-application` lock dependency edges - the live
+/// root `Cargo.lock` content, confirmed Cargo-reproducible from the `Post58`
+/// manifest tuple with the repository-pinned toolchain.
+const TRANSITION_POST58_APPLICATION_LOCK_DEPS: &[&str] =
+    &["claw-domain", "claw-protocol", "secrecy", "tokio", "url"];
+/// #58 (current) canonical `gta-claw-daemon` lock dependency edges - the live
+/// root `Cargo.lock` content, confirmed Cargo-reproducible from the `Post58`
+/// manifest tuple with the repository-pinned toolchain.
+const TRANSITION_POST58_DAEMON_LOCK_DEPS: &[&str] = &[
+    "claw-application",
+    "claw-domain",
+    "claw-platform",
+    "claw-protocol",
+    "secrecy",
+    "tokio",
+    "tokio-util",
+];
+
+/// The two recognized states of the temporary root lock/manifest transition.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RootLockTransitionState {
+    /// The exact pre-#58 canonical manifest input set with its exact
+    /// pre-#58 canonical lock dependency edges.
+    Pre58,
+    /// The exact #58 canonical manifest input set with its exact,
+    /// Cargo-derived lock dependency edges.
+    Post58,
+}
+
+fn transition_manifest_state(
+    path: &str,
+    actual: &[u8],
+    pre58: &[u8],
+    post58: &[u8],
+) -> PolicyResult<RootLockTransitionState> {
+    let actual = normalize_text(actual);
+    if actual == normalize_text(pre58) {
+        Ok(RootLockTransitionState::Pre58)
+    } else if actual == normalize_text(post58) {
+        Ok(RootLockTransitionState::Post58)
+    } else {
+        Err(PolicyError::new(format!(
+            "root lock transition: manifest input matches neither the pre-#58 nor the #58 canonical tuple: {path}"
+        )))
+    }
+}
+
+fn transition_lock_dependencies<'a>(
+    packages: &'a [TomlValue],
+    package_name: &str,
+) -> PolicyResult<Vec<&'a str>> {
+    let mut matches = packages
+        .iter()
+        .filter(|package| package.get("name").and_then(TomlValue::as_str) == Some(package_name));
+    let package = matches.next().ok_or_else(|| {
+        PolicyError::new(format!(
+            "root lock transition: package is missing from Cargo.lock: {package_name}"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(PolicyError::new(format!(
+            "root lock transition: package appears more than once in Cargo.lock: {package_name}"
+        )));
+    }
+    let dependencies = package
+        .get("dependencies")
+        .and_then(TomlValue::as_array)
+        .ok_or_else(|| {
+            PolicyError::new(format!(
+                "root lock transition: package has no dependencies array in Cargo.lock: {package_name}"
+            ))
+        })?;
+    dependencies
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                PolicyError::new(format!(
+                    "root lock transition: a dependency entry is not a string: {package_name}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Validates the temporary root lock/manifest transition tuple (phase 1 of
+/// 2; see the banner comment above). Accepts only
+/// [`RootLockTransitionState::Pre58`] or [`RootLockTransitionState::Post58`]:
+/// every other combination of these two manifests and their Cargo.lock
+/// dependency edges is rejected, including partial adoption, cross-matched
+/// manifest/lock pairs, decoys, and unrelated mutations. This check is
+/// additive: it never widens, replaces, or short-circuits
+/// `validate_root_lock`'s existing structural checks.
+pub fn validate_root_lock_transition(root: &SafeRoot) -> PolicyResult<RootLockTransitionState> {
+    let application_manifest = root.read_bytes(APPLICATION_MANIFEST, DEFAULT_FILE_LIMIT)?;
+    let daemon_manifest = root.read_bytes(DAEMON_MANIFEST, DEFAULT_FILE_LIMIT)?;
+
+    let application_state = transition_manifest_state(
+        APPLICATION_MANIFEST,
+        &application_manifest,
+        TRANSITION_PRE58_APPLICATION_MANIFEST,
+        TRANSITION_POST58_APPLICATION_MANIFEST,
+    )?;
+    let daemon_state = transition_manifest_state(
+        DAEMON_MANIFEST,
+        &daemon_manifest,
+        TRANSITION_PRE58_DAEMON_MANIFEST,
+        TRANSITION_POST58_DAEMON_MANIFEST,
+    )?;
+    if application_state != daemon_state {
+        return Err(PolicyError::new(format!(
+            "root lock transition: manifest input set is split across states ({APPLICATION_MANIFEST} is {application_state:?}, {DAEMON_MANIFEST} is {daemon_state:?}); both must match the same pre-#58 or #58 tuple"
+        )));
+    }
+    let manifest_state = application_state;
+
+    let lock = parse_toml(root, ROOT_LOCK, MAX_LOCK_BYTES)?;
+    let packages = lock_packages(&lock)?;
+    let application_deps = transition_lock_dependencies(packages, "claw-application")?;
+    let daemon_deps = transition_lock_dependencies(packages, "gta-claw-daemon")?;
+
+    let (expected_application_deps, expected_daemon_deps): (&[&str], &[&str]) = match manifest_state
+    {
+        RootLockTransitionState::Pre58 => (
+            TRANSITION_PRE58_APPLICATION_LOCK_DEPS,
+            TRANSITION_PRE58_DAEMON_LOCK_DEPS,
+        ),
+        RootLockTransitionState::Post58 => (
+            TRANSITION_POST58_APPLICATION_LOCK_DEPS,
+            TRANSITION_POST58_DAEMON_LOCK_DEPS,
+        ),
+    };
+    if application_deps.as_slice() != expected_application_deps {
+        return Err(PolicyError::new(format!(
+            "root lock transition: Cargo.lock dependency edges for claw-application do not match the {manifest_state:?} tuple: expected {expected_application_deps:?}, found {application_deps:?}"
+        )));
+    }
+    if daemon_deps.as_slice() != expected_daemon_deps {
+        return Err(PolicyError::new(format!(
+            "root lock transition: Cargo.lock dependency edges for gta-claw-daemon do not match the {manifest_state:?} tuple: expected {expected_daemon_deps:?}, found {daemon_deps:?}"
+        )));
+    }
+    Ok(manifest_state)
+}
+// ============================================================================
+// END TEMPORARY root lock/manifest transition (phase 1 of 2).
+// ============================================================================
+
 fn validate_desktop_lock(root: &SafeRoot) -> PolicyResult<()> {
     let lock = parse_toml(root, DESKTOP_LOCK, MAX_LOCK_BYTES)?;
     let packages = lock_packages(&lock)?;
@@ -2172,6 +2392,7 @@ pub fn validate_final_static(root: &SafeRoot) -> PolicyResult<RootWorkspace> {
     let workspace = validate_root_workspace(root)?;
     validate_manifest_and_lock_inventory(root, &workspace)?;
     validate_root_lock(root, &workspace)?;
+    validate_root_lock_transition(root)?;
     Ok(workspace)
 }
 

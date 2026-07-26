@@ -81,6 +81,45 @@ The validator exact-freezes:
 - the three required lockfile locations — root, desktop, and this validator — plus a bounded
   admitted set that adds only `android/Cargo.lock` and `ios/Cargo.lock`.
 
+## Temporary root lock/manifest transition (phase 1 of 2)
+
+`validate_root_lock` checks the root lock only structurally (registry checksum shape,
+local package/version agreement with declared workspace members); unlike the desktop
+lock, it carries no byte-exact pin. Merged PR #58 ("Add the daemon composition layer")
+changed two root-workspace manifests — `crates/claw-application/Cargo.toml` and
+`apps/gta-claw-daemon/Cargo.toml` — to gate the daemon's composition dependency edges
+behind a `composition` Cargo feature, which changed those two packages'
+`[[package]] dependencies` arrays in the root `Cargo.lock` with no dedicated regression
+binding the lock to its manifest inputs.
+
+`validate_root_lock_transition` (`ROOT_LOCK_TRANSITION_ID =
+"root-lock-transition-pr58-phase1"`) adds narrow, fail-closed coverage of exactly that
+tuple — the two named manifests and the two named packages' lock dependency arrays,
+nothing else. It accepts exactly two independently reproducible states and fails closed
+on every other combination, including cross-matches:
+
+- **Pre58:** the exact pre-#58 manifest pair (commit `cfb88cd`) with its exact historical
+  lock dependency edges.
+- **Post58:** the exact #58 (current) manifest pair with its exact lock dependency edges,
+  confirmed reproducible from that manifest pair with the repository-pinned toolchain
+  (`cargo metadata --locked`, `rust-toolchain.toml` channel `1.97.0`) rather than
+  hand-authored.
+
+It deliberately does not bind the broader, by-design-evolving root workspace member set
+(see `compliant_declared_root_member_and_lock_evolution_pass`, which must keep passing
+unmodified).
+
+**Phase 2 closure condition:** #58 is already merged to `main`; this transition only adds
+regression coverage for a gap the merge otherwise left open. Once a follow-up
+trust-root-only pull request collapses the accepted set to the single `Post58` tuple as a
+permanent byte-exact fixture (mirroring the desktop lock's `FINAL_DESKTOP_LOCK` pinning),
+delete in one pass: the banner-to-banner block in `src/policy.rs` (from `// TEMPORARY root
+lock/manifest transition` to `// END TEMPORARY root lock/manifest transition`) and its
+call site in `validate_final_static`, the `policy/transition/root-lock-58/` fixture
+directory, and the `root_lock_transition_*` tests in `tests/security_policy.rs`. Nothing
+in this block runs automatically, self-modifies, or expires on its own; removal is a
+manual, independently reviewed trust-root-only change.
+
 ## Mobile workspace admission
 
 Slint cannot live anywhere in the root headless workspace: `FORBIDDEN_GUI_NAMES`, the `i-slint`

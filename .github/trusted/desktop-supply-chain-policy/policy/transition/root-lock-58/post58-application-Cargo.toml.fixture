@@ -1,0 +1,37 @@
+[package]
+name = "claw-application"
+description = "Use cases and ports for the GTA Claw application core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The composition layer is the daemon's process-wiring machinery: subsystem
+# lifecycle, egress policy and credential minting. Client front-ends link this
+# crate only for `Application` and `SystemProbe`, so the feature is off by
+# default and their dependency graphs stay free of `claw-domain`, `secrecy`
+# and `url`. Enable it in any binary that composes subsystems.
+composition = ["dep:claw-domain", "dep:secrecy", "dep:url"]
+# The agent runtime's port traits carry `claw_domain::SessionId` in their
+# public signatures. Front-ends link this crate only for `Application` and
+# `SystemProbe`, so the feature is off by default and their dependency graphs
+# stay free of `claw-domain`. Enable it in crates that implement or drive the
+# ports.
+runtime-ports = ["dep:claw-domain"]
+
+[dependencies]
+claw-domain = { workspace = true, optional = true }
+claw-protocol.workspace = true
+secrecy = { version = "=0.10.3", optional = true }
+url = { version = "=2.5.8", optional = true }
+
+[dev-dependencies]
+claw-domain.workspace = true
+secrecy = "=0.10.3"
+tokio = { version = "=1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+url = "=2.5.8"
+
+[lints]
+workspace = true

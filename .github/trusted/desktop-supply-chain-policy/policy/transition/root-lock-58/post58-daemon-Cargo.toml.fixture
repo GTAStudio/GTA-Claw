@@ -1,0 +1,28 @@
+[package]
+name = "gta-claw-daemon"
+description = "Headless GTA Claw daemon entry point"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+claw-application = { workspace = true, features = ["composition"] }
+claw-domain.workspace = true
+claw-platform.workspace = true
+claw-protocol.workspace = true
+secrecy = "=0.10.3"
+tokio = { version = "=1.52.3", features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+
+[lints]
+workspace = true
