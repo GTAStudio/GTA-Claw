@@ -1312,6 +1312,69 @@ fn bootstrap_snapshot_writer_pins_first_write_semantics() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn bootstrap_snapshot_writer_accepts_a_symlinked_output_directory() {
+    use std::os::unix::fs::symlink;
+
+    let tree = bootstrap_tree("snapshot-writer-symlinked-parent");
+    let real_parent = tree.join("real-output");
+    let linked_parent = tree.join("linked-output");
+    fs::create_dir(&real_parent).expect("create real output directory");
+    symlink(&real_parent, &linked_parent).expect("symlink output directory");
+    let output = linked_parent.join("output.snapshot");
+
+    let delta = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect("write through symlinked output directory");
+
+    assert_eq!(delta.changed_count(), 28);
+    assert_eq!(
+        fs::read(real_parent.join("output.snapshot")).expect("read canonical-parent output"),
+        committed_bootstrap_snapshot()
+    );
+    assert_eq!(
+        fs::read_dir(real_parent)
+            .expect("list canonical output directory")
+            .count(),
+        1,
+        "staged file must be renamed within the canonical output directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_snapshot_writer_rejects_an_existing_output_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tree = bootstrap_tree("snapshot-writer-symlinked-output");
+    let target = tree.join("target.snapshot");
+    let output = tree.join("output.snapshot");
+    let sentinel = b"unchanged symlink target";
+    fs::write(&target, sentinel).expect("write symlink target");
+    symlink(&target, &output).expect("symlink existing output");
+
+    let error = write_bootstrap_snapshot(
+        &SafeRoot::new(&tree.path).expect("open Bootstrap materialization"),
+        &output,
+    )
+    .expect_err("existing output symlink must fail closed");
+
+    assert!(error.to_string().contains("symlink or reparse point"));
+    assert!(
+        fs::symlink_metadata(&output)
+            .expect("inspect output symlink")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(target).expect("read unchanged symlink target"),
+        sentinel
+    );
+}
+
 #[test]
 fn authoritative_workflow_has_no_path_filter() {
     let workflow = fs::read_to_string(repo_root().join(AUTHORITATIVE_PATH))

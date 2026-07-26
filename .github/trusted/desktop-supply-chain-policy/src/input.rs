@@ -51,33 +51,12 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn require_plain(metadata: &fs::Metadata, path: &Path) -> PolicyResult<()> {
+pub(crate) fn require_plain(metadata: &fs::Metadata, path: &Path) -> PolicyResult<()> {
     if metadata.file_type().is_symlink() || is_reparse(metadata) {
         return Err(PolicyError::new(format!(
             "candidate path is a symlink or reparse point: {}",
             path.display()
         )));
-    }
-    Ok(())
-}
-
-pub(crate) fn require_plain_path(path: &Path) -> PolicyResult<()> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|cause| error("resolve current directory for plain path inspection", cause))?
-            .join(path)
-    };
-    let mut ancestors = absolute
-        .ancestors()
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        let metadata = fs::symlink_metadata(ancestor)
-            .map_err(|cause| error("inspect plain path component", cause))?;
-        require_plain(&metadata, ancestor)?;
     }
     Ok(())
 }
