@@ -114,4 +114,23 @@ for job_section in "$native_job" "$containers_job"; do
   }
 done
 
+# Removing the rebuild also removed the locked cargo cache it left behind, which
+# package.sh needs to emit the SBOM. The requirement is an ordering, so assert the
+# ordering rather than the mere presence of the fetch.
+containers_line() {
+  grep -n -F "$1" <<<"$containers_job" | head -n 1 | cut -d: -f1
+}
+for manifest in Cargo.toml desktop/Cargo.toml; do
+  grep -F "cargo fetch --manifest-path $manifest --locked" <<<"$containers_job" >/dev/null || {
+    echo "containers job must acquire the locked graph for $manifest" >&2
+    exit 1
+  }
+done
+fetch_at="$(containers_line 'cargo fetch --manifest-path desktop/Cargo.toml --locked')"
+package_at="$(containers_line 'packaging/macos/package.sh prototype')"
+[[ -n "$fetch_at" && -n "$package_at" && "$fetch_at" -lt "$package_at" ]] || {
+  echo "containers job must acquire the locked graph before it packages" >&2
+  exit 1
+}
+
 echo "macOS workflow trust-boundary self-tests passed"

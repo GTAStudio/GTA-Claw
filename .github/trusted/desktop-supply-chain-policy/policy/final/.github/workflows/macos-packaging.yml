@@ -245,6 +245,20 @@ jobs:
           ./packaging/macos/transport.sh unpack arm64 \
             "$RUNNER_TEMP/tested-build/macos-arm64-tested-build.tar"
 
+      # package.sh builds the SBOM from `cargo tree --locked --offline`, which reads
+      # the locked registry cache. That cache used to appear in this job as a side
+      # effect of build.sh calling acquire_locked_dependencies, so dropping the
+      # rebuild dropped the cache with it and the SBOM step failed on an offline
+      # resolution error that named a transitive crate rather than the missing
+      # precondition. Fetch is `--locked`: it can acquire nothing the byte-frozen
+      # lockfiles do not already name, and it is the same network access this job
+      # already performed before it stopped rebuilding.
+      - name: Acquire the locked dependency graph the SBOM is generated from
+        shell: bash
+        run: |
+          cargo fetch --manifest-path Cargo.toml --locked
+          cargo fetch --manifest-path desktop/Cargo.toml --locked
+
       - name: Build unsigned prototype DMG and PKG
         shell: bash
         run: |
