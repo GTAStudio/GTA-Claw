@@ -34,19 +34,16 @@ pub enum IosAction {
     SendMessage,
     /// Resolve a pending approval.
     ResolveApproval,
-    /// Approve or revoke a device pairing.
-    ManagePairing,
     /// Change Gateway configuration.
     Administer,
 }
 
 impl IosAction {
     /// Every action a user interface may offer, in a stable order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::ReadSessions,
         Self::SendMessage,
         Self::ResolveApproval,
-        Self::ManagePairing,
         Self::Administer,
     ];
 
@@ -57,7 +54,6 @@ impl IosAction {
             Self::ReadSessions => Scope::OperatorRead,
             Self::SendMessage => Scope::OperatorWrite,
             Self::ResolveApproval => Scope::OperatorApprovals,
-            Self::ManagePairing => Scope::OperatorPairing,
             Self::Administer => Scope::OperatorAdmin,
         }
     }
@@ -69,7 +65,6 @@ impl IosAction {
             Self::ReadSessions => "read sessions",
             Self::SendMessage => "send a message",
             Self::ResolveApproval => "resolve an approval",
-            Self::ManagePairing => "manage pairing",
             Self::Administer => "administer the Gateway",
         }
     }
@@ -88,10 +83,21 @@ impl Display for IosAction {
 /// an interface that renders a requested scope as though it were held is a
 /// fabricated permission summary.
 ///
-/// Scope implication is deliberately not modelled. `operator.admin` does not
-/// imply `operator.read` here, because no implication rule exists anywhere in
-/// this workspace and inventing one would let the interface promise access the
-/// server may refuse.
+/// Scope implication is deliberately not modelled: `operator.admin` does not
+/// imply `operator.read` here.
+///
+/// Implication rules *do* exist in this workspace, on the server side —
+/// `claw_protocol::gateway::authorization` allows any method when the granted
+/// set contains `operator.admin`, and treats `operator.write` as satisfying
+/// `operator.read`. This client deliberately does not mirror them. Mirroring
+/// would make the interface *more* permissive by inference, and an interface
+/// that infers a grant it was never told about is the fabricated permission
+/// summary this type exists to prevent.
+///
+/// The cost is accepted and is in the safe direction: this client may withhold
+/// an action the server would in fact have allowed, which a person discovers by
+/// the action being absent. The reverse — offering an action the server refuses
+/// — would be discovered by a failure after the person had been told they could.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedAuthorization {
     role: Option<Role>,
