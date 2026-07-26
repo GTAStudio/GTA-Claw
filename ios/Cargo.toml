@@ -1,0 +1,55 @@
+# This workspace is deliberately excluded from the root workspace.
+#
+# The root pins `unsafe_code = "forbid"`, and `forbid` cannot be relaxed by an
+# inner `allow`. Slint's generated item-tree macros locally allow their own
+# audited unsafe internals, so a Slint shell cannot be a root member. The
+# `desktop/` workspace is excluded for exactly this reason and uses `deny`
+# instead of `forbid`; this workspace does the same. Do not fold `ios/` back
+# into the root members list — it will not compile, and the trusted
+# supply-chain policy refuses `slint` by name in every root manifest.
+[workspace]
+members = ["apps/gta-claw-ios-shell"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+license = "MIT"
+repository = "https://github.com/GTAStudio/GTA-Claw"
+
+[workspace.dependencies]
+claw-gateway-client = { path = "../crates/claw-gateway-client", version = "0.1.0" }
+claw-security = { path = "../crates/claw-security", version = "0.1.0" }
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+gta-claw-ios = { path = "../apps/gta-claw-ios", version = "0.1.0" }
+rand_chacha = "=0.10.0"
+# Slint forces Skia on Apple non-macOS targets: `i-slint-renderer-skia` is a
+# non-optional dependency there, so there is no femtovg or software fallback to
+# select. `renderer-skia` is named explicitly rather than left to
+# `backend-default`, so the renderer this ships with is visible in the manifest.
+slint = { version = "=1.17.1", default-features = false, features = [
+  "accessibility",
+  "backend-winit",
+  "compat-1-2",
+  "renderer-skia",
+  "std",
+] }
+slint-build = "=1.17.1"
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+# `deny`, not the root's `forbid`, so Slint's generated code may allow its own
+# audited unsafe internals. No code in this workspace writes `unsafe` itself.
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

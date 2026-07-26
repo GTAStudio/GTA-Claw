@@ -1,0 +1,31 @@
+[package]
+name = "gta-claw-ios-shell"
+description = "Slint iOS shell for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+publish = false
+
+# These are intentionally unconditional rather than scoped to
+# `cfg(target_os = "ios")`. Scoping them would mean this package's own source is
+# never compiled on any machine a developer or this repository's CI can reach
+# today, so a type error would first appear on an iOS build nobody can run
+# locally. The code here is platform-neutral; the iOS-specific work is inside
+# Slint's winit backend and Skia renderer.
+[dependencies]
+claw-gateway-client.workspace = true
+claw-security.workspace = true
+getrandom.workspace = true
+gta-claw-ios.workspace = true
+rand_chacha.workspace = true
+slint.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[lints]
+workspace = true

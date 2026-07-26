@@ -1,0 +1,131 @@
+// Copyright © GTAStudio
+// SPDX-License-Identifier: MIT
+
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct ActionRow {
+    label: string,
+    permitted: bool,
+    detail: string,
+}
+
+export component AppWindow inherits Window {
+    title: "GTA Claw";
+    preferred-width: 390px;
+    preferred-height: 844px;
+    background: #0b0d12;
+
+    in-out property <string> endpoint-text;
+    in-out property <string> token-text;
+    in property <string> status-title;
+    in property <string> status-detail;
+    in property <bool> busy;
+    in property <string> discovery-text;
+    in property <string> authorization-text;
+    in property <[ActionRow]> actions;
+    in property <string> action-result;
+
+    callback connect-pressed();
+    callback action-pressed(int);
+
+    ScrollView {
+        VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+
+            Text {
+                text: "GTA Claw";
+                font-size: 30px;
+                color: #f2f5fa;
+            }
+
+            Text {
+                text: root.status-title;
+                font-size: 18px;
+                color: #f2f5fa;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.status-detail;
+                font-size: 14px;
+                color: #98a1b3;
+                wrap: word-wrap;
+            }
+
+            LineEdit {
+                placeholder-text: "wss://gateway.example:4443";
+                text <=> root.endpoint-text;
+                enabled: !root.busy;
+            }
+
+            LineEdit {
+                placeholder-text: "Operator token";
+                input-type: password;
+                text <=> root.token-text;
+                enabled: !root.busy;
+            }
+
+            Button {
+                text: root.busy ? "Connecting…" : "Connect";
+                enabled: !root.busy;
+                clicked => {
+                    root.connect-pressed();
+                }
+            }
+
+            Text {
+                text: "Authorization";
+                font-size: 16px;
+                color: #f2f5fa;
+            }
+
+            Text {
+                text: root.authorization-text;
+                font-size: 13px;
+                color: #98a1b3;
+                wrap: word-wrap;
+            }
+
+            for row[index] in root.actions: HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: row.label;
+                    font-size: 14px;
+                    color: row.permitted ? #7fd18b : #6d7488;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: row.permitted ? "Run" : "Not granted";
+                    enabled: row.permitted;
+                    clicked => {
+                        root.action-pressed(index);
+                    }
+                }
+            }
+
+            Text {
+                text: root.action-result;
+                font-size: 13px;
+                color: #98a1b3;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: "Local network discovery";
+                font-size: 16px;
+                color: #f2f5fa;
+            }
+
+            Text {
+                text: root.discovery-text;
+                font-size: 13px;
+                color: #98a1b3;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

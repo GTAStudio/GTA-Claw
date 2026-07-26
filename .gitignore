@@ -5,6 +5,7 @@ node_modules/
 dist/
 /target/
 /desktop/target/
+/ios/target/
 
 # Environment and secrets
 .env

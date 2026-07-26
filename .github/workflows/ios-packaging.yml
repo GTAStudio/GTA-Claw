@@ -1,0 +1,123 @@
+name: iOS packaging prototype
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "ios/**"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "ios/**"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  ios-build:
+    name: iOS device and simulator cross build
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      # Recorded rather than assumed: the runner image's default Xcode has
+      # changed before, and `ring` and `skia-bindings` both fail at `xcrun`
+      # when only the Command Line Tools are installed. If this step shows
+      # Command Line Tools instead of a full Xcode, the build failure below
+      # is a toolchain problem and not a Rust one.
+      - name: Record Apple and Rust tool versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcode-select --print-path
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          rustc -Vv
+          cargo -V
+          uname -m
+
+      - name: Install the iOS Rust targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup target list --installed
+
+      - name: Format the iOS workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path ios/Cargo.toml --all -- --check
+
+      # Host-target lint first. This is the only pass that compiles the shell's
+      # own source on a machine that can also run its tests, so a type error
+      # surfaces here rather than only under cross compilation.
+      - name: Clippy the iOS workspace for the host
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path ios/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy the iOS workspace for the device target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path ios/Cargo.toml --workspace --locked --target aarch64-apple-ios -- -D warnings
+
+      # The build steps are the ones that prove something a `cargo check` cannot:
+      # they run the Apple linker, and they force `skia-bindings` to produce a
+      # real iOS static library. Slint has no software or femtovg fallback on
+      # iOS, so a Skia failure here is a total failure of the platform.
+      - name: Build the shell for aarch64-apple-ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path ios/Cargo.toml --locked \
+            --target aarch64-apple-ios --bin gta-claw-ios-shell
+          file ios/target/aarch64-apple-ios/debug/gta-claw-ios-shell
+
+      - name: Build the shell for aarch64-apple-ios-sim
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path ios/Cargo.toml --locked \
+            --target aarch64-apple-ios-sim --bin gta-claw-ios-shell
+          file ios/target/aarch64-apple-ios-sim/debug/gta-claw-ios-shell
+
+      # Neither build above runs the binary. This step states that plainly in
+      # the job log so a green tick is not read as "the app works on a phone".
+      - name: State what this job did not prove
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Built for both iOS targets. Not proven by this job:"
+          echo "  - the app has never been launched on a device or a simulator"
+          echo "  - no Gateway v4 handshake has been completed from iOS"
+          echo "  - safe-area, virtual-keyboard and lifecycle behaviour are unverified"

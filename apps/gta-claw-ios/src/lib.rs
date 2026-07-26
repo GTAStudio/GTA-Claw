@@ -4,26 +4,26 @@
 //!
 //! This crate contains no Slint code, no `include_modules!`, and no binary
 //! target. The base-owned trusted supply-chain policy in
-//! `.github/trusted/desktop-supply-chain-policy` refuses a Slint dependency
-//! anywhere a root workspace member can put it:
+//! `.github/trusted/desktop-supply-chain-policy` still refuses a Slint
+//! dependency anywhere a *root workspace member* can put it:
 //!
 //! * `FORBIDDEN_GUI_NAMES` bans `slint`, `slint-build` and `winit` in every
 //!   dependency table of every root member, including `[target.'cfg(...)']`
 //!   tables and `package = "..."` renames, and additionally bans them by name
 //!   in the root `Cargo.lock`.
-//! * A separate excluded workspace is not available either: `workspace.exclude`
-//!   is pinned to exactly `["desktop"]`, the lockfile inventory is pinned to
-//!   exactly three paths, and the manifest inventory is pinned to the root
-//!   members plus the desktop and trusted manifests.
 //! * Every root member's `[lints]` must be exactly `workspace = true`, which
 //!   inherits `unsafe_code = "forbid"`. Slint's generated item-tree macros need
 //!   a local `allow(unsafe_code)`, which `forbid` cannot grant. The `desktop/`
-//!   workspace uses `deny` instead of `forbid` for precisely this reason and
-//!   says so in its own manifest comment.
+//!   and `ios/` workspaces use `deny` instead of `forbid` for precisely this
+//!   reason and say so in their own manifest comments.
 //!
-//! Lifting those three restrictions is a change to `.github/trusted/**`, which
-//! is byte-frozen and cannot authorise itself. Until that lands, the honest
-//! shape of an iOS client in this repository is the part below the UI.
+//! The user interface therefore lives outside the root workspace, in the
+//! excluded `ios/` workspace at `ios/apps/gta-claw-ios-shell`, which the trust
+//! root admitted in `workspace.exclude` alongside `desktop` and `android`. That
+//! shell depends on this crate by path and supplies the Slint front end. This
+//! crate stays UI-independent so that it can remain a root member, and so that
+//! its tests keep running on every host in CI — including the Linux and Windows
+//! machines that can never build for iOS at all.
 //!
 //! # What this crate does provide
 //!
