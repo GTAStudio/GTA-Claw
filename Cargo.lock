@@ -558,6 +558,18 @@ name = "claw-repo-policy"
 version = "0.1.0"
 
 [[package]]
+name = "claw-runtime"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-domain",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "claw-security"
 version = "0.1.0"
 dependencies = [
