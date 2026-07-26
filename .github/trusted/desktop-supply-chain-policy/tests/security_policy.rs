@@ -3940,8 +3940,8 @@ fn exact_desktop_binding_rejects_member_package_build_and_target_mutations() {
         (
             "slint-renderer-skia-feature-add",
             "desktop/apps/gta-claw-desktop/Cargo.toml",
-            "  \"renderer-software\",\r\n  \"std\",\r\n",
-            "  \"renderer-software\",\r\n  \"renderer-skia\",\r\n  \"std\",\r\n",
+            "  \"renderer-software\",\n  \"std\",\n",
+            "  \"renderer-software\",\n  \"renderer-skia\",\n  \"std\",\n",
         ),
         (
             "slint-default-features-enabled",
