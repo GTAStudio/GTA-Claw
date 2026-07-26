@@ -5198,16 +5198,18 @@ fn case_aliased_mobile_directories_fail_on_every_host() {
 }
 
 #[test]
-fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
+fn ios_lands_once_its_reviewed_skia_archive_pins_exist_and_not_before() {
     let slint = {
         let probe = final_tree("mobile-ios-slint-probe");
         desktop_slint_version(&probe)
     };
 
-    // Everything except the reviewed archive digest is satisfied, so the reported failure proves
-    // the digest gate is the sole remaining blocker rather than a defect elsewhere in the fixture.
-    let pinned = final_tree("mobile-ios-pinned");
-    retarget_root_exclude(&pinned);
+    // `PINNED_BUILD_ARTIFACTS` now carries a reviewed pin for both admitted iOS targets, so an
+    // otherwise conforming iOS lock on the pinned `skia-bindings` release is admitted rather than
+    // rejected. This is the change this table's population is for: it proves an iOS mobile
+    // workspace can actually land, not merely that the table is well formed in isolation.
+    let conforming = final_tree("mobile-ios-conforming");
+    retarget_root_exclude(&conforming);
     let lock = mobile_lock(
         "ios",
         &format!(
@@ -5216,14 +5218,10 @@ fn ios_cannot_land_until_its_prebuilt_skia_archive_is_pinned() {
             registry_lock_entry("slint", &slint)
         ),
     );
-    write_mobile_workspace(&pinned, "ios", &lock);
-    let error = rejection(&pinned, "iOS without a reviewed Skia digest is rejected");
-    assert!(
-        error.contains("uses skia-bindings, which fetches at build time")
-            && error.contains("aarch64-apple-ios")
-            && error.contains("aarch64-apple-ios-sim"),
-        "iOS admission must require a reviewed digest for every admitted target, got: {error}"
-    );
+    write_mobile_workspace(&conforming, "ios", &lock);
+    let root = SafeRoot::new(&conforming.path).expect("open conforming iOS fixture");
+    validate_final_static(&root)
+        .expect("an iOS lock on the reviewed skia-bindings release is admitted once both admitted targets carry a reviewed pin");
 
     let drifted = final_tree("mobile-ios-drift");
     retarget_root_exclude(&drifted);

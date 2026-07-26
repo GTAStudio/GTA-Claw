@@ -145,9 +145,16 @@ the software renderer instead, and is held to the identical discipline the momen
 
 `PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. The archive key embeds
 the crate commit, target, and resolved feature set, so it cannot be computed before the mobile lock
-exists. The table is therefore empty, and the validator refuses to admit any mobile workspace that
-uses Skia while it stays empty. Filling it is a reviewed trust-root edit. Obtain each digest from
-the release asset metadata, which publishes a SHA-256 the build script ignores:
+exists, and the validator refuses to admit any mobile workspace whose lock uses a fetching package
+for a target that is not in this table. Filling or changing it is a reviewed trust-root edit.
+
+The table currently carries the two entries the admitted iOS targets need for `skia-bindings`
+`0.99.0`: `aarch64-apple-ios` and `aarch64-apple-ios-sim`. Both were confirmed against the release
+asset metadata below — each reviewed SHA-256 is a unique, exact match (via the release's own asset
+`digest` field, not a locally recomputed hash) against exactly one currently published archive — and
+both archives were exercised end to end by a green cross build of the admitted iOS Slint shell for
+both targets. Obtain each digest from the release asset metadata, which publishes a SHA-256 the
+build script ignores:
 
 ```text
 gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
@@ -173,8 +180,8 @@ own manifest: its `include` list is `Cargo.toml`, `bindings_docs.rs`, `build.rs`
 `build_support/**/*.rs`, and `src/**`. The published `.crate` file cannot contain the artifact, so
 no checksum over it can cover the artifact.
 
-Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a future session
-filling `PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source:
+Three further facts, each verified against `rust-skia` at tag `0.99.0`, that any future change to
+`PINNED_BUILD_ARTIFACTS` needs in order to source it correctly:
 
 - **The artifact host is a different repository from the crate source.** The crate declares
   `repository = "https://github.com/rust-skia/rust-skia"`; the archive is served from

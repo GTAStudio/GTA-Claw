@@ -430,11 +430,32 @@ const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99
 /// which accepts a `file://` URL.
 ///
 /// The archive key embeds the crate commit, the target, and the sorted resolved feature set, so it
-/// cannot be computed before the mobile lock exists. This table is therefore **empty by default**,
-/// and `validate_mobile_lock` refuses to admit any workspace whose lock contains a fetching package
-/// while the corresponding pins are absent. That makes the pin impossible to skip, keeps filling it
-/// a reviewed trust-root edit, and stops a second fetching package appearing silently.
-const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 0] = [];
+/// cannot be computed before the mobile lock exists. `validate_mobile_lock` refuses to admit any
+/// workspace whose lock contains a fetching package while the corresponding pins are absent. That
+/// makes the pin impossible to skip, keeps filling it a reviewed trust-root edit, and stops a
+/// second fetching package appearing silently.
+///
+/// The two iOS entries below were confirmed against the `rust-skia/skia-binaries` `0.99.0` GitHub
+/// release: each digest is a unique, exact match (via the release API's own asset `digest` field)
+/// against exactly one real, currently published archive, and both archives were exercised by a
+/// green cross build of the admitted iOS Slint shell for `aarch64-apple-ios` and
+/// `aarch64-apple-ios-sim` (run `30187476394` at `a4a670c2735a65d5d3418164846edfe19f8398d6`).
+const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 2] = [
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz",
+        "15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8",
+    ),
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-sim-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz",
+        "ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e",
+    ),
+];
 
 const FORBIDDEN_GUI_NAMES: [&str; 11] = [
     "dioxus-desktop",
