@@ -1437,7 +1437,12 @@ async fn commit_verified(
             )
             .await
     );
-    rollback_on_error!(transaction, operation, identity.verify());
+    let commit_identity = identity.verify();
+    #[cfg(all(test, unix))]
+    if commit_identity.is_err() {
+        wait_at_identity_invalidation_test_barrier(owner).await;
+    }
+    rollback_on_error!(transaction, operation, commit_identity);
     #[cfg(unix)]
     {
         let deadline_guard = transaction.operation_deadline();
