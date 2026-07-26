@@ -332,3 +332,89 @@ impl From<TranscriptError> for DurableStateRuntimeError {
         Self::Transcript(error)
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::persistence::{CleanupFailurePoint, WriteWarning, with_cleanup_failure};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn runtime() -> (Cleanup, DurableStateRuntime) {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "claw-memory-runtime-warning-test-{}-{sequence}",
+            std::process::id()
+        ));
+        let cleanup = Cleanup(root.clone());
+        let config = DurableStateConfig::new(root, 4_096, 4_096, 32, 4_096);
+        let runtime = DurableStateRuntime::open(config).expect("open durable runtime");
+        (cleanup, runtime)
+    }
+
+    fn cleanup_artifacts(warnings: &[WriteWarning]) -> Vec<PathBuf> {
+        assert_eq!(warnings.len(), 1);
+        let WriteWarning::CleanupDeferred { artifacts, message } = &warnings[0] else {
+            panic!("unexpected warning: {:?}", warnings[0]);
+        };
+        assert!(message.contains("injected"));
+        assert!(artifacts.iter().all(|path| path.exists()));
+        artifacts.clone()
+    }
+
+    #[test]
+    fn memory_port_reports_previous_cleanup_failure_and_recovers_on_read() {
+        let (_cleanup, runtime) = runtime();
+        let scope = SessionId::new("memory-warning").expect("valid scope");
+        let memory = runtime.memory();
+        memory
+            .add(&scope, MemoryTarget::Memory, "first fact", 1)
+            .expect("write initial memory");
+
+        let mutation = with_cleanup_failure(CleanupFailurePoint::Previous, || {
+            memory.add(&scope, MemoryTarget::Memory, "second fact", 2)
+        })
+        .expect("committed write remains successful");
+        let artifacts = cleanup_artifacts(&mutation.warnings);
+
+        let page = memory
+            .list(&scope, MemoryTarget::Memory, 0, 10)
+            .expect("next access finalizes cleanup");
+        assert_eq!(page.entries.len(), 2);
+        assert!(artifacts.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn transcript_port_reports_marker_cleanup_failure_and_recovers_on_read() {
+        let (_cleanup, runtime) = runtime();
+        let scope = SessionId::new("transcript-warning").expect("valid scope");
+        let transcript = runtime.transcript();
+        transcript
+            .append(&scope, TranscriptRole::User, "first message", 1)
+            .expect("write initial transcript");
+
+        let message = with_cleanup_failure(CleanupFailurePoint::Transaction, || {
+            transcript.append(&scope, TranscriptRole::Assistant, "second message", 2)
+        })
+        .expect("committed write remains successful");
+        let artifacts = cleanup_artifacts(&message.warnings);
+
+        let page = transcript
+            .browse(&scope, None, 10)
+            .expect("next access finalizes cleanup");
+        assert_eq!(page.messages.len(), 2);
+        assert!(artifacts.iter().all(|path| !path.exists()));
+    }
+}

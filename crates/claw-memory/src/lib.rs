@@ -89,7 +89,7 @@ pub use durable::{
     DurableMemoryEntry, DurableMemoryError, DurableMemoryStore, MemoryMutation, MemoryPage,
     MemoryReference, MemoryTarget, MemoryUsage, VisibleMemoryEntry,
 };
-pub use persistence::PersistenceError;
+pub use persistence::{PersistenceError, WriteOutcome, WriteWarning};
 pub use retrieval::{
     KeywordRetriever, MAX_RETRIEVAL_LIMIT, MemoryRecord, RecordKind, RetrievalError,
     RetrievalQuery, RetrievedItem, Retriever, VectorRetriever,

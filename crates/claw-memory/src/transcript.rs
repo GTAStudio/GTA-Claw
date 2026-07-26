@@ -1,6 +1,7 @@
 //! Durable transcript append, search, and backward browsing.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -9,8 +10,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::{
-    PersistenceError, ScopeLocks, atomic_write_json, quarantine_corrupt_state, read_json,
-    scope_key, scoped_state_path,
+    PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json,
+    quarantine_corrupt_state, read_json, scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, normalize_for_matching, scan_persistent_content};
 use crate::session::SessionId;
@@ -74,6 +75,8 @@ pub struct TranscriptMessage {
     pub truncated: bool,
     /// Unsafe classification of the complete pre-truncation content, if any.
     pub unsafe_reason: Option<UnsafeContentReason>,
+    /// Non-fatal conditions observed after this message was committed.
+    pub warnings: Vec<WriteWarning>,
 }
 
 /// One read-safe historical message.
@@ -270,16 +273,17 @@ impl DurableTranscriptStore {
             }
             let unsafe_reason = scan_persistent_content(content).reason();
             let (content, truncated) = limit_content(content, self.content_char_limit);
-            let message = TranscriptMessage {
+            let mut message = TranscriptMessage {
                 id: document.allocate_id()?,
                 role,
                 content,
                 unix_millis,
                 truncated,
                 unsafe_reason,
+                warnings: Vec::new(),
             };
             document.messages.push(message.clone());
-            self.write_document(scope, &document)?;
+            message.warnings = self.write_document(scope, &document)?.warnings;
             Ok(message)
         })
     }
@@ -391,7 +395,7 @@ impl DurableTranscriptStore {
         &self,
         scope: &SessionId,
         document: &TranscriptDocument,
-    ) -> Result<(), TranscriptError> {
+    ) -> Result<WriteOutcome, TranscriptError> {
         atomic_write_json(
             &self.file_path(scope),
             &document.to_wire(&scope_key(scope)),
@@ -458,6 +462,7 @@ fn limit_stored_message(message: &TranscriptMessage, limit: usize) -> Transcript
         unix_millis: message.unix_millis,
         truncated: true,
         unsafe_reason: message.unsafe_reason,
+        warnings: message.warnings.clone(),
     }
 }
 
@@ -512,16 +517,18 @@ fn rank_messages<'a>(
             continue;
         }
         ranked.push(RankedMessage { message, score });
-        ranked.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| right.message.unix_millis.cmp(&left.message.unix_millis))
-                .then_with(|| left.message.id.cmp(&right.message.id))
-        });
+        ranked.sort_by(compare_ranked);
         ranked.truncate(result_limit);
     }
     ranked
+}
+
+fn compare_ranked(left: &RankedMessage<'_>, right: &RankedMessage<'_>) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| right.message.unix_millis.cmp(&left.message.unix_millis))
+        .then_with(|| left.message.id.cmp(&right.message.id))
 }
 
 fn configured_content(message: &TranscriptMessage, limit: usize) -> Cow<'_, str> {
@@ -695,6 +702,7 @@ impl TranscriptDocument {
                     unix_millis: message.unix_millis,
                     truncated: message.truncated,
                     unsafe_reason: message.unsafe_reason,
+                    warnings: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -761,5 +769,63 @@ impl From<TranscriptRoleWire> for TranscriptRole {
             TranscriptRoleWire::User => Self::User,
             TranscriptRoleWire::Assistant => Self::Assistant,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(id: &str, unix_millis: u64) -> TranscriptMessage {
+        TranscriptMessage {
+            id: RecordId::new(id).expect("valid record identifier"),
+            role: TranscriptRole::User,
+            content: "query".to_owned(),
+            unix_millis,
+            truncated: false,
+            unsafe_reason: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ranking_uses_score_then_time_then_identifier() {
+        let highest_score = message("rank-z", 1);
+        let newest = message("rank-y", 3);
+        let identifier_a = message("rank-a", 2);
+        let identifier_b = message("rank-b", 2);
+        let lowest_score = message("rank-0", 99);
+        let mut ranked = [
+            RankedMessage {
+                message: &identifier_b,
+                score: 2,
+            },
+            RankedMessage {
+                message: &lowest_score,
+                score: 1,
+            },
+            RankedMessage {
+                message: &newest,
+                score: 2,
+            },
+            RankedMessage {
+                message: &highest_score,
+                score: 3,
+            },
+            RankedMessage {
+                message: &identifier_a,
+                score: 2,
+            },
+        ];
+
+        ranked.sort_by(compare_ranked);
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rank-z", "rank-y", "rank-a", "rank-b", "rank-0"]
+        );
     }
 }

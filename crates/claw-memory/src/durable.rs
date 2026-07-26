@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::{
-    PersistenceError, ScopeLocks, atomic_write_json, quarantine_corrupt_state, read_json,
-    scope_key, scoped_state_path,
+    PersistenceError, ScopeLocks, WriteOutcome, WriteWarning, atomic_write_json,
+    quarantine_corrupt_state, read_json, scope_key, scoped_state_path,
 };
 use crate::safety::{UnsafeContentReason, scan_persistent_content};
 use crate::session::SessionId;
@@ -125,6 +125,8 @@ pub struct MemoryMutation {
     pub entry_id: RecordId,
     /// Usage after the operation.
     pub usage: MemoryUsage,
+    /// Non-fatal conditions observed after persistent bytes were committed.
+    pub warnings: Vec<WriteWarning>,
 }
 
 /// A rejected durable memory operation.
@@ -276,6 +278,7 @@ impl DurableMemoryStore {
                     changed: false,
                     entry_id: duplicate.id.clone(),
                     usage: self.usage(target, document.entries(target)),
+                    warnings: Vec::new(),
                 });
             }
 
@@ -301,11 +304,12 @@ impl DurableMemoryStore {
                 created_unix_millis: unix_millis,
                 updated_unix_millis: unix_millis,
             });
-            self.write_document(scope, &document)?;
+            let outcome = self.write_document(scope, &document)?;
             Ok(MemoryMutation {
                 changed: true,
                 entry_id: id,
                 usage: self.usage(target, document.entries(target)),
+                warnings: outcome.warnings,
             })
         })
     }
@@ -348,11 +352,12 @@ impl DurableMemoryStore {
             let id = entry.id.clone();
             entry.content = content;
             entry.updated_unix_millis = unix_millis;
-            self.write_document(scope, &document)?;
+            let outcome = self.write_document(scope, &document)?;
             Ok(MemoryMutation {
                 changed: true,
                 entry_id: id,
                 usage: self.usage(target, document.entries(target)),
+                warnings: outcome.warnings,
             })
         })
     }
@@ -368,11 +373,12 @@ impl DurableMemoryStore {
             let mut document = self.read_document(scope)?;
             let index = resolve_entry(document.entries(target), reference)?;
             let entry = document.entries_mut(target).remove(index);
-            self.write_document(scope, &document)?;
+            let outcome = self.write_document(scope, &document)?;
             Ok(MemoryMutation {
                 changed: true,
                 entry_id: entry.id,
                 usage: self.usage(target, document.entries(target)),
+                warnings: outcome.warnings,
             })
         })
     }
@@ -496,7 +502,7 @@ impl DurableMemoryStore {
         &self,
         scope: &SessionId,
         document: &MemoryDocument,
-    ) -> Result<(), DurableMemoryError> {
+    ) -> Result<WriteOutcome, DurableMemoryError> {
         atomic_write_json(
             &self.file_path(scope),
             &document.to_wire(&scope_key(scope)),

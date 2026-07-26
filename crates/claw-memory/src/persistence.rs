@@ -16,6 +16,60 @@ use serde::de::DeserializeOwned;
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SCOPE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
+#[cfg(all(test, windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupFailurePoint {
+    Previous,
+    Transaction,
+}
+
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static CLEANUP_FAILURE_POINT: std::cell::Cell<Option<CleanupFailurePoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn with_cleanup_failure<T>(point: CleanupFailurePoint, action: impl FnOnce() -> T) -> T {
+    struct ResetFailurePoint;
+
+    impl Drop for ResetFailurePoint {
+        fn drop(&mut self) {
+            CLEANUP_FAILURE_POINT.set(None);
+        }
+    }
+
+    CLEANUP_FAILURE_POINT.set(Some(point));
+    let _reset = ResetFailurePoint;
+    action()
+}
+
+/// Successful durable-write result, including non-fatal post-publication warnings.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WriteOutcome {
+    /// Cleanup or durability limitations observed after new bytes were published.
+    pub warnings: Vec<WriteWarning>,
+}
+
+/// A non-fatal condition discovered after durable-state publication succeeded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriteWarning {
+    /// Windows committed new bytes but could not remove replacement artifacts.
+    CleanupDeferred {
+        /// Artifacts intentionally retained for next-access recovery.
+        artifacts: Vec<PathBuf>,
+        /// Operating-system cleanup diagnostic.
+        message: String,
+    },
+    /// Unix published the rename but could not synchronize the directory entry.
+    DirectorySyncFailed {
+        /// Directory whose metadata could not be synchronized.
+        path: PathBuf,
+        /// Operating-system synchronization diagnostic.
+        message: String,
+    },
+}
+
 /// A failure in the durable JSON persistence layer.
 #[derive(Debug)]
 pub enum PersistenceError {
@@ -259,7 +313,7 @@ pub(crate) fn atomic_write_json<T: Serialize>(
     path: &Path,
     value: &T,
     max_bytes: usize,
-) -> Result<(), PersistenceError> {
+) -> Result<WriteOutcome, PersistenceError> {
     let destination = prepare_destination(path)?;
     recover_previous_if_needed(&destination)?;
     let mut bytes =
@@ -297,15 +351,28 @@ pub(crate) fn atomic_write_json<T: Serialize>(
             .and_then(|()| file.sync_all())
             .map_err(|source| PersistenceError::io("write", temporary.path(), source))?;
         drop(file);
-        replace_destination(temporary.path(), &destination, existing.is_some())
-            .map_err(|source| PersistenceError::io("publish", &destination, source))?;
+        let mut warnings = Vec::new();
+        if let Some(warning) =
+            replace_destination(temporary.path(), &destination, existing.is_some())
+                .map_err(|source| PersistenceError::io("publish", &destination, source))?
+        {
+            warnings.push(warning);
+        }
         temporary.disarm();
-        sync_parent(&destination)
-            .map_err(|source| PersistenceError::io("synchronize parent of", &destination, source))
+        if let Err(error) = sync_parent(&destination) {
+            warnings.push(WriteWarning::DirectorySyncFailed {
+                path: destination
+                    .parent()
+                    .expect("prepared destination always has a parent")
+                    .to_owned(),
+                message: error.to_string(),
+            });
+        }
+        Ok(WriteOutcome { warnings })
     })();
 
     match operation {
-        Ok(()) => Ok(()),
+        Ok(outcome) => Ok(outcome),
         Err(operation_error) => match temporary.cleanup() {
             Ok(()) => Err(operation_error),
             Err(cleanup_error) => Err(PersistenceError::io(
@@ -781,14 +848,57 @@ fn set_permissions(_existing: Option<&fs::Metadata>, _file: &File) -> io::Result
 }
 
 #[cfg(not(windows))]
-fn replace_destination(temporary: &Path, destination: &Path, _exists: bool) -> io::Result<()> {
-    fs::rename(temporary, destination)
+fn replace_destination(
+    temporary: &Path,
+    destination: &Path,
+    _exists: bool,
+) -> io::Result<Option<WriteWarning>> {
+    fs::rename(temporary, destination)?;
+    Ok(None)
 }
 
 #[cfg(windows)]
-fn replace_destination(temporary: &Path, destination: &Path, exists: bool) -> io::Result<()> {
+fn replace_destination(
+    temporary: &Path,
+    destination: &Path,
+    exists: bool,
+) -> io::Result<Option<WriteWarning>> {
+    replace_destination_with_cleanup(temporary, destination, exists, remove_replacement_artifact)
+}
+
+#[cfg(windows)]
+fn remove_replacement_artifact(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let point = CLEANUP_FAILURE_POINT.get();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let should_fail = match point {
+            Some(CleanupFailurePoint::Previous) => file_name.ends_with(".gta-claw.previous"),
+            Some(CleanupFailurePoint::Transaction) => file_name.ends_with(".gta-claw.replacing"),
+            None => false,
+        };
+        if should_fail {
+            return Err(io::Error::other(format!(
+                "injected {point:?} cleanup failure"
+            )));
+        }
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn replace_destination_with_cleanup(
+    temporary: &Path,
+    destination: &Path,
+    exists: bool,
+    mut cleanup: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<Option<WriteWarning>> {
     if !exists {
-        return fs::rename(temporary, destination);
+        fs::rename(temporary, destination)?;
+        return Ok(None);
     }
     let previous = previous_path(destination);
     let transaction = transaction_path(destination);
@@ -807,8 +917,19 @@ fn replace_destination(temporary: &Path, destination: &Path, exists: bool) -> io
     }
     match fs::rename(temporary, destination) {
         Ok(()) => {
-            fs::remove_file(&previous)?;
-            fs::remove_file(&transaction)
+            if let Err(error) = cleanup(&previous) {
+                return Ok(Some(WriteWarning::CleanupDeferred {
+                    artifacts: vec![previous, transaction],
+                    message: error.to_string(),
+                }));
+            }
+            if let Err(error) = cleanup(&transaction) {
+                return Ok(Some(WriteWarning::CleanupDeferred {
+                    artifacts: vec![transaction],
+                    message: error.to_string(),
+                }));
+            }
+            Ok(None)
         }
         Err(publish_error) => match fs::rename(&previous, destination) {
             Ok(()) => {
@@ -1116,5 +1237,53 @@ mod tests {
         assert_eq!(file_name.len(), 69);
         assert!(file_name.ends_with(".json"));
         assert!(!file_name.contains(scope.as_str()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn committed_windows_replacement_warns_and_next_access_finishes_cleanup() {
+        struct Cleanup(PathBuf);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let sequence = FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "claw-memory-replace-test-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create replacement test directory");
+        let cleanup = Cleanup(directory.clone());
+        let destination = directory.join("state.json");
+        let temporary = directory.join("replacement.json");
+        fs::write(&destination, br#"{"value":"old"}"#).expect("write old state");
+        fs::write(&temporary, br#"{"value":"new"}"#).expect("write replacement state");
+
+        let warning = replace_destination_with_cleanup(&temporary, &destination, true, |_| {
+            Err(io::Error::other("injected cleanup failure"))
+        })
+        .expect("publication succeeds")
+        .expect("cleanup warning");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read committed state"),
+            r#"{"value":"new"}"#
+        );
+        let WriteWarning::CleanupDeferred { artifacts, message } = warning else {
+            panic!("unexpected warning: {warning:?}");
+        };
+        assert!(message.contains("injected cleanup failure"));
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().all(|path| path.exists()));
+
+        let loaded = read_json::<serde_json::Value>(&destination, 1_024)
+            .expect("next access recovers")
+            .expect("state exists");
+        assert_eq!(loaded["value"], "new");
+        assert!(artifacts.iter().all(|path| !path.exists()));
+        drop(cleanup);
     }
 }

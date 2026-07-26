@@ -656,7 +656,7 @@ fn runtime_ports_are_object_safe_file_backed_and_restartable() {
     let memory: std::sync::Arc<dyn DurableMemoryPort> = runtime.memory();
     let transcript: std::sync::Arc<dyn DurableTranscriptPort> = runtime.transcript();
 
-    memory
+    let memory_write = memory
         .add(
             &alpha,
             MemoryTarget::Memory,
@@ -664,6 +664,7 @@ fn runtime_ports_are_object_safe_file_backed_and_restartable() {
             1,
         )
         .expect("persist memory through port");
+    assert!(memory_write.warnings.is_empty());
     memory
         .add(
             &alpha,
@@ -672,7 +673,7 @@ fn runtime_ports_are_object_safe_file_backed_and_restartable() {
             2,
         )
         .expect("persist profile through port");
-    transcript
+    let transcript_write = transcript
         .append(
             &alpha,
             TranscriptRole::User,
@@ -680,6 +681,7 @@ fn runtime_ports_are_object_safe_file_backed_and_restartable() {
             3,
         )
         .expect("persist transcript through port");
+    assert!(transcript_write.warnings.is_empty());
     assert!(
         memory
             .list(&beta, MemoryTarget::Memory, 0, 20)
