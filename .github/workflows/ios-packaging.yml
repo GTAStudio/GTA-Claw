@@ -1,0 +1,108 @@
+name: iOS target compile
+
+# Compiles the shipped iOS client for the two admitted Apple mobile targets.
+#
+# This deliberately does NOT package: there is no signing, no .ipa, no simulator
+# run. It answers one question that nothing in this repository has answered yet —
+# whether `apps/gta-claw-ios` actually compiles for `aarch64-apple-ios`. Every
+# green result on this crate so far has been a host-target result (x86_64-pc-
+# windows-msvc and x86_64-apple-darwin), which is evidence about the host and not
+# about iOS.
+#
+# It needs no reviewed Skia pin because the shipped crate is UI-independent and
+# pulls in no `skia-bindings`. That invariant is asserted below rather than
+# assumed, because it is the property that keeps this workflow runnable while
+# `PINNED_BUILD_ARTIFACTS` is empty.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-packaging.yml"
+      - "apps/gta-claw-ios/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-target-compile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: ${{ matrix.target }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            sdk: iphoneos
+          - target: aarch64-apple-ios-sim
+            sdk: iphonesimulator
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Record the toolchain and SDK actually used
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.target }}"
+          rustc --version --verbose
+          cargo --version
+          echo "sdk path: $(xcrun --show-sdk-path --sdk '${{ matrix.sdk }}')"
+          echo "sdk version: $(xcrun --show-sdk-version --sdk '${{ matrix.sdk }}')"
+
+      - name: Assert the shipped crate pulls in no build-time-fetching package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree --locked --package gta-claw-ios \
+            --target '${{ matrix.target }}' --prefix none)"
+
+          total="$(printf '%s\n' "$tree" | grep -c . || true)"
+          echo "dependency lines resolved for ${{ matrix.target }}: ${total}"
+
+          # Positive control. An absence assertion over an empty or failed tree
+          # would pass while proving nothing, so first prove the tree is real by
+          # requiring a dependency the crate certainly has.
+          if ! printf '%s\n' "$tree" | grep -qE '^claw-gateway-client v'; then
+            echo "positive control failed: claw-gateway-client absent from the" \
+                 "resolved tree, so this check cannot distinguish 'no Skia' from" \
+                 "'no tree'. Resolved ${total} lines:"
+            printf '%s\n' "$tree" | head -n 40
+            exit 1
+          fi
+
+          # The absence assertion itself, reported with the offending lines.
+          offenders="$(printf '%s\n' "$tree" \
+            | grep -E '^(skia-bindings|skia-safe|i-slint-renderer-skia) v' || true)"
+          if [ -n "${offenders}" ]; then
+            echo "the shipped iOS crate resolved a build-time-fetching package," \
+                 "which requires a reviewed PINNED_BUILD_ARTIFACTS entry before" \
+                 "it may build. Offending dependencies:"
+            printf '%s\n' "${offenders}"
+            exit 1
+          fi
+          echo "no skia-bindings/skia-safe/i-slint-renderer-skia in ${total} resolved lines"
+
+      - name: Compile gta-claw-ios for ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --package gta-claw-ios --target '${{ matrix.target }}'
