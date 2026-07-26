@@ -377,9 +377,10 @@ an explicit `harness = false` test target, a default example, a default bench, a
 `src/bin/` target, a lib and an ordinary integration test — `cargo metadata`
 reports `test = true` for the `harness = false` target, while
 `cargo test -- --list` yields exactly `lib_test`, `bin_test` and `normal_test`.
-Metadata alone therefore admits a target whose `#[test]` never runs. The harness
-now reads the manifest to overlay that field, so the two answers agree; the
-corpus pins all six of those paths so neither side can drift back.
+Metadata alone therefore admits a target whose `#[test]` never runs.
+`claw-conformance` reads the manifest to overlay that one field, so the two
+implementations now agree here; the corpus pins all six of those paths so
+neither side can drift back.
 
 A tightening rule needs its false-positive cases pinned as much as its
 true-positive ones. Twelve of the fourteen accepting cases pin reachability — a
