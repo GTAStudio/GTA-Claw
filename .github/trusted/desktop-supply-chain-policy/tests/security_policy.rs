@@ -1921,10 +1921,14 @@ fn ios_resolve_and_verify_step(step_name: &str, target: &str, archive_var: &str)
 /// residual ANSI escape codes before grepping, proving that capture-and-strip pipeline finds
 /// something with a verified-nonzero positive control, and asserting on that captured log that the
 /// forced Skia download actually ran rather than silently falling back to a source build. It also
-/// deletes any stale prior build-script output directory before the build (the freshness proof),
-/// then reads Cargo's own unconditionally-written output file directly and asserts it names both
-/// the exact injected pinned URL and the unpack marker — the stronger, primary evidence this
-/// module's Round 4 correction requires on top of the piped console log above.
+/// deletes any stale prior build-script output directory *scoped to this exact target's own
+/// output tree* before the build (the freshness-and-no-cross-target proof), then reads Cargo's own
+/// unconditionally-written output file from that same target-scoped root, confirms exactly one
+/// candidate was found, and asserts it names the exact injected pinned URL together with the
+/// unconditional `DOWNLOAD AND INSTALL SUCCEEDED` line — the definitive completion proof, not
+/// merely `UNPACKING ARCHIVE INTO`, which `download_and_unpack` prints *before* the unpack call
+/// even runs and therefore establishes only an attempt. This is the stronger, primary evidence
+/// this module's Round 5 correction requires on top of the piped console log above.
 fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     let log_file = format!("build-{target}.log");
     let plain_log_file = format!("build-{target}.plain.log");
@@ -1937,7 +1941,9 @@ fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     step.push_str("          CARGO_TERM_COLOR: \"never\"\n");
     step.push_str("        run: |\n");
     step.push_str("          set -o pipefail\n");
-    step.push_str("          rm -rf target/*/build/skia-bindings-*\n");
+    step.push_str(&format!(
+        "          rm -rf target/{target}/*/build/skia-bindings-*\n"
+    ));
     step.push_str(&format!(
         "          cargo build --manifest-path ios/Cargo.toml --target {target} -vv --color never 2>&1 | tee {log_file}\n"
     ));
@@ -1957,13 +1963,17 @@ fn ios_build_step(step_name: &str, target: &str, archive_var: &str) -> String {
     step.push_str(&format!(
         "          ! grep -q \"DOWNLOAD AND INSTALL FAILED\" {plain_log_file}\n"
     ));
-    step.push_str(
-        "          output_file=$(find target -path \"*/build/skia-bindings-*/output\" | head -n1)\n",
-    );
+    step.push_str(&format!(
+        "          candidates=$(find \"target/{target}/\" -path \"*/build/skia-bindings-*/output\")\n"
+    ));
+    step.push_str("          candidate_count=$(printf '%s\\n' \"$candidates\" | grep -c .)\n");
+    step.push_str("          [ \"$candidate_count\" -eq 1 ]\n");
+    step.push_str("          output_file=\"$candidates\"\n");
     step.push_str(&format!(
         "          grep -q \"FROM: file://${{{{ env.{archive_var} }}}}\" \"$output_file\"\n"
     ));
     step.push_str("          grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n");
+    step.push_str("          grep -q \"DOWNLOAD AND INSTALL SUCCEEDED\" \"$output_file\"\n");
     step
 }
 
@@ -5792,6 +5802,90 @@ fn ios_packaging_workflow_rejects_missing_download_log_evidence() {
     );
     assert!(
         error.contains("never checks a captured build log for evidence"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_missing_download_succeeded_marker() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // `UNPACKING ARCHIVE INTO` is printed before `skia-bindings` ever calls `binaries::unpack`, so
+    // it is only ever an attempt marker. Stripping just the unconditional `DOWNLOAD AND INSTALL
+    // SUCCEEDED` line — the actual completion proof — from both build steps' output-file checks,
+    // while leaving every other check (including the piped-console-log UNPACKING checks) intact,
+    // isolates this fixture to Round 5's own new requirement.
+    let missing_succeeded = workflow.replace(
+        "          grep -q \"DOWNLOAD AND INSTALL SUCCEEDED\" \"$output_file\"\n",
+        "",
+    );
+    assert_ne!(
+        missing_succeeded, workflow,
+        "missing-succeeded fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_succeeded).expect_err(
+        "an output-file check that never asserts the unconditional DOWNLOAD AND INSTALL \
+         SUCCEEDED line must be rejected — UNPACKING ARCHIVE INTO alone proves only an attempt, \
+         not a completed, successful download",
+    );
+    assert!(
+        error.contains("DOWNLOAD AND INSTALL SUCCEEDED"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_a_non_target_scoped_stale_output_clean() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Reverting the device build step's stale-output clean back to the old, non-target-scoped
+    // glob (`rm -rf target/*/build/skia-bindings-*`) means it can no longer prove it did not leave
+    // the *simulator's* own stale output undisturbed, or that a hash change did not leave a stale
+    // leftover under some other target's tree unremoved — the cross-target freshness gap Round 5
+    // closes.
+    let unscoped_clean = workflow.replacen(
+        "rm -rf target/aarch64-apple-ios/*/build/skia-bindings-*",
+        "rm -rf target/*/build/skia-bindings-*",
+        1,
+    );
+    assert_ne!(
+        unscoped_clean, workflow,
+        "unscoped-clean fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&unscoped_clean).expect_err(
+        "a stale-output clean that is not scoped to this exact target's own output tree must be \
+         rejected",
+    );
+    assert!(
+        error.contains("scoped to this exact target's own output tree"),
+        "wrong rejection reason: {error}"
+    );
+}
+
+#[test]
+fn ios_packaging_workflow_rejects_missing_output_candidate_uniqueness_verification() {
+    let workflow = compliant_ios_packaging_workflow("iOS packaging", "package", "iOS packaging");
+
+    // Removing the exactly-one-candidate assertion from the device build step reverts to trusting
+    // an unverified `find` result: the "ambiguous multiple candidates" gap Round 5 closes. A stale
+    // leftover the clean step's scope missed, or two hash-suffixed variants coexisting, could
+    // otherwise be silently narrowed to an arbitrary result (a bare first line) and trusted
+    // anyway.
+    let missing_uniqueness_check = workflow.replacen(
+        "          candidate_count=$(printf '%s\\n' \"$candidates\" | grep -c .)\n          [ \"$candidate_count\" -eq 1 ]\n",
+        "",
+        1,
+    );
+    assert_ne!(
+        missing_uniqueness_check, workflow,
+        "missing-uniqueness-check fixture did not change anything"
+    );
+    let error = validate_ios_skia_injection_text(&missing_uniqueness_check).expect_err(
+        "an output-file discovery that never confirms exactly one candidate was found must be \
+         rejected",
+    );
+    assert!(
+        error.contains("exactly one candidate"),
         "wrong rejection reason: {error}"
     );
 }

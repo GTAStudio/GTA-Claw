@@ -356,15 +356,39 @@ pipeline missing `set -o pipefail` (without it, a shell pipeline's exit status i
 log file that was still faithfully written).
 
 Because reading Cargo's own build-script output file requires no verbosity flag at all, this policy
-additionally requires a positive read of it: the step (or a later one in the same job) must locate
-`target/<profile>/build/skia-bindings-*/output`, assert it contains both `FROM:` immediately followed
-by the exact injected pinned `file://` expression for that step's own archive variable (not merely
-`FROM:` in isolation, which the fallback source-build path could print for something else) and
-`UNPACKING ARCHIVE INTO`, and — because Cargo reuses a fingerprinted build directory and will not
-rewrite `output` on a no-op rebuild — the job must first remove any stale prior output
-(`target/*/build/skia-bindings-*`) so that file's presence is proof of *this* run, not a leftover from
-a previous one. A cached, stale `output` file left over from an earlier successful run is treated as
-no evidence at all, exactly like a cached `Compiling skia-bindings` console line is.
+additionally requires a positive read of it. Three further conditions make that file trustworthy as
+*this* run's evidence, for *the exact target it was built for*, rather than some earlier or
+differently-targeted leftover:
+
+- Because Cargo reuses a fingerprinted build directory and will not rewrite `output` on a no-op
+  rebuild, the job must first remove any stale prior output before the build meant to recreate it, so
+  that file's presence afterward is proof of *this* run and not a leftover from a previous one.
+- When the Skia-resolving step names one specific `--target` (not the host-target, either-archive
+  case), both that removal and the later read must be scoped to that exact target's own output tree
+  (`target/<target>/*/build/skia-bindings-*`, not the unscoped `target/*/build/skia-bindings-*`) —
+  otherwise a device build's clean could leave the simulator's own leftover output undisturbed, and a
+  later read could pick up the wrong target's file even though *some* file exists.
+- Cargo's own hash-suffixed directory naming means more than one candidate file can exist under a
+  search root at once (an interrupted prior run, a hash change across a dependency bump, or the clean
+  step above having the wrong scope). The job must therefore also assert its discovery found *exactly
+  one* candidate (`-eq 1`, `== 1`, or `= 1`) before trusting it — silently narrowing an ambiguous
+  multi-match list to an arbitrary "first" result (a bare `head -n1` with no count check) is rejected
+  exactly like finding zero.
+
+Once discovered, that one file must assert it contains `FROM:` immediately followed by the exact
+injected pinned `file://` expression for that step's own archive variable (not merely `FROM:` in
+isolation, which the fallback source-build path could print for something else), together with the
+unconditional `DOWNLOAD AND INSTALL SUCCEEDED` line. That literal line is `skia-bindings` 0.99.0's own
+definitive completion proof: printed only from the same `Ok` branch as the rest of a successful
+`download_and_install`, i.e. only once the archive was both fully fetched *and* successfully unpacked.
+`UNPACKING ARCHIVE INTO` is still required alongside it as corroboration, but it is printed *before*
+`skia-bindings` calls its own unpack routine, so on its own it proves only that an unpack was
+attempted, never that it (or the whole download-and-install step) actually succeeded — a prior
+revision of this document incorrectly described `UNPACKING ARCHIVE INTO` itself as post-unpack,
+"complete, successful download" proof, which this revision corrects. A cached, stale `output` file
+left over from an earlier successful run, an output file from the wrong target, an ambiguous
+multi-candidate discovery, or one missing the unconditional success line is all treated as no evidence
+at all, exactly like a cached `Compiling skia-bindings` console line is.
 
 ### Current desktop clippy is Skia-free by construction, and untouched by this trust chain
 

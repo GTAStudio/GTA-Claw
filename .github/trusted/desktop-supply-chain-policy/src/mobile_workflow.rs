@@ -94,16 +94,43 @@
 //! complete captured stdout to `target/<...>/build/<pkgname>-<hash>/output` on **every** build
 //! script invocation, unconditionally, regardless of verbosity — a strictly more reliable evidence
 //! source than a piped console log, immune to both a plain build's suppressed echo and any
-//! pipe/`tee` exit-status concern (below). Two further conditions make that file trustworthy as
-//! *this run's* evidence rather than some earlier, possibly-unverified run's leftover: an admitted
-//! workflow must delete any stale prior copy of that directory before the build meant to recreate
-//! it ([`cleans_stale_build_script_output`] — the hash suffix cannot be checked literally, so
-//! deleting the whole directory beforehand is what makes anything found there afterward
-//! unambiguous), and it must then read that exact file and assert it names both the literal
-//! [`SKIA_UNPACK_LOG`] line and the specific injected pinned `file://` URL via
-//! [`SKIA_DOWNLOAD_FROM_LOG`] ([`asserts_from_pinned_url_in_output`]) — not merely that *some*
-//! download happened, but that it was *this* verified archive, not a stale cache, the other
-//! target's archive, or the crate's own unverified default resolution silently taking over
+//! pipe/`tee` exit-status concern (below). Three further conditions make that file trustworthy as
+//! *this run's* evidence, for *the exact target it was built for*, rather than some earlier or
+//! differently-targeted leftover:
+//!
+//! - An admitted workflow must delete any stale prior copy of that directory before the build
+//!   meant to recreate it ([`cleans_stale_build_script_output`] — the hash suffix cannot be
+//!   checked literally, so deleting the whole directory beforehand is what makes anything found
+//!   there afterward unambiguous).
+//! - When the Skia-resolving step names one specific `--target` (not the host-target,
+//!   either-archive-accepted case), both that clean and the later read must be scoped to that
+//!   exact target's own output tree (`target/<target>/`, [`build_script_output_target_root`]) —
+//!   otherwise a device build's stale-output clean could leave the simulator's own leftover
+//!   output file undisturbed and vice versa, and a later read could pick up the wrong target's
+//!   file even though *some* file exists. This root is trailing-slash-qualified for the same
+//!   reason [`exact_flag_token`] cannot use a bare `contains` for `--target`: `aarch64-apple-ios`
+//!   is itself a proper prefix of `aarch64-apple-ios-sim`.
+//! - Cargo's own hash-suffixed directory naming means more than one candidate file can exist
+//!   under a search root at once (an interrupted prior run, a hash change across a dependency
+//!   bump, or the clean step above having the wrong scope). An admitted workflow must therefore
+//!   also assert its discovery found *exactly* one candidate ([`EXACTLY_ONE_COMPARISONS`]) before
+//!   trusting it — silently narrowing an ambiguous multi-match list to an arbitrary "first" result
+//!   (a bare `head -n1` with no count check) is rejected exactly like finding zero.
+//!
+//! Once discovered, that one file must assert the literal [`SKIA_DOWNLOAD_SUCCEEDED_LOG`] line —
+//! printed, unconditionally and without interpolation, only from `try_prepare_download`'s `Ok`
+//! branch, i.e. only once `download_and_install` has both fetched *and* unpacked the archive
+//! successfully (confirmed against the published source) — together with [`SKIA_UNPACK_LOG`] and
+//! the specific injected pinned `file://` URL via [`SKIA_DOWNLOAD_FROM_LOG`]
+//! ([`asserts_from_pinned_url_in_output`]). [`SKIA_UNPACK_LOG`] is retained as additional
+//! corroboration, never as the control by itself: `download_and_unpack` prints it *before* calling
+//! `binaries::unpack`, so on its own it proves only that an unpack was attempted, not that it (or
+//! the whole download-and-install step) actually succeeded — a prior revision of this module's own
+//! doc comment incorrectly described it as post-unpack, "complete, successful download" proof,
+//! which this revision corrects. Together these checks prove not merely that *some* download was
+//! attempted, but that it was *this* verified archive, for *this* target, and that it *completed
+//! successfully* — not a stale cache, the other target's archive, an ambiguous multi-match, or the
+//! crate's own unverified default resolution silently taking over
 //! ([`skia_download_receipt_is_verified_via_output_file`]). This check is additional to, not a
 //! replacement for, the piped-console-log evidence above.
 //!
@@ -157,14 +184,31 @@ const TRUSTED_ROOT_TRIGGER_PATH: &str = ".github/trusted/**";
 /// (`build_support/binary_cache/download.rs::try_prepare_download`, confirmed against the
 /// published source at that tag).
 const SKIA_DOWNLOAD_ATTEMPTED_LOG: &str = "TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES";
-/// Literal build-script log line printed only after the archive is fetched and unpacked
-/// (`download_and_unpack`) — i.e. after a complete, successful download.
+/// Literal build-script log line `download_and_unpack` prints once the archive's bytes have been
+/// fetched, but **before** it calls `binaries::unpack` — an attempt marker, not a completion
+/// proof. If the unpack call itself then failed, this line was already printed; a prior revision
+/// of this module incorrectly documented it as post-unpack, "complete, successful download"
+/// evidence. [`SKIA_DOWNLOAD_SUCCEEDED_LOG`] is the actual proof of a completed, successful
+/// download-and-unpack.
 const SKIA_UNPACK_LOG: &str = "UNPACKING ARCHIVE INTO";
 /// Literal build-script log line printed on any download-or-unpack failure. An admitted workflow
 /// must check its own captured log for this line's *absence*; `Compiling skia-bindings` alone
 /// proves nothing, since a stale build directory or a silent fallback source build can print that
-/// line too.
+/// line too. Retained as defense-in-depth only: this line's *absence* is necessary but not
+/// sufficient, since a silent fallback to a source build (`should_try_download_binaries`
+/// returning `None` — e.g. because `git::half_hash()` found no discoverable repository from the
+/// build script's own working directory) prints no marker line at all, neither this one nor
+/// [`SKIA_DOWNLOAD_SUCCEEDED_LOG`]. [`SKIA_DOWNLOAD_SUCCEEDED_LOG`]'s *presence* is the actual
+/// positive control this module's output-file checks are built around.
 const SKIA_DOWNLOAD_FAILED_LOG: &str = "DOWNLOAD AND INSTALL FAILED";
+/// Literal build-script log line `skia-bindings` 0.99.0 prints only from `try_prepare_download`'s
+/// `else` branch — i.e. only once `download_and_install(...)` has returned `Ok`, meaning the
+/// pinned archive was both fully fetched *and* successfully unpacked (confirmed against the
+/// published source: an unconditional `println!("DOWNLOAD AND INSTALL SUCCEEDED");` with no
+/// interpolation, so the literal text matches exactly). This is the definitive completion proof
+/// [`SKIA_UNPACK_LOG`] alone is not; [`skia_download_receipt_is_verified_via_output_file`] treats
+/// its presence in the fresh, target-scoped output file as mandatory, not merely corroborating.
+const SKIA_DOWNLOAD_SUCCEEDED_LOG: &str = "DOWNLOAD AND INSTALL SUCCEEDED";
 /// The cargo/env knob controlling ANSI color output in build logs.
 const CARGO_TERM_COLOR_VAR: &str = "CARGO_TERM_COLOR";
 /// The only value of [`CARGO_TERM_COLOR_VAR`] (or a `--color` flag) this policy accepts as
@@ -182,6 +226,14 @@ const ANSI_CSI_STRIP_PATTERN: &str = r"\x1b\[";
 /// `test`/`[`) or `!= 0` (arithmetic `(( ))`/`[[ ]]`) — any one of the ways an author might spell
 /// "and it is not zero".
 const NONZERO_COMPARISONS: [&str; 3] = ["-gt 0", "-ne 0", "!= 0"];
+/// Literal shell idioms proving a discovered build-script-output candidate count was compared
+/// against exactly one: `-eq 1` (POSIX `test`/`[`) or `== 1`/`= 1` (arithmetic `(( ))`/`[[ ]]` or a
+/// string comparison) — any spelling of "exactly one, neither zero nor several". Required so a
+/// `find` that discovers no candidate (nothing built yet, or the wrong target's tree) or several
+/// (a stale leftover the clean step's scope missed, or two hash-suffixed variants coexisting)
+/// cannot be silently narrowed to an arbitrary "first" result (a bare `head -n1` with no count
+/// check) and trusted anyway.
+const EXACTLY_ONE_COMPARISONS: [&str; 3] = ["-eq 1", "== 1", "= 1"];
 /// Literal build-script log line `skia-bindings` 0.99.0 prints immediately after
 /// [`SKIA_DOWNLOAD_ATTEMPTED_LOG`], naming the exact URL the download actually used (confirmed
 /// against the published source: `println!("  FROM: {url}");`, distinct from the unrelated
@@ -868,25 +920,79 @@ fn build_script_output_dir_hint() -> String {
     format!("build/{}-", skia_bindings_package_name())
 }
 
-/// Returns whether `run` deletes any prior build-script output directory for this package before
-/// its own cargo invocation runs: an `rm` token together with `hint`
-/// ([`build_script_output_dir_hint`]). This is the freshness proof
-/// [`skia_download_receipt_is_verified_via_output_file`] requires: Cargo names this directory with
-/// an unpredictable hash suffix that cannot be checked literally, so deleting it beforehand is what
-/// makes any file found there afterward unambiguously written by *this* run, rather than a cached
-/// leftover from some earlier, unrelated, possibly-unverified build.
-fn cleans_stale_build_script_output(run: &str, hint: &str) -> bool {
-    contains_word_token(run, "rm") && run.contains(hint)
+/// Returns the target-triple-scoped root of Cargo's own output tree for a cross-compiled
+/// `--target <target>` build: `target/<target>/`, trailing-slash-qualified so `aarch64-apple-ios`
+/// — itself a proper prefix of `aarch64-apple-ios-sim` — cannot satisfy a check meant for the
+/// other target, the same reason [`exact_flag_token`] cannot use a bare `contains` for `--target`
+/// matching. [`cleans_stale_build_script_output`] and [`reads_build_script_output_file`] both
+/// require this root's text whenever a Skia-resolving step names one specific target, so a device
+/// build's stale-output clean or output-file read cannot cross into the simulator's own tree, or
+/// vice versa.
+fn build_script_output_target_root(target: &str) -> String {
+    format!("target/{target}/")
 }
 
-/// Returns whether `run` reads Cargo's own captured build-script output file — text naming both
-/// `hint` ([`build_script_output_dir_hint`]) and [`BUILD_SCRIPT_OUTPUT_FILE_HINT`] — rather than
-/// relying solely on the piped console log. Cargo writes this file unconditionally on every
-/// build-script invocation, regardless of `-v`/`-vv` verbosity (only the *console echo* of its
-/// contents needs `-vv`, or a build failure), so it is a strictly more reliable evidence source
-/// than a piped log for proving a normal, successful build actually ran the forced download path.
-fn reads_build_script_output_file(run: &str, hint: &str) -> bool {
-    run.contains(hint) && run.contains(BUILD_SCRIPT_OUTPUT_FILE_HINT)
+/// Maps one of the two fixed archive-variable names back to the target string it corresponds to —
+/// the inverse of the `--target` matching [`candidate_archive_vars`] performs — so
+/// [`skia_download_receipt_is_verified_via_output_file`] can compute the exact
+/// [`build_script_output_target_root`] a single-target step's evidence must be scoped to.
+fn target_for_archive_var(var: &str, ctx: &StepContext<'_>) -> &'static str {
+    if var == SKIA_ARCHIVE_IOS_SIM_VAR {
+        ctx.sim
+    } else {
+        ctx.device
+    }
+}
+
+/// Returns whether some *single line* of `run` deletes any prior build-script output directory
+/// for this package before its own cargo invocation runs: an `rm` token together with `hint`
+/// ([`build_script_output_dir_hint`]), and, when `target_root` is non-empty
+/// ([`build_script_output_target_root`], required whenever the step names one specific
+/// `--target`), that root's text too — all three required on the *same line*, not merely present
+/// somewhere in the run block, so an unrelated line elsewhere in the same step (such as this
+/// module's own [`reads_build_script_output_file`] discovery command, which necessarily also
+/// names `target_root`) cannot stand in for an actually-scoped `rm`. An empty `target_root` is
+/// trivially satisfied by any line, leaving the host-target, either-archive-accepted case
+/// unscoped, exactly as before. This is the freshness proof
+/// [`skia_download_receipt_is_verified_via_output_file`] requires: Cargo names this directory with
+/// an unpredictable hash suffix that cannot be checked literally, so deleting it beforehand is
+/// what makes any file found there afterward unambiguously written by *this* run — and, with
+/// `target_root`, by *this exact target's* build — rather than a cached leftover from some
+/// earlier, unrelated, possibly-unverified, or differently-targeted build.
+fn cleans_stale_build_script_output(run: &str, hint: &str, target_root: &str) -> bool {
+    run.lines().any(|line| {
+        contains_word_token(line, "rm") && line.contains(hint) && line.contains(target_root)
+    })
+}
+
+/// Returns whether some *single line* of `run` reads Cargo's own captured build-script output file
+/// — text naming `hint` ([`build_script_output_dir_hint`]), [`BUILD_SCRIPT_OUTPUT_FILE_HINT`],
+/// and, when `target_root` is non-empty ([`build_script_output_target_root`]), that root's text
+/// too, all on that same line — rather than relying solely on the piped console log, and rather
+/// than crediting an unrelated line elsewhere in the run block (such as
+/// [`cleans_stale_build_script_output`]'s own clean command) for a `target_root` this specific
+/// read line never actually names. Cargo writes this file unconditionally on every build-script
+/// invocation, regardless of `-v`/`-vv` verbosity (only the *console echo* of its contents needs
+/// `-vv`, or a build failure), so it is a strictly more reliable evidence source than a piped log
+/// for proving a normal, successful build actually ran the forced download path for the exact
+/// target under test.
+fn reads_build_script_output_file(run: &str, hint: &str, target_root: &str) -> bool {
+    run.lines().any(|line| {
+        line.contains(hint)
+            && line.contains(BUILD_SCRIPT_OUTPUT_FILE_HINT)
+            && line.contains(target_root)
+    })
+}
+
+/// Returns whether `run` checks a discovered build-script-output candidate count against exactly
+/// one ([`EXACTLY_ONE_COMPARISONS`]) before trusting it — so a `find` returning zero candidates
+/// (nothing built yet, or the wrong target's tree) or several (a stale leftover the clean step's
+/// scope missed, or two hash-suffixed variants coexisting) cannot be silently narrowed to an
+/// arbitrary "first" match (a bare `head -n1` with no count check) and trusted anyway.
+fn asserts_exactly_one_output_candidate(run: &str) -> bool {
+    EXACTLY_ONE_COMPARISONS
+        .iter()
+        .any(|pattern| run.contains(pattern))
 }
 
 /// Returns whether `run` asserts, against literal text naming both [`SKIA_DOWNLOAD_FROM_LOG`] and
@@ -901,35 +1007,61 @@ fn asserts_from_pinned_url_in_output(run: &str, var: &str) -> bool {
         && normalize_expression(run).contains(&expected_file_url(var))
 }
 
+/// Returns whether `run` asserts, against literal text, that Cargo's captured build-script output
+/// file names both the specific verified archive for `var` ([`asserts_from_pinned_url_in_output`])
+/// and the unconditional [`SKIA_DOWNLOAD_SUCCEEDED_LOG`] line — the definitive proof
+/// `download_and_install` returned `Ok` this run, i.e. that the archive was not merely fetched but
+/// also successfully unpacked. [`SKIA_UNPACK_LOG`] is required here too, but only as additional
+/// corroboration: printed *before* `binaries::unpack` is even called, it alone is consistent with
+/// a subsequent unpack failure, so it can never stand in for [`SKIA_DOWNLOAD_SUCCEEDED_LOG`] as
+/// the control (see this module's doc comment).
+fn asserts_download_succeeded_in_output(run: &str, var: &str) -> bool {
+    asserts_from_pinned_url_in_output(run, var)
+        && run.contains(SKIA_UNPACK_LOG)
+        && run.contains(SKIA_DOWNLOAD_SUCCEEDED_LOG)
+}
+
 /// Returns whether, for the Skia-resolving cargo step at `build_index`, this job proves — through
 /// Cargo's own unconditionally-written build-script output file rather than the piped console log
-/// — that *this run's* forced download actually fetched the exact verified local archive for one
-/// of `candidate_vars`: some step at or before `build_index` deletes any stale prior output
-/// directory ([`cleans_stale_build_script_output`], the freshness proof, allowed in the same step
-/// since a `run: |` block naturally cleans immediately before the build it precedes), and some
-/// step at or after `build_index` both reads that file ([`reads_build_script_output_file`]) and
-/// asserts it contains [`SKIA_UNPACK_LOG`] and the exact pinned URL for one of `candidate_vars`
-/// ([`asserts_from_pinned_url_in_output`]).
+/// — that *this run's* forced download actually fetched and successfully unpacked the exact
+/// verified local archive for one of `candidate_vars`: some step at or before `build_index`
+/// deletes any stale prior output directory ([`cleans_stale_build_script_output`], the freshness
+/// proof, allowed in the same step since a `run: |` block naturally cleans immediately before the
+/// build it precedes), and some step at or after `build_index` reads that file
+/// ([`reads_build_script_output_file`]), confirms its discovery found exactly one candidate
+/// ([`asserts_exactly_one_output_candidate`]), and asserts it names both the completed download
+/// for one of `candidate_vars` and [`SKIA_DOWNLOAD_SUCCEEDED_LOG`]
+/// ([`asserts_download_succeeded_in_output`]). When `candidate_vars` names exactly one target (a
+/// step naming that target's own `--target`, as opposed to a host-target step accepting either),
+/// both the clean and the read are further required to be scoped to that target's own output tree
+/// ([`build_script_output_target_root`]) via `ctx` — otherwise a device build's clean or read
+/// could silently cross into the simulator's own output tree, or vice versa, even while every
+/// other check above passes.
 fn skia_download_receipt_is_verified_via_output_file(
     steps: &[ParsedStep<'_>],
     build_index: usize,
     candidate_vars: &'static [&'static str],
+    ctx: &StepContext<'_>,
 ) -> bool {
     let hint = build_script_output_dir_hint();
+    let target_root = match candidate_vars {
+        [single_var] => build_script_output_target_root(target_for_archive_var(single_var, ctx)),
+        _ => String::new(),
+    };
     let cleaned = steps[..=build_index].iter().any(|step| {
         step.run
-            .is_some_and(|run| cleans_stale_build_script_output(run, &hint))
+            .is_some_and(|run| cleans_stale_build_script_output(run, &hint, &target_root))
     });
     if !cleaned {
         return false;
     }
     steps[build_index..].iter().any(|step| {
         step.run.is_some_and(|run| {
-            reads_build_script_output_file(run, &hint)
-                && run.contains(SKIA_UNPACK_LOG)
+            reads_build_script_output_file(run, &hint, &target_root)
+                && asserts_exactly_one_output_candidate(run)
                 && candidate_vars
                     .iter()
-                    .any(|var| asserts_from_pinned_url_in_output(run, var))
+                    .any(|var| asserts_download_succeeded_in_output(run, var))
         })
     })
 }
@@ -1054,20 +1186,25 @@ fn validate_job_skia_injection(
             )));
         }
         let candidate_vars = candidate_archive_vars(run, &ctx);
-        if !skia_download_receipt_is_verified_via_output_file(&steps, index, candidate_vars) {
+        if !skia_download_receipt_is_verified_via_output_file(&steps, index, candidate_vars, &ctx) {
             let hint = build_script_output_dir_hint();
             return Err(PolicyError::new(format!(
                 "{path}: job {job_id} step {index} never proves, by reading Cargo's own \
                  captured build-script output file ({hint}*{BUILD_SCRIPT_OUTPUT_FILE_HINT}, \
                  written unconditionally on every build-script invocation regardless of \
                  verbosity) rather than relying solely on the piped console log, that this \
-                 run's forced download actually used the verified pinned archive: some step at \
-                 or before this one must delete any stale prior output directory for this \
-                 package first (the freshness proof — a cached leftover from an earlier, \
-                 possibly-unverified run would otherwise look identical), and some step at or \
-                 after this one must then assert that file contains both \
-                 {SKIA_DOWNLOAD_FROM_LOG:?} naming the exact injected pinned file:// URL and \
-                 {SKIA_UNPACK_LOG:?}"
+                 run's forced download actually completed for the verified pinned archive: some \
+                 step at or before this one must delete any stale prior output directory for \
+                 this package first (the freshness proof — a cached leftover from an earlier, \
+                 possibly-unverified, or differently-targeted run would otherwise look \
+                 identical), scoped to this exact target's own output tree when this step names \
+                 one specific target; and some step at or after this one must read that same \
+                 exact-target-scoped file, confirm its discovery found exactly one candidate \
+                 ({EXACTLY_ONE_COMPARISONS:?}), and assert it contains \
+                 {SKIA_DOWNLOAD_FROM_LOG:?} naming the exact injected pinned file:// URL \
+                 together with the unconditional {SKIA_DOWNLOAD_SUCCEEDED_LOG:?} line — \
+                 {SKIA_UNPACK_LOG:?} alone is not enough, since it is printed before the unpack \
+                 call even runs and therefore proves only an attempt, not success"
             )));
         }
     }
@@ -1167,12 +1304,13 @@ mod tests {
 
     use super::{
         ParsedStep, SKIA_ARCHIVE_IOS_DEVICE_VAR, SKIA_ARCHIVE_IOS_SIM_VAR,
+        asserts_download_succeeded_in_output, asserts_exactly_one_output_candidate,
         asserts_from_pinned_url_in_output, build_script_output_dir_hint,
-        cleans_stale_build_script_output, contains_bare_hex_run_at_least, curl_output_token,
-        exact_flag_token, has_fail_closed_curl, is_curl_fail_flag, is_hardcoded_literal,
-        is_skia_resolving_cargo_step, protects_pipeline_exit_status,
-        publishes_absolute_archive_var, publishes_archive_var, reads_build_script_output_file,
-        requests_double_verbose, targets_ios_skia_workspace,
+        build_script_output_target_root, cleans_stale_build_script_output,
+        contains_bare_hex_run_at_least, curl_output_token, exact_flag_token, has_fail_closed_curl,
+        is_curl_fail_flag, is_hardcoded_literal, is_skia_resolving_cargo_step,
+        protects_pipeline_exit_status, publishes_absolute_archive_var, publishes_archive_var,
+        reads_build_script_output_file, requests_double_verbose, targets_ios_skia_workspace,
     };
 
     #[test]
@@ -1399,16 +1537,55 @@ mod tests {
         let hint = build_script_output_dir_hint();
         assert!(cleans_stale_build_script_output(
             "rm -rf target/*/build/skia-bindings-*",
-            &hint
+            &hint,
+            ""
         ));
         // `rm` must be a standalone token, not embedded in a longer word such as `confirm`.
         assert!(!cleans_stale_build_script_output(
             "confirm target/*/build/skia-bindings-* exists",
-            &hint
+            &hint,
+            ""
         ));
         assert!(!cleans_stale_build_script_output(
             "rm -rf target/*/build/some-other-crate-*",
-            &hint
+            &hint,
+            ""
+        ));
+    }
+
+    #[test]
+    fn stale_output_cleaning_requires_the_target_root_when_one_target_is_named() {
+        let hint = build_script_output_dir_hint();
+        let device_root = build_script_output_target_root("aarch64-apple-ios");
+        assert!(cleans_stale_build_script_output(
+            "rm -rf target/aarch64-apple-ios/*/build/skia-bindings-*",
+            &hint,
+            &device_root
+        ));
+        // An unscoped clean (no target segment at all) does not satisfy a target-scoped
+        // requirement: it cannot prove it did not also disturb, or fail to reach, the exact
+        // target's own tree.
+        assert!(!cleans_stale_build_script_output(
+            "rm -rf target/*/build/skia-bindings-*",
+            &hint,
+            &device_root
+        ));
+        // The *other* target's root must not satisfy this target's requirement — the collision a
+        // bare `contains` on an un-qualified target string would wrongly let through.
+        assert!(!cleans_stale_build_script_output(
+            "rm -rf target/aarch64-apple-ios-sim/*/build/skia-bindings-*",
+            &hint,
+            &device_root
+        ));
+        // The target root must appear on the *same line* as the `rm` command: an unscoped `rm`
+        // line sitting alongside a separately target-scoped, unrelated line (such as this same
+        // step's own output-file discovery command) must not let the unscoped clean pass merely
+        // because `run.contains(target_root)` is true somewhere else in the block.
+        assert!(!cleans_stale_build_script_output(
+            "rm -rf target/*/build/skia-bindings-*\n\
+             candidates=$(find \"target/aarch64-apple-ios/\" -path \"*/build/skia-bindings-*/output\")",
+            &hint,
+            &device_root
         ));
     }
 
@@ -1417,15 +1594,118 @@ mod tests {
         let hint = build_script_output_dir_hint();
         assert!(reads_build_script_output_file(
             "cat target/*/build/skia-bindings-*/output",
-            &hint
+            &hint,
+            ""
         ));
         assert!(!reads_build_script_output_file(
             "cat target/*/build/skia-bindings-*/stderr",
-            &hint
+            &hint,
+            ""
         ));
         assert!(!reads_build_script_output_file(
             "cat target/*/build/some-other-crate-*/output",
-            &hint
+            &hint,
+            ""
+        ));
+    }
+
+    #[test]
+    fn output_file_reading_requires_the_target_root_when_one_target_is_named() {
+        let hint = build_script_output_dir_hint();
+        let device_root = build_script_output_target_root("aarch64-apple-ios");
+        assert!(reads_build_script_output_file(
+            "cat target/aarch64-apple-ios/release/build/skia-bindings-abc/output",
+            &hint,
+            &device_root
+        ));
+        assert!(!reads_build_script_output_file(
+            "cat target/*/build/skia-bindings-*/output",
+            &hint,
+            &device_root
+        ));
+        // The simulator's own tree must not satisfy the device target's requirement, and vice
+        // versa — `aarch64-apple-ios` is itself a proper prefix of `aarch64-apple-ios-sim`.
+        assert!(!reads_build_script_output_file(
+            "cat target/aarch64-apple-ios-sim/release/build/skia-bindings-abc/output",
+            &hint,
+            &device_root
+        ));
+        // The target root must appear on the *same line* as the discovery/read command: an
+        // unscoped read line sitting alongside a separately target-scoped, unrelated line (such
+        // as this same step's own stale-output clean command) must not let the unscoped read pass
+        // merely because `run.contains(target_root)` is true somewhere else in the block.
+        assert!(!reads_build_script_output_file(
+            "rm -rf target/aarch64-apple-ios/*/build/skia-bindings-*\n\
+             cat target/*/build/skia-bindings-*/output",
+            &hint,
+            &device_root
+        ));
+    }
+
+    #[test]
+    fn output_target_root_is_trailing_slash_qualified_and_collision_safe() {
+        let device_root = build_script_output_target_root("aarch64-apple-ios");
+        let sim_root = build_script_output_target_root("aarch64-apple-ios-sim");
+        assert_eq!(device_root, "target/aarch64-apple-ios/");
+        assert_eq!(sim_root, "target/aarch64-apple-ios-sim/");
+        let sim_only_path = "target/aarch64-apple-ios-sim/release/build/skia-bindings-abc/output";
+        assert!(sim_only_path.contains(&sim_root));
+        assert!(!sim_only_path.contains(&device_root));
+    }
+
+    #[test]
+    fn download_succeeded_assertion_requires_the_from_marker_unpacking_and_the_succeeded_marker() {
+        let from_and_unpacking_and_succeeded = concat!(
+            "grep -q \"FROM: file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\" \"$output_file\"\n",
+            "grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n",
+            "grep -q \"DOWNLOAD AND INSTALL SUCCEEDED\" \"$output_file\"\n",
+        );
+        assert!(asserts_download_succeeded_in_output(
+            from_and_unpacking_and_succeeded,
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
+        // UNPACKING is printed before the unpack call even runs, so it alone (with FROM) is
+        // consistent with a subsequent unpack failure and must not satisfy this assertion without
+        // the SUCCEEDED marker too.
+        let from_and_unpacking_only = concat!(
+            "grep -q \"FROM: file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\" \"$output_file\"\n",
+            "grep -q \"UNPACKING ARCHIVE INTO\" \"$output_file\"\n",
+        );
+        assert!(!asserts_download_succeeded_in_output(
+            from_and_unpacking_only,
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
+        // SUCCEEDED plus FROM but no UNPACKING corroboration is likewise insufficient.
+        let from_and_succeeded_only = concat!(
+            "grep -q \"FROM: file://${{ env.SKIA_ARCHIVE_IOS_DEVICE }}\" \"$output_file\"\n",
+            "grep -q \"DOWNLOAD AND INSTALL SUCCEEDED\" \"$output_file\"\n",
+        );
+        assert!(!asserts_download_succeeded_in_output(
+            from_and_succeeded_only,
+            SKIA_ARCHIVE_IOS_DEVICE_VAR
+        ));
+        // The other target's FROM expression must not satisfy this target's assertion.
+        assert!(!asserts_download_succeeded_in_output(
+            from_and_unpacking_and_succeeded,
+            SKIA_ARCHIVE_IOS_SIM_VAR
+        ));
+    }
+
+    #[test]
+    fn output_candidate_count_assertion_requires_an_exactly_one_comparison() {
+        assert!(asserts_exactly_one_output_candidate(
+            "count=$(printf '%s\\n' \"$output_file\" | grep -c .); [ \"$count\" -eq 1 ]"
+        ));
+        assert!(asserts_exactly_one_output_candidate("[[ $count == 1 ]]"));
+        // A bare `head -n1` with no count comparison anywhere proves nothing about uniqueness —
+        // it silently narrows zero, one, or several matches to an arbitrary "first" line.
+        assert!(!asserts_exactly_one_output_candidate(
+            "output_file=$(find target -path \"*/output\" | head -n1)"
+        ));
+        // A *nonzero* comparison (this module's separate positive-control idiom) is a different
+        // property and must not satisfy the *exactly-one* requirement.
+        assert!(!asserts_exactly_one_output_candidate(
+            "[ \"$count\" -gt 0 ]"
         ));
     }
 
