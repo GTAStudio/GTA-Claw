@@ -40,6 +40,14 @@ deb_architecture="$(deb_arch "$arch")"
 rpm_architecture="$(rpm_arch "$arch")"
 oci_architecture="$(oci_arch "$arch")"
 base_name="$LINUX_PACKAGE_NAME-$VERSION-linux-$arch"
+package_identity="$VERSION-$LINUX_PACKAGE_RELEASE"
+validate_oci_orchestration_templates \
+  "$LINUX_DIR/oci/compose.yaml.in" \
+  "$LINUX_DIR/oci/kubernetes.yaml.in"
+validate_cri_fixture_templates \
+  "$LINUX_DIR/oci/cri-sandbox.json" \
+  "$LINUX_DIR/oci/cri-init.json.in" \
+  "$LINUX_DIR/oci/cri-runtime.json.in"
 
 write_json() {
   local output="$1"
@@ -61,6 +69,8 @@ write_json "$package_toolchain" -n \
   --arg gzip "$(dpkg-query -W -f='${Version}' gzip)" \
   --arg jq "$(dpkg-query -W -f='${Version}' jq)" \
   --arg python3 "$(dpkg-query -W -f='${Version}' python3)" \
+  --arg python3_jsonschema "$(dpkg-query -W -f='${Version}' python3-jsonschema)" \
+  --arg python3_yaml "$(dpkg-query -W -f='${Version}' python3-yaml)" \
   --arg cpio "$(dpkg-query -W -f='${Version}' cpio)" \
   '{
     schemaVersion: 1,
@@ -74,6 +84,8 @@ write_json "$package_toolchain" -n \
       gzip: $gzip,
       jq: $jq,
       python3: $python3,
+      "python3-jsonschema": $python3_jsonschema,
+      "python3-yaml": $python3_yaml,
       cpio: $cpio
     }
   }'
@@ -91,7 +103,9 @@ generate_provenance() {
     --arg source_tree "$source_tree" \
     --arg build_manifest_sha "$build_manifest_sha" \
     --arg source_epoch "$SOURCE_DATE_EPOCH" \
-    --arg version "$VERSION" \
+    --arg version "$package_identity" \
+    --arg package_release "$LINUX_PACKAGE_RELEASE" \
+    --arg package_identity "$package_identity" \
     --arg arch "$arch" \
     --arg target "$target" \
     --arg daemon_path "$daemon_path" \
@@ -111,7 +125,9 @@ generate_provenance() {
           "externalParameters": {
             "architecture": $arch,
             "rustTarget": $target,
-            "version": $version
+            "version": $version,
+            "packageRelease": ($package_release | tonumber),
+            "packageVersion": $package_identity
           },
           "internalParameters": {
             "sourceDateEpoch": ($source_epoch | tonumber)
@@ -244,9 +260,10 @@ generate_spdx() {
     --arg libgcc_arch "$libgcc_arch" \
     --arg sbom_relative "$sbom_relative" \
     --arg checksum_relative "$checksum_relative" \
-    --arg namespace "https://github.com/GTAStudio/GTA-Claw/spdx/$source_sha/$arch/$label" \
+    --arg namespace "https://github.com/GTAStudio/GTA-Claw/spdx/$source_sha/$arch/$package_identity/$label" \
     --arg created "$created_at" \
-    --arg version "$VERSION" \
+    --arg version "$package_identity" \
+    --arg package_release "$LINUX_PACKAGE_RELEASE" \
     --arg source_sha "$source_sha" \
     '{
       spdxVersion: "SPDX-2.3",
@@ -263,6 +280,7 @@ generate_spdx() {
           SPDXID: "SPDXRef-Package-GTA-Claw",
           name: "gta-claw",
           versionInfo: $version,
+          comment: ("Linux package release: " + $package_release),
           downloadLocation: "NOASSERTION",
           filesAnalyzed: true,
           packageVerificationCode: {
@@ -278,7 +296,10 @@ generate_spdx() {
           externalRefs: [{
             referenceCategory: "PACKAGE-MANAGER",
             referenceType: "purl",
-            referenceLocator: ("pkg:github/GTAStudio/GTA-Claw@" + $source_sha)
+            referenceLocator: (
+              "pkg:github/GTAStudio/GTA-Claw@" + $source_sha +
+              "?package_release=" + $package_release
+            )
           }]
         },
         ({
@@ -367,9 +388,60 @@ stage_documentation() {
 
 archive_stage="$WORK_DIR/archive/$base_name"
 ensure_output_directory "$archive_stage/bin"
+ensure_output_directory "$archive_stage/etc/gta-claw/credentials"
+ensure_output_directory "$archive_stage/lib/systemd/system"
+ensure_output_directory "$archive_stage/lib/systemd/system-preset"
+ensure_output_directory "$archive_stage/lib/sysusers.d"
+ensure_output_directory "$archive_stage/libexec"
 ensure_output_directory "$archive_stage/share/doc/gta-claw"
 copy_verified_input "$daemon_binary" "$archive_stage/bin/$LINUX_DAEMON_NAME" 0755
 copy_verified_input "$cli_binary" "$archive_stage/bin/$LINUX_CLI_NAME" 0755
+copy_regular_input "$LINUX_DIR/direct/install.sh" "$archive_stage/install.sh" 0755
+copy_regular_input "$LINUX_DIR/direct/uninstall.sh" "$archive_stage/uninstall.sh" 0755
+write_output_text \
+  "$archive_stage/package-version" \
+  0644 \
+  "$package_identity"$'\n'
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-state-init" \
+  "$archive_stage/libexec/gta-claw-state-init" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/direct/config-safeio.py" \
+  "$archive_stage/libexec/gta-claw-direct-config" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-runtime-ready" \
+  "$archive_stage/libexec/gta-claw-runtime-ready" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-start-authorized" \
+  "$archive_stage/libexec/gta-claw-start-authorized" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw-daemon.service" \
+  "$archive_stage/lib/systemd/system/gta-claw-daemon.service" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw-state-init.service" \
+  "$archive_stage/lib/systemd/system/gta-claw-state-init.service" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/80-gta-claw.preset" \
+  "$archive_stage/lib/systemd/system-preset/80-gta-claw.preset" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/sysusers/gta-claw.conf" \
+  "$archive_stage/lib/sysusers.d/gta-claw.conf" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw.env" \
+  "$archive_stage/etc/gta-claw/gta-claw.env" \
+  0640
+copy_regular_input \
+  "$LINUX_DIR/systemd/daemon.conf" \
+  "$archive_stage/etc/gta-claw/credentials/daemon.conf" \
+  0600
 stage_documentation "$archive_stage/share/doc/gta-claw"
 generate_provenance \
   "$archive_stage" \
@@ -379,6 +451,30 @@ generate_provenance \
 generate_spdx "$archive_stage" "$archive_stage/sbom.spdx.json" "native-tar"
 write_sha256_manifest "$archive_stage" "$archive_stage/SHA256SUMS"
 normalize_tree "$archive_stage"
+chmod 0700 "$archive_stage/etc/gta-claw/credentials"
+chmod 0755 \
+  "$archive_stage/bin/$LINUX_DAEMON_NAME" \
+  "$archive_stage/bin/$LINUX_CLI_NAME" \
+  "$archive_stage/install.sh" \
+  "$archive_stage/uninstall.sh" \
+  "$archive_stage/libexec/gta-claw-direct-config" \
+  "$archive_stage/libexec/gta-claw-state-init" \
+  "$archive_stage/libexec/gta-claw-runtime-ready" \
+  "$archive_stage/libexec/gta-claw-start-authorized"
+chmod 0640 "$archive_stage/etc/gta-claw/gta-claw.env"
+chmod 0600 "$archive_stage/etc/gta-claw/credentials/daemon.conf"
+validate_service_contract \
+  "$archive_stage/lib/systemd/system/gta-claw-daemon.service"
+validate_initializer_service_contract \
+  "$archive_stage/lib/systemd/system/gta-claw-state-init.service"
+validate_sysusers_contract "$archive_stage/lib/sysusers.d/gta-claw.conf"
+validate_initializer_wrapper_contract "$archive_stage/libexec/gta-claw-state-init"
+validate_runtime_ready_contract "$archive_stage/libexec/gta-claw-runtime-ready"
+validate_start_authorization_contract \
+  "$archive_stage/libexec/gta-claw-start-authorized"
+validate_direct_lifecycle_contract \
+  "$archive_stage/install.sh" \
+  "$archive_stage/uninstall.sh"
 tar_artifact="$ARTIFACT_DIR/$base_name.tar.gz"
 create_deterministic_tar_gz "$(dirname "$archive_stage")" "$(basename "$archive_stage")" "$tar_artifact"
 
@@ -387,6 +483,7 @@ ensure_output_directory "$rootfs/usr/bin"
 ensure_output_directory "$rootfs/usr/libexec/gta-claw"
 ensure_output_directory "$rootfs/usr/lib/systemd/system"
 ensure_output_directory "$rootfs/usr/lib/systemd/system-preset"
+ensure_output_directory "$rootfs/usr/lib/sysusers.d"
 ensure_output_directory "$rootfs/usr/share/doc/gta-claw"
 ensure_output_directory "$rootfs/etc/gta-claw/credentials"
 copy_verified_input "$cli_binary" "$rootfs/usr/bin/$LINUX_CLI_NAME" 0755
@@ -399,9 +496,33 @@ copy_regular_input \
   "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service" \
   0644
 copy_regular_input \
+  "$LINUX_DIR/systemd/gta-claw-state-init.service" \
+  "$rootfs/usr/lib/systemd/system/gta-claw-state-init.service" \
+  0644
+copy_regular_input \
   "$LINUX_DIR/systemd/80-gta-claw.preset" \
   "$rootfs/usr/lib/systemd/system-preset/80-gta-claw.preset" \
   0644
+copy_regular_input \
+  "$LINUX_DIR/sysusers/gta-claw.conf" \
+  "$rootfs/usr/lib/sysusers.d/gta-claw.conf" \
+  0644
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-state-init" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-state-init" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/direct/config-safeio.py" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-direct-config" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-runtime-ready" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready" \
+  0755
+copy_regular_input \
+  "$LINUX_DIR/libexec/gta-claw-start-authorized" \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized" \
+  0755
 copy_regular_input \
   "$LINUX_DIR/systemd/gta-claw.env" \
   "$rootfs/etc/gta-claw/gta-claw.env" \
@@ -424,11 +545,25 @@ write_sha256_manifest \
   "$rootfs" \
   "$rootfs/usr/share/doc/gta-claw/SHA256SUMS"
 normalize_tree "$rootfs"
+chmod 0700 "$rootfs/etc/gta-claw/credentials"
 chmod 0755 "$rootfs/usr/bin/$LINUX_CLI_NAME"
 chmod 0755 "$rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-direct-config"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
+chmod 0755 "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 chmod 0640 "$rootfs/etc/gta-claw/gta-claw.env"
 chmod 0600 "$rootfs/etc/gta-claw/credentials/daemon.conf"
 validate_service_contract "$rootfs/usr/lib/systemd/system/gta-claw-daemon.service"
+validate_initializer_service_contract \
+  "$rootfs/usr/lib/systemd/system/gta-claw-state-init.service"
+validate_sysusers_contract "$rootfs/usr/lib/sysusers.d/gta-claw.conf"
+validate_initializer_wrapper_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-state-init"
+validate_runtime_ready_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-runtime-ready"
+validate_start_authorization_contract \
+  "$rootfs/usr/libexec/gta-claw/gta-claw-start-authorized"
 reject_forbidden_runtime_content "$rootfs"
 
 deb_root="$WORK_DIR/deb-root"
@@ -447,7 +582,7 @@ Priority: optional
 Architecture: $deb_architecture
 Maintainer: GTAStudio <noreply@github.com>
 Installed-Size: $installed_size
-Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, systemd (>= 249)
+Depends: libc6 (>= $BUILD_GLIBC_REQUIREMENT), libgcc-s1, python3 (>= 3.8), systemd (>= 249), util-linux
 Homepage: https://github.com/GTAStudio/GTA-Claw
 Description: GTA Claw native Rust headless prototype
  Packages gta-claw-daemon and gta-claw-cli without the legacy JavaScript
@@ -459,6 +594,12 @@ cat >&"$OPEN_OUTPUT_FD" <<'EOF'
 /etc/gta-claw/gta-claw.env
 /etc/gta-claw/credentials/daemon.conf
 EOF
+finish_output_file
+open_output_file "$deb_root/DEBIAN/preinst" 0755
+sed \
+  "s/@PACKAGE_VERSION@/$VERSION-$LINUX_PACKAGE_RELEASE/g" \
+  "$LINUX_DIR/debian/preinst.in" \
+  >&"$OPEN_OUTPUT_FD"
 finish_output_file
 copy_regular_input "$LINUX_DIR/debian/postinst" "$deb_root/DEBIAN/postinst" 0755
 copy_regular_input "$LINUX_DIR/debian/prerm" "$deb_root/DEBIAN/prerm" 0755
@@ -473,8 +614,13 @@ open_output_file "$deb_root/DEBIAN/md5sums" 0644
 ) >&"$OPEN_OUTPUT_FD"
 finish_output_file
 normalize_tree "$deb_root"
+chmod 0700 "$deb_root/etc/gta-claw/credentials"
 chmod 0755 "$deb_root/DEBIAN"
-chmod 0755 "$deb_root/DEBIAN/postinst" "$deb_root/DEBIAN/prerm" "$deb_root/DEBIAN/postrm"
+chmod 0755 \
+  "$deb_root/DEBIAN/preinst" \
+  "$deb_root/DEBIAN/postinst" \
+  "$deb_root/DEBIAN/prerm" \
+  "$deb_root/DEBIAN/postrm"
 chmod 0644 "$deb_root/DEBIAN/control" "$deb_root/DEBIAN/conffiles" "$deb_root/DEBIAN/md5sums"
 chmod 0640 "$deb_root/etc/gta-claw/gta-claw.env"
 chmod 0600 "$deb_root/etc/gta-claw/credentials/daemon.conf"
@@ -524,6 +670,21 @@ touch --date="@$SOURCE_DATE_EPOCH" "$rpm_source_temporary"
 publish_output_file "$rpm_source_temporary" "$rpm_source"
 rpm_spec="$rpm_work/SPECS/gta-claw.spec"
 changelog_date="$(LC_ALL=C date -u --date="@$SOURCE_DATE_EPOCH" '+%a %b %d %Y')"
+rpm_scriptlet_dir="$WORK_DIR/rpm-scriptlets"
+ensure_output_directory "$rpm_scriptlet_dir"
+rpm_pre="$rpm_scriptlet_dir/pre"
+open_output_file "$rpm_pre" 0755
+sed \
+  "s/@PACKAGE_VERSION@/$VERSION-$LINUX_PACKAGE_RELEASE/g" \
+  "$LINUX_DIR/rpm/pre.in" \
+  >&"$OPEN_OUTPUT_FD"
+finish_output_file
+for scriptlet in post preun posttrans postun; do
+  copy_regular_input \
+    "$LINUX_DIR/rpm/$scriptlet" \
+    "$rpm_scriptlet_dir/$scriptlet" \
+    0755
+done
 open_output_file "$rpm_spec" 0644
 cat >&"$OPEN_OUTPUT_FD" <<EOF
 %global debug_package %{nil}
@@ -544,6 +705,8 @@ Source0:        gta-claw-rootfs.tar
 Requires:       glibc >= $BUILD_GLIBC_REQUIREMENT
 Requires:       libgcc
 Requires:       systemd >= 249
+Requires:       util-linux
+Requires:       python3 >= 3.8
 
 %description
 Packages gta-claw-daemon and gta-claw-cli without a JavaScript runtime or
@@ -560,60 +723,33 @@ tar -xf "%{SOURCE0}" -C "%{buildroot}"
 
 %files
 %defattr(-,root,root,-)
+%dir %attr(0700,root,root) /etc/gta-claw/credentials
 %config(noreplace) %attr(0640,root,root) /etc/gta-claw/gta-claw.env
 %config(noreplace) %attr(0600,root,root) /etc/gta-claw/credentials/daemon.conf
 /usr/bin/gta-claw-cli
 /usr/libexec/gta-claw/gta-claw-daemon
+/usr/libexec/gta-claw/gta-claw-direct-config
+/usr/libexec/gta-claw/gta-claw-runtime-ready
+/usr/libexec/gta-claw/gta-claw-start-authorized
+/usr/libexec/gta-claw/gta-claw-state-init
 /usr/lib/systemd/system/gta-claw-daemon.service
+/usr/lib/systemd/system/gta-claw-state-init.service
 /usr/lib/systemd/system-preset/80-gta-claw.preset
+/usr/lib/sysusers.d/gta-claw.conf
 /usr/share/doc/gta-claw
 
 %pre
-set -e
-if [ "\$1" -gt 1 ] && [ -d /run/systemd/system ]; then
-  if systemctl is-active --quiet gta-claw-daemon.service; then
-    touch /run/gta-claw-daemon.was-active
-  else
-    rm -f /run/gta-claw-daemon.was-active
-  fi
-else
-  rm -f /run/gta-claw-daemon.was-active
-fi
-exit 0
-
-%post
-set -e
-if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1
-  if [ "\$1" -eq 1 ]; then
-    systemctl preset gta-claw-daemon.service >/dev/null 2>&1
-  elif [ "\$1" -gt 1 ] && [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl restart gta-claw-daemon.service >/dev/null 2>&1
-  fi
-fi
-exit 0
-
-%preun
-set -e
-if [ -d /run/systemd/system ]; then
-  if [ "\$1" -eq 0 ]; then
-    systemctl disable --now gta-claw-daemon.service >/dev/null 2>&1
-    if systemctl is-active --quiet gta-claw-daemon.service; then
-      exit 1
-    fi
-  elif [ -e /run/gta-claw-daemon.was-active ]; then
-    systemctl is-active --quiet gta-claw-daemon.service
-    rm -f /run/gta-claw-daemon.was-active
-  fi
-fi
-exit 0
-
-%postun
-set -e
-if [ -d /run/systemd/system ]; then
-  systemctl daemon-reload >/dev/null 2>&1
-fi
-exit 0
+EOF
+cat "$rpm_pre" >&"$OPEN_OUTPUT_FD"
+printf '\n%%post\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/post" >&"$OPEN_OUTPUT_FD"
+printf '\n%%preun\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/preun" >&"$OPEN_OUTPUT_FD"
+printf '\n%%posttrans\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/posttrans" >&"$OPEN_OUTPUT_FD"
+printf '\n%%postun\n' >&"$OPEN_OUTPUT_FD"
+cat "$rpm_scriptlet_dir/postun" >&"$OPEN_OUTPUT_FD"
+cat >&"$OPEN_OUTPUT_FD" <<EOF
 
 %changelog
 * $changelog_date GTAStudio <noreply@github.com> - $VERSION-$LINUX_PACKAGE_RELEASE
@@ -644,7 +780,7 @@ ensure_output_directory "$oci_rootfs/usr/share/doc/gta-claw"
 ensure_output_directory "$oci_rootfs/usr/share/licenses/libc6"
 ensure_output_directory "$oci_rootfs/usr/share/licenses/libgcc-s1"
 ensure_output_directory "$oci_rootfs/etc"
-ensure_output_directory "$oci_rootfs/var/lib/gta-claw"
+ensure_output_directory "$oci_rootfs/var/lib"
 ensure_output_directory "$oci_rootfs/var/cache/gta-claw"
 ensure_output_directory "$oci_rootfs/var/log/gta-claw"
 ensure_output_directory "$oci_rootfs/run/gta-claw"
@@ -704,7 +840,6 @@ chmod 0755 "$oci_rootfs/usr/libexec/gta-claw/$LINUX_DAEMON_NAME"
 chmod 0644 "$oci_rootfs/etc/passwd" "$oci_rootfs/etc/group"
 find "$oci_rootfs/lib" -type f -exec chmod 0755 {} +
 chmod 0700 \
-  "$oci_rootfs/var/lib/gta-claw" \
   "$oci_rootfs/var/cache/gta-claw" \
   "$oci_rootfs/var/log/gta-claw" \
   "$oci_rootfs/run/gta-claw"
@@ -744,7 +879,6 @@ open_output_file "$writable_layer" 0644
     --numeric-owner \
     --no-recursion \
     -cf - \
-    var/lib/gta-claw \
     var/cache/gta-claw \
     var/log/gta-claw \
     run/gta-claw
@@ -767,7 +901,7 @@ oci_config_source="$oci_work/config.json"
 write_json "$oci_config_source" -n \
   --arg created "$created_at" \
   --arg architecture "$oci_architecture" \
-  --arg version "$VERSION" \
+  --arg version "$package_identity" \
   --arg revision "$source_sha" \
   --arg root_digest "sha256:$root_layer_digest" \
   --arg writable_digest "sha256:$writable_layer_digest" \
@@ -778,10 +912,16 @@ write_json "$oci_config_source" -n \
     config: {
       User: "65532:65532",
       Entrypoint: ["/usr/libexec/gta-claw/gta-claw-daemon"],
+      Cmd: [
+        "--state-profile",
+        "linux-protected",
+        "--state-path",
+        "/var/lib/gta-claw-protected"
+      ],
       WorkingDir: "/",
       Env: ["RUST_BACKTRACE=0"],
       Volumes: {
-        "/var/lib/gta-claw": {},
+        "/var/lib": {},
         "/var/cache/gta-claw": {},
         "/var/log/gta-claw": {},
         "/run/gta-claw": {}
@@ -793,7 +933,9 @@ write_json "$oci_config_source" -n \
         "org.opencontainers.image.revision": $revision,
         "org.opencontainers.image.source": "https://github.com/GTAStudio/GTA-Claw",
         "org.opencontainers.image.title": "gta-claw",
-        "org.opencontainers.image.version": $version
+        "org.opencontainers.image.version": $version,
+        "io.gta-claw.linux-protected.init": "/usr/libexec/gta-claw/gta-claw-daemon --prepare-linux-protected --state-path /var/lib/gta-claw-protected --service-uid 65532 --service-gid 65532",
+        "io.gta-claw.linux-protected.mode": "two-phase"
       }
     },
     rootfs: {
@@ -803,7 +945,7 @@ write_json "$oci_config_source" -n \
     history: [{
       created: $created,
       created_by: "packaging/linux/package.sh",
-      comment: "Node-free scratch OCI prototype"
+      comment: "Node-free scratch OCI two-phase runtime"
     }]
   }'
 oci_config_digest="$(sha256_file "$oci_config_source")"
@@ -855,7 +997,7 @@ write_json "$oci_layout/index.json" -n \
   --arg digest "sha256:$oci_manifest_digest" \
   --argjson size "$oci_manifest_size" \
   --arg architecture "$oci_architecture" \
-  --arg version "$VERSION" \
+  --arg version "$package_identity" \
   '{
     schemaVersion: 2,
     mediaType: "application/vnd.oci.image.index.v1+json",
@@ -873,6 +1015,39 @@ write_json "$oci_layout/oci-layout" -n '{imageLayoutVersion: "1.0.0"}'
 normalize_tree "$oci_layout"
 oci_artifact="$ARTIFACT_DIR/$base_name.oci.tar.gz"
 create_deterministic_tar_gz "$(dirname "$oci_layout")" "$(basename "$oci_layout")" "$oci_artifact"
+compose_artifact="$ARTIFACT_DIR/$base_name.compose.yaml"
+kubernetes_artifact="$ARTIFACT_DIR/$base_name.kubernetes.yaml"
+cri_sandbox_artifact="$ARTIFACT_DIR/$base_name.cri-sandbox.json"
+cri_init_artifact="$ARTIFACT_DIR/$base_name.cri-init.json"
+cri_runtime_artifact="$ARTIFACT_DIR/$base_name.cri-runtime.json"
+cri_probe_artifact="$ARTIFACT_DIR/$base_name.cri-probe.sh"
+render_oci_orchestration \
+  "$LINUX_DIR/oci/compose.yaml.in" \
+  "$compose_artifact" \
+  "$oci_manifest_digest"
+render_oci_orchestration \
+  "$LINUX_DIR/oci/kubernetes.yaml.in" \
+  "$kubernetes_artifact" \
+  "$oci_manifest_digest"
+validate_oci_orchestration_contract \
+  "$compose_artifact" \
+  "$kubernetes_artifact" \
+  "$oci_manifest_digest"
+copy_regular_input "$LINUX_DIR/oci/cri-sandbox.json" "$cri_sandbox_artifact" 0644
+render_oci_orchestration \
+  "$LINUX_DIR/oci/cri-init.json.in" \
+  "$cri_init_artifact" \
+  "$oci_manifest_digest"
+render_oci_orchestration \
+  "$LINUX_DIR/oci/cri-runtime.json.in" \
+  "$cri_runtime_artifact" \
+  "$oci_manifest_digest"
+copy_regular_input "$LINUX_DIR/oci/cri-probe.sh" "$cri_probe_artifact" 0755
+validate_cri_fixture_contract \
+  "$cri_sandbox_artifact" \
+  "$cri_init_artifact" \
+  "$cri_runtime_artifact" \
+  "$oci_manifest_digest"
 
 artifact_provenance="$ARTIFACT_DIR/provenance-$arch.json"
 write_json "$artifact_provenance" -n \
@@ -882,7 +1057,8 @@ write_json "$artifact_provenance" -n \
   --arg source_sha "$source_sha" \
   --arg source_tree "$source_tree" \
   --arg build_manifest_sha "$build_manifest_sha" \
-  --arg version "$VERSION" \
+  --arg version "$package_identity" \
+  --arg package_release "$LINUX_PACKAGE_RELEASE" \
   --arg architecture "$arch" \
   --arg tar_name "$(basename "$tar_artifact")" \
   --arg tar_sha "$(sha256_file "$tar_artifact")" \
@@ -892,6 +1068,18 @@ write_json "$artifact_provenance" -n \
   --arg rpm_sha "$(sha256_file "$rpm_artifact")" \
   --arg oci_name "$(basename "$oci_artifact")" \
   --arg oci_sha "$(sha256_file "$oci_artifact")" \
+  --arg compose_name "$(basename "$compose_artifact")" \
+  --arg compose_sha "$(sha256_file "$compose_artifact")" \
+  --arg kubernetes_name "$(basename "$kubernetes_artifact")" \
+  --arg kubernetes_sha "$(sha256_file "$kubernetes_artifact")" \
+  --arg cri_sandbox_name "$(basename "$cri_sandbox_artifact")" \
+  --arg cri_sandbox_sha "$(sha256_file "$cri_sandbox_artifact")" \
+  --arg cri_init_name "$(basename "$cri_init_artifact")" \
+  --arg cri_init_sha "$(sha256_file "$cri_init_artifact")" \
+  --arg cri_runtime_name "$(basename "$cri_runtime_artifact")" \
+  --arg cri_runtime_sha "$(sha256_file "$cri_runtime_artifact")" \
+  --arg cri_probe_name "$(basename "$cri_probe_artifact")" \
+  --arg cri_probe_sha "$(sha256_file "$cri_probe_artifact")" \
   '{
     schemaVersion: 1,
     source: {
@@ -905,12 +1093,23 @@ write_json "$artifact_provenance" -n \
     },
     runtimeDependencies: $runtime_manifest[0].packages,
     packageToolchain: $package_toolchain[0],
-    package: {name: "gta-claw", version: $version, architecture: $architecture},
+    package: {
+      name: "gta-claw",
+      version: $version,
+      release: ($package_release | tonumber),
+      architecture: $architecture
+    },
     subjects: [
       {name: $tar_name, digest: {sha256: $tar_sha}},
       {name: $deb_name, digest: {sha256: $deb_sha}},
       {name: $rpm_name, digest: {sha256: $rpm_sha}},
-      {name: $oci_name, digest: {sha256: $oci_sha}}
+      {name: $oci_name, digest: {sha256: $oci_sha}},
+      {name: $compose_name, digest: {sha256: $compose_sha}},
+      {name: $kubernetes_name, digest: {sha256: $kubernetes_sha}},
+      {name: $cri_sandbox_name, digest: {sha256: $cri_sandbox_sha}},
+      {name: $cri_init_name, digest: {sha256: $cri_init_sha}},
+      {name: $cri_runtime_name, digest: {sha256: $cri_runtime_sha}},
+      {name: $cri_probe_name, digest: {sha256: $cri_probe_sha}}
     ]
   }'
 write_sha256_manifest "$ARTIFACT_DIR" "$ARTIFACT_DIR/SHA256SUMS"

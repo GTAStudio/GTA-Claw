@@ -1,0 +1,66 @@
+# shellcheck shell=sh
+set -eu
+
+persistent_runtime_directory=/var/lib/gta-claw-install
+persistent_failure_marker=$persistent_runtime_directory/transaction-failed
+
+clear_native_configuration_fence() {
+  if [ ! -e "$persistent_failure_marker" ] &&
+    [ ! -L "$persistent_failure_marker" ]; then
+    return 0
+  fi
+  [ -d "$persistent_runtime_directory" ] &&
+    [ ! -L "$persistent_runtime_directory" ] &&
+    [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  [ -f "$persistent_failure_marker" ] &&
+    [ ! -L "$persistent_failure_marker" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$persistent_failure_marker")" = "0:0:600:1" ] ||
+    return 1
+  state=
+  extra=
+  size="$(wc -c <"$persistent_failure_marker")" || return 1
+  {
+    IFS= read -r state || return 1
+    if IFS= read -r extra || [ -n "$extra" ]; then
+      return 1
+    fi
+  } <"$persistent_failure_marker"
+  case "$state:$size" in
+    'configuration active:21' | 'configuration inactive:23')
+      rm -f "$persistent_failure_marker" || return 1
+      /usr/bin/sync -f "$persistent_runtime_directory" || return 1
+      if rmdir "$persistent_runtime_directory" >/dev/null 2>&1; then
+        :
+      fi
+      ;;
+  esac
+}
+
+status=0
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null || status=1
+  if [ "$1" -eq 0 ]; then
+    systemctl unmask --runtime gta-claw-daemon.service >/dev/null || status=1
+  fi
+fi
+
+if [ "$1" -eq 0 ]; then
+  rm -f \
+    /run/gta-claw-daemon.fresh-install \
+    /run/gta-claw-daemon.ready-for-replacement \
+    /run/gta-claw-daemon.remove-was-active \
+    /run/gta-claw-daemon.remove-was-enabled \
+    /run/gta-claw-daemon.remove-was-enabled-runtime \
+    /run/gta-claw-daemon.replacement \
+    /run/gta-claw-daemon.was-active \
+    /run/gta-claw-state-init/remove-was-active \
+    /run/gta-claw-state-init/remove-prepared \
+    /run/gta-claw-state-init/remove-was-package-fenced \
+    /run/gta-claw-state-init/start-authorized \
+    /run/gta-claw-state-init/initialization-failed \
+    /run/gta-claw-state-init/replacement-fenced || status=1
+  clear_native_configuration_fence || status=1
+fi
+
+exit "$status"

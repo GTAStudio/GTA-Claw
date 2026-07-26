@@ -1,0 +1,344 @@
+# shellcheck shell=sh disable=SC2317
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+replacement=/run/gta-claw-daemon.replacement
+ready=/run/gta-claw-daemon.ready-for-replacement
+was_active=/run/gta-claw-daemon.was-active
+remove_was_active=/run/gta-claw-daemon.remove-was-active
+remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
+remove_was_enabled_runtime=/run/gta-claw-daemon.remove-was-enabled-runtime
+persistent_enable_link=/etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service
+runtime_enable_link=/run/systemd/system/multi-user.target.wants/gta-claw-daemon.service
+runtime_mask_link=/run/systemd/system/gta-claw-daemon.service
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
+remove_initializer_was_active=$runtime_directory/remove-was-active
+remove_prepared=$runtime_directory/remove-prepared
+remove_was_package_fenced=$runtime_directory/remove-was-package-fenced
+lock=/var/lib/gta-claw-protected/state.writer.lock
+prepared=0
+package_fenced=0
+
+lock_holder_pid() {
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    return 1
+  fi
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+verify_unit_stopped() {
+  unit="$1"
+  active_state="$(systemctl show -P ActiveState "$unit")"
+  main_pid="$(systemctl show -P MainPID "$unit")"
+  control_pid="$(systemctl show -P ControlPID "$unit")"
+  case "$active_state:$main_pid:$control_pid" in
+    inactive:0:0 | failed:0:0) ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_writer_lock_released() {
+  lock_pid="$(lock_holder_pid)" || return 1
+  [ -z "$lock_pid" ]
+}
+
+stop_initializer() {
+  initializer_load_state="$(systemctl show -P LoadState gta-claw-state-init.service)"
+  case "$initializer_load_state" in
+    loaded | masked)
+      systemctl stop gta-claw-state-init.service
+      verify_unit_stopped gta-claw-state-init.service
+      ;;
+    not-found) ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_runtime_directory() {
+  if [ -L "$runtime_directory" ] ||
+    { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+    return 1
+  fi
+  if [ ! -e "$runtime_directory" ]; then
+    mkdir -m 0755 -- "$runtime_directory"
+  fi
+  if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    return 1
+  fi
+}
+
+ensure_failure_fence() {
+  ensure_runtime_directory || return 1
+  touch "$failure_marker"
+  touch "$replacement_fence"
+  chown 0:0 "$failure_marker" "$replacement_fence"
+  chmod 0644 "$failure_marker" "$replacement_fence"
+}
+
+fence_failed_restore() {
+  if ! ensure_failure_fence; then
+    echo "gta-claw removal rollback could not retain its failure fence" >&2
+  fi
+  if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon could not be runtime-masked after RPM removal rollback failure" >&2
+  fi
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after RPM removal rollback failure" >&2
+  fi
+  if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+    echo "gta-claw initializer stop failed after RPM removal rollback failure" >&2
+  fi
+  verify_unit_stopped gta-claw-daemon.service
+  verify_writer_lock_released
+  exit 1
+}
+
+restore_enablement() {
+  restore_enablement_failed=0
+  if [ -e "$remove_was_enabled" ]; then
+    systemctl enable gta-claw-daemon.service >/dev/null ||
+      restore_enablement_failed=1
+  fi
+  if [ -e "$remove_was_enabled_runtime" ]; then
+    systemctl enable --runtime gta-claw-daemon.service >/dev/null ||
+      restore_enablement_failed=1
+  fi
+  [ "$restore_enablement_failed" -eq 0 ]
+}
+
+capture_enablement_link() {
+  link="$1"
+  marker="$2"
+  if [ -L "$link" ]; then
+    if [ "$(readlink "$link")" != "/usr/lib/systemd/system/gta-claw-daemon.service" ]; then
+      echo "gta-claw enablement link has an unexpected target: $link" >&2
+      return 1
+    fi
+    touch "$marker" || return 1
+    chown 0:0 "$marker" || return 1
+    chmod 0600 "$marker" || return 1
+  elif [ -e "$link" ]; then
+    echo "gta-claw enablement path is not a symlink: $link" >&2
+    return 1
+  fi
+}
+
+remove_enablement_link() {
+  marker="$1"
+  link="$2"
+  [ -e "$marker" ] || return 0
+  if [ ! -L "$link" ] ||
+    [ "$(readlink "$link")" != "/usr/lib/systemd/system/gta-claw-daemon.service" ]; then
+    echo "gta-claw enablement link changed during RPM removal: $link" >&2
+    return 1
+  fi
+  rm -f -- "$link"
+}
+
+remove_enablement() {
+  remove_enablement_link "$remove_was_enabled" "$persistent_enable_link" || return 1
+  remove_enablement_link "$remove_was_enabled_runtime" "$runtime_enable_link"
+}
+
+retire_remove_journal() {
+  rm -f \
+    "$remove_was_active" \
+    "$remove_was_enabled" \
+    "$remove_was_enabled_runtime" \
+    "$remove_initializer_was_active" \
+    "$remove_prepared" \
+    "$remove_was_package_fenced"
+}
+
+validate_remove_journal_marker() {
+  marker="$1"
+  [ ! -e "$marker" ] && [ ! -L "$marker" ] && return 0
+  if [ -L "$marker" ] ||
+    [ ! -f "$marker" ] ||
+    [ "$(stat -c '%u:%g:%a:%h' "$marker")" != "0:0:644:1" ]; then
+    echo "gta-claw removal journal marker is invalid: $marker" >&2
+    return 1
+  fi
+}
+
+restore_on_failure() {
+  status="${1:-$?}"
+  trap - 0 HUP INT TERM
+  if [ "$prepared" -eq 0 ]; then
+    if [ "$package_fenced" -eq 1 ]; then
+      systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
+        fence_failed_restore
+      systemctl daemon-reload >/dev/null 2>&1 || fence_failed_restore
+      restore_enablement >/dev/null 2>&1 || fence_failed_restore
+      ensure_failure_fence || fence_failed_restore
+      systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
+        fence_failed_restore
+      systemctl stop gta-claw-daemon.service >/dev/null 2>&1 ||
+        fence_failed_restore
+      verify_unit_stopped gta-claw-daemon.service
+      verify_writer_lock_released
+    else
+      systemctl unmask --runtime gta-claw-daemon.service >/dev/null 2>&1 ||
+        fence_failed_restore
+      systemctl daemon-reload >/dev/null 2>&1 || fence_failed_restore
+      if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+        if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+          [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
+          fence_failed_restore
+        fi
+      fi
+      restore_enablement >/dev/null 2>&1 || fence_failed_restore
+      if [ -e "$remove_initializer_was_active" ]; then
+        systemctl start gta-claw-state-init.service >/dev/null 2>&1 ||
+          fence_failed_restore
+      fi
+      if [ -e "$remove_was_active" ]; then
+        systemctl start gta-claw-daemon.service >/dev/null 2>&1 ||
+          fence_failed_restore
+        /usr/libexec/gta-claw/gta-claw-runtime-ready >/dev/null 2>&1 ||
+          fence_failed_restore
+      fi
+    fi
+    retire_remove_journal || fence_failed_restore
+  fi
+  exit "$status"
+}
+
+if [ -d /run/systemd/system ]; then
+  if [ "$1" -eq 0 ]; then
+    if [ -e "$authorization_marker" ] || [ -L "$authorization_marker" ]; then
+      echo "refusing RPM removal during a gta-claw start authorization transaction" >&2
+      exit 1
+    fi
+    ensure_runtime_directory
+    if [ -e "$remove_prepared" ] || [ -L "$remove_prepared" ]; then
+      for journal_marker in \
+        "$remove_was_active" \
+        "$remove_was_enabled" \
+        "$remove_was_enabled_runtime" \
+        "$remove_initializer_was_active" \
+        "$remove_prepared" \
+        "$remove_was_package_fenced"; do
+        validate_remove_journal_marker "$journal_marker"
+      done
+      if [ -e "$remove_was_package_fenced" ]; then
+        package_fenced=1
+      fi
+      trap 'restore_on_failure "$?"' 0
+      trap 'restore_on_failure 129' HUP
+      trap 'restore_on_failure 130' INT
+      trap 'restore_on_failure 143' TERM
+      if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "masked" ] ||
+        [ ! -L "$runtime_mask_link" ] ||
+        [ "$(readlink "$runtime_mask_link")" != "/dev/null" ]; then
+        echo "gta-claw runtime mask changed during interrupted RPM removal" >&2
+        exit 1
+      fi
+      verify_unit_stopped gta-claw-daemon.service
+      verify_writer_lock_released
+      if [ -e "$persistent_enable_link" ] || [ -L "$persistent_enable_link" ] ||
+        [ -e "$runtime_enable_link" ] || [ -L "$runtime_enable_link" ]; then
+        echo "gta-claw enablement changed during interrupted RPM removal" >&2
+        exit 1
+      fi
+      stop_initializer
+      prepared=1
+      trap - 0 HUP INT TERM
+      exit 0
+    fi
+    rm -f \
+      "$remove_was_active" \
+      "$remove_was_enabled" \
+      "$remove_was_enabled_runtime" \
+      "$remove_initializer_was_active" \
+      "$remove_prepared" \
+      "$remove_was_package_fenced"
+    if ! enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+      : # disabled and not-found states are returned with nonzero status.
+    fi
+    case "$enabled_state" in
+      masked | masked-runtime)
+        if [ ! -e "$replacement_fence" ] || [ ! -e "$failure_marker" ]; then
+          echo "refusing externally masked gta-claw daemon during RPM removal" >&2
+          exit 1
+        fi
+        package_fenced=1
+        trap 'restore_on_failure "$?"' 0
+        trap 'restore_on_failure 129' HUP
+        trap 'restore_on_failure 130' INT
+        trap 'restore_on_failure 143' TERM
+        verify_unit_stopped gta-claw-daemon.service
+        verify_writer_lock_released
+        systemctl unmask --runtime gta-claw-daemon.service
+        systemctl daemon-reload
+        if ! enabled_state="$(systemctl is-enabled gta-claw-daemon.service 2>/dev/null)"; then
+          : # disabled and not-found states are returned with nonzero status.
+        fi
+        ;;
+    esac
+    case "$enabled_state" in
+      enabled | enabled-runtime | disabled | indirect | static | generated | transient | \
+        not-found | '') ;;
+      *) {
+        echo "unexpected gta-claw enablement state before RPM removal: $enabled_state" >&2
+        exit 1
+      } ;;
+    esac
+    capture_enablement_link "$persistent_enable_link" "$remove_was_enabled"
+    capture_enablement_link "$runtime_enable_link" "$remove_was_enabled_runtime"
+    active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+    case "$active_state" in
+      inactive | failed) ;;
+      active | activating | reloading | deactivating)
+        touch "$remove_was_active"
+        ;;
+      *) {
+        echo "unexpected gta-claw active state before RPM removal: $active_state" >&2
+        exit 1
+      } ;;
+    esac
+    initializer_active_state="$(systemctl show -P ActiveState gta-claw-state-init.service)"
+    case "$initializer_active_state" in
+      active | activating | reloading | deactivating)
+        touch "$remove_initializer_was_active"
+        ;;
+      inactive | failed) ;;
+      *) {
+        echo "unexpected gta-claw initializer state before RPM removal: $initializer_active_state" >&2
+        exit 1
+      } ;;
+    esac
+    touch "$remove_prepared"
+    if [ "$package_fenced" -eq 1 ]; then
+      touch "$remove_was_package_fenced"
+    fi
+    trap 'restore_on_failure "$?"' 0
+    trap 'restore_on_failure 129' HUP
+    trap 'restore_on_failure 130' INT
+    trap 'restore_on_failure 143' TERM
+    systemctl mask --runtime gta-claw-daemon.service
+    systemctl stop gta-claw-daemon.service
+    verify_unit_stopped gta-claw-daemon.service
+    verify_writer_lock_released
+    remove_enablement
+    stop_initializer
+    prepared=1
+    trap - 0 HUP INT TERM
+  elif [ -e "$replacement" ] && [ -e "$was_active" ]; then
+    test -e "$ready"
+    systemctl is-active --quiet gta-claw-daemon.service
+    main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"
+    case "$main_pid" in
+      '' | 0 | *[!0-9]*) exit 1 ;;
+    esac
+    test "$(lock_holder_pid)" = "$main_pid"
+  fi
+fi
+
+exit 0

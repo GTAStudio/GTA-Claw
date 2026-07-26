@@ -25,6 +25,14 @@ require_linux() {
   [[ "$(uname -s)" == "Linux" ]] || die "this operation requires Linux"
 }
 
+assert_no_protected_payload_path() {
+  local label="$1"
+  local listing="$2"
+  if grep -Eq '(^|/)(var/lib/gta-claw-protected)(/|$)' <<<"$listing"; then
+    die "$label owns the LinuxProtected namespace or a descendant"
+  fi
+}
+
 validate_release_version() {
   [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "version must be numeric X.Y.Z: $1"
@@ -66,7 +74,7 @@ validate_absolute_path() {
 
 canonical_target_root() {
   local repository
-  local target="$REPO_ROOT/target"
+  local target="${GTA_CLAW_TARGET_ROOT:-$REPO_ROOT/target}"
   local canonical
   if [[ "${SAFEIO_ACTIVE:-0}" == "1" ]]; then
     "$SAFEIO_HELPER" check "$SAFEIO_TARGET_FD"
@@ -75,20 +83,27 @@ canonical_target_root() {
   fi
   repository="$(cd "$REPO_ROOT" && pwd -P)"
   [[ "$repository" == "$REPO_ROOT" ]] || die "repository root changed during validation"
-  [[ ! -L "$target" ]] || die "repository target directory must not be a symlink"
-  if [[ ! -e "$target" ]]; then
-    mkdir -m 0700 -- "$target"
+  validate_absolute_path "$target" "canonical target directory"
+  [[ ! -L "$target" ]] || die "canonical target directory must not be a symlink"
+  if [[ -n "${GTA_CLAW_TARGET_ROOT:-}" ]]; then
+    [[ -d "$target" ]] || die "external target root must already exist"
+    [[ "$(stat -c '%u:%a' "$target")" == "$(id -u):700" ]] ||
+      die "external target root must be caller-owned mode 0700"
+  else
+    if [[ ! -e "$target" ]]; then
+      mkdir -m 0700 -- "$target"
+    fi
+    [[ "$(stat -c '%u' "$target")" -eq "$(id -u)" ]] ||
+      die "canonical target directory is not owned by the current user"
+    chmod 0700 -- "$target"
   fi
   [[ -d "$target" && ! -L "$target" ]] ||
-    die "repository target path is not a real directory"
-  [[ "$(stat -c '%u' "$target")" -eq "$(id -u)" ]] ||
-    die "repository target directory is not owned by the current user"
-  chmod 0700 -- "$target"
+    die "canonical target path is not a real directory"
   [[ "$(stat -c '%a' "$target")" == "700" ]] ||
     die "repository target directory is not private"
   canonical="$(cd "$target" && pwd -P)"
   [[ "$canonical" == "$target" ]] ||
-    die "repository target directory resolves outside the repository"
+    die "canonical target directory changed during validation"
   printf '%s\n' "$canonical"
 }
 
@@ -795,10 +810,26 @@ reject_forbidden_runtime_content() {
 }
 
 validate_service_contract() {
+  local network_directives
   local service="$1"
   local required
   for required in \
-    'DynamicUser=yes' \
+    'Requires=gta-claw-state-init.service' \
+    'After=local-fs.target gta-claw-state-init.service' \
+    'ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon' \
+    'ExecCondition=+/usr/libexec/gta-claw/gta-claw-start-authorized check' \
+    'ExecCondition=+/usr/libexec/gta-claw/gta-claw-direct-config network-deny-check gta-claw-daemon.service' \
+    'ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
+    'ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected' \
+    'EnvironmentFile=/run/gta-claw-state-init/gta-claw.env' \
+    'Type=notify' \
+    'NotifyAccess=main' \
+    'TimeoutStartSec=60s' \
+    'User=gta-claw' \
+    'Group=gta-claw' \
+    'SupplementaryGroups=' \
+    'ReadOnlyPaths=/run/gta-claw-state-init' \
+    'ReadWritePaths=/var/lib/gta-claw-protected' \
     'NoNewPrivileges=yes' \
     'PrivateTmp=yes' \
     'PrivateDevices=yes' \
@@ -806,20 +837,395 @@ validate_service_contract() {
     'ProtectHome=yes' \
     'ProtectKernelTunables=yes' \
     'ProtectControlGroups=yes' \
-    'CapabilityBoundingSet=' \
-    'RestrictAddressFamilies=AF_UNIX' \
+    'CapabilityBoundingSet=CAP_SETGID CAP_SETPCAP CAP_SETUID' \
+    'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
     'IPAddressDeny=any' \
-    'SystemCallFilter=@system-service' \
+    'SystemCallFilter=@system-service setgroups setresgid setresuid' \
     'LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf'; do
     grep -Fx "$required" "$service" >/dev/null ||
       die "service hardening contract missing: $required"
   done
+  if grep -Eq '^(DynamicUser|StateDirectory)=' "$service"; then
+    die "runtime service grants dynamic identity or state-directory mutation authority"
+  fi
   if grep -Eiq 'Environment=.*(token|secret|password|private.?key)=' "$service"; then
     die "service embeds a secret-like environment literal"
   fi
-  if grep -Eq '^ExecStart=.*--(listen|socket|config|state|log)' "$service"; then
+  network_directives="$(
+    awk -F= '
+      /^[[:space:]]*(RestrictAddressFamilies|IPAddressDeny|IPAddressAllow)[[:space:]]*=/ {
+        key = $1
+        value = substr($0, index($0, "=") + 1)
+        gsub(/[[:space:]]/, "", key)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        print key "=" value
+      }
+    ' "$service"
+  )"
+  [[ "$(printf '%s\n' "$network_directives" |
+    grep -c '^RestrictAddressFamilies=' || true)" == "1" &&
+    "$(printf '%s\n' "$network_directives" |
+      grep -c '^IPAddressDeny=' || true)" == "1" ]] ||
+    die "service network policy contains duplicate effective directives"
+  if printf '%s\n' "$network_directives" | grep -q '^IPAddressAllow='; then
+    die "package-owned service grants network access instead of requiring an operator drop-in"
+  fi
+  if grep -Eq '^ExecStart=.*--(listen|socket|config|log)' "$service"; then
     die "service invents a daemon runtime flag"
   fi
+}
+
+validate_initializer_service_contract() {
+  local service="$1"
+  local required
+  for required in \
+    'After=local-fs.target systemd-sysusers.service' \
+    'Before=gta-claw-daemon.service' \
+    'RequiresMountsFor=/var/lib' \
+    'Type=oneshot' \
+    'User=root' \
+    'Group=root' \
+    'ExecStart=/usr/libexec/gta-claw/gta-claw-state-init' \
+    'RemainAfterExit=no' \
+    'RuntimeDirectory=gta-claw-state-init' \
+    'RuntimeDirectoryMode=0755' \
+    'RuntimeDirectoryPreserve=yes' \
+    'ReadWritePaths=/var/lib /run/gta-claw-state-init' \
+    'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER' \
+    'NoNewPrivileges=yes' \
+    'ProtectSystem=strict' \
+    'IPAddressDeny=any'; do
+    grep -Fx "$required" "$service" >/dev/null ||
+      die "initializer service contract missing: $required"
+  done
+  if grep -Eq '^Condition(File|Path)IsExecutable=' "$service"; then
+    die "initializer service must fail rather than skip when its helper is unavailable"
+  fi
+}
+
+validate_sysusers_contract() {
+  local config="$1"
+  local expected
+  expected="$(
+    printf '%s\n' \
+      'g gta-claw -' \
+      'u gta-claw - "GTA Claw service" /nonexistent /usr/sbin/nologin'
+  )"
+  [[ "$(cat "$config")" == "$expected" ]] ||
+    die "sysusers contract must define only the locked gta-claw user and group"
+}
+
+validate_initializer_wrapper_contract() {
+  local wrapper="$1"
+  local required
+  local marker_line
+  local daemon_line
+  for required in \
+    'namespace=/var/lib/gta-claw-protected' \
+    'runtime_directory=/run/gta-claw-state-init' \
+    'failure_marker=$runtime_directory/initialization-failed' \
+    'validated_environment=$runtime_directory/gta-claw.env' \
+    'configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config' \
+    '"$configuration_helper" materialize / "$environment_file" "$credential_file"' \
+    'service_gid="$(getent group gta-claw | cut -d: -f3)"' \
+    'if [ "$primary_gid" != "$service_gid" ]; then' \
+    'touch "$failure_marker"' \
+    'chown 0:0 "$failure_marker"' \
+    'chmod 0644 "$failure_marker"' \
+    '--provision-linux-protected' \
+    '--initialize-linux-protected' \
+    '--state-path "$namespace"' \
+    '--service-uid "$service_uid"' \
+    '--service-gid "$service_gid"' \
+    'rm -f "$failure_marker"'; do
+    grep -F -- "$required" "$wrapper" >/dev/null ||
+      die "initializer wrapper contract missing: $required"
+  done
+  if grep -Eq \
+    '(^|[[:space:]])(rm|unlink|mv|ln|chmod|chown)([[:space:]].*)?gta-claw-protected' \
+    "$wrapper"; then
+    die "initializer wrapper contains directory-entry repair logic"
+  fi
+  marker_line="$(grep -nF 'touch "$failure_marker"' "$wrapper" | head -n 1 | cut -d: -f1)"
+  daemon_line="$(grep -nF 'if [ ! -x "$daemon" ]; then' "$wrapper" | head -n 1 | cut -d: -f1)"
+  [[ -n "$marker_line" && -n "$daemon_line" && "$marker_line" -lt "$daemon_line" ]] ||
+    die "initializer wrapper does not establish its failure fence before fallible initialization"
+}
+
+validate_runtime_ready_contract() {
+  local wrapper="$1"
+  local required
+  for required in \
+    'lock=/var/lib/gta-claw-protected/state.writer.lock' \
+    'ready_marker=/run/gta-claw-daemon.ready-for-replacement' \
+    'systemctl is-active --quiet gta-claw-daemon.service' \
+    'main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"' \
+    'control_pid="$(systemctl show -P ControlPID gta-claw-daemon.service' \
+    'ensure_failure_fence' \
+    'lslocks --noheadings --notruncate --output PID,PATH' \
+    'if [ "$lock_pid" = "$main_pid" ]; then' \
+    'if ! main_pid="$(systemctl show -P MainPID gta-claw-daemon.service)"; then' \
+    'if ! touch "$ready_marker"; then'; do
+    grep -F -- "$required" "$wrapper" >/dev/null ||
+      die "runtime readiness contract missing: $required"
+  done
+}
+
+validate_start_authorization_contract() {
+  local wrapper="$1"
+  local required
+  for required in \
+    'failure_marker=$runtime_directory/initialization-failed' \
+    'replacement_fence=$runtime_directory/replacement-fenced' \
+    'authorization_marker=$runtime_directory/start-authorized' \
+    'persistent_runtime_directory=/var/lib/gta-claw-install' \
+    'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
+    'process_start_time()' \
+    'process_state="$1"' \
+    'Z | X | x) return 1' \
+    'authorization_valid()' \
+    'arm_authorization()' \
+    'clear_authorization()' \
+    '[ "$authorized_pid" = "$PPID" ]' \
+    '0:0:600:1' \
+    'case "${1:-check}" in'; do
+    grep -F -- "$required" "$wrapper" >/dev/null ||
+      die "start authorization contract missing: $required"
+  done
+}
+
+validate_direct_lifecycle_contract() {
+  local installer="$1"
+  local uninstaller="$2"
+  local required
+  local mask_line
+  local stop_line
+  local lock_line
+  local unlink_line
+  for required in \
+    'refusing gta-claw downgrade' \
+    'gta-claw-direct-config' \
+    'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
+    'persistent_was_active_marker=$persistent_runtime_directory/was-active' \
+    'authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized' \
+    'ensure_failure_fence' \
+    'ensure_persistent_failure_fence' \
+    'lifecycle_lock=/run/gta-claw-lifecycle.lock' \
+    'acquire_lifecycle_lock' \
+    '/usr/bin/sync -f "$persistent_failure_marker"' \
+    '/usr/bin/sync -f /usr/libexec/gta-claw/gta-claw-daemon' \
+    "trap 'cancel_incomplete_install 130' INT" \
+    'stop_runtime_for_replacement' \
+    'verify_runtime_stopped' \
+    'active | activating | reloading | deactivating)' \
+    'main_pid="$(systemctl show -P MainPID "$unit")"' \
+    'control_pid="$(systemctl show -P ControlPID "$unit")"' \
+    'lock_pid="$(lock_holder_pid)"' \
+    'replacement_fence=$runtime_directory/replacement-fenced' \
+    'stop_initializer_for_replacement' \
+    'fail_install_runtime' \
+    'systemctl kill' \
+    '--kill-whom=all' \
+    'systemctl reset-failed gta-claw-daemon.service' \
+    '/usr/bin/systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf' \
+    '/usr/libexec/gta-claw/gta-claw-state-init' \
+    '/usr/libexec/gta-claw/gta-claw-runtime-ready' \
+    '"$authorization_helper" arm "$$"' \
+    '"$authorization_helper" clear' \
+    'systemctl restart gta-claw-daemon.service'; do
+    grep -F -- "$required" "$installer" >/dev/null ||
+      die "direct installer lifecycle contract missing: $required"
+  done
+  for required in \
+    'persistent_enable_link=/etc/systemd/system/multi-user.target.wants/gta-claw-daemon.service' \
+    'runtime_enable_link=/run/systemd/system/multi-user.target.wants/gta-claw-daemon.service' \
+    'persistent_mask_link=/etc/systemd/system/gta-claw-daemon.service' \
+    'runtime_mask_link=/run/systemd/system/gta-claw-daemon.service' \
+    'persistent_failure_marker=$persistent_runtime_directory/transaction-failed' \
+    'marker_state()' \
+    'capture_link()' \
+    'rollback_removal()' \
+    'lifecycle_lock=/run/gta-claw-lifecycle.lock' \
+    'acquire_lifecycle_lock' \
+    "trap 'rollback_removal 130' INT" \
+    'acquire_writer_lock' \
+    'verify_held_writer_lock' \
+    'main_pid="$(systemctl show -P MainPID "$unit")"' \
+    'control_pid="$(systemctl show -P ControlPID "$unit")"' \
+    'systemctl mask --runtime gta-claw-daemon.service' \
+    'payload_mutated=1'; do
+    grep -F -- "$required" "$uninstaller" >/dev/null ||
+      die "direct uninstaller lifecycle contract missing: $required"
+  done
+  mask_line="$(
+    grep -nF '  systemctl mask --runtime gta-claw-daemon.service' "$uninstaller" |
+      tail -n 1 |
+      cut -d: -f1
+  )"
+  stop_line="$(
+    grep -nF '  systemctl stop gta-claw-daemon.service' "$uninstaller" |
+      tail -n 1 |
+      cut -d: -f1
+  )"
+  lock_line="$(grep -nF 'acquire_writer_lock' "$uninstaller" | tail -n 1 | cut -d: -f1)"
+  unlink_line="$(grep -nF 'payload_mutated=1' "$uninstaller" | tail -n 1 | cut -d: -f1)"
+  [[ -n "$mask_line" && -n "$stop_line" && -n "$lock_line" &&
+    -n "$unlink_line" &&
+    "$mask_line" -lt "$stop_line" &&
+    "$stop_line" -lt "$lock_line" &&
+    "$lock_line" -lt "$unlink_line" ]] ||
+    die "direct uninstaller does not mask, stop, lock, and unlink in order"
+  grep -F 'preserved /var/lib/gta-claw-protected' "$uninstaller" >/dev/null ||
+    die "direct uninstaller does not declare protected-state preservation"
+  if grep -Eq 'rm .*gta-claw-protected|rm -[^[:space:]]*r.*gta-claw-protected' \
+    "$installer" "$uninstaller"; then
+    die "direct lifecycle scripts remove protected state"
+  fi
+  if grep -F 'systemctl disable --now' "$uninstaller" >/dev/null; then
+    die "direct uninstaller disables before proving the runtime stopped"
+  fi
+}
+
+validate_oci_manifest_digest() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]] ||
+    die "OCI manifest digest must be exactly 64 lowercase hexadecimal characters"
+}
+
+validate_oci_orchestration_templates() {
+  local compose="$1"
+  local kubernetes="$2"
+  local digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  assert_regular_file "$compose" "Compose orchestration template"
+  assert_regular_file "$kubernetes" "Kubernetes orchestration template"
+  python3 "$LINUX_DIR/tests/validate-orchestration.py" \
+    --template \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$compose" \
+    "$kubernetes"
+}
+
+render_oci_orchestration() {
+  local template="$1"
+  local output="$2"
+  local digest="$3"
+  local image
+  validate_oci_manifest_digest "$digest"
+  image="$LINUX_OCI_IMAGE_REPOSITORY@sha256:$digest"
+  open_output_file "$output" 0644
+  sed "s|@OCI_IMAGE_REFERENCE@|$image|g" "$template" >&"$OPEN_OUTPUT_FD"
+  finish_output_file
+}
+
+validate_oci_orchestration_contract() {
+  local compose="$1"
+  local kubernetes="$2"
+  local digest="$3"
+  validate_oci_manifest_digest "$digest"
+  python3 "$LINUX_DIR/tests/validate-orchestration.py" \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$compose" \
+    "$kubernetes"
+}
+
+validate_cri_fixture_templates() {
+  local digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  python3 "$LINUX_DIR/tests/validate-cri-fixtures.py" \
+    --template \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$1" \
+    "$2" \
+    "$3"
+}
+
+validate_cri_fixture_contract() {
+  local digest="$4"
+  validate_oci_manifest_digest "$digest"
+  python3 "$LINUX_DIR/tests/validate-cri-fixtures.py" \
+    --repository "$LINUX_OCI_IMAGE_REPOSITORY" \
+    --digest "$digest" \
+    "$1" \
+    "$2" \
+    "$3"
+}
+
+reject_unexpected_rpm_scriptlets() {
+  local artifact="$1"
+  local unexpected_tag
+  local unexpected_script
+  local unexpected_program
+  local trigger_tag
+  for unexpected_tag in PRETRANS VERIFYSCRIPT; do
+    unexpected_script="$(rpm -qp --qf "%{$unexpected_tag}" "$artifact")"
+    [[ -z "$unexpected_script" || "$unexpected_script" == "(none)" ]] ||
+      die "RPM contains unexpected $unexpected_tag scriptlet"
+    unexpected_program="$(rpm -qp --qf "%{${unexpected_tag}PROG}" "$artifact")"
+    [[ -z "$unexpected_program" || "$unexpected_program" == "(none)" ]] ||
+      die "RPM contains an unexpected $unexpected_tag interpreter"
+  done
+  for trigger_tag in \
+    TRIGGERSCRIPTS \
+    TRIGGERCONDS \
+    TRIGGERNAME \
+    TRIGGERTYPE \
+    FILETRIGGERSCRIPTS \
+    FILETRIGGERCONDS \
+    FILETRIGGERNAME \
+    FILETRIGGERTYPE \
+    TRANSFILETRIGGERSCRIPTS \
+    TRANSFILETRIGGERCONDS \
+    TRANSFILETRIGGERNAME \
+    TRANSFILETRIGGERTYPE; do
+    [[ -z "$(rpm -qp --qf "[%{$trigger_tag}\n]" "$artifact")" ]] ||
+      die "RPM contains unexpected trigger metadata: $trigger_tag"
+  done
+}
+
+reject_rpm_ghost_files() {
+  local artifact="$1"
+  local ghost
+  ghost="$(
+    rpm -qp --qf '[%{FILENAMES}\t%{FILEFLAGS:fflags}\n]' "$artifact" |
+      awk -F '\t' 'index($2, "g") { print $1; exit }'
+  )"
+  [[ -z "$ghost" ]] || die "RPM contains an unexpected ghost path: $ghost"
+}
+
+reject_forbidden_rpm_requirements() {
+  local artifact="$1"
+  if rpm -qp --requires "$artifact" |
+    grep -Eiq '(^|[[:space:]])(node|nodejs|npm|npx|pnpm|bun)([[:space:]]|$)'; then
+    die "RPM declares a forbidden JavaScript runtime or package-manager dependency"
+  fi
+}
+
+rpm_relationship_rows() {
+  local artifact="$1"
+  local prefix="$2"
+  local rows
+  if ! rows="$(
+    rpm -qp \
+      --qf "[%{${prefix}NAME}\t%{${prefix}VERSION}\t%{${prefix}FLAGS}\n]" \
+      "$artifact"
+  )"; then
+    die "RPM $prefix relationship arrays could not be queried"
+  fi
+  printf '%s\n' "$rows" | LC_ALL=C sort
+}
+
+validate_exact_rpm_relationships() {
+  local artifact="$1"
+  local expected_provides="$2"
+  local prefix
+  [[ "$(rpm_relationship_rows "$artifact" PROVIDE)" == "$expected_provides" ]] ||
+    die "RPM Provides arrays differ from the exact package policy"
+  for prefix in CONFLICT OBSOLETE RECOMMEND SUGGEST SUPPLEMENT ENHANCE ORDER; do
+    [[ -z "$(rpm_relationship_rows "$artifact" "$prefix")" ]] ||
+      die "RPM contains an unexpected $prefix relationship"
+  done
 }
 
 source "$LINUX_DIR/config.sh"

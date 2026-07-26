@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gta-claw
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gta-claw
+  template:
+    metadata:
+      labels:
+        app: gta-claw
+    spec:
+      initContainers:
+        - name: linux-protected-init
+          image: @OCI_IMAGE_REFERENCE@
+          command: ["/usr/libexec/gta-claw/gta-claw-daemon"]
+          args:
+            - --prepare-linux-protected
+            - --state-path
+            - /var/lib/gta-claw-protected
+            - --service-uid
+            - "65532"
+            - --service-gid
+            - "65532"
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, DAC_OVERRIDE, FOWNER]
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib
+      containers:
+        - name: gta-claw
+          image: @OCI_IMAGE_REFERENCE@
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: gta-claw-state

@@ -75,13 +75,17 @@ def normalize_member(name: str) -> str:
 
 
 def validate_tar(arguments: list[str]) -> None:
-    if len(arguments) != 6:
+    if len(arguments) != 7:
         fail(
             "usage: strict_artifact.py tar ARCHIVE gzip|none "
-            "MAX_COMPRESSED MAX_EXPANDED MAX_FILE MAX_MEMBERS"
+            "MAX_COMPRESSED MAX_EXPANDED MAX_FILE MAX_MEMBERS "
+            "required|forbidden|optional"
         )
     path, compression = arguments[:2]
-    max_compressed, max_expanded, max_file, max_members = map(int, arguments[2:])
+    max_compressed, max_expanded, max_file, max_members = map(int, arguments[2:6])
+    root_policy = arguments[6]
+    if root_policy not in {"required", "forbidden", "optional"}:
+        fail(f"invalid archive root policy: {root_policy}")
     compressed_size = os.path.getsize(path)
     if compressed_size > max_compressed:
         fail(f"archive compressed size exceeds limit: {compressed_size}")
@@ -102,6 +106,7 @@ def validate_tar(arguments: list[str]) -> None:
     names = set()
     entries = []
     total = 0
+    root_count = 0
     try:
         with tarfile.open(path, mode) as archive:
             for index, member in enumerate(archive, start=1):
@@ -109,6 +114,21 @@ def validate_tar(arguments: list[str]) -> None:
                     fail(f"archive member count exceeds {max_members}")
                 name = normalize_member(member.name)
                 if not name:
+                    root_count += 1
+                    if root_count > 1:
+                        fail("archive contains duplicate canonical root headers")
+                    if root_policy == "forbidden":
+                        fail("archive contains a forbidden canonical root header")
+                    if (
+                        not member.isdir()
+                        or member.size != 0
+                        or member.uid != 0
+                        or member.gid != 0
+                        or member.mode != 0o755
+                    ):
+                        fail(
+                            "archive canonical root must be a root-owned mode-0755 directory"
+                        )
                     continue
                 if name in names:
                     fail(f"duplicate normalized archive member: {name}")
@@ -132,6 +152,8 @@ def validate_tar(arguments: list[str]) -> None:
                         "gid": member.gid,
                     }
                 )
+            if root_policy == "required" and root_count != 1:
+                fail("archive must contain exactly one canonical root header")
     except (tarfile.TarError, EOFError, OSError) as error:
         fail(f"invalid archive {path}: {error}")
     print(json.dumps(entries, sort_keys=True, separators=(",", ":")))

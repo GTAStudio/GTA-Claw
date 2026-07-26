@@ -1,1 +1,2 @@
 disable gta-claw-daemon.service
+disable gta-claw-state-init.service

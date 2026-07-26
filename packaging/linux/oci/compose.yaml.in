@@ -1,0 +1,35 @@
+services:
+  gta-claw-init:
+    image: @OCI_IMAGE_REFERENCE@
+    user: "0:0"
+    entrypoint: ["/usr/libexec/gta-claw/gta-claw-daemon"]
+    command:
+      - --prepare-linux-protected
+      - --state-path
+      - /var/lib/gta-claw-protected
+      - --service-uid
+      - "65532"
+      - --service-gid
+      - "65532"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+    volumes:
+      - gta-claw-state:/var/lib
+
+  gta-claw:
+    image: @OCI_IMAGE_REFERENCE@
+    user: "65532:65532"
+    depends_on:
+      gta-claw-init:
+        condition: service_completed_successfully
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    volumes:
+      - gta-claw-state:/var/lib
+
+volumes:
+  gta-claw-state:

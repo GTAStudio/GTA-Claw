@@ -12,6 +12,7 @@ claw-application = { workspace = true, features = ["composition"] }
 claw-domain.workspace = true
 claw-platform.workspace = true
 claw-protocol.workspace = true
+claw-state.workspace = true
 secrecy = "=0.10.3"
 tokio = { version = "=1.52.3", features = [
   "io-std",
@@ -23,6 +24,9 @@ tokio = { version = "=1.52.3", features = [
   "time",
 ] }
 tokio-util = { version = "=0.7.18", features = ["rt"] }
+
+[dev-dependencies]
+sqlx.workspace = true
 
 [lints]
 workspace = true

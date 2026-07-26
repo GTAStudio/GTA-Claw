@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 require_linux
 [[ "${SAFEIO_ACTIVE:-0}" == "1" ]] ||
   die "build.sh is internal; use build-container.sh for directory-FD confinement"
-for tool in cargo dpkg-query git jq openssl readelf realpath rustc sha256sum; do
+for tool in cargo dpkg-query jq openssl readelf realpath rustc sha256sum; do
   require_tool "$tool"
 done
 [[ "$#" -eq 1 ]] || die "usage: build.sh ARCH"
@@ -24,6 +24,10 @@ target="$(arch_target "$arch")"
 : "${BUILD_INPUT_UMASK:?BUILD_INPUT_UMASK is required}"
 : "${BUILD_RECIPE_SHA256:?BUILD_RECIPE_SHA256 is required}"
 : "${DEBIAN_SNAPSHOT:?DEBIAN_SNAPSHOT is required}"
+: "${IMMUTABLE_SOURCE_SNAPSHOT:?IMMUTABLE_SOURCE_SNAPSHOT is required}"
+: "${SOURCE_COMMIT:?SOURCE_COMMIT is required}"
+: "${SOURCE_TREE:?SOURCE_TREE is required}"
+: "${SOURCE_TREE_RECEIPT:?SOURCE_TREE_RECEIPT is required}"
 : "${RUSTFLAGS:?RUSTFLAGS is required}"
 
 [[ "$BUILD_IMAGE" == "$LINUX_BUILD_IMAGE" ]] || die "unexpected build image identity"
@@ -34,6 +38,11 @@ target="$(arch_target "$arch")"
 [[ "$BUILD_RECIPE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "invalid build recipe digest"
 [[ "$BUILD_ENVIRONMENT_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "invalid build environment image ID"
+[[ "$IMMUTABLE_SOURCE_SNAPSHOT" == "1" ]] ||
+  die "build requires an immutable verified source snapshot"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ &&
+  "$SOURCE_TREE_RECEIPT" =~ ^[0-9a-f]{64}$ ]] ||
+  die "immutable source snapshot identity is invalid"
 
 OUTPUT_ROOT="$CARGO_TARGET_DIR"
 initialize_output_root
@@ -48,12 +57,8 @@ effective_umask="$(umask)"
 effective_umask="${effective_umask: -3}"
 [[ "$effective_umask" == "$BUILD_INPUT_UMASK" ]] ||
   die "effective build umask does not match BUILD_INPUT_UMASK"
-git -C "$REPO_ROOT" diff --quiet
-git -C "$REPO_ROOT" diff --cached --quiet
-source_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
-[[ -z "$source_status" ]] || die "source worktree must be clean: $source_status"
-source_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-source_tree="$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')"
+source_sha="$SOURCE_COMMIT"
+source_tree="$SOURCE_TREE"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$source_tree" =~ ^[0-9a-f]{40}$ ]] ||
   die "invalid source commit or tree identity"
 
@@ -293,6 +298,7 @@ manifest="$OUTPUT_ROOT/build-manifest.json"
 write_json_file "$manifest" -n \
   --arg source_sha "$source_sha" \
   --arg source_tree "$source_tree" \
+  --arg source_tree_receipt "$SOURCE_TREE_RECEIPT" \
   --arg source_epoch "$SOURCE_DATE_EPOCH" \
   --arg build_image "$BUILD_IMAGE" \
   --arg environment_image_id "$BUILD_ENVIRONMENT_IMAGE_ID" \
@@ -316,6 +322,7 @@ write_json_file "$manifest" -n \
       repository: "https://github.com/GTAStudio/GTA-Claw",
       commit: $source_sha,
       tree: $source_tree,
+      snapshotTreeReceipt: $source_tree_receipt,
       clean: true,
       sourceDateEpoch: ($source_epoch | tonumber)
     },

@@ -1,15 +1,522 @@
 #!/bin/sh
+# shellcheck disable=SC2317
 
-set -e
+set -eu
 
-if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] ||
-  [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
-  if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
-    systemctl --system daemon-reload >/dev/null
-    if [ -n "${2:-}" ]; then
-      deb-systemd-invoke try-restart gta-claw-daemon.service >/dev/null
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+complete_marker=$runtime_directory/initialization-complete
+replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
+authorization_helper=/usr/libexec/gta-claw/gta-claw-start-authorized
+configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config
+environment_file=/etc/gta-claw/gta-claw.env
+credential_file=/etc/gta-claw/credentials/daemon.conf
+persistent_runtime_directory=/var/lib/gta-claw-install
+persistent_failure_marker=$persistent_runtime_directory/transaction-failed
+was_active=/run/gta-claw-daemon.was-active
+remove_was_active=/run/gta-claw-daemon.remove-was-active
+remove_was_enabled=/run/gta-claw-daemon.remove-was-enabled
+remove_was_enabled_runtime=/run/gta-claw-daemon.remove-was-enabled-runtime
+remove_initializer_was_active=$runtime_directory/remove-was-active
+remove_prepared=$runtime_directory/remove-prepared
+remove_was_package_fenced=$runtime_directory/remove-was-package-fenced
+lock=/var/lib/gta-claw-protected/state.writer.lock
+rollback_complete=/run/gta-claw-daemon.preinst-rollback-complete
+configure_complete=0
+configuration_restart_intent=0
+
+lock_holder_pid() {
+  if ! locks="$(lslocks --noheadings --notruncate --output PID,PATH)"; then
+    echo "gta-claw writer-lock ownership could not be inspected" >&2
+    return 1
+  fi
+  printf '%s\n' "$locks" |
+    awk -v path="$lock" '$2 == path { print $1; exit }'
+}
+
+ensure_failure_fence() {
+  if [ -L "$runtime_directory" ] ||
+    { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+    echo "gta-claw initialization runtime path is not a physical directory" >&2
+    return 1
+  fi
+  if [ ! -e "$runtime_directory" ]; then
+    mkdir -m 0755 -- "$runtime_directory" || return 1
+  fi
+  if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+    return 1
+  fi
+  if [ -L "$failure_marker" ] ||
+    { [ -e "$failure_marker" ] && [ ! -f "$failure_marker" ]; }; then
+    echo "gta-claw initialization failure marker is not a physical file" >&2
+    return 1
+  fi
+  touch "$failure_marker" || return 1
+  chown 0:0 "$failure_marker" || return 1
+  chmod 0644 "$failure_marker" || return 1
+}
+
+retain_replacement_fence() {
+  [ -d "$runtime_directory" ] && [ ! -L "$runtime_directory" ] || return 1
+  if [ -L "$replacement_fence" ] ||
+    { [ -e "$replacement_fence" ] && [ ! -f "$replacement_fence" ]; }; then
+    return 1
+  fi
+  touch "$replacement_fence" || return 1
+  chown 0:0 "$replacement_fence" || return 1
+  chmod 0644 "$replacement_fence" || return 1
+}
+
+retain_configuration_failure() {
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    echo "gta-claw persistent configuration path is not a physical directory" >&2
+    return 1
+  fi
+  if [ ! -e "$persistent_runtime_directory" ]; then
+    mkdir -m 0700 -- "$persistent_runtime_directory" || return 1
+  fi
+  [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  if [ -L "$persistent_failure_marker" ] ||
+    [ ! -f "$persistent_failure_marker" ] ||
+    [ "$(stat -c '%u:%g:%a:%h' "$persistent_failure_marker")" != "0:0:600:1" ]; then
+    return 1
+  fi
+  configuration_state=
+  extra=
+  size="$(wc -c <"$persistent_failure_marker")" || return 1
+  {
+    IFS= read -r configuration_state || return 1
+    if IFS= read -r extra || [ -n "$extra" ]; then
+      return 1
+    fi
+  } <"$persistent_failure_marker"
+  case "$configuration_state:$size" in
+    'configuration active:21') configuration_restart_intent=1 ;;
+    'configuration inactive:23') configuration_restart_intent=0 ;;
+    *) return 1 ;;
+  esac
+}
+
+clear_configuration_failure() {
+  [ -f "$persistent_failure_marker" ] &&
+    [ ! -L "$persistent_failure_marker" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$persistent_failure_marker")" = "0:0:600:1" ] ||
+    return 1
+  rm -f "$persistent_failure_marker" || return 1
+  if /usr/bin/sync -f "$persistent_runtime_directory"; then
+    return
+  fi
+  printf '%s\n' "$configuration_state" >"$persistent_failure_marker" || return 1
+  chown 0:0 "$persistent_failure_marker" || return 1
+  chmod 0600 "$persistent_failure_marker" || return 1
+  /usr/bin/sync -f "$persistent_failure_marker" || return 1
+  /usr/bin/sync -f "$persistent_runtime_directory" || return 1
+  return 1
+}
+
+prepare_abort_deconfigure_configuration() {
+  [ "$1" = "abort-deconfigure" ] || return 0
+  if [ -e "$persistent_failure_marker" ] || [ -L "$persistent_failure_marker" ]; then
+    return 0
+  fi
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    return 1
+  fi
+  if [ ! -e "$persistent_runtime_directory" ]; then
+    mkdir -m 0700 -- "$persistent_runtime_directory" || return 1
+  fi
+  [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  intent=inactive
+  if ! active_state="$(
+    systemctl show -P ActiveState gta-claw-daemon.service 2>/dev/null
+  )"; then
+    return 1
+  fi
+  case "$active_state" in
+    active | activating | reloading | deactivating) intent=active ;;
+  esac
+  [ ! -e "$remove_was_active" ] || intent=active
+  temporary="$persistent_runtime_directory/.transaction-failed.$$"
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+  if ! {
+    (umask 077 && printf 'configuration %s\n' "$intent" >"$temporary") &&
+      chown 0:0 "$temporary" &&
+      chmod 0600 "$temporary" &&
+      /usr/bin/sync -f "$temporary" &&
+      mv -f "$temporary" "$persistent_failure_marker" &&
+      /usr/bin/sync -f "$persistent_runtime_directory"
+  }; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+verify_unit_stopped() {
+  unit="$1"
+  label="$2"
+  active_state="$(systemctl show -P ActiveState "$unit")"
+  main_pid="$(systemctl show -P MainPID "$unit")"
+  control_pid="$(systemctl show -P ControlPID "$unit")"
+  case "$active_state:$main_pid:$control_pid" in
+    inactive:0:0 | failed:0:0) ;;
+    *) {
+      echo "$label remains $active_state with MainPID $main_pid and ControlPID $control_pid" >&2
+      return 1
+    } ;;
+  esac
+}
+
+verify_writer_lock_released() {
+  if ! lock_pid="$(lock_holder_pid)"; then
+    return 1
+  fi
+  if [ -n "$lock_pid" ]; then
+    echo "gta-claw writer lock remains held by PID $lock_pid" >&2
+    return 1
+  fi
+}
+
+verify_runtime_stopped() {
+  verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+  verify_writer_lock_released
+}
+
+stop_initializer_for_replacement() {
+  initializer_load_state="$(systemctl show -P LoadState gta-claw-state-init.service)"
+  case "$initializer_load_state" in
+    loaded | masked)
+      systemctl stop gta-claw-state-init.service
+      verify_unit_stopped gta-claw-state-init.service "gta-claw initializer"
+      ;;
+    not-found) ;;
+    *) {
+      echo "unexpected gta-claw initializer load state: $initializer_load_state" >&2
+      exit 1
+    } ;;
+  esac
+}
+
+fence_failed_runtime() {
+  requested_status="${1:-1}"
+  trap - 0 HUP INT TERM
+  failure=0
+  if ! rm -f "$authorization_marker"; then
+    echo "gta-claw configure start authorization could not be cancelled" >&2
+    failure=1
+  fi
+  ensure_failure_fence ||
+    {
+      echo "gta-claw configure failure marker could not be retained" >&2
+      failure=1
+    }
+  retain_replacement_fence ||
+    {
+      echo "gta-claw configure replacement fence could not be retained" >&2
+      failure=1
+    }
+  if [ -d /run/systemd/system ]; then
+    if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+      echo "gta-claw daemon could not be runtime-masked after configure failure" >&2
+      failure=1
+    fi
+    if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+      echo "gta-claw daemon stop failed after configure failure" >&2
+      failure=1
+    fi
+    if ! verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"; then
+      if ! systemctl kill \
+        --kill-whom=all \
+        --signal=KILL \
+        gta-claw-daemon.service >/dev/null 2>&1; then
+        echo "gta-claw daemon processes could not be killed after configure failure" >&2
+        failure=1
+      fi
+    fi
+    if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+      echo "gta-claw initializer stop failed after configure failure" >&2
+      failure=1
+    fi
+    verify_runtime_stopped ||
+      {
+        echo "gta-claw configure failure cancellation could not be verified" >&2
+        failure=1
+      }
+  elif ! verify_writer_lock_released; then
+    failure=1
+  fi
+  [ "$failure" -eq 0 ] ||
+    {
+      echo "gta-claw configure failure cancellation completed with errors" >&2
+      exit 1
+    }
+  exit "$requested_status"
+}
+
+cancel_incomplete_configure() {
+  status="${1:-$?}"
+  trap - 0 HUP INT TERM
+  if [ "$configure_complete" -eq 0 ]; then
+    fence_failed_runtime "$status"
+  fi
+  exit "$status"
+}
+
+fail_configure_after() {
+  if [ "${GTA_CLAW_PACKAGE_TEST_FAIL_AFTER:-}" = "$1" ]; then
+    if [ "${GTA_CLAW_PACKAGE_TEST_BREAK_FAILURE_FENCE:-0}" = "1" ]; then
+      rm -f "$failure_marker"
+      ln -s /bin/true "$failure_marker"
+    fi
+    echo "injected Debian configure failure after $1" >&2
+    return 1
+  fi
+}
+
+fence_failed_remove_restore() {
+  ensure_failure_fence
+  retain_replacement_fence
+  chown 0:0 "$replacement_fence"
+  chmod 0644 "$replacement_fence"
+  if ! systemctl mask --runtime gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon could not be runtime-masked after removal recovery failure" >&2
+  fi
+  if ! systemctl stop gta-claw-daemon.service >/dev/null 2>&1; then
+    echo "gta-claw daemon stop failed after removal recovery failure" >&2
+  fi
+  if ! systemctl stop gta-claw-state-init.service >/dev/null 2>&1; then
+    echo "gta-claw initializer stop failed after removal recovery failure" >&2
+  fi
+  verify_runtime_stopped
+  exit 1
+}
+
+stop_for_idempotent_configure() {
+  load_state="$(systemctl show -P LoadState gta-claw-daemon.service)"
+  case "$load_state" in
+    masked)
+      if [ ! -e "$replacement_fence" ] || [ ! -e "$failure_marker" ]; then
+        echo "refusing externally masked gta-claw daemon" >&2
+        exit 1
+      fi
+      systemctl stop gta-claw-daemon.service
+      verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+      verify_writer_lock_released
+      stop_initializer_for_replacement
+      verify_writer_lock_released
+      return
+      ;;
+    loaded)
+      ensure_failure_fence
+      if [ ! -e "$replacement_fence" ]; then
+        rm -f "$was_active"
+        active_state="$(systemctl show -P ActiveState gta-claw-daemon.service)"
+        case "$active_state" in
+          inactive | failed) ;;
+          active | activating | reloading | deactivating)
+            touch "$was_active"
+            ;;
+          *) {
+            echo "unexpected gta-claw daemon state before initialization: $active_state" >&2
+            exit 1
+          } ;;
+        esac
+      fi
+      retain_replacement_fence
+      systemctl mask --runtime gta-claw-daemon.service
+      systemctl stop gta-claw-daemon.service
+      verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+      ;;
+    not-found)
+      ensure_failure_fence
+      if [ ! -e "$replacement_fence" ]; then
+        rm -f "$was_active"
+      fi
+      retain_replacement_fence
+      systemctl mask --runtime gta-claw-daemon.service
+      verify_unit_stopped gta-claw-daemon.service "gta-claw daemon"
+      ;;
+    *) {
+      echo "unexpected gta-claw daemon load state before initialization: $load_state" >&2
+      exit 1
+    } ;;
+  esac
+  verify_writer_lock_released
+  stop_initializer_for_replacement
+  verify_writer_lock_released
+}
+
+restore_remove_state() {
+  [ -e "$remove_prepared" ] || return 0
+  if ! systemctl unmask --runtime gta-claw-daemon.service; then
+    fence_failed_remove_restore
+  fi
+  if ! systemctl daemon-reload >/dev/null; then
+    fence_failed_remove_restore
+  fi
+  if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+    if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+      [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
+      fence_failed_remove_restore
     fi
   fi
-fi
+  if [ -e "$remove_was_enabled" ]; then
+    if ! systemctl enable gta-claw-daemon.service >/dev/null; then
+      fence_failed_remove_restore
+    fi
+  fi
+  if [ -e "$remove_was_enabled_runtime" ]; then
+    if ! systemctl enable --runtime gta-claw-daemon.service >/dev/null; then
+      fence_failed_remove_restore
+    fi
+  fi
+  if [ -e "$remove_was_package_fenced" ]; then
+    ensure_failure_fence
+    retain_replacement_fence
+    if ! systemctl mask --runtime gta-claw-daemon.service; then
+      fence_failed_remove_restore
+    fi
+    if ! systemctl stop gta-claw-daemon.service; then
+      fence_failed_remove_restore
+    fi
+    verify_runtime_stopped
+    rm -f \
+      "$remove_was_active" \
+      "$remove_was_enabled" \
+      "$remove_was_enabled_runtime" \
+      "$remove_initializer_was_active" \
+      "$remove_prepared" \
+      "$remove_was_package_fenced"
+    return
+  fi
+  if [ -e "$remove_initializer_was_active" ]; then
+    if ! systemctl start gta-claw-state-init.service; then
+      fence_failed_remove_restore
+    fi
+  fi
+  if [ -e "$remove_was_active" ]; then
+    if ! deb-systemd-invoke start gta-claw-daemon.service; then
+      fence_failed_remove_restore
+    fi
+    if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+      fence_failed_remove_restore
+    fi
+  fi
+  rm -f \
+    "$remove_was_active" \
+    "$remove_was_enabled" \
+    "$remove_was_enabled_runtime" \
+    "$remove_initializer_was_active" \
+    "$remove_prepared" \
+    "$remove_was_package_fenced"
+}
+
+case "$1" in
+  configure | abort-upgrade | abort-deconfigure)
+    if [ -z "${DPKG_ROOT:-}" ]; then
+      preinst_rolled_back=0
+      if [ "$1" != "configure" ] &&
+        { [ -e "$rollback_complete" ] || [ -L "$rollback_complete" ]; }; then
+        if [ -L "$rollback_complete" ] ||
+          [ ! -f "$rollback_complete" ] ||
+          [ "$(stat -c '%u:%g:%a:%h' "$rollback_complete")" != "0:0:600:1" ]; then
+          echo "gta-claw preinst rollback receipt is invalid" >&2
+          exit 1
+        fi
+        rm -f "$rollback_complete"
+        preinst_rolled_back=1
+      fi
+      if [ "$preinst_rolled_back" -eq 0 ]; then
+        prepare_abort_deconfigure_configuration "$1" || fence_failed_runtime
+        trap 'cancel_incomplete_configure "$?"' 0
+        trap 'cancel_incomplete_configure 129' HUP
+        trap 'cancel_incomplete_configure 130' INT
+        trap 'cancel_incomplete_configure 143' TERM
+        rm -f "$authorization_marker"
+        ensure_failure_fence
+        if [ -d /run/systemd/system ]; then
+          stop_for_idempotent_configure
+        else
+          ensure_failure_fence
+          retain_replacement_fence
+          verify_writer_lock_released
+        fi
+        systemd-sysusers /usr/lib/sysusers.d/gta-claw.conf
+        GTA_CLAW_DEFER_FENCE_CLEAR=1 \
+          /usr/libexec/gta-claw/gta-claw-state-init
+        fail_configure_after initialization
+        retain_configuration_failure || fence_failed_runtime
+        if ! "$configuration_helper" \
+          verify / "$environment_file" "$credential_file"; then
+          fence_failed_runtime
+        fi
+        fail_configure_after configuration
+        if [ -d /run/systemd/system ]; then
+          if ! systemctl unmask --runtime gta-claw-daemon.service; then
+            fence_failed_runtime
+          fi
+          fail_configure_after unmask
+          if ! systemctl --system daemon-reload >/dev/null; then
+            fence_failed_runtime
+          fi
+          fail_configure_after daemon-reload
+          if [ "$(systemctl show -P LoadState gta-claw-daemon.service)" != "not-found" ]; then
+            if ! systemctl reset-failed gta-claw-daemon.service >/dev/null 2>&1 &&
+              [ "$(systemctl show -P ActiveState gta-claw-daemon.service)" != "inactive" ]; then
+              fence_failed_runtime
+            fi
+          fi
+          if [ "$1" = "configure" ] && [ -z "${2:-}" ] &&
+            [ ! -e "$was_active" ] &&
+            [ "$configuration_restart_intent" -eq 0 ]; then
+            if ! systemctl preset gta-claw-daemon.service >/dev/null; then
+              fence_failed_runtime
+            fi
+            fail_configure_after preset
+          fi
+          if [ -e "$was_active" ] || [ "$configuration_restart_intent" -eq 1 ]; then
+            if ! "$authorization_helper" arm "$$"; then
+              fence_failed_runtime
+            fi
+            if ! deb-systemd-invoke restart gta-claw-daemon.service >/dev/null; then
+              fence_failed_runtime
+            fi
+            fail_configure_after restart
+            if ! /usr/libexec/gta-claw/gta-claw-runtime-ready; then
+              fence_failed_runtime
+            fi
+            if ! "$authorization_helper" clear; then
+              fence_failed_runtime
+            fi
+            fail_configure_after readiness
+            rm -f \
+              /run/gta-claw-daemon.ready-for-replacement \
+              "$was_active"
+          fi
+        fi
+        rm -f "$authorization_marker"
+        rm -f "$failure_marker" "$complete_marker" "$replacement_fence"
+        clear_configuration_failure || fence_failed_runtime
+        configure_complete=1
+        trap - 0 HUP INT TERM
+      fi
+    fi
+    ;;
+  abort-remove)
+    if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+      restore_remove_state
+    fi
+    ;;
+esac
 
 exit 0

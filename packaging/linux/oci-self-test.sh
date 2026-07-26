@@ -241,6 +241,49 @@ printf 'x' >&"$OPEN_OUTPUT_FD"
 finish_output_file
 expect_invalid config-blob "$(pack_case config-blob "$layout")"
 
+for mutation in \
+  root-user \
+  missing-runtime-command \
+  single-phase-label \
+  missing-state-volume \
+  extra-state-volume \
+  null-state-volume \
+  invalid-rootfs-type; do
+  layout="$(prepare_case "config-$mutation")"
+  manifest="$(manifest_blob "$layout")"
+  config_digest="$(jq -er '.config.digest' "$manifest")"
+  config="$layout/blobs/sha256/${config_digest#sha256:}"
+  case "$mutation" in
+    root-user)
+      replace_json "$config" '.config.User = "0:0"'
+      ;;
+    missing-runtime-command)
+      replace_json "$config" 'del(.config.Cmd)'
+      ;;
+    single-phase-label)
+      replace_json \
+        "$config" \
+        '.config.Labels["io.gta-claw.linux-protected.mode"] = "single-process"'
+      ;;
+    missing-state-volume)
+      replace_json "$config" 'del(.config.Volumes["/var/lib"])'
+      ;;
+    extra-state-volume)
+      replace_json \
+        "$config" \
+        '.config.Volumes["/var/lib/gta-claw-protected"] = {}'
+      ;;
+    null-state-volume)
+      replace_json "$config" '.config.Volumes["/var/lib"] = null'
+      ;;
+    invalid-rootfs-type)
+      replace_json "$config" '.rootfs.type = "invalid"'
+      ;;
+  esac
+  reseal_all "$layout"
+  expect_invalid "config-$mutation" "$(pack_case "config-$mutation" "$layout")"
+done
+
 layout="$(prepare_case manifest-blob)"
 manifest="$(manifest_blob "$layout")"
 mv "$manifest" "$OUTPUT_ROOT/discard/manifest-blob"
@@ -272,6 +315,46 @@ for kind in traversal symlink hardlink fifo device whiteout duplicate bomb; do
   reseal_all "$layout"
   expect_invalid "layer-$kind" "$(pack_case "layer-$kind" "$layout")"
 done
+
+layout="$(prepare_case writable-state-ownership)"
+manifest="$(manifest_blob "$layout")"
+layer_digest="$(jq -er '.layers[1].digest' "$manifest")"
+layer="$layout/blobs/sha256/${layer_digest#sha256:}"
+writable_root="$OUTPUT_ROOT/writable-state-root"
+ensure_output_directory "$writable_root"
+tar -xf "$layer" -C "$writable_root"
+ensure_output_directory "$writable_root/var/lib/gta-claw-protected"
+chmod 0700 "$writable_root/var/lib/gta-claw-protected"
+mv "$layer" "$OUTPUT_ROOT/discard/writable-state-layer"
+open_output_file "$layer" 0644
+(
+  cd "$writable_root"
+  tar \
+    --sort=name \
+    --format=posix \
+    --owner=65532 \
+    --group=65532 \
+    --numeric-owner \
+    --no-recursion \
+    -cf - \
+    run/gta-claw \
+    var/cache/gta-claw \
+    var/lib/gta-claw-protected \
+    var/log/gta-claw
+) >&"$OPEN_OUTPUT_FD"
+finish_output_file
+reseal_all "$layout"
+expect_invalid writable-state-ownership \
+  "$(pack_case writable-state-ownership "$layout")"
+
+root_case="$(prepare_rootfs_case root-layer-state-directory)"
+layout="${root_case%%|*}"
+rootfs="${root_case##*|}"
+ensure_output_directory "$rootfs/var/lib/gta-claw-protected"
+chmod 0750 "$rootfs/var/lib/gta-claw-protected"
+repack_root_layer "$layout" "$rootfs"
+expect_invalid root-layer-state-directory \
+  "$(pack_case root-layer-state-directory "$layout")"
 
 layout="$(prepare_case duplicate-json-key)"
 manifest="$(manifest_blob "$layout")"
@@ -343,6 +426,18 @@ replace_json \
 rewrite_rootfs_checksums "$rootfs"
 repack_root_layer "$layout" "$rootfs"
 expect_invalid substituted-application "$(pack_case substituted-application "$layout")"
+
+for orchestration in compose.yaml kubernetes.yaml; do
+  name="substituted-${orchestration%%.*}"
+  root_case="$(prepare_rootfs_case "$name")"
+  layout="${root_case%%|*}"
+  rootfs="${root_case##*|}"
+  printf '\n# resealed untrusted mutation\n' \
+    >>"$rootfs/usr/share/doc/gta-claw/$orchestration"
+  rewrite_rootfs_checksums "$rootfs"
+  repack_root_layer "$layout" "$rootfs"
+  expect_invalid "$name" "$(pack_case "$name" "$layout")"
+done
 
 layout="$(prepare_case outer-traversal)"
 outer="$OUTPUT_ROOT/outer-traversal.oci.tar.gz"

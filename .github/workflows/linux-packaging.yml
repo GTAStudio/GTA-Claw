@@ -5,28 +5,10 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/linux-packaging.yml"
-      - "packaging/linux/**"
-      - "apps/**"
-      - "crates/**"
-      - "compat/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "deny.toml"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
+      - "**"
   pull_request:
     paths:
-      - ".github/workflows/linux-packaging.yml"
-      - "packaging/linux/**"
-      - "apps/**"
-      - "crates/**"
-      - "compat/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "deny.toml"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
+      - "**"
   workflow_dispatch:
 
 permissions:
@@ -57,7 +39,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils gcc jq patchelf python3 rpm shellcheck
+            binutils gcc jq patchelf python3 python3-jsonschema python3-yaml rpm shellcheck
           archive="$RUNNER_TEMP/actionlint.tar.gz"
           curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
             --output "$archive" \
@@ -71,6 +53,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unsafe_source="$(
+            find packaging/linux -mindepth 1 \
+              ! -type d ! -type f -print -quit
+          )"
+          test -z "$unsafe_source" || {
+            echo "Linux packaging contains a symlink or special source: $unsafe_source" >&2
+            exit 1
+          }
+          source_policy=packaging/linux/tests/validate-source-surfaces.py
+          test -f "$source_policy" && test ! -L "$source_policy"
+          test "$(git ls-files --stage -- "$source_policy" | awk '{ print $1 }')" = 100755
+          python3 "$source_policy" packaging/linux
           find packaging/linux -type f -name '*.sh' -print0 |
             while IFS= read -r -d '' script; do
               bash -n "$script"
@@ -78,6 +72,21 @@ jobs:
               # intentionally use single quotes to prevent shell expansion.
               shellcheck -x -e SC1091,SC2016 "$script"
             done
+          for script in \
+            packaging/linux/debian/postinst \
+            packaging/linux/debian/postrm \
+            packaging/linux/debian/preinst.in \
+            packaging/linux/debian/prerm \
+            packaging/linux/libexec/gta-claw-runtime-ready \
+            packaging/linux/libexec/gta-claw-state-init \
+            packaging/linux/rpm/post \
+            packaging/linux/rpm/posttrans \
+            packaging/linux/rpm/postun \
+            packaging/linux/rpm/pre.in \
+            packaging/linux/rpm/preun; do
+            sh -n "$script"
+            shellcheck -x "$script"
+          done
           find packaging/linux -type f -name '*.py' -print0 |
             while IFS= read -r -d '' script; do
               python3 -c 'import sys; path = sys.argv[1]; compile(open(path, encoding="utf-8").read(), path, "exec")' "$script"
@@ -85,7 +94,10 @@ jobs:
           actionlint .github/workflows/linux-packaging.yml
           ./packaging/linux/workflow-self-test.sh
           ./packaging/linux/self-test.sh
-          python3 packaging/linux/safeio.py \
+          TMPDIR="$RUNNER_TEMP" ./packaging/linux/tests/container-trust-self-test.sh
+          sudo ./packaging/linux/tests/direct-config-self-test.sh \
+            "$RUNNER_TEMP/gta-claw-direct-config-self-test"
+          TMPDIR="$RUNNER_TEMP" python3 packaging/linux/safeio.py \
             run-create linux-safeio-self-test -- \
             ./packaging/linux/safeio-self-test.sh
 
@@ -93,6 +105,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01  crates/claw-sqlite-file-control/Cargo.toml" |
+            sha256sum -c -
+          if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
+            crates/claw-sqlite-file-control/Cargo.toml; then
+            echo "protected SQLite file-control manifest exposes a test or raw-handle feature" >&2
+            exit 1
+          fi
           cargo metadata --locked --format-version 1 |
             jq -e '
               [.packages[].name |
@@ -173,20 +192,27 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils cpio jq python3 rpm
+            binutils cpio jq python3 python3-jsonschema python3-yaml rpm
 
       - name: Build twice in pinned Bookworm with different umasks
         id: build
         shell: bash
         run: |
           set -euo pipefail
+          export GTA_CLAW_TARGET_ROOT="$RUNNER_TEMP/gta-claw-target"
+          export TMPDIR="$RUNNER_TEMP/gta-claw-tmp"
+          {
+            echo "GTA_CLAW_TARGET_ROOT=$GTA_CLAW_TARGET_ROOT"
+            echo "TMPDIR=$TMPDIR"
+          } >>"$GITHUB_ENV"
+          install -d -m 0700 "$GTA_CLAW_TARGET_ROOT" "$TMPDIR"
           first_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask000" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-x86-build-umask000" \
             BUILD_INPUT_UMASK=000 \
               ./packaging/linux/build-container.sh x86_64
           )"
           second_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-x86-build-umask002" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-x86-build-umask002" \
             BUILD_INPUT_UMASK=002 \
               ./packaging/linux/build-container.sh x86_64
           )"
@@ -214,31 +240,33 @@ jobs:
         run: |
           set -euo pipefail
           build_root="$(dirname "$BUILD_MANIFEST")"
-          relative_root="${build_root#"$GITHUB_WORKSPACE/target/"}"
+          relative_root="${build_root#"$GTA_CLAW_TARGET_ROOT/"}"
           cli="$(jq -er '.binaries[] | select(.name == "gta-claw-cli") | .path' "$BUILD_MANIFEST")"
           daemon="$(jq -er '.binaries[] | select(.name == "gta-claw-daemon") | .path' "$BUILD_MANIFEST")"
           image='gta-claw-linux-build:rust-1.97.0-bookworm'
+          image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --volume "$GITHUB_WORKSPACE/target:/workspace/target:ro" \
-            "$image" \
+            --volume "$GTA_CLAW_TARGET_ROOT:/workspace/target:ro" \
+            "$image_id" \
             "/workspace/target/$relative_root/$cli" health |
             grep -F 'healthy runtime='
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --volume "$GITHUB_WORKSPACE/target:/workspace/target:ro" \
-            "$image" \
+            --volume "$GTA_CLAW_TARGET_ROOT:/workspace/target:ro" \
+            "$image_id" \
             "/workspace/target/$relative_root/$daemon" --probe |
             grep -F 'healthy runtime='
 
       - name: Reject forged build manifests and substituted binaries
         shell: bash
         run: |
-          OUTPUT_ROOT="$GITHUB_WORKSPACE/target/linux-build-manifest-self-test" \
+          OUTPUT_ROOT="$GTA_CLAW_TARGET_ROOT/linux-build-manifest-self-test" \
             ./packaging/linux/build-manifest-self-test-container.sh \
               x86_64 \
               "${{ steps.build.outputs.first-manifest }}" \
@@ -249,9 +277,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          first="$GITHUB_WORKSPACE/target/linux-x86_64-run1"
-          second="$GITHUB_WORKSPACE/target/linux-x86_64-run2"
-          upgrade="$GITHUB_WORKSPACE/target/linux-x86_64-upgrade"
+          first="$GTA_CLAW_TARGET_ROOT/linux-x86_64-run1"
+          second="$GTA_CLAW_TARGET_ROOT/linux-x86_64-run2"
+          upgrade="$GTA_CLAW_TARGET_ROOT/linux-x86_64-upgrade"
           umask 000
           PACKAGE_RELEASE=1 OUTPUT_ROOT="$first" \
             ./packaging/linux/package-container.sh \
@@ -281,7 +309,7 @@ jobs:
       - name: Mutate every published OCI trust edge
         shell: bash
         run: |
-          OUTPUT_ROOT="$GITHUB_WORKSPACE/target/linux-oci-mutation-tests" \
+          OUTPUT_ROOT="$GTA_CLAW_TARGET_ROOT/linux-oci-mutation-tests" \
             ./packaging/linux/oci-self-test-container.sh \
             x86_64 \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-linux-x86_64.oci.tar.gz" \
@@ -293,6 +321,30 @@ jobs:
         run: |
           set -euo pipefail
           package="${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb"
+          image=debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+          # LinuxProtected fstatfs()es the protected directory's PARENT, so
+          # /var/lib itself has to sit on an allowed filesystem. A container
+          # root is overlayfs, which the ext/XFS/Btrfs/F2FS allowlist correctly
+          # refuses because overlayfs cannot guarantee the ownership and xattr
+          # semantics the protected store depends on. Back /var/lib with a real
+          # ext4 loopback mount rather than widening the allowlist, so this step
+          # proves the store works on a filesystem it is actually allowed to use.
+          varlib_image="$RUNNER_TEMP/gta-claw-varlib.ext4"
+          varlib_mount="$RUNNER_TEMP/gta-claw-varlib"
+          rm -f "$varlib_image"
+          truncate -s 1G "$varlib_image"
+          mkfs.ext4 -q -F "$varlib_image"
+          mkdir -p "$varlib_mount"
+          sudo mount -o loop "$varlib_image" "$varlib_mount"
+          test "$(findmnt -no FSTYPE "$varlib_mount")" = "ext4"
+          # Seed the loopback from the pinned image's own /var/lib so dpkg's
+          # database stays consistent, then pre-create the protected state
+          # directory exactly as the previous bind mount did.
+          docker run --rm \
+            --volume "$varlib_mount:/seed" \
+            "$image" \
+            bash -c 'set -euo pipefail; cp -a /var/lib/. /seed/'
+          sudo install -d -o root -g 65532 -m 0750 "$varlib_mount/gta-claw-protected"
           docker run --rm \
             --cap-drop ALL \
             --cap-add CHOWN \
@@ -301,7 +353,8 @@ jobs:
             --cap-add SETGID \
             --cap-add SETUID \
             --volume "$package:/tmp/gta-claw.deb:ro" \
-            debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df \
+            --volume "$varlib_mount:/var/lib" \
+            "$image" \
             bash -c '
               set -euo pipefail
               for forbidden in gcc cargo rustc rpm make; do
@@ -316,12 +369,25 @@ jobs:
               rm -f /etc/apt/sources.list.d/*
               apt-get -o Acquire::Check-Valid-Until=false update
               apt-get -o Acquire::Check-Valid-Until=false install --no-install-recommends -y \
+                systemd
+              printf "%s\n" \
+                "g gta-claw 65532" \
+                "u gta-claw 65532:65532 \"GTA Claw service\" /nonexistent /usr/sbin/nologin" \
+                >/tmp/gta-claw-test.sysusers
+              systemd-sysusers /tmp/gta-claw-test.sysusers
+              apt-get -o Acquire::Check-Valid-Until=false install --no-install-recommends -y \
                 /tmp/gta-claw.deb
+              test "$(stat -c "%u:%g:%a" /var/lib/gta-claw-protected)" = "0:65532:750"
+              test "$(find /var/lib/gta-claw-protected -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
               /usr/bin/gta-claw-cli health | grep -F "healthy runtime="
               /usr/libexec/gta-claw/gta-claw-daemon --probe | grep -F "healthy runtime="
               apt-get remove -y gta-claw
               test ! -e /usr/libexec/gta-claw/gta-claw-daemon
+              test "$(find /var/lib/gta-claw-protected -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
             '
+          sudo umount "$varlib_mount"
+          rmdir "$varlib_mount"
+          rm -f "$varlib_image"
 
       - name: Verify systemd unit with packaged executable
         shell: bash
@@ -333,17 +399,35 @@ jobs:
           sudo install -D -m 0755 \
             "$build_root/$daemon" \
             /usr/libexec/gta-claw/gta-claw-daemon
-          systemd-analyze verify packaging/linux/systemd/gta-claw-daemon.service
+          sudo install -D -m 0755 \
+            packaging/linux/libexec/gta-claw-state-init \
+            /usr/libexec/gta-claw/gta-claw-state-init
+          # systemd-analyze resolves every ExecCondition helper as well as ExecStart.
+          sudo install -D -m 0755 \
+            packaging/linux/libexec/gta-claw-start-authorized \
+            /usr/libexec/gta-claw/gta-claw-start-authorized
+          sudo install -D -m 0755 \
+            packaging/linux/direct/config-safeio.py \
+            /usr/libexec/gta-claw/gta-claw-direct-config
+          systemd-analyze verify \
+            packaging/linux/systemd/gta-claw-state-init.service \
+            packaging/linux/systemd/gta-claw-daemon.service
           systemd-analyze security --offline=yes \
             packaging/linux/systemd/gta-claw-daemon.service |
             tee "$RUNNER_TEMP/systemd-security.txt"
           grep -F 'NoNewPrivileges=' "$RUNNER_TEMP/systemd-security.txt"
-          sudo rm -f /usr/libexec/gta-claw/gta-claw-daemon
+          sudo rm -f \
+            /usr/libexec/gta-claw/gta-claw-daemon \
+            /usr/libexec/gta-claw/gta-claw-direct-config \
+            /usr/libexec/gta-claw/gta-claw-state-init \
+            /usr/libexec/gta-claw/gta-claw-start-authorized
 
       - name: Prove real Debian and RPM lifecycle
         shell: bash
         run: |
           ./packaging/linux/lifecycle-test.sh \
+            "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-linux-x86_64.tar.gz" \
+            "${{ steps.package.outputs.release2 }}/artifacts/gta-claw-0.1.0-linux-x86_64.tar.gz" \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw_0.1.0-1_amd64.deb" \
             "${{ steps.package.outputs.release2 }}/artifacts/gta-claw_0.1.0-2_amd64.deb" \
             "${{ steps.package.outputs.release1 }}/artifacts/gta-claw-0.1.0-1.x86_64.rpm" \
@@ -366,7 +450,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: linux-x86_64-prototype-${{ github.sha }}
-          path: target/linux-x86_64-run1/artifacts/*
+          path: ${{ runner.temp }}/gta-claw-target/linux-x86_64-run1/artifacts/*
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
@@ -387,20 +471,27 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            binutils cpio jq python3 rpm
+            binutils cpio jq python3 python3-jsonschema python3-yaml rpm
 
       - name: Cross-build arm64 twice in pinned Bookworm
         id: build
         shell: bash
         run: |
           set -euo pipefail
+          export GTA_CLAW_TARGET_ROOT="$RUNNER_TEMP/gta-claw-target"
+          export TMPDIR="$RUNNER_TEMP/gta-claw-tmp"
+          {
+            echo "GTA_CLAW_TARGET_ROOT=$GTA_CLAW_TARGET_ROOT"
+            echo "TMPDIR=$TMPDIR"
+          } >>"$GITHUB_ENV"
+          install -d -m 0700 "$GTA_CLAW_TARGET_ROOT" "$TMPDIR"
           first_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask000" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-arm64-build-umask000" \
             BUILD_INPUT_UMASK=000 \
               ./packaging/linux/build-container.sh arm64
           )"
           second_build="$(
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/linux-arm64-build-umask002" \
+            CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-arm64-build-umask002" \
             BUILD_INPUT_UMASK=002 \
               ./packaging/linux/build-container.sh arm64
           )"
@@ -426,8 +517,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          first="$GITHUB_WORKSPACE/target/linux-arm64-run1"
-          second="$GITHUB_WORKSPACE/target/linux-arm64-run2"
+          first="$GTA_CLAW_TARGET_ROOT/linux-arm64-run1"
+          second="$GTA_CLAW_TARGET_ROOT/linux-arm64-run2"
           umask 000
           OUTPUT_ROOT="$first" \
             ./packaging/linux/package-container.sh \
@@ -452,7 +543,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: linux-arm64-prototype-${{ github.sha }}
-          path: target/linux-arm64-run1/artifacts/*
+          path: ${{ runner.temp }}/gta-claw-target/linux-arm64-run1/artifacts/*
           if-no-files-found: error
           retention-days: 3
           compression-level: 0

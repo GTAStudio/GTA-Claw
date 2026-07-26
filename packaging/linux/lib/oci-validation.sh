@@ -25,6 +25,7 @@ create_private_validation_directory() {
 validate_archive_entries() {
   local archive="$1"
   local compression="$2"
+  local root_policy="${3:-optional}"
   local max_compressed
   local max_expanded
   local max_file
@@ -49,6 +50,7 @@ validate_archive_entries() {
     "$max_expanded" \
     "$max_file" \
     4096 \
+    "$root_policy" \
     >/dev/null
 }
 
@@ -118,7 +120,7 @@ validate_published_oci() {
     die "OCI validation root must be new"
   create_private_validation_directory "$validation_root"
   create_private_validation_directory "$extract_root"
-  validate_archive_entries "$archive" gzip
+  validate_archive_entries "$archive" gzip forbidden
   listing="$(tar --quoting-style=escape -tzf "$archive")"
   [[ "$(awk -F/ 'NF { print $1 }' <<<"$listing" | LC_ALL=C sort -u)" == \
     "$expected_layout_name" ]] || die "OCI archive has an unexpected top-level layout"
@@ -175,15 +177,33 @@ validate_published_oci() {
     .os == "linux" and
     .config.User == "65532:65532" and
     .config.Entrypoint == ["/usr/libexec/gta-claw/gta-claw-daemon"] and
+    .config.Cmd == [
+      "--state-profile",
+      "linux-protected",
+      "--state-path",
+      "/var/lib/gta-claw-protected"
+    ] and
     .config.WorkingDir == "/" and
+    .config.Env == ["RUST_BACKTRACE=0"] and
+    .config.Volumes == {
+      "/run/gta-claw": {},
+      "/var/cache/gta-claw": {},
+      "/var/lib": {},
+      "/var/log/gta-claw": {}
+    } and
+    .rootfs.type == "layers" and
+    .config.Labels["io.gta-claw.linux-protected.mode"] == "two-phase" and
+    .config.Labels["io.gta-claw.linux-protected.init"] ==
+      "/usr/libexec/gta-claw/gta-claw-daemon --prepare-linux-protected --state-path /var/lib/gta-claw-protected --service-uid 65532 --service-gid 65532" and
     .config.Labels["org.opencontainers.image.licenses"] ==
       "MIT AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)"
   ' "$config" >/dev/null || die "published OCI config contract is invalid"
-  for volume in \
-    /var/lib/gta-claw /var/cache/gta-claw /var/log/gta-claw /run/gta-claw; do
-    jq -e --arg volume "$volume" '.config.Volumes[$volume] == {}' "$config" >/dev/null ||
-      die "published OCI config is missing volume $volume"
-  done
+  [[ "$(jq -er '.config.Labels["org.opencontainers.image.version"]' "$config")" == \
+    "$VERSION-$LINUX_PACKAGE_RELEASE" ]] ||
+    die "published OCI config omits package release identity"
+  [[ "$(jq -er '.manifests[0].annotations["org.opencontainers.image.ref.name"]' \
+    "$layout/index.json")" == "gta-claw:$VERSION-$LINUX_PACKAGE_RELEASE" ]] ||
+    die "published OCI index reference omits package release identity"
 
   layer_count="$(jq -er '.layers | length' "$manifest")"
   [[ "$layer_count" -eq 2 ]] || die "published OCI manifest must contain exactly two layers"
@@ -196,7 +216,11 @@ validate_published_oci() {
     diff_id="$(jq -er ".rootfs.diff_ids[$index]" "$config")"
     [[ "$diff_id" == "sha256:$(sha256_file "$layer")" ]] ||
       die "published OCI layer[$index] DiffID mismatch"
-    validate_archive_entries "$layer" none
+    if [[ "$index" -eq 0 ]]; then
+      validate_archive_entries "$layer" none required
+    else
+      validate_archive_entries "$layer" none forbidden
+    fi
     if [[ "$index" -eq 0 ]]; then
       root_layer="$layer"
       root_layer_sha="$(sha256_file "$layer")"
@@ -253,6 +277,8 @@ validate_published_oci() {
   [[ "$(stat -c '%a' "$rootfs/etc/passwd")" == "644" &&
     "$(stat -c '%a' "$rootfs/etc/group")" == "644" ]] ||
     die "published OCI account file mode mismatch"
+  [[ "$(stat -c '%a:%u:%g' "$rootfs/var/lib")" == "755:0:0" ]] ||
+    die "published OCI /var/lib must remain root-owned mode 0755 before init"
   reject_forbidden_runtime_content "$rootfs"
 
   PUBLISHED_RUNTIME_MANIFEST="$rootfs/usr/share/doc/gta-claw/runtime-manifest.json"
@@ -397,6 +423,43 @@ validate_published_oci() {
   actual_rootfs_files="$(find "$rootfs" -type f -printf '%P\n' | LC_ALL=C sort -u)"
   [[ "$actual_rootfs_files" == "$expected_rootfs_files" ]] ||
     die "published OCI rootfs differs from independently derived file policy"
+  expected_rootfs_directories="$(
+    {
+      printf '%s\n' \
+        run \
+        run/gta-claw \
+        var \
+        var/cache \
+        var/cache/gta-claw \
+        var/lib \
+        var/log \
+        var/log/gta-claw
+      while IFS= read -r file; do
+        directory="$(dirname "$file")"
+        while [[ "$directory" != "." ]]; do
+          printf '%s\n' "$directory"
+          directory="$(dirname "$directory")"
+        done
+      done <<<"$expected_rootfs_files"
+    } | LC_ALL=C sort -u
+  )"
+  actual_rootfs_directories="$(
+    find "$rootfs" -mindepth 1 -type d -printf '%P\n' | LC_ALL=C sort -u
+  )"
+  [[ "$actual_rootfs_directories" == "$expected_rootfs_directories" ]] ||
+    die "published OCI rootfs directories differ from exact policy"
+  [[ -z "$(find "$rootfs/var/lib" -mindepth 1 -print -quit)" ]] ||
+    die "published OCI root layer precreates protected state"
+  while IFS= read -r directory; do
+    expected_metadata="755:0:0"
+    case "$directory" in
+      run/gta-claw | var/cache/gta-claw | var/log/gta-claw)
+        expected_metadata="700:0:0"
+        ;;
+    esac
+    [[ "$(stat -c '%a:%u:%g' "$rootfs/$directory")" == "$expected_metadata" ]] ||
+      die "published OCI root directory metadata mismatch: $directory"
+  done <<<"$expected_rootfs_directories"
 
   listing="$(
     tar --numeric-owner -tvf "$writable_layer" |
@@ -407,7 +470,6 @@ validate_published_oci() {
     printf '%s\n' \
       $'drwx------\t65532/65532\trun/gta-claw' \
       $'drwx------\t65532/65532\tvar/cache/gta-claw' \
-      $'drwx------\t65532/65532\tvar/lib/gta-claw' \
       $'drwx------\t65532/65532\tvar/log/gta-claw' |
       LC_ALL=C sort
   )" ]] || die "published OCI writable layer entries, modes, or ownership are invalid"

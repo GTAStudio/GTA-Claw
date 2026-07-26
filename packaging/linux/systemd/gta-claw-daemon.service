@@ -1,20 +1,23 @@
 [Unit]
-Description=GTA Claw headless daemon prototype
+Description=GTA Claw headless daemon
 Documentation=file:/usr/share/doc/gta-claw/README.md
-After=local-fs.target
-ConditionPathIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon
+Requires=gta-claw-state-init.service
+After=local-fs.target gta-claw-state-init.service
+ConditionFileIsExecutable=/usr/libexec/gta-claw/gta-claw-daemon
 
 [Service]
-Type=simple
-ExecStartPre=/usr/libexec/gta-claw/gta-claw-daemon --probe
-ExecStart=/usr/libexec/gta-claw/gta-claw-daemon
-DynamicUser=yes
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60s
+ExecCondition=+/usr/libexec/gta-claw/gta-claw-start-authorized check
+ExecCondition=+/usr/libexec/gta-claw/gta-claw-direct-config network-deny-check gta-claw-daemon.service
+ExecStartPre=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --probe --state-profile linux-protected --state-path /var/lib/gta-claw-protected
+ExecStart=!/usr/bin/setpriv --reuid=gta-claw --regid=gta-claw --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- /usr/libexec/gta-claw/gta-claw-daemon --state-profile linux-protected --state-path /var/lib/gta-claw-protected
+EnvironmentFile=/run/gta-claw-state-init/gta-claw.env
 User=gta-claw
 Group=gta-claw
-EnvironmentFile=-/etc/gta-claw/gta-claw.env
+SupplementaryGroups=
 LoadCredential=gta-claw-config:/etc/gta-claw/credentials/daemon.conf
-StateDirectory=gta-claw
-StateDirectoryMode=0700
 CacheDirectory=gta-claw
 CacheDirectoryMode=0700
 LogsDirectory=gta-claw
@@ -36,9 +39,11 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectProc=invisible
 ProcSubset=pid
-CapabilityBoundingSet=
+ReadOnlyPaths=/run/gta-claw-state-init
+ReadWritePaths=/var/lib/gta-claw-protected
+CapabilityBoundingSet=CAP_SETGID CAP_SETPCAP CAP_SETUID
 AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -47,8 +52,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RemoveIPC=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+SystemCallFilter=@system-service setgroups setresgid setresuid
 KillSignal=SIGTERM
 TimeoutStopSec=15s
 SendSIGKILL=yes

@@ -1,0 +1,144 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+replacement_fence=$runtime_directory/replacement-fenced
+authorization_marker=$runtime_directory/start-authorized
+persistent_runtime_directory=/var/lib/gta-claw-install
+persistent_failure_marker=$persistent_runtime_directory/transaction-failed
+
+if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
+  echo "gta-claw start authorization requires real and effective UID 0" >&2
+  exit 1
+fi
+
+process_start_time() {
+  pid="$1"
+  case "$pid" in
+    '' | 0 | *[!0-9]*) return 1 ;;
+  esac
+  [ -d "/proc/$pid" ] && [ "$(stat -c '%u' "/proc/$pid")" = "0" ] ||
+    return 1
+  IFS= read -r process_stat <"/proc/$pid/stat" || return 1
+  process_fields="${process_stat##*) }"
+  [ "$process_fields" != "$process_stat" ] || return 1
+  # Word splitting maps the post-comm /proc stat fields to positional parameters.
+  # shellcheck disable=SC2086
+  set -- $process_fields
+  [ "$#" -ge 20 ] || return 1
+  process_state="$1"
+  case "$process_state" in
+    Z | X | x) return 1 ;;
+    ?) ;;
+    *) return 1 ;;
+  esac
+  start_time="${20}"
+  case "$start_time" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$start_time"
+}
+
+validate_fence() {
+  path="$1"
+  expected="$2"
+  if [ -L "$path" ] ||
+    { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    return 1
+  fi
+  [ ! -e "$path" ] ||
+    [ "$(stat -c '%u:%g:%a:%h' "$path")" = "$expected" ]
+}
+
+authorization_valid() {
+  if [ -L "$persistent_runtime_directory" ] ||
+    { [ -e "$persistent_runtime_directory" ] &&
+      [ ! -d "$persistent_runtime_directory" ]; }; then
+    return 1
+  fi
+  [ ! -e "$persistent_runtime_directory" ] ||
+    [ "$(stat -c '%u:%g:%a' "$persistent_runtime_directory")" = "0:0:700" ] ||
+    return 1
+  validate_fence "$failure_marker" "0:0:644:1" || return 1
+  validate_fence "$replacement_fence" "0:0:644:1" || return 1
+  validate_fence "$persistent_failure_marker" "0:0:600:1" || return 1
+  if [ ! -e "$failure_marker" ] &&
+    [ ! -e "$replacement_fence" ] &&
+    [ ! -e "$persistent_failure_marker" ]; then
+    return 0
+  fi
+  [ -f "$authorization_marker" ] && [ ! -L "$authorization_marker" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$authorization_marker")" = "0:0:600:1" ] ||
+    return 1
+  IFS=' ' read -r authorized_pid authorized_start extra <"$authorization_marker" ||
+    return 1
+  [ -z "${extra:-}" ] || return 1
+  actual_start="$(process_start_time "$authorized_pid")" || return 1
+  [ "$actual_start" = "$authorized_start" ]
+}
+
+arm_authorization() {
+  [ "$#" -eq 1 ] || return 1
+  authorized_pid="$1"
+  [ "$authorized_pid" = "$PPID" ] ||
+    {
+      echo "gta-claw start authorization PID is not the invoking process" >&2
+      return 1
+    }
+  if [ ! -d "$runtime_directory" ] || [ -L "$runtime_directory" ] ||
+    [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+    echo "gta-claw start authorization runtime directory is invalid" >&2
+    return 1
+  fi
+  if [ -L "$authorization_marker" ] ||
+    { [ -e "$authorization_marker" ] && [ ! -f "$authorization_marker" ]; }; then
+    echo "gta-claw start authorization marker is not a physical file" >&2
+    return 1
+  fi
+  if [ -e "$authorization_marker" ] &&
+    [ "$(stat -c '%u:%g:%a:%h' "$authorization_marker")" != "0:0:600:1" ]; then
+    echo "gta-claw start authorization marker metadata is invalid" >&2
+    return 1
+  fi
+  authorized_start="$(process_start_time "$authorized_pid")" || return 1
+  printf '%s %s\n' "$authorized_pid" "$authorized_start" >"$authorization_marker"
+  chown 0:0 "$authorization_marker"
+  chmod 0600 "$authorization_marker"
+}
+
+clear_authorization() {
+  if [ ! -e "$authorization_marker" ] && [ ! -L "$authorization_marker" ]; then
+    return
+  fi
+  if [ -L "$authorization_marker" ] ||
+    { [ -e "$authorization_marker" ] && [ ! -f "$authorization_marker" ]; }; then
+    echo "gta-claw start authorization marker is not a physical file" >&2
+    return 1
+  fi
+  rm -f "$authorization_marker"
+}
+
+case "${1:-check}" in
+  check)
+    [ "$#" -eq 0 ] || [ "$#" -eq 1 ] || exit 1
+    authorization_valid
+    ;;
+  arm)
+    shift
+    arm_authorization "$@"
+    ;;
+  clear)
+    [ "$#" -eq 1 ] || exit 1
+    clear_authorization
+    ;;
+  *)
+    echo "usage: gta-claw-start-authorized [check|arm PID|clear]" >&2
+    exit 2
+    ;;
+esac

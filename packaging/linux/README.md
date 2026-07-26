@@ -13,8 +13,9 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
 `arm64`), `package.sh` emits:
 
 - `gta-claw-VERSION-linux-ARCH.tar.gz`, containing separate daemon and CLI
-  executables, README, license, notice, sorted SHA-256 manifest, SPDX 2.3
-  SBOM, and SLSA-shaped in-toto provenance.
+  executables, reviewed direct install/remove scripts, sysusers and systemd
+  definitions, README, license, notice, sorted SHA-256 manifest, SPDX 2.3 SBOM,
+  and SLSA-shaped in-toto provenance.
 - `gta-claw_VERSION-1_ARCH.deb`, built with `dpkg-deb`, root ownership, gzip
   payload compression, ELF-derived dependencies, conffiles, and reviewed
   systemd lifecycle scripts.
@@ -22,13 +23,18 @@ For `x86_64` (`x86_64-unknown-linux-gnu`, Debian `amd64`, RPM `x86_64`, OCI
   time/host/payload settings, `%config(noreplace)` configuration, an explicit
   disable preset, and reviewed systemd lifecycle scriptlets.
 - `gta-claw-VERSION-linux-ARCH.oci.tar.gz`, an OCI image layout with a
-  scratch root filesystem, numeric non-root user `65532:65532`, OCI labels,
-  two deterministic layers, explicit writable volumes, and no shell or
-  package manager. The first layer contains only the Rust executables,
+  scratch root filesystem, numeric non-root runtime user `65532:65532`, an
+  explicit root init command, OCI labels, two deterministic layers, shared
+  `/var/lib` storage, and no shell or package manager. The first layer contains only the Rust executables,
   documentation/metadata, account files, and exact glibc/libm/libgcc runtime objects
   from the pinned build sysroot. Their Debian versions, hashes, SPDX
   expressions, and copyright files are embedded in the SBOM and provenance.
-  The second layer assigns the writable directories to uid/gid 65532.
+  The second layer assigns cache, log, and runtime directories to uid/gid
+  65532. It deliberately does not assign `/var/lib` to the runtime identity.
+- Compose, Kubernetes, and CRI fixtures bind both phases to the same
+  `ghcr.io/gtastudio/gta-claw@sha256:...` reference derived from the packaged
+  manifest. The CRI probe uses root initialization followed by a
+  `65532:65532` runtime whose only supplementary GID is redundant `65532`.
 - `provenance-ARCH.json` and `SHA256SUMS` for the final artifacts.
 
 Builds run in the digest-pinned Rust 1.97.0 Bookworm image using the immutable
@@ -44,51 +50,145 @@ gzip/jq/Python/cpio versions. CI performs two complete builds and package runs
 in distinct Cargo/output roots under input umasks 000 and 002, then compares
 every final artifact byte.
 
-## Filesystem and upgrade contract
+## LinuxProtected filesystem and upgrade contract
+
+Every Linux delivery uses `/var/lib/gta-claw-protected`. Its parent is a
+root-owned, `gta-claw`-group directory at mode `0750`; the service group can
+traverse it but cannot add, remove, link, or rename entries. It contains exactly
+these service-owned, mode-`0600`, single-link regular files:
+
+```text
+state.sqlite
+state.sqlite-wal
+state.writer.lock
+snapshot-0.sqlite
+snapshot-0.meta
+snapshot-1.sqlite
+snapshot-1.meta
+snapshot.selector
+```
+
+SHM, rollback journals, links, aliases, special files, extra names, partial
+state, and ownership/mode/ACL/filesystem drift fail closed. Provisioning creates
+only an absent namespace or an already-canonical empty directory. It never
+repairs existing entries. No repair-oriented tmpfiles `d`/`f` rule is shipped;
+the root production provisioner is the only namespace creator. The root wrapper
+first runs the production
+`--provision-linux-protected` command and then the accepted LP3
+`--initialize-linux-protected` command with the resolved static UID/GID. The
+second command performs the SQLite/WAL handoff while holding the fixed writer
+lock. A live runtime therefore makes initialization fail rather than race.
 
 The native packages install the CLI at `/usr/bin/gta-claw-cli`, the daemon at
 `/usr/libexec/gta-claw/gta-claw-daemon`, the service at
 `/usr/lib/systemd/system/gta-claw-daemon.service`, documentation under
 `/usr/share/doc/gta-claw`, and administrator-controlled files below
-`/etc/gta-claw`.
+`/etc/gta-claw`. They also install the reviewed root configuration validator at
+`/usr/libexec/gta-claw/gta-claw-direct-config`; Python 3 is a declared package
+dependency for that bounded maintainer-hook helper, not for the Rust daemon or
+CLI runtime.
 
 Debian conffiles and RPM `%config(noreplace)` preserve local environment and
 credential-file edits on upgrade. Package removal removes package-owned
 programs, units, and unmodified configuration according to the native package
-manager. Native packages deliberately do not own `/var/lib/gta-claw`,
-`/var/cache/gta-claw`, `/var/log/gta-claw`, or `/run/gta-claw`: systemd creates
-the private/persistent or ephemeral paths declared by the unit. Fresh installs
-stay disabled and stopped; active upgrades restart, inactive upgrades remain
-inactive, final removal stops/disables before executable unlink, and
-post-transaction hooks reload systemd. Stop/restart errors propagate. The RPM
-upgrade path carries active state through `/run` and uses a critical old-package
-`%preun` postcondition because RPM treats `%post` errors as warnings. No hook
-executes network or dynamic code.
+manager. The package payload does not own the protected namespace. Root
+maintainer hooks create the identity, provision and initialize the namespace,
+and only then allow a previously active service to restart. Fresh installs stay
+disabled and stopped; inactive upgrades remain inactive; downgrade attempts are
+rejected before service disruption; final removal stops/disables before
+executable unlink. Ordinary removal and Debian purge preserve protected state
+and the stable service identity. LP4 intentionally ships no automated state
+purge action. No hook executes network or dynamic code.
+The root wrapper creates
+`/run/gta-claw-state-init/initialization-failed` before every handoff. The
+root-owned mode-0755 runtime directory is preserved by the initializer oneshot;
+only root can change the marker while the runtime can read it. Failed direct,
+Debian, RPM, or manual initialization therefore remains fenced.
+RPM may report `%post` failures as warnings, but the runtime unit still refuses
+startup until a later successful root initialization clears the marker.
+
+The tar archive's `install.sh` applies the same contract and `uninstall.sh`
+preserves `/var/lib/gta-claw-protected`. Both require real/effective root.
 
 ## systemd boundary
 
-The service is disabled by default and uses `DynamicUser=yes`; no static
-account is created by package scripts. systemd owns private state, cache, log,
-and runtime directories. The unit removes all capabilities, denies IP
-networking, permits only `AF_UNIX`, and enables `NoNewPrivileges`, private
-temporary storage/devices, strict system/home/kernel/control-group
-protections, namespace/personality/SUID restrictions, syscall filtering, and
-a 15-second SIGTERM stop window with restart-on-failure.
+`sysusers.d` creates a locked `gta-claw` user and group with no home or login
+shell. The account persists across upgrades and restarts. A root
+`gta-claw-state-init.service` oneshot runs after sysusers/local filesystems and
+before the runtime. `gta-claw-daemon.service` requires that oneshot, uses the
+static identity, uses `setpriv` to clear systemd's implicit supplementary
+primary group and drop the launcher's temporary credential capabilities, and always supplies
+`--state-profile linux-protected --state-path /var/lib/gta-claw-protected`.
+The unit is `Type=notify`; the daemon sends readiness only after protected state
+open, mandatory role and credential/provider validation, and the real listener
+bind complete. Package hooks additionally require `MainPID` to own the fixed
+writer lock.
+`ProtectSystem=strict` is paired with a namespace `ReadWritePaths` exception;
+filesystem mode `0750` still withholds directory-entry mutation while the held
+`0600` files remain writable. The runtime has no capabilities and retains
+`IPAddressDeny=any`; the package grants no network destination. The unit permits
+the `AF_UNIX`, `AF_INET`, and `AF_INET6` socket families, but an operator-owned
+drop-in must add narrow `IPAddressAllow=` CIDRs for intended ingress, DNS when
+needed, and every reviewed role/provider destination. Application egress is a
+second deny-by-default boundary that admits only exact configured origins and
+revalidates DNS and redirects.
+Before startup, an `ExecCondition` parses systemd's effective
+`IPAddressAllow` policy, rejects IPv4 prefixes broader than `/24`, IPv6 prefixes
+broader than `/64`, and any rule covering reserved canaries. It then sends UDP
+through both address families to an unallowlisted canary and requires `EPERM`.
+Unavailable BPF enforcement or an over-broad operator allow therefore fails
+closed. Phase 1 reserves IPv4 `127.255.255.254` and IPv6 `::1` for these probes;
+operator policy must not allow either address.
 
-The current daemon accepts only no arguments or `--probe`. It prints readiness
-and health and then parks; it does not listen, consume systemd sockets, read
-configuration or credentials, persist state, or implement an application
-shutdown protocol. The package therefore invents no flags. The service uses
-only the supported command forms. `gta-claw-daemon.socket.deferred` records a
-future `AF_UNIX` endpoint but deliberately is not a `.socket` unit and is not
-installed in the systemd unit search path.
+`gta-claw-daemon.socket.deferred` records a future `AF_UNIX` endpoint but is not
+a `.socket` unit and is not installed in the systemd unit search path.
 
-`gta-claw.env` is for non-secret settings only and currently contains no
-assignments. Secret material belongs in root-owned mode-0600
-`/etc/gta-claw/credentials/daemon.conf`; systemd exposes it through
-`LoadCredential` rather than an environment literal. The current binary does
-not consume that credential, so adding actual secret-dependent behavior is
-deferred until the Rust boundary supports `CREDENTIALS_DIRECTORY`.
+`gta-claw.env` is an exact non-secret phase-1 allowlist. It ships only
+`ENABLE_TEAMS=false`; before explicitly enabling the service, the operator must
+set `AGENT_ROLE_URL` and configure the documented GitHub device-flow pair. The
+validator rejects unknown, duplicate, malformed, and secret-like keys. Secret
+material belongs in root-owned mode-0600
+`/etc/gta-claw/credentials/daemon.conf`; systemd exposes it only as
+`$CREDENTIALS_DIRECTORY/gta-claw-config`, never as an environment literal.
+The root initializer validates `/etc/gta-claw/gta-claw.env` and atomically
+materializes `/run/gta-claw-state-init/gta-claw.env`; the daemon unit consumes
+only that authenticated runtime copy, so rejected raw values never enter an
+`ExecCondition` or launcher environment.
+Native replacement writes the root-owned mode-0600
+`/var/lib/gta-claw-install/transaction-failed` fence before payload handoff.
+For configuration transactions its exact content also records whether the
+daemon was active. The predecessor start helper already rejects this path, so
+the fence and restart intent survive both reboot and helper replacement. Only a
+later successful exact validation and, when required, notify-ready restart may
+clear it.
+
+## OCI two-phase startup
+
+The OCI image is not a transparent privilege-dropping single process. Mount one
+shared volume at `/var/lib` in both phases:
+
+1. Run the image as root with entrypoint
+   `/usr/libexec/gta-claw/gta-claw-daemon` and arguments
+   `--prepare-linux-protected --state-path /var/lib/gta-claw-protected
+   --service-uid 65532 --service-gid 65532`. The command provisions and invokes
+   the accepted initializer, then exits.
+2. Start the normal image only after phase one succeeds. Its baked-in user is
+   `65532:65532` and its baked-in command selects the LinuxProtected profile.
+
+Compose uses an init service with
+`user: "0:0"` and a main service pinned to `user: "65532:65532"` with
+`depends_on: { gta-claw-init: { condition: service_completed_successfully } }`.
+Kubernetes uses a `Recreate` Deployment so the old writer exits before the root
+`initContainer` runs, then starts a main container
+with `runAsUser/runAsGroup: 65532`, `allowPrivilegeEscalation: false`,
+`readOnlyRootFilesystem: true`, and all capabilities dropped. Both containers
+mount the same PVC at `/var/lib`; do not set `fsGroup` or an ownership-changing
+CSI policy. The volume must expose an accepted ext/XFS/Btrfs/F2FS filesystem.
+The runtime volume remains writable for held-file I/O, but mode `0750` prevents
+UID 65532 from mutating the namespace directory.
+Generated orchestration rejects mutable tags, short image names, divergent
+phase digests, malformed YAML, and duplicate keys. The CRI probe also requires
+an explicit fully qualified `CRI_RUNTIME_ENDPOINT`.
 
 ## Output and release safety
 
@@ -123,15 +223,21 @@ prototype artifacts.
 On Ubuntu with Docker plus the declared native package tools, run:
 
 ```sh
-export CARGO_TARGET_DIR="$PWD/target/linux-x86-build"
+export GTA_CLAW_TARGET_ROOT="${RUNNER_TEMP:-/tmp}/gta-claw-target"
+export TMPDIR="${RUNNER_TEMP:-/tmp}/gta-claw-tmp"
+install -d -m 0700 "$GTA_CLAW_TARGET_ROOT" "$TMPDIR"
+export CARGO_TARGET_DIR="$GTA_CLAW_TARGET_ROOT/linux-x86-build"
 build_result="$(./packaging/linux/build-container.sh x86_64)"
 build_manifest="${build_result%%|*}"
 build_key_sha="${build_result##*|}"
-OUTPUT_ROOT="$PWD/target/linux-x86-run1" \
+OUTPUT_ROOT="$GTA_CLAW_TARGET_ROOT/linux-x86-run1" \
   ./packaging/linux/package-container.sh \
     x86_64 "$build_manifest" "$build_key_sha"
 ./packaging/linux/self-test.sh
 ```
+
+For a direct install, extract the tar and run `sudo ./install.sh`. Run
+`sudo ./uninstall.sh` from the same extracted release for ordinary removal.
 
 The dedicated workflow performs root formatting, checks, Clippy, tests, MSRV,
 deny, audit, metadata proof, pinned-Bookworm x86_64 execution and Debian

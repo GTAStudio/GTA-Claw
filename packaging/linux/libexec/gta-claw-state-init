@@ -1,0 +1,94 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+daemon=/usr/libexec/gta-claw/gta-claw-daemon
+namespace=/var/lib/gta-claw-protected
+runtime_directory=/run/gta-claw-state-init
+failure_marker=$runtime_directory/initialization-failed
+complete_marker=$runtime_directory/initialization-complete
+validated_environment=$runtime_directory/gta-claw.env
+configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config
+environment_file=/etc/gta-claw/gta-claw.env
+credential_file=/etc/gta-claw/credentials/daemon.conf
+
+if [ "$(/usr/bin/id -ru)" != 0 ] || [ "$(/usr/bin/id -u)" != 0 ]; then
+  echo "gta-claw protected initialization requires real and effective UID 0" >&2
+  exit 1
+fi
+
+if [ -L "$runtime_directory" ] ||
+  { [ -e "$runtime_directory" ] && [ ! -d "$runtime_directory" ]; }; then
+  echo "gta-claw initialization runtime path is not a physical directory" >&2
+  exit 1
+fi
+if [ ! -e "$runtime_directory" ]; then
+  mkdir -m 0755 -- "$runtime_directory"
+fi
+if [ "$(stat -c '%u:%g:%a' "$runtime_directory")" != "0:0:755" ]; then
+  echo "gta-claw initialization runtime directory must be root:root mode 0755" >&2
+  exit 1
+fi
+if [ -L "$failure_marker" ] ||
+  { [ -e "$failure_marker" ] && [ ! -f "$failure_marker" ]; }; then
+  echo "gta-claw initialization failure marker is not a physical file" >&2
+  exit 1
+fi
+touch "$failure_marker"
+chown 0:0 "$failure_marker"
+chmod 0644 "$failure_marker"
+rm -f "$complete_marker"
+
+if [ -L "$validated_environment" ] ||
+  { [ -e "$validated_environment" ] && [ ! -f "$validated_environment" ]; }; then
+  echo "gta-claw validated environment is not a physical file" >&2
+  exit 1
+fi
+rm -f "$validated_environment"
+if [ ! -x "$configuration_helper" ]; then
+  echo "gta-claw configuration validator is not executable" >&2
+  exit 1
+fi
+"$configuration_helper" materialize / "$environment_file" "$credential_file"
+
+if [ ! -x "$daemon" ]; then
+  echo "gta-claw daemon is not executable: $daemon" >&2
+  exit 1
+fi
+
+service_uid="$(/usr/bin/id -u gta-claw)"
+primary_gid="$(/usr/bin/id -g gta-claw)"
+service_gid="$(getent group gta-claw | cut -d: -f3)"
+case "$service_uid:$service_gid" in
+  0:* | *:0 | *[!0-9:]* | :* | *:) {
+    echo "gta-claw service identity must have nonzero numeric UID and GID" >&2
+    exit 1
+  } ;;
+esac
+if [ "$primary_gid" != "$service_gid" ]; then
+  echo "gta-claw user primary GID does not match the named gta-claw group" >&2
+  exit 1
+fi
+
+"$daemon" \
+  --provision-linux-protected \
+  --state-path "$namespace" \
+  --service-uid "$service_uid" \
+  --service-gid "$service_gid"
+
+"$daemon" \
+  --initialize-linux-protected \
+  --state-path "$namespace" \
+  --service-uid "$service_uid" \
+  --service-gid "$service_gid"
+
+if [ "${GTA_CLAW_DEFER_FENCE_CLEAR:-0}" = "1" ]; then
+  touch "$complete_marker"
+  chown 0:0 "$complete_marker"
+  chmod 0644 "$complete_marker"
+else
+  rm -f "$failure_marker" "$complete_marker"
+fi

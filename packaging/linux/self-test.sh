@@ -9,9 +9,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 require_linux
-for tool in gcc jq patchelf python3 readelf sha256sum tar; do
+for tool in dpkg-deb gcc jq patchelf python3 readelf rpm rpmbuild sha256sum tar; do
   require_tool "$tool"
 done
+[[ "$(sha256_file "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml")" == \
+  "12f3b3d87c1b21337285be2e320935539c4c52bdbb9b0c349e1f85fab658ea01" ]] ||
+  die "protected SQLite file-control manifest hash changed"
+if grep -Eq 'test-hooks|public.*raw.?handle|raw.?handle.*public' \
+  "$REPO_ROOT/crates/claw-sqlite-file-control/Cargo.toml"; then
+  die "protected SQLite file-control manifest exposes a test or raw-handle feature"
+fi
+grep -F 'active | activating | reloading | deactivating)' \
+  "$SCRIPT_DIR/rpm/pre.in" >/dev/null ||
+  die "RPM pre-install does not classify transitional daemon states as restart intent"
 initialize_output_root
 work="$OUTPUT_ROOT/tests"
 ensure_output_directory "$work"
@@ -223,16 +233,342 @@ expect_failure forbidden-runtime \
 
 cp "$SCRIPT_DIR/systemd/gta-claw-daemon.service" "$work/service-good"
 grep -v '^NoNewPrivileges=yes$' "$work/service-good" >"$work/service-weakened"
+grep -v '^User=gta-claw$' "$work/service-good" >"$work/service-dynamic"
 expect_success hardened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-good'"
 expect_failure weakened-service \
   bash -c "source '$common'; validate_service_contract '$work/service-weakened'"
+expect_failure missing-static-user \
+  bash -c "source '$common'; validate_service_contract '$work/service-dynamic'"
 {
   cat "$work/service-good"
   printf 'Environment=API_TOKEN=plaintext\n'
 } >"$work/service-secret"
 expect_failure environment-secret \
   bash -c "source '$common'; validate_service_contract '$work/service-secret'"
+{
+  cat "$work/service-good"
+  printf 'IPAddressAllow=0.0.0.0/0\n'
+} >"$work/service-network-grant"
+expect_failure package-owned-network-grant \
+  bash -c "source '$common'; validate_service_contract '$work/service-network-grant'"
+{
+  cat "$work/service-good"
+  printf 'IPAddressAllow = 0.0.0.0/0\n'
+} >"$work/service-spaced-network-grant"
+expect_failure spaced-package-network-grant \
+  bash -c "source '$common'; validate_service_contract '$work/service-spaced-network-grant'"
+{
+  cat "$work/service-good"
+  printf 'IPAddressDeny=\n'
+} >"$work/service-network-reset"
+expect_failure package-network-deny-reset \
+  bash -c "source '$common'; validate_service_contract '$work/service-network-reset'"
+expect_success native-config-validation-hooks \
+  bash -c "
+    for hook in '$SCRIPT_DIR/debian/postinst' '$SCRIPT_DIR/rpm/post'; do
+      grep -F 'configuration_helper=/usr/libexec/gta-claw/gta-claw-direct-config' \
+        \"\$hook\"
+      grep -F 'retain_configuration_failure || fence_failed_runtime' \"\$hook\"
+      grep -F 'verify / \"\$environment_file\" \"\$credential_file\"' \"\$hook\"
+      grep -F 'clear_configuration_failure || fence_failed_runtime' \"\$hook\"
+      awk '
+        /fail_configure_after configuration/ { configured = 1 }
+        configured && /systemctl unmask --runtime gta-claw-daemon.service/ {
+          unmasked_after_configuration = 1
+          exit
+        }
+        END { exit !(configured && unmasked_after_configuration) }
+      ' \"\$hook\"
+    done
+  "
+expect_success native-config-removal-hooks \
+  bash -c "
+    grep -F 'clear_native_configuration_fence' '$SCRIPT_DIR/debian/postrm'
+    grep -F 'clear_native_configuration_fence' '$SCRIPT_DIR/rpm/postun'
+  "
+expect_success debian-abort-deconfigure-fence \
+  grep -F 'prepare_abort_deconfigure_configuration "$1" || fence_failed_runtime' \
+  "$SCRIPT_DIR/debian/postinst"
+expect_success hardened-initializer-service \
+  bash -c "source '$common'; validate_initializer_service_contract '$SCRIPT_DIR/systemd/gta-claw-state-init.service'"
+expect_success static-sysusers \
+  bash -c "source '$common'; validate_sysusers_contract '$SCRIPT_DIR/sysusers/gta-claw.conf'"
+expect_success nonrepairing-initializer-wrapper \
+  bash -c "source '$common'; validate_initializer_wrapper_contract '$SCRIPT_DIR/libexec/gta-claw-state-init'"
+expect_success runtime-readiness-wrapper \
+  bash -c "source '$common'; validate_runtime_ready_contract '$SCRIPT_DIR/libexec/gta-claw-runtime-ready'"
+expect_success direct-lifecycle \
+  bash -c "source '$common'; validate_direct_lifecycle_contract '$SCRIPT_DIR/direct/install.sh' '$SCRIPT_DIR/direct/uninstall.sh'"
+oci_test_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+validate_oci_orchestration_templates \
+  "$SCRIPT_DIR/oci/compose.yaml.in" \
+  "$SCRIPT_DIR/oci/kubernetes.yaml.in"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/compose.yaml.in" \
+  "$work/compose.yaml" \
+  "$oci_test_digest"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/kubernetes.yaml.in" \
+  "$work/kubernetes.yaml" \
+  "$oci_test_digest"
+validate_cri_fixture_templates \
+  "$SCRIPT_DIR/oci/cri-sandbox.json" \
+  "$SCRIPT_DIR/oci/cri-init.json.in" \
+  "$SCRIPT_DIR/oci/cri-runtime.json.in"
+cp -- "$SCRIPT_DIR/oci/cri-sandbox.json" "$work/cri-sandbox.json"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/cri-init.json.in" \
+  "$work/cri-init.json" \
+  "$oci_test_digest"
+render_oci_orchestration \
+  "$SCRIPT_DIR/oci/cri-runtime.json.in" \
+  "$work/cri-runtime.json" \
+  "$oci_test_digest"
+validate_cri_fixture_contract \
+  "$work/cri-sandbox.json" \
+  "$work/cri-init.json" \
+  "$work/cri-runtime.json" \
+  "$oci_test_digest"
+python3 - "$work/cri-runtime.json" "$work/cri-runtime-foreign-group.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    fixture = json.load(source)
+fixture["linux"]["security_context"]["supplemental_groups"] = [65532, 0]
+with open(sys.argv[2], "w", encoding="utf-8") as output:
+    json.dump(fixture, output, sort_keys=True)
+    output.write("\n")
+PY
+expect_failure cri-foreign-supplementary-group \
+  bash -c "source '$common'; validate_cri_fixture_contract '$work/cri-sandbox.json' '$work/cri-init.json' '$work/cri-runtime-foreign-group.json' '$oci_test_digest'"
+expect_success oci-two-phase-orchestration \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+python3 - \
+  "$work/compose.yaml" \
+  "$work/compose-root-runtime.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = '    user: "65532:65532"\n'
+assert source.count(needle) == 1
+Path(sys.argv[2]).write_text(source.replace(needle, '    user: "0:0"\n'), encoding="utf-8")
+PY
+expect_failure oci-compose-root-runtime \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-root-runtime.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+python3 - \
+  "$work/compose.yaml" \
+  "$work/compose-unshared-state.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = "      - gta-claw-state:/var/lib\n"
+index = source.rfind(needle)
+assert index >= 0
+Path(sys.argv[2]).write_text(source[:index] + source[index + len(needle):], encoding="utf-8")
+PY
+expect_failure oci-compose-unshared-state \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-unshared-state.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+python3 - \
+  "$work/kubernetes.yaml" \
+  "$work/kubernetes-root-runtime.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = "            runAsUser: 65532\n"
+assert source.count(needle) == 1
+Path(sys.argv[2]).write_text(source.replace(needle, "            runAsUser: 0\n"), encoding="utf-8")
+PY
+expect_failure oci-kubernetes-root-runtime \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes-root-runtime.yaml' '$oci_test_digest'"
+sed \
+  "0,\\|$LINUX_OCI_IMAGE_REPOSITORY@sha256:$oci_test_digest|s||$LINUX_OCI_IMAGE_REPOSITORY@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff|" \
+  "$work/compose.yaml" \
+  >"$work/compose-split-digest.yaml"
+expect_failure oci-compose-split-digest \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-split-digest.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+sed \
+  "s|$LINUX_OCI_IMAGE_REPOSITORY@sha256:|gta-claw@sha256:|g" \
+  "$work/compose.yaml" \
+  >"$work/compose-short-image.yaml"
+expect_failure oci-compose-short-image \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-short-image.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+{
+  cat "$work/kubernetes.yaml"
+  printf 'malformed: [\n'
+} >"$work/kubernetes-malformed.yaml"
+expect_failure oci-kubernetes-malformed-yaml \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose.yaml' '$work/kubernetes-malformed.yaml' '$oci_test_digest'"
+{
+  printf 'services: {}\n'
+  cat "$work/compose.yaml"
+} >"$work/compose-duplicate-key.yaml"
+expect_failure oci-compose-duplicate-key \
+  bash -c "source '$common'; validate_oci_orchestration_contract '$work/compose-duplicate-key.yaml' '$work/kubernetes.yaml' '$oci_test_digest'"
+
+build_scriptlet_fixture() {
+  local name="$1"
+  local extra="$2"
+  local file_extra="${3:-}"
+  local header_extra="${4:-}"
+  local install_extra="${5:-}"
+  local top="$work/rpm-$name"
+  local spec="$top/SPECS/$name.spec"
+  mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+  {
+    printf '%s\n' \
+      '%global debug_package %{nil}' \
+      "Name: $name" \
+      'Version: 1' \
+      'Release: 1' \
+      'Summary: scriptlet policy fixture' \
+      'License: MIT' \
+      'BuildArch: noarch'
+    if [[ -n "$header_extra" ]]; then
+      printf '%s\n' "$header_extra"
+    fi
+    printf '%s\n' \
+      '%description' \
+      'scriptlet policy fixture' \
+      '%prep' \
+      '%build' \
+      '%install' \
+      'mkdir -p %{buildroot}/usr/share/gta-claw-test' \
+      'printf fixture >%{buildroot}/usr/share/gta-claw-test/value'
+    if [[ -n "$install_extra" ]]; then
+      printf '%s\n' "$install_extra"
+    fi
+    printf '%s\n' \
+      '%files' \
+      '/usr/share/gta-claw-test/value'
+    if [[ -n "$file_extra" ]]; then
+      printf '%s\n' "$file_extra"
+    fi
+    printf '%s\n' \
+      '%pre' ':' \
+      '%post' ':' \
+      '%preun' ':' \
+      '%posttrans' ':' \
+      '%postun' ':'
+    printf '%s\n' "$extra"
+  } >"$spec"
+  rpmbuild -bb --quiet --define "_topdir $top" "$spec" >/dev/null
+  find "$top/RPMS" -type f -name '*.rpm' -print -quit
+}
+
+pretrans_extra=$'%pretrans -p /usr/bin/no''de\nprocess.exit(0)'
+pretrans_rpm="$(build_scriptlet_fixture gta-claw-pretrans-test "$pretrans_extra")"
+if (reject_unexpected_rpm_scriptlets "$pretrans_rpm"); then
+  die "RPM scriptlet policy accepted a Node-powered pretrans"
+fi
+trigger_extra=$'%triggerin -- gta-claw-trigger-target\n:'
+trigger_rpm="$(build_scriptlet_fixture gta-claw-trigger-test "$trigger_extra")"
+if (reject_unexpected_rpm_scriptlets "$trigger_rpm"); then
+  die "RPM scriptlet policy accepted an extra trigger"
+fi
+ghost_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-ghost-test \
+    "" \
+    '%ghost /var/lib/gta-claw-protected'
+)"
+if (reject_rpm_ghost_files "$ghost_rpm"); then
+  die "RPM header policy accepted a ghost path"
+fi
+protected_root="$work/protected-payload"
+mkdir -p "$protected_root/var/lib/gta-claw-protected"
+printf 'forbidden\n' >"$protected_root/var/lib/gta-claw-protected/value"
+tar -czf "$work/protected-payload.tar.gz" -C "$protected_root" .
+if (assert_no_protected_payload_path \
+  "malicious native tar" \
+  "$(tar -tzf "$work/protected-payload.tar.gz")"); then
+  die "native tar member policy accepted the LinuxProtected namespace"
+fi
+protected_deb_root="$work/protected-deb"
+mkdir -p \
+  "$protected_deb_root/DEBIAN" \
+  "$protected_deb_root/var/lib/gta-claw-protected"
+printf '%s\n' \
+  'Package: gta-claw-protected-test' \
+  'Version: 1' \
+  'Architecture: all' \
+  'Maintainer: GTA Claw test' \
+  'Description: protected payload policy fixture' \
+  >"$protected_deb_root/DEBIAN/control"
+printf 'forbidden\n' >"$protected_deb_root/var/lib/gta-claw-protected/value"
+dpkg-deb --build "$protected_deb_root" "$work/protected-payload.deb" >/dev/null
+if (assert_no_protected_payload_path \
+  "malicious Debian package" \
+  "$(dpkg-deb --fsys-tarfile "$work/protected-payload.deb" | tar -tf -)"); then
+  die "Debian member policy accepted the LinuxProtected namespace"
+fi
+protected_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-protected-payload-test \
+    "" \
+    '/var/lib/gta-claw-protected/value' \
+    "" \
+    $'mkdir -p %{buildroot}/var/lib/gta-claw-protected\nprintf forbidden >%{buildroot}/var/lib/gta-claw-protected/value'
+)"
+if (assert_no_protected_payload_path \
+  "malicious RPM package" \
+  "$(rpm -qlp "$protected_rpm")"); then
+  die "RPM member policy accepted the LinuxProtected namespace"
+fi
+node_requirement_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-node-requirement-test \
+    "" \
+    "" \
+    'Requires: nodejs'
+)"
+if (reject_forbidden_rpm_requirements "$node_requirement_rpm"); then
+  die "RPM dependency policy accepted nodejs"
+fi
+extra_provide_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-extra-provide-test \
+    "" \
+    "" \
+    'Provides: harmless-extra-capability'
+)"
+extra_provide_expected="$(
+  rpm_relationship_rows "$extra_provide_rpm" PROVIDE |
+    grep -v $'^harmless-extra-capability\t'
+)"
+if (validate_exact_rpm_relationships \
+  "$extra_provide_rpm" \
+  "$extra_provide_expected"); then
+  die "RPM relationship policy accepted an undeclared Provides capability"
+fi
+weak_dependency_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-weak-dependency-test \
+    "" \
+    "" \
+    'Recommends: harmless-optional-capability'
+)"
+if (validate_exact_rpm_relationships \
+  "$weak_dependency_rpm" \
+  "$(rpm_relationship_rows "$weak_dependency_rpm" PROVIDE)"); then
+  die "RPM relationship policy accepted an undeclared weak dependency"
+fi
+ordered_dependency_rpm="$(
+  build_scriptlet_fixture \
+    gta-claw-ordered-dependency-test \
+    "" \
+    "" \
+    'OrderWithRequires: harmless-ordered-capability'
+)"
+if (validate_exact_rpm_relationships \
+  "$ordered_dependency_rpm" \
+  "$(rpm_relationship_rows "$ordered_dependency_rpm" PROVIDE)"); then
+  die "RPM relationship policy accepted an undeclared ordered dependency"
+fi
 
 expect_failure release-signing-without-release-mode "$SCRIPT_DIR/release.sh" sign
 expect_failure publication-without-release-mode "$SCRIPT_DIR/release.sh" publish

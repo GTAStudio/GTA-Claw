@@ -392,12 +392,13 @@ assert_required_job() {
 
   actual_digest="$(
     printf '%s\n' "$block" |
+      tr -d '\r' |
       sha256sum |
       awk '{ print $1 }'
   )"
   [[ "$actual_digest" == "$expected_digest" ]] || {
-    printf '%s structure differs from the exact command/action allowlist\n' \
-      "$job" >&2
+    printf '%s structure differs from the exact command/action allowlist (expected %s, actual %s)\n' \
+      "$job" "$expected_digest" "$actual_digest" >&2
     return 1
   }
 }
@@ -435,17 +436,7 @@ validate_workflow() {
   actual="$(workflow_event_names "$candidate")"
   assert_exact_block "workflow events" "$expected" "$actual" || return 1
 
-  expected="$(printf '%s\n' \
-    '.github/workflows/linux-packaging.yml' \
-    'packaging/linux/**' \
-    'apps/**' \
-    'crates/**' \
-    'compat/**' \
-    'Cargo.lock' \
-    'Cargo.toml' \
-    'deny.toml' \
-    'rust-toolchain.toml' \
-    'rustfmt.toml')"
+  expected='**'
   for event in push pull_request; do
     actual="$(workflow_trigger_paths "$event" "$candidate")" || return 1
     assert_exact_block "$event trigger paths" "$expected" "$actual" || return 1
@@ -497,7 +488,7 @@ validate_workflow() {
 
   assert_required_job \
     source-policy \
-    8dbca08bd966c4fff889ebae5382d1de819dfdedaa81ed406db5da676f278c04 \
+    3d3607c094bdedd84163df7ad88299fe871c746469854c92b378d808d695e922 \
     "$(printf '%s\n' \
       'Checkout without credential persistence' \
       'Install native policy tools' \
@@ -518,7 +509,7 @@ validate_workflow() {
 
   assert_required_job \
     native-x86 \
-    cb0e04fca2614c6a4b7aaac15e35e61d0ead3270a8574190d28ec1fd3e7fd832 \
+    a28459b7298ac5b93cebfc8599bc7967e107d996d41396a8f405c8eef69f19ec \
     "$(printf '%s\n' \
       'Checkout' \
       'Install native package inspection tools' \
@@ -536,7 +527,7 @@ validate_workflow() {
 
   assert_required_job \
     cross-arm64 \
-    a813a82001df0461d87569206a31306702af423e23d02b0d524f1830300e4172 \
+    6ee3c9eec809b364d5e63be5397aaa31a36586668c83ee70b4c4928b54e4c9f2 \
     "$(printf '%s\n' \
       'Checkout' \
       'Install arm64 cross and native package tools' \
@@ -555,6 +546,7 @@ workflow_accepts_path() {
 
   while IFS= read -r pattern; do
     case "$pattern" in
+      '**') return 0 ;;
       */'**')
         prefix="${pattern%/**}"
         [[ "$changed_path" == "$prefix"/* ]] && return 0
@@ -613,7 +605,7 @@ insert_event_path() {
     in_event && $0 != "  " event ":" && /^  [^ ]/ {
       in_event = 0
     }
-    in_event && !inserted && $0 == "      - \"apps/**\"" {
+    in_event && !inserted && $0 == "      - \"**\"" {
       print
       print entry
       inserted++
@@ -640,7 +632,7 @@ insert_event_block_path() {
     in_event && $0 != "  " event ":" && /^  [^ ]/ {
       in_event = 0
     }
-    in_event && !inserted && $0 == "      - \"apps/**\"" {
+    in_event && !inserted && $0 == "      - \"**\"" {
       print
       print "      - " style
       print "        !apps/**"
@@ -656,13 +648,24 @@ insert_event_block_path() {
   ' "$candidate" >"$output"
 }
 
-synthetic_app_path="apps/gta-claw-cli/src/lib.rs"
+consumed_paths="$(
+  printf '%s\n' \
+    apps/gta-claw-cli/src/lib.rs \
+    .cargo/audit.toml \
+    .gitignore \
+    .github/workflows/upstream-gateway-reference.yml \
+    desktop/Cargo.toml \
+    .github/workflows/windows-packaging.yml \
+    .github/workflows/macos-packaging.yml
+)"
 for event in push pull_request; do
-  workflow_accepts_path "$event" "$synthetic_app_path" "$workflow" || {
-    printf '%s does not accept apps-only change: %s\n' \
-      "$event" "$synthetic_app_path" >&2
-    exit 1
-  }
+  while IFS= read -r consumed_path; do
+    workflow_accepts_path "$event" "$consumed_path" "$workflow" || {
+      printf '%s does not accept consumed input change: %s\n' \
+        "$event" "$consumed_path" >&2
+      exit 1
+    }
+  done <<<"$consumed_paths"
 done
 
 validate_workflow "$workflow"
@@ -908,25 +911,20 @@ expect_actionlint_valid_validation_failure \
   "$tmp_dir/masking-workflow-defaults.yml"
 
 awk '
-  !changed && /^      - "apps\/\*\*"$/ {
-    print "      - '\''apps/**'\''"
+  !changed && /^      - "\*\*"$/ {
+    print "      - '\''**'\''"
     changed = 1
-    next
-  }
-  changed == 1 && /^      - "apps\/\*\*"$/ {
-    print "      - apps/**"
-    changed = 2
     next
   }
   { print }
   END {
-    if (changed != 2) {
+    if (changed != 1) {
       exit 1
     }
   }
 ' "$workflow" >"$tmp_dir/equivalent-path-scalars.yml"
 expect_actionlint_valid_validation_success \
-  "single-quoted and unquoted positive path scalars" \
+  "single-quoted positive path scalar" \
   "$tmp_dir/equivalent-path-scalars.yml"
 
 insert_event_path \
@@ -1013,8 +1011,8 @@ awk '
   in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
     in_pr = 0
   }
-  in_pr && !changed && /^      - "apps\/\*\*"$/ {
-    print "      - apps/** # semantically equivalent but unsupported comment"
+  in_pr && !changed && /^      - "\*\*"$/ {
+    print "      - \"**\" # semantically equivalent but unsupported comment"
     changed++
     next
   }
@@ -1036,7 +1034,7 @@ awk '
   in_pr && $0 != "  pull_request:" && /^  [^ ]/ {
     in_pr = 0
   }
-  in_pr && !inserted && /^      - "apps\/\*\*"$/ {
+  in_pr && !inserted && /^      - "\*\*"$/ {
     print
     print "      - docs/**"
     inserted++
@@ -1053,12 +1051,45 @@ expect_actionlint_valid_validation_failure \
   "extra path entry" \
   "$tmp_dir/extra-path.yml"
 
-if grep -RInE '(^|[[:space:]])(npm|npx|node|nodejs|bun|pnpm)([[:space:]]|$)' \
-  "$SCRIPT_DIR" "$workflow" \
-  --include='*.sh' --include='*.yml'; then
-  echo "JavaScript runtime or package-manager command found in Linux packaging" >&2
+source_policy="$SCRIPT_DIR/tests/validate-source-surfaces.py"
+python3 "$source_policy" "$SCRIPT_DIR"
+mkdir -p "$tmp_dir/source-type-fixture"
+ln -s /bin/true "$tmp_dir/source-type-fixture/validator.sh"
+if python3 "$source_policy" --types-only "$tmp_dir/source-type-fixture" \
+  >/dev/null 2>&1; then
+  echo "Linux source policy accepted a /bin/true validator symlink" >&2
   exit 1
 fi
+rm "$tmp_dir/source-type-fixture/validator.sh"
+if python3 "$source_policy" --types-only /dev/null \
+  >/dev/null 2>&1; then
+  echo "Linux source policy accepted a special file" >&2
+  exit 1
+fi
+
+command_policy="$SCRIPT_DIR/tests/reject-javascript-commands.py"
+python3 "$command_policy" "$SCRIPT_DIR" "$workflow"
+python3 "$SCRIPT_DIR/tests/reject-javascript-commands-self-test.py"
+mkdir -p "$tmp_dir/recursive-policy/nested"
+ln -s /bin/true "$tmp_dir/recursive-policy/nested/validator.sh"
+if python3 "$command_policy" "$tmp_dir/recursive-policy" >/dev/null 2>&1; then
+  echo "command policy skipped a /bin/true command-surface symlink" >&2
+  exit 1
+fi
+rm "$tmp_dir/recursive-policy/nested/validator.sh"
+yaml_command_pattern='(^|[^[:alnum:]_.-])(npm|npx|node|nodejs|bun|pnpm)([^[:alnum:]_.-]|$)'
+grep -Eq "$yaml_command_pattern" <<< 'command: ["/usr/bin/node", "daemon.js"]' ||
+  {
+    echo "YAML JavaScript-command policy misses absolute executable paths" >&2
+    exit 1
+  }
+for yaml in "$workflow" "$SCRIPT_DIR/oci/"*.yml "$SCRIPT_DIR/oci/"*.yaml; do
+  [[ -e "$yaml" ]] || continue
+  if grep -InE "$yaml_command_pattern" "$yaml"; then
+    echo "JavaScript runtime or package-manager command found in Linux YAML surface" >&2
+    exit 1
+  fi
+done
 
 if git -C "$REPO_ROOT" ls-files packaging/linux |
   grep -Ei '\.(deb|rpm|tar\.gz|oci|sig|asc|key|pem|crt|bin)$'; then

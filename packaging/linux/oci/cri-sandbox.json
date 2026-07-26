@@ -1,0 +1,18 @@
+{
+  "metadata": {
+    "name": "gta-claw-probe",
+    "namespace": "gta-claw",
+    "uid": "gta-claw-probe",
+    "attempt": 0
+  },
+  "log_directory": "/var/log/gta-claw-cri-probe",
+  "linux": {
+    "security_context": {
+      "namespace_options": {
+        "network": 2,
+        "pid": 1,
+        "ipc": 1
+      }
+    }
+  }
+}

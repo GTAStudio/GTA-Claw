@@ -1,0 +1,88 @@
+use std::path::Path;
+
+use crate::StateError;
+
+/// Result of an offline LinuxProtected namespace initialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LinuxProtectedInitialization {
+    /// A fresh namespace, or exact initializer-owned progress, completed runtime handoff.
+    Initialized,
+    /// The namespace had already crossed the selector commit boundary and was verified.
+    AlreadyInitialized,
+}
+
+/// Creates or verifies the fixed LinuxProtected namespace without initializing it.
+///
+/// This root-only operation creates the parent and eight empty entries only when
+/// the namespace is absent or is an already-canonical empty directory. Existing
+/// entries are never chmodded, chowned, deleted, truncated, or replaced. Any
+/// partial namespace or ownership, mode, type, ACL, link, name, filesystem, or
+/// ancestor drift is rejected.
+pub fn provision_linux_protected_offline(
+    namespace: impl AsRef<Path>,
+    service_uid: u32,
+    service_gid: u32,
+) -> Result<(), StateError> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_protected::provision_offline(namespace.as_ref(), service_uid, service_gid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (namespace, service_uid, service_gid);
+        Err(StateError::InvalidValue {
+            field: "state platform",
+            reason: "offline LinuxProtected provisioning requires Linux",
+        })
+    }
+}
+
+/// Provisions and initializes a LinuxProtected namespace for a service identity.
+///
+/// Provisioning is fail-closed and non-repairing, then the accepted offline
+/// initializer performs the SQLite/WAL handoff under the fixed writer lock.
+pub fn prepare_linux_protected_offline(
+    namespace: impl AsRef<Path>,
+    service_uid: u32,
+    service_gid: u32,
+) -> Result<LinuxProtectedInitialization, StateError> {
+    let namespace = namespace.as_ref();
+    provision_linux_protected_offline(namespace, service_uid, service_gid)?;
+    initialize_linux_protected_offline(namespace, service_uid, service_gid)
+}
+
+/// Initializes or verifies an already precreated LinuxProtected namespace offline.
+///
+/// `service_uid` and `service_gid` are the nonzero numeric credentials that
+/// will run the daemon after provisioning. They are deliberately explicit and
+/// are not inferred from the root provisioner process. On Linux this operation
+/// requires both the real and effective UID to be zero. It never creates,
+/// renames, unlinks, chmods, or chowns namespace entries and never runs
+/// application migrations or claims the application writer row.
+///
+/// The namespace must already contain exactly the accepted eight fixed regular
+/// files. A fresh namespace is initialized only when all eight entries,
+/// including the database and WAL, are empty. Exact versioned initializer-owned
+/// preparation, transition, or committed-cleanup records can be resumed
+/// idempotently under the fixed writer lock. Every unknown, ambiguous, or
+/// noncanonical partial state is rejected rather than repaired. Off Linux this function returns
+/// [`crate::StateErrorKind::UnsupportedPlatform`].
+pub fn initialize_linux_protected_offline(
+    namespace: impl AsRef<Path>,
+    service_uid: u32,
+    service_gid: u32,
+) -> Result<LinuxProtectedInitialization, StateError> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_protected::initialize_offline(namespace.as_ref(), service_uid, service_gid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (namespace, service_uid, service_gid);
+        Err(StateError::InvalidValue {
+            field: "state platform",
+            reason: "offline LinuxProtected initialization requires Linux",
+        })
+    }
+}

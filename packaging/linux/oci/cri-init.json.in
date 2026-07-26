@@ -1,0 +1,46 @@
+{
+  "metadata": {
+    "name": "gta-claw-init",
+    "attempt": 0
+  },
+  "image": {
+    "image": "@OCI_IMAGE_REFERENCE@"
+  },
+  "command": [
+    "/usr/libexec/gta-claw/gta-claw-daemon",
+    "--prepare-linux-protected",
+    "--state-path",
+    "/var/lib/gta-claw-protected",
+    "--service-uid",
+    "65532",
+    "--service-gid",
+    "65532"
+  ],
+  "mounts": [
+    {
+      "container_path": "/var/lib",
+      "host_path": "/var/lib/gta-claw-cri-probe",
+      "readonly": false,
+      "selinux_relabel": false,
+      "propagation": 0
+    }
+  ],
+  "log_path": "init.log",
+  "stdin": false,
+  "stdin_once": false,
+  "tty": false,
+  "linux": {
+    "security_context": {
+      "capabilities": {
+        "add_capabilities": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
+        "drop_capabilities": ["ALL"]
+      },
+      "privileged": false,
+      "run_as_user": {"value": 0},
+      "run_as_group": {"value": 0},
+      "supplemental_groups": [],
+      "no_new_privs": true,
+      "readonly_rootfs": true
+    }
+  }
+}

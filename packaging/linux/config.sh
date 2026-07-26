@@ -2,6 +2,7 @@
 
 # shellcheck disable=SC2034
 LINUX_PACKAGE_NAME="gta-claw"
+LINUX_OCI_IMAGE_REPOSITORY="ghcr.io/gtastudio/gta-claw"
 # shellcheck disable=SC2034
 LINUX_DAEMON_NAME="gta-claw-daemon"
 # shellcheck disable=SC2034

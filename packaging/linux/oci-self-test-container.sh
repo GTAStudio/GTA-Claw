@@ -4,11 +4,16 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/lib/worktree-git.sh"
+bootstrap_windows_worktree_git "$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/container-trust.sh"
 source "$SCRIPT_DIR/lib/container-mount.sh"
 
 require_linux
-require_tool docker
+for tool in docker findmnt git id python3 realpath stat tar; do
+  require_tool "$tool"
+done
 [[ "$#" -eq 4 ]] ||
   die "usage: oci-self-test-container.sh ARCH OCI_ARCHIVE BUILD_MANIFEST EXPECTED_BUILD_KEY_SHA256"
 arch="$1"
@@ -16,7 +21,15 @@ archive="$2"
 manifest="$3"
 expected_key_sha="$4"
 : "${OUTPUT_ROOT:?OUTPUT_ROOT must select a new OCI mutation root}"
+: "${GTA_CLAW_TARGET_ROOT:?GTA_CLAW_TARGET_ROOT must select a dedicated external target root}"
+: "${TMPDIR:?TMPDIR must select a dedicated external temporary root}"
+
 target_root="$(canonical_target_root)"
+git_common_dir="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
+assert_isolated_target_root "$REPO_ROOT" "$git_common_dir" "$target_root"
+assert_no_path_overlap "$REPO_ROOT" "source repository" "$TMPDIR" "snapshot temp root"
+assert_no_path_overlap "$git_common_dir" "Git common directory" "$TMPDIR" "snapshot temp root"
+assert_no_path_overlap "$target_root" "target root" "$TMPDIR" "snapshot temp root"
 for input in "$archive" "$manifest"; do
   validate_absolute_path "$input" "OCI self-test input"
   [[ "$input" == "$target_root/"* ]] || die "OCI self-test input is outside target"
@@ -24,20 +37,41 @@ done
 validate_new_private_root_path "$OUTPUT_ROOT" "OUTPUT_ROOT"
 build_component="${manifest#"$target_root/"}"
 build_component="${build_component%%/*}"
+artifact_component="${archive#"$target_root/"}"
+artifact_component="${artifact_component%%/*}"
 output_component="${OUTPUT_ROOT#"$target_root/"}"
-archive_relative="${archive#"$target_root/"}"
+archive_in_component="${archive#"$target_root/$artifact_component/"}"
 validate_safe_component "$build_component" "build component"
+validate_safe_component "$artifact_component" "artifact component"
 validate_safe_component "$output_component" "output component"
+[[ "$archive_in_component" != /* && "$archive_in_component" != *".."* ]] ||
+  die "OCI archive path is unsafe within artifact component"
+
+trap 'cleanup_container_resources "$?"' EXIT
+trap 'cleanup_container_resources 129' HUP
+trap 'cleanup_container_resources 130' INT
+trap 'cleanup_container_resources 143' TERM
+create_verified_source_snapshot "$REPO_ROOT"
+open_build_component "$target_root" "$build_component"
+open_artifact_component "$target_root" "$artifact_component"
+prepare_output_component "$target_root" "$output_component"
+assert_no_path_overlap \
+  "$SOURCE_SNAPSHOT_DIRECTORY" \
+  "immutable source snapshot" \
+  "$target_root" \
+  "target root"
+[[ "$BUILD_COMPONENT_ID" != "$OUTPUT_COMPONENT_ID" &&
+  "$ARTIFACT_COMPONENT_ID" != "$OUTPUT_COMPONENT_ID" ]] ||
+  die "OCI self-test input and output identities must differ"
 
 image="gta-claw-linux-build:rust-${LINUX_RUST_TOOLCHAIN}-bookworm"
 packaging_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
-exec {repo_mount_fd}<"$REPO_ROOT"
-exec {target_mount_fd}<"$target_root"
-repo_mount_id="$(stat -Lc '%d:%i' "/proc/$BASHPID/fd/$repo_mount_fd")"
-target_mount_id="$(stat -Lc '%d:%i' "/proc/$BASHPID/fd/$target_mount_fd")"
+exec {source_fd}<"$SOURCE_SNAPSHOT_DIRECTORY"
 create_anchored_mounts \
-  "/proc/$BASHPID/fd/$repo_mount_fd" \
-  "/proc/$BASHPID/fd/$target_mount_fd"
+  "/proc/$BASHPID/fd/$source_fd" \
+  "/proc/$BASHPID/fd/$OUTPUT_COMPONENT_FD" \
+  "/proc/$BASHPID/fd/$BUILD_COMPONENT_FD" \
+  "/proc/$BASHPID/fd/$ARTIFACT_COMPONENT_FD"
 docker run --rm \
   --cap-drop ALL \
   --cap-add CHOWN \
@@ -47,17 +81,21 @@ docker run --rm \
   --env "SAFEIO_RETURN_UID=$(id -u)" \
   --env "SAFEIO_RETURN_GID=$(id -g)" \
   --env "PACKAGING_IMAGE_ID=$packaging_image_id" \
-  --env GIT_CONFIG_COUNT=1 \
-  --env GIT_CONFIG_KEY_0=safe.directory \
-  --env GIT_CONFIG_VALUE_0=/workspace \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/repository,target=/workspace,readonly" \
-  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/target,target=/workspace/target" \
+  --env IMMUTABLE_SOURCE_SNAPSHOT=1 \
+  --env "SOURCE_COMMIT=$SOURCE_COMMIT" \
+  --env "SOURCE_TREE=$SOURCE_TREE" \
+  --env "SOURCE_TREE_RECEIPT=$SOURCE_TREE_RECEIPT" \
+  --env "SOURCE_DATE_EPOCH=$SOURCE_EPOCH" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/source,target=/workspace,readonly" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/build,target=/gta-claw-build,readonly" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/artifact,target=/gta-claw-artifact,readonly" \
+  --mount "type=bind,source=$ANCHORED_MOUNT_ROOT/output,target=/gta-claw-output" \
   --workdir /workspace \
-  "$image" \
+  "$packaging_image_id" \
   /usr/local/bin/gta-claw-safeio \
-  run-package \
-  "$build_component" \
-  "$output_component" \
+  run-mounted-package \
+  /gta-claw-build \
+  /gta-claw-output \
   -- \
   bash -c '
     exec ./packaging/linux/oci-self-test.sh \
@@ -67,11 +105,10 @@ docker run --rm \
       "$3"
   ' \
   _ \
-  "/workspace/target/$archive_relative" \
+  "/gta-claw-artifact/$archive_in_component" \
   "$arch" \
   "$expected_key_sha"
 cleanup_anchored_mounts
-[[ "$(stat -Lc '%d:%i' "$REPO_ROOT")" == "$repo_mount_id" ]] ||
-  die "repository path identity changed during OCI mutation transaction"
-[[ "$(stat -Lc '%d:%i' "$target_root")" == "$target_mount_id" ]] ||
-  die "target path identity changed during OCI mutation transaction"
+verify_container_transaction_receipts
+cleanup_container_trust
+trap - EXIT HUP INT TERM

@@ -33,6 +33,8 @@ members = [
   "crates/claw-runtime",
   "crates/claw-security",
   "crates/claw-skills",
+  "crates/claw-sqlite-file-control",
+  "crates/claw-state",
   "crates/claw-tools",
 ]
 exclude = ["android", "desktop", "ios"]
@@ -65,11 +67,28 @@ claw-relay = { path = "crates/claw-relay", version = "0.1.0" }
 claw-runtime = { path = "crates/claw-runtime", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
+claw-sqlite-file-control = { path = "crates/claw-sqlite-file-control", version = "0.1.0" }
+claw-state = { path = "crates/claw-state", version = "0.1.0" }
 claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
+getrandom = "=0.2.17"
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+same-file = "1.0.6"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150", features = ["raw_value"] }
 serde_path_to_error = "=0.1.20"
 sha2 = "=0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
+tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+xattr = "1.6.1"
+uzers = "0.12.2"
 
 [workspace.package]
 version = "0.1.0"
