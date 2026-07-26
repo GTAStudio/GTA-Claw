@@ -780,3 +780,79 @@ async fn a_drain_that_gives_up_on_a_wire_request_reports_it_as_abandoned() {
 
     ingress.shutdown().await.expect("the gateway shuts down");
 }
+
+/// The interface, not the port, is what the gateway refuses.
+///
+/// The Gateway server speaks RFC 6455 over plain TCP and terminates no TLS, so
+/// `Exposure::LoopbackOnly` — its default — refuses any address that is not
+/// loopback, and a wildcard such as `0.0.0.0` is explicitly *not* loopback. That
+/// refusal is the composition's, not the operating system's: a wildcard bind is
+/// something the kernel would happily grant.
+///
+/// This matters at the subsystem boundary rather than inside `claw-gateway`. The
+/// daemon hosts more than one ingress, and a sibling ingress that defaults to a
+/// routable interface would put the two subsystems in disagreement about what
+/// the same daemon is willing to expose. Encoding the refusal here makes that
+/// disagreement a failed start rather than a quietly reachable port.
+///
+/// The same port is used twice so the interface is the only variable: refused on
+/// the wildcard, accepted on loopback. Without the second half, "refused" would
+/// be compatible with the port simply being unavailable.
+#[tokio::test]
+async fn the_gateway_refuses_a_routable_interface_but_accepts_the_same_port_on_loopback() {
+    // A port the operating system has just confirmed is free, released again so
+    // both halves below can ask for it.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a port is available");
+        probe
+            .local_addr()
+            .expect("the probe listener has an address")
+            .port()
+    };
+
+    let wildcard = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+    let mut exposed = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()) as Arc<dyn Clock>)
+        .listen(vec![wildcard])
+        .build()
+        .expect("the composition is orderable");
+
+    let error = exposed
+        .start()
+        .await
+        .expect_err("a wildcard interface must not be served in plaintext");
+
+    let CompositionError::SubsystemFailed(failure) = error else {
+        panic!("the composition reported {error:?} rather than a subsystem failure");
+    };
+    assert_eq!(failure.kind(), SubsystemErrorKind::Internal);
+    assert_eq!(failure.subsystem(), &well_known::gateway());
+    assert!(!exposed.is_started());
+    assert!(
+        exposed.gateway().bound().is_empty(),
+        "a refused gateway advertised an address anyway"
+    );
+
+    // The same port on loopback comes up, so the refusal above was about the
+    // interface. A wildcard bind is something the kernel grants freely; only the
+    // composition refuses it.
+    let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let mut permitted = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()) as Arc<dyn Clock>)
+        .listen(vec![loopback])
+        .build()
+        .expect("the composition is orderable");
+
+    permitted
+        .start()
+        .await
+        .expect("the same port on loopback is served");
+    assert_eq!(
+        permitted.gateway().bound(),
+        vec![loopback],
+        "the gateway bound something other than the loopback address it was given"
+    );
+    assert!(permitted.gateway().serves_the_wire().await);
+
+    assert!(permitted.stop().await.expect("the daemon stops").is_clean());
+}
