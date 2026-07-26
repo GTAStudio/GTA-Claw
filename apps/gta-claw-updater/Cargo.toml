@@ -1,0 +1,44 @@
+[package]
+name = "gta-claw-updater"
+description = "Standalone signed updater for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+base64 = "=0.22.1"
+bytes = "=1.12.1"
+ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
+futures-util = "=0.3.33"
+http-body-util = "=0.1.4"
+httparse = "=1.10.1"
+hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["client-proxy", "tokio"] }
+reqwest = { version = "=0.13.2", default-features = false, features = ["stream"] }
+rustls = { version = "=0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
+semver = "=1.0.28"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+unicode-casefold = "=0.2.0"
+unicode-normalization = "=0.1.25"
+url = "=2.5.8"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-acl = "=0.3.0"
+
+[dev-dependencies]
+ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
+tokio = { version = "=1.52.3", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true
