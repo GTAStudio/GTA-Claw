@@ -4162,14 +4162,8 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
     );
     let clone_child_argv = git_trace_child_argv(&clone_trace);
     assert!(
-        clone_child_argv.iter().any(|argv| is_upload_pack(argv)),
-        "local clone did not invoke upload-pack: {clone_child_argv:?}"
-    );
-    assert!(
-        !clone_child_argv
-            .iter()
-            .any(|argv| is_auto_maintenance(argv)),
-        "local clone unexpectedly spawned automatic maintenance: {clone_child_argv:?}"
+        clone_child_argv.len() == 1 && is_upload_pack(&clone_child_argv[0]),
+        "local clone invoked a child other than its sole upload-pack: {clone_child_argv:?}"
     );
     assert!(
         fs::read_dir(candidate.join(".git/objects/pack"))
