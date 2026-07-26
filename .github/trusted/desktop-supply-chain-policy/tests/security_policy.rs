@@ -38,8 +38,9 @@ use desktop_supply_chain_policy::validation::{
 };
 use desktop_supply_chain_policy::workflows::{
     AUTHORITATIVE_JOB_NAME, AUTHORITATIVE_PATH, AUTHORITATIVE_WORKFLOW_NAME, ActionlintTool,
-    BOOTSTRAP_JOB_NAME, BOOTSTRAP_PATH, BOOTSTRAP_WORKFLOW_NAME, validate_final_workflows,
-    validate_inventory, validate_protected_files,
+    BOOTSTRAP_JOB_NAME, BOOTSTRAP_PATH, BOOTSTRAP_WORKFLOW_NAME, WorkflowIdentity,
+    admitted_workflows, required_workflows, validate_final_workflows, validate_inventory,
+    validate_protected_files,
 };
 
 mod mutations;
@@ -1334,12 +1335,45 @@ fn otherwise_valid_standing_covered_source_change_reaches_preserved_instead() {
     );
 }
 
+/// Asserts the inventory shape the workflow policy actually guarantees.
+///
+/// This replaces three hardcoded counts. The live tree holds every required workflow plus whichever
+/// admitted ones happen to exist, so a literal has to be re-edited each time an admitted workflow
+/// lands - and while it is stale, an unexpected workflow is indistinguishable from an expected one
+/// nobody updated the count for. Asserting the containment states the rule instead of its size.
+fn assert_workflow_inventory_shape(identities: &[WorkflowIdentity], label: &str) {
+    let present = identities
+        .iter()
+        .map(|identity| identity.path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        present.len(),
+        identities.len(),
+        "{label}: duplicate workflow path"
+    );
+    let required = required_workflows();
+    let admitted = admitted_workflows();
+    let missing = required.difference(&present).collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "{label}: missing required workflows: {missing:?}"
+    );
+    let unexpected = present
+        .iter()
+        .filter(|path| !required.contains(*path) && !admitted.contains(*path))
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "{label}: workflows outside required or admitted: {unexpected:?}"
+    );
+}
+
 #[test]
 fn live_tree_is_a_valid_bootstrap_or_final_policy_state() {
     let tree = copy_repo("live-policy-state");
     let root = SafeRoot::new(&tree.path).expect("open copied live repository");
     let identities = validate_inventory(&root).expect("validate live workflow inventory");
-    assert_eq!(identities.len(), 8);
+    assert_workflow_inventory_shape(&identities, "live tree");
     assert!(identities.iter().any(|identity| {
         identity.path == AUTHORITATIVE_PATH
             && identity.workflow_name == AUTHORITATIVE_WORKFLOW_NAME
@@ -1892,8 +1926,13 @@ fn mobile_workflow_stub(name: &str, job_id: &str, job_name: &str) -> String {
 fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
     let base = copy_repo("mobile-inventory-baseline");
     let identities = validate_inventory(&SafeRoot::new(&base.path).expect("open baseline tree"))
-        .expect("the eight required workflows are a valid inventory");
-    assert_eq!(identities.len(), 8);
+        .expect("the required workflows are a valid inventory");
+    assert_workflow_inventory_shape(&identities, "mobile inventory baseline");
+    let baseline_paths = identities
+        .iter()
+        .map(|identity| identity.path.clone())
+        .collect::<BTreeSet<_>>();
+    let baseline = identities.len();
 
     for (label, added) in [
         ("ios", &[".github/workflows/ios-packaging.yml"][..]),
@@ -1921,7 +1960,13 @@ fn mobile_packaging_workflows_are_admitted_but_the_inventory_stays_closed() {
         let identities =
             validate_inventory(&SafeRoot::new(&tree.path).expect("open admitted mobile tree"))
                 .expect("admitted mobile workflows pass the inventory");
-        assert_eq!(identities.len(), 8 + added.len(), "{label}");
+        // Only paths the baseline lacks add to the count. Once an admitted workflow actually
+        // lands in the repository, writing it again replaces a file rather than adding one.
+        let introduced = added
+            .iter()
+            .filter(|path| !baseline_paths.contains(**path))
+            .count();
+        assert_eq!(identities.len(), baseline + introduced, "{label}");
     }
 
     for (label, path) in [
@@ -4832,17 +4877,26 @@ fn mobile_manifest_dependencies_cannot_escape_the_repository_or_use_forbidden_so
 
 #[test]
 fn a_mobile_dependency_policy_is_rejected_until_ci_executes_it() {
-    // `android-packaging.yml` and `ios-packaging.yml` are admitted workflow paths but do not
-    // exist, so nothing runs cargo-deny against a mobile policy file. A policy file that nothing
-    // executes is worse than none, because it reads as protection. Admitting one belongs in the
-    // change that also lands the workflow executing it, so today it fails closed.
-    for platform in ["android", "ios"] {
-        assert!(
-            !Path::new(&repo_root())
-                .join(format!(".github/workflows/{platform}-packaging.yml"))
-                .exists(),
-            "this rule is only correct while no {platform} packaging workflow exists"
-        );
+    // A mobile `deny.toml` is rejected because nothing executes it, and a policy file that nothing
+    // runs is worse than none - it reads as protection. The precondition is therefore *behavioural*
+    // rather than a claim that the packaging workflows are absent: a mobile packaging workflow may
+    // exist and still not run cargo-deny, which is exactly the state after the iOS compile job
+    // landed. What must remain true is that no workflow references a mobile deny configuration.
+    let workflows = Path::new(&repo_root()).join(".github/workflows");
+    for entry in fs::read_dir(&workflows).expect("read workflow directory") {
+        let path = entry.expect("workflow directory entry").path();
+        if path.extension().is_none_or(|ext| ext != "yml") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("read workflow");
+        for platform in ["android", "ios"] {
+            assert!(
+                !text.contains(&format!("{platform}/deny.toml")),
+                "{} executes {platform}/deny.toml, so the rejection rule below is stale and the \
+                 policy file should now be admitted alongside the workflow that runs it",
+                path.display()
+            );
+        }
     }
 
     let tree = accepted_android_tree("mobile-deny-unexecuted");
