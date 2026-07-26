@@ -402,6 +402,13 @@ jobs:
           sudo install -D -m 0755 \
             packaging/linux/libexec/gta-claw-state-init \
             /usr/libexec/gta-claw/gta-claw-state-init
+          # The unit's ExecCondition runs gta-claw-start-authorized, so systemd-analyze
+          # verify resolves it too. package.sh ships all three libexec entries at 0755;
+          # installing only two made this step fail closed the first time it was ever
+          # reached, because the Debian install ahead of it had always failed first.
+          sudo install -D -m 0755 \
+            packaging/linux/libexec/gta-claw-start-authorized \
+            /usr/libexec/gta-claw/gta-claw-start-authorized
           systemd-analyze verify \
             packaging/linux/systemd/gta-claw-state-init.service \
             packaging/linux/systemd/gta-claw-daemon.service
@@ -411,7 +418,8 @@ jobs:
           grep -F 'NoNewPrivileges=' "$RUNNER_TEMP/systemd-security.txt"
           sudo rm -f \
             /usr/libexec/gta-claw/gta-claw-daemon \
-            /usr/libexec/gta-claw/gta-claw-state-init
+            /usr/libexec/gta-claw/gta-claw-state-init \
+            /usr/libexec/gta-claw/gta-claw-start-authorized
 
       - name: Prove real Debian and RPM lifecycle
         shell: bash
