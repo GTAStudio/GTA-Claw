@@ -863,6 +863,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let options = SqliteConnectOptions::new().filename(&path).read_only(true);
+        let sidecars_before_inspection: Vec<PathBuf> = ["-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| sidecar(&path, suffix))
+            .filter(|artifact| artifact.exists())
+            .collect();
         let mut inspection = SqliteConnection::connect_with(&options)
             .await
             .expect("inspect cancelled open");
@@ -886,6 +891,16 @@ mod tests {
             .close()
             .await
             .expect("close cancellation inspection");
+        // A read-only SQLite connection materializes -wal/-shm to read a WAL database and
+        // cannot unlink them on close, so the probe leaves untagged sidecars the store is
+        // right to refuse. Undo exactly what the probe created, and nothing else, so a real
+        // sidecar leak from the cancelled open would still reach the reopen below.
+        for suffix in ["-wal", "-shm"] {
+            let artifact = sidecar(&path, suffix);
+            if artifact.exists() && !sidecars_before_inspection.contains(&artifact) {
+                fs::remove_file(&artifact).expect("remove read-only inspection sidecar");
+            }
+        }
         let reopened = open(&path).await;
         assert_eq!(
             reopened.recovered_writer(),
