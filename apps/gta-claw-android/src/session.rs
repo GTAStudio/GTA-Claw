@@ -353,26 +353,45 @@ mod tests {
         );
     }
 
+    /// Every endpoint here must be constructible with the opt-in it is paired
+    /// with. An earlier version of this test looped over `[false, true]` against
+    /// a remote `ws://` URL, where the `false` case is refused at construction
+    /// and took a `continue` branch, so the assertion only ever ran with
+    /// `accepted == true` and could not observe the transport ignoring the
+    /// operator's choice. The counter below exists so that reintroducing an
+    /// unreachable case fails rather than silently narrowing the test.
     #[test]
     fn the_plaintext_opt_in_reaches_the_transport_configuration() {
-        for accepted in [false, true] {
-            let request = ConnectRequest::prepare("ws://gateway.example.com", "", accepted);
-            let Ok(request) = request else {
-                assert!(
-                    !accepted,
-                    "the opt-in must make remote plaintext acceptable, got {request:?}"
-                );
-                continue;
-            };
+        const CASES: &[(&str, bool)] = &[
+            ("wss://gateway.example.com", false),
+            ("wss://gateway.example.com", true),
+            ("ws://127.0.0.1:9000", false),
+            ("ws://gateway.example.com", true),
+        ];
+        let mut observed = Vec::new();
+
+        for (endpoint, accepted) in CASES {
+            let request =
+                ConnectRequest::prepare(endpoint, "", *accepted).unwrap_or_else(|error| {
+                    panic!("{endpoint} with opt-in {accepted} must be constructible, got {error:?}")
+                });
 
             let config = build_client_config(request, test_identity());
 
             assert_eq!(
-                config.allow_insecure_remote_ws, accepted,
-                "the transport must enforce exactly the operator's choice ({accepted}), got {}",
+                config.allow_insecure_remote_ws, *accepted,
+                "the transport must carry exactly the operator's choice for {endpoint} \
+                 (expected {accepted}), got {}",
                 config.allow_insecure_remote_ws
             );
+            observed.push(config.allow_insecure_remote_ws);
         }
+
+        assert!(
+            observed.contains(&false) && observed.contains(&true),
+            "this test is only meaningful if both opt-in states reach the transport; \
+             observed {observed:?}"
+        );
     }
 
     #[test]
@@ -464,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn the_frozen_client_contract_admits_the_scopes_this_client_requests() {
+    fn the_declared_client_ceiling_admits_the_scopes_this_client_requests() {
         let config = test_config();
         let requested = requested_operator_scopes(&config);
         let pinned: &'static [OperatorScope] = Box::leak(requested.clone().into_boxed_slice());
@@ -478,13 +497,13 @@ mod tests {
         assert_eq!(
             outcome,
             Ok(()),
-            "the frozen Android contract must admit the scopes this client requests \
+            "the declared client ceiling must admit the scopes this client requests \
              ({requested:?}), got {outcome:?}"
         );
     }
 
     #[test]
-    fn the_frozen_client_contract_refuses_pairing_for_android() {
+    fn the_declared_client_ceiling_refuses_pairing_for_android() {
         const READ_PLUS_PAIRING: &[OperatorScope] = &[OperatorScope::Read, OperatorScope::Pairing];
         let config = test_config();
 
