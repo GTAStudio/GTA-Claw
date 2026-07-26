@@ -61,6 +61,58 @@ version = "=0.16.1"
 name = "sha2"
 version = "=0.10.9"
 
+# Discovery/fleet automation (russh 0.62 + hickory-resolver 0.26) authorization.
+# Each pair below is forced by an upstream crate we do not control; convergence
+# is blocked until that upstream publishes a release on the newer line.
+#
+# core-foundation: hickory-resolver 0.26.1's system-configuration 0.7.0 backend
+# pins core-foundation 0.9, while the pre-existing security-framework 3.7.0
+# stack (TLS/keychain, used across the desktop/CLI/TUI/updater apps) requires
+# 0.10.1. Convergence needs system-configuration to release on core-foundation 0.10.
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+
+# generic-array: wasmtime/cranelift's SHA-2 0.10 line still requires the 0.14
+# series, while russh 0.62 mandates the 1.x line and enables its non-optional
+# compat-0_14 bridge. The 1.x line is the direction russh's crypto stack has
+# already converged on, so it remains the unskipped, canonical version.
+[[bans.skip]]
+name = "generic-array"
+version = "=0.14.7"
+
+# getrandom: ring 0.17 and rand_core 0.6 (already relied on throughout the
+# gateway/client/app crates) pin getrandom 0.2, while russh 0.62's ECDSA stack
+# (crypto-bigint 0.7.5 -> elliptic-curve 0.14.1 -> p256/p384/p521) requires
+# getrandom 0.4. Convergence needs ring/rand_core to move off the 0.2 API.
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+
+# rand: fastwebsockets 0.10 (used by claw-gateway/claw-gateway-client) pins
+# rand 0.8 solely for RFC 6455 client masking, while hickory-resolver 0.26.1
+# and russh 0.62 (including internal-russh-num-bigint and pageant) require
+# rand 0.10. Convergence needs fastwebsockets to move off the rand 0.8 API.
+[[bans.skip]]
+name = "rand"
+version = "=0.8.7"
+
+# sha3: russh 0.62.4 depends directly on sha3 0.12, but its ml-kem 0.3.2
+# dependency (post-quantum ML-KEM key exchange) still pins sha3 0.11.
+# Convergence needs ml-kem to publish a release on sha3 0.12.
+[[bans.skip]]
+name = "sha3"
+version = "=0.11.0"
+
+# widestring: windows-acl 0.3 (gta-claw-updater's pre-existing Windows ACL
+# dependency) retains widestring 0.4, while hickory-resolver 0.26.1's
+# ipconfig 0.3.4 backend uses widestring 1.x. Owner: @aizhihuxiao. Remove
+# when windows-acl is replaced/upgraded, or when audited convergence removes
+# this edge.
+[[bans.skip]]
+name = "widestring"
+version = "=0.4.3"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

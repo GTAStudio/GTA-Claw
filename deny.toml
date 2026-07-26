@@ -104,6 +104,15 @@ version = "=0.8.7"
 name = "sha3"
 version = "=0.11.0"
 
+# widestring: windows-acl 0.3 (gta-claw-updater's pre-existing Windows ACL
+# dependency) retains widestring 0.4, while hickory-resolver 0.26.1's
+# ipconfig 0.3.4 backend uses widestring 1.x. Owner: @aizhihuxiao. Remove
+# when windows-acl is replaced/upgraded, or when audited convergence removes
+# this edge.
+[[bans.skip]]
+name = "widestring"
+version = "=0.4.3"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
