@@ -668,6 +668,46 @@ fn archive_only_or_policy_source_only_companions_do_not_satisfy_synchronization(
 }
 
 #[test]
+fn archive_and_fingerprint_recording_paths_cannot_change_by_themselves() {
+    let archive_trusted = snapshot_fixture("standalone-archive-trusted");
+    let archive_candidate = snapshot_fixture("standalone-archive-candidate");
+    append_bytes(
+        &archive_candidate,
+        UPSTREAM_WORKFLOW,
+        b"\n# snapshot-only payload\n",
+    );
+    synchronize_snapshot(&archive_candidate);
+    fs::copy(
+        archive_trusted.join(UPSTREAM_WORKFLOW),
+        archive_candidate.join(UPSTREAM_WORKFLOW),
+    )
+    .expect("restore unchanged live source");
+    fs::copy(
+        archive_trusted.join(BOOTSTRAP_FINGERPRINT_SOURCE_PATH),
+        archive_candidate.join(BOOTSTRAP_FINGERPRINT_SOURCE_PATH),
+    )
+    .expect("restore unchanged fingerprint source");
+    expect_error(
+        &archive_trusted,
+        &archive_candidate,
+        &manifest([('M', BOOTSTRAP_SNAPSHOT_PATH)]),
+        &format!(
+            "candidate Bootstrap snapshot changed without a synchronized live source decision: {UPSTREAM_WORKFLOW}"
+        ),
+    );
+
+    let fingerprint_trusted = snapshot_fixture("standalone-fingerprint-trusted");
+    let fingerprint_candidate = snapshot_fixture("standalone-fingerprint-candidate");
+    replace_fingerprint(&fingerprint_candidate, &"0".repeat(64));
+    expect_error(
+        &fingerprint_trusted,
+        &fingerprint_candidate,
+        &manifest([('M', BOOTSTRAP_FINGERPRINT_SOURCE_PATH)]),
+        "candidate Bootstrap snapshot fingerprint does not match BOOTSTRAP_FINGERPRINT",
+    );
+}
+
+#[test]
 fn unavailable_add_delete_and_type_change_statuses_fail_closed() {
     for status in ['A', 'D', 'T'] {
         let trusted = snapshot_fixture(&format!("status-{status}-trusted"));
