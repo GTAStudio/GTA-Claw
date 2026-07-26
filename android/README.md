@@ -146,13 +146,71 @@ byte-matches `desktop/Cargo.toml`, and the rule is "no weaker than desktop",
 so the single `android_main` exception survives. The ceiling that blocks a
 **root** member does not block a mobile-workspace member.
 
-Two barriers beyond the three above were **not** reached, because validation
-stops at the first rejection, and they are the likely next ones. They are
-recorded as unverified: a mobile lock may not introduce a second `slint`
-line — any `slint` entry must match the release in the protected desktop
-lock — and wherever a mobile lock contains `skia-bindings` it must be the
-pinned release. This archive's lock was resolved independently and neither
-property has been checked against it.
+Two barriers beyond the three above were not reached, because validation
+stops at the first rejection. One of them has since been **measured and is a
+certain fourth rejection**:
+
+4. **The Skia pin, which cannot be satisfied today.** This archive's
+   `Cargo.lock` contains `skia-bindings 0.99.0` and `skia-safe 0.99.0`.
+   The trust root requires that wherever a mobile lock contains
+   `skia-bindings` it must be the pinned release, and
+   `PINNED_BUILD_ARTIFACTS` on `main` is `[(&str, &str, &str, &str, &str); 0]
+   = []` — **literally empty**. No release is pinned, so no lock containing
+   Skia can pass. A reviver must either land a Skia pin first, or produce a
+   lock with no `skia-bindings` line at all — and the next section explains
+   why the second option is not available on Android.
+
+The remaining unverified barrier is the single-`slint`-line rule: any `slint`
+entry in a mobile lock must match the release recorded in the protected
+desktop lock. That has not been checked against this lock.
+
+### Skia is unavoidable on Android, and the trust root records the opposite
+
+This crate selects `default-features = false` with only `renderer-femtovg`
+and `renderer-software`. **It still builds Skia.** The cause is upstream and
+structural:
+
+```toml
+# i-slint-backend-android-activity 1.17.1, Cargo.toml lines 89-91
+[target.'cfg(target_os = "android")'.dependencies.i-slint-renderer-skia]
+version = "=1.17.1"
+default-features = false
+```
+
+There is no `optional = true`. `cargo tree -i i-slint-renderer-skia` confirms
+it on both `aarch64-linux-android` and `armv7-linux-androideabi`, arriving
+through `i-slint-backend-android-activity` — the backend this crate selects
+by name. Renderer features select what is *used*; they do not remove a
+non-optional dependency of the backend.
+
+**This contradicts the trust root's platform table.** `policy.rs` sets
+`skia_is_unavoidable: false` for Android with the comment "The Android
+backend can select femtovg or the software renderer, so Skia is optional
+here". That is true of Slint's renderer features in general and false of the
+`android-activity` backend at 1.17.1. Android is structurally the same case
+as iOS, which the table already marks unavoidable. **This is reported to the
+trust-root owner and is not this branch's to fix** — recorded here because
+anyone reviving this tree will hit it.
+
+### This archive has a JNI trust boundary; the shipped crate does not
+
+An earlier finding, correct for the shipped no-GUI `apps/gta-claw-android`,
+was that the Android dependency graph contains none of `jni`, `jni-sys`,
+`ndk`, `ndk-sys` or `android-activity`. **That statement does not extend to
+this archive.** Measured on `aarch64-linux-android`:
+
+| Crate | Version(s) |
+| --- | --- |
+| `jni` | 0.22.4 |
+| `jni-sys` | **0.3.1 and 0.4.1** |
+| `ndk` | 0.9.0 |
+| `ndk-sys` | 0.6.0+11769913 |
+| `android-activity` | 0.6.1 |
+
+`jni` is likewise a non-optional Android dependency of the backend
+(`Cargo.toml` line 93). So if mobile GUI is ever revived, **the JNI audit
+that currently has no subject acquires one**, including a `jni-sys` present
+at two major versions in a single graph.
 
 **None of this makes the tree shippable.** Mobile ships without a GUI this
 release, so conforming to the admitted shape would be speculative work on a
@@ -266,6 +324,29 @@ which needs `python3`, `ninja` and the `ANDROID_NDK` variable, and takes on the
 order of an hour. Supporting armv7 means either accepting a from-source Skia
 build or waiting for an upstream armv7 binary release; it is not a change to
 this crate.
+
+This was originally established by listing the release assets. It has since
+been **reproduced by running the build**, which is stronger, and the failure
+is verbatim:
+
+```
+TRYING TO DOWNLOAD AND INSTALL SKIA BINARIES:
+  0.99.0/<key>-armv7-linux-androideabi-gl-jpegd-jpege-pdf-vulkan
+DOWNLOAD AND INSTALL FAILED: curl error code: "22"
+curl stderr: "curl: (22) The requested URL returned error: 404"
+STARTING A FULL BUILD
+...
+panicked at skia-bindings-0.99.0/build_support/platform/android.rs:69:35:
+ANDROID_NDK variable not set
+```
+
+Two details a future reader will need. The variable `skia-bindings` demands
+is **`ANDROID_NDK`**, which is *not* the `ANDROID_NDK_HOME` that the rest of
+the Android tooling uses; setting only the latter produces a panic that reads
+like a missing NDK on a machine that has five. And the fallback is silent in
+the sense that matters: a 404 on an artefact that was never published
+escalates automatically into fetching and compiling an unvendored C++ tree,
+rather than stopping and saying the platform is unsupported.
 
 ## Packaging
 
