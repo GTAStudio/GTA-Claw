@@ -2514,6 +2514,33 @@ $cases = @(
             $ledger.features = "not-an-array"
             Save-FirstLedger $caseRoot $ledger
         }
+    },
+    # The self-test is the instrument every other case is measured with, and
+    # nothing in CI runs it. Before validate.ps1 pinned its digest, replacing the
+    # whole file with "exit 0" left BOTH scripts exiting 0 - the suite reported
+    # success having tested nothing. These two cases exist so that hole cannot
+    # reopen silently.
+    [ordered]@{
+        name = "gutted-self-test-is-rejected"
+        expected_message = "validate-self-test.ps1 digest mismatch"
+        mutate = {
+            param($caseRoot)
+            Set-Content -LiteralPath (Join-Path $caseRoot "validate-self-test.ps1") -Value "exit 0" -NoNewline
+        }
+    },
+    # Re-blessing the mutable ledger digests first must not help: the self-test
+    # digest is frozen in validate.ps1 and -WriteLedgerDigests cannot reach it.
+    # A single appended comment is enough, so this also proves the check is not
+    # merely a size or "looks empty" heuristic.
+    [ordered]@{
+        name = "appended-comment-in-self-test-survives-digest-regeneration"
+        expected_message = "validate-self-test.ps1 digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "validate-self-test.ps1"
+            Add-Content -LiteralPath $path -Value "# harmless-looking comment"
+        }
     }
 )
 
