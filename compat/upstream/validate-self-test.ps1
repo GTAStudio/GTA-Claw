@@ -1925,7 +1925,7 @@ $cases = @(
                 # git checks these out with CRLF on Windows and LF on Linux. Their
                 # digests are structural and every newline inside a case source is
                 # a \n escape, so both checkouts must reach the same digest and
-                # the same 120 oracle verdicts and 27 reachability verdicts.
+                # the same 120 oracle verdicts and 32 reachability verdicts.
                 "enabled-test-oracle.json",
                 "reachability-corpus.json"
             )

@@ -11,7 +11,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `inventories/*.json` (10 files, 717 rows) | frozen, digest hardcoded in `validate.ps1` |
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
-| `reachability-corpus.json` (27 cases) | frozen, digest hardcoded in `validate.ps1` |
+| `reachability-corpus.json` (32 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `manifest.json` | only `evidence_policy.status_totals` may change |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
@@ -368,10 +368,18 @@ to `cargo metadata`, which keeps this trust root hermetic: it reads files and
 executes nothing. That is a deliberate trade. It costs exactness at the margins
 of cargo's auto-discovery rules, and it means the per-kind defaults above are a
 model of cargo rather than cargo's own answer — a model that was **wrong** once
-already, when `benches/` and `examples/` were treated as roots. Where the two
-differ today, this validator is the stricter side: `harness = false` cannot be
-expressed in `cargo metadata` at all, which still reports such a target as
-`test = true`.
+already, when `benches/` and `examples/` were treated as roots.
+
+The `harness = false` case is the one where the model was, for a time, the
+*stricter* side: it cannot be expressed in `cargo metadata` at all, which still
+reports such a target as `test = true`. Measured directly — a package carrying
+an explicit `harness = false` test target, a default example, a default bench, a
+`src/bin/` target, a lib and an ordinary integration test — `cargo metadata`
+reports `test = true` for the `harness = false` target, while
+`cargo test -- --list` yields exactly `lib_test`, `bin_test` and `normal_test`.
+Metadata alone therefore admits a target whose `#[test]` never runs. The harness
+now reads the manifest to overlay that field, so the two answers agree; the
+corpus pins all six of those paths so neither side can drift back.
 
 A tightening rule needs its false-positive cases pinned as much as its
 true-positive ones. Twelve of the fourteen accepting cases pin reachability — a
@@ -411,10 +419,11 @@ repository. Two implementations could agree 287/5 forever with both fixes never
 once compared. A whole-tree sweep is the highest-yield instrument for rules the
 tree exercises and no instrument at all for rules it does not.
 
-`reachability-corpus.json` holds 27 synthetic workspaces — 13 that must be
-accepted and 14 that must be rejected — each a complete set of files, a cited
-path and the expected verdict. It covers explicit `test = false` targets, the
-three `#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
+`reachability-corpus.json` holds 32 synthetic workspaces — 15 that must be
+accepted and 17 that must be rejected — each a complete set of files, a cited
+path and the expected verdict. It covers explicit `test = false` targets,
+`harness = false` targets, default examples and default benches, the three
+`#[path]` base-directory rules, raw-string `#[path]`, `E0761` ambiguity in
 both directions, package boundaries, and target roots in excluded and
 self-rooted workspaces.
 
@@ -440,9 +449,11 @@ define — otherwise a case could name a real repository file and assert a verdi
 about something the fixture never contained — and that no path may contain a dot
 segment, so no replayer can be induced to write outside its fixture root.
 
-**This file is the single copy.** `crates/claw-conformance` is expected to load
-it from `compat/upstream/reachability-corpus.json`, exactly as it already loads
-`compat/upstream/enabled-test-oracle.json`, and to replay it against `cargo`.
+**This file is the single copy, and it now is one.** `crates/claw-conformance`
+loads it from `compat/upstream/reachability-corpus.json`, exactly as it already
+loads `compat/upstream/enabled-test-oracle.json`, and replays every case against
+`cargo` before comparing its own resolver's verdict to `expect`. The private
+duplicate that previously lived under that crate's fixtures has been deleted.
 A corpus that exists twice is not shared: it is two corpora that agree until one
 is edited, and the cheapest drift detector — comparing digests — is unavailable
 the moment the copies differ in whitespace or member order, which two independent
@@ -450,6 +461,21 @@ serializers will do immediately. The schema is deliberately additive-only for
 that reason; a reader may ignore `schema_version`, `purpose`, `rule`, `arbiter`,
 `implementations` and each case's `why` and still see `name`, `files`, `cite` and
 `expect`.
+
+Sharing the file has a cost that must be stated rather than discovered. The
+consumer asserts an exact case count, so **adding a case to this corpus is a
+change that cannot land on either side alone** — the same coupling that already
+applies to `enabled-test-oracle.json` and to `canonical_counts.artifact_json_files`,
+and the reason the artifact count needed a single atomic pull request across two
+owners. The coupling is worth keeping in the shrinking direction: without it,
+cases could be deleted to hide a disagreement in a tree where `validate.ps1` was
+bypassed. It is not worth paying in the growing direction, because a corpus is
+only useful if adding coverage is cheap, and every case added here exists because
+some rule was otherwise pinned by nothing. An exact equality is also strictly
+weaker than the digest this validator already enforces: it cannot detect a case
+being *replaced* by a weaker one at constant count. A lower bound on the consumer
+side preserves the anti-deletion property, drops the coupling on additions, and
+gives up nothing the digest does not already cover.
 
 #### A row may not rewrite its own acceptance bar
 

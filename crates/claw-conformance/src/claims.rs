@@ -3235,7 +3235,8 @@ mod nested {
             "../../../compat/upstream/reachability-corpus.json"
         ))
         .expect("parse shared reachability corpus");
-        assert_eq!(corpus.cases.len(), 27);
+        // This exact count is an independent fail-closed anti-deletion pin; update it atomically with the canonical corpus.
+        assert_eq!(corpus.cases.len(), 32);
         let fixture_root = env::temp_dir().join(format!(
             "claw-conformance-reachability-corpus-{}-{}",
             std::process::id(),
