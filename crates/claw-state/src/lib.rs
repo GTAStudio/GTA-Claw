@@ -36,6 +36,22 @@ pub use store::{
 
 #[cfg(test)]
 mod tests {
+    mod tempfile {
+        pub(super) use ::tempfile::TempDir;
+
+        pub(super) fn tempdir() -> std::io::Result<TempDir> {
+            #[cfg(target_os = "macos")]
+            {
+                let root = std::fs::canonicalize(std::env::temp_dir())?;
+                return ::tempfile::Builder::new().tempdir_in(root);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                ::tempfile::tempdir()
+            }
+        }
+    }
+
     use std::ffi::OsString;
     use std::fs::{self, OpenOptions};
     use std::path::{Path, PathBuf};
@@ -8346,7 +8362,7 @@ mod tests {
             .status()
             .expect("grant inheritable world-write test ACL");
         assert!(status.success());
-        let inherited = tempfile::Builder::new()
+        let inherited = ::tempfile::Builder::new()
             .prefix("inherited-state-")
             .tempdir_in(outer.path())
             .expect("create inherited temporary directory");

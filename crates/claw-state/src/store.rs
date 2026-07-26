@@ -8817,10 +8817,16 @@ mod open_deadline_tests {
 mod snapshot_quarantine_tests {
     use super::*;
 
-    fn private_tempdir() -> tempfile::TempDir {
+    pub(super) fn private_tempdir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory = tempfile::tempdir().expect("create private test directory");
+        let temporary_root = std::env::temp_dir();
+        #[cfg(target_os = "macos")]
+        let temporary_root =
+            std::fs::canonicalize(temporary_root).expect("canonicalize macOS temporary root");
+        let directory = tempfile::Builder::new()
+            .tempdir_in(temporary_root)
+            .expect("create private test directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("secure private test directory");
         directory
@@ -9162,7 +9168,7 @@ mod trusted_backup_seal_cleanup_tests {
 
     #[test]
     fn transient_post_unlink_failure_resumes_at_parent_sync() {
-        let directory = tempfile::tempdir().expect("transient seal cleanup directory");
+        let directory = super::snapshot_quarantine_tests::private_tempdir();
         let path = directory.path().join("transient-seal.record");
         let (mut seal, attempts) = trusted_seal_fixture(&path, 1);
 
@@ -9196,7 +9202,7 @@ mod trusted_backup_seal_cleanup_tests {
 
     #[test]
     fn persistent_post_unlink_failure_returns_without_reunlinking() {
-        let directory = tempfile::tempdir().expect("persistent seal cleanup directory");
+        let directory = super::snapshot_quarantine_tests::private_tempdir();
         let path = directory.path().join("persistent-seal.record");
         let (mut seal, attempts) = trusted_seal_fixture(&path, usize::MAX);
 
