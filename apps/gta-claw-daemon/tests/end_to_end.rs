@@ -16,9 +16,20 @@ use claw_application::composition::{
     SubsystemKind, ToolName, TurnEvent, TurnEventSink, well_known,
 };
 use claw_domain::SessionId;
+use claw_gateway::Grant;
+use claw_gateway_client::{GatewayClient, GatewayClientConfig, ReconnectPolicy};
+use claw_protocol::gateway::{OperatorScope, ProtocolVersion, Role};
+use claw_security::{
+    authorization::{Role as SecurityRole, Scope, ScopeSet},
+    identity::DeviceIdentity,
+};
 use gta_claw_daemon::adapters::model::request_tool;
 use gta_claw_daemon::adapters::support::SteppedClock;
 use gta_claw_daemon::compose::Daemon;
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::SeedableRng;
+use tokio::net::TcpStream;
+use url::Url;
 
 /// Collects every event a turn emitted, in arrival order.
 #[derive(Debug, Default)]
@@ -63,6 +74,99 @@ async fn started(clock: Arc<SteppedClock>) -> Daemon {
 
     daemon.start().await.expect("every subsystem comes up");
     daemon
+}
+
+#[tokio::test]
+async fn the_daemon_exposes_the_real_gateway_and_releases_its_listener_on_shutdown() {
+    let mut daemon = started(Arc::new(SteppedClock::new())).await;
+    let bound = daemon.gateway().bound();
+
+    assert_eq!(
+        bound.len(),
+        1,
+        "the daemon must report exactly one address from a real Gateway listener"
+    );
+    let address = bound[0];
+    assert!(address.ip().is_loopback());
+    assert_ne!(address.port(), 0);
+
+    let mut rng = ChaCha20Rng::from_seed([71; 32]);
+    let identity = Arc::new(DeviceIdentity::generate(&mut rng));
+    daemon.gateway().devices().pair(
+        identity.device_id().gateway_wire_id(),
+        Grant::new(Role::Operator, [OperatorScope::Read]),
+    );
+    let mut client_config = GatewayClientConfig::new(
+        Url::parse(&format!("ws://{address}/")).expect("the bound address is a valid endpoint"),
+        identity,
+    );
+    client_config.role = SecurityRole::Operator;
+    client_config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
+    client_config.reconnect = ReconnectPolicy::Never;
+    client_config.timeouts.connect = Duration::from_secs(2);
+    client_config.timeouts.authentication = Duration::from_secs(2);
+
+    let (client, _events) =
+        GatewayClient::start(client_config).expect("the client configuration is valid");
+    let ready = client
+        .wait_ready()
+        .await
+        .expect("the real Gateway authenticates its paired client");
+    assert_eq!(ready.info.protocol, ProtocolVersion::new(4).unwrap());
+    assert_eq!(ready.info.server_version, "0.1.0");
+    assert_eq!(ready.info.role, "operator");
+    assert_eq!(ready.info.scopes.as_ref(), ["operator.read".to_owned()]);
+    assert_eq!(ready.info.advertised_method_count, 258);
+    assert_eq!(ready.info.advertised_event_count, 33);
+    assert_eq!(ready.info.max_payload_bytes, 26_214_400);
+
+    let summary = daemon.stop().await.expect("the daemon stops");
+    assert!(summary.is_clean());
+    assert_eq!(summary.phase(), LifecyclePhase::Stopped);
+    assert_eq!(summary.shutdown().abandoned(), 0);
+    assert_eq!(summary.tasks().spawned(), 1);
+    assert_eq!(summary.tasks().terminated(), 1);
+    assert!(summary.tasks().is_settled());
+
+    let refused = TcpStream::connect(address)
+        .await
+        .expect_err("the stopped daemon must release the Gateway listener");
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "shutdown must close the listener rather than reject a later handshake"
+    );
+    client.shutdown().await.expect("the client stops cleanly");
+}
+
+#[tokio::test]
+async fn a_startup_failure_rolls_back_the_bound_gateway_listener() {
+    let reservation =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is available");
+    let address = reservation
+        .local_addr()
+        .expect("the reservation has an address");
+    drop(reservation);
+
+    let mut daemon = Daemon::builder()
+        .clock(Arc::new(SteppedClock::new()))
+        .listen(vec![address])
+        .build()
+        .expect("the composition is orderable");
+    daemon.dns().set("models.example.test", Vec::new());
+
+    daemon
+        .start()
+        .await
+        .expect_err("credential provisioning fails without a provider address");
+
+    assert_eq!(daemon.phase(), LifecyclePhase::Stopped);
+    assert!(!daemon.is_started());
+    assert!(daemon.gateway().bound().is_empty());
+    let refused = TcpStream::connect(address)
+        .await
+        .expect_err("failed startup must release the Gateway listener");
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
 }
 
 #[tokio::test]
@@ -259,7 +363,7 @@ async fn a_request_arriving_at_the_gateway_produces_the_same_answer_as_a_direct_
         .expect("the gateway describes the session");
 
     assert_eq!(described.body(), "via-gateway revision 1 turns 1");
-    assert_eq!(daemon.gateway().registered_methods(), 2);
+    assert_eq!(daemon.gateway().registered_methods(), 278);
 
     assert!(daemon.stop().await.expect("the daemon stops").is_clean());
 }
@@ -348,10 +452,10 @@ async fn shutdown_stops_ingress_first_and_joins_every_spawned_task() {
     assert_eq!(summary.phase(), LifecyclePhase::Stopped);
     assert!(summary.shutdown().is_clean());
     assert_eq!(summary.shutdown().abandoned(), 0);
-    assert_eq!(summary.tasks().spawned(), 8);
+    assert_eq!(summary.tasks().spawned(), 9);
     assert_eq!(
         summary.tasks().terminated(),
-        8,
+        9,
         "every spawned task ran to termination"
     );
     assert_eq!(summary.tasks().outstanding(), 0);
@@ -384,25 +488,20 @@ async fn every_subsystem_is_initialized_started_and_stopped_exactly_once() {
     daemon.stop().await.expect("the daemon stops");
     assert!(!daemon.is_started());
 
-    // The gateway and HTTP surfaces report through their own counters; the ten
-    // capability subsystems report through the wrapper.
+    // The gateway has released its real listener and the HTTP stand-in never
+    // bound one.
     assert_eq!(daemon.gateway().bound().len(), 0);
     assert_eq!(daemon.http().bound().len(), 0);
 }
 
-/// No built-in subsystem may claim an address, because none of them binds one.
-///
-/// The in-process surfaces are doubles: they speak no wire protocol and open no
-/// socket. Reporting the *requested* `listen()` addresses as bound would
-/// advertise a service nothing is accepting on, which is worse than advertising
-/// nothing — a health check would see an address and believe it. Only a
-/// subsystem that owns a real listener may report `listening`, and the address
-/// must come from that listener.
+/// The Gateway must advertise addresses read back from its real listeners, not
+/// requested port-zero placeholders. The HTTP stand-in must still advertise
+/// nothing.
 #[tokio::test]
-async fn no_subsystem_advertises_an_address_it_has_not_bound() {
+async fn only_the_real_gateway_advertises_addresses_it_actually_bound() {
     let requested: Vec<std::net::SocketAddr> = vec![
-        "127.0.0.1:65000".parse().expect("a valid address"),
-        "127.0.0.1:65001".parse().expect("a valid address"),
+        "127.0.0.1:0".parse().expect("a valid address"),
+        "127.0.0.1:0".parse().expect("a valid address"),
     ];
     let mut daemon = Daemon::builder()
         .clock(Arc::new(SteppedClock::new()))
@@ -412,25 +511,19 @@ async fn no_subsystem_advertises_an_address_it_has_not_bound() {
 
     let handles = daemon.start().await.expect("the daemon starts");
 
-    assert!(
-        !handles.is_empty(),
-        "no handles were returned, so the assertion below proves nothing"
-    );
-    for handle in &handles {
-        assert!(
-            handle.bound().is_empty(),
-            "{} advertised {:?} without binding it",
-            handle.subsystem().as_str(),
-            handle.bound()
-        );
-    }
-
-    // While running, not merely after shutdown: the fiction would be live here.
-    assert!(daemon.gateway().bound().is_empty());
+    let gateway_handle = handles
+        .iter()
+        .find(|handle| handle.subsystem() == &well_known::gateway())
+        .expect("the Gateway reports readiness");
+    let bound = daemon.gateway().bound();
+    assert_eq!(bound.len(), 2);
+    assert_eq!(gateway_handle.bound(), bound.as_slice());
+    assert!(bound.iter().all(|address| address.ip().is_loopback()));
+    assert!(bound.iter().all(|address| address.port() != 0));
     assert!(daemon.http().bound().is_empty());
 
-    // And the requested addresses really were carried into the composition, so
-    // this is "nothing advertises them", not "they were silently dropped".
+    // Requested values remain available as configuration; readiness uses the
+    // listener-derived values above.
     assert_eq!(daemon.settings().listen(), requested.as_slice());
 
     daemon.stop().await.expect("the daemon stops");

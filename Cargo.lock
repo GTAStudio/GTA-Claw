@@ -1307,11 +1307,16 @@ version = "0.1.0"
 dependencies = [
  "claw-application",
  "claw-domain",
+ "claw-gateway",
+ "claw-gateway-client",
  "claw-platform",
  "claw-protocol",
+ "claw-security",
+ "rand_chacha 0.10.0",
  "secrecy",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]

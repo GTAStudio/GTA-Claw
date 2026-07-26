@@ -9,21 +9,26 @@
 //! for ordering even when the body of `start` is empty: the plan is what
 //! guarantees persistence exists before the engine tries to use it.
 //!
-//! [`LoopbackGateway`] and [`LoopbackHttpApi`] are ingress. They own a
-//! [`GatewayDispatch`], accept requests through a bounded queue, and refuse new
-//! work the moment they are quiesced. They are the reason
-//! [`SubsystemKind::Ingress`] exists: the composition stops the edges before it
-//! drains the middle.
+//! [`GatewayIngress`] and [`LoopbackHttpApi`] are ingress. The Gateway owns the
+//! real WebSocket server plus the in-process dispatch seam used by composition
+//! tests; the HTTP stand-in only owns its dispatch seam. Both refuse new work
+//! the moment they are quiesced. They are the reason [`SubsystemKind::Ingress`]
+//! exists: the composition stops the edges before it drains the middle.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use claw_application::composition::{
     BoxFuture, DrainReport, GatewayDispatch, GatewayPort, GatewayRequest, GatewayResponse,
     HttpApiPort, HttpRoute, ServiceHandle, StartContext, Subsystem, SubsystemDescriptor,
     SubsystemError, SubsystemId, SubsystemKind, well_known,
 };
+use claw_gateway::{
+    BoundServer, CredentialPolicy, DeviceDirectory, GatewayServer, GatewayServerConfig,
+    ServerHandle, StaticAuthenticator, SystemClock,
+};
+use tokio::sync::{mpsc, oneshot};
 
 /// Wraps a port with no lifecycle so it takes part in the composition plan.
 pub struct PortSubsystem {
@@ -125,25 +130,41 @@ impl IngressGate {
     }
 }
 
-/// An in-process Gateway v4 ingress.
+/// The daemon-owned Gateway v4 ingress.
 ///
-/// It speaks no wire protocol, but it enforces the part of the contract the
-/// composition cares about: a request is served only while the ingress is
-/// accepting, and every request is dispatched through the shared
-/// [`GatewayDispatch`] rather than through any decision this ingress made
-/// earlier.
-pub struct LoopbackGateway {
+/// The real [`GatewayServer`] owns every bound socket and wire connection. The
+/// in-process dispatch method remains available for focused composition tests,
+/// but network clients always reach the real protocol server directly.
+pub struct GatewayIngress {
     dispatch: Arc<dyn GatewayDispatch>,
     gate: IngressGate,
+    server_config: GatewayServerConfig,
+    devices: DeviceDirectory,
+    pending: Mutex<Vec<BoundServer>>,
+    control: Mutex<Option<mpsc::UnboundedSender<GatewayCommand>>>,
+    bound: Arc<RwLock<Vec<SocketAddr>>>,
+    registered_methods: AtomicUsize,
 }
 
-impl LoopbackGateway {
-    /// Creates a gateway serving `dispatch`.
+enum GatewayCommand {
+    StopAccepting(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+impl GatewayIngress {
+    /// Creates a gateway serving `dispatch` with an initially empty pairing
+    /// directory.
     #[must_use]
     pub fn new(dispatch: Arc<dyn GatewayDispatch>) -> Self {
         Self {
             dispatch,
             gate: IngressGate::new(),
+            server_config: GatewayServerConfig::default(),
+            devices: DeviceDirectory::new(),
+            pending: Mutex::new(Vec::new()),
+            control: Mutex::new(None),
+            bound: Arc::new(RwLock::new(Vec::new())),
+            registered_methods: AtomicUsize::new(0),
         }
     }
 
@@ -158,6 +179,12 @@ impl LoopbackGateway {
     #[must_use]
     pub fn refused(&self) -> u64 {
         self.gate.refused.load(Ordering::SeqCst)
+    }
+
+    /// Returns the live pairing directory used by every bound Gateway server.
+    #[must_use]
+    pub fn devices(&self) -> DeviceDirectory {
+        self.devices.clone()
     }
 
     /// Handles one request.
@@ -187,7 +214,7 @@ impl LoopbackGateway {
     }
 }
 
-impl Subsystem for LoopbackGateway {
+impl Subsystem for GatewayIngress {
     fn descriptor(&self) -> SubsystemDescriptor {
         SubsystemDescriptor::new(well_known::gateway(), SubsystemKind::Ingress)
             .depends_on(well_known::engine())
@@ -196,27 +223,114 @@ impl Subsystem for LoopbackGateway {
 
     fn initialize<'a>(
         &'a self,
-        _context: &'a StartContext,
+        context: &'a StartContext,
     ) -> BoxFuture<'a, Result<(), SubsystemError>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            if context.settings().listen().is_empty() {
+                return Err(SubsystemError::invalid(
+                    well_known::gateway(),
+                    "at least one Gateway listen address is required",
+                ));
+            }
+
+            let clock = Arc::new(SystemClock);
+            let mut pending = Vec::with_capacity(context.settings().listen().len());
+            let mut registered_methods = None;
+
+            for address in context.settings().listen() {
+                let authenticator = StaticAuthenticator::with_devices(
+                    CredentialPolicy::None,
+                    clock.clone(),
+                    self.devices.clone(),
+                );
+                let authorization = authenticator.devices();
+                let server = GatewayServer::new(
+                    self.server_config.clone(),
+                    Arc::new(authenticator),
+                    Arc::new(authorization),
+                )
+                .map_err(|error| {
+                    SubsystemError::internal(
+                        well_known::gateway(),
+                        format!("could not construct Gateway server: {error}"),
+                    )
+                })?;
+                registered_methods = Some(server.registry().len());
+                let bound = server.bind(*address).await.map_err(|error| {
+                    SubsystemError::unavailable(
+                        well_known::gateway(),
+                        format!("could not bind Gateway listener at {address}: {error}"),
+                    )
+                })?;
+                pending.push(bound);
+            }
+
+            self.registered_methods
+                .store(registered_methods.unwrap_or(0), Ordering::SeqCst);
+            *self
+                .pending
+                .lock()
+                .expect("the Gateway pending-server lock is not poisoned") = pending;
+            Ok(())
+        })
     }
 
     fn start<'a>(
         &'a self,
-        _context: &'a StartContext,
+        context: &'a StartContext,
     ) -> BoxFuture<'a, Result<ServiceHandle, SubsystemError>> {
         Box::pin(async move {
+            let pending = std::mem::take(
+                &mut *self
+                    .pending
+                    .lock()
+                    .expect("the Gateway pending-server lock is not poisoned"),
+            );
+            if pending.is_empty() {
+                return Err(SubsystemError::internal(
+                    well_known::gateway(),
+                    "Gateway start was called without initialized listeners",
+                ));
+            }
+
+            let bound: Vec<SocketAddr> = pending.iter().map(BoundServer::local_address).collect();
+            let (control, commands) = mpsc::unbounded_channel();
+            let (started, ready) = oneshot::channel();
+            *self
+                .control
+                .lock()
+                .expect("the Gateway control lock is not poisoned") = Some(control);
+
+            let bound_state = Arc::clone(&self.bound);
+            if let Err(error) = context.spawner().spawn(
+                "gateway-server",
+                Box::pin(run_gateway_servers(
+                    pending,
+                    commands,
+                    started,
+                    bound.clone(),
+                    bound_state,
+                )),
+            ) {
+                self.control
+                    .lock()
+                    .expect("the Gateway control lock is not poisoned")
+                    .take();
+                return Err(error);
+            }
+
+            ready.await.map_err(|_| {
+                SubsystemError::internal(
+                    well_known::gateway(),
+                    "the Gateway server task ended before reporting readiness",
+                )
+            })?;
             self.gate.accepting.store(true, Ordering::SeqCst);
 
-            // Deliberately `inert`, not `listening`. This ingress binds no
-            // socket, and a handle that reported the *requested* addresses
-            // would advertise a service nothing is accepting on. Only a
-            // subsystem that owns a real listener may report `listening`, with
-            // addresses taken from the listener itself.
             Ok(
-                ServiceHandle::inert(well_known::gateway()).with_detail(format!(
-                    "{} methods, in-process only",
-                    self.dispatch.methods().len()
+                ServiceHandle::listening(well_known::gateway(), bound).with_detail(format!(
+                    "{} Gateway v4 methods",
+                    self.registered_methods.load(Ordering::SeqCst)
                 )),
             )
         })
@@ -225,7 +339,32 @@ impl Subsystem for LoopbackGateway {
     fn quiesce<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
         Box::pin(async move {
             self.gate.accepting.store(false, Ordering::SeqCst);
-            Ok(())
+            let control = self
+                .control
+                .lock()
+                .expect("the Gateway control lock is not poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    SubsystemError::internal(
+                        well_known::gateway(),
+                        "the Gateway server task has no control channel",
+                    )
+                })?;
+            let (completed, completion) = oneshot::channel();
+            control
+                .send(GatewayCommand::StopAccepting(completed))
+                .map_err(|_| {
+                    SubsystemError::internal(
+                        well_known::gateway(),
+                        "the Gateway server task ended before quiescing",
+                    )
+                })?;
+            completion.await.map_err(|_| {
+                SubsystemError::internal(
+                    well_known::gateway(),
+                    "the Gateway server task did not acknowledge quiescing",
+                )
+            })
         })
     }
 
@@ -245,25 +384,114 @@ impl Subsystem for LoopbackGateway {
     }
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<(), SubsystemError>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            self.gate.accepting.store(false, Ordering::SeqCst);
+            self.pending
+                .lock()
+                .expect("the Gateway pending-server lock is not poisoned")
+                .clear();
+            let control = self
+                .control
+                .lock()
+                .expect("the Gateway control lock is not poisoned")
+                .clone();
+            let Some(control) = control else {
+                return Ok(());
+            };
+
+            let (completed, completion) = oneshot::channel();
+            control
+                .send(GatewayCommand::Shutdown(completed))
+                .map_err(|_| {
+                    SubsystemError::internal(
+                        well_known::gateway(),
+                        "the Gateway server task ended before shutdown",
+                    )
+                })?;
+            completion.await.map_err(|_| {
+                SubsystemError::internal(
+                    well_known::gateway(),
+                    "the Gateway server task did not acknowledge shutdown",
+                )
+            })?;
+            self.control
+                .lock()
+                .expect("the Gateway control lock is not poisoned")
+                .take();
+            Ok(())
+        })
     }
 }
 
-impl GatewayPort for LoopbackGateway {
+async fn run_gateway_servers(
+    pending: Vec<BoundServer>,
+    mut commands: mpsc::UnboundedReceiver<GatewayCommand>,
+    started: oneshot::Sender<()>,
+    addresses: Vec<SocketAddr>,
+    bound: Arc<RwLock<Vec<SocketAddr>>>,
+) {
+    let mut running: Vec<ServerHandle> = pending.into_iter().map(BoundServer::start).collect();
+    *bound
+        .write()
+        .expect("the Gateway bound-address lock is not poisoned") = addresses;
+    let _ = started.send(());
+
+    while let Some(command) = commands.recv().await {
+        match command {
+            GatewayCommand::StopAccepting(completed) => {
+                for server in &running {
+                    server.stop_accepting().await;
+                }
+                bound
+                    .write()
+                    .expect("the Gateway bound-address lock is not poisoned")
+                    .clear();
+                let _ = completed.send(());
+            }
+            GatewayCommand::Shutdown(completed) => {
+                for server in std::mem::take(&mut running) {
+                    server.shutdown().await;
+                }
+                bound
+                    .write()
+                    .expect("the Gateway bound-address lock is not poisoned")
+                    .clear();
+                let _ = completed.send(());
+                return;
+            }
+        }
+    }
+
+    for server in running {
+        server.shutdown().await;
+    }
+    bound
+        .write()
+        .expect("the Gateway bound-address lock is not poisoned")
+        .clear();
+}
+
+impl GatewayPort for GatewayIngress {
     fn registered_methods(&self) -> usize {
-        self.dispatch.methods().len()
+        self.registered_methods.load(Ordering::SeqCst)
     }
 
-    /// Always empty: this ingress binds no socket.
+    /// Returns addresses taken from the live listeners, never requested port
+    /// zero values.
     fn bound(&self) -> Vec<SocketAddr> {
-        Vec::new()
+        self.bound
+            .read()
+            .expect("the Gateway bound-address lock is not poisoned")
+            .clone()
     }
 }
 
-impl std::fmt::Debug for LoopbackGateway {
+impl std::fmt::Debug for GatewayIngress {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("LoopbackGateway")
+            .debug_struct("GatewayIngress")
+            .field("bound", &self.bound())
+            .field("registered_methods", &self.registered_methods())
             .field("served", &self.served())
             .field("refused", &self.refused())
             .finish_non_exhaustive()

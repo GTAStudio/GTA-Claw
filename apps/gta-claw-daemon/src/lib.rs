@@ -7,11 +7,10 @@
 //! # What is real here and what is standing in
 //!
 //! The composition, the lifecycle, the authorization flow, the task tracking
-//! and the shutdown path are real and are what will ship. The subsystem
-//! implementations in [`adapters`] are deterministic stand-ins for crates that
-//! are still on unmerged branches. Each one implements exactly the port its
-//! real counterpart will implement, so swapping them is a one-line change in
-//! [`compose`].
+//! and the shutdown path are real and are what will ship. The Gateway adapter
+//! owns the real `claw-gateway` server; remaining subsystem implementations in
+//! [`adapters`] are deterministic stand-ins for crates that are still on
+//! unmerged branches.
 //!
 //! # The two rules the composition enforces
 //!

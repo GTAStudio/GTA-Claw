@@ -9,12 +9,9 @@
 //! follows that order while shutdown follows its reverse with ingress quiesced
 //! first. Adding a subsystem means declaring an edge, not editing a sequence.
 //!
-//! # Replacing a stand-in with a real crate
-//!
-//! Each `Arc<dyn Port>` below is the seam. When `claw-gateway` lands, the
-//! `LoopbackGateway` line becomes a `claw_gateway::Server` line and nothing else
-//! changes — not the plan, not the shutdown path, not the session service. That
-//! is the whole point of doing this before the crates exist.
+//! The Gateway ingress owns the real `claw-gateway` listener and protocol
+//! server. Remaining deterministic adapters are seams for crates that have not
+//! landed yet.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -34,7 +31,7 @@ use claw_application::composition::{
 use claw_domain::SessionId;
 
 use crate::adapters::engine::DeterministicEngine;
-use crate::adapters::ingress::{LoopbackGateway, LoopbackHttpApi, PortSubsystem};
+use crate::adapters::ingress::{GatewayIngress, LoopbackHttpApi, PortSubsystem};
 use crate::adapters::model::{
     FakeTool, GuardedProviderRegistry, MemoryToolSurface, NoteContext, ProviderConfig,
     ScriptedTransport, reading_workspace,
@@ -105,7 +102,7 @@ pub struct Daemon {
     tools: Arc<MemoryToolSurface>,
     context: Arc<NoteContext>,
     plugins: Arc<PerActivationPluginHost>,
-    gateway: Arc<LoopbackGateway>,
+    gateway: Arc<GatewayIngress>,
     http: Arc<LoopbackHttpApi>,
     dns: Arc<TableDns>,
     started: bool,
@@ -134,7 +131,24 @@ impl Daemon {
         );
 
         let handles = self.host.start(&context).await?;
-        self.provision_credentials().await?;
+        if let Err(error) = self.provision_credentials().await {
+            let failure = error.to_string();
+            let shutdown = self.host.shutdown().await?;
+            let tasks = self.runtime.shutdown().await;
+            if !shutdown.is_clean() || !tasks.is_settled() {
+                return Err(SubsystemError::internal(
+                    well_known::providers(),
+                    format!(
+                        "startup failed ({failure}) and rollback was incomplete: {} abandoned, {} of {} tasks joined",
+                        shutdown.abandoned(),
+                        tasks.terminated(),
+                        tasks.spawned(),
+                    ),
+                )
+                .into());
+            }
+            return Err(error);
+        }
         self.started = true;
 
         self.observability.record(note(
@@ -330,7 +344,7 @@ impl Daemon {
 
     /// Returns the gateway ingress.
     #[must_use]
-    pub fn gateway(&self) -> Arc<LoopbackGateway> {
+    pub fn gateway(&self) -> Arc<GatewayIngress> {
         Arc::clone(&self.gateway)
     }
 
@@ -342,9 +356,9 @@ impl Daemon {
 
     /// Returns the settings the composition was built with.
     ///
-    /// The addresses in [`RuntimeSettings::listen`] are *requested*, not bound.
-    /// Nothing in this composition opens a socket, so a subsystem that owns a
-    /// real listener is what turns them into something being accepted on.
+    /// The addresses in [`RuntimeSettings::listen`] are requested values. The
+    /// Gateway service handle and [`GatewayIngress`](crate::adapters::ingress::GatewayIngress)
+    /// report the addresses the operating system actually bound.
     #[must_use]
     pub fn settings(&self) -> Arc<RuntimeSettings> {
         Arc::clone(&self.settings)
@@ -566,7 +580,7 @@ impl DaemonBuilder {
                 .build()?,
         );
 
-        let gateway = Arc::new(LoopbackGateway::new(
+        let gateway = Arc::new(GatewayIngress::new(
             Arc::clone(&service) as Arc<dyn GatewayDispatch>
         ));
         let http = Arc::new(LoopbackHttpApi::new(
