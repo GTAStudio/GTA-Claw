@@ -4986,6 +4986,11 @@ fn admitted_lock_and_skia_target_sets_are_derived_from_the_platform_table() {
 #[test]
 fn reviewed_build_artifact_pin_table_shape_is_enforced() {
     const DIGEST: &str = "500ddee961ef415f36fce4fcd300aca7bfaf9a4f676cf2332f2e4048621fce37";
+    // The same digest in the spelling every other gate refuses: the decision ledger demands a
+    // "lowercase full SHA-256" and the release workflow matches `^[0-9a-f]{64}$`. Only the case
+    // differs, so this case fails on the checksum rule and nothing else.
+    const UPPERCASE_DIGEST: &str =
+        "500DDEE961EF415F36FCE4FCD300ACA7BFAF9A4F676CF2332F2E4048621FCE37";
     let url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-aarch64-apple-ios.tar.gz";
     validate_build_artifact_pin_table(&[(
         "skia-bindings",
@@ -5028,6 +5033,16 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
             )],
         ),
         (
+            "uppercase digest",
+            vec![(
+                "skia-bindings",
+                "0.99.0",
+                "aarch64-apple-ios",
+                url,
+                UPPERCASE_DIGEST,
+            )],
+        ),
+        (
             "plaintext URL",
             vec![(
                 "skia-bindings",
@@ -5063,6 +5078,27 @@ fn reviewed_build_artifact_pin_table_shape_is_enforced() {
             "reviewed build-artifact pin table must reject: {label}"
         );
     }
+
+    // Asserted on its own production error, so a future rule that stops distinguishing spellings
+    // fails here rather than letting the table carry a digest no other gate would accept.
+    assert!(
+        validate_build_artifact_pin_table(&[(
+            "skia-bindings",
+            "0.99.0",
+            "aarch64-apple-ios",
+            url,
+            UPPERCASE_DIGEST,
+        )])
+        .expect_err("an uppercase digest is not the admitted spelling")
+        .to_string()
+        .contains("is not a lowercase SHA-256"),
+        "an uppercase digest must be refused as a spelling problem, not something else"
+    );
+    assert_eq!(
+        UPPERCASE_DIGEST,
+        DIGEST.to_ascii_uppercase(),
+        "the uppercase fixture stopped being the same digest, so it no longer isolates case"
+    );
 }
 
 #[test]
