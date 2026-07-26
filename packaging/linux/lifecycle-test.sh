@@ -545,7 +545,7 @@ assert_protected_contract() {
     die "protected namespace does not contain exactly the eight fixed names"
   for name in $expected_names; do
     path="$namespace/$name"
-    [[ -f "$path" && ! -L "$path" ]] ||
+    { sudo test -f "$path" && sudo test ! -L "$path"; } ||
       die "protected entry is not a physical regular file: $name"
     [[ "$(sudo stat -c '%u:%g:%a:%h' "$path")" == \
       "$service_uid:$service_gid:600:1" ]] ||
@@ -755,8 +755,8 @@ simulate_direct_reboot() {
     /run/gta-claw-daemon.ready-for-replacement \
     /run/gta-claw-daemon.was-active
   sudo systemctl daemon-reload
-  [[ -e /var/lib/gta-claw-install/transaction-failed &&
-    -e /var/lib/gta-claw-install/was-active ]] ||
+  { sudo test -e /var/lib/gta-claw-install/transaction-failed &&
+    sudo test -e /var/lib/gta-claw-install/was-active; } ||
     die "direct hard interruption lost its persistent transaction journal"
   assert_start_fenced "direct hard interruption after simulated reboot"
   ! systemctl is-active --quiet gta-claw-daemon.service ||
@@ -796,8 +796,8 @@ for _ in 1 2; do
     masked | masked-runtime) ;;
     *) die "direct mask rejection changed administrator mask ownership" ;;
   esac
-  [[ ! -e /var/lib/gta-claw-install/transaction-failed &&
-    ! -e /run/gta-claw-state-init/replacement-fenced ]] ||
+  { sudo test ! -e /var/lib/gta-claw-install/transaction-failed &&
+    [[ ! -e /run/gta-claw-state-init/replacement-fenced ]]; } ||
     die "direct mask rejection claimed an administrator-owned transaction"
 done
 sudo systemctl unmask --runtime gta-claw-daemon.service
@@ -927,8 +927,8 @@ for direct_boundary in unit daemon authorization; do
   simulate_direct_reboot
   sudo "$direct2/install.sh"
   assert_active_restart "$direct_pid"
-  [[ ! -e /var/lib/gta-claw-install/transaction-failed &&
-    ! -e /var/lib/gta-claw-install/was-active ]] ||
+  { sudo test ! -e /var/lib/gta-claw-install/transaction-failed &&
+    sudo test ! -e /var/lib/gta-claw-install/was-active; } ||
     die "direct install retry left its persistent transaction journal"
 done
 bin_true_hash="$(sha256sum /bin/true)"
