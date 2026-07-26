@@ -4,6 +4,29 @@
 //! browser extension. This crate defines the authenticated connection profiles,
 //! negotiated host capabilities, session projections, and bounded event
 //! delivery those clients consume.
+//!
+//! ## Frozen scope ceilings and concrete requests
+//!
+//! An operator [`GatewayProfile::scopes`] list is the pinned upstream surface
+//! ceiling, not the exact request every GTA-Claw client must send and not a
+//! quota. [`validate_gateway_profile`] admits any subset of that ceiling and
+//! rejects scopes outside it. In particular, both the Android and iOS ceilings
+//! include the `operator.talk.secrets` wire scope. Local request composition is
+//! narrower and remains separate from those ceilings:
+//!
+//! - `apps/gta-claw-android/src/session.rs` requests only `operator.read` and
+//!   uses `AuthorizationExpectation::ExactRequested`.
+//! - `apps/gta-claw-ios/src/profile.rs` starts with no requested scopes, lets
+//!   callers select the narrow set, and uses
+//!   `AuthorizationExpectation::RequestedRole`, not exact-scope matching. This
+//!   checkout has no production iOS connection composition; its read-only
+//!   integration fixture selects `operator.read`.
+//!
+//! Request narrowing belongs in a concrete client composition root, when one is
+//! present; it must not be represented by shrinking these frozen upstream
+//! ceilings. `operator.read` is also the correct frozen scope for
+//! browse/read-only clients. It is a protocol wire identity, so local code must
+//! not rename it or split it into narrower GTA-Claw-only scopes.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -135,7 +158,10 @@ pub struct GatewayProfile {
     pub mode: ClientMode,
     /// Authenticated role.
     pub role: Role,
-    /// Requested operator scopes. Node profiles always use an empty slice.
+    /// Maximum pinned operator scopes for this surface.
+    ///
+    /// Concrete clients may request a subset. Node profiles always use an
+    /// empty slice.
     pub scopes: &'static [OperatorScope],
     /// Whether a verified device identity is mandatory.
     pub requires_device_identity: bool,
@@ -479,7 +505,11 @@ pub const fn surface(id: SurfaceId) -> &'static SurfaceContract {
     &SURFACES[id as usize]
 }
 
-/// Validates a Gateway profile against the frozen protocol and exact identity.
+/// Validates a Gateway profile against the frozen protocol and identity ceiling.
+///
+/// Operator scopes are subset-checked: the frozen profile is a ceiling, not an
+/// exact-request quota. A candidate may omit any ceiling scope, but may not add
+/// a scope outside it.
 pub fn validate_gateway_profile(
     surface_id: SurfaceId,
     candidate: GatewayProfile,
@@ -843,6 +873,41 @@ mod tests {
             validate_gateway_profile(SurfaceId::ChromeExtension, profile, 4),
             Err(ConnectionError::WrongTransport)
         );
+    }
+
+    #[test]
+    fn mobile_gateway_scope_ceilings_admit_narrow_read_only_profiles() {
+        for (surface_id, client_id) in [
+            (SurfaceId::Android, ClientId::Android),
+            (SurfaceId::Ios, ClientId::Ios),
+        ] {
+            let ConnectionContract::GatewayV4(profiles) = surface(surface_id).connection else {
+                panic!("mobile surface must use Gateway v4");
+            };
+            let operator = profiles
+                .iter()
+                .find(|profile| profile.role == Role::Operator)
+                .expect("mobile surface must have an operator profile");
+            assert!(
+                operator.scopes.contains(&OperatorScope::TalkSecrets),
+                "{surface_id:?} frozen ceiling must retain operator.talk.secrets"
+            );
+            assert_eq!(
+                validate_gateway_profile(
+                    surface_id,
+                    GatewayProfile {
+                        client_id,
+                        mode: ClientMode::Ui,
+                        role: Role::Operator,
+                        scopes: &[OperatorScope::Read],
+                        requires_device_identity: true,
+                    },
+                    4,
+                ),
+                Ok(()),
+                "{surface_id:?} must admit the narrower read-only composition"
+            );
+        }
     }
 
     #[test]

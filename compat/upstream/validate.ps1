@@ -51,6 +51,19 @@ $ExpectedOracleCorpusTrue = 46
 $ExpectedReachabilityCorpusDigest = "70aec3e02f3885970ec37d61421fdc34ea932e591842d6a1669adf0e1f4880dd"
 $ExpectedReachabilityCorpusCases = 32
 $ExpectedReachabilityCorpusAccepting = 15
+# The anti-forgery self-test is a trust-root artifact, not a convenience script.
+# Nothing in CI executes it today, and validate.ps1 previously only checked that
+# the file EXISTED: replacing all 113,996 bytes with "exit 0" left both this
+# script and the gutted self-test exiting 0, so the instrument that proves every
+# rejection rule still bites could be removed without any check noticing.
+#
+# The digest is taken over LF-normalised text on purpose. *.ps1 is NOT covered by
+# .gitattributes and core.autocrlf rewrites these bytes per platform, so a raw
+# byte digest would pass on a Windows checkout and fail under pwsh on Linux CI.
+# Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
+# reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
+# edit to this line.
+$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -2926,6 +2939,20 @@ if ($actualJsonPaths.Count -ne 18 -or
     $unexpectedJsonFiles.Count -gt 0) {
     Fail ("fixed JSON topology mismatch; expected 18 JSON artifacts, found {0}; missing=[{1}], unexpected=[{2}]" -f
         $actualJsonPaths.Count, ($missingJsonFiles -join ','), ($unexpectedJsonFiles -join ','))
+}
+
+# The self-test is the only thing that proves the rules below actually reject a
+# forgery, and nothing in CI runs it. Verify the instrument is intact before its
+# verdicts are relied on. Placed after the topology check so a MISSING self-test
+# is still reported as a topology failure rather than a digest mismatch, and the
+# comparison is over LF-normalised text so the answer is identical on Windows and
+# on Linux CI.
+$selfTestPath = Join-Path $Root "validate-self-test.ps1"
+$selfTestText = [System.IO.File]::ReadAllText($selfTestPath) -replace "`r`n", "`n"
+$selfTestDigest = Get-Sha256Text $selfTestText
+if (-not (Test-OrdinalStringEqual $selfTestDigest $ExpectedSelfTestDigest)) {
+    Fail ("validate-self-test.ps1 digest mismatch; expected {0}, found {1}. The anti-forgery self-test is a frozen trust-root artifact; regenerating it is a reviewed edit to `$ExpectedSelfTestDigest, never an automatic step." -f
+        $ExpectedSelfTestDigest, $selfTestDigest)
 }
 
 $documents = @{}

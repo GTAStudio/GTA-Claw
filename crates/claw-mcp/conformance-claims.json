@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "crate_name": "claw-mcp",
+  "features": [
+    {
+      "feature_id": "interop.mcp.server",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-mcp/tests/stdio_interop.rs",
+          "test": "stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down"
+        },
+        {
+          "path": "crates/claw-mcp/tests/stdio_interop.rs",
+          "test": "list_timeout_cancels_the_server_request"
+        },
+        {
+          "path": "crates/claw-mcp/tests/stdio_interop.rs",
+          "test": "panicking_client_owner_terminates_the_descendant_process_tree"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-mcp/src/server.rs",
+          "note": "Implements the GTA-Claw MCP server handler for negotiated tools, resources, prompts, sampling, notifications, and cancellation."
+        },
+        {
+          "path": "crates/claw-mcp/src/framing.rs",
+          "note": "Implements bounded partial-read-safe newline-delimited JSON-RPC transport and whole-connection cancellation."
+        }
+      ]
+    },
+    {
+      "feature_id": "interop.mcp.client",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-mcp/tests/stdio_interop.rs",
+          "test": "stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down"
+        },
+        {
+          "path": "crates/claw-mcp/tests/http_interop.rs",
+          "test": "streamable_http_discovers_capabilities_and_authenticates_requests"
+        },
+        {
+          "path": "crates/claw-mcp/tests/sse_interop.rs",
+          "test": "legacy_sse_reconnects_with_event_id_and_authenticates_get_and_post"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-mcp/src/client.rs",
+          "note": "Implements capability-discovering MCP clients, request deadlines, stdio supervision, notifications, sampling, and shutdown."
+        },
+        {
+          "path": "crates/claw-mcp/src/http_client.rs",
+          "note": "Implements the bounded Hyper and ring-Rustls HTTP connector with credential-safe proxy routing."
+        },
+        {
+          "path": "crates/claw-mcp/src/sse.rs",
+          "note": "Implements legacy SSE endpoint discovery, event-ID reconnection, authenticated GET and POST, and bounded retries."
+        }
+      ]
+    },
+    {
+      "feature_id": "interop.mcp.oauth",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-mcp/src/oauth.rs",
+          "test": "tests::local_authorization_server_covers_registration_exchange_and_refresh"
+        },
+        {
+          "path": "crates/claw-mcp/src/oauth.rs",
+          "test": "tests::logout_waits_for_in_flight_refresh_and_removes_the_rotated_token"
+        },
+        {
+          "path": "crates/claw-mcp/src/oauth.rs",
+          "test": "tests::secrets_are_redacted_from_debug_output"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-mcp/src/oauth.rs",
+          "note": "Implements protected-resource and authorization-server discovery, dynamic registration, PKCE, exchange, serialized refresh, origin-bound bearer injection, logout, and redacted token-store ports."
+        }
+      ]
+    },
+    {
+      "feature_id": "interop.mcp.registry",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-mcp/src/registry.rs",
+          "test": "tests::add_configure_unset_and_reload_are_persistent"
+        },
+        {
+          "path": "crates/claw-mcp/src/registry.rs",
+          "test": "tests::login_completion_and_logout_delegate_to_the_configured_profile"
+        },
+        {
+          "path": "crates/claw-mcp/tests/registry_interop.rs",
+          "test": "registry_manages_stdio_health_capabilities_tools_and_restart"
+        },
+        {
+          "path": "crates/claw-mcp/tests/registry_interop.rs",
+          "test": "failed_temporary_probe_still_stops_its_child"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-mcp/src/registry.rs",
+          "note": "Implements persistent configuration, discovery, health, probe, doctor, tools, authentication delegation, and managed server lifecycle operations."
+        }
+      ]
+    },
+    {
+      "feature_id": "interop.mcp.conversation-projection",
+      "level": "implemented",
+      "evidence": [
+        {
+          "path": "crates/claw-mcp/src/projection.rs",
+          "test": "tests::conversation_shape_matches_frozen_channel_contract"
+        },
+        {
+          "path": "crates/claw-mcp/src/projection.rs",
+          "test": "tests::attachments_preserve_non_text_blocks_exactly"
+        },
+        {
+          "path": "crates/claw-mcp/src/projection.rs",
+          "test": "tests::gateway_operations_match_frozen_list_read_send_and_approval_shapes"
+        },
+        {
+          "path": "crates/claw-mcp/src/projection.rs",
+          "test": "tests::event_wait_wakes_for_the_first_matching_session_event"
+        }
+      ],
+      "implementation_pointers": [
+        {
+          "path": "crates/claw-mcp/src/projection.rs",
+          "note": "Implements exact conversation list, read, send, live-event, attachment, and approval projection over the GTA-Claw gateway port."
+        }
+      ]
+    }
+  ],
+  "inventories": []
+}

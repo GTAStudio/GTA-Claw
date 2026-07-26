@@ -1,0 +1,31 @@
+[package]
+name = "claw-acp"
+description = "Pure-Rust Agent Client Protocol interoperability for GTA Claw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+agent-client-protocol-schema = { version = "=0.13.5", features = ["unstable_mcp_over_acp"] }
+claw-mcp.workspace = true
+process-wrap = { version = "=9.1.0", default-features = false, features = [
+  "job-object",
+  "kill-on-drop",
+  "process-group",
+  "tokio1",
+] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "=2.0.19"
+tokio = { version = "=1.52.3", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+
+[[bin]]
+name = "claw-acp-fixture"
+path = "tests/fixtures/acp_fixture.rs"
+
+[lints]
+workspace = true

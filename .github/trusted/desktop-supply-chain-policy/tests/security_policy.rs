@@ -7,6 +7,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use desktop_supply_chain_policy::bootstrap_decisions::{
+    BootstrapSourceDecisionEvidence, validate_bootstrap_source_decisions,
+};
 use desktop_supply_chain_policy::changes::{
     ChangeManifest, ChangedPath, MAX_GIT_PACK_FILES, MAX_PULL_REQUEST_COMMITS, compute_manifest,
     has_policy_relevant_change, is_policy_relevant, read_manifest,
@@ -656,7 +659,7 @@ fn assert_unique_sorted_root_members(members: &[toml::Value]) {
     );
 }
 
-fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
+fn add_new_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
     let root_manifest_path = tree.join("Cargo.toml");
     let mut root_manifest: toml::Value = toml::from_str(
         &fs::read_to_string(&root_manifest_path).expect("read root member fixture manifest"),
@@ -674,24 +677,9 @@ fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
             .expect("root workspace member string")
             .cmp(member)
     }) {
-        Ok(_) => {
-            assert_eq!(
-                member, P03B_SQLITE_FILE_CONTROL_MEMBER,
-                "only the exact native-FFI member setup is idempotent"
-            );
-            assert_eq!(
-                member_manifest, P03B_SQLITE_FILE_CONTROL_MANIFEST,
-                "existing native-FFI member must use the canonical manifest"
-            );
-            assert_eq!(
-                fs::read_to_string(tree.join(member).join("Cargo.toml"))
-                    .expect("read existing native-FFI member manifest")
-                    .replace("\r\n", "\n"),
-                P03B_SQLITE_FILE_CONTROL_MANIFEST,
-                "existing native-FFI member manifest changed"
-            );
-            return;
-        }
+        Ok(_) => panic!(
+            "fixture member `{member}` now exists in the real repository; rename the fixture member - it must be a name no crate will ever take"
+        ),
         Err(position) => position,
     };
     members.insert(position, toml::Value::String(member.to_owned()));
@@ -720,6 +708,54 @@ fn add_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
         "\n[[package]]\nname = \"{package_name}\"\nversion = \"0.1.0\"\n"
     ));
     fs::write(tree.join("Cargo.lock"), lock).expect("write synthetic member lock entry");
+}
+
+fn ensure_existing_root_member(tree: &TempTree, member: &str, member_manifest: &str) {
+    assert!(
+        member == P03B_SQLITE_FILE_CONTROL_MEMBER,
+        "only the exact native-FFI member setup may use the existing-member helper"
+    );
+    assert!(
+        member_manifest == P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        "existing native-FFI member must use the canonical manifest"
+    );
+
+    let root_manifest: toml::Value = toml::from_str(
+        &fs::read_to_string(tree.join("Cargo.toml")).expect("read existing root member manifest"),
+    )
+    .expect("parse existing root member manifest");
+    let members = root_manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .expect("root workspace member array");
+    assert_unique_sorted_root_members(members);
+    assert!(
+        members
+            .binary_search_by(|candidate| {
+                candidate
+                    .as_str()
+                    .expect("root workspace member string")
+                    .cmp(member)
+            })
+            .is_ok(),
+        "existing native-FFI member is missing from the root workspace"
+    );
+    assert!(
+        fs::read_to_string(tree.join(member).join("Cargo.toml"))
+            .expect("read existing native-FFI member manifest")
+            .replace("\r\n", "\n")
+            == P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        "existing native-FFI member manifest changed"
+    );
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .expect("panic payload string")
 }
 
 const REPOSITORY_POLICY_MANIFEST: &str = r#"[package]
@@ -891,7 +927,7 @@ fn deactivate_repository_policy(tree: &TempTree) {
 }
 
 fn activate_repository_policy(tree: &TempTree) {
-    add_root_member(tree, REPOSITORY_POLICY_MEMBER, REPOSITORY_POLICY_MANIFEST);
+    add_new_root_member(tree, REPOSITORY_POLICY_MEMBER, REPOSITORY_POLICY_MANIFEST);
     fs::write(
         tree.join(REPOSITORY_POLICY_MEMBER).join("src/lib.rs"),
         "//! Repository-wide architecture policy gates for GTA Claw.\n",
@@ -1178,6 +1214,21 @@ fn residual_bootstrap_coupling_does_not_shadow_repository_ratchet_diagnostic() {
     );
 }
 
+/// Bootstrap sources that carry no standing preservation and are not already byte-pinned by an
+/// earlier rule, so an otherwise-valid live change to one still reaches the residual diagnostic.
+///
+/// The other nine fully coupled sources are refused earlier and more strictly: CODEOWNERS by
+/// `validate_codeowners`/`validate_protected_files`, `rust.yml` and `macos-packaging.yml` by
+/// `validate_final_workflows`, the two policy workflows by `validate_protected_files`, and
+/// `.cargo/audit.toml`, `.gitattributes`, `rust-toolchain.toml` and `rustfmt.toml` by
+/// `validate_final_fixed_files`. Only these four can reach the residual through the full stack.
+const RESIDUAL_REACHABLE_SOURCES: [&str; 4] = [
+    ".github/workflows/docker-publish.yml",
+    ".github/workflows/linux-packaging.yml",
+    ".github/workflows/upstream-gateway-reference.yml",
+    ".github/workflows/windows-packaging.yml",
+];
+
 #[test]
 fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
     let Some(actionlint) = local_actionlint() else {
@@ -1185,26 +1236,84 @@ fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
         return;
     };
     let trusted = final_tree("residual-exact-trusted");
-    let candidate = final_tree("residual-exact-candidate");
+    for path in RESIDUAL_REACHABLE_SOURCES {
+        let label = path.rsplit('/').next().expect("Bootstrap source file name");
+        let candidate = final_tree(&format!("residual-exact-candidate-{label}"));
+        let source = candidate.join(path);
+        let mut source_bytes = fs::read(&source).expect("read candidate Bootstrap source");
+        source_bytes.extend_from_slice(b"\n# otherwise-valid Bootstrap source change\n");
+        fs::write(source, source_bytes).expect("write otherwise-valid source change");
+        let artifacts = TempTree::new(&format!("residual-exact-artifacts-{label}"));
+        let changes = artifacts.join("changes.json");
+        write_manifest(
+            &changes,
+            &ChangeManifest {
+                base: "1111111111111111111111111111111111111111".to_owned(),
+                head: "2222222222222222222222222222222222222222".to_owned(),
+                paths: vec![ChangedPath {
+                    status: 'M',
+                    path: path.to_owned(),
+                }],
+            },
+        )
+        .expect("write otherwise-valid source manifest");
+        let error = validate_request(&ValidationRequest {
+            trusted_root: trusted.path.clone(),
+            candidate_root: candidate.path.clone(),
+            changes,
+            metadata_tools: local_metadata_tools(),
+            actionlint: actionlint.clone(),
+            isolation_root: artifacts.join("isolation"),
+        })
+        .expect_err("silent Bootstrap source change unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: {path}"
+            )
+        );
+    }
+}
+
+/// Twin of the residual test: the same otherwise-valid change on a standing-covered path must
+/// reach `preserved` through the full stack, writing nothing inside the protected trust root.
+///
+/// The pair is what pins the boundary. Alone, neither test says where the line is.
+#[test]
+fn otherwise_valid_standing_covered_source_change_reaches_preserved_instead() {
+    let Some(actionlint) = local_actionlint() else {
+        eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires and runs this test");
+        return;
+    };
+    let trusted = final_tree("standing-preserved-trusted");
+    let candidate = final_tree("standing-preserved-candidate");
     let root_manifest = candidate.join("Cargo.toml");
     let mut manifest_bytes = fs::read(&root_manifest).expect("read candidate root manifest");
     manifest_bytes.extend_from_slice(b"\n# otherwise-valid Bootstrap source change\n");
-    fs::write(root_manifest, manifest_bytes).expect("write otherwise-valid source change");
-    let artifacts = TempTree::new("residual-exact-artifacts");
-    let changes = artifacts.join("changes.json");
-    write_manifest(
-        &changes,
-        &ChangeManifest {
-            base: "1111111111111111111111111111111111111111".to_owned(),
-            head: "2222222222222222222222222222222222222222".to_owned(),
-            paths: vec![ChangedPath {
-                status: 'M',
-                path: "Cargo.toml".to_owned(),
-            }],
-        },
+    fs::write(root_manifest, manifest_bytes).expect("write standing-covered source change");
+
+    let trusted_root = SafeRoot::new(&trusted.path).expect("open trusted root");
+    let candidate_root = SafeRoot::new(&candidate.path).expect("open candidate root");
+    compare_trees(
+        &trusted_root,
+        &candidate_root,
+        ".github/trusted/desktop-supply-chain-policy",
     )
-    .expect("write otherwise-valid source manifest");
-    let error = validate_request(&ValidationRequest {
+    .expect("a standing-covered change writes nothing inside the protected trust root");
+
+    let artifacts = TempTree::new("standing-preserved-artifacts");
+    let changes = artifacts.join("changes.json");
+    let manifest = ChangeManifest {
+        base: "1111111111111111111111111111111111111111".to_owned(),
+        head: "2222222222222222222222222222222222222222".to_owned(),
+        paths: vec![ChangedPath {
+            status: 'M',
+            path: "Cargo.toml".to_owned(),
+        }],
+    };
+    write_manifest(&changes, &manifest).expect("write standing-covered source manifest");
+    validate_request(&ValidationRequest {
         trusted_root: trusted.path.clone(),
         candidate_root: candidate.path.clone(),
         changes,
@@ -1212,11 +1321,16 @@ fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
         actionlint,
         isolation_root: artifacts.join("isolation"),
     })
-    .expect_err("silent Bootstrap source change unexpectedly passed")
-    .to_string();
+    .expect("standing-covered Bootstrap source change passes the complete authoritative stack");
+
     assert_eq!(
-        error,
-        "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: Cargo.toml"
+        validate_bootstrap_source_decisions(&trusted_root, &candidate_root, &manifest)
+            .expect("standing preservation covers the changed Bootstrap source"),
+        BootstrapSourceDecisionEvidence {
+            changed_paths: 1,
+            synchronized_paths: 0,
+            preserved_paths: 1,
+        }
     );
 }
 
@@ -2506,12 +2620,20 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
         let manifest_before = already_present
             .then(|| fs::read(&manifest_path).expect("read native-FFI manifest before setup"));
 
-        add_root_member(
-            &tree,
-            P03B_SQLITE_FILE_CONTROL_MEMBER,
-            P03B_SQLITE_FILE_CONTROL_MANIFEST,
-        );
-        add_root_member(
+        if already_present {
+            ensure_existing_root_member(
+                &tree,
+                P03B_SQLITE_FILE_CONTROL_MEMBER,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+            );
+        } else {
+            add_new_root_member(
+                &tree,
+                P03B_SQLITE_FILE_CONTROL_MEMBER,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+            );
+        }
+        ensure_existing_root_member(
             &tree,
             P03B_SQLITE_FILE_CONTROL_MEMBER,
             P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2547,6 +2669,31 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
         }
     }
 
+    let noncanonical = P03B_SQLITE_FILE_CONTROL_MANIFEST.replacen(
+        "futures-core = \"=0.3.32\"",
+        "futures-core = \"=0.3.31\"",
+        1,
+    );
+    let tree = final_tree("sqlite-file-control-noncanonical-input");
+    add_new_root_member(
+        &tree,
+        P03B_SQLITE_FILE_CONTROL_MEMBER,
+        P03B_SQLITE_FILE_CONTROL_MANIFEST,
+    );
+    ensure_existing_root_member(
+        &tree,
+        P03B_SQLITE_FILE_CONTROL_MEMBER,
+        P03B_SQLITE_FILE_CONTROL_MANIFEST,
+    );
+    let rejection = std::panic::catch_unwind(|| {
+        ensure_existing_root_member(&tree, P03B_SQLITE_FILE_CONTROL_MEMBER, &noncanonical);
+    })
+    .expect_err("noncanonical existing-member manifest unexpectedly passed");
+    assert_eq!(
+        panic_message(rejection.as_ref()),
+        "existing native-FFI member must use the canonical manifest"
+    );
+
     for (label, from, to) in [
         ("dependency-removed", "futures-core = \"=0.3.32\"\n", ""),
         (
@@ -2572,7 +2719,12 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
             "unauthorized helper manifest drift matched the reviewed digest: {label}"
         );
         let tree = final_tree(label);
-        add_root_member(
+        add_new_root_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        ensure_existing_root_member(
             &tree,
             P03B_SQLITE_FILE_CONTROL_MEMBER,
             P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2584,17 +2736,35 @@ fn sqlite_file_control_synthetic_setup_is_idempotent() {
         )
         .expect("write unauthorized helper manifest drift");
         let rejection = std::panic::catch_unwind(|| {
-            add_root_member(
+            ensure_existing_root_member(
                 &tree,
                 P03B_SQLITE_FILE_CONTROL_MEMBER,
                 P03B_SQLITE_FILE_CONTROL_MANIFEST,
             );
-        });
-        assert!(
-            rejection.is_err(),
-            "unauthorized helper manifest drift escaped the exact fixture: {label}"
+        })
+        .expect_err("unauthorized helper manifest drift escaped the exact fixture");
+        assert_eq!(
+            panic_message(rejection.as_ref()),
+            "existing native-FFI member manifest changed",
+            "unauthorized helper manifest drift failed imprecisely: {label}"
         );
     }
+}
+
+#[test]
+fn add_new_root_member_rejects_real_repository_collision() {
+    let tree = copy_repo("root-member-collision");
+    let member = "crates/claw-memory";
+    let manifest = fs::read_to_string(tree.join(member).join("Cargo.toml"))
+        .expect("read real root member manifest");
+    let rejection = std::panic::catch_unwind(|| {
+        add_new_root_member(&tree, member, &manifest);
+    })
+    .expect_err("real repository member unexpectedly accepted as a new fixture member");
+    assert_eq!(
+        panic_message(rejection.as_ref()),
+        "fixture member `crates/claw-memory` now exists in the real repository; rename the fixture member - it must be a name no crate will ever take"
+    );
 }
 
 #[test]
@@ -2604,7 +2774,12 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
         P03B_SQLITE_FILE_CONTROL_MANIFEST_SHA256
     );
     let accepted = final_tree("sqlite-file-control-lints");
-    add_root_member(
+    add_new_root_member(
+        &accepted,
+        P03B_SQLITE_FILE_CONTROL_MEMBER,
+        P03B_SQLITE_FILE_CONTROL_MANIFEST,
+    );
+    ensure_existing_root_member(
         &accepted,
         P03B_SQLITE_FILE_CONTROL_MEMBER,
         P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2724,7 +2899,12 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
     for (label, member, manifest, expected) in cases {
         let tree = final_tree(label);
         if member == P03B_SQLITE_FILE_CONTROL_MEMBER {
-            add_root_member(
+            add_new_root_member(
+                &tree,
+                P03B_SQLITE_FILE_CONTROL_MEMBER,
+                P03B_SQLITE_FILE_CONTROL_MANIFEST,
+            );
+            ensure_existing_root_member(
                 &tree,
                 P03B_SQLITE_FILE_CONTROL_MEMBER,
                 P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2732,7 +2912,7 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
             fs::write(tree.join(member).join("Cargo.toml"), manifest)
                 .expect("write native-FFI manifest mutation");
         } else {
-            add_root_member(&tree, member, &manifest);
+            add_new_root_member(&tree, member, &manifest);
         }
         let error =
             validate_final_static(&SafeRoot::new(&tree.path).expect("open lint mutation fixture"))
@@ -2746,7 +2926,12 @@ fn sqlite_file_control_native_ffi_lints_are_exactly_identity_bound() {
 
     for mutation in ["duplicate", "unsorted"] {
         let tree = final_tree(&format!("sqlite-file-control-{mutation}"));
-        add_root_member(
+        add_new_root_member(
+            &tree,
+            P03B_SQLITE_FILE_CONTROL_MEMBER,
+            P03B_SQLITE_FILE_CONTROL_MANIFEST,
+        );
+        ensure_existing_root_member(
             &tree,
             P03B_SQLITE_FILE_CONTROL_MEMBER,
             P03B_SQLITE_FILE_CONTROL_MANIFEST,
@@ -2931,9 +3116,12 @@ fn superseded_final_and_dependency_surface_mutations_are_rejected() {
             "\n[[package]]\nname = \"{package}\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0000000000000000000000000000000000000000000000000000000000000000\"\n"
         ));
         fs::write(tree.join("desktop/Cargo.lock"), lock).expect("write desktop lock mutation");
-        assert!(
-            validate_final_static(&SafeRoot::new(&tree.path).expect("open lock mutation")).is_err(),
-            "desktop lock mutation unexpectedly passed: {package}"
+        assert_eq!(
+            validate_final_static(&SafeRoot::new(&tree.path).expect("open lock mutation"))
+                .expect_err("desktop lock mutation unexpectedly passed")
+                .to_string(),
+            "exact security policy file changed: desktop/Cargo.lock",
+            "desktop lock mutation failed through the wrong rule: {package}"
         );
     }
 }
@@ -3289,8 +3477,8 @@ fn release_metadata_version_is_format_independent_and_requires_agreement() {
 #[test]
 fn compliant_declared_root_member_and_lock_evolution_pass() {
     let tree = final_tree("root-growth");
-    let migrate_manifest = r#"[package]
-name = "claw-migrate"
+    let jjj_manifest = r#"[package]
+name = "claw-jjj-root-growth-fixture"
 description = "Compliant future root crate in the h through n range"
 version.workspace = true
 edition.workspace = true
@@ -3301,8 +3489,8 @@ repository.workspace = true
 [lints]
 workspace = true
 "#;
-    let new_manifest = r#"[package]
-name = "claw-new"
+    let kkk_manifest = r#"[package]
+name = "claw-kkk-root-growth-fixture"
 description = "Compliant future root crate"
 version.workspace = true
 edition.workspace = true
@@ -3313,26 +3501,41 @@ repository.workspace = true
 [lints]
 workspace = true
 "#;
-    add_root_member(&tree, "crates/claw-migrate", migrate_manifest);
-    add_root_member(&tree, "crates/claw-new", new_manifest);
+    add_new_root_member(&tree, "crates/claw-jjj-root-growth-fixture", jjj_manifest);
+    add_new_root_member(&tree, "crates/claw-kkk-root-growth-fixture", kkk_manifest);
 
     let root = SafeRoot::new(&tree.path).expect("open evolved fixture");
     let workspace = validate_final_static(&root).expect("accept compliant root growth");
     assert_eq!(
         workspace
             .members
-            .get("crates/claw-migrate")
+            .get("crates/claw-jjj-root-growth-fixture")
             .map(String::as_str),
-        Some("claw-migrate"),
+        Some("claw-jjj-root-growth-fixture"),
         "a pre-existing h through n member must not invalidate ordinal insertion"
     );
     assert_eq!(
-        workspace.members.get("crates/claw-new").map(String::as_str),
-        Some("claw-new")
+        workspace
+            .members
+            .get("crates/claw-kkk-root-growth-fixture")
+            .map(String::as_str),
+        Some("claw-kkk-root-growth-fixture")
     );
     let isolation = TempTree::new("root-growth-metadata");
     validate_root_metadata(&root, &workspace, &local_metadata_tools(), &isolation.path)
         .expect("Cargo accepts compliant declared root member and lock evolution");
+
+    replace(
+        &tree.join("deny.toml"),
+        "ignore = []",
+        "ignore = [\"RUSTSEC-0000-0000\"]",
+    );
+    assert_eq!(
+        validate_final_static(&root)
+            .expect_err("root deny policy violation unexpectedly passed after compliant growth")
+            .to_string(),
+        "exact security policy file changed: deny.toml"
+    );
 }
 
 #[test]

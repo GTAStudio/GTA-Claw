@@ -2071,6 +2071,125 @@ fn cleanup_quarantine_capacity_is_partitioned_per_authenticated_connection() {
 }
 
 #[test]
+fn draining_lifecycle_owners_reserve_connection_partitions_for_active_clients() {
+    const DRAINING_AGGRESSOR_OWNERS: u64 = 7;
+
+    let mut endpoint = endpoint(4096);
+    let extension = endpoint
+        .accept(&extension_upgrade(
+            &format!("chrome-extension://{EXTENSION_ID}"),
+            TOKEN,
+        ))
+        .expect("extension");
+    let victim = endpoint.accept(&cdp_upgrade()).expect("victim CDP");
+    let mut bridge = CdpBridge::with_pending_limit(1).expect("positive per-client bound");
+    assert_eq!(bridge.connect_extension(extension), Vec::new());
+    bridge.connect_cdp(victim).expect("victim CDP");
+    bridge
+        .receive_extension(
+            extension,
+            ExtensionMessage::Hello {
+                user_agent: "Fixture".to_owned(),
+                browser_version: "Chrome/144".to_owned(),
+                extension_version: "2.0.0".to_owned(),
+                tabs: (41..=50)
+                    .map(|tab_id| RelayTab {
+                        tab_id,
+                        url: format!("https://tab-{tab_id}.example.test/"),
+                        title: format!("Tab {tab_id}"),
+                        active: tab_id == 41,
+                    })
+                    .collect(),
+            },
+        )
+        .expect("hello");
+    let attach = |id, tab_id| CdpRequest {
+        id,
+        method: "Target.attachToTarget".to_owned(),
+        params: Some(json!({ "targetId": format!("tab-{tab_id}") })),
+        session_id: None,
+    };
+    let complete_aggressor_cycle = |bridge: &mut CdpBridge, aggressor, request_id, tab_id| {
+        let effects = bridge
+            .receive_cdp(aggressor, attach(request_id, tab_id))
+            .expect("aggressor acquires a root lifecycle slot");
+        let [
+            BridgeEffect::ToExtension(ExtensionCommand::Attach {
+                seq,
+                tab_id: attached,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("aggressor attach emitted an unexpected effect");
+        };
+        assert_eq!(*attached, tab_id);
+        bridge
+            .receive_extension(
+                extension,
+                ExtensionMessage::Result {
+                    seq: *seq,
+                    result: Some(json!({})),
+                },
+            )
+            .expect("aggressor attach completed");
+        assert!(matches!(
+            bridge.disconnect_cdp(aggressor).as_slice(),
+            [BridgeEffect::ToExtension(ExtensionCommand::Detach {
+                tab_id: detached,
+                ..
+            })] if *detached == tab_id
+        ));
+    };
+
+    let mut completed_aggressor_cycles = 0;
+    for offset in 0..DRAINING_AGGRESSOR_OWNERS {
+        let aggressor = endpoint
+            .accept(&cdp_upgrade())
+            .expect("authenticated aggressor reconnect");
+        bridge
+            .connect_cdp(aggressor)
+            .expect("aggressor partition available");
+        complete_aggressor_cycle(&mut bridge, aggressor, offset + 1, 41 + offset);
+        endpoint.close(aggressor).expect("aggressor disconnected");
+        completed_aggressor_cycles += 1;
+    }
+
+    let extra_aggressor = endpoint
+        .accept(&cdp_upgrade())
+        .expect("extra authenticated aggressor reconnect");
+    let extra_aggressor_connected = match bridge.connect_cdp(extra_aggressor) {
+        Ok(()) => {
+            complete_aggressor_cycle(&mut bridge, extra_aggressor, 8, 48);
+            true
+        }
+        Err(BridgeError::CdpConnectionLimit) => false,
+        Err(error) => panic!("unexpected extra aggressor admission error: {error}"),
+    };
+    endpoint
+        .close(extra_aggressor)
+        .expect("extra aggressor disconnected");
+
+    assert!(
+        completed_aggressor_cycles > 0,
+        "the aggressor must complete a disconnect cycle before victim acquisition is tested"
+    );
+    assert!(matches!(
+        bridge
+            .receive_cdp(victim, attach(9, 49))
+            .expect("the connected victim retains lifecycle availability")
+            .as_slice(),
+        [BridgeEffect::ToExtension(ExtensionCommand::Attach {
+            tab_id: 49,
+            ..
+        })]
+    ));
+    assert!(
+        !extra_aggressor_connected,
+        "draining lifecycle owners must keep their bounded connection partitions"
+    );
+}
+
+#[test]
 fn pending_work_is_bounded_expires_and_disconnect_cleanup_cannot_leak_ownership() {
     let mut endpoint = endpoint(4096);
     let extension = endpoint
