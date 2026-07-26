@@ -17,7 +17,7 @@ use crate::{PolicyError, PolicyResult, error};
 
 const MAX_REPOSITORY_FILES: usize = 50_000;
 const MAX_REPOSITORY_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_LOCK_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 const ROOT_MANIFEST: &str = "Cargo.toml";
 const ROOT_LOCK: &str = "Cargo.lock";
 const DESKTOP_MANIFEST: &str = "desktop/Cargo.toml";
@@ -88,7 +88,7 @@ const BOOTSTRAP_SNAPSHOT_MAGIC: &[u8; 8] = b"GTABOOT1";
 const MAX_BOOTSTRAP_SNAPSHOT_PATH_BYTES: usize = 4096;
 static NEXT_BOOTSTRAP_SNAPSHOT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-const BOOTSTRAP_FILES: [&str; 28] = [
+pub(crate) const BOOTSTRAP_FILES: [&str; 28] = [
     ".cargo/audit.toml",
     ".gitattributes",
     ".github/CODEOWNERS",
@@ -288,6 +288,53 @@ impl BootstrapSnapshotArchive {
             .map(|(path, payload)| (path.as_str(), payload.as_slice()))
     }
 
+    /// Returns one exact normalized payload by repository path.
+    #[must_use]
+    pub fn payload(&self, path: &str) -> Option<&[u8]> {
+        self.entries.get(path).map(Vec::as_slice)
+    }
+
+    /// Requires the exact Bootstrap inventory and normalized payload form.
+    pub fn validate_bootstrap_contents(&self) -> PolicyResult<()> {
+        if self.entries.len() != BOOTSTRAP_FILES.len()
+            || self.entries.keys().map(String::as_str).ne(BOOTSTRAP_FILES)
+        {
+            return Err(PolicyError::new(
+                "Bootstrap snapshot inventory does not match BOOTSTRAP_FILES",
+            ));
+        }
+        for (path, payload) in &self.entries {
+            if normalize_text(payload) != *payload {
+                return Err(PolicyError::new(format!(
+                    "Bootstrap snapshot payload is not normalized: {path}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Computes the semantic Bootstrap fingerprint over the stored normalized payloads.
+    #[must_use]
+    pub fn semantic_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        for (path, payload) in &self.entries {
+            digest.update(path.as_bytes());
+            digest.update([0]);
+            digest.update(payload);
+            digest.update([0]);
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Returns the canonical byte serialization of this archive.
+    pub fn canonical_bytes(&self) -> PolicyResult<Vec<u8>> {
+        self.serialize()
+    }
+
     fn from_root(root: &SafeRoot) -> PolicyResult<Self> {
         let mut entries = BTreeMap::new();
         for path in BOOTSTRAP_FILES {
@@ -379,7 +426,7 @@ fn expected_keys<'a>(values: &'a [&'a str]) -> BTreeSet<&'a str> {
     values.iter().copied().collect()
 }
 
-fn normalize_text(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn normalize_text(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -1540,19 +1587,7 @@ fn bootstrap_manifest_inventory(root: &SafeRoot) -> PolicyResult<bool> {
 
 /// Computes the exact pre-P04f product and trust-root workflow fingerprint.
 pub fn bootstrap_fingerprint(root: &SafeRoot) -> PolicyResult<String> {
-    let mut digest = Sha256::new();
-    for path in BOOTSTRAP_FILES {
-        digest.update(path.as_bytes());
-        digest.update([0]);
-        let bytes = root.read_bytes(path, MAX_LOCK_BYTES)?;
-        digest.update(normalize_text(&bytes));
-        digest.update([0]);
-    }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(BootstrapSnapshotArchive::from_root(root)?.semantic_fingerprint())
 }
 
 /// Serializes the exact pre-P04f policy inputs into the canonical Bootstrap snapshot format.

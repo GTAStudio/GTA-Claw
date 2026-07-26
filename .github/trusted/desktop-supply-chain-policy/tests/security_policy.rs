@@ -1042,7 +1042,7 @@ fn local_actionlint() -> Option<ActionlintTool> {
 
 fn fake_manifest(path: &Path, relevant: bool) {
     let changed = if relevant {
-        "desktop/Cargo.toml"
+        "desktop/deny.toml"
     } else {
         "crates/claw-domain/src/lib.rs"
     };
@@ -1058,6 +1058,166 @@ fn fake_manifest(path: &Path, relevant: bool) {
         },
     )
     .expect("write fake trusted manifest");
+}
+
+#[test]
+fn residual_bootstrap_coupling_does_not_shadow_workflow_or_static_diagnostics() {
+    let cases = [
+        (
+            "protected-workflow",
+            AUTHORITATIVE_PATH,
+            "\n# planted protected workflow mutation\n",
+            format!("protected workflow changed: {AUTHORITATIVE_PATH}"),
+        ),
+        (
+            "root-static",
+            "deny.toml",
+            "\n# planted root policy mutation\n",
+            "exact security policy file changed: deny.toml".to_owned(),
+        ),
+    ];
+    for (label, changed_path, suffix, expected) in cases {
+        let trusted = bootstrap_tree(&format!("{label}-trusted"));
+        let candidate = final_tree(&format!("{label}-candidate"));
+        for protected in [CODEOWNERS_PATH, AUTHORITATIVE_PATH, BOOTSTRAP_PATH] {
+            fs::copy(trusted.join(protected), candidate.join(protected))
+                .expect("align protected Bootstrap fixture bytes");
+        }
+        let path = candidate.join(changed_path);
+        let mut bytes = fs::read(&path).expect("read planted ordering input");
+        bytes.extend_from_slice(suffix.as_bytes());
+        fs::write(path, bytes).expect("write planted ordering mutation");
+        let artifacts = TempTree::new(&format!("{label}-artifacts"));
+        let changes = artifacts.join("changes.json");
+        write_manifest(
+            &changes,
+            &ChangeManifest {
+                base: "1111111111111111111111111111111111111111".to_owned(),
+                head: "2222222222222222222222222222222222222222".to_owned(),
+                paths: vec![ChangedPath {
+                    status: 'M',
+                    path: changed_path.to_owned(),
+                }],
+            },
+        )
+        .expect("write ordering manifest");
+        let error = validate_request(&ValidationRequest {
+            trusted_root: trusted.path.clone(),
+            candidate_root: candidate.path.clone(),
+            changes,
+            metadata_tools: MetadataTools {
+                cargo: artifacts.join("unreachable-cargo"),
+                cargo_sha256: "0".repeat(64),
+                rustc: artifacts.join("unreachable-rustc"),
+                rustc_sha256: "0".repeat(64),
+            },
+            actionlint: ActionlintTool {
+                path: artifacts.join("unreachable-actionlint"),
+                sha256: "0".repeat(64),
+            },
+            isolation_root: artifacts.join("isolation"),
+        })
+        .expect_err("planted preexisting diagnostic unexpectedly passed")
+        .to_string();
+        assert_eq!(
+            error, expected,
+            "{label} was shadowed by the residual Bootstrap coupling rule"
+        );
+    }
+}
+
+#[test]
+fn residual_bootstrap_coupling_does_not_shadow_repository_ratchet_diagnostic() {
+    let Some(actionlint) = local_actionlint() else {
+        eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires and runs this test");
+        return;
+    };
+    let trusted = final_tree("residual-repository-trusted");
+    let candidate = final_tree("residual-repository-candidate");
+    deactivate_repository_policy(&trusted);
+    deactivate_repository_policy(&candidate);
+    fs::write(candidate.join("src/newFeature.ts"), "new legacy feature")
+        .expect("plant repository ratchet violation");
+    let root_manifest = candidate.join("Cargo.toml");
+    let mut manifest_bytes = fs::read(&root_manifest).expect("read candidate root manifest");
+    manifest_bytes.extend_from_slice(b"\n# planted Bootstrap source change\n");
+    fs::write(root_manifest, manifest_bytes).expect("write Bootstrap source change");
+    let artifacts = TempTree::new("residual-repository-artifacts");
+    let changes = artifacts.join("changes.json");
+    write_manifest(
+        &changes,
+        &ChangeManifest {
+            base: "1111111111111111111111111111111111111111".to_owned(),
+            head: "2222222222222222222222222222222222222222".to_owned(),
+            paths: vec![
+                ChangedPath {
+                    status: 'M',
+                    path: "Cargo.toml".to_owned(),
+                },
+                ChangedPath {
+                    status: 'A',
+                    path: "src/newFeature.ts".to_owned(),
+                },
+            ],
+        },
+    )
+    .expect("write repository ordering manifest");
+    let error = validate_request(&ValidationRequest {
+        trusted_root: trusted.path.clone(),
+        candidate_root: candidate.path.clone(),
+        changes,
+        metadata_tools: local_metadata_tools(),
+        actionlint,
+        isolation_root: artifacts.join("isolation"),
+    })
+    .expect_err("repository ratchet violation unexpectedly passed")
+    .to_string();
+    assert!(
+        error.contains("legacy Node artifacts outside the exact ceiling"),
+        "repository ratchet was shadowed by the residual Bootstrap coupling rule: {error}"
+    );
+}
+
+#[test]
+fn otherwise_valid_bootstrap_source_change_reaches_exact_residual_diagnostic() {
+    let Some(actionlint) = local_actionlint() else {
+        eprintln!("ACTIONLINT_BIN is not set; hosted bootstrap requires and runs this test");
+        return;
+    };
+    let trusted = final_tree("residual-exact-trusted");
+    let candidate = final_tree("residual-exact-candidate");
+    let root_manifest = candidate.join("Cargo.toml");
+    let mut manifest_bytes = fs::read(&root_manifest).expect("read candidate root manifest");
+    manifest_bytes.extend_from_slice(b"\n# otherwise-valid Bootstrap source change\n");
+    fs::write(root_manifest, manifest_bytes).expect("write otherwise-valid source change");
+    let artifacts = TempTree::new("residual-exact-artifacts");
+    let changes = artifacts.join("changes.json");
+    write_manifest(
+        &changes,
+        &ChangeManifest {
+            base: "1111111111111111111111111111111111111111".to_owned(),
+            head: "2222222222222222222222222222222222222222".to_owned(),
+            paths: vec![ChangedPath {
+                status: 'M',
+                path: "Cargo.toml".to_owned(),
+            }],
+        },
+    )
+    .expect("write otherwise-valid source manifest");
+    let error = validate_request(&ValidationRequest {
+        trusted_root: trusted.path.clone(),
+        candidate_root: candidate.path.clone(),
+        changes,
+        metadata_tools: local_metadata_tools(),
+        actionlint,
+        isolation_root: artifacts.join("isolation"),
+    })
+    .expect_err("silent Bootstrap source change unexpectedly passed")
+    .to_string();
+    assert_eq!(
+        error,
+        "Bootstrap source change requires synchronized snapshot/fingerprint or a new bound preservation decision: Cargo.toml"
+    );
 }
 
 #[test]
