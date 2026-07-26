@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-async-trait = "=0.1.89"
+async-trait = "=0.1.91"
 base64 = "=0.22.1"
 hmac = "=0.13.0"
 hyper = { version = "=1.11.0", features = ["client", "http1"] }
