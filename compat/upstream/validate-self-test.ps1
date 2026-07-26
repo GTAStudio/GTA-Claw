@@ -343,6 +343,59 @@ function Write-Json {
     [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-Sha256OfText {
+    param([string]$Text)
+    # Mirrors Get-Sha256Text in validate.ps1 deliberately: the self-test must
+    # compute the pin the same way the validator does, or a case would fail on a
+    # hashing difference rather than on the rule it is planted to exercise.
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($algorithm.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) |
+            ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Set-SelfTestSweepRecord {
+    param(
+        [string]$CaseRoot,
+        [string[]]$Rows
+    )
+    # Writes a well-formed evidence sweep record AND re-pins its digest in the
+    # case's own copy of validate.ps1. Without the re-pin every one of these cases
+    # would stop at the digest, pass, and prove nothing about the rules behind it
+    # -- a negative case that fails for a reason other than the one it names is
+    # the defect this suite exists to find, so it must not be one itself.
+    $accept = @($Rows | Where-Object { $_.StartsWith("accept`t") }).Count
+    $reject = @($Rows | Where-Object { $_.StartsWith("reject`t") }).Count
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("# GTA-Claw evidence reachability sweep")
+    $lines.Add("# generated-by: validate.ps1 -ReplayEvidenceSweep")
+    $lines.Add("# base-commit: 0000000000000000000000000000000000000000")
+    $lines.Add("# swept-at: 2026-07-26")
+    $lines.Add(("# totals: files={0} accept={1} reject={2}" -f $Rows.Count, $accept, $reject))
+    foreach ($row in $Rows) { $lines.Add($row) }
+    $recordPath = Join-Path $CaseRoot "evidence-reachability-sweep.tsv"
+    $text = [string]::Join("`r`n", $lines.ToArray()) + "`r`n"
+    [System.IO.File]::WriteAllText($recordPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+
+    $digest = Get-Sha256OfText ($text -replace "`r`n", "`n")
+    $validatorPath = Join-Path $CaseRoot "validate.ps1"
+    $validator = [System.IO.File]::ReadAllText($validatorPath)
+    $updated = [regex]::Replace(
+        $validator,
+        '\$ExpectedEvidenceSweepDigest = "[0-9a-f]{64}"',
+        ('$ExpectedEvidenceSweepDigest = "' + $digest + '"'))
+    if ($updated -eq $validator) {
+        # Fail loudly rather than silently leaving the old pin in place: if this
+        # constant is ever renamed, these cases must break here instead of
+        # quietly reverting to testing the digest check again.
+        throw "Set-SelfTestSweepRecord could not re-pin `$ExpectedEvidenceSweepDigest in $validatorPath"
+    }
+    [System.IO.File]::WriteAllText($validatorPath, $updated)
+}
+
 function Test-OrdinalStringEqual {
     param(
         [AllowNull()]
@@ -2516,6 +2569,72 @@ $cases = @(
             param($caseRoot)
             $path = Join-Path $caseRoot "validate-self-test.ps1"
             Add-Content -LiteralPath $path -Value "# harmless-looking comment"
+        }
+    },
+    # The evidence sweep record. Deleting it is refused by the file-topology rule
+    # rather than by anything sweep-specific, so this asserts the message that
+    # actually fires; an earlier case of mine asserted the more specific rule and
+    # was wrong about which one refuses first.
+    [ordered]@{
+        name = "evidence-sweep-record-removed-is-rejected"
+        expected_message = "missing=[evidence-reachability-sweep.tsv]"
+        mutate = {
+            param($caseRoot)
+            Remove-Item -LiteralPath (Join-Path $caseRoot "evidence-reachability-sweep.tsv") -Force
+        }
+    },
+    # One flipped verdict, and nothing else touched. This is the cheapest possible
+    # forgery -- relabel a refusal as accepted so a weakened rule looks agreed --
+    # and the digest is what refuses it.
+    [ordered]@{
+        name = "evidence-sweep-refusal-relabelled-accept-is-rejected"
+        expected_message = "evidence-reachability-sweep.tsv digest mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            $text = [System.IO.File]::ReadAllText($path)
+            [System.IO.File]::WriteAllText($path, ($text -replace "(?m)^reject\t", "accept`t"))
+        }
+    },
+    # Re-blessing the mutable ledger digests first must not launder it: the sweep
+    # digest is frozen in validate.ps1 and -WriteLedgerDigests cannot reach it.
+    [ordered]@{
+        name = "evidence-sweep-tamper-survives-digest-regeneration"
+        expected_message = "evidence-reachability-sweep.tsv digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "evidence-reachability-sweep.tsv"
+            Add-Content -LiteralPath $path -Value "accept`tcrates/synthetic/src/lib.rs"
+        }
+    },
+    # The remaining two cases re-pin the sweep digest in the case's own copy of
+    # validate.ps1, modelling somebody who edited the record and updated the
+    # constant to match. That is the only way to reach the rules behind the
+    # digest, and it is worth reaching them: the digest proves the record is the
+    # reviewed one, and these prove the reviewed one still has to mean something.
+    [ordered]@{
+        name = "evidence-sweep-record-with-no-refusal-is-rejected"
+        expected_message = "records no refusal at all"
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepRecord $caseRoot @("accept`tcrates/synthetic/tests/enabled.rs")
+        }
+    },
+    # The direction the digest cannot see: the record stays internally consistent
+    # while the rule underneath it changes. A recorded refusal that the live rule
+    # now accepts must fail by name.
+    [ordered]@{
+        name = "evidence-sweep-refusal-the-rule-now-accepts-is-rejected"
+        expected_message = "but the shipped reachability rule now accepts it"
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            Set-SelfTestSweepRecord $caseRoot @(
+                "reject`tcrates/synthetic/tests/enabled.rs",
+                "accept`tcrates/synthetic/tests/ignored.rs"
+            )
         }
     }
 )

@@ -419,6 +419,67 @@ stable, and each entry names the rule that refuses it — three `build.rs`, one
 `harness = false` desktop target. A measurement that moves with the tree is
 recorded with the revision it was taken at, or it is not reproducible.
 
+#### `evidence-reachability-sweep.tsv` — the checked-in cross-check
+
+That per-file verdict list is now a committed artifact rather than a number
+quoted in prose. `evidence-reachability-sweep.tsv` holds one `<verdict><TAB><path>`
+row for every tracked `.rs` file in the repository, sorted ordinally, with a
+header naming the command that produced it, the commit it was swept at and the
+totals. Regenerate it with:
+
+```
+powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep
+```
+
+That mode reruns the shipped reachability rule over every tracked `.rs` file,
+rewrites the record, prints a differential against the previous one — verdict
+changes, files added, files removed — and prints the digest to paste into
+`$ExpectedEvidenceSweepDigest`. It touches nothing else: ledger digests,
+inventory digests, the schema digest and `baseline.json` are all unreachable
+from it, exactly as `-WriteLedgerDigests` cannot reach anything but the three
+ledgers.
+
+**This record grants no permission, and it must not be mistaken for one.** A row
+saying `accept` does not make that file citable; every citation is checked
+against the live rule by the evidence admission path, which never consults this
+file. The record exists so that two independent implementations of reachability
+have a shared expectation that either one failing would expose. Its value is
+entirely as a cross-check, which is why the five refusals matter more than the
+three hundred acceptances: those five are where the rule says *no*, and a rule
+that silently stops saying no is the failure this artifact is here to catch.
+
+Every ordinary run enforces two different things about it:
+
+- **The digest**, checked before anything is parsed. This is what makes the
+  record unforgeable. An earlier design instead re-derived the verdict for every
+  row the record labelled `reject`, and a negative control broke it in one edit:
+  flipping a row to `accept` made the checker skip it, so the single change that
+  hides a refusal was the one change it could not see. Re-deriving all 307 rows
+  closes that hole and costs about 110 seconds on every invocation, which the
+  self-test — roughly 156 validator invocations — cannot absorb. The digest
+  closes it for the price of one hash, because no label can be edited at all
+  without a reviewed change to a constant in `validate.ps1`.
+- **The refusals, re-derived from the tree.** The digest cannot detect the other
+  direction: the record staying honest while the rule underneath it is weakened.
+  Every recorded `reject` whose file still exists is re-checked against the live
+  rule, and a file that has started being accepted fails the run by name. There
+  are few enough refusals for this to cost seconds rather than minutes.
+
+Both are needed, and neither subsumes the other. Reaching the second one in a
+test required a forgery that was consistent in three separate ways — the verdict
+flipped, the totals line corrected to match, and the digest re-pinned — because
+the ordering rule, the totals rule and the digest each refused it first, by name,
+before the re-derivation was ever reached.
+
+Two things are deliberately **not** enforced: a `.rs` file absent from the record,
+and a recorded row whose file no longer exists. The swept tree belongs to
+seventeen other sessions and grew from 114 to 307 files in about a day. Failing
+on their additions, renames and deletions would couple this contract to every one
+of them — the exact coupling that has already had to be untangled four times in
+this repository, each time as a change that could not land from either side
+alone. Additions and deletions surface in the `-ReplayEvidenceSweep` differential
+instead, where somebody is already reading.
+
 That agreement proves nothing about
 the two rules both sides changed most recently, because neither construct occurs
 anywhere in either tree: scanned at the time of writing, there are **zero inline
