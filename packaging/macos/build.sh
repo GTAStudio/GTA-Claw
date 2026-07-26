@@ -109,16 +109,17 @@ build_target() {
   # skipping silently. Both CI invocations of this script use `native`, which
   # workflow-self-test.sh asserts, so the skip cannot occur there.
   #
-  # gta-claw-desktop is deliberately absent: it ends in window.run(), which
-  # blocks forever, so there is no bounded way to execute it here. The packaged
-  # GUI binary is still never executed by anything in this repository.
+  # The application bundle is checked after assemble-app.sh has ad-hoc signed
+  # and validated it, and before archive-headless.sh runs, so nothing is
+  # archived that has not started at least once.
+  "$MACOS_DIR/assemble-app.sh" "$desktop" "$arch" "$arch"
   if [[ "$target" == "$(host_target)" ]]; then
     assert_headless_binaries_execute "$cli" "$daemon" "$target"
+    assert_packaged_app_executes "$(app_bundle_path "$arch")" "$target"
   else
-    note "cross build for $target on $(host_target): headless execution not attempted"
+    note "cross build for $target on $(host_target): execution not attempted"
   fi
 
-  "$MACOS_DIR/assemble-app.sh" "$desktop" "$arch" "$arch"
   "$MACOS_DIR/archive-headless.sh" "$cli" gta-claw-cli "$arch" "$arch"
   "$MACOS_DIR/archive-headless.sh" "$daemon" gta-claw-daemon "$arch" "$arch"
   write_artifact_set_checksums "$OUTPUT_ROOT/headless/$arch"

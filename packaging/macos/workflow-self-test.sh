@@ -99,4 +99,62 @@ while IFS= read -r invocation; do
   fi
 done <<<"$build_invocations"
 
+# The candidate binaries are executed in the job that builds them, and that job
+# must be the one that holds nothing worth stealing. protected-release-contract:
+# is where the signing identity and the notarization credentials are, and it
+# only ever inspects the downloaded candidate: running it there would execute
+# unsigned candidate code in the one job that can sign on the project's behalf.
+#
+# Neither half is stated anywhere else, so both are asserted here rather than
+# left as a property that happens to hold.
+jobs_section="$(sed -n '/^jobs:/,$p' "$workflow")"
+executing_jobs=0
+while IFS= read -r job; do
+  block="$(
+    awk -v header="  $job:" '
+      $0 == header { inside = 1; next }
+      inside && /^  [^ ]/ { inside = 0 }
+      inside { print }
+    ' <<<"$jobs_section"
+  )"
+  grep -F 'packaging/macos/build.sh' <<<"$block" >/dev/null || continue
+  executing_jobs=$((executing_jobs + 1))
+  if grep -E '^    environment:' <<<"$block" >/dev/null; then
+    echo "job '$job' executes candidate binaries and must not use a secret environment" >&2
+    exit 1
+  fi
+  if grep -F 'secrets.' <<<"$block" >/dev/null; then
+    echo "job '$job' executes candidate binaries and must not read release secrets" >&2
+    exit 1
+  fi
+done <<<"$(grep -E '^  [a-z][a-z0-9-]*:[[:space:]]*$' <<<"$jobs_section" | tr -d ' :')"
+if [[ "$executing_jobs" -eq 0 ]]; then
+  echo "no workflow job invokes packaging/macos/build.sh" >&2
+  exit 1
+fi
+
+if grep -F -- '--packaging-self-check' <<<"$protected_release" >/dev/null; then
+  echo "protected release job must not run the downloaded candidate app" >&2
+  exit 1
+fi
+# A line that continues the previous one is an argument, not a command: the
+# signing step legitimately passes "$app" to codesign on its own line. Only
+# lines that actually start a command are candidates for execution, and this
+# catches the plain shapes rather than every possible obfuscation -- the rule
+# that carries the weight is that this job may run no repository script and
+# holds the only credentials worth protecting.
+offenders="$(
+  awk '
+    !continued && $0 ~ /^ *([;&|(]+ *)?(open|"?\$\{?(binary|app|executable)\}?"?)([ \t]|$)/ {
+      print $0
+    }
+    { continued = ($0 ~ /\\$/) }
+  ' <<<"$protected_release"
+)"
+if [[ -n "$offenders" ]]; then
+  echo "protected release job must not execute the downloaded candidate app:" >&2
+  printf '%s\n' "$offenders" >&2
+  exit 1
+fi
+
 echo "macOS workflow trust-boundary self-tests passed"

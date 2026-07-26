@@ -21,7 +21,13 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::rc::Rc;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::time::Duration;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use claw_application::SystemProbe as _;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use claw_platform::NativeSystemProbe;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use controller::{
     CommandRejection, ControllerSender, ControllerShutdownError, ControllerStartError,
@@ -708,6 +714,7 @@ fn wire_callbacks(
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn main() -> Result<(), DesktopError> {
+    let self_check = packaging_self_check_requested();
     let window = AppWindow::new().map_err(DesktopError::Platform)?;
     let weak_window = window.as_weak();
     let controller = DesktopController::spawn(move |snapshot| {
@@ -724,10 +731,89 @@ fn main() -> Result<(), DesktopError> {
     apply_preferences(&window, *preferences.borrow());
     apply_product_state(&window, &product_state.borrow());
     wire_callbacks(&window, controller.sender(), preferences, product_state);
+    // Dropping a Slint timer cancels it, so the self-check timer has to outlive
+    // the event loop it is going to stop.
+    let _self_check_timer = self_check.then(arm_packaging_self_check);
     window.run().map_err(DesktopError::Platform)?;
     controller
         .shutdown()
-        .map_err(DesktopError::ControllerShutdown)
+        .map_err(DesktopError::ControllerShutdown)?;
+    if self_check {
+        report_packaging_self_check();
+    }
+    Ok(())
+}
+
+/// Sole argument that makes this binary complete one full startup and shut
+/// itself down again instead of waiting for a person.
+///
+/// The packaging scripts pass it so that the bytes they are about to archive,
+/// sign and publish have been run at least once. Every other check in
+/// `packaging/macos` only reads those bytes.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const PACKAGING_SELF_CHECK_FLAG: &str = "--packaging-self-check";
+
+/// Delay before a self-check run asks the Slint event loop to stop.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const PACKAGING_SELF_CHECK_QUIT_DELAY: Duration = Duration::from_millis(250);
+
+/// Deadline after which a self-check that never reached its quit timer aborts,
+/// so a window that never opens fails the packaging run instead of hanging it.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const PACKAGING_SELF_CHECK_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Reports whether this process was started for a packaging self-check.
+///
+/// The flag has to be the only argument, and it is read from the argument
+/// vector rather than the environment on purpose: an environment variable is
+/// inherited by every descendant of whatever set it, so one exported name could
+/// make ordinary launches exit on their own. An argument cannot be inherited,
+/// and a launch through Finder or `open` supplies none. Arguments are read as
+/// `OsString` because `env::args` panics on a non-Unicode argument, which a
+/// launcher must not be able to cause.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn packaging_self_check_requested() -> bool {
+    let mut arguments = std::env::args_os().skip(1);
+    arguments
+        .next()
+        .is_some_and(|first| first == PACKAGING_SELF_CHECK_FLAG)
+        && arguments.next().is_none()
+}
+
+/// Arms the watchdog and the single-shot timer that ends a self-check run.
+///
+/// The returned timer is the whole difference between a self-check run and an
+/// ordinary one: the window, the controller, the callbacks and the shutdown
+/// path are the production ones.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn arm_packaging_self_check() -> slint::Timer {
+    std::thread::spawn(|| {
+        std::thread::sleep(PACKAGING_SELF_CHECK_DEADLINE);
+        eprintln!("packaging self-check exceeded its deadline without reaching the event loop");
+        std::process::abort();
+    });
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::SingleShot,
+        PACKAGING_SELF_CHECK_QUIT_DELAY,
+        || slint::quit_event_loop().expect("quit the Slint event loop"),
+    );
+    timer
+}
+
+/// Prints what actually ran, once the real shutdown path has completed.
+///
+/// A zero exit status only says that something ran. The package version ties
+/// the run to this build, and the runtime descriptor is resolved from
+/// `std::env::consts` at compile time, so a binary built for another target
+/// fails this even on a host that could execute it.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn report_packaging_self_check() {
+    println!(
+        "gta-claw-desktop packaging self-check ok version={} runtime={}",
+        env!("CARGO_PKG_VERSION"),
+        NativeSystemProbe.runtime()
+    );
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
