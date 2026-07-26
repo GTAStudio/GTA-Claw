@@ -2654,6 +2654,56 @@ $cases = @(
             $path = Join-Path $caseRoot "validate-self-test.ps1"
             Add-Content -LiteralPath $path -Value "# harmless-looking comment"
         }
+    },
+    # README.md is the normative specification these rules are judged against, and
+    # it was only presence-checked until it had already caused a live incident: its
+    # ownership paragraph went on asserting that the Cargo reachability rule was
+    # locally owned and unported for about a day after crates/claw-conformance
+    # implemented it, and a session reasoned from that text, in good faith, to a
+    # proposal that would have rejected 225 legitimate tests. These three cases
+    # pin the three shapes that failure can take.
+    #
+    # A whole-file replacement, the way a hollowed-out specification would look.
+    [ordered]@{
+        name = "gutted-readme-is-rejected"
+        expected_message = "README.md digest mismatch"
+        mutate = {
+            param($caseRoot)
+            Set-Content -LiteralPath (Join-Path $caseRoot "README.md") -Value "# Frozen upstream compatibility contract" -NoNewline
+        }
+    },
+    # One sentence, silently reversed. This is the shape that actually happened and
+    # the shape a size or "looks empty" heuristic would miss entirely: the file is
+    # still a plausible specification, and only the claim changed.
+    [ordered]@{
+        name = "reversed-ownership-claim-in-readme-is-rejected"
+        expected_message = "README.md digest mismatch"
+        mutate = {
+            param($caseRoot)
+            $path = Join-Path $caseRoot "README.md"
+            $text = [System.IO.File]::ReadAllText($path)
+            $mutated = $text.Replace("shared, not locally owned", "locally owned, not shared")
+            # A no-op Replace would leave the file byte-identical and the validator
+            # would pass, which this case would then report as "failed for the wrong
+            # reason". Say so directly instead: the anchor sentence moving is a
+            # legitimate edit, but it must not silently turn this case into a
+            # tautology.
+            if ($mutated -eq $text) {
+                throw "self-test fixture README.md no longer contains the anchor sentence 'shared, not locally owned'; update this case to a sentence that exists"
+            }
+            [System.IO.File]::WriteAllText($path, $mutated)
+        }
+    },
+    # Re-blessing the mutable ledger digests first must not help. -WriteLedgerDigests
+    # may only ever move the three ledger digests; it cannot reach the specification.
+    [ordered]@{
+        name = "appended-line-in-readme-survives-digest-regeneration"
+        expected_message = "README.md digest mismatch"
+        regenerate_digests = $true
+        mutate = {
+            param($caseRoot)
+            Add-Content -LiteralPath (Join-Path $caseRoot "README.md") -Value "A harmless-looking sentence."
+        }
     }
 )
 
