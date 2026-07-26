@@ -271,6 +271,9 @@ version = "0.1.0"
 dependencies = [
  "claw-domain",
  "claw-protocol",
+ "secrecy",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -448,6 +451,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-migrate"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "claw-observability"
 version = "0.1.0"
 dependencies = [
@@ -552,6 +565,18 @@ dependencies = [
 [[package]]
 name = "claw-repo-policy"
 version = "0.1.0"
+
+[[package]]
+name = "claw-runtime"
+version = "0.1.0"
+dependencies = [
+ "claw-application",
+ "claw-domain",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "claw-security"
@@ -1421,8 +1446,12 @@ name = "gta-claw-daemon"
 version = "0.1.0"
 dependencies = [
  "claw-application",
+ "claw-domain",
  "claw-platform",
  "claw-protocol",
+ "secrecy",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -203,6 +203,17 @@ impl BoundServer {
         let directory = server.directory.clone();
         let permits = Arc::new(Semaphore::new(limits.max_connections));
         let (shutdown, shutdown_rx) = watch::channel(false);
+        // Quiescing and shutting down are different events and must not share a
+        // signal. Quiescing releases the listener while every established
+        // connection keeps serving; shutting down closes those connections. A
+        // composition root stops its ingress before it drains the subsystems
+        // behind it, so the server has to be able to do the first without the
+        // second.
+        let (quiesce, quiesce_rx) = watch::channel(false);
+        // Reported *by* the accept loop once the listener is released, so that
+        // `stop_accepting` can be awaited to a definite state instead of
+        // returning while the socket is still accepting.
+        let (accepting_tx, accepting) = watch::channel(true);
 
         let tick_clock = Arc::clone(&server.clock);
         let tick_events = events.clone();
@@ -239,13 +250,17 @@ impl BoundServer {
             listener,
             services,
             accept_permits,
+            quiesce_rx,
             accept_shutdown,
+            accepting_tx,
             timeouts.close,
         ));
 
         ServerHandle {
             local_address,
             shutdown,
+            quiesce,
+            accepting,
             events,
             directory,
             permits,
@@ -260,17 +275,26 @@ async fn accept_loop(
     listener: TcpListener,
     services: ConnectionServices,
     permits: Arc<Semaphore>,
+    mut quiesce: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
+    accepting: watch::Sender<bool>,
     grace: std::time::Duration,
 ) {
     let next_id = AtomicU64::new(1);
     let mut connections = JoinSet::new();
-    loop {
+    // Distinguishes the two ways of leaving the accept phase: a shutdown goes
+    // straight to the bounded drain, a quiesce keeps serving first.
+    let shutting_down = loop {
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    break;
+                    break true;
+                }
+            }
+            changed = quiesce.changed() => {
+                if changed.is_err() || *quiesce.borrow() {
+                    break false;
                 }
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
@@ -296,8 +320,28 @@ async fn accept_loop(
                 });
             }
         }
-    }
+    };
     drop(listener);
+    // Published only after the listener is gone, so an awaited `stop_accepting`
+    // cannot return while the port would still complete a TCP handshake.
+    let _ = accepting.send(false);
+
+    if !shutting_down {
+        // Quiesced: refuse new work, but let established connections finish
+        // their in-flight requests until an actual shutdown arrives.
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    }
+
     let drain = async { while connections.join_next().await.is_some() {} };
     if timeout(grace, drain).await.is_err() {
         connections.shutdown().await;
@@ -309,6 +353,8 @@ async fn accept_loop(
 pub struct ServerHandle {
     local_address: SocketAddr,
     shutdown: watch::Sender<bool>,
+    quiesce: watch::Sender<bool>,
+    accepting: watch::Receiver<bool>,
     events: EventBus,
     directory: ConnectionDirectory,
     permits: Arc<Semaphore>,
@@ -341,6 +387,28 @@ impl ServerHandle {
     pub fn connection_count(&self) -> usize {
         self.max_connections
             .saturating_sub(self.permits.available_permits())
+    }
+
+    /// Releases the listener while every established connection keeps serving.
+    ///
+    /// This is the ingress half of a graceful stop: after it returns, the port
+    /// no longer completes a TCP handshake, so a new client is refused at
+    /// connect time, but connections that were already established continue to
+    /// answer requests until [`shutdown`](Self::shutdown) closes them. A
+    /// composition root uses it to stop the edges before draining the
+    /// subsystems behind them.
+    ///
+    /// It awaits the acceptor's acknowledgement rather than only signalling, so
+    /// when it returns the listener is definitely gone. It is idempotent.
+    pub async fn stop_accepting(&self) {
+        let _ = self.quiesce.send(true);
+        let mut accepting = self.accepting.clone();
+        while *accepting.borrow_and_update() {
+            if accepting.changed().await.is_err() {
+                // The acceptor is gone, which means it is no longer accepting.
+                break;
+            }
+        }
     }
 
     /// Announces shutdown, stops accepting, and waits for the accept loop.

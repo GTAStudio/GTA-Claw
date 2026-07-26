@@ -284,7 +284,10 @@ impl CdpBridge {
         if self.clients.contains(&connection) {
             return Err(BridgeError::DuplicateConnection);
         }
-        if self.clients.len() >= MAX_CDP_CONNECTIONS {
+        let assigned_partitions = self.assigned_cdp_partitions();
+        if assigned_partitions.len() >= MAX_CDP_CONNECTIONS
+            && !assigned_partitions.contains(&connection)
+        {
             return Err(BridgeError::CdpConnectionLimit);
         }
         self.clients.insert(connection);
@@ -917,6 +920,23 @@ impl CdpBridge {
         Ok(())
     }
 
+    fn assigned_cdp_partitions(&self) -> BTreeSet<ConnectionId> {
+        let mut owners = self.clients.clone();
+        owners.extend(self.session_lifecycle_owners());
+        owners
+    }
+
+    fn session_lifecycle_owners(&self) -> impl Iterator<Item = ConnectionId> + '_ {
+        self.targets
+            .values()
+            .filter_map(|target| target.session.map(|session| session.owner))
+            .chain(self.pending.values().filter_map(|pending| {
+                matches!(pending.kind, PendingKind::Attach { .. }).then_some(pending.client)
+            }))
+            .chain(self.abandoned.values().map(|abandoned| abandoned.owner))
+            .chain(self.cleanup_detaches.values().map(|cleanup| cleanup.owner))
+    }
+
     fn session_lifecycle_counts(
         &self,
         client: ConnectionId,
@@ -930,25 +950,8 @@ impl CdpBridge {
             }
             Ok(())
         };
-        for session in self.targets.values().filter_map(|target| target.session) {
-            add(session.owner == client)?;
-        }
-        for pending in self.pending.values().filter(|pending| {
-            matches!(
-                pending.kind,
-                PendingKind::Attach {
-                    tab_id: _,
-                    respond: _
-                }
-            )
-        }) {
-            add(pending.client == client)?;
-        }
-        for abandoned in self.abandoned.values() {
-            add(abandoned.owner == client)?;
-        }
-        for cleanup in self.cleanup_detaches.values() {
-            add(cleanup.owner == client)?;
+        for owner in self.session_lifecycle_owners() {
+            add(owner == client)?;
         }
         Ok((owned, total))
     }
