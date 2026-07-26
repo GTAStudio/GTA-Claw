@@ -227,7 +227,12 @@ impl Daemon {
             .collect()
     }
 
-    /// Sends a request in through the Gateway ingress, as a client would.
+    /// Sends a request through the in-process-only application dispatch seam.
+    ///
+    /// This is not a wire request. `session.prompt` and `session.describe` are
+    /// application action strings and are not advertised Gateway method
+    /// identities. The real [`claw_gateway::GatewayServer`] retains ownership of
+    /// wire authorization and dispatch.
     ///
     /// # Errors
     ///

@@ -152,6 +152,7 @@ async fn the_daemon_exposes_the_real_gateway_and_releases_its_listener_on_shutdo
     assert_eq!(ready.info.advertised_method_count, 258);
     assert_eq!(ready.info.advertised_event_count, 33);
     assert_eq!(ready.info.max_payload_bytes, 26_214_400);
+    assert_eq!(daemon.gateway().registered_methods(), 278);
 
     let summary = daemon.stop().await.expect("the daemon stops");
     assert!(summary.is_clean());
@@ -362,7 +363,7 @@ async fn a_second_turn_advances_the_revision_rather_than_replacing_it() {
 }
 
 #[tokio::test]
-async fn a_request_arriving_at_the_gateway_produces_the_same_answer_as_a_direct_turn() {
+async fn the_in_process_dispatch_seam_reaches_the_application_service() {
     let clock = Arc::new(SteppedClock::new());
     let mut daemon = started(Arc::clone(&clock)).await;
 
@@ -374,7 +375,7 @@ async fn a_request_arriving_at_the_gateway_produces_the_same_answer_as_a_direct_
             "hello".to_owned(),
         ))
         .await
-        .expect("the gateway serves the request");
+        .expect("the in-process seam serves the application action");
 
     assert_eq!(response.body(), "echo: hello");
     assert_eq!(
@@ -393,10 +394,9 @@ async fn a_request_arriving_at_the_gateway_produces_the_same_answer_as_a_direct_
             String::new(),
         ))
         .await
-        .expect("the gateway describes the session");
+        .expect("the in-process seam describes the session");
 
     assert_eq!(described.body(), "via-gateway revision 1 turns 1");
-    assert_eq!(daemon.gateway().registered_methods(), 278);
 
     assert!(daemon.stop().await.expect("the daemon stops").is_clean());
 }

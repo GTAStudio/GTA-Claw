@@ -153,8 +153,8 @@ enum GatewayCommand {
 }
 
 impl GatewayIngress {
-    /// Creates a gateway serving `dispatch` with an initially empty pairing
-    /// directory.
+    /// Creates the Gateway subsystem with an in-process-only application
+    /// dispatch seam and an initially empty wire pairing directory.
     #[must_use]
     pub fn new(dispatch: Arc<dyn GatewayDispatch>) -> Self {
         Self {
@@ -189,7 +189,10 @@ impl GatewayIngress {
         self.devices.clone()
     }
 
-    /// Handles one request.
+    /// Handles one request through the in-process-only application seam.
+    ///
+    /// Wire requests are handled by [`GatewayServer`] and never enter this
+    /// method. No wire identity is mapped to these application action strings.
     ///
     /// # Errors
     ///
