@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn the_frozen_client_contract_admits_the_scopes_this_client_requests() {
+    fn the_declared_android_ceiling_admits_the_scopes_this_client_requests() {
         let config = test_config();
         let requested = requested_operator_scopes(&config);
         let pinned: &'static [OperatorScope] = Box::leak(requested.clone().into_boxed_slice());
@@ -497,13 +497,13 @@ mod tests {
         assert_eq!(
             outcome,
             Ok(()),
-            "the frozen Android contract must admit the scopes this client requests \
+            "the declared Android ceiling must admit the scopes this client requests \
              ({requested:?}), got {outcome:?}"
         );
     }
 
     #[test]
-    fn the_frozen_client_contract_refuses_pairing_for_android() {
+    fn the_declared_android_ceiling_refuses_pairing_for_android() {
         const READ_PLUS_PAIRING: &[OperatorScope] = &[OperatorScope::Read, OperatorScope::Pairing];
         let config = test_config();
 
