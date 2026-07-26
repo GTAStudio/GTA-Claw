@@ -399,6 +399,9 @@ version = "0.1.0"
 dependencies = [
  "claw-domain",
  "claw-protocol",
+ "secrecy",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -1725,8 +1728,12 @@ name = "gta-claw-daemon"
 version = "0.1.0"
 dependencies = [
  "claw-application",
+ "claw-domain",
  "claw-platform",
  "claw-protocol",
+ "secrecy",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
