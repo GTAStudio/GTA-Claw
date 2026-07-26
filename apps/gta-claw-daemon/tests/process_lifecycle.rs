@@ -1,6 +1,7 @@
 //! Process-level checks for daemon lifecycle modes.
 
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -14,9 +15,39 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Returns a port that is free at this instant.
+fn reserve_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve an ephemeral port");
+    listener
+        .local_addr()
+        .expect("reserved port is readable")
+        .port()
+}
+
+/// Builds a daemon invocation with the smallest configuration the frozen
+/// contract accepts, so an inherited environment cannot decide the outcome.
+fn daemon() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
+    command
+        .env("AGENT_ROLE_URL", "https://roles.example.com/role.json")
+        .env("ENABLE_TEAMS", "false")
+        .env("GITHUB_TOKEN", "lifecycle-token")
+        .env_remove("DEVICE_FLOW_ENABLED")
+        .env_remove("DOMAIN")
+        .env_remove("GITHUB_CLIENT_ID")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("HTTP_PROXY")
+        .env_remove("LOG_LEVEL")
+        .env_remove("NODE_ENV")
+        .env_remove("all_proxy")
+        .env_remove("https_proxy");
+    command
+}
+
 #[test]
 fn normal_mode_remains_running_until_terminated() {
-    let child = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+    let child = daemon()
+        .env("PORT", reserve_port().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -46,7 +77,7 @@ fn normal_mode_remains_running_until_terminated() {
 
 #[test]
 fn one_shot_probe_exits_successfully() {
-    let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"))
+    let output = daemon()
         .arg("--probe")
         .output()
         .expect("daemon probe starts");

@@ -1042,9 +1042,16 @@ dependencies = [
 name = "gta-claw-daemon"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "claw-application",
+ "claw-config",
+ "claw-http-api",
  "claw-platform",
  "claw-protocol",
+ "claw-security",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
