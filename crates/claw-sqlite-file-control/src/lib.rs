@@ -2951,6 +2951,15 @@ fn send_terminal_rollback_error<Connection: BeginOwnedConnection>(
         }
         TerminalRollbackCompletion::ReportCommit { result, primary } => {
             let error = match (rollback, close) {
+                // A vetoed COMMIT is converted to a ROLLBACK by SQLite, which
+                // restores autocommit and unregisters the manual transaction
+                // token. The terminal rollback then finds nothing to undo. That
+                // is a completed rollback, not a cleanup failure, so it must not
+                // mask a primary result that carries a definite SQLite code.
+                (
+                    Some(FileControlError::TransactionInvalidated(_)),
+                    Some(TerminalCloseOutcome::Closed),
+                ) if primary.code().is_some() => primary,
                 (Some(rollback), Some(close)) => FileControlError::Handle(format!(
                     "COMMIT failed: {primary}; terminal rollback failed: {rollback}; terminal close: {close:?}"
                 )),
@@ -6192,10 +6201,24 @@ async fn commit_synchronously(
     if result == libsqlite3_sys::SQLITE_OK {
         Ok(())
     } else if autocommit {
-        Err(FileControlError::CommitOutcomeUncertain(
-            result,
-            "autocommit was restored before the error was reported".to_owned(),
-        ))
+        // SQLite converts a vetoed COMMIT into a ROLLBACK. When the guard tells
+        // us only the binding drifted, the database and its sidecars are still
+        // the files this connection wrote through, so that rollback is durable
+        // and definite. Anything else, including a missing classification,
+        // stays uncertain.
+        #[cfg(unix)]
+        let provable =
+            recorded_commit_veto(database.as_raw_handle()) == Some(CommitVeto::ProvableRollback);
+        #[cfg(not(unix))]
+        let provable = false;
+        if provable {
+            Err(FileControlError::SQLite(result))
+        } else {
+            Err(FileControlError::CommitOutcomeUncertain(
+                result,
+                "autocommit was restored before the error was reported".to_owned(),
+            ))
+        }
     } else {
         Err(FileControlError::SQLite(result))
     }
@@ -6388,6 +6411,7 @@ pub async fn install_identity_commit_guard(
         sidecars,
         writer_generation,
         expected_writer_generation,
+        veto_class: std::sync::atomic::AtomicU8::new(0),
     });
     let context = Box::into_raw(context);
     // SAFETY: SQLite assumes ownership of the boxed context and invokes the
@@ -6430,6 +6454,26 @@ struct IdentityCommitContext {
     sidecars: Vec<PinnedSidecar>,
     writer_generation: Arc<AtomicU64>,
     expected_writer_generation: u64,
+    veto_class: std::sync::atomic::AtomicU8,
+}
+
+/// Why an identity commit guard vetoed, and therefore whether the resulting
+/// rollback can be proven.
+///
+/// SQLite converts a vetoed COMMIT into a ROLLBACK, so the transaction is
+/// always logically rolled back. What differs is whether this connection can
+/// still establish what that rollback left on disk.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitVeto {
+    /// Binding metadata drifted, but the database and its sidecars are still
+    /// the inodes this connection wrote through, so the rollback is durable
+    /// in files we still hold and is therefore provable.
+    ProvableRollback = 1,
+    /// The durable substrate itself moved: a sidecar, the rollback journal, or
+    /// the writer generation. What the rollback left on disk cannot be
+    /// established from this connection.
+    Uncertain = 2,
 }
 
 #[cfg(any(unix, windows))]
@@ -6455,48 +6499,94 @@ unsafe extern "C" fn reject_moved_or_unbound_commit(context: *mut std::ffi::c_vo
     // SAFETY: SQLite invokes the hook only while its client-data context and
     // connection are live.
     let context = unsafe { context.as_ref() };
-    let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        !database_has_moved(context.database) && unix_identity_matches(context)
+    let veto = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if database_has_moved(context.database) {
+            // The pathname moved but the file this connection writes through is
+            // unchanged, so the converted ROLLBACK is durable in that file.
+            Some(CommitVeto::ProvableRollback)
+        } else {
+            unix_identity_veto(context)
+        }
     }))
-    .unwrap_or(false);
-    i32::from(!valid)
+    // A panicking probe establishes nothing, so it cannot claim provability.
+    .unwrap_or(Some(CommitVeto::Uncertain));
+    match veto {
+        None => 0,
+        Some(class) => {
+            context
+                .veto_class
+                .store(class as u8, std::sync::atomic::Ordering::Release);
+            1
+        }
+    }
+}
+
+/// Reads the classification recorded by the most recent commit-guard veto on
+/// this connection.
+///
+/// Returns `None` when no identity guard is installed or no veto was recorded,
+/// which callers must treat as "not provable".
+#[cfg(unix)]
+fn recorded_commit_veto(database: NonNull<libsqlite3_sys::sqlite3>) -> Option<CommitVeto> {
+    // SAFETY: the pointer is the live connection handle held by the caller, and
+    // the named client data is owned by that connection until it closes.
+    let context = unsafe {
+        libsqlite3_sys::sqlite3_get_clientdata(
+            database.as_ptr(),
+            c"gta-claw-commit-identity".as_ptr(),
+        )
+    };
+    let context = NonNull::new(context.cast::<IdentityCommitContext>())?;
+    // SAFETY: the client data outlives this read because the connection is live.
+    let context = unsafe { context.as_ref() };
+    match context
+        .veto_class
+        .swap(0, std::sync::atomic::Ordering::AcqRel)
+    {
+        1 => Some(CommitVeto::ProvableRollback),
+        2 => Some(CommitVeto::Uncertain),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
-fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
+fn unix_identity_veto(context: &IdentityCommitContext) -> Option<CommitVeto> {
     use std::os::unix::fs::FileExt as _;
     use xattr::FileExt as _;
 
-    if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation
-        || !unix_path_matches_private_directory(
-            &context.database_parent_path,
-            &context.database_parent,
-            context.expected_uid,
-        )
-        || !unix_path_matches_private_file(
-            &context.database_path,
-            &context.database_file,
-            0o600,
-            context.expected_uid,
-        )
-        || !unix_path_matches_private_file(
-            &context.lock_path,
-            &context.lock_file,
-            0o600,
-            context.expected_uid,
-        )
-    {
-        return false;
+    // A different writer generation means another writer may already have
+    // written through this database, so our view of durability is stale.
+    if context.writer_generation.load(Ordering::Acquire) != context.expected_writer_generation {
+        return Some(CommitVeto::Uncertain);
+    }
+    if !unix_path_matches_private_directory(
+        &context.database_parent_path,
+        &context.database_parent,
+        context.expected_uid,
+    ) || !unix_path_matches_private_file(
+        &context.database_path,
+        &context.database_file,
+        0o600,
+        context.expected_uid,
+    ) || !unix_path_matches_private_file(
+        &context.lock_path,
+        &context.lock_file,
+        0o600,
+        context.expected_uid,
+    ) {
+        return Some(CommitVeto::ProvableRollback);
     }
     let Ok(Some(identity)) = context
         .database_file
         .get_xattr("user.gta-claw.writer-lock-path")
     else {
-        return false;
+        return Some(CommitVeto::ProvableRollback);
     };
     if identity != context.expected_identity {
-        return false;
+        return Some(CommitVeto::ProvableRollback);
     }
+    // Sidecar drift is substrate drift: the WAL carrying the rollback is not
+    // the WAL this connection wrote to.
     for sidecar in &context.sidecars {
         let expected_generation = unix_sidecar_generation_record(
             &context.database_path,
@@ -6514,7 +6604,7 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
                 .get_xattr("user.gta-claw.sidecar-generation"),
             Ok(Some(generation)) if generation == expected_generation
         ) {
-            return false;
+            return Some(CommitVeto::Uncertain);
         }
     }
     let mut journal = context.database_path.as_os_str().to_owned();
@@ -6526,13 +6616,13 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
         &context.expected_identity,
         false,
     ) {
-        return false;
+        return Some(CommitVeto::Uncertain);
     }
     let Ok(metadata) = context.lock_file.metadata() else {
-        return false;
+        return Some(CommitVeto::ProvableRollback);
     };
     if usize::try_from(metadata.len()).ok() != Some(context.expected_identity.len()) {
-        return false;
+        return Some(CommitVeto::ProvableRollback);
     }
 
     #[cfg(unix)]
@@ -6604,8 +6694,11 @@ fn unix_identity_matches(context: &IdentityCommitContext) -> bool {
     }
     let mut contents = vec![0_u8; context.expected_identity.len()];
     match context.lock_file.read_at(&mut contents, 0) {
-        Ok(read) => read == contents.len() && contents == context.expected_identity,
-        Err(_) => false,
+        Ok(read) if read == contents.len() && contents == context.expected_identity => None,
+        // The lock file this database is bound to no longer carries our
+        // generation. The database and its sidecars are untouched, so the
+        // converted ROLLBACK is durable in the files we still hold.
+        _ => Some(CommitVeto::ProvableRollback),
     }
 }
 
