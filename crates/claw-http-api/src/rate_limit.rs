@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::json;
@@ -23,6 +23,7 @@ pub(crate) struct RateLimiter {
     shared: Arc<Mutex<LimiterState>>,
     requests_per_minute: u32,
     max_clients: usize,
+    trust_proxy: bool,
 }
 
 struct LimiterState {
@@ -37,11 +38,21 @@ struct Bucket {
 }
 
 impl RateLimiter {
-    pub(crate) fn new(requests_per_minute: NonZeroU32) -> Self {
-        Self::new_at(requests_per_minute, MAX_CLIENTS, Instant::now())
+    pub(crate) fn new(requests_per_minute: NonZeroU32, trust_proxy: bool) -> Self {
+        Self::new_at(
+            requests_per_minute,
+            MAX_CLIENTS,
+            trust_proxy,
+            Instant::now(),
+        )
     }
 
-    fn new_at(requests_per_minute: NonZeroU32, max_clients: usize, now: Instant) -> Self {
+    fn new_at(
+        requests_per_minute: NonZeroU32,
+        max_clients: usize,
+        trust_proxy: bool,
+        now: Instant,
+    ) -> Self {
         debug_assert!(max_clients > 0);
         Self {
             shared: Arc::new(Mutex::new(LimiterState {
@@ -50,11 +61,13 @@ impl RateLimiter {
             })),
             requests_per_minute: requests_per_minute.get(),
             max_clients,
+            trust_proxy,
         }
     }
 
-    fn is_allowed(&self, peer: IpAddr) -> bool {
-        self.is_allowed_at(normalize_ip(peer), Instant::now())
+    fn is_allowed(&self, socket_peer: IpAddr, headers: &HeaderMap) -> bool {
+        let peer = client_ip(socket_peer, headers, self.trust_proxy);
+        self.is_allowed_at(peer, Instant::now())
     }
 
     fn is_allowed_at(&self, peer: IpAddr, now: Instant) -> bool {
@@ -122,7 +135,7 @@ pub(crate) async fn enforce(
     request: Request,
     next: Next,
 ) -> Response {
-    if is_probe(request.uri().path()) || limiter.is_allowed(peer.ip()) {
+    if is_probe(request.uri().path()) || limiter.is_allowed(peer.ip(), request.headers()) {
         return next.run(request).await;
     }
     json_response(
@@ -142,6 +155,21 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn client_ip(socket_peer: IpAddr, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
+    if trust_proxy
+        && let Some(forwarded) = headers
+            .get(header::HeaderName::from_static("x-forwarded-for"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<IpAddr>().ok())
+    {
+        return normalize_ip(forwarded);
+    }
+    normalize_ip(socket_peer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RateLimiter, WINDOW};
@@ -154,7 +182,7 @@ mod tests {
     #[test]
     fn token_refill_uses_a_deterministic_sixty_second_oracle() {
         let start = Instant::now();
-        let limiter = RateLimiter::new_at(NonZeroU32::new(2).expect("non-zero"), 4, start);
+        let limiter = RateLimiter::new_at(NonZeroU32::new(2).expect("non-zero"), 4, false, start);
         let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
         assert!(limiter.is_allowed_at(peer, start));
@@ -176,7 +204,7 @@ mod tests {
     #[test]
     fn stale_cleanup_and_oldest_eviction_keep_the_map_bounded() {
         let start = Instant::now();
-        let limiter = RateLimiter::new_at(NonZeroU32::new(1).expect("non-zero"), 2, start);
+        let limiter = RateLimiter::new_at(NonZeroU32::new(1).expect("non-zero"), 2, false, start);
         let first = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let second = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         let third = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
@@ -196,7 +224,7 @@ mod tests {
     #[test]
     fn concurrent_requests_cannot_overdraw_a_peer_budget() {
         let start = Instant::now();
-        let limiter = RateLimiter::new_at(NonZeroU32::new(4).expect("non-zero"), 4, start);
+        let limiter = RateLimiter::new_at(NonZeroU32::new(4).expect("non-zero"), 4, false, start);
         let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let barrier = Arc::new(Barrier::new(16));
 

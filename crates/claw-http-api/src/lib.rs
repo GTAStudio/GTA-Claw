@@ -144,6 +144,7 @@ impl HttpApi {
         };
         let cors_origins = config.cors_origins.clone();
         let rate_limit_per_minute = config.rate_limit_per_minute;
+        let trust_proxy = config.trust_proxy;
         let state = ApiState::new(config, services);
         let (router, protected, mcp_router) = http_api_endpoints!(build_route_groups);
         let protected = protected.layer(middleware::from_fn_with_state(auth_state, require_bearer));
@@ -170,11 +171,11 @@ impl HttpApi {
         let mut mcp_router = mcp_router;
         if let Some(requests_per_minute) = rate_limit_per_minute {
             router = router.layer(middleware::from_fn_with_state(
-                RateLimiter::new(requests_per_minute),
+                RateLimiter::new(requests_per_minute, trust_proxy),
                 rate_limit::enforce,
             ));
             mcp_router = mcp_router.layer(middleware::from_fn_with_state(
-                RateLimiter::new(requests_per_minute),
+                RateLimiter::new(requests_per_minute, trust_proxy),
                 rate_limit::enforce,
             ));
         }

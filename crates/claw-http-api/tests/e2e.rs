@@ -614,6 +614,77 @@ async fn rate_limit_enforces_exact_contract_by_socket_peer_and_ignores_forwardin
 }
 
 #[tokio::test]
+async fn trusted_proxy_rate_limit_accepts_only_valid_first_forwarded_ips() {
+    let mut rate_config = config();
+    rate_config.rate_limit_per_minute = NonZeroU32::new(2);
+    rate_config.trust_proxy = true;
+    let server = spawn_with(rate_config, DeterministicRuntime::new()).await;
+
+    for _ in 0..2 {
+        let forwarded = request(
+            &server,
+            "GET",
+            "/v1/models/openclaw",
+            Some("operator-token"),
+            &[("X-Forwarded-For", "198.51.100.10, not-an-ip")],
+            b"",
+        )
+        .await;
+        assert_eq!(forwarded.status, 200);
+    }
+    let forwarded_limited = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "198.51.100.10, 203.0.113.2")],
+        b"",
+    )
+    .await;
+    assert_eq!(forwarded_limited.status, 429);
+    assert_eq!(forwarded_limited.body, br#"{"error":"Too many requests"}"#);
+
+    let isolated_forwarded = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "198.51.100.11")],
+        b"",
+    )
+    .await;
+    assert_eq!(isolated_forwarded.status, 200);
+    assert_eq!(
+        isolated_forwarded.json(),
+        json!({"id":"openclaw","object":"model","created":0,"owned_by":"openclaw","permission":[]})
+    );
+
+    for malformed in ["", "not-an-ip"] {
+        let fallback = request(
+            &server,
+            "GET",
+            "/v1/models/openclaw",
+            Some("operator-token"),
+            &[("X-Forwarded-For", malformed)],
+            b"",
+        )
+        .await;
+        assert_eq!(fallback.status, 200);
+    }
+    let malformed_limited = request(
+        &server,
+        "GET",
+        "/v1/models/openclaw",
+        Some("operator-token"),
+        &[("X-Forwarded-For", "[invalid-ip]")],
+        b"",
+    )
+    .await;
+    assert_eq!(malformed_limited.status, 429);
+    assert_eq!(malformed_limited.body, br#"{"error":"Too many requests"}"#);
+}
+
+#[tokio::test]
 async fn absent_rate_limit_is_explicitly_unlimited() {
     let runtime = DeterministicRuntime::new();
     let server = spawn_with(config(), runtime).await;
