@@ -357,7 +357,7 @@ assert_protected_contract() {
     die "protected namespace does not contain exactly the eight fixed names"
   for name in $expected_names; do
     path="$namespace/$name"
-    { sudo test -f "$path" && sudo test ! -L "$path"; } ||
+    [[ -f "$path" && ! -L "$path" ]] ||
       die "protected entry is not a physical regular file: $name"
     [[ "$(sudo stat -c '%u:%g:%a:%h' "$path")" == \
       "$service_uid:$service_gid:600:1" ]] ||
