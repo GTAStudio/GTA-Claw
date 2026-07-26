@@ -116,7 +116,7 @@ impl Daemon {
         let stderr = child.stderr.take().expect("daemon stderr is piped");
 
         let mut announced = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..5 {
             let mut line = String::new();
             let read = stdout
                 .read_line(&mut line)
@@ -147,6 +147,16 @@ impl Daemon {
             announced[2],
             format!("listening address=0.0.0.0:{port} domain=localhost\n"),
             "unexpected listening announcement"
+        );
+        assert!(
+            announced[3].starts_with("unconfigured dependencies="),
+            "startup did not name the unconfigured dependencies: {}",
+            announced[3]
+        );
+        assert!(
+            announced[4].starts_with("protected routes closed:"),
+            "startup did not name the closed protected surface: {}",
+            announced[4]
         );
 
         Ok(Self {
@@ -389,6 +399,29 @@ fn missing_credentials_stop_startup_before_any_readiness_claim() {
     );
 }
 
+/// Reads one `key=value` field out of the stop line.
+///
+/// Deliberately hand-written rather than shared with the production formatter,
+/// so a formatter that changed shape would fail this rather than agree with it.
+#[cfg(unix)]
+fn stop_field<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("stop line has no {key}: {line:?}"))
+}
+
+/// Asserts the joined property: after a stop signal the HTTP surface stops
+/// accepting **and** the composition reports a clean stop.
+///
+/// Neither half implies the other. A clean `StopSummary` counts task joins and
+/// cannot observe a file descriptor, so a leaked listener would still report
+/// clean; and a refused connection says nothing about whether in-flight work
+/// was abandoned.
+///
+/// The daemon is started with standard input closed, which is also what a
+/// systemd service inherits unless its unit says otherwise. That makes this the
+/// regression test for a `select!` that stops observing signals once the
+/// control channel reaches end of file.
 #[cfg(unix)]
 fn shutdown_by(signal: &str, expected: &str) {
     let mut daemon = Daemon::start();
@@ -401,32 +434,62 @@ fn shutdown_by(signal: &str, expected: &str) {
         .expect("signal is delivered");
     assert!(delivered.success(), "kill {signal} failed");
 
+    let stopped = daemon
+        .next_line()
+        .expect("daemon reported a stop line before exiting");
+    assert!(
+        stopped.starts_with("stopped "),
+        "daemon did not report a graceful stop: {stopped:?}"
+    );
     assert_eq!(
-        daemon.next_line().as_deref(),
-        Some(format!("shutdown signal={expected}\n").as_str()),
-        "daemon did not report a graceful shutdown"
+        stop_field(&stopped, "reason"),
+        expected,
+        "unexpected stop reason: {stopped:?}"
+    );
+    assert_eq!(
+        stop_field(&stopped, "clean"),
+        "true",
+        "the composition did not report a clean stop: {stopped:?}"
+    );
+    assert_eq!(
+        stop_field(&stopped, "abandoned"),
+        "0",
+        "work was abandoned during shutdown: {stopped:?}"
+    );
+    let tasks = stop_field(&stopped, "tasks");
+    let (terminated, spawned) = tasks
+        .split_once('/')
+        .unwrap_or_else(|| panic!("unparsable task ledger: {tasks:?}"));
+    assert_eq!(
+        terminated, spawned,
+        "a spawned task was not joined: {stopped:?}"
     );
 
     let status = daemon.wait_for_exit();
     assert_eq!(
         status.code(),
         Some(0),
-        "daemon did not exit cleanly after {expected}"
+        "daemon did not exit cleanly after {expected}, raw status {status:?}"
     );
+
+    // The listening socket is gone, not merely idle: a fresh bind to the same
+    // address would fail with EADDRINUSE while any listener survived.
+    let released = TcpListener::bind(daemon.address);
     assert!(
-        TcpStream::connect_timeout(&daemon.address, Duration::from_secs(2)).is_err(),
-        "listener kept accepting after shutdown"
+        released.is_ok(),
+        "the listening socket outlived shutdown: {:?}",
+        released.err()
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn sigterm_drains_and_exits_zero() {
-    shutdown_by("-TERM", "SIGTERM");
+    shutdown_by("-TERM", "terminate");
 }
 
 #[cfg(unix)]
 #[test]
 fn sigint_drains_and_exits_zero() {
-    shutdown_by("-INT", "SIGINT");
+    shutdown_by("-INT", "interrupt");
 }

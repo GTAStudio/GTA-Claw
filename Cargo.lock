@@ -262,6 +262,9 @@ version = "0.1.0"
 dependencies = [
  "claw-domain",
  "claw-protocol",
+ "secrecy",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -1283,10 +1286,12 @@ dependencies = [
  "axum",
  "claw-application",
  "claw-config",
+ "claw-domain",
  "claw-http-api",
  "claw-platform",
  "claw-protocol",
  "claw-security",
+ "secrecy",
  "serde_json",
  "tokio",
  "tokio-util",

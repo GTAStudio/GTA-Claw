@@ -6,7 +6,7 @@
 //! the few process-level facts a listener needs.
 
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use claw_config::{
@@ -21,7 +21,7 @@ const LISTEN_INTERFACE: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// Process-level settings derived from a validated configuration snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DaemonSettings {
+pub struct DaemonSettings {
     listen_address: SocketAddr,
     public_domain: String,
     manual_migrations: Vec<ManualMigration>,
@@ -29,7 +29,7 @@ pub(crate) struct DaemonSettings {
 
 /// One legacy value that this runtime intentionally cannot apply.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ManualMigration {
+pub struct ManualMigration {
     legacy_env: &'static str,
     target: &'static str,
     reason: &'static str,
@@ -47,17 +47,17 @@ impl Display for ManualMigration {
 
 impl DaemonSettings {
     /// Returns the address the HTTP listener must bind.
-    pub(crate) const fn listen_address(&self) -> SocketAddr {
+    pub const fn listen_address(&self) -> SocketAddr {
         self.listen_address
     }
 
     /// Returns the externally advertised domain.
-    pub(crate) fn public_domain(&self) -> &str {
+    pub fn public_domain(&self) -> &str {
         &self.public_domain
     }
 
     /// Returns the legacy values that require operator action.
-    pub(crate) fn manual_migrations(&self) -> &[ManualMigration] {
+    pub fn manual_migrations(&self) -> &[ManualMigration] {
         &self.manual_migrations
     }
 
@@ -81,10 +81,20 @@ impl DaemonSettings {
 }
 
 /// A startup configuration failure that must stop the process.
-#[derive(Debug)]
-pub(crate) enum SettingsError {
+pub enum SettingsError {
     /// The supplied environment could not be converted into valid configuration.
     Invalid(MigrationError),
+}
+
+/// Renders the operator-facing message rather than the enum shape.
+///
+/// `main` returns `Result`, and the runtime prints a returned error with
+/// `Debug`. A derived `Debug` would put `Invalid(Config(Validation { .. }))` in
+/// front of an operator instead of the sentence explaining what to fix.
+impl Debug for SettingsError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, formatter)
+    }
 }
 
 impl Display for SettingsError {
@@ -110,7 +120,7 @@ impl Error for SettingsError {
 ///
 /// This function is pure so that startup failures are testable without
 /// mutating the environment of a running test process.
-pub(crate) fn load<'a>(
+pub fn load<'a>(
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<DaemonSettings, SettingsError> {
     let migration = migrate_legacy_environment(variables).map_err(SettingsError::Invalid)?;
@@ -125,7 +135,7 @@ pub(crate) fn load<'a>(
 ///
 /// Non-UTF-8 entries can never match the frozen ASCII mapping names, so they
 /// are irrelevant rather than fatal.
-pub(crate) fn process_environment() -> Vec<(String, String)> {
+pub fn process_environment() -> Vec<(String, String)> {
     std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect()
