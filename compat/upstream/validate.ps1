@@ -1713,8 +1713,8 @@ function Assert-EnabledTestOracle {
         }
         $actual = Test-DeclaresEnabledRustTest ([string]$case.source) ([string]$case.test)
         if ($actual -ne $case.expected) {
-            Fail ("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
-                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus." -f
+            Fail (("enabled-test oracle drift on case '{0}': the shared corpus records {1} but this port returned {2}. " +
+                "crates/claw-conformance declares_enabled_test is normative; re-port Test-DeclaresEnabledRustTest before changing this corpus.") -f
                 $name, $case.expected, $actual)
         }
     }

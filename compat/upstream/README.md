@@ -637,3 +637,34 @@ every push:
 It exits 0 when every case passes and 1 otherwise, printing `ok`/`FAIL` per case
 followed by an aggregate. It evaluates every case even after one fails, so a
 single regression cannot hide the cases behind it.
+
+### Where the self-test builds its throwaway trees
+
+Both throwaway trees — the per-case copies of this directory and the synthetic
+repository root used by the enabled-test cases — are created under the system
+temp directory by default. That directory is not private to the run. On Windows,
+Storage Sense deletes `%TEMP%` content under disk pressure, and a machine running
+several concurrent `cargo` builds produces exactly that pressure. Set
+
+```text
+GTA_CLAW_SELFTEST_WORK_ROOT=/some/stable/directory
+```
+
+to place them somewhere a temp cleaner will not reach.
+
+The self-test verifies its own fixture against a sentinel set immediately after
+construction and again before every case, and reports a disappearance as an
+explicit environment failure. This matters because of how the failure presents
+otherwise: the fixture is built once and never modified by any case, so if it is
+deleted mid-run every later case fails its precondition and reports "not a
+GTA-Claw tree", which reads exactly like a semantic regression in the validator.
+One such run cost a downstream session a real investigation before the cause was
+identified as the temp cleaner.
+
+The cases themselves degrade safely, which is the property that made that run
+diagnosable at all. A negative case asserts the *specific* rejection reason, not
+merely a non-zero exit, so a vanished fixture makes it fail with "failed for the
+wrong reason" rather than pass. Had the harness only checked that the validator
+rejected something, every one of the negative cases would have passed vacuously
+against a fixture that no longer existed — a green anti-forgery suite testing
+nothing.

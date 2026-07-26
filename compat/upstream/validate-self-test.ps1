@@ -34,7 +34,21 @@ $RustFileWithoutTests = "crates/claw-config/src/error.rs"
 # ENABLED Rust test. The real tree has no #[ignore]d, cfg-gated or commented-out
 # test to cite, so those forgeries are staged in a synthetic tree instead of
 # adding files outside compat/upstream.
-$SyntheticRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+#
+# Both throwaway trees live under a work root that defaults to the system temp
+# directory. That directory is NOT private to this run: on Windows, Storage Sense
+# deletes %TEMP% content under disk pressure, and this repository's development
+# and CI machines run many concurrent cargo builds that create exactly that
+# pressure. Allow relocating the work root so a run can be made hermetic.
+$SelfTestWorkRoot = if ([string]::IsNullOrEmpty($env:GTA_CLAW_SELFTEST_WORK_ROOT)) {
+    [System.IO.Path]::GetTempPath()
+} else {
+    $env:GTA_CLAW_SELFTEST_WORK_ROOT
+}
+if (-not (Test-Path -LiteralPath $SelfTestWorkRoot)) {
+    New-Item -ItemType Directory -Path $SelfTestWorkRoot -Force | Out-Null
+}
+$SyntheticRoot = Join-Path $SelfTestWorkRoot (
     "gta-claw-upstream-validator-synthetic-" + [Guid]::NewGuid().ToString("N")
 )
 $SyntheticTestName = "parity_is_proven_here"
@@ -263,6 +277,52 @@ function New-SyntheticRepositoryRoot {
 }
 
 New-SyntheticRepositoryRoot $SyntheticRoot
+
+# Sentinels spanning every subtree the synthetic cases cite. The fixture is built
+# once at startup and no case ever modifies it, so a missing file can only mean
+# the tree was deleted or truncated underneath the run. Checked immediately after
+# construction AND before every case, because the observed failure mode is
+# disappearance mid-run rather than a failed create.
+$SyntheticRootSentinels = @(
+    "Cargo.toml",
+    "crates/synthetic/Cargo.toml",
+    "crates/synthetic/tests/enabled.rs",
+    "crates/synthetic/tests/ignored.rs",
+    "crates/orphanpkg/Cargo.toml",
+    "vendored/Cargo.toml",
+    "globbed/member/Cargo.toml",
+    "standalone/Cargo.toml"
+)
+
+function Assert-SelfTestFixtureIntact {
+    param([string]$Stage)
+    $separator = [string][System.IO.Path]::DirectorySeparatorChar
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($relative in $SyntheticRootSentinels) {
+        $absolute = Join-Path $SyntheticRoot ($relative.Replace("/", $separator))
+        if (-not (Test-Path -LiteralPath $absolute)) {
+            $missing.Add($relative)
+        }
+    }
+    if ($missing.Count -eq 0) {
+        return
+    }
+    # Deliberately not phrased as a rule violation. A run that reports this has
+    # measured nothing about the validator, and saying so plainly is the whole
+    # point: the previous behaviour was a cascade of per-case "not a GTA-Claw
+    # tree" errors that read exactly like a semantic regression.
+    throw (("validator self-test fixture is INCOMPLETE at {0}: {1} of {2} sentinel " +
+        "files are missing under '{3}' (first missing: {4}). This is an " +
+        "ENVIRONMENT failure, not a validator regression -- the fixture is built " +
+        "once at startup and never modified by any case, so missing files mean " +
+        "the directory was removed underneath this run. On Windows, Storage Sense " +
+        "deletes %TEMP% content under disk pressure, which concurrent cargo builds " +
+        "readily create. Re-run with GTA_CLAW_SELFTEST_WORK_ROOT set to a " +
+        "directory outside the temp cleaner's reach.") -f
+        $Stage, $missing.Count, $SyntheticRootSentinels.Count, $SyntheticRoot, $missing[0])
+}
+
+Assert-SelfTestFixtureIntact "construction"
 
 function Read-Json {
     param([string]$Path)
@@ -2433,7 +2493,7 @@ $cases = @(
     }
 )
 
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+$temporaryRoot = Join-Path $SelfTestWorkRoot (
     "gta-claw-upstream-validator-self-test-" + [Guid]::NewGuid().ToString("N")
 )
 New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
@@ -2444,6 +2504,16 @@ $negativeCases = 0
 $positiveCases = 1
 try {
     foreach ($case in $cases) {
+        # Re-checked every iteration: a fixture that evaporates part-way through
+        # would otherwise turn every remaining case into a confusing precondition
+        # error that looks like a rule regression.
+        Assert-SelfTestFixtureIntact ("case '" + $case.name + "'")
+        if (-not (Test-Path -LiteralPath $temporaryRoot)) {
+            throw (("validator self-test work root '{0}' disappeared before case " +
+                "'{1}'. This is an ENVIRONMENT failure, not a validator " +
+                "regression; see the fixture-integrity note above.") -f
+                $temporaryRoot, $case.name)
+        }
         $caseRoot = Join-Path $temporaryRoot $case.name
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         Copy-Item -Path (Join-Path $SourceRoot "*") -Destination $caseRoot -Recurse -Force
