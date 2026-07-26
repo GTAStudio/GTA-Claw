@@ -1041,8 +1041,12 @@ fn local_actionlint() -> Option<ActionlintTool> {
 }
 
 fn fake_manifest(path: &Path, relevant: bool) {
+    // "desktop/deny.toml" is policy-relevant (matches the `deny*.toml` pattern) but, unlike
+    // "desktop/Cargo.toml", is not one of the 28 exact `BOOTSTRAP_FILES` paths, so it does not
+    // also trip the new per-path Bootstrap change-coupling invariant these state-machine tests
+    // are not exercising.
     let changed = if relevant {
-        "desktop/Cargo.toml"
+        "desktop/deny.toml"
     } else {
         "crates/claw-domain/src/lib.rs"
     };
