@@ -145,14 +145,28 @@ the software renderer instead, and is held to the identical discipline the momen
 
 `PINNED_BUILD_ARTIFACTS` records reviewed `(package, version, target, url, SHA-256)` pins for every package known to fetch at build time, listed in `BUILD_TIME_FETCHING_PACKAGES` — today exactly `skia-bindings`, so a second such package cannot appear silently. The archive key embeds
 the crate commit, target, and resolved feature set, so it cannot be computed before the mobile lock
-exists. The table is therefore empty, and the validator refuses to admit any mobile workspace that
-uses Skia while it stays empty. Filling it is a reviewed trust-root edit. Obtain each digest from
-the release asset metadata, which publishes a SHA-256 the build script ignores:
+exists, which is why the table started empty. It now carries the two reviewed `aarch64-apple-ios`
+and `aarch64-apple-ios-sim` rows for `skia-bindings` 0.99.0 — the only pair the shipped iOS platform
+can need, since `MOBILE_PLATFORMS` declares no other Skia target for it. The validator still refuses
+to admit any mobile workspace that uses Skia on a target whose pin is absent here, so a third target,
+or a second fetching package, cannot appear silently; a future platform (Android, if it ever selects
+Skia over FemtoVG or the software renderer) still fills its own rows the same reviewed way. Each
+digest was obtained from the release asset metadata, which publishes a SHA-256 the build script
+ignores:
 
 ```text
 gh api repos/rust-skia/skia-binaries/releases/tags/<version> \
   --jq '.assets[] | select(.name | test("aarch64-apple-ios")) | [.name, .digest] | @tsv'
 ```
+
+Matching a pin row's URL to its target is not a plain `url.contains(target)`: `aarch64-apple-ios` is
+a proper prefix of `aarch64-apple-ios-sim`, so a simulator archive's URL also contains the device
+target's name and would otherwise satisfy the device row. The validator instead extracts the
+**longest** admitted target that appears in the URL and requires it to equal the row's own target,
+and rejects the row outright if no admitted target appears or if two distinct admitted targets of
+the same longest length both appear. This resolves collisions between admitted targets; it does not
+parse the URL, so a target name reachable only through an unrelated path segment or query string is
+still out of scope for this check and depends on the digest to catch the wrong artifact.
 
 #### Why the lockfile does not already cover this
 
@@ -164,8 +178,9 @@ own manifest: its `include` list is `Cargo.toml`, `bindings_docs.rs`, `build.rs`
 `build_support/**/*.rs`, and `src/**`. The published `.crate` file cannot contain the artifact, so
 no checksum over it can cover the artifact.
 
-Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a future session
-filling `PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source:
+Three further facts, each verified against `rust-skia` at tag `0.99.0`, that a session filling
+`PINNED_BUILD_ARTIFACTS` needs in order to fill it from the right source — used to obtain the two
+iOS rows above, and equally binding on any future platform's rows:
 
 - **The artifact host is a different repository from the crate source.** The crate declares
   `repository = "https://github.com/rust-skia/rust-skia"`; the archive is served from

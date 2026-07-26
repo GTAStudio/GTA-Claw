@@ -403,11 +403,24 @@ fn admitted_locks() -> BTreeSet<&'static str> {
 ///
 /// Derived as the union of what the platforms declare, so a second hardcoded list cannot silently
 /// disagree with the platforms it is meant to describe.
-fn admitted_skia_targets() -> BTreeSet<&'static str> {
+pub(crate) fn admitted_skia_targets() -> BTreeSet<&'static str> {
     MOBILE_PLATFORMS
         .iter()
         .flat_map(|platform| platform.skia_targets.iter().copied())
         .collect()
+}
+
+/// Returns the iOS platform's exact device and simulator Skia targets.
+///
+/// Exposed so callers outside this module (the trusted CLI resolver and the mobile packaging
+/// workflow content policy) describe iOS by the same two targets `MOBILE_PLATFORMS` declares,
+/// rather than carrying a second hardcoded pair that could silently drift from it.
+pub(crate) fn ios_skia_targets() -> &'static [&'static str] {
+    MOBILE_PLATFORMS
+        .iter()
+        .find(|platform| platform.directory == "ios")
+        .map(|platform| platform.skia_targets)
+        .unwrap_or(&[])
 }
 
 /// Packages known to fetch a prebuilt artifact from the network during their build script.
@@ -420,7 +433,21 @@ fn admitted_skia_targets() -> BTreeSet<&'static str> {
 /// `cfg(all(target_vendor = "apple", not(target_os = "macos")))`.
 ///
 /// Any package listed here must carry a reviewed pin below before a workspace using it is admitted.
-const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99.0")];
+pub(crate) const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99.0")];
+
+/// Returns the sole build-time-fetching package name reviewed pins exist for.
+///
+/// Exposed as an accessor onto `BUILD_TIME_FETCHING_PACKAGES` rather than a second hardcoded
+/// `"skia-bindings"` literal, so the mobile workflow content policy names the same package this
+/// table does and cannot silently drift from it.
+pub(crate) fn skia_bindings_package_name() -> &'static str {
+    BUILD_TIME_FETCHING_PACKAGES[0].0
+}
+
+/// Returns the sole reviewed release version pinned for `skia_bindings_package_name()`.
+pub(crate) fn skia_bindings_pin_version() -> &'static str {
+    BUILD_TIME_FETCHING_PACKAGES[0].1
+}
 
 /// Reviewed build-time fetch pins: `(package, version, target, url, lowercase SHA-256)`.
 ///
@@ -430,11 +457,31 @@ const BUILD_TIME_FETCHING_PACKAGES: [(&str, &str); 1] = [("skia-bindings", "0.99
 /// which accepts a `file://` URL.
 ///
 /// The archive key embeds the crate commit, the target, and the sorted resolved feature set, so it
-/// cannot be computed before the mobile lock exists. This table is therefore **empty by default**,
-/// and `validate_mobile_lock` refuses to admit any workspace whose lock contains a fetching package
-/// while the corresponding pins are absent. That makes the pin impossible to skip, keeps filling it
-/// a reviewed trust-root edit, and stops a second fetching package appearing silently.
-const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 0] = [];
+/// cannot be computed before the mobile lock exists, which is why this table stayed empty until
+/// now. These two rows were obtained independently, not from a build that already succeeded: each
+/// archive was fetched directly from its published release URL into a clean directory and its
+/// SHA-256 computed from that file, then cross-checked against the release asset metadata
+/// (`gh api repos/rust-skia/skia-binaries/releases/tags/0.99.0`), which reports the identical
+/// digest for both. Both targets share release tag `0.99.0`; there is no asymmetry between them.
+/// `validate_mobile_lock` still refuses to admit any workspace whose lock contains a fetching
+/// package while its target's pin is absent here, so a second fetching package, or a third target
+/// for this one, cannot appear silently.
+pub(crate) const PINNED_BUILD_ARTIFACTS: [(&str, &str, &str, &str, &str); 2] = [
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz",
+        "15e20f3265dfddd658f9ef0d0e30d50a73afccb88787812f65fb5e6cf4ec55c8",
+    ),
+    (
+        "skia-bindings",
+        "0.99.0",
+        "aarch64-apple-ios-sim",
+        "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-ios-sim-gl-jpegd-jpege-metal-pdf-textlayout.tar.gz",
+        "ade5b153818d9b7b81240f106df148a9c4b92fb3aba566f942a713b93914e11e",
+    ),
+];
 
 const FORBIDDEN_GUI_NAMES: [&str; 11] = [
     "dioxus-desktop",
@@ -1394,6 +1441,39 @@ impl MobilePlatform {
     }
 }
 
+/// Returns the single admitted target with the longest name that `url` contains, or `None` if no
+/// admitted target appears in `url` or more than one distinct admitted target of the same
+/// (longest) length appears in it.
+///
+/// A plain `url.contains(target)` is unsound whenever one admitted target is a proper prefix of
+/// another — `aarch64-apple-ios` is a proper prefix of `aarch64-apple-ios-sim`, so a simulator
+/// archive's URL also contains the device target's name and would satisfy the device row. Taking
+/// the *longest* admitted target actually present in the URL resolves that: a simulator URL
+/// contains both `aarch64-apple-ios` and `aarch64-apple-ios-sim`, and only the longer, more
+/// specific one is the one the URL actually names. Ties at the longest length are rejected rather
+/// than resolved arbitrarily, so the check fails closed instead of guessing.
+fn longest_admitted_target_in_url<'a>(
+    url: &str,
+    admitted_targets: &BTreeSet<&'a str>,
+) -> Option<&'a str> {
+    let longest_len = admitted_targets
+        .iter()
+        .filter(|target| url.contains(*target))
+        .map(|target| target.len())
+        .max()?;
+    let mut longest_matches = admitted_targets
+        .iter()
+        .copied()
+        .filter(|target| target.len() == longest_len && url.contains(target));
+    let candidate = longest_matches.next()?;
+    if longest_matches.next().is_some() {
+        // Two distinct admitted targets of the same length both appear in the URL: ambiguous,
+        // so fail closed instead of picking one arbitrarily.
+        return None;
+    }
+    Some(candidate)
+}
+
 /// Requires a reviewed build-time fetch pin table to stay well formed and within admitted targets.
 ///
 /// Exposed so the table's shape is proven directly rather than only vacuously through the empty
@@ -1432,9 +1512,19 @@ pub fn validate_build_artifact_pin_table(
                 "reviewed build-artifact digest is not a SHA-256: {package} {target}"
             )));
         }
-        if !url.starts_with("https://") || url.contains("..") || !url.contains(target) {
+        if !url.starts_with("https://") || url.contains("..") {
             return Err(PolicyError::new(format!(
-                "reviewed build-artifact URL is not a hardened absolute URL naming its target: {url}"
+                "reviewed build-artifact URL is not a hardened absolute URL: {url}"
+            )));
+        }
+        let Some(url_target) = longest_admitted_target_in_url(url, &admitted_targets) else {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL does not unambiguously name an admitted target: {url}"
+            )));
+        };
+        if url_target != *target {
+            return Err(PolicyError::new(format!(
+                "reviewed build-artifact URL names target {url_target}, not the row's target {target}: {url}"
             )));
         }
     }
@@ -1460,6 +1550,108 @@ fn require_build_artifact_pins(platform: &MobilePlatform, package: &str) -> Poli
         )));
     }
     Ok(())
+}
+
+/// One resolved, reviewed build-artifact pin: the sole URL/hash fact for one exact
+/// `(package, version, target)` triple.
+///
+/// Every field borrows from the trust-root's own `'static` pin table, so a resolved value can
+/// never carry text that did not come from a reviewed row.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ResolvedBuildArtifactPin {
+    /// The exact crates.io package name, e.g. `skia-bindings`.
+    pub package: &'static str,
+    /// The exact admitted release, e.g. `0.99.0`.
+    pub version: &'static str,
+    /// The exact admitted target triple, e.g. `aarch64-apple-ios`.
+    pub target: &'static str,
+    /// The sole reviewed download URL for this triple.
+    pub url: &'static str,
+    /// The sole reviewed lowercase SHA-256 for this triple.
+    pub sha256: &'static str,
+}
+
+/// Maximum size accepted for a locally verified build artifact.
+///
+/// The two reviewed iOS archives are each roughly 15 MiB; this bound comfortably covers a future
+/// Skia release while still failing closed on an unexpectedly huge or truncated local file rather
+/// than reading it without limit.
+pub const MAX_BUILD_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Resolves the sole reviewed build-artifact pin for one exact `(package, version, target)`
+/// triple, or fails closed.
+///
+/// Matching is exact-string equality on all three fields — never substring, prefix, or
+/// case-insensitive matching — so a caller-supplied target that is a prefix of another admitted
+/// target (`aarch64-apple-ios` of `aarch64-apple-ios-sim`) can never silently resolve to the wrong
+/// row. This is the same discipline `longest_admitted_target_in_url` enforces on URLs, applied
+/// here to the caller's own input. Unknown inputs and, defensively, a corrupted table that somehow
+/// carries more than one matching row are both rejected rather than guessed at.
+pub fn resolve_build_artifact_pin(
+    package: &str,
+    version: &str,
+    target: &str,
+) -> PolicyResult<ResolvedBuildArtifactPin> {
+    validate_build_artifact_pin_table(&PINNED_BUILD_ARTIFACTS)?;
+    let mut matches =
+        PINNED_BUILD_ARTIFACTS
+            .iter()
+            .filter(|(row_package, row_version, row_target, _, _)| {
+                *row_package == package && *row_version == version && *row_target == target
+            });
+    let Some(&(row_package, row_version, row_target, url, sha256)) = matches.next() else {
+        return Err(PolicyError::new(format!(
+            "no reviewed build-artifact pin matches package={package} version={version} target={target}"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(PolicyError::new(format!(
+            "reviewed build-artifact pin table has more than one row for package={package} version={version} target={target}"
+        )));
+    }
+    Ok(ResolvedBuildArtifactPin {
+        package: row_package,
+        version: row_version,
+        target: row_target,
+        url,
+        sha256,
+    })
+}
+
+/// Verifies that the exact regular file at `path` matches `pin`'s reviewed SHA-256 and is no
+/// larger than `limit` bytes, returning the verified byte count on success.
+///
+/// The read is bounded, rejects symlinks and reparse points, and re-checks size after reading
+/// (`SafeRoot::read_bytes`), so this cannot be satisfied by a file that changes between the size
+/// check and the digest computation. On mismatch the error names `pin`'s package/version/target
+/// and the *expected* digest, but never the untrusted file's actual computed digest: an
+/// unexpected local file's real hash must not leak into error text, where it could be used as an
+/// oracle to fingerprint or gradually confirm the contents of a file the caller does not already
+/// know the hash of.
+pub fn verify_local_build_artifact(
+    pin: &ResolvedBuildArtifactPin,
+    path: &Path,
+    limit: u64,
+) -> PolicyResult<u64> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| PolicyError::new("local build-artifact path must name a file"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.ok_or_else(|| {
+        PolicyError::new("local build-artifact path must have a parent directory")
+    })?;
+    let root = SafeRoot::new(parent)?;
+    let bytes = root.read_bytes(Path::new(file_name), limit)?;
+    let digest = sha256(&bytes);
+    if digest != pin.sha256 {
+        return Err(PolicyError::new(format!(
+            "local build-artifact digest mismatch for {} {} {}: expected {}",
+            pin.package, pin.version, pin.target, pin.sha256
+        )));
+    }
+    Ok(bytes.len() as u64)
 }
 
 /// Validates one present mobile workspace manifest, member, and lock.

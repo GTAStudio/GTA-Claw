@@ -10,6 +10,7 @@ use serde_yaml_ng::{Mapping as YamlMapping, Value as YamlValue};
 use crate::identity::spoof_identity;
 use crate::input::sha256;
 use crate::input::{SafeRoot, compare_trees};
+use crate::mobile_workflow::validate_ios_packaging_workflow_skia_injection;
 use crate::ownership::CODEOWNERS_PATH;
 use crate::process::{CommandSpec, canonical_tool, run_checked};
 use crate::{PolicyError, PolicyResult, error};
@@ -84,6 +85,14 @@ const ADMITTED_WORKFLOWS: [&str; 2] = [
     ".github/workflows/ios-packaging.yml",
 ];
 
+/// The one admitted iOS packaging workflow path.
+///
+/// Absent from every checkout this trust root has ever validated a workflow for: `ios/` does not
+/// exist on `main`, and closed PR #110, which drafted a shell under it, is audit evidence only and
+/// is neither reopened nor mutated by this change. If a future change admits the file, its content
+/// is additionally required to match the Skia trust chain `mobile_workflow` describes.
+const IOS_PACKAGING_PATH: &str = ".github/workflows/ios-packaging.yml";
+
 /// Parsed workflow identity used to prevent required-check spoofing.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WorkflowIdentity {
@@ -95,11 +104,11 @@ pub struct WorkflowIdentity {
     pub jobs: Vec<(String, String)>,
 }
 
-fn yaml_key(key: &str) -> YamlValue {
+pub(crate) fn yaml_key(key: &str) -> YamlValue {
     YamlValue::String(key.to_owned())
 }
 
-fn mapping(value: &YamlValue) -> Option<&YamlMapping> {
+pub(crate) fn mapping(value: &YamlValue) -> Option<&YamlMapping> {
     if let YamlValue::Mapping(mapping) = value {
         Some(mapping)
     } else {
@@ -107,11 +116,11 @@ fn mapping(value: &YamlValue) -> Option<&YamlMapping> {
     }
 }
 
-fn get<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
+pub(crate) fn get<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
     mapping(value)?.get(yaml_key(key))
 }
 
-fn string(value: Option<&YamlValue>) -> Option<&str> {
+pub(crate) fn string(value: Option<&YamlValue>) -> Option<&str> {
     if let Some(YamlValue::String(value)) = value {
         Some(value)
     } else {
@@ -429,6 +438,9 @@ pub fn validate_inventory(root: &SafeRoot) -> PolicyResult<Vec<WorkflowIdentity>
         reject_tagged_yaml(&workflow, &path)?;
         if path == AUTHORITATIVE_PATH {
             validate_ruleset_workflow_eligibility(&workflow)?;
+        }
+        if path == IOS_PACKAGING_PATH {
+            validate_ios_packaging_workflow_skia_injection(&path, &text, &workflow)?;
         }
         let identity = parse_identity(&path, &workflow)?;
         let normalized = require_ascii_identity(&identity.workflow_name, "workflow name")?;
