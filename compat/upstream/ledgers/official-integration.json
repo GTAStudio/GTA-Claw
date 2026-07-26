@@ -177,9 +177,9 @@
                                                                "src/infra/clawhub-install-trust.ts"
                                                            ]
                                              },
-                         "status":  "implemented",
+                         "status":  "partial",
                          "acceptance_evidence":  {
-                                                     "status":  "accepted",
+                                                     "status":  "partial",
                                                      "artifacts":  [
                                                                        {
                                                                            "path":  "crates/claw-automation/src/clawhub.rs",
@@ -198,7 +198,7 @@
                                                  },
                          "last_verified_sha":  "b43e832fcc8000ed7287c7accc54e381db607f85",
                          "known_differences":  [
-                                                   "No known behavioral differences from the frozen ClawHub lifecycle contract."
+                                                   "The Rust lifecycle uses an in-process registry; interoperability with the frozen upstream ClawHub HTTP API, package transport, and origin-lock semantics has not been verified against an external service."
                                                ],
                          "implementation_pointers":  [
                                                          {

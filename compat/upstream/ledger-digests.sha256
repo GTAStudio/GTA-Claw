@@ -5,5 +5,5 @@
 #   powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
 # Format: <sha256>  <ledger path>
 4b9acba6bab704fd76148d19bcb0142b7526efba6c27617459e3981fb0a2d17d  ledgers/gateway-core.json
-db4442bcd627608ea2bee05f0103a56ab493aca92cd6deca850053a043b8b30e  ledgers/official-integration.json
+f4298cc6fc2a74b80f15952600c1eee2b29210d2f18562ab99be1073ae745d6a  ledgers/official-integration.json
 e09abccfcf890939ee220fa303b574673c346b21479bf0ff622d0e183cb44e0d  ledgers/official-client-interop.json

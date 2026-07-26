@@ -105,8 +105,8 @@
                             "implementation_pointers_are_not_acceptance_evidence":  true,
                             "status_totals":  {
                                                   "unimplemented":  33,
-                                                  "partial":  1,
-                                                  "implemented":  13
+                                                  "partial":  2,
+                                                  "implemented":  12
                                               }
                         }
 }
