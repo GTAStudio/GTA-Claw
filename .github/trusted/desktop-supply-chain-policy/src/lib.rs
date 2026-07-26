@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
+pub mod bootstrap_coupling;
 pub mod changes;
 pub mod identity;
 pub mod input;

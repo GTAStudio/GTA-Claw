@@ -80,6 +80,60 @@ The validator exact-freezes:
   classes and messages;
 - the three real lockfile locations: root, desktop, and this validator.
 
+## Bootstrap change coupling: historical archive is not a live mirror
+
+The 28-entry `GTABOOT1` archive (`policy/bootstrap.snapshot`) is a canonical, fingerprint-bound
+historical composite. It is correct the moment it is written, but nothing about the Bootstrap
+fingerprint check alone stops it from going stale afterward: a later pull request can change a
+live `BOOTSTRAP_FILES` path without anyone deciding whether the archive should follow. That
+exact gap let `.github/workflows/upstream-gateway-reference.yml` drift out from under the
+archived `setup-node`/`npm`/`pnpm` entries until it was caught and fixed well after the fact.
+Historical Bootstrap state must never be treated as a standing mirror of current Final state,
+and an unrelated global live/archive comparison is deliberately out of scope — the invariant
+below triggers only from the trusted Git changed-path manifest for the current pull request.
+
+For every changed path in that manifest whose exact string is one of the 28 `BOOTSTRAP_FILES`
+entries, the candidate must make one explicit, mechanically checked decision:
+
+- **Synchronize.** The candidate's own regenerated archive entry for that path equals the
+  candidate's own normalized live bytes for that path; the semantic fingerprint of that
+  regenerated archive (the same digest as `bootstrap_fingerprint`, computed over the archive's
+  own entries instead of a live checkout) equals the exact `BOOTSTRAP_FINGERPRINT` the
+  candidate declares in its own `src/policy.rs`; and the manifest directly shows both
+  `policy/bootstrap.snapshot` and `src/policy.rs` changing in the same pull request. Every one
+  of the 28 canonical archive entries — not merely the touched path — must independently be
+  either byte-for-byte identical to the trusted archive's entry or freshly equal to the
+  candidate's own live bytes for that same path; this is what stops a candidate from
+  fabricating arbitrary bytes for an unrelated, untouched Bootstrap-managed path and then
+  simply hashing whatever it wrote. Merely touching the archive and fingerprint-bearing source
+  paths without all of this actually agreeing is insufficient.
+- **Preserve.** The candidate appends a new, strictly ordered record to
+  `policy/bootstrap-preservation-records.toml` binding the exact normalized base-live
+  SHA-256, candidate-live SHA-256, the still-archived payload SHA-256, the archive's semantic
+  fingerprint, the exact path, and a bounded non-empty rationale.
+
+Silence fails closed with a dedicated diagnostic. A single pull request may mix Synchronize for
+one changed path and Preserve for another. An `A`/`M` status can satisfy either branch; a `D`
+status can only ever satisfy Preserve (there is no live content left to synchronize against);
+a `T` status (a type change on a Bootstrap-managed path) is never permitted under either
+branch.
+
+The preservation ledger is append-only and lives inside the frozen trusted tree, so like the
+archive and the fingerprint constant it can only change through an audited trust-root update
+(see below) — an ordinary pull request cannot add, edit, or delete a record and still pass the
+protected-tree freeze. Existing records are immutable: a candidate may add only new, correctly
+sorted records whose path is an exact changed Bootstrap path in that same pull request; it can
+never edit, reorder, delete, or duplicate an existing one, and a stale record from an earlier
+decision can never cover a later change to the same path — that always requires a fresh record
+with fresh, currently accurate hashes. The initial ledger intentionally starts empty; it must
+never be backfilled to retroactively declare that the current archive already matches live
+Bootstrap-managed files.
+
+This coupling check runs last, after every existing workflow, static, repository, and metadata
+check in `validate_request`. It is strictly residual: it never shadows or changes any
+pre-existing diagnostic, and a pull request that already fails an older, unrelated invariant
+keeps failing with that invariant's own exact message.
+
 The `.github/workflows` directory is a closed inventory. Eight workflow files are
 **required** and must be present in every checkout. Two further exact paths,
 `.github/workflows/ios-packaging.yml` and `.github/workflows/android-packaging.yml`,

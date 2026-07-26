@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::bootstrap_coupling::validate_bootstrap_change_coupling;
 use crate::changes::{ChangeManifest, has_policy_relevant_change, read_manifest};
 use crate::input::SafeRoot;
 use crate::metadata::{MetadataTools, validate_desktop_metadata, validate_root_metadata};
@@ -168,6 +169,8 @@ pub fn validate_request(request: &ValidationRequest) -> PolicyResult<ValidationE
         }
         false
     };
+
+    validate_bootstrap_change_coupling(&trusted, &candidate, &manifest)?;
 
     Ok(ValidationEvidence {
         base_state,

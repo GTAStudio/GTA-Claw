@@ -1,0 +1,14 @@
+# Canonical, append-only Bootstrap change-coupling preservation ledger.
+#
+# This file is part of the frozen trust root and can only change through the audited
+# trust-root-update process described in ../README.md. Every table in `record` is an
+# immutable, strictly ordered decision that a pull request explicitly chose to preserve a
+# stale historical Bootstrap archive entry for one exact path in `BOOTSTRAP_FILES` instead
+# of synchronizing it. Existing records can never be edited, reordered, or removed; a new
+# decision for the same path appends a new record with the next `sequence` value.
+#
+# This initial ledger intentionally starts empty. It must never be backfilled to declare
+# that the current archive already matches live Bootstrap-managed files; every record here
+# must correspond to an exact changed path in the pull request that appended it.
+version = 1
+record = []
