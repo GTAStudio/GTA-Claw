@@ -18,6 +18,37 @@ use claw_protocol::{ClientCommand, PROTOCOL_VERSION, RuntimeDescriptor, ServerEv
 /// dependent lockfiles, so the gate costs consumers nothing.
 #[cfg(any(feature = "composition", test))]
 pub mod composition;
+/// Domain model shared by the agent runtime's ports.
+///
+/// Gated behind the `runtime-ports` feature so that front-ends linking this
+/// crate only for [`Application`] and [`SystemProbe`] do not inherit
+/// `claw-domain`. `test` is in the gate as well so `cargo test -p
+/// claw-application` still compiles and runs the suite rather than reporting
+/// success over skipped tests.
+#[cfg(any(feature = "runtime-ports", test))]
+pub mod model;
+/// Port traits the agent runtime requires of its adapters.
+///
+/// Gated behind the `runtime-ports` feature; see [`model`].
+#[cfg(any(feature = "runtime-ports", test))]
+pub mod ports;
+
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::approval::ApprovalPort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::clock::ClockPort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::context::ContextEnginePort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::goal::GoalStorePort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::provider::{ProviderPort, ProviderStream};
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::state::StatePort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::tool::ToolPort;
+#[cfg(any(feature = "runtime-ports", test))]
+pub use ports::{PortError, PortFuture};
 
 /// Supplies native runtime identity without coupling the application to an OS.
 pub trait SystemProbe {
