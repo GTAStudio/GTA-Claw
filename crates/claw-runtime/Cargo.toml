@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-claw-application.workspace = true
+claw-application = { workspace = true, features = ["runtime-ports"] }
 claw-domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true

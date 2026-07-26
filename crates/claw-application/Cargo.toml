@@ -7,9 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The agent runtime's port traits carry `claw_domain::SessionId` in their
+# public signatures. Front-ends link this crate only for `Application` and
+# `SystemProbe`, so the feature is off by default and their dependency graphs
+# stay free of `claw-domain`. Enable it in crates that implement or drive the
+# ports.
+runtime-ports = ["dep:claw-domain"]
+
 [dependencies]
-claw-domain.workspace = true
+claw-domain = { workspace = true, optional = true }
 claw-protocol.workspace = true
+
+[dev-dependencies]
+claw-domain.workspace = true
 
 [lints]
 workspace = true
